@@ -136,9 +136,15 @@ struct ProcessInner {
     is_killing_other_threads: bool,
     /// The exit code of the last exited thread in the process. Not updated once
     /// `group_exit` is set.
-    exit_code: i32,
+    exit_status: ExitStatus,
     /// The thread list for the process, mapped by thread ID.
     threads: BTreeMap<i32, Arc<ThreadRemote>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ExitStatus {
+    Exit(i8),
+    Signal(litebox_common_linux::signal::Signal),
 }
 
 impl Process {
@@ -150,7 +156,7 @@ impl Process {
         Self {
             nr_threads,
             inner: crate::litebox().sync().new_mutex(ProcessInner {
-                exit_code: 0,
+                exit_status: ExitStatus::Exit(0),
                 group_exit: false,
                 is_killing_other_threads: false,
                 threads: BTreeMap::from_iter([(pid, remote)]),
@@ -165,7 +171,7 @@ impl Process {
     }
 
     /// Waits for all threads in this process to exit, returning the exit code.
-    pub fn wait_for_exit(&self) -> i32 {
+    pub fn wait_for_exit(&self) -> ExitStatus {
         loop {
             let n = self.nr_threads.underlying_atomic().load(Ordering::Acquire);
             if n == 0 {
@@ -173,7 +179,7 @@ impl Process {
             }
             let _ = self.nr_threads.block(n);
         }
-        self.inner.lock().exit_code
+        self.inner.lock().exit_status
     }
 
     /// Attaches a new thread to this process, returning a new remote state for
@@ -226,24 +232,24 @@ impl Process {
 
 impl Task {
     /// Updates the process exit status for a thread exit.
-    fn exit_thread(&self, status: i32) {
+    fn exit_thread(&self, code: i8) {
         let mut inner = self.thread.process.inner.lock();
         if self.is_exiting() {
             return;
         }
-        inner.exit_code = status;
+        inner.exit_status = ExitStatus::Exit(code);
         self.thread.remote.is_exiting.store(true, Ordering::Relaxed);
     }
 
     /// Updates the process exit status for a group exit and signals all threads
     /// to exit.
-    fn exit_group(&self, status: i32) {
+    pub(crate) fn exit_group(&self, status: ExitStatus) {
         let mut inner = self.thread.process.inner.lock();
         if self.is_exiting() {
             return;
         }
         assert!(!inner.group_exit);
-        inner.exit_code = status;
+        inner.exit_status = status;
         inner.group_exit = true;
         for thread in inner.threads.values() {
             thread.is_exiting.store(true, Ordering::Relaxed);
@@ -426,43 +432,6 @@ impl Task {
             _ => unimplemented!("Unsupported punchthrough error {:?}", e),
         })
     }
-
-    pub(crate) fn sys_rt_sigprocmask(
-        &self,
-        how: litebox_common_linux::SigmaskHow,
-        set: Option<crate::ConstPtr<litebox_common_linux::SigSet>>,
-        oldset: Option<crate::MutPtr<litebox_common_linux::SigSet>>,
-    ) -> Result<(), Errno> {
-        let punchthrough =
-            litebox_common_linux::PunchthroughSyscall::RtSigprocmask { how, set, oldset };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for RT_SIGPROCMASK");
-        token.execute().map(|_| ()).map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        })
-    }
-
-    pub(crate) fn sys_rt_sigaction(
-        &self,
-        signum: litebox_common_linux::Signal,
-        act: Option<crate::ConstPtr<litebox_common_linux::SigAction>>,
-        oldact: Option<crate::MutPtr<litebox_common_linux::SigAction>>,
-    ) -> Result<(), Errno> {
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigaction {
-            signum,
-            act,
-            oldact,
-        };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for RT_SIGACTION");
-        token.execute().map(|_| ()).map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        })
-    }
 }
 
 const ROBUST_LIST_LIMIT: isize = 2048;
@@ -562,12 +531,12 @@ impl Task {
     pub(crate) fn sys_exit(&self, status: i32) {
         // The `Task` will be dropped on the way out of the shim, which will
         // call `self.prepare_for_exit()`.
-        self.exit_thread(status);
+        self.exit_thread(status.truncate());
     }
 
     pub(crate) fn sys_exit_group(&self, status: i32) {
         // Tear down occurs similarly to `sys_exit`.
-        self.exit_group(status);
+        self.exit_group(ExitStatus::Exit(status.truncate()));
     }
 }
 
@@ -801,7 +770,7 @@ impl Task {
                         comm: self.comm.clone(),
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
-                        pending_sigreturn: false.into(),
+                        signals: self.signals.clone_for_new_task(),
                     },
                 }),
             )
@@ -1393,6 +1362,8 @@ impl Task {
         }
         self.thread.clear_child_tid.set(None);
 
+        self.signals.reset_for_exec(crate::litebox());
+
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
         let page_manager = crate::litebox_page_manager();
@@ -1418,54 +1389,6 @@ impl Task {
             })
             .expect("Failed to get punchthrough token for SET_ALARM");
         token.execute().map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        })
-    }
-
-    /// Handle syscall `tgkill`.
-    pub(crate) fn sys_tgkill(
-        &self,
-        thread_group_id: i32,
-        thread_id: i32,
-        sig: litebox_common_linux::Signal,
-    ) -> Result<(), Errno> {
-        if thread_id <= 0 || thread_group_id <= 0 {
-            return Err(Errno::EINVAL);
-        }
-        if thread_group_id != self.sys_getpid() {
-            unimplemented!("Sending signal to other processes is not supported yet");
-        }
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::ThreadKill {
-            thread_group_id,
-            thread_id,
-            sig,
-        };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for TGKILL");
-        token.execute().map(|_| ()).map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        })
-    }
-
-    /// Handle syscall `setitimer`
-    pub(crate) fn sys_setitimer(
-        &self,
-        which: litebox_common_linux::IntervalTimer,
-        new_value: crate::ConstPtr<litebox_common_linux::ItimerVal>,
-        old_value: Option<crate::MutPtr<litebox_common_linux::ItimerVal>>,
-    ) -> Result<(), Errno> {
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetITimer {
-            which,
-            new_value,
-            old_value,
-        };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for SETITIMER");
-        token.execute().map(|_| ()).map_err(|e| match e {
             litebox::platform::PunchthroughError::Failure(errno) => errno,
             _ => unimplemented!("Unsupported punchthrough error {:?}", e),
         })

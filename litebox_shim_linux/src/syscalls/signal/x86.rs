@@ -1,0 +1,225 @@
+use super::SignalState;
+use crate::{Errno, Task};
+use crate::{UserConstPointer, UserMutPointer};
+use core::mem::offset_of;
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
+use litebox_common_linux::{
+    PtRegs,
+    signal::{SaFlags, SigAction, SigSet, Siginfo, Ucontext, x86::Sigcontext},
+};
+
+#[repr(C)]
+#[derive(Clone)]
+struct SignalFrame {
+    return_address: usize,
+    signal: i32,
+    context: LegacyContext,
+}
+
+#[repr(C)]
+#[derive(Clone)]
+struct LegacyContext {
+    sigcontext: Sigcontext,
+    unused: [u32; 136],
+    extramask: u32,
+}
+
+#[repr(C)]
+#[derive(Clone)]
+struct SignalFrameRt {
+    return_address: usize,
+    signal: i32,
+    siginfo_ptr: usize,
+    ucontext_ptr: usize,
+    siginfo: Siginfo,
+    ucontext: Ucontext,
+}
+
+impl Task {
+    /// Legacy signal return syscall implementation for x86.
+    pub(crate) fn sys_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
+        let lctx_addr = ctx.esp.wrapping_sub(8);
+        let lctx_ptr = UserConstPointer::<LegacyContext>::from_usize(lctx_addr);
+        let Ok(lctx) = (unsafe { lctx_ptr.read_at_offset(0) }) else {
+            self.force_signal(Signal::SIGSEGV, false);
+            return Err(Errno::EFAULT);
+        };
+        let lctx = lctx.into_owned();
+
+        let mask = SigSet::from_u64(
+            u64::from(lctx.sigcontext.oldmask) | (u64::from(lctx.extramask) << 32),
+        );
+        self.signals.set_signal_mask(mask);
+
+        Ok(restore_sigcontext(ctx, &lctx.sigcontext))
+    }
+}
+
+pub(super) fn uctx_addr(ctx: &PtRegs) -> usize {
+    // Skip parameters.
+    ctx.esp.wrapping_add(
+        offset_of!(SignalFrameRt, ucontext_ptr) - offset_of!(SignalFrameRt, return_address),
+    )
+}
+
+pub(super) fn sp(ctx: &PtRegs) -> usize {
+    ctx.esp
+}
+
+pub(super) fn get_signal_frame(sp: usize, action: &SigAction) -> usize {
+    let mut frame_addr = sp;
+
+    // Space for the signal frame.
+    if action.flags.contains(SaFlags::SIGINFO) {
+        frame_addr -= core::mem::size_of::<SignalFrameRt>();
+    } else {
+        frame_addr -= core::mem::size_of::<SignalFrame>();
+    }
+
+    // Align the frame (offset by 4 bytes for return address).
+    frame_addr &= !15;
+    frame_addr -= 4;
+
+    frame_addr
+}
+
+impl SignalState {
+    pub(super) fn write_signal_frame(
+        &self,
+        frame_addr: usize,
+        siginfo: &Siginfo,
+        action: &SigAction,
+        ctx: &mut PtRegs,
+    ) -> Result<(), DeliverFault> {
+        if !action.flags.contains(SaFlags::RESTORER) {
+            // FUTURE: use the restorer in the vDSO, when we have one.
+            return Err(DeliverFault);
+        }
+
+        let mask = self.blocked.get().as_u64();
+        let oldmask = mask.truncate();
+        let extramask = (mask >> 32).truncate();
+
+        let last_exception = self.last_exception.get();
+        let sigcontext = Sigcontext {
+            gs: ctx.xgs as u32,
+            fs: ctx.xfs as u32,
+            es: ctx.xes as u32,
+            ds: ctx.xds as u32,
+            edi: ctx.edi as u32,
+            esi: ctx.esi as u32,
+            ebp: ctx.ebp as u32,
+            esp: ctx.esp as u32,
+            ebx: ctx.ebx as u32,
+            edx: ctx.edx as u32,
+            ecx: ctx.ecx as u32,
+            eax: ctx.eax as u32,
+            eip: ctx.eip as u32,
+            cs: ctx.xcs.truncate(),
+            eflags: ctx.eflags as u32,
+            esp_at_signal: ctx.esp as u32,
+            ss: ctx.xss.truncate(),
+            err: last_exception.error_code as u32,
+            trapno: last_exception.exception.0 as u32,
+            oldmask,
+            cr2: last_exception.cr2 as u32,
+            fpstate: 0, // TODO
+        };
+
+        let rt = action.flags.contains(SaFlags::SIGINFO);
+        if rt {
+            let frame_ptr = UserMutPointer::from_usize(frame_addr);
+            let frame = SignalFrameRt {
+                return_address: action.restorer,
+                signal: siginfo.signo,
+                siginfo_ptr: frame_addr + core::mem::offset_of!(SignalFrameRt, siginfo_ptr),
+                ucontext_ptr: frame_addr + core::mem::offset_of!(SignalFrameRt, ucontext_ptr),
+                ucontext: Ucontext {
+                    flags: 0,
+                    link: core::ptr::null_mut(),
+                    stack: self.altstack.get(),
+                    mcontext: sigcontext,
+                    sigmask: self.blocked.get(),
+                },
+                siginfo: siginfo.clone(),
+            };
+            unsafe { frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)? };
+        } else {
+            let frame_ptr = UserMutPointer::from_usize(frame_addr);
+            let frame = SignalFrame {
+                return_address: action.restorer,
+                signal: siginfo.signo,
+                context: LegacyContext {
+                    sigcontext,
+                    unused: [0; 136],
+                    extramask,
+                },
+            };
+            unsafe { frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)? };
+        };
+
+        ctx.esp = frame_addr;
+        ctx.eip = action.sigaction;
+        ctx.eax = siginfo.signo.reinterpret_as_unsigned() as usize;
+        if rt {
+            ctx.edx = frame_addr + core::mem::offset_of!(SignalFrameRt, siginfo_ptr);
+            ctx.ecx = frame_addr + core::mem::offset_of!(SignalFrameRt, ucontext_ptr);
+        } else {
+            ctx.edx = 0;
+            ctx.ecx = 0;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn restore_sigcontext(
+    ctx: &mut PtRegs,
+    sigctx: &litebox_common_linux::signal::x86::Sigcontext,
+) -> usize {
+    let litebox_common_linux::signal::x86::Sigcontext {
+        gs,
+        fs,
+        es,
+        ds,
+        edi,
+        esi,
+        ebp,
+        esp,
+        ebx,
+        edx,
+        ecx,
+        eax,
+        trapno: _,
+        err: _,
+        eip,
+        cs,
+        eflags,
+        esp_at_signal: _,
+        ss,
+        fpstate: _,
+        oldmask: _,
+        cr2: _,
+    } = *sigctx;
+
+    ctx.xgs = gs as usize;
+    ctx.xfs = fs as usize;
+    ctx.xes = es as usize;
+    ctx.xds = ds as usize;
+    ctx.xcs = cs as usize;
+    ctx.xss = ss as usize;
+    ctx.edi = edi as usize;
+    ctx.esi = esi as usize;
+    ctx.ebp = ebp as usize;
+    ctx.esp = esp as usize;
+    ctx.ebx = ebx as usize;
+    ctx.edx = edx as usize;
+    ctx.ecx = ecx as usize;
+    ctx.eax = eax as usize;
+    ctx.eip = eip as usize;
+    ctx.eflags = eflags as usize;
+
+    // TODO: restore fpstate
+
+    ctx.eax
+}

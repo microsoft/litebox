@@ -50,7 +50,7 @@ fn register_sigsys_handler() {
     unsafe { libc::sigemptyset(sig_mask.as_mut_ptr()) };
     let sig_action = libc::sigaction {
         sa_sigaction: sigsys_handler as usize,
-        sa_flags: litebox_common_linux::SaFlags::SIGINFO
+        sa_flags: litebox_common_linux::signal::SaFlags::SIGINFO
             .bits()
             .reinterpret_as_signed(),
         // SAFETY: Initialized by `libc::sigemptyset`
@@ -115,7 +115,7 @@ fn register_seccomp_filter() {
                         0,
                         SeccompCmpArgLen::Dword,
                         SeccompCmpOp::Ne,
-                        litebox_common_linux::Signal::SIGSYS as u64,
+                        litebox_common_linux::signal::Signal::SIGSYS.as_usize() as u64,
                     )
                     .unwrap(),
                 ])

@@ -64,23 +64,11 @@ impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, H
         litebox::platform::PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
     > {
         let r = match self.punchthrough {
-            PunchthroughSyscall::RtSigprocmask { how, set, oldset } => {
-                Host::rt_sigprocmask(how, set, oldset)
-            }
-            PunchthroughSyscall::RtSigaction {
-                signum: _,
-                act: _,
-                oldact: _,
-            } => todo!(),
-            PunchthroughSyscall::RtSigreturn { stack: _ } => todo!(),
-            PunchthroughSyscall::ThreadKill { .. } => todo!(),
             PunchthroughSyscall::SetFsBase { addr } => {
                 unsafe { litebox_common_linux::wrfsbase(addr) };
                 Ok(0)
             }
             PunchthroughSyscall::GetFsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
-            PunchthroughSyscall::Alarm { seconds: _ } => todo!(),
-            PunchthroughSyscall::SetITimer { .. } => todo!(),
         };
         match r {
             Ok(v) => Ok(v),
@@ -366,9 +354,9 @@ pub trait HostInterface {
 
     /// For Punchthrough
     fn rt_sigprocmask(
-        how: litebox_common_linux::SigmaskHow,
-        set: Option<UserConstPtr<litebox_common_linux::SigSet>>,
-        old_set: Option<UserMutPtr<litebox_common_linux::SigSet>>,
+        how: litebox_common_linux::signal::SigmaskHow,
+        set: Option<UserConstPtr<litebox_common_linux::signal::SigSet>>,
+        old_set: Option<UserMutPtr<litebox_common_linux::signal::SigSet>>,
     ) -> Result<usize, Errno>;
 
     fn wake_many(mutex: &AtomicU32, n: usize) -> Result<usize, Errno>;

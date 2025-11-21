@@ -9,7 +9,10 @@ use litebox::{
     platform::{RawConstPointer, RawMutPointer},
     utils::ReinterpretUnsignedExt as _,
 };
-use litebox_common_linux::{CloneFlags, SigSet, SigmaskHow};
+use litebox_common_linux::{
+    CloneFlags,
+    signal::{SigSet, SigmaskHow},
+};
 
 use super::ghcb::ghcb_prints;
 use crate::{

@@ -1128,105 +1128,6 @@ impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
         >,
     > {
         match self.punchthrough {
-            PunchthroughSyscall::RtSigprocmask { how, set, oldset } => {
-                let set = match set {
-                    Some(ptr) => {
-                        let mut set = unsafe { ptr.read_at_offset(0) }
-                            .ok_or(litebox::platform::PunchthroughError::Failure(
-                                litebox_common_linux::errno::Errno::EFAULT,
-                            ))?
-                            .into_owned();
-                        // never block SIGSYS (required by Seccomp to intercept syscalls)
-                        #[cfg(feature = "systrap_backend")]
-                        set.remove(litebox_common_linux::Signal::SIGSYS);
-                        // never block SIGSEGV (required to recover from fallible read/write)
-                        set.remove(litebox_common_linux::Signal::SIGSEGV);
-                        Some(set)
-                    }
-                    None => None,
-                };
-                unsafe {
-                    syscalls::syscall5(
-                        syscalls::Sysno::rt_sigprocmask,
-                        how as usize,
-                        if let Some(set) = set.as_ref() {
-                            core::ptr::from_ref(set) as usize
-                        } else {
-                            0
-                        },
-                        oldset.map_or(0, |ptr| ptr.as_usize()),
-                        size_of::<litebox_common_linux::SigSet>(),
-                        // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                        syscall_intercept::SYSCALL_ARG_MAGIC,
-                    )
-                }
-                .map_err(|err| match err {
-                    syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
-                    syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                    _ => panic!("unexpected error {err}"),
-                })
-                .map_err(litebox::platform::PunchthroughError::Failure)
-            }
-            PunchthroughSyscall::RtSigaction {
-                signum,
-                act,
-                oldact,
-            } => {
-                if signum == litebox_common_linux::Signal::SIGSYS && act.is_some() {
-                    // don't allow changing the SIGSYS handler
-                    return Err(litebox::platform::PunchthroughError::Failure(
-                        litebox_common_linux::errno::Errno::EINVAL,
-                    ));
-                }
-
-                let act = act.map_or(0, |ptr| ptr.as_usize());
-                let oldact = oldact.map_or(0, |ptr| ptr.as_usize());
-                unsafe {
-                    syscalls::syscall4(
-                        syscalls::Sysno::rt_sigaction,
-                        signum as usize,
-                        act,
-                        oldact,
-                        size_of::<litebox_common_linux::SigSet>(),
-                    )
-                }
-                .map_err(|err| match err {
-                    syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
-                    syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                    _ => panic!("unexpected error {err}"),
-                })
-                .map_err(litebox::platform::PunchthroughError::Failure)
-            }
-            PunchthroughSyscall::RtSigreturn { stack } => {
-                // The stack pointer should point to a `ucontext` structure.
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    core::arch::asm!(
-                        "mov rsp, {0}",
-                        // Switch to the guest fsbase
-                        "mov BYTE PTR fs:in_guest@tpoff, 1",
-                        "mov rax, fs:guest_fsbase@tpoff",
-                        "wrfsbase rax",
-                        "mov rax, {SYSCALL_NUM}",
-                        "syscall", // invokes rt_sigreturn
-                        in(reg) stack,
-                        SYSCALL_NUM = const syscalls::Sysno::rt_sigreturn as usize,
-                        options(noreturn)
-                    );
-                }
-                #[cfg(target_arch = "x86")]
-                unsafe {
-                    core::arch::asm!(
-                        "mov esp, {0}",
-                        "mov BYTE PTR gs:in_guest@ntpoff, 1",
-                        "mov eax, {SYSCALL_NUM}",
-                        "int 0x80", // invokes rt_sigreturn
-                        in(reg) stack,
-                        SYSCALL_NUM = const syscalls::Sysno::rt_sigreturn as usize,
-                        options(noreturn)
-                    );
-                }
-            }
             // We swap gs and fs before and after a syscall so at this point guest's fs base is stored in gs
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::SetFsBase { addr } => {
@@ -1239,58 +1140,6 @@ impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
             PunchthroughSyscall::SetThreadArea { user_desc } => {
                 set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
             }
-            PunchthroughSyscall::Alarm { seconds } => unsafe {
-                let remain = syscalls::syscall2(
-                    syscalls::Sysno::alarm,
-                    seconds as usize,
-                    // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                    syscall_intercept::SYSCALL_ARG_MAGIC,
-                )
-                .expect("failed to set alarm");
-                Ok(remain)
-            },
-            PunchthroughSyscall::ThreadKill {
-                thread_group_id,
-                thread_id,
-                sig,
-            } => unsafe {
-                syscalls::syscall3(
-                    syscalls::Sysno::tgkill,
-                    thread_group_id.reinterpret_as_unsigned() as usize,
-                    thread_id.reinterpret_as_unsigned() as usize,
-                    (sig as i32 as isize).reinterpret_as_unsigned(),
-                )
-            }
-            .map_err(|err| match err {
-                syscalls::Errno::EAGAIN => litebox_common_linux::errno::Errno::EAGAIN,
-                syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                syscalls::Errno::EPERM => litebox_common_linux::errno::Errno::EPERM,
-                syscalls::Errno::ESRCH => litebox_common_linux::errno::Errno::ESRCH,
-                _ => panic!("unexpected error {err}"),
-            })
-            .map_err(litebox::platform::PunchthroughError::Failure),
-            PunchthroughSyscall::SetITimer {
-                which,
-                new_value,
-                old_value,
-            } => unsafe {
-                syscalls::syscall3(
-                    syscalls::Sysno::setitimer,
-                    which as usize,
-                    new_value.as_usize(),
-                    if let Some(old_value) = old_value {
-                        old_value.as_usize()
-                    } else {
-                        0
-                    },
-                )
-            }
-            .map_err(|err| match err {
-                syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
-                syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-                _ => panic!("unexpected error {err}"),
-            })
-            .map_err(litebox::platform::PunchthroughError::Failure),
         }
     }
 }
@@ -1716,6 +1565,15 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
+        if cfg!(target_arch = "x86") {
+            // Enabling VDSO on x86 causes glibc to not set a restorer in signal
+            // handlers, which we do not currently support. Disable VDSO for
+            // now.
+            //
+            // TODO: implement VDSO in the shim, don't try to pass through the
+            // platform VDSO.
+            return None;
+        }
         self.vdso_address
     }
 }

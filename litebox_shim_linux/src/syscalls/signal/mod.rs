@@ -1,0 +1,618 @@
+//! Signal handling syscalls and support.
+
+#[cfg(target_arch = "x86")]
+pub(crate) mod x86;
+#[cfg(target_arch = "x86_64")]
+mod x86_64;
+
+use litebox_common_linux::signal::SignalDisposition;
+#[cfg(target_arch = "x86")]
+use x86 as arch;
+#[cfg(target_arch = "x86_64")]
+use x86_64 as arch;
+
+use crate::ConstPtr;
+use crate::MutPtr;
+use crate::Task;
+use crate::syscalls::process::ExitStatus;
+use alloc::collections::vec_deque::VecDeque;
+use alloc::sync::Arc;
+use core::cell::Cell;
+use core::cell::RefCell;
+use litebox::LiteBox;
+use litebox::platform::RawConstPointer as _;
+use litebox::platform::RawMutPointer as _;
+use litebox::shim::Exception;
+use litebox::sync::Mutex;
+use litebox_common_linux::signal::MINSIGSTKSZ;
+use litebox_common_linux::signal::SIG_DFL;
+use litebox_common_linux::signal::SIG_IGN;
+use litebox_common_linux::signal::{
+    NSIG, SI_KERNEL, SI_USER, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData,
+    SigmaskHow, Signal, SsFlags, Ucontext,
+};
+use litebox_common_linux::{PtRegs, errno::Errno};
+use litebox_platform_multiplex::Platform;
+
+pub(crate) struct SignalState {
+    /// Pending thread signals.
+    pending: RefCell<PendingSignals>,
+    /// Currently blocked signals.
+    blocked: Cell<SigSet>,
+    /// Signal handlers.
+    handlers: RefCell<Arc<SignalHandlers>>,
+    /// Alternate signal stack.
+    altstack: Cell<SigAltStack>,
+    /// The last exception info recorded for signal delivery.
+    last_exception: Cell<litebox::shim::ExceptionInfo>,
+}
+
+impl SignalState {
+    pub fn new_process(litebox: &LiteBox<Platform>) -> Self {
+        Self {
+            pending: RefCell::new(PendingSignals::new()),
+            blocked: Cell::new(SigSet::empty()),
+            handlers: RefCell::new(Arc::new(SignalHandlers::new(litebox))),
+            altstack: Cell::new(SigAltStack {
+                sp: 0,
+                flags: SsFlags::DISABLE,
+                size: 0,
+            }),
+            last_exception: Cell::new(litebox::shim::ExceptionInfo {
+                exception: litebox::shim::Exception(0),
+                error_code: 0,
+                cr2: 0,
+            }),
+        }
+    }
+
+    pub fn clone_for_new_task(&self) -> Self {
+        Self {
+            // Reset pending
+            pending: RefCell::new(PendingSignals::new()),
+            // Preserve blocked
+            blocked: Cell::new(self.blocked.get()),
+            // Share handlers across tasks
+            handlers: self.handlers.clone(),
+            // Clear altstack
+            altstack: SigAltStack {
+                flags: SsFlags::DISABLE,
+                sp: 0,
+                size: 0,
+            }
+            .into(),
+            // Preserve last exception
+            last_exception: self.last_exception.clone(),
+        }
+    }
+
+    pub(crate) fn reset_for_exec(&self, litebox: &LiteBox<Platform>) {
+        let mut handlers = self.handlers.borrow_mut();
+        // Ensure that the signal handlers are no longer shared.
+        let handlers = match Arc::get_mut(&mut handlers) {
+            Some(handlers) => handlers,
+            None => {
+                *handlers = Arc::new(handlers.clone_with_litebox(litebox));
+                Arc::get_mut(&mut handlers).unwrap()
+            }
+        };
+        // Reset the handlers to defaults.
+        for handler in handlers.inner.get_mut().handlers.iter_mut() {
+            handler.action = SigAction {
+                sigaction: if handler.action.sigaction == SIG_IGN {
+                    SIG_IGN
+                } else {
+                    SIG_DFL
+                },
+                restorer: 0,
+                flags: SaFlags::empty(),
+                mask: SigSet::empty(),
+            };
+        }
+        self.clear_sigaltstack();
+    }
+}
+
+struct SignalHandlers {
+    inner: Mutex<Platform, SignalHandlersInner>,
+}
+
+#[derive(Clone)]
+struct SignalHandlersInner {
+    handlers: [Handler; NSIG],
+}
+
+#[derive(Clone)]
+struct Handler {
+    action: SigAction,
+    /// The user cannot change this action.
+    immutable: bool,
+}
+
+impl SignalHandlers {
+    fn new(litebox: &LiteBox<Platform>) -> Self {
+        Self {
+            inner: litebox.sync().new_mutex(SignalHandlersInner {
+                handlers: core::array::from_fn(|i| Handler {
+                    action: SigAction {
+                        sigaction: SIG_DFL,
+                        restorer: 0,
+                        flags: SaFlags::empty(),
+                        mask: SigSet::empty(),
+                    },
+                    immutable: i == Signal::SIGKILL.as_usize() || i == Signal::SIGSTOP.as_usize(),
+                }),
+            }),
+        }
+    }
+
+    // FUTURE: implement Clone directly if it becomes possible to create a
+    // `Mutex` without needing to go through `LiteBox`.
+    fn clone_with_litebox(&self, litebox: &LiteBox<Platform>) -> Self {
+        Self {
+            inner: litebox.sync().new_mutex(self.inner.lock().clone()),
+        }
+    }
+}
+
+struct PendingSignals {
+    /// The set of pending signals.
+    pending: SigSet,
+    /// The queue of pending siginfo structures.
+    queue: VecDeque<Siginfo>,
+}
+
+impl PendingSignals {
+    fn new() -> Self {
+        Self {
+            pending: SigSet::empty(),
+            queue: VecDeque::new(),
+        }
+    }
+
+    fn find(&self, signo: Signal) -> Option<usize> {
+        self.queue
+            .iter()
+            .position(|info| info.signo == signo.as_i32())
+    }
+
+    fn next(&mut self, blocked: SigSet) -> Option<Signal> {
+        const EXCEPTION_SIGNALS: SigSet = SigSet::empty()
+            .with(Signal::SIGSEGV)
+            .with(Signal::SIGBUS)
+            .with(Signal::SIGFPE)
+            .with(Signal::SIGILL)
+            .with(Signal::SIGTRAP);
+
+        let pending = self.pending & !blocked;
+
+        // Look for exception signals first since these must be delivered with
+        // the user context at the time of the exception.
+        let next = (pending & EXCEPTION_SIGNALS)
+            .lowest_set()
+            .or_else(|| pending.lowest_set())?;
+
+        Some(next)
+    }
+
+    fn remove(&mut self, signal: Signal) -> Siginfo {
+        // Find the entry.
+        let siginfo = if let Some(pos) = self.find(signal) {
+            self.queue.remove(pos).unwrap()
+        } else {
+            // No entry. Synthesize a default siginfo.
+            Siginfo {
+                signo: signal.as_i32(),
+                errno: 0,
+                code: SI_USER,
+                data: SiginfoData { pad: [0; 29] },
+            }
+        };
+
+        if self.find(signal).is_none() {
+            // No more entries of this signal number, remove from the pending
+            // mask.
+            self.pending.remove(signal);
+        }
+        siginfo
+    }
+
+    fn push(&mut self, signal: Signal, siginfo: Siginfo) {
+        assert_eq!(signal.as_i32(), siginfo.signo);
+        let old_mask = self.pending;
+        self.pending.add(signal);
+        if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
+            // Don't bother to queue a siginfo since the task will never see it.
+            return;
+        }
+        if !signal.is_rt_signal() && old_mask.contains(signal) {
+            // Already pending, don't queue duplicates for standard signals.
+            return;
+        }
+        // TODO: handle rlimits for RT signals.
+        self.queue.push_back(siginfo);
+    }
+}
+
+/// Returns whether `sp` is within the given signal stack.
+fn is_on_stack(stack: &SigAltStack, sp: usize) -> bool {
+    if stack.flags.contains(SsFlags::DISABLE) {
+        return false;
+    }
+    let stack_start = stack.sp;
+    let stack_end = stack.sp + stack.size;
+    sp >= stack_start && sp < stack_end
+}
+
+/// Creates a `Siginfo` for an exception signal.
+fn siginfo_exception(signo: Signal, fault_address: usize) -> Siginfo {
+    Siginfo {
+        signo: signo.as_i32(),
+        errno: 0,
+        code: SI_KERNEL,
+        data: SiginfoData {
+            addr: fault_address,
+        },
+    }
+}
+
+/// Creates a `Siginfo` for a signal sent by a user process via `kill()`,
+/// `tkill()`, or `tgkill()`.
+fn siginfo_kill(signo: Signal) -> Siginfo {
+    Siginfo {
+        signo: signo.as_i32(),
+        errno: 0,
+        code: SI_USER,
+        data: SiginfoData { pad: [0; 29] },
+    }
+}
+
+impl SignalState {
+    /// Updates the blocked signal mask.
+    fn set_signal_mask(&self, mask: SigSet) {
+        self.blocked.set(mask);
+    }
+
+    /// Sets the alternate signal stack.
+    fn set_sigaltstack(&self, ss: SigAltStack) -> Result<(), Errno> {
+        if !ss
+            .flags
+            .difference(SsFlags::DISABLE | SsFlags::AUTODISARM)
+            .is_empty()
+        {
+            Err(Errno::EINVAL)
+        } else if ss.flags.contains(SsFlags::DISABLE) {
+            self.clear_sigaltstack();
+            Ok(())
+        } else if ss.sp.checked_add(ss.size).is_none() {
+            Err(Errno::EINVAL)
+        } else if ss.size < MINSIGSTKSZ {
+            Err(Errno::ENOMEM)
+        } else {
+            self.altstack.set(ss);
+            Ok(())
+        }
+    }
+
+    /// Clears the alternate signal stack.
+    fn clear_sigaltstack(&self) {
+        self.altstack.set(SigAltStack {
+            sp: 0,
+            flags: SsFlags::DISABLE,
+            size: 0,
+        });
+    }
+
+    #[must_use]
+    fn deliver_signal(
+        &self,
+        siginfo: &Siginfo,
+        action: &SigAction,
+        ctx: &mut PtRegs,
+    ) -> Result<(), DeliverFault> {
+        let sp = arch::sp(ctx);
+        let on_alt_stack = is_on_stack(&self.altstack.get(), sp);
+        let altstack = self.altstack.get();
+        let switch_stacks = action.flags.contains(SaFlags::ONSTACK)
+            && !on_alt_stack
+            && !altstack.flags.contains(SsFlags::DISABLE);
+        let sp = if switch_stacks {
+            altstack.sp + altstack.size
+        } else {
+            sp
+        };
+
+        let frame_addr = arch::get_signal_frame(sp, action);
+
+        self.set_signal_mask(action.mask);
+
+        if (switch_stacks || on_alt_stack) && !is_on_stack(&altstack, frame_addr) {
+            return Err(DeliverFault);
+        }
+
+        self.write_signal_frame(frame_addr, siginfo, action, ctx)?;
+
+        if switch_stacks && altstack.flags.contains(SsFlags::AUTODISARM) {
+            self.clear_sigaltstack();
+        }
+        Ok(())
+    }
+}
+
+/// A fault when delivering a signal.
+struct DeliverFault;
+
+impl Task {
+    pub(crate) fn sys_rt_sigprocmask(
+        &self,
+        how: SigmaskHow,
+        set_ptr: Option<crate::ConstPtr<SigSet>>,
+        oldset_ptr: Option<crate::MutPtr<SigSet>>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let set = if let Some(set_ptr) = set_ptr {
+            Some(
+                unsafe { set_ptr.read_at_offset(0) }
+                    .ok_or(Errno::EFAULT)?
+                    .into_owned(),
+            )
+        } else {
+            None
+        };
+
+        if let Some(oldset_ptr) = oldset_ptr {
+            let oldset = self.signals.blocked.get();
+            unsafe {
+                oldset_ptr.write_at_offset(0, oldset).ok_or(Errno::EFAULT)?;
+            };
+        }
+
+        if let Some(set) = set {
+            let mut blocked = self.signals.blocked.get();
+            match how {
+                SigmaskHow::SIG_BLOCK => {
+                    blocked = blocked | set;
+                }
+                SigmaskHow::SIG_UNBLOCK => {
+                    blocked = blocked & !set;
+                }
+                SigmaskHow::SIG_SETMASK => {
+                    blocked = set;
+                }
+            }
+            self.signals.set_signal_mask(blocked);
+        }
+
+        Ok(0)
+    }
+
+    pub(crate) fn sys_sigaltstack(
+        &self,
+        ss_ptr: Option<ConstPtr<SigAltStack>>,
+        old_ss_ptr: Option<MutPtr<SigAltStack>>,
+        ctx: &PtRegs,
+    ) -> Result<usize, Errno> {
+        let mut old_ss = self.signals.altstack.get();
+        let is_on_stack = is_on_stack(&old_ss, arch::sp(ctx));
+        if let Some(old_ss_ptr) = old_ss_ptr {
+            if is_on_stack {
+                old_ss.flags |= SsFlags::ONSTACK;
+            }
+            unsafe { old_ss_ptr.write_at_offset(0, old_ss).ok_or(Errno::EFAULT)? };
+        }
+        if let Some(ss_ptr) = ss_ptr {
+            if is_on_stack {
+                return Err(Errno::EPERM);
+            }
+            let ss = unsafe { ss_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?.into_owned() };
+            self.signals.set_sigaltstack(ss)?;
+        }
+        Ok(0)
+    }
+
+    pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
+        let uctx_addr = arch::uctx_addr(ctx);
+        let uctx_ptr = ConstPtr::<Ucontext>::from_usize(uctx_addr);
+        let Some(uctx) = (unsafe { uctx_ptr.read_at_offset(0) }) else {
+            self.force_signal(Signal::SIGSEGV, false);
+            return Err(Errno::EFAULT);
+        };
+        let uctx = uctx.into_owned();
+
+        // Restore the alternate signal stack, ignoring errors.
+        self.signals.set_sigaltstack(uctx.stack).ok();
+
+        self.signals.set_signal_mask(uctx.sigmask);
+
+        Ok(arch::restore_sigcontext(ctx, &uctx.mcontext))
+    }
+
+    pub(crate) fn sys_rt_sigaction(
+        &self,
+        signo: Signal,
+        act_ptr: Option<ConstPtr<SigAction>>,
+        oldact_ptr: Option<MutPtr<SigAction>>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if signo == Signal::SIGKILL || signo == Signal::SIGSTOP {
+            return Err(Errno::EINVAL);
+        }
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let act = if let Some(act_ptr) = act_ptr {
+            Some(
+                unsafe { act_ptr.read_at_offset(0) }
+                    .ok_or(Errno::EFAULT)?
+                    .into_owned(),
+            )
+        } else {
+            None
+        };
+
+        let handlers = self.signals.handlers.borrow();
+        let old_act = {
+            let mut list = handlers.inner.lock();
+            let handler = &mut list.handlers[signo.as_usize()];
+            if handler.immutable {
+                return Err(Errno::EINVAL);
+            }
+            let old_act = handler.action;
+            if let Some(act) = act {
+                handler.action = act;
+            }
+            old_act
+        };
+
+        if let Some(oldact_ptr) = oldact_ptr {
+            unsafe {
+                oldact_ptr
+                    .write_at_offset(0, old_act)
+                    .ok_or(Errno::EFAULT)?;
+            };
+        }
+
+        Ok(0)
+    }
+
+    pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
+        self.do_kill(Some(pid), None, signal)
+    }
+
+    pub(crate) fn sys_tkill(&self, tid: i32, signal: i32) -> Result<usize, Errno> {
+        self.do_kill(None, Some(tid), signal)
+    }
+
+    pub(crate) fn sys_tgkill(&self, pid: i32, tid: i32, signal: i32) -> Result<usize, Errno> {
+        self.do_kill(Some(pid), Some(tid), signal)
+    }
+
+    fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
+        let signal = Signal::try_from(signal)?;
+        if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid) {
+            self.send_signal(signal, siginfo_kill(signal));
+            Ok(0)
+        } else {
+            log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
+            return Err(Errno::ESRCH);
+        }
+    }
+
+    /// Returns whether there are any pending signals that can be delivered.
+    pub(crate) fn has_pending_signals(&self) -> bool {
+        let pending = (self.signals.pending.borrow().pending & !self.signals.blocked.get());
+        !pending.is_empty()
+    }
+
+    /// Deliver any pending signals.
+    pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
+        let pending = &mut self.signals.pending.borrow_mut();
+        while let Some(signo) = pending.next(self.signals.blocked.get()) {
+            if self.is_exiting() {
+                // Don't deliver any more signals if exiting.
+                return;
+            }
+
+            let siginfo = pending.remove(signo);
+            let action =
+                self.signals.handlers.borrow().inner.lock().handlers[signo.as_usize()].action;
+            match action.sigaction {
+                SIG_DFL => {
+                    match signo.default_disposition() {
+                        SignalDisposition::Terminate
+                        | SignalDisposition::Core
+                        | SignalDisposition::Stop => {
+                            // STOP is not currently supported, so treat as
+                            // terminate. Core dumps are also not currently
+                            // supported.
+                            litebox::log_println!(
+                                litebox_platform_multiplex::platform(),
+                                "-- Fatal signal {:?}: terminating task {}:{}",
+                                signo,
+                                self.pid,
+                                self.tid,
+                            );
+                            self.exit_group(ExitStatus::Signal(signo));
+                        }
+                        SignalDisposition::Ignore => {}
+                        SignalDisposition::Continue => {
+                            // Stop is not supported, so continue does nothing.
+                        }
+                    }
+                }
+                SIG_IGN => {}
+                _ => {
+                    if let Err(DeliverFault) = self.signals.deliver_signal(&siginfo, &action, ctx) {
+                        // Failed to deliver signal. Inject a SIGSEGV
+                        // (terminating the process if we were trying to deliver
+                        // a SIGSEGV).
+                        self.force_signal(Signal::SIGSEGV, signo == Signal::SIGSEGV);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Only supports sending signals to self for now.
+    fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
+        self.signals.pending.borrow_mut().push(signal, siginfo);
+    }
+
+    /// Forces a signal to be delivered on next call to `check_for_signals`.
+    fn force_signal(&self, signal: Signal, force_exit: bool) {
+        let siginfo = Siginfo {
+            signo: signal.as_i32(),
+            errno: 0,
+            code: SI_KERNEL,
+            data: SiginfoData { pad: [0; 29] },
+        };
+        self.force_signal_with_info(signal, force_exit, siginfo);
+    }
+
+    fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
+        assert!(matches!(signal, Signal::SIGKILL | Signal::SIGSEGV));
+
+        self.signals.pending.borrow_mut().push(signal, siginfo);
+
+        // Update the handler if necessary to ensure the signal is handled.
+        let handlers = self.signals.handlers.borrow();
+        let mut list = handlers.inner.lock();
+        let handler = &mut list.handlers[signal.as_usize()];
+        if force_exit
+            || self.signals.blocked.get().contains(signal)
+            || handler.action.sigaction == SIG_IGN
+        {
+            let mut blocked = self.signals.blocked.get();
+            blocked.remove(signal);
+            self.signals.set_signal_mask(blocked);
+            handler.action = SigAction {
+                sigaction: SIG_DFL,
+                restorer: 0,
+                flags: SaFlags::empty(),
+                mask: SigSet::empty(),
+            };
+            // Don't allow further changes to this action.
+            handler.immutable = true;
+        }
+    }
+
+    pub(crate) fn handle_exception_request(&self, info: &litebox::shim::ExceptionInfo) {
+        let signal = match info.exception {
+            Exception::DIVIDE_ERROR => Signal::SIGFPE,
+            Exception::BREAKPOINT => Signal::SIGTRAP,
+            Exception::INVALID_OPCODE => Signal::SIGILL,
+            _ => Signal::SIGSEGV,
+        };
+        // For page faults, provide the faulting address.
+        let fault_address = if info.exception == Exception::PAGE_FAULT {
+            info.cr2
+        } else {
+            0
+        };
+        self.signals.last_exception.set(*info);
+        self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
+    }
+}
