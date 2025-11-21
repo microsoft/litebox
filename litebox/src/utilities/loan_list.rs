@@ -580,14 +580,11 @@ mod tests {
                     let done = &done;
                     let observed_removed = &observed_removed;
                     move || {
-                        let mut v = pin!(LoanListEntry::new(
-                            platform,
-                            Value {
-                                key: i / entries_per_key,
-                                str: String::from("one"),
-                                removed: AtomicBool::new(false),
-                            },
-                        ));
+                        let mut v = pin!(LoanListEntry::new(platform, Value {
+                            key: i / entries_per_key,
+                            str: String::from("one"),
+                            removed: AtomicBool::new(false),
+                        },));
                         v.as_mut().insert(list);
                         if i % 2 == 0 {
                             v.remove();

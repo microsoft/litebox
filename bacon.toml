@@ -91,6 +91,16 @@ need_stdout = false
 allow_warnings = true
 on_success = "job:doc" # so that we don't open the browser at each change
 
+# osdk check
+[jobs.osdk-check]
+command = ["cargo", "osdk", "check"]
+workdir = "ostd-test/runner"
+
+# osdk run
+[jobs.osdk-run]
+command = ["cargo", "osdk", "run"]
+allow_warnings = true
+
 # Project-specific keybindings, to make it easier to run the various jobs here.
 [keybindings]
 k = "job:check"
@@ -104,3 +114,5 @@ alt-d = "job:doc"
 v = "job:buildchecks-lvbs"
 alt-s = "job:buildchecks-snp"
 w = "job:clippy-windows"
+o = "job:osdk-check"
+alt-o = "job:osdk-run"

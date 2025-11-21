@@ -356,7 +356,7 @@ pub fn parse_modinfo(original_elf_data: &[u8]) -> Result<(), KernelElfError> {
         let modinfo_data = &original_elf_data[start..end];
 
         for entry in modinfo_data.split(|&b| b == 0) {
-            if let Ok(s) = str::from_utf8(entry)
+            if let Ok(s) = core::str::from_utf8(entry)
                 && let Some((k, v)) = s.split_once('=')
                 && k == "name"
             {

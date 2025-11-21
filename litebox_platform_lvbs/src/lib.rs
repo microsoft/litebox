@@ -3,6 +3,10 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 #![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
+#![feature(let_chains)]
+#![feature(unsigned_is_multiple_of)]
+#![feature(naked_functions)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::{
     mshv::{vsm::Vtl0KernelInfo, vtl1_mem_layout::PAGE_SIZE},

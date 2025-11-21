@@ -618,14 +618,10 @@ mod test {
         let consumer = Arc::new(consumer);
         let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
         epoll
-            .add_interest(
-                10,
-                &reader,
-                EpollEvent {
-                    events: Events::IN.bits(),
-                    data: 0,
-                },
-            )
+            .add_interest(10, &reader, EpollEvent {
+                events: Events::IN.bits(),
+                data: 0,
+            })
             .unwrap();
 
         // spawn a thread to write to the pipe

@@ -1,6 +1,6 @@
 //! Userspace Pointer Abstraction
 
-use litebox::mm::exception_table::__memcpy_fallible;
+use litebox::mm::exception_table::__lb_memcpy_fallible;
 use litebox::platform::{RawConstPointer, RawMutPointer};
 
 /// Represent a user space pointer to a read-only object
@@ -23,7 +23,7 @@ unsafe fn read_at_offset<'a, T: Clone>(
     let src = unsafe { ptr.add(usize::try_from(count).ok()?) };
     let mut data = core::mem::MaybeUninit::<T>::uninit();
     let failed_bytes = unsafe {
-        __memcpy_fallible(
+        __lb_memcpy_fallible(
             data.as_mut_ptr().cast(),
             src.cast(),
             core::mem::size_of::<T>(),
@@ -46,7 +46,7 @@ unsafe fn to_cow_slice<'a, T: Clone>(
     }
     let mut data = alloc::vec::Vec::<T>::with_capacity(len);
     let failed_bytes = unsafe {
-        __memcpy_fallible(
+        __lb_memcpy_fallible(
             data.as_mut_ptr().cast(),
             ptr.cast(),
             len * core::mem::size_of::<T>(),
@@ -136,7 +136,7 @@ impl<T: Clone> RawMutPointer<T> for UserMutPtr<T> {
     unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()> {
         let dst = unsafe { self.inner.add(usize::try_from(count).ok()?) };
         let failed_bytes = unsafe {
-            __memcpy_fallible(
+            __lb_memcpy_fallible(
                 dst.cast(),
                 (&raw const value).cast(),
                 core::mem::size_of::<T>(),
@@ -162,7 +162,7 @@ impl<T: Clone> RawMutPointer<T> for UserMutPtr<T> {
         }
         let dst = unsafe { self.inner.add(start_offset) };
         let failed_bytes = unsafe {
-            __memcpy_fallible(dst.cast(), buf.as_ptr().cast(), core::mem::size_of_val(buf))
+            __lb_memcpy_fallible(dst.cast(), buf.as_ptr().cast(), core::mem::size_of_val(buf))
         };
         if failed_bytes == 0 { Some(()) } else { None }
     }

@@ -145,13 +145,10 @@ impl Task {
             }
             _ => {
                 unsafe {
-                    header.write_at_offset(
-                        0,
-                        litebox_common_linux::CapHeader {
-                            version: _LINUX_CAPABILITY_VERSION_3,
-                            pid: hdr.pid,
-                        },
-                    )
+                    header.write_at_offset(0, litebox_common_linux::CapHeader {
+                        version: _LINUX_CAPABILITY_VERSION_3,
+                        pid: hdr.pid,
+                    })
                 }
                 .ok_or(Errno::EFAULT)?;
                 if data.is_none() {

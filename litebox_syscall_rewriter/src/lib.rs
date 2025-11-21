@@ -11,6 +11,9 @@
 //!
 //! This crate currently only supports x86-64 (i.e., amd64) ELFs.
 
+#![feature(let_chains)]
+#![feature(unsigned_is_multiple_of)]
+
 use capstone::arch::x86::X86InsnGroup::{X86_GRP_CALL, X86_GRP_JUMP, X86_GRP_RET};
 use capstone::prelude::*;
 

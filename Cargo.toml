@@ -19,6 +19,9 @@ members = [
     # The CI tests are not meant to be released (thus are not prefixed with
     # `litebox_`), but exist purely to better manage development on LiteBox.
     "dev_tests",
+    ########################################################
+    "ostd-test/platform",
+    "ostd-test/runner",
 ]
 default-members = [
     "litebox",
@@ -35,6 +38,8 @@ default-members = [
     "litebox_shim_optee",
     "litebox_syscall_rewriter",
     "dev_tests",
+    "ostd-test/platform",
+    "ostd-test/runner",
 ]
 # We exclude `litebox_runner_lvbs` from `default-members` because its interrupt handling
 # depends on the unstable `abi_x86_interrupt` feature, which requires a nightly toolchain.

@@ -34,13 +34,10 @@ pub fn run_ta_with_test_commands(ta_info: &ElfLoadInfo, prog_name: &str, json_pa
         };
 
         if func_id == UteeEntryFunc::OpenSession {
-            let _litebox = litebox_shim_optee::init_session(
-                &TeeUuid::default(),
-                &TeeIdentity {
-                    login: TeeLogin::User,
-                    uuid: TeeUuid::default(),
-                },
-            );
+            let _litebox = litebox_shim_optee::init_session(&TeeUuid::default(), &TeeIdentity {
+                login: TeeLogin::User,
+                uuid: TeeUuid::default(),
+            });
         }
 
         // special handling for the KMPP TA whose `OpenSession` expects a session ID that we cannot determine in advance

@@ -221,10 +221,14 @@ fn test_getdent64() {
         .map(|(name, _, _)| name.clone())
         .collect();
     entry_names.sort();
-    assert_eq!(
-        entry_names,
-        alloc::vec![".", "..", "bar", "foo", "test_file1.txt", "test_file2.txt"]
-    );
+    assert_eq!(entry_names, alloc::vec![
+        ".",
+        "..",
+        "bar",
+        "foo",
+        "test_file1.txt",
+        "test_file2.txt"
+    ]);
 
     // Verify that our test files have the correct type (regular file)
     for (name, typ, _) in &found_entries {
@@ -382,10 +386,14 @@ fn test_getdent64() {
 
     // Verify we still got our expected entries through chunked reading
     all_entries.sort();
-    assert_eq!(
-        all_entries,
-        alloc::vec![".", "..", "bar", "foo", "test_file1.txt", "test_file2.txt"]
-    );
+    assert_eq!(all_entries, alloc::vec![
+        ".",
+        "..",
+        "bar",
+        "foo",
+        "test_file1.txt",
+        "test_file2.txt"
+    ]);
 }
 
 #[test]

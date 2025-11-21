@@ -88,7 +88,7 @@ fn save_vtl_state_to_per_cpu_variables(vtl: u8, vtl_state: *const VtlState) {
 }
 
 // Save CPU registers to a global data structure through using a stack
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C" fn save_vtl0_state() {
     naked_asm!(
         "push r15",
@@ -124,7 +124,7 @@ unsafe extern "C" fn save_vtl0_state() {
 }
 const STACK_ALIGNMENT: isize = -16;
 
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C" fn save_vtl1_state() {
     naked_asm!(
         "push r15",
@@ -168,7 +168,7 @@ fn load_vtl_state_from_per_cpu_variables(vtl: u8, vtl_state: *mut VtlState) {
 }
 
 // Restore CPU registers from the global data structure through using a stack.
-#[unsafe(naked)]
+#[naked]
 unsafe extern "C" fn load_vtl_state(vtl: u8) {
     naked_asm!(
         "sub rsp, {register_space}",
@@ -240,7 +240,7 @@ fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
 }
 
 /// expose `vtl_switch_loop` to the outside (e.g., the syscall handler)
-#[unsafe(naked)]
+#[naked]
 pub(crate) unsafe extern "C" fn jump_to_vtl_switch_loop() -> ! {
     naked_asm!(
         "call {loop}",

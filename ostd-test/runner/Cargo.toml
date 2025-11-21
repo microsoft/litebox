@@ -1,0 +1,12 @@
+[package]
+name = "runner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ostd = "0.16.1"
+platform = { path = "../platform/" }
+litebox = { path = "../../litebox" }
+litebox_common_linux = { path = "../../litebox_common_linux", default-features = false }
+litebox_shim_linux = { path = "../../litebox_shim_linux", default-features = false }
+litebox_platform_multiplex = { path = "../../litebox_platform_multiplex", default-features = false, features = ["platform_ostd"] }

@@ -2,6 +2,7 @@
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
+#![feature(unsigned_is_multiple_of)]
 
 use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};

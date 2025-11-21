@@ -1898,23 +1898,20 @@ mod tests {
         .as_usize();
         // Even though `fixed_address` is false, we should still get the requested address if it's free.
         assert_eq!(addr2, addr + 0x8000);
-        assert_eq!(
-            collect_regions(addr..addr + 0x1_0000),
-            vec![
-                (
-                    addr..addr + 0x1000,
-                    windows_sys::Win32::System::Memory::MEM_COMMIT
-                ),
-                (
-                    addr + 0x1000..addr + 0x8000,
-                    windows_sys::Win32::System::Memory::MEM_RESERVE
-                ),
-                (
-                    addr + 0x8000..addr + 0x1_0000,
-                    windows_sys::Win32::System::Memory::MEM_COMMIT
-                ),
-            ]
-        );
+        assert_eq!(collect_regions(addr..addr + 0x1_0000), vec![
+            (
+                addr..addr + 0x1000,
+                windows_sys::Win32::System::Memory::MEM_COMMIT
+            ),
+            (
+                addr + 0x1000..addr + 0x8000,
+                windows_sys::Win32::System::Memory::MEM_RESERVE
+            ),
+            (
+                addr + 0x8000..addr + 0x1_0000,
+                windows_sys::Win32::System::Memory::MEM_COMMIT
+            ),
+        ]);
 
         // Try to allocate [addr + 0x4000, addr + 0x1_0000), which overlaps with existing committed pages.
         // OS should allocate a new region instead of the requested one (as `fixed_address` is false)
