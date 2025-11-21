@@ -73,6 +73,15 @@ pub fn main() {
     // TODO: Need to implement run_thread equivalent for OSTD
 
     use ostd::prelude::*;
+    println!(r#"   _     _ _       ____              "#);
+    println!(r#"  | |   (_) |_ ___| __ )  _____  __  "#);
+    println!(r#"  | |   | | __/ _ \  _ \ / _ \ \/ /  "#);
+    println!(r#"  | |___| | ||  __/ |_) | (_) >  <   "#);
+    println!(r#"  |_____|_|\__\___|____/ \___/_/\_\  "#);
+    println!(r#"                                     "#);
     println!("Runner initialized with binary at /bin/hello_world_static");
     println!("TODO: Implement task creation and execution for OSTD platform");
+    println!("oO0OoO0OoO0OooO0OoO0OoO0OooO0OoO0OoO0Oo");
+
+    ostd::arch::qemu::exit_qemu(ostd::arch::qemu::QemuExitCode::Success);
 }
