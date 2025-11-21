@@ -520,24 +520,7 @@ impl litebox::platform::ThreadProvider for OstdPlatform {
     ) -> Result<(), Self::ThreadSpawnError> {
         let mut user_ctx = UserContext::default();
 
-        user_ctx.set_rax(ctx.rax);
-        user_ctx.set_rbx(ctx.rbx);
-        user_ctx.set_rcx(ctx.rcx);
-        user_ctx.set_rdx(ctx.rdx);
-        user_ctx.set_rsi(ctx.rsi);
-        user_ctx.set_rdi(ctx.rdi);
-        user_ctx.set_rbp(ctx.rbp);
-        user_ctx.set_rsp(ctx.rsp);
-        user_ctx.set_r8(ctx.r8);
-        user_ctx.set_r9(ctx.r9);
-        user_ctx.set_r10(ctx.r10);
-        user_ctx.set_r11(ctx.r11);
-        user_ctx.set_r12(ctx.r12);
-        user_ctx.set_r13(ctx.r13);
-        user_ctx.set_r14(ctx.r14);
-        user_ctx.set_r15(ctx.r15);
-        user_ctx.set_rip(ctx.rip);
-        user_ctx.set_rflags(ctx.eflags);
+        copy_pt_to_uc(&mut user_ctx, ctx);
 
         let task_result = ostd::task::TaskOptions::new(move || {
             init_thread.init();
