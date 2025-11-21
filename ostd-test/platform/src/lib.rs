@@ -253,17 +253,30 @@ impl litebox::platform::SystemInfoProvider for OstdPlatform {
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
-        todo!()
+        None
     }
+}
+
+// XXX: Maybe should use current task instead? `Task::current`
+ostd::cpu_local! {
+    static TLS_POINTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 }
 
 unsafe impl litebox::platform::ThreadLocalStorageProvider for OstdPlatform {
     fn get_thread_local_storage() -> *mut () {
-        todo!()
+        use ostd::cpu::PinCurrentCpu as _;
+        let preempt_guard = ostd::task::disable_preempt();
+        let cpu_id = preempt_guard.current_cpu();
+        let tls_ref = TLS_POINTER.get_on_cpu(cpu_id);
+        tls_ref.load(core::sync::atomic::Ordering::Acquire) as *mut ()
     }
 
-    unsafe fn replace_thread_local_storage(_value: *mut ()) -> *mut () {
-        todo!()
+    unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
+        use ostd::cpu::PinCurrentCpu as _;
+        let preempt_guard = ostd::task::disable_preempt();
+        let cpu_id = preempt_guard.current_cpu();
+        let tls_ref = TLS_POINTER.get_on_cpu(cpu_id);
+        tls_ref.swap(value as usize, core::sync::atomic::Ordering::AcqRel) as *mut ()
     }
 }
 
@@ -282,21 +295,55 @@ impl litebox::platform::ThreadProvider for OstdPlatform {
 
     unsafe fn spawn_thread(
         &self,
-        _ctx: &Self::ExecutionContext,
-        _init_thread: alloc::boxed::Box<dyn litebox::shim::InitThread>,
+        ctx: &Self::ExecutionContext,
+        init_thread: alloc::boxed::Box<dyn litebox::shim::InitThread>,
     ) -> Result<(), Self::ThreadSpawnError> {
-        todo!()
+        let mut user_ctx = ostd::arch::cpu::context::UserContext::default();
+
+        user_ctx.set_rax(ctx.rax);
+        user_ctx.set_rbx(ctx.rbx);
+        user_ctx.set_rcx(ctx.rcx);
+        user_ctx.set_rdx(ctx.rdx);
+        user_ctx.set_rsi(ctx.rsi);
+        user_ctx.set_rdi(ctx.rdi);
+        user_ctx.set_rbp(ctx.rbp);
+        user_ctx.set_rsp(ctx.rsp);
+        user_ctx.set_r8(ctx.r8);
+        user_ctx.set_r9(ctx.r9);
+        user_ctx.set_r10(ctx.r10);
+        user_ctx.set_r11(ctx.r11);
+        user_ctx.set_r12(ctx.r12);
+        user_ctx.set_r13(ctx.r13);
+        user_ctx.set_r14(ctx.r14);
+        user_ctx.set_r15(ctx.r15);
+        user_ctx.set_rip(ctx.rip);
+        user_ctx.set_rflags(ctx.eflags);
+
+        let task_result = ostd::task::TaskOptions::new(move || {
+            init_thread.init();
+        })
+        .spawn();
+
+        match task_result {
+            Ok(_task) => Ok(()),
+            Err(_) => Err(litebox_common_linux::errno::Errno::EAGAIN),
+        }
     }
 
     fn current_thread(&self) -> Self::ThreadHandle {
-        todo!()
+        let current_task =
+            ostd::task::Task::current().expect("current_thread called outside of a task context");
+        ThreadHandle {
+            task: current_task.cloned(),
+        }
     }
 
     fn interrupt_thread(&self, _thread: &Self::ThreadHandle) {
+        // TODO: Implement thread interruption
         todo!()
     }
 }
 
 pub struct ThreadHandle {
-    // TODO
+    task: alloc::sync::Arc<ostd::task::Task>,
 }
