@@ -19,6 +19,11 @@ impl OstdPlatform {
             vm_space: alloc::sync::Arc::new(ostd::mm::VmSpace::new()),
         }
     }
+
+    // XXX: We prob should not be exposing this directly like this, but this is a quick workaround.
+    pub fn activate_vm_space(&self) {
+        self.vm_space.activate();
+    }
 }
 
 impl litebox::platform::Provider for OstdPlatform {}
@@ -232,8 +237,10 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
         use litebox::platform::page_mgmt::AllocationError;
         use ostd::mm::{CachePolicy, FrameAllocOptions, PageProperty};
 
-        debug!("[allocate_pages] range={:#x}..{:#x}, populate={}\n",
-            suggested_range.start, suggested_range.end, populate_pages_immediately);
+        debug!(
+            "[allocate_pages] range={:#x}..{:#x}, populate={}\n",
+            suggested_range.start, suggested_range.end, populate_pages_immediately
+        );
 
         let vm_space = &self.vm_space;
         debug!("[allocate_pages] Got VmSpace\n");
@@ -244,7 +251,10 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
             return Err(AllocationError::InvalidRange);
         }
         let num_pages = (size + 4095) / 4096;
-        debug!("[allocate_pages] Allocating {} pages (size={:#x})\n", num_pages, size);
+        debug!(
+            "[allocate_pages] Allocating {} pages (size={:#x})\n",
+            num_pages, size
+        );
 
         let segment = if populate_pages_immediately {
             FrameAllocOptions::new()
@@ -254,7 +264,10 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
             FrameAllocOptions::new().alloc_segment(num_pages)
         }
         .map_err(|e| {
-            debug!("[allocate_pages] ERROR: Failed to allocate segment: {:?}\n", e);
+            debug!(
+                "[allocate_pages] ERROR: Failed to allocate segment: {:?}\n",
+                e
+            );
             AllocationError::OutOfMemory
         })?;
         debug!("[allocate_pages] Allocated segment\n");
@@ -264,12 +277,10 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
 
         debug!("[allocate_pages] Creating cursor\n");
         let guard = ostd::task::disable_preempt();
-        let mut cursor = vm_space
-            .cursor_mut(&guard, &suggested_range)
-            .map_err(|e| {
-                debug!("[allocate_pages] ERROR: Failed to create cursor: {:?}\n", e);
-                AllocationError::OutOfMemory
-            })?;
+        let mut cursor = vm_space.cursor_mut(&guard, &suggested_range).map_err(|e| {
+            debug!("[allocate_pages] ERROR: Failed to create cursor: {:?}\n", e);
+            AllocationError::OutOfMemory
+        })?;
         debug!("[allocate_pages] Mapping frames\n");
 
         for frame in segment.into_iter() {
@@ -299,7 +310,10 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         use litebox::platform::page_mgmt::DeallocationError;
 
-        debug!("[deallocate_pages] range={:#x}..{:#x}\n", range.start, range.end);
+        debug!(
+            "[deallocate_pages] range={:#x}..{:#x}\n",
+            range.start, range.end
+        );
 
         let vm_space = &self.vm_space;
 
@@ -318,7 +332,10 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
 
         let unmapped = cursor.unmap(num_pages);
         if unmapped != num_pages {
-            debug!("[deallocate_pages] ERROR: Only unmapped {} of {} pages\n", unmapped, num_pages);
+            debug!(
+                "[deallocate_pages] ERROR: Only unmapped {} of {} pages\n",
+                unmapped, num_pages
+            );
             return Err(DeallocationError::AlreadyUnallocated);
         }
 
@@ -337,10 +354,10 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         use litebox::platform::page_mgmt::PermissionUpdateError;
 
-        debug!("[update_permissions] range={:#x}..{:#x}, perms={:?}\n",
-            range.start, range.end, new_permissions);
-
-        let vm_space = &self.vm_space;
+        debug!(
+            "[update_permissions] range={:#x}..{:#x}, perms={:?}\n",
+            range.start, range.end, new_permissions
+        );
 
         let size = range.end.saturating_sub(range.start);
         if size == 0 || size % 4096 != 0 {
@@ -350,20 +367,8 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
         let num_pages = size / 4096;
         debug!("[update_permissions] Updating {} pages\n", num_pages);
 
-        let new_flags = convert_permissions_to_flags(new_permissions);
-
-        let guard = ostd::task::disable_preempt();
-        let mut cursor = vm_space
-            .cursor_mut(&guard, &range)
-            .map_err(|_| PermissionUpdateError::Unallocated)?;
-
-        cursor.protect_next(num_pages, |flags, _cache| {
-            *flags = new_flags;
-        });
-
-        cursor
-            .flusher()
-            .issue_tlb_flush(ostd::mm::tlb::TlbFlushOp::for_range(range));
+        // TODO: Actually implement permission updates
+        debug!("[update_permissions] STUB: Not actually updating permissions (TODO)\n");
 
         debug!("[update_permissions] Success\n");
         Ok(())

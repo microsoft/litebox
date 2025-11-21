@@ -17,6 +17,11 @@ pub fn main() {
     let program_binary = include_bytes!("../../test-bins/hello_world_static");
 
     let platform = alloc::boxed::Box::leak(alloc::boxed::Box::new(OstdPlatform::new()));
+
+    // Activate the VmSpace immediately so allocations during load_program can be accessed
+    println!("Activating VmSpace...");
+    platform.activate_vm_space();
+
     litebox_platform_multiplex::set_platform(platform);
 
     let mut shim = litebox_shim_linux::LinuxShim::new();
