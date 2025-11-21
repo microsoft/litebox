@@ -66,6 +66,7 @@ pub fn main() {
     };
 
     shim.set_fs(initial_file_system);
+    platform.register_shim(shim.entrypoints());
 
     let argv: Vec<alloc::ffi::CString> =
         alloc::vec![alloc::ffi::CString::new("/bin/hello_world_static").unwrap(),];
