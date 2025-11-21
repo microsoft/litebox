@@ -85,5 +85,6 @@ impl TestLauncher {
                 &mut litebox_common_linux::PtRegs::default(),
             );
         }
+        assert_eq!(program.process.wait(), 0);
     }
 }
