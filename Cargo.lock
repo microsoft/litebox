@@ -1554,6 +1554,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "ostd",
+ "spin 0.9.8",
 ]
 
 [[package]]

@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 ostd = "0.16.1"
+spin = "0.9.8"
 litebox = { path = "../../litebox" }
 litebox_common_linux = { path = "../../litebox_common_linux" }

@@ -1,5 +1,7 @@
 #![no_std]
 
+use ostd::arch::cpu::context::UserContext;
+
 extern crate alloc;
 
 macro_rules! debug {
@@ -8,9 +10,18 @@ macro_rules! debug {
     };
 }
 
-#[derive(Debug)]
 pub struct OstdPlatform {
     vm_space: alloc::sync::Arc<ostd::mm::VmSpace>,
+}
+
+static SHIM: spin::Once<
+    &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+> = spin::Once::new();
+
+impl core::fmt::Debug for OstdPlatform {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OstdPlatform").finish_non_exhaustive()
+    }
 }
 
 impl OstdPlatform {
@@ -23,6 +34,16 @@ impl OstdPlatform {
     // XXX: We prob should not be exposing this directly like this, but this is a quick workaround.
     pub fn activate_vm_space(&self) {
         self.vm_space.activate();
+    }
+
+    pub fn register_shim(
+        &self,
+        shim: &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ) {
+        if SHIM.is_completed() {
+            panic!("should not register more than one shim");
+        }
+        SHIM.call_once(|| shim);
     }
 }
 
@@ -454,7 +475,7 @@ impl litebox::platform::ThreadProvider for OstdPlatform {
         ctx: &Self::ExecutionContext,
         init_thread: alloc::boxed::Box<dyn litebox::shim::InitThread>,
     ) -> Result<(), Self::ThreadSpawnError> {
-        let mut user_ctx = ostd::arch::cpu::context::UserContext::default();
+        let mut user_ctx = UserContext::default();
 
         user_ctx.set_rax(ctx.rax);
         user_ctx.set_rbx(ctx.rbx);
@@ -503,4 +524,78 @@ impl litebox::platform::ThreadProvider for OstdPlatform {
 pub struct ThreadHandle {
     #[expect(dead_code)]
     task: alloc::sync::Arc<ostd::task::Task>,
+}
+
+pub fn run_thread(pt_regs: &mut litebox_common_linux::PtRegs) {
+    let pt_regs = *pt_regs;
+    let task = alloc::sync::Arc::new(
+        ostd::task::TaskOptions::new(move || {
+            unsafe { run_thread_inner(pt_regs) };
+        })
+        .build()
+        .unwrap(),
+    );
+    task.run();
+}
+
+unsafe fn run_thread_inner(mut pt_regs: litebox_common_linux::PtRegs) {
+    let pt_regs = &mut pt_regs;
+    let mut user_context = UserContext::default();
+
+    copy_pt_to_uc(&mut user_context, pt_regs);
+
+    let mut user_mode = ostd::user::UserMode::new(user_context);
+
+    loop {
+        let return_reason = user_mode.execute(|| false);
+
+        match return_reason {
+            ostd::user::ReturnReason::UserSyscall => {
+                let user_context = user_mode.context_mut();
+                copy_uc_to_pt(&user_context, pt_regs);
+                match SHIM
+                    .get()
+                    .expect("shim must have been registered")
+                    .syscall(pt_regs)
+                {
+                    litebox::shim::ContinueOperation::ResumeGuest => {
+                        copy_pt_to_uc(user_context, pt_regs);
+                    }
+                    litebox::shim::ContinueOperation::ExitThread => {
+                        ostd::console::early_print(format_args!("Program exited\n"));
+                        break;
+                    }
+                }
+            }
+            ostd::user::ReturnReason::KernelEvent | ostd::user::ReturnReason::UserException => {
+                ostd::console::early_print(format_args!(
+                    "TODO: Unhandled return reason: {:?}\n",
+                    return_reason
+                ));
+                break;
+            }
+        }
+    }
+}
+
+fn copy_uc_to_pt(user_context: &UserContext, pt_regs: &mut litebox_common_linux::PtRegs) {
+    // Convert UserContext to PtRegs for the shim
+    macro_rules! cp {
+        ($($r:ident),*) => { $(pt_regs.$r = user_context.$r();)* };
+    }
+    #[cfg(target_arch = "x86_64")]
+    cp!(
+        rax, rbx, rcx, rdx, rsi, rdi, rsp, rbp, r8, r9, r10, r11, r12, r13, r14, r15, rip
+    );
+}
+
+fn copy_pt_to_uc(user_context: &mut UserContext, pt_regs: &litebox_common_linux::PtRegs) {
+    // Copy results back to user context
+    macro_rules! cp {
+        ($($r:ident),*) => { $(user_context.general_regs_mut().$r = pt_regs.$r;)* };
+    }
+    #[cfg(target_arch = "x86_64")]
+    cp!(
+        rax, rbx, rcx, rdx, rsi, rdi, rsp, rbp, r8, r9, r10, r11, r12, r13, r14, r15, rip
+    );
 }
