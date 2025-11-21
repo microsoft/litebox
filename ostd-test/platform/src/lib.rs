@@ -590,12 +590,20 @@ unsafe fn run_thread_inner(mut pt_regs: litebox_common_linux::PtRegs) {
             ostd::user::ReturnReason::UserSyscall => {
                 let user_context = user_mode.context_mut();
                 copy_uc_to_pt(&user_context, pt_regs);
+                debug!(
+                    "[run_thread] ... start with rax={} orig_rax={}\n",
+                    pt_regs.rax, pt_regs.orig_rax
+                );
                 match SHIM
                     .get()
                     .expect("shim must have been registered")
                     .syscall(pt_regs)
                 {
                     litebox::shim::ContinueOperation::ResumeGuest => {
+                        debug!(
+                            "[run_thread] ...resume with rax={} orig_rax={}\n",
+                            pt_regs.rax, pt_regs.orig_rax
+                        );
                         copy_pt_to_uc(user_context, pt_regs);
                     }
                     litebox::shim::ContinueOperation::ExitThread => {
@@ -679,6 +687,7 @@ fn copy_uc_to_pt(user_context: &UserContext, pt_regs: &mut litebox_common_linux:
     cp!(
         rax, rbx, rcx, rdx, rsi, rdi, rsp, rbp, r8, r9, r10, r11, r12, r13, r14, r15, rip
     );
+    pt_regs.orig_rax = pt_regs.rax;
 }
 
 fn copy_pt_to_uc(user_context: &mut UserContext, pt_regs: &litebox_common_linux::PtRegs) {
