@@ -91,7 +91,7 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                         litebox_common_linux::errno::Errno::EFAULT,
                     ))
             }
-            _ => unimplemented!(),
+            _ => unimplemented!("{:?}", self.punchthrough),
         }
     }
 }
@@ -111,25 +111,25 @@ pub struct Instant {
     from_boot: core::time::Duration,
 }
 pub struct SystemTime {
-    // TODO
-    #[allow(dead_code)]
-    x: u64,
+    // TODO: actual time somehow?
+    from_boot: core::time::Duration,
 }
 impl litebox::platform::Instant for Instant {
-    fn checked_duration_since(&self, _earlier: &Self) -> Option<core::time::Duration> {
-        todo!()
+    fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
+        self.from_boot.checked_sub(earlier.from_boot)
     }
     fn checked_add(&self, _duration: core::time::Duration) -> Option<Self> {
         todo!()
     }
 }
 impl litebox::platform::SystemTime for SystemTime {
-    const UNIX_EPOCH: Self = Self { x: 0 };
-    fn duration_since(
-        &self,
-        _earlier: &Self,
-    ) -> Result<core::time::Duration, core::time::Duration> {
-        todo!()
+    const UNIX_EPOCH: Self = Self {
+        from_boot: core::time::Duration::new(0, 0),
+    };
+    fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration> {
+        self.from_boot
+            .checked_sub(earlier.from_boot)
+            .ok_or_else(|| self.from_boot.abs_diff(earlier.from_boot))
     }
 }
 
@@ -142,7 +142,9 @@ impl litebox::platform::TimeProvider for OstdPlatform {
         }
     }
     fn current_time(&self) -> Self::SystemTime {
-        todo!()
+        SystemTime {
+            from_boot: ostd::timer::Jiffies::elapsed().as_duration(),
+        }
     }
 }
 
