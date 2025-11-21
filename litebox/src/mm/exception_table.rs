@@ -67,7 +67,7 @@ pub struct Fault;
 /// `dst` and `src` must be valid for reads and writes of `size` bytes, or
 /// pointers that are guaranteed to be in non-Rust memory.
 pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Result<(), Fault> {
-    #[cfg(any(target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm! {
             "2:",
@@ -82,7 +82,7 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
     }
     // LLVM on x86 does not allow using `esi` as an asm operand register. Save
     // and restore it manually.
-    #[cfg(any(target_arch = "x86"))]
+    #[cfg(target_arch = "x86")]
     unsafe {
         core::arch::asm! {
             "2:",
