@@ -5,6 +5,7 @@ use litebox_platform_multiplex::Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 extern crate alloc;
 
@@ -218,11 +219,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     if cli_args.tun_device_name.is_some() {
         std::thread::spawn(|| {
-            // TODO: use `poll` rather than busy-looping
-            // Also, we need to terminate this thread when the main program exits
             loop {
                 while litebox_shim_linux::perform_network_interaction().call_again_immediately() {}
-                core::hint::spin_loop();
+                litebox_platform_multiplex::platform().wait_on_tun(Some(Duration::from_millis(50)));
             }
         });
     }

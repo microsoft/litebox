@@ -291,6 +291,30 @@ impl LinuxUserland {
                 .unwrap(),
         }
     }
+
+    /// Wait until there is data available on the TUN device.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TUN device is not initialized.
+    pub fn wait_on_tun(&self, timeout: Option<Duration>) {
+        let tun_fd = self.tun_socket_fd.read().unwrap();
+        let mut pfd = libc::pollfd {
+            fd: tun_fd.as_ref().unwrap().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let _ = unsafe {
+            libc::poll(
+                &raw mut pfd,
+                1,
+                timeout.map_or(-1, |t| {
+                    let ms = t.as_millis();
+                    i32::try_from(ms).unwrap_or(i32::MAX)
+                }),
+            )
+        };
+    }
 }
 
 impl litebox::platform::Provider for LinuxUserland {}
