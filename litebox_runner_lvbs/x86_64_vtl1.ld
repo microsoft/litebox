@@ -32,7 +32,6 @@ SECTIONS
     }
 
     /* Relocation section for position-independent execution */
-    . = ALIGN(0x200000);
     .rela.dyn : ALIGN(0x200000) {
         _rela_start = .;
         *(.rela.text .rela.text*)
