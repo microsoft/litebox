@@ -97,7 +97,6 @@ impl SnpLinuxKernel {
     ) -> litebox_common_linux::TaskParams {
         litebox_common_linux::TaskParams {
             pid: boot_params.pid,
-            tid: boot_params.pid,
             ppid: boot_params.ppid,
             uid: boot_params.uid,
             gid: boot_params.gid,

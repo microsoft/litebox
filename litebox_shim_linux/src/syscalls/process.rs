@@ -1,5 +1,7 @@
 //! Process/thread related syscalls.
 
+use crate::ConstPtr;
+use crate::MutPtr;
 use crate::Task;
 use crate::UserMutPointer;
 use alloc::boxed::Box;
@@ -15,8 +17,7 @@ use litebox::platform::{
     ThreadLocalStorageProvider as _,
 };
 use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
-#[cfg(target_arch = "x86")]
-use litebox::utils::TruncateExt;
+use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
 };
@@ -288,14 +289,16 @@ impl Task {
     }
 
     pub(crate) fn sys_exit(&self, _status: i32) {
-        // Nothing to do yet. The `Task` will be dropped on the way out of the
-        // shim, which will call `self.prepare_for_exit()`.
+        // Set the task to exit. The `Task` will be dropped on the way out of
+        // the shim, which will call `self.prepare_for_exit()`.
+        self.is_exiting.set(true);
     }
 
     pub(crate) fn sys_exit_group(&self, _status: i32) {
         // Tear down occurs similarly to `sys_exit`.
         //
         // TODO: remotely kill other threads.
+        self.is_exiting.set(true);
     }
 }
 
@@ -367,52 +370,131 @@ impl litebox::shim::InitThread for NewThreadArgs {
 }
 
 impl Task {
+    pub(crate) fn sys_clone(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+        args: &litebox_common_linux::CloneArgs,
+    ) -> Result<usize, Errno> {
+        self.do_clone(ctx, args, false)
+    }
+
+    pub(crate) fn sys_clone3(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+        args: ConstPtr<litebox_common_linux::CloneArgs>,
+    ) -> Result<usize, Errno> {
+        let args = unsafe { args.read_at_offset(0) }
+            .ok_or(Errno::EFAULT)?
+            .into_owned();
+        self.do_clone(ctx, &args, true)
+    }
+
     /// Creates a new thread or process.
     ///
     /// Note we currently only support creating threads with the VM, FS, and FILES flags set.
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) fn sys_clone(
+    fn do_clone(
         &self,
-        flags: litebox_common_linux::CloneFlags,
-        parent_tid: Option<crate::MutPtr<i32>>,
-        stack: Option<crate::MutPtr<u8>>,
-        stack_size: usize,
-        child_tid: Option<crate::MutPtr<i32>>,
-        tls: Option<ThreadLocalDescriptor>,
         ctx: &litebox_common_linux::PtRegs,
-        main: usize,
+        args: &litebox_common_linux::CloneArgs,
+        clone3: bool,
     ) -> Result<usize, Errno> {
-        if !flags.contains(CloneFlags::VM) {
-            unimplemented!("Clone without VM flag is not supported");
+        const MAX_SIGNAL_NUMBER: u64 = 64;
+
+        let litebox_common_linux::CloneArgs {
+            flags,
+            pidfd: _,
+            child_tid,
+            parent_tid,
+            exit_signal,
+            stack,
+            stack_size,
+            tls,
+            set_tid,
+            set_tid_size,
+            cgroup,
+        } = *args;
+
+        let required_clone_flags =
+            CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
+
+        let supported_clone_flags = CloneFlags::VM
+            | CloneFlags::FS
+            | CloneFlags::FILES
+            | CloneFlags::SIGHAND
+            | CloneFlags::PARENT
+            | CloneFlags::THREAD
+            | CloneFlags::SETTLS
+            | CloneFlags::PARENT_SETTID
+            | CloneFlags::CHILD_CLEARTID
+            | CloneFlags::CHILD_SETTID
+            // Ignored since we don't support sysv semaphores anyway.
+            | CloneFlags::SYSVSEM;
+
+        if flags.intersects(!supported_clone_flags) {
+            log_unsupported!(
+                "clone with unsupported flags: {:?}",
+                flags & !supported_clone_flags
+            );
+            return Err(Errno::EINVAL);
         }
-        if !flags.contains(CloneFlags::FILES) {
-            unimplemented!("Clone without FILES flag is not supported");
-        }
-        if !flags.contains(CloneFlags::SYSVSEM) {
-            unimplemented!("Clone without SYSVSEM flag is not supported");
-        }
-        if !flags.contains(CloneFlags::THREAD | CloneFlags::SIGHAND) {
-            unimplemented!("Clone without THREAD or SIGHAND flag is not supported");
-        }
-        let unsupported_clone_flags = CloneFlags::PIDFD
-            | CloneFlags::PTRACE
-            | CloneFlags::VFORK
-            | CloneFlags::NEWNS
-            | CloneFlags::UNTRACED
-            | CloneFlags::NEWCGROUP
-            | CloneFlags::NEWUTS
-            | CloneFlags::NEWIPC
-            | CloneFlags::NEWUSER
-            | CloneFlags::NEWPID
-            | CloneFlags::NEWNET
-            | CloneFlags::IO
-            | CloneFlags::CLEAR_SIGHAND
-            | CloneFlags::INTO_CGROUP
-            | CloneFlags::NEWTIME;
-        if flags.intersects(unsupported_clone_flags) {
-            unimplemented!("Clone with unsupported flags: {:?}", flags);
+        if !flags.contains(required_clone_flags) {
+            log_unsupported!(
+                "clone with missing required flags: {:?}",
+                required_clone_flags & !flags
+            );
+            return Err(Errno::EINVAL);
         }
 
+        if cgroup != 0 {
+            log_unsupported!("clone with cgroup");
+            return Err(Errno::EINVAL);
+        }
+
+        if set_tid != 0 || set_tid_size != 0 {
+            log_unsupported!("clone with set_tid");
+            return Err(Errno::EINVAL);
+        }
+
+        // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
+        if exit_signal > MAX_SIGNAL_NUMBER {
+            return Err(Errno::EINVAL);
+        }
+
+        let tls = if flags.contains(CloneFlags::SETTLS) {
+            let addr = tls.truncate();
+            #[cfg(target_arch = "x86_64")]
+            let desc = MutPtr::from_usize(addr);
+            #[cfg(target_arch = "x86")]
+            let desc = {
+                let desc = unsafe {
+                    MutPtr::<litebox_common_linux::UserDesc>::from_usize(addr).read_at_offset(0)
+                }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+                // Note that different from `set_thread_area` syscall that returns the allocated entry number
+                // when requested (i.e., `desc.entry_number` is -1), here we just read the descriptor to LiteBox and
+                // assume the entry number is properly set so that we don't need to write it back. This is because
+                // we set up the TLS descriptor in the new thread's context, at which point the original descriptor
+                // pointer might no longer be valid. Linux does not have this problem because it sets up the TLS for
+                // the child thread in the parent thread before `clone` returns.
+                // In practice, glibc always sets the entry number to a valid value when calling `clone` with TLS as
+                // all threads can share the same TLS entry as the main thread.
+                let idx = desc.entry_number;
+                if idx == u32::MAX {
+                    return Err(Errno::EINVAL);
+                }
+                desc
+            };
+            Some(desc)
+        } else {
+            None
+        };
+
+        let child_tid = if child_tid == 0 {
+            None
+        } else {
+            Some(MutPtr::from_usize(child_tid.truncate()))
+        };
         let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) {
             child_tid
         } else {
@@ -423,11 +505,12 @@ impl Task {
         } else {
             None
         };
-        let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) {
-            parent_tid
+        let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) && parent_tid != 0 {
+            Some(MutPtr::from_usize(parent_tid.truncate()))
         } else {
             None
         };
+
         let fs = if flags.contains(CloneFlags::FS) {
             self.fs.borrow().clone()
         } else {
@@ -439,7 +522,15 @@ impl Task {
             let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid) };
         }
 
-        let stack = stack.expect("Stack must be provided when creating a new thread");
+        if (stack == 0 && stack_size != 0) || (stack != 0 && clone3 && stack_size == 0) {
+            return Err(Errno::EINVAL);
+        }
+        let sp = if stack != 0 {
+            let stack: usize = stack.truncate();
+            Some(stack.wrapping_add(stack_size.truncate()))
+        } else {
+            None
+        };
 
         let mut ctx_copy = *ctx;
 
@@ -447,14 +538,16 @@ impl Task {
         // return value of 0.
         #[cfg(target_arch = "x86_64")]
         {
-            ctx_copy.rip = main;
-            ctx_copy.rsp = stack.as_usize() + stack_size;
+            if let Some(sp) = sp {
+                ctx_copy.rsp = sp;
+            }
             ctx_copy.rax = 0;
         }
         #[cfg(target_arch = "x86")]
         {
-            ctx_copy.eip = main;
-            ctx_copy.esp = stack.as_usize() + stack_size;
+            if let Some(sp) = sp {
+                ctx_copy.esp = sp;
+            }
             ctx_copy.eax = 0;
         }
 
@@ -482,6 +575,8 @@ impl Task {
                         fs: fs.into(),
                         process: self.process.clone(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
+                        pending_sigreturn: false.into(),
+                        is_exiting: false.into(),
                     },
                 }),
             )
@@ -737,6 +832,36 @@ impl Task {
         Ok(duration)
     }
 
+    /// Convert an absolute time, specified as a duration since the epoch of the
+    /// given clock, to a `Platform::Instant` suitable for use as a deadline.
+    ///
+    /// If the time is so far in the future that it cannot be represented as an
+    /// `Instant`, returns `Ok(None)`. If the time occurs in the past, returns
+    /// the current time.
+    fn duration_since_epoch_to_deadline(
+        &self,
+        clock_id: litebox_common_linux::ClockId,
+        duration: Duration,
+    ) -> Result<Option<<Platform as TimeProvider>::Instant>, Errno> {
+        match clock_id {
+            litebox_common_linux::ClockId::Monotonic
+            | litebox_common_linux::ClockId::MonotonicCoarse => {
+                // No need to compute the current time since the offset from the
+                // request to `Instant` is known.
+                Ok(crate::boot_time().checked_add(duration))
+            }
+            _ => {
+                // Convert between time domains. If the requested time is in the past,
+                // return the current time.
+                let platform = litebox_platform_multiplex::platform();
+                let current_time = self.gettime_as_duration(platform, clock_id)?;
+                Ok(platform
+                    .now()
+                    .checked_add(duration.checked_sub(current_time).unwrap_or(Duration::ZERO)))
+            }
+        }
+    }
+
     /// Handle syscall `clock_getres`.
     pub(crate) fn sys_clock_getres(
         &self,
@@ -774,19 +899,10 @@ impl Task {
         }
         let is_abs = flags.contains(litebox_common_linux::TimerFlags::ABSTIME);
 
-        let platform = litebox_platform_multiplex::platform();
-
         // Set up a wait context with the right deadline/timeout.
         let wait_cx = self.wait_cx();
         let wait_cx = if is_abs {
-            if matches!(clockid, litebox_common_linux::ClockId::Monotonic) {
-                // No need to compute the current time since the offset from the
-                // request to `Instant` is known.
-                wait_cx.with_deadline(crate::boot_time().checked_add(request))
-            } else {
-                wait_cx
-                    .with_timeout(request.checked_sub(self.gettime_as_duration(platform, clockid)?))
-            }
+            wait_cx.with_deadline(self.duration_since_epoch_to_deadline(clockid, request)?)
         } else {
             // Relative. Treat all clocks the same. TODO: handle the different clocks differently.
             wait_cx.with_timeout(request)
@@ -932,7 +1048,7 @@ impl Task {
                 warn_shared_futex!(flags);
                 let futex_manager = crate::litebox_futex_manager();
                 let timeout = timeout.read()?;
-                futex_manager.wait(addr, val, timeout, None)?;
+                futex_manager.wait(&self.wait_cx().with_timeout(timeout), addr, val, None)?;
                 0
             }
             litebox_common_linux::FutexArgs::WaitBitset {
@@ -943,21 +1059,24 @@ impl Task {
                 bitmask,
             } => {
                 warn_shared_futex!(flags);
-                let timeout = timeout.read()?.map(|ts| {
-                    let now = self
-                        .gettime_as_duration(
-                            litebox_platform_multiplex::platform(),
-                            if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
-                                litebox_common_linux::ClockId::RealTime
-                            } else {
-                                litebox_common_linux::ClockId::Monotonic
-                            },
-                        )
-                        .expect("failed to get current time");
-                    ts.saturating_sub(now)
-                });
                 let futex_manager = crate::litebox_futex_manager();
-                futex_manager.wait(addr, val, timeout, core::num::NonZeroU32::new(bitmask))?;
+                let deadline = if let Some(timeout) = timeout.read()? {
+                    let clock_id =
+                        if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
+                            litebox_common_linux::ClockId::RealTime
+                        } else {
+                            litebox_common_linux::ClockId::Monotonic
+                        };
+                    self.duration_since_epoch_to_deadline(clock_id, timeout)?
+                } else {
+                    None
+                };
+                futex_manager.wait(
+                    &self.wait_cx().with_deadline(deadline),
+                    addr,
+                    val,
+                    core::num::NonZeroU32::new(bitmask),
+                )?;
                 0
             }
             _ => unimplemented!("Unsupported futex operation"),
@@ -977,7 +1096,7 @@ impl Task {
         argv: crate::ConstPtr<crate::ConstPtr<i8>>,
         envp: crate::ConstPtr<crate::ConstPtr<i8>>,
         ctx: &mut litebox_common_linux::PtRegs,
-    ) -> Result<(), Errno> {
+    ) -> Result<usize, Errno> {
         fn copy_vector(
             mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
             _which: &str,
@@ -1062,7 +1181,7 @@ impl Task {
             .load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
 
-        Ok(())
+        Ok(0)
     }
 
     /// Handle syscall `alarm`.

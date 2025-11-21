@@ -29,10 +29,11 @@ use litebox::{
     platform::{
         PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutPointer as _,
     },
+    shim::ContinueOperation,
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
-use litebox_common_linux::{ContinueOperation, SyscallRequest, errno::Errno};
+use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
@@ -82,49 +83,60 @@ pub struct LinuxShimEntrypoints;
 
 impl litebox::shim::EnterShim for LinuxShimEntrypoints {
     type ExecutionContext = litebox_common_linux::PtRegs;
-    type ContinueOperation = ContinueOperation;
 
-    fn init(&self, _ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
+    fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         ContinueOperation::ResumeGuest
     }
 
-    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
-        let r = with_current_task(|task| task.handle_syscall_request(ctx));
-        match r {
-            ContinueOperation::ResumeGuest => {}
-            ContinueOperation::ExitThread(_) | ContinueOperation::ExitProcess(_) => {
-                SHIM_TLS.deinit();
-            }
-            // TEMP: this must be done outside of with_current_task to avoid leaking a borrow.
-            // Remove this once rt_sigreturn is handled natively by the shim.
-            ContinueOperation::RtSigreturn(stack) => {
-                let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigreturn { stack };
-                let token = litebox_platform_multiplex::platform()
-                    .get_punchthrough_token_for(punchthrough)
-                    .expect("Failed to get punchthrough token for RT_SIGRETURN");
-                token
-                    .execute()
-                    .map(|_| ())
-                    .map_err(|e| match e {
-                        litebox::platform::PunchthroughError::Failure(errno) => errno,
-                        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-                    })
-                    .expect("rt_sigreturn failed");
-                unreachable!("rt_sigreturn should not return");
-            }
-        }
-        r
+    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        enter_shim(ctx, Task::handle_syscall_request)
     }
 
     fn exception(
         &self,
         _ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
-    ) -> Self::ContinueOperation {
+    ) -> ContinueOperation {
         panic!("Unhandled exception: {info:#x?}");
     }
 
-    fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
+    fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        ContinueOperation::ResumeGuest
+    }
+}
+
+fn enter_shim(
+    ctx: &mut litebox_common_linux::PtRegs,
+    f: impl FnOnce(&Task, &mut litebox_common_linux::PtRegs),
+) -> ContinueOperation {
+    let (exit_thread, pending_sigreturn) = with_current_task(|task| {
+        f(task, ctx);
+        (task.is_exiting.get(), task.pending_sigreturn.take())
+    });
+    if exit_thread {
+        crate::SHIM_TLS.deinit();
+        ContinueOperation::ExitThread
+    } else if pending_sigreturn {
+        // TEMP: this must be done outside of with_current_task to avoid leaking a borrow.
+        // Remove this once rt_sigreturn is handled natively by the shim.
+        #[cfg(target_arch = "x86_64")]
+        let stack = ctx.rsp;
+        #[cfg(target_arch = "x86")]
+        let stack = ctx.esp;
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigreturn { stack };
+        let token = litebox_platform_multiplex::platform()
+            .get_punchthrough_token_for(punchthrough)
+            .expect("Failed to get punchthrough token for RT_SIGRETURN");
+        token
+            .execute()
+            .map(|_| ())
+            .map_err(|e| match e {
+                litebox::platform::PunchthroughError::Failure(errno) => errno,
+                _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+            })
+            .expect("rt_sigreturn failed");
+        unreachable!("rt_sigreturn should not return");
+    } else {
         ContinueOperation::ResumeGuest
     }
 }
@@ -224,7 +236,6 @@ impl LinuxShim {
         let litebox_common_linux::TaskParams {
             pid,
             ppid,
-            tid,
             uid,
             euid,
             gid,
@@ -234,29 +245,6 @@ impl LinuxShim {
         let files = Arc::new(syscalls::file::FilesState::new(litebox));
         files.initialize_stdio_in_shared_descriptors_table(&global.fs);
 
-        let task = Task {
-            global,
-            wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
-            pid,
-            ppid,
-            tid,
-            clear_child_tid: None.into(),
-            robust_list: None.into(),
-            credentials: syscalls::process::Credentials {
-                uid,
-                euid,
-                gid,
-                egid,
-            }
-            .into(),
-            comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
-            fs: Arc::new(syscalls::file::FsState::new()).into(),
-            files: files.into(),
-            process: syscalls::process::Process::new().into(),
-        };
-
-        let regs = task.load_program(loader::elf::ElfLoader::new(&task, path)?, argv, envp)?;
-
         // TODO: ensure this gets torn down even if the thread never runs sys_exit.
         // Consider a scoped execution model, e.g.
         // ```
@@ -264,8 +252,38 @@ impl LinuxShim {
         //     ...
         // })
         // ```
-        SHIM_TLS.init(LinuxShimTls { current_task: task });
-        Ok(regs)
+        SHIM_TLS.init(LinuxShimTls {
+            current_task: Task {
+                global,
+                wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
+                pid,
+                ppid,
+                tid: pid,
+                clear_child_tid: None.into(),
+                robust_list: None.into(),
+                credentials: syscalls::process::Credentials {
+                    uid,
+                    euid,
+                    gid,
+                    egid,
+                }
+                .into(),
+                comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
+                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                files: files.into(),
+                process: syscalls::process::Process::new().into(),
+                pending_sigreturn: false.into(),
+                is_exiting: false.into(),
+            },
+        });
+
+        let r = with_current_task(|task| {
+            task.load_program(loader::elf::ElfLoader::new(task, path)?, argv, envp)
+        });
+        if r.is_err() {
+            SHIM_TLS.deinit();
+        }
+        r
     }
 }
 
@@ -591,51 +609,43 @@ impl Task {
     /// # Panics
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-    fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
-        fn set_return(ctx: &mut litebox_common_linux::PtRegs, value: usize) {
-            #[cfg(target_arch = "x86")]
-            {
-                ctx.eax = value;
-            }
-            #[cfg(target_arch = "x86_64")]
-            {
-                ctx.rax = value;
-            }
+    fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let return_value = match self.do_syscall(ctx) {
+            Ok(v) => v,
+            Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
+        };
+        #[cfg(target_arch = "x86")]
+        {
+            ctx.eax = return_value;
         }
+        #[cfg(target_arch = "x86_64")]
+        {
+            ctx.rax = return_value;
+        }
+    }
 
+    fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
         #[cfg(target_arch = "x86")]
         let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
-        let request = match SyscallRequest::<Platform>::try_from_raw(
-            syscall_number,
-            ctx,
-            log_unsupported_fmt,
-        ) {
-            Ok(request) => request,
-            Err(err) => {
-                set_return(ctx, (err.as_neg() as isize).reinterpret_as_unsigned());
-                return ContinueOperation::ResumeGuest;
-            }
-        };
+        let request =
+            SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
-        let res: Result<usize, Errno> = match request {
+        match request {
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
-                return ContinueOperation::ExitThread(status);
+                Ok(0)
             }
             SyscallRequest::ExitGroup { status } => {
                 self.sys_exit_group(status);
-                return ContinueOperation::ExitProcess(status);
+                Ok(0)
             }
             SyscallRequest::Execve {
                 pathname,
                 argv,
                 envp,
-            } => match self.sys_execve(pathname, argv, envp, ctx) {
-                Ok(()) => return ContinueOperation::ResumeGuest,
-                Err(err) => Err(err),
-            },
+            } => self.sys_execve(pathname, argv, envp, ctx),
             SyscallRequest::Read { fd, buf, count } => {
                 // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
                 // requested indicates EOF.
@@ -719,7 +729,10 @@ impl Task {
                     Err(Errno::EINVAL)
                 }
             }
-            SyscallRequest::RtSigreturn { stack } => return ContinueOperation::RtSigreturn(stack),
+            SyscallRequest::RtSigreturn => {
+                self.pending_sigreturn.set(true);
+                Ok(0)
+            }
             SyscallRequest::Ioctl { fd, arg } => self.sys_ioctl(fd, arg).map(|v| v as usize),
             SyscallRequest::Pread64 {
                 fd,
@@ -1078,14 +1091,8 @@ impl Task {
                     Ok(0)
                 })
             }
-            SyscallRequest::Clone { args } => self.handle_clone_request(&args, ctx),
-            SyscallRequest::Clone3 { args } => {
-                if let Some(clone_args) = unsafe { args.read_at_offset(0) } {
-                    self.handle_clone_request(&clone_args, ctx)
-                } else {
-                    Err(Errno::EFAULT)
-                }
-            }
+            SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
+            SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
             SyscallRequest::SetThreadArea { user_desc } => {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -1207,98 +1214,7 @@ impl Task {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)
             }
-        };
-
-        set_return(
-            ctx,
-            res.unwrap_or_else(|e| (e.as_neg() as isize).reinterpret_as_unsigned()),
-        );
-        ContinueOperation::ResumeGuest
-    }
-}
-
-const MAX_SIGNAL_NUMBER: u64 = 64;
-
-impl Task {
-    fn handle_clone_request(
-        &self,
-        clone_args: &litebox_common_linux::CloneArgs,
-        ctx: &litebox_common_linux::PtRegs,
-    ) -> Result<usize, Errno> {
-        if clone_args.cgroup != 0 {
-            log_unsupported!("clone with cgroup");
-            return Err(Errno::EINVAL);
         }
-        if clone_args.set_tid != 0 {
-            log_unsupported!("clone with set_tid");
-            return Err(Errno::EINVAL);
-        }
-        // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
-        if clone_args.exit_signal > MAX_SIGNAL_NUMBER {
-            return Err(Errno::EINVAL);
-        }
-        let parent_tid = if clone_args.parent_tid == 0 {
-            None
-        } else {
-            Some(MutPtr::from_usize(
-                usize::try_from(clone_args.parent_tid).unwrap(),
-            ))
-        };
-        let stack = if clone_args.stack == 0 {
-            None
-        } else {
-            Some(MutPtr::from_usize(
-                usize::try_from(clone_args.stack).unwrap(),
-            ))
-        };
-        let child_tid = if clone_args.child_tid == 0 {
-            None
-        } else {
-            Some(MutPtr::from_usize(
-                usize::try_from(clone_args.child_tid).unwrap(),
-            ))
-        };
-        let tls = if clone_args.tls != 0 {
-            let addr = usize::try_from(clone_args.tls).unwrap();
-            #[cfg(target_arch = "x86_64")]
-            let desc = MutPtr::from_usize(addr);
-            #[cfg(target_arch = "x86")]
-            let desc = {
-                let desc = unsafe {
-                    MutPtr::<litebox_common_linux::UserDesc>::from_usize(addr).read_at_offset(0)
-                }
-                .ok_or(Errno::EFAULT)?
-                .into_owned();
-                // Note that different from `set_thread_area` syscall that returns the allocated entry number
-                // when requested (i.e., `desc.entry_number` is -1), here we just read the descriptor to LiteBox and
-                // assume the entry number is properly set so that we don't need to write it back. This is because
-                // we set up the TLS descriptor in the new thread's context, at which point the original descriptor
-                // pointer might no longer be valid. Linux does not have this problem because it sets up the TLS for
-                // the child thread in the parent thread before `clone` returns.
-                // In practice, glibc always sets the entry number to a valid value when calling `clone` with TLS as
-                // all threads can share the same TLS entry as the main thread.
-                let idx = desc.entry_number;
-                debug_assert_ne!(idx, u32::MAX);
-                desc
-            };
-            Some(desc)
-        } else {
-            None
-        };
-        usize::try_from(clone_args.stack_size)
-            .map_err(|_| Errno::EINVAL)
-            .and_then(|stack_size| {
-                self.sys_clone(
-                    clone_args.flags,
-                    parent_tid,
-                    stack,
-                    stack_size,
-                    child_tid,
-                    tls,
-                    ctx,
-                    ctx.get_ip(),
-                )
-            })
     }
 }
 
@@ -1342,6 +1258,11 @@ struct Task {
     fs: RefCell<Arc<syscalls::file::FsState>>,
     /// File descriptors. `RefCell` to support `unshare` in the future.
     files: RefCell<Arc<syscalls::file::FilesState>>,
+    /// If true, call the sigreturn punchthrough instead of returning to user mode.
+    /// TODO: remove once signals are handled internally in the shim.
+    pending_sigreturn: Cell<bool>,
+    /// If true, exit the thread instead of returning to user mode.
+    is_exiting: Cell<bool>,
 }
 
 impl Drop for Task {
@@ -1468,6 +1389,8 @@ mod test_utils {
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
+                pending_sigreturn: false.into(),
+                is_exiting: false.into(),
             }
         }
     }
@@ -1497,6 +1420,8 @@ mod test_utils {
                 comm,
                 fs,
                 files,
+                pending_sigreturn: false.into(),
+                is_exiting: false.into(),
             }
         }
 

@@ -13,6 +13,7 @@ use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer};
+use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
@@ -20,23 +21,9 @@ mod syscall_intercept;
 
 extern crate alloc;
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "linux_syscall")] {
-        use litebox_common_linux::ContinueOperation;
-        pub type SyscallReturnType = litebox_common_linux::ContinueOperation;
-    } else if #[cfg(feature = "optee_syscall")] {
-        use litebox_common_optee::ContinueOperation;
-        pub type SyscallReturnType = litebox_common_optee::ContinueOperation;
-    } else {
-        compile_error!(r##"No syscall handler specified."##);
-    }
-}
 /// The syscall handler passed down from the shim.
 static SHIM: std::sync::OnceLock<
-    &'static dyn litebox::shim::EnterShim<
-        ExecutionContext = litebox_common_linux::PtRegs,
-        ContinueOperation = ContinueOperation,
-    >,
+    &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 > = const { std::sync::OnceLock::new() };
 
 /// The userland Linux platform.
@@ -185,10 +172,7 @@ impl LinuxUserland {
     /// Panics if the function has already been invoked earlier.
     pub fn register_shim(
         &self,
-        shim: &'static dyn litebox::shim::EnterShim<
-            ExecutionContext = litebox_common_linux::PtRegs,
-            ContinueOperation = ContinueOperation,
-        >,
+        shim: &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ) {
         SHIM.set(shim)
             .ok()
@@ -292,7 +276,6 @@ impl LinuxUserland {
             .unwrap();
         litebox_common_linux::TaskParams {
             pid: tid,
-            tid,
             ppid,
             uid: unsafe { syscalls::raw::syscall0(syscalls::Sysno::getuid) }
                 .try_into()
@@ -1674,10 +1657,7 @@ extern "C-unwind" fn interrupt_handler(ctx: &mut litebox_common_linux::PtRegs) {
 fn call_shim(
     ctx: &mut litebox_common_linux::PtRegs,
     f: impl FnOnce(
-        &dyn litebox::shim::EnterShim<
-            ContinueOperation = ContinueOperation,
-            ExecutionContext = litebox_common_linux::PtRegs,
-        >,
+        &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
         &mut litebox_common_linux::PtRegs,
     ) -> ContinueOperation,
 ) {
@@ -1703,24 +1683,7 @@ fn call_shim(
     let op = f(shim, ctx);
     match op {
         ContinueOperation::ResumeGuest => unsafe { switch_to_guest(ctx) },
-        ContinueOperation::ExitThread(status) | ContinueOperation::ExitProcess(status) => {
-            #[cfg(target_arch = "x86_64")]
-            {
-                cfg_if::cfg_if! {
-                    if #[cfg(feature = "linux_syscall")] {
-                        ctx.rax = status.reinterpret_as_unsigned() as usize;
-                    } else if #[cfg(feature = "optee_syscall")] {
-                        ctx.rax = status;
-                    }
-                }
-            }
-            #[cfg(target_arch = "x86")]
-            {
-                ctx.eax = status.reinterpret_as_unsigned() as usize;
-            }
-        }
-        #[cfg(feature = "linux_syscall")]
-        ContinueOperation::RtSigreturn(..) => unreachable!(),
+        ContinueOperation::ExitThread => {}
     }
 }
 

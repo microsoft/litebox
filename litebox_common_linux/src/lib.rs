@@ -1224,8 +1224,6 @@ pub struct TaskParams {
     pub pid: i32,
     /// Parent Process ID
     pub ppid: i32,
-    /// Thread ID
-    pub tid: i32,
     /// The initial uid.
     pub uid: u32,
     /// The initial effective uid.
@@ -1916,9 +1914,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         oldact: Option<Platform::RawMutPointer<SigAction>>,
         sigsetsize: usize,
     },
-    RtSigreturn {
-        stack: usize,
-    },
+    RtSigreturn,
     Ioctl {
         fd: i32,
         arg: IoctlArg<Platform>,
@@ -2247,13 +2243,6 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
 }
 
-pub enum ContinueOperation {
-    ResumeGuest,
-    ExitThread(i32),
-    ExitProcess(i32),
-    RtSigreturn(usize), // TEMP: remove once this is handled natively by the shim
-}
-
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
     /// Take the raw syscall number and arguments, and provide a stronger-typed `SyscallRequest`.
     ///
@@ -2389,10 +2378,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     return Err(errno::Errno::EINVAL);
                 }
             }
-            #[cfg(target_arch = "x86_64")]
-            Sysno::rt_sigreturn => SyscallRequest::RtSigreturn { stack: ctx.rsp },
-            #[cfg(target_arch = "x86")]
-            Sysno::rt_sigreturn => SyscallRequest::RtSigreturn { stack: ctx.esp },
+            Sysno::rt_sigreturn => SyscallRequest::RtSigreturn,
             Sysno::ioctl => SyscallRequest::Ioctl {
                 fd: ctx.sys_req_arg(0),
                 arg: {

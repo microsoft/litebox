@@ -18,12 +18,13 @@ use litebox::{
     LiteBox,
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
+    shim::ContinueOperation,
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_optee::{
-    ContinueOperation, SyscallRequest, TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType,
-    TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeObjHandle, TeeObjectInfo, TeeObjectType,
-    TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
+    SyscallRequest, TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType, TeeCrypStateHandle,
+    TeeHandleFlag, TeeIdentity, TeeObjHandle, TeeObjectInfo, TeeObjectType, TeeOperationMode,
+    TeeResult, TeeUuid, UteeAttribute,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -86,13 +87,12 @@ pub struct OpteeShim;
 
 impl litebox::shim::EnterShim for OpteeShim {
     type ExecutionContext = litebox_common_linux::PtRegs;
-    type ContinueOperation = ContinueOperation;
 
-    fn init(&self, _ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
+    fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         ContinueOperation::ResumeGuest
     }
 
-    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
+    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         handle_syscall_request(ctx)
     }
 
@@ -100,11 +100,11 @@ impl litebox::shim::EnterShim for OpteeShim {
         &self,
         _ctx: &mut Self::ExecutionContext,
         _info: &litebox::shim::ExceptionInfo,
-    ) -> Self::ContinueOperation {
+    ) -> ContinueOperation {
         todo!("terminate the optee process on exception")
     }
 
-    fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> Self::ContinueOperation {
+    fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         ContinueOperation::ResumeGuest
     }
 }
@@ -125,9 +125,11 @@ fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOpe
     };
 
     if let SyscallRequest::Return { ret } = request {
-        return ContinueOperation::ExitThread(syscalls::tee::sys_return(ret));
+        ctx.rax = syscalls::tee::sys_return(ret);
+        return ContinueOperation::ExitThread;
     } else if let SyscallRequest::Panic { code } = request {
-        return ContinueOperation::ExitThread(syscalls::tee::sys_panic(code));
+        ctx.rax = syscalls::tee::sys_panic(code);
+        return ContinueOperation::ExitThread;
     }
     let res: Result<(), TeeResult> = match request {
         SyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
@@ -285,11 +287,18 @@ fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOpe
             syscalls::cryp::sys_cryp_obj_copy(dst_obj, src_obj)
         }
         SyscallRequest::CrypRandomNumberGenerate { buf, blen } => {
-            let mut kernel_buf = vec![0u8; blen.min(MAX_KERNEL_BUF_SIZE)];
-            syscalls::cryp::sys_cryp_random_number_generate(&mut kernel_buf).and_then(|()| {
-                buf.copy_from_slice(0, &kernel_buf)
-                    .ok_or(TeeResult::ShortBuffer)
-            })
+            // This could take a long time for large sizes. But OP-TEE OS limits
+            // the maximum size of random data generation to 4096 bytes, so
+            // let's do the same rather than something more complicated.
+            if blen > 4096 {
+                Err(TeeResult::OutOfMemory)
+            } else {
+                let mut kernel_buf = vec![0u8; blen];
+                syscalls::cryp::sys_cryp_random_number_generate(&mut kernel_buf).and_then(|()| {
+                    buf.copy_from_slice(0, &kernel_buf)
+                        .ok_or(TeeResult::AccessDenied)
+                })
+            }
         }
         _ => todo!(),
     };

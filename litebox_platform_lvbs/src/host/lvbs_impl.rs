@@ -58,7 +58,6 @@ impl LvbsLinuxKernel {
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
         litebox_common_linux::TaskParams {
             pid: 1,
-            tid: 1,
             ppid: 1,
             uid: 1000,
             gid: 1000,
@@ -77,6 +76,20 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
         let tls = with_per_cpu_variables_mut(|pcv| pcv.tls);
         core::mem::replace(&mut tls.as_mut_ptr::<()>(), value.cast()).cast()
+    }
+}
+
+impl litebox::platform::CrngProvider for LvbsLinuxKernel {
+    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+        // FIXME: generate real random data.
+        static RANDOM: spin::mutex::SpinMutex<litebox::utils::rng::FastRng> =
+            spin::mutex::SpinMutex::new(litebox::utils::rng::FastRng::new_from_seed(
+                core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
+            ));
+        let mut random = RANDOM.lock();
+        for b in buf.chunks_mut(8) {
+            b.copy_from_slice(&random.next_u64().to_ne_bytes()[..b.len()]);
+        }
     }
 }
 
