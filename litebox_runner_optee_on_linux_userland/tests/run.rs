@@ -8,6 +8,7 @@ fn run(name: &str) {
 
     let mut command = std::process::Command::new(&binary_path);
     command.args([
+        &format!("tests/ldelf.elf.hooked"),
         &format!("tests/{name}.elf.hooked"),
         &format!("tests/{name}-cmds.json"),
     ]);

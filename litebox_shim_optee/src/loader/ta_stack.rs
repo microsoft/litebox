@@ -4,7 +4,7 @@ use litebox::{
     mm::linux::CreatePagesFlags,
     platform::{RawConstPointer, RawMutPointer},
 };
-use litebox_common_optee::{TeeParamType, UteeParamOwned, UteeParams};
+use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 
 use crate::{MutPtr, litebox_page_manager};
 
@@ -92,6 +92,11 @@ impl TaStack {
     /// Get the address of `UteeParams` on the stack.
     pub(crate) fn get_params_address(&self) -> usize {
         self.stack_top.as_usize() + self.len - core::mem::size_of::<UteeParams>()
+    }
+
+    /// Get the address of `LdelfArg` on the stack.
+    pub(crate) fn get_ldelf_arg_address(&self) -> usize {
+        self.stack_top.as_usize() + self.len - core::mem::size_of::<LdelfArg>()
     }
 
     /// Push `bytes` to the stack.
@@ -247,6 +252,19 @@ impl TaStack {
         ])?;
 
         // ensure stack is aligned
+        self.pos = align_down(self.pos, Self::STACK_ALIGNMENT);
+        assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
+        Some(())
+    }
+
+    pub(crate) fn init_with_ldelf_arg(&mut self, ldelf_arg: &LdelfArg) -> Option<()> {
+        self.push_bytes(unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(ldelf_arg).cast::<u8>(),
+                core::mem::size_of::<LdelfArg>(),
+            )
+        })?;
+
         self.pos = align_down(self.pos, Self::STACK_ALIGNMENT);
         assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
         Some(())
