@@ -1,5 +1,6 @@
 #![no_std]
 
+use litebox::platform::common_providers::userspace_pointers::{UserConstPtr, UserMutPtr};
 use ostd::arch::cpu::context::UserContext;
 use ostd::user::UserContextApi;
 
@@ -51,10 +52,8 @@ impl OstdPlatform {
 impl litebox::platform::Provider for OstdPlatform {}
 
 impl litebox::platform::RawPointerProvider for OstdPlatform {
-    type RawConstPointer<T: Clone> =
-        litebox::platform::common_providers::userspace_pointers::UserConstPtr<T>;
-    type RawMutPointer<T: Clone> =
-        litebox::platform::common_providers::userspace_pointers::UserMutPtr<T>;
+    type RawConstPointer<T: Clone> = UserConstPtr<T>;
+    type RawMutPointer<T: Clone> = UserMutPtr<T>;
 }
 
 impl litebox::platform::DebugLogProvider for OstdPlatform {
@@ -79,12 +78,19 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
     > {
         match self.punchthrough {
             #[cfg(target_arch = "x86_64")]
-            litebox_common_linux::PunchthroughSyscall::SetFsBase { addr: _ } => {
-                todo!()
+            litebox_common_linux::PunchthroughSyscall::SetFsBase { addr } => {
+                unsafe { litebox_common_linux::wrfsbase(addr) };
+                Ok(0)
             }
             #[cfg(target_arch = "x86_64")]
-            litebox_common_linux::PunchthroughSyscall::GetFsBase { addr: _ } => {
-                todo!()
+            litebox_common_linux::PunchthroughSyscall::GetFsBase { addr } => {
+                use litebox::platform::RawMutPointer as _;
+                let fs_base = unsafe { litebox_common_linux::rdfsbase() };
+                unsafe { addr.write_at_offset(0, fs_base) }
+                    .map(|()| 0)
+                    .ok_or(litebox::platform::PunchthroughError::Failure(
+                        litebox_common_linux::errno::Errno::EFAULT,
+                    ))
             }
             _ => unimplemented!(),
         }
@@ -324,11 +330,7 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
 
         debug!("[allocate_pages] Success\n");
         use litebox::platform::RawConstPointer;
-        Ok(
-            litebox::platform::common_providers::userspace_pointers::UserMutPtr::from_usize(
-                suggested_range.start,
-            ),
-        )
+        Ok(UserMutPtr::from_usize(suggested_range.start))
     }
 
     unsafe fn deallocate_pages(
