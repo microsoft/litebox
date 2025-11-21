@@ -613,49 +613,12 @@ unsafe fn run_thread_inner(mut pt_regs: litebox_common_linux::PtRegs) {
             ostd::user::ReturnReason::UserException => {
                 let user_context = user_mode.context();
 
-                debug!("\n\n=== UserException Debug Dump ===\n");
+                debug!("\n\n=== UserException ===\n");
                 debug!("Trap Number: {:#x}\n", user_context.trap_number());
                 debug!("Trap Error Code: {:#x}\n", user_context.trap_error_code());
-                debug!(
-                    "Instruction Pointer (RIP): {:#x}\n",
-                    user_context.instruction_pointer()
-                );
-                debug!("Stack Pointer (RSP): {:#x}\n", user_context.stack_pointer());
-
-                debug!("\nCPU Register State:\n");
-                #[cfg(target_arch = "x86_64")]
-                {
-                    debug!(
-                        "  RAX: {:#018x}  RBX: {:#018x}  RCX: {:#018x}  RDX: {:#018x}\n",
-                        user_context.rax(),
-                        user_context.rbx(),
-                        user_context.rcx(),
-                        user_context.rdx()
-                    );
-                    debug!(
-                        "  RSI: {:#018x}  RDI: {:#018x}  RBP: {:#018x}  RSP: {:#018x}\n",
-                        user_context.rsi(),
-                        user_context.rdi(),
-                        user_context.rbp(),
-                        user_context.rsp()
-                    );
-                    debug!(
-                        "  R8:  {:#018x}  R9:  {:#018x}  R10: {:#018x}  R11: {:#018x}\n",
-                        user_context.r8(),
-                        user_context.r9(),
-                        user_context.r10(),
-                        user_context.r11()
-                    );
-                    debug!(
-                        "  R12: {:#018x}  R13: {:#018x}  R14: {:#018x}  R15: {:#018x}\n",
-                        user_context.r12(),
-                        user_context.r13(),
-                        user_context.r14(),
-                        user_context.r15()
-                    );
-                    debug!("  RIP: {:#018x}\n", user_context.rip());
-                }
-                debug!("================================\n\n\n");
+                debug!("RIP: {:#x}\n", user_context.instruction_pointer());
+                debug!("RSP: {:#x}\n", user_context.stack_pointer());
+                debug!("======================\n\n\n");
                 let _ = user_context;
 
                 ostd::console::early_print(format_args!(
