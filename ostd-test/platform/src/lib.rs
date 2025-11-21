@@ -217,34 +217,157 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
 
     fn allocate_pages(
         &self,
-        _suggested_range: core::ops::Range<usize>,
-        _initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        suggested_range: core::ops::Range<usize>,
+        initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         _can_grow_down: bool,
-        _populate_pages_immediately: bool,
+        populate_pages_immediately: bool,
         _fixed_address_behavior: litebox::platform::page_mgmt::FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        todo!()
+        use litebox::platform::page_mgmt::AllocationError;
+        use ostd::mm::{CachePolicy, FrameAllocOptions, PageProperty};
+
+        let current_task = ostd::task::Task::current().ok_or(AllocationError::OutOfMemory)?;
+        let task_data = current_task.data();
+        let vm_space = task_data
+            .downcast_ref::<alloc::sync::Arc<ostd::mm::VmSpace>>()
+            .ok_or(AllocationError::OutOfMemory)?;
+
+        let size = suggested_range.end.saturating_sub(suggested_range.start);
+        if size == 0 {
+            return Err(AllocationError::InvalidRange);
+        }
+        let num_pages = (size + 4095) / 4096;
+
+        let segment = if populate_pages_immediately {
+            FrameAllocOptions::new()
+                .zeroed(true)
+                .alloc_segment(num_pages)
+        } else {
+            FrameAllocOptions::new().alloc_segment(num_pages)
+        }
+        .map_err(|_| AllocationError::OutOfMemory)?;
+
+        let flags = convert_permissions_to_flags(initial_permissions);
+        let page_prop = PageProperty::new_user(flags, CachePolicy::Writeback);
+
+        let guard = ostd::task::disable_preempt();
+        let mut cursor = vm_space
+            .cursor_mut(&guard, &suggested_range)
+            .map_err(|_| AllocationError::OutOfMemory)?;
+
+        for frame in segment.into_iter() {
+            cursor.map(frame.into(), page_prop);
+        }
+
+        cursor
+            .flusher()
+            .issue_tlb_flush(ostd::mm::tlb::TlbFlushOp::for_range(
+                suggested_range.clone(),
+            ));
+
+        use litebox::platform::RawConstPointer;
+        Ok(
+            litebox::platform::common_providers::userspace_pointers::UserMutPtr::from_usize(
+                suggested_range.start,
+            ),
+        )
     }
 
     unsafe fn deallocate_pages(
         &self,
-        _range: core::ops::Range<usize>,
+        range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        todo!()
+        use litebox::platform::page_mgmt::DeallocationError;
+
+        let current_task = ostd::task::Task::current().ok_or(DeallocationError::Unaligned)?;
+        let task_data = current_task.data();
+        let vm_space = task_data
+            .downcast_ref::<alloc::sync::Arc<ostd::mm::VmSpace>>()
+            .ok_or(DeallocationError::Unaligned)?;
+
+        let size = range.end.saturating_sub(range.start);
+        if size == 0 || size % 4096 != 0 {
+            return Err(DeallocationError::Unaligned);
+        }
+        let num_pages = size / 4096;
+
+        let guard = ostd::task::disable_preempt();
+        let mut cursor = vm_space
+            .cursor_mut(&guard, &range)
+            .map_err(|_| DeallocationError::Unaligned)?;
+
+        let unmapped = cursor.unmap(num_pages);
+        if unmapped != num_pages {
+            return Err(DeallocationError::AlreadyUnallocated);
+        }
+
+        cursor
+            .flusher()
+            .issue_tlb_flush(ostd::mm::tlb::TlbFlushOp::for_range(range));
+
+        Ok(())
     }
 
     unsafe fn update_permissions(
         &self,
-        _range: core::ops::Range<usize>,
-        _new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        range: core::ops::Range<usize>,
+        new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
-        todo!()
+        use litebox::platform::page_mgmt::PermissionUpdateError;
+
+        let current_task = ostd::task::Task::current().ok_or(PermissionUpdateError::Unaligned)?;
+        let task_data = current_task.data();
+        let vm_space = task_data
+            .downcast_ref::<alloc::sync::Arc<ostd::mm::VmSpace>>()
+            .ok_or(PermissionUpdateError::Unaligned)?;
+
+        let size = range.end.saturating_sub(range.start);
+        if size == 0 || size % 4096 != 0 {
+            return Err(PermissionUpdateError::Unaligned);
+        }
+        let num_pages = size / 4096;
+
+        let new_flags = convert_permissions_to_flags(new_permissions);
+
+        let guard = ostd::task::disable_preempt();
+        let mut cursor = vm_space
+            .cursor_mut(&guard, &range)
+            .map_err(|_| PermissionUpdateError::Unallocated)?;
+
+        cursor.protect_next(num_pages, |flags, _cache| {
+            *flags = new_flags;
+        });
+
+        cursor
+            .flusher()
+            .issue_tlb_flush(ostd::mm::tlb::TlbFlushOp::for_range(range));
+
+        Ok(())
     }
 
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
-        // TODO
+        // TODO: Query the VmSpace or system for reserved ranges
         core::iter::empty()
     }
+}
+
+fn convert_permissions_to_flags(
+    perms: litebox::platform::page_mgmt::MemoryRegionPermissions,
+) -> ostd::mm::PageFlags {
+    use litebox::platform::page_mgmt::MemoryRegionPermissions;
+    use ostd::mm::PageFlags;
+
+    let mut flags = PageFlags::empty();
+    if perms.contains(MemoryRegionPermissions::READ) {
+        flags |= PageFlags::R;
+    }
+    if perms.contains(MemoryRegionPermissions::WRITE) {
+        flags |= PageFlags::W;
+    }
+    if perms.contains(MemoryRegionPermissions::EXEC) {
+        flags |= PageFlags::X;
+    }
+    flags
 }
 
 impl litebox::platform::SystemInfoProvider for OstdPlatform {
@@ -345,5 +468,6 @@ impl litebox::platform::ThreadProvider for OstdPlatform {
 }
 
 pub struct ThreadHandle {
+    #[expect(dead_code)]
     task: alloc::sync::Arc<ostd::task::Task>,
 }
