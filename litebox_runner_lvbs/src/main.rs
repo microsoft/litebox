@@ -49,14 +49,9 @@ unsafe fn apply_relocations() {
         );
     }
 
-    // Get link-time address (where linker EXPECTED us to be)
-    // SAFETY: This is also position-independent - it's just the address
-    // the linker embedded in the relocation entries themselves
-
-    const EXPECTED_BASE: u64 = 0x0;
-    let expected_base = EXPECTED_BASE;
-
-    let offset = actual_base.wrapping_sub(expected_base);
+    // offset = actual_base - expected_base
+    // The expected base is 0x0, so offset = actual_base
+    let offset = actual_base;
 
     // Early return if already at expected location
     if offset == 0 {
@@ -89,9 +84,10 @@ unsafe fn apply_relocations() {
         if r_type == R_X86_64_RELATIVE {
             // Calculate target address: original offset + load offset
             // SAFETY: Target address is valid after offset adjustment
-            let target = (rela.offset.wrapping_add(offset)) as *mut u64;
+            let target = (offset.wrapping_add(rela.offset)) as *mut u64;
             unsafe {
-                target.write_volatile((rela.addend as u64).wrapping_add(offset));
+                let value = (rela.addend as i64).wrapping_add(offset as i64);
+                target.write_volatile(value as u64);
             }
         }
 
