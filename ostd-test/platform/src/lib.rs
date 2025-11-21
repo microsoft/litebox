@@ -241,9 +241,14 @@ impl litebox::platform::StdioProvider for OstdPlatform {
     fn write_to(
         &self,
         _stream: litebox::platform::StdioOutStream,
-        _buf: &[u8],
+        buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        todo!()
+        debug!("[write] {_stream:?}\n");
+        ostd::console::early_print(format_args!(
+            "{}",
+            alloc::string::String::from_utf8_lossy(buf),
+        ));
+        Ok(buf.len())
     }
     fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
         todo!()
