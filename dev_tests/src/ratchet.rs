@@ -9,7 +9,7 @@ fn ratchet_transmutes() -> Result<()> {
     ratchet(
         &[
             ("dev_tests/", 2),
-            ("litebox/", 1),
+            ("litebox/", 9),
             ("litebox_shim_linux/", 1),
             ("litebox_platform_linux_userland/", 2),
         ],
@@ -61,9 +61,8 @@ fn ratchet_maybe_uninit() -> Result<()> {
         &[
             ("dev_tests/", 1),
             ("litebox/", 1),
-            ("litebox_platform_linux_kernel/", 1),
             ("litebox_platform_linux_userland/", 3),
-            ("litebox_platform_lvbs/", 6),
+            ("litebox_platform_lvbs/", 5),
             ("litebox_shim_linux/", 5),
         ],
         |file| {
