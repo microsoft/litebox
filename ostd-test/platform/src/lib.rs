@@ -377,24 +377,53 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
     unsafe fn update_permissions(
         &self,
         range: core::ops::Range<usize>,
-        _new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         use litebox::platform::page_mgmt::PermissionUpdateError;
 
         debug!(
             "[update_permissions] range={:#x}..{:#x}, perms={:?}\n",
-            range.start, range.end, _new_permissions
+            range.start, range.end, new_permissions
         );
+
+        let vm_space = &self.vm_space;
 
         let size = range.end.saturating_sub(range.start);
         if size == 0 || size % 4096 != 0 {
             debug!("[update_permissions] ERROR: Invalid size {:#x}\n", size);
             return Err(PermissionUpdateError::Unaligned);
         }
-        debug!("[update_permissions] Updating {} pages\n", size / 4096);
+        let num_pages = size / 4096;
+        debug!("[update_permissions] Updating {} pages\n", num_pages);
 
-        // TODO: Actually implement permission updates
-        debug!("[update_permissions] STUB: Not actually updating permissions (TODO)\n");
+        let new_flags = convert_permissions_to_flags(new_permissions);
+
+        let guard = ostd::task::disable_preempt();
+        let mut cursor = vm_space
+            .cursor_mut(&guard, &range)
+            .map_err(|_| PermissionUpdateError::Unaligned)?;
+
+        debug!("[update_permissions] Protecting pages with new flags\n");
+        let mut remaining_size = size;
+        while remaining_size > 0 {
+            match cursor.protect_next(remaining_size, |flags, _cache_policy| {
+                *flags = new_flags;
+            }) {
+                Some(protected_range) => {
+                    let protected_size = protected_range.end - protected_range.start;
+                    remaining_size = remaining_size.saturating_sub(protected_size);
+                }
+                None => {
+                    debug!("[update_permissions] ERROR: No more mapped pages to protect\n");
+                    return Err(PermissionUpdateError::Unallocated);
+                }
+            }
+        }
+
+        debug!("[update_permissions] Flushing TLB\n");
+        cursor
+            .flusher()
+            .issue_tlb_flush(ostd::mm::tlb::TlbFlushOp::for_range(range));
 
         debug!("[update_permissions] Success\n");
         Ok(())
