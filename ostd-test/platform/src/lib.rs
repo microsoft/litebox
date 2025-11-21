@@ -6,7 +6,7 @@ extern crate alloc;
 
 macro_rules! debug {
     ($($arg:tt)*) => {
-        // ostd::console::early_print(format_args!($($arg)*));
+        ostd::console::early_print(format_args!($($arg)*));
     };
 }
 
@@ -528,6 +528,7 @@ pub struct ThreadHandle {
 
 pub fn run_thread(pt_regs: &mut litebox_common_linux::PtRegs) {
     let pt_regs = *pt_regs;
+    debug!("[run_thread] setting up task\n");
     let task = alloc::sync::Arc::new(
         ostd::task::TaskOptions::new(move || {
             unsafe { run_thread_inner(pt_regs) };
@@ -535,10 +536,14 @@ pub fn run_thread(pt_regs: &mut litebox_common_linux::PtRegs) {
         .build()
         .unwrap(),
     );
+    debug!("[run_thread] running task\n");
     task.run();
+    // XXX: Weird that we need this
+    ostd::task::Task::yield_now();
 }
 
 unsafe fn run_thread_inner(mut pt_regs: litebox_common_linux::PtRegs) {
+    debug!("[run_thread] begin\n");
     let pt_regs = &mut pt_regs;
     let mut user_context = UserContext::default();
 
@@ -547,8 +552,10 @@ unsafe fn run_thread_inner(mut pt_regs: litebox_common_linux::PtRegs) {
     let mut user_mode = ostd::user::UserMode::new(user_context);
 
     loop {
+        debug!("[run_thread] switch to user mode\n");
         let return_reason = user_mode.execute(|| false);
 
+        debug!("[run_thread] returned due to {return_reason:?}\n");
         match return_reason {
             ostd::user::ReturnReason::UserSyscall => {
                 let user_context = user_mode.context_mut();
