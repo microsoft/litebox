@@ -10,8 +10,8 @@ extern crate std;
 
 use core::sync::atomic::AtomicU32;
 use std::collections::VecDeque;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 use std::vec::Vec;
 
 use super::*;
@@ -31,6 +31,7 @@ use super::*;
 pub(crate) struct MockPlatform {
     current_time: AtomicU64,
     ip_packets: RwLock<VecDeque<Vec<u8>>>,
+    random: Mutex<crate::utils::rng::FastRng>,
     pub(crate) stdin_queue: RwLock<VecDeque<Vec<u8>>>,
     pub(crate) stdout_queue: RwLock<VecDeque<Vec<u8>>>,
     pub(crate) stderr_queue: RwLock<VecDeque<Vec<u8>>>,
@@ -43,6 +44,9 @@ impl MockPlatform {
         alloc::boxed::Box::leak(alloc::boxed::Box::new(MockPlatform {
             current_time: AtomicU64::new(0),
             ip_packets: RwLock::new(VecDeque::new()),
+            random: Mutex::new(crate::utils::rng::FastRng::new_from_seed(
+                core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
+            )),
             stdin_queue: RwLock::new(VecDeque::new()),
             stdout_queue: RwLock::new(VecDeque::new()),
             stderr_queue: RwLock::new(VecDeque::new()),
@@ -307,6 +311,19 @@ impl StdioProvider for MockPlatform {
 
     fn is_a_tty(&self, _stream: StdioStream) -> bool {
         false
+    }
+}
+
+impl CrngProvider for MockPlatform {
+    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+        let mut random = self.random.lock().unwrap();
+        let mut off = 0;
+        while off < buf.len() {
+            let bytes = random.next_u64();
+            let max = core::cmp::min(buf.len() - off, 8);
+            buf[off..off + max].copy_from_slice(&bytes.to_ne_bytes()[..max]);
+            off += max;
+        }
     }
 }
 
