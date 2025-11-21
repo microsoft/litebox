@@ -2,13 +2,12 @@
 
 use litebox::platform::common_providers::userspace_pointers::{UserConstPtr, UserMutPtr};
 use ostd::arch::cpu::context::UserContext;
-use ostd::user::UserContextApi;
 
 extern crate alloc;
 
 macro_rules! debug {
     ($($arg:tt)*) => {
-        ostd::console::early_print(format_args!($($arg)*));
+        // ostd::console::early_print(format_args!($($arg)*));
     };
 }
 
@@ -400,8 +399,7 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
             debug!("[update_permissions] ERROR: Invalid size {:#x}\n", size);
             return Err(PermissionUpdateError::Unaligned);
         }
-        let num_pages = size / 4096;
-        debug!("[update_permissions] Updating {} pages\n", num_pages);
+        debug!("[update_permissions] Updating {} pages\n", size / 4096);
 
         let new_flags = convert_permissions_to_flags(new_permissions);
 
@@ -623,7 +621,9 @@ unsafe fn run_thread_inner(mut pt_regs: litebox_common_linux::PtRegs) {
                     }
                     litebox::shim::ContinueOperation::ExitThread => {
                         ostd::console::early_print(format_args!("Program exited\n"));
-                        break;
+                        // XXX: Actually return from `run_thread` instead
+                        ostd::arch::qemu::exit_qemu(ostd::arch::qemu::QemuExitCode::Success);
+                        // break;
                     }
                 }
             }
@@ -672,8 +672,8 @@ unsafe fn run_thread_inner(mut pt_regs: litebox_common_linux::PtRegs) {
                     );
                     debug!("  RIP: {:#018x}\n", user_context.rip());
                 }
-
                 debug!("================================\n\n\n");
+                let _ = user_context;
 
                 ostd::console::early_print(format_args!(
                     "TODO: Unhandled user exception: {:?}\n",
