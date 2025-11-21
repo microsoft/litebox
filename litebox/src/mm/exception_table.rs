@@ -15,7 +15,7 @@
 
 use crate::utils::TruncateExt as _;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "none"))]
 macro_rules! ex_table_section {
     () => {
         // a = allocate, R = retain: don't discard on linking.
@@ -206,11 +206,10 @@ struct ExceptionTableEntry {
 
 /// Returns the exception table, found by linker-defined symbols marking the
 /// start and end of the section.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "none"))]
 fn exception_table() -> &'static [ExceptionTableEntry] {
     // SAFETY: the linker automatically defines these symbols when the section
     // is non-empty.
-    #[cfg(target_os = "linux")]
     unsafe extern "C" {
         #[link_name = "__start_ex_table"]
         static START_EX_TABLE: [ExceptionTableEntry; 0];
