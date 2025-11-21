@@ -4,7 +4,7 @@ extern crate alloc;
 
 macro_rules! debug {
     ($($arg:tt)*) => {
-        ostd::console::early_print(format_args!($($arg)*));
+        // ostd::console::early_print(format_args!($($arg)*));
     };
 }
 
@@ -263,10 +263,10 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
         } else {
             FrameAllocOptions::new().alloc_segment(num_pages)
         }
-        .map_err(|e| {
+        .map_err(|_e| {
             debug!(
                 "[allocate_pages] ERROR: Failed to allocate segment: {:?}\n",
-                e
+                _e
             );
             AllocationError::OutOfMemory
         })?;
@@ -277,10 +277,15 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
 
         debug!("[allocate_pages] Creating cursor\n");
         let guard = ostd::task::disable_preempt();
-        let mut cursor = vm_space.cursor_mut(&guard, &suggested_range).map_err(|e| {
-            debug!("[allocate_pages] ERROR: Failed to create cursor: {:?}\n", e);
-            AllocationError::OutOfMemory
-        })?;
+        let mut cursor = vm_space
+            .cursor_mut(&guard, &suggested_range)
+            .map_err(|_e| {
+                debug!(
+                    "[allocate_pages] ERROR: Failed to create cursor: {:?}\n",
+                    _e
+                );
+                AllocationError::OutOfMemory
+            })?;
         debug!("[allocate_pages] Mapping frames\n");
 
         for frame in segment.into_iter() {
@@ -350,13 +355,13 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
     unsafe fn update_permissions(
         &self,
         range: core::ops::Range<usize>,
-        new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        _new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         use litebox::platform::page_mgmt::PermissionUpdateError;
 
         debug!(
             "[update_permissions] range={:#x}..{:#x}, perms={:?}\n",
-            range.start, range.end, new_permissions
+            range.start, range.end, _new_permissions
         );
 
         let size = range.end.saturating_sub(range.start);
@@ -364,8 +369,7 @@ impl litebox::platform::PageManagementProvider<4096> for OstdPlatform {
             debug!("[update_permissions] ERROR: Invalid size {:#x}\n", size);
             return Err(PermissionUpdateError::Unaligned);
         }
-        let num_pages = size / 4096;
-        debug!("[update_permissions] Updating {} pages\n", num_pages);
+        debug!("[update_permissions] Updating {} pages\n", size / 4096);
 
         // TODO: Actually implement permission updates
         debug!("[update_permissions] STUB: Not actually updating permissions (TODO)\n");
