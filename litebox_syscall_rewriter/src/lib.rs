@@ -35,6 +35,8 @@ pub enum Error {
     DisassemblyFailure(String),
     #[error("insufficient bytes before or after syscall at {0:#x}")]
     InsufficientBytesBeforeOrAfter(u64),
+    #[error("provided trampoline address is too large for 32-bit executable")]
+    TrampolineAddressTooLarge,
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -76,7 +78,7 @@ const TRAMPOLINE_SECTION_SIZE: usize = 0x18;
     clippy::missing_panics_doc,
     reason = "any panics in here are not part of the public contract and should be fixed within this module"
 )]
-pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> Result<Vec<u8>> {
+pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
     let mut input_workaround: Vec<u64>;
     let input_binary: &[u8] = if (&raw const input_binary[0] as usize).is_multiple_of(8) {
         input_binary
@@ -174,9 +176,10 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     // The placeholder for the address of the new syscall entry point
     let trampoline = trampoline.unwrap_or(0);
     if arch == Arch::X86_64 {
-        trampoline_data.extend_from_slice(&u64::try_from(trampoline).unwrap().to_le_bytes());
+        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     } else {
-        trampoline_data.extend_from_slice(&u32::try_from(trampoline).unwrap().to_le_bytes());
+        let trampoline = u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
+        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     }
 
     let mut syscall_insns_found = false;
