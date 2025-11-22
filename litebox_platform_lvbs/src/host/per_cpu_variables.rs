@@ -286,7 +286,9 @@ fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut Pe
             None
         } else {
             let addr = x86_64::VirtAddr::new(&raw const *refcell as u64);
-            unsafe { wrgsbase(usize::try_from(addr.as_u64()).unwrap()) }
+            unsafe {
+                wrgsbase(usize::try_from(addr.as_u64()).unwrap());
+            }
             Some(refcell)
         }
     } else {
