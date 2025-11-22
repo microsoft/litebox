@@ -1557,7 +1557,7 @@ impl Task {
         if nfds >= i32::MAX as u32
             || nfds as usize
                 > self
-                    .process
+                    .process()
                     .limits
                     .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
         {
@@ -1690,7 +1690,7 @@ impl Task {
             }
             if newfd as usize
                 > self
-                    .process
+                    .process()
                     .limits
                     .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
             {

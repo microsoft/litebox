@@ -381,7 +381,11 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// Register the shim. This function must be called for each core to program
     /// its MSRs.
     pub fn register_shim(
-        shim: &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+        shim: &'static (
+                     dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>
+                         + Send
+                         + Sync
+                 ),
     ) {
         syscall_entry::init(shim);
     }

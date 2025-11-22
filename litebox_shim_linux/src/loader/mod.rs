@@ -6,7 +6,7 @@ mod elf;
 mod stack;
 
 use crate::Task;
-pub use elf::ElfLoaderError;
+pub use elf::{ElfLoadInfo, ElfLoaderError};
 
 /// Load a program into the LiteBox shim.
 pub(crate) fn load_program(

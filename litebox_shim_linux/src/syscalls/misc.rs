@@ -94,7 +94,7 @@ impl Task {
             totalswap: 0,
             freeswap: 0,
             procs: self
-                .process
+                .process()
                 .nr_threads
                 .load(core::sync::atomic::Ordering::Relaxed),
             totalhigh: 0,

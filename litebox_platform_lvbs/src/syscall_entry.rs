@@ -39,8 +39,9 @@ use x86_64::{
 // r11: userspace rflags
 // Note. rsp should point to the userspace stack before calling `sysretq`
 
-static SHIM: spin::Once<&'static dyn litebox::shim::EnterShim<ExecutionContext = PtRegs>> =
-    spin::Once::new();
+static SHIM: spin::Once<
+    &'static (dyn litebox::shim::EnterShim<ExecutionContext = PtRegs> + Send + Sync),
+> = spin::Once::new();
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug)]
@@ -229,7 +230,9 @@ const STACK_ALIGNMENT: isize = -16;
 /// # Panics
 /// Panics if GDT is not initialized for the current core.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn init(shim: &'static dyn litebox::shim::EnterShim<ExecutionContext = PtRegs>) {
+pub(crate) fn init(
+    shim: &'static (dyn litebox::shim::EnterShim<ExecutionContext = PtRegs> + Send + Sync),
+) {
     SHIM.call_once(|| shim);
 
     // enable 64-bit syscall/sysret

@@ -6,15 +6,20 @@
 /// This is implemented by the shim for passing to
 /// [`ThreadProvider::spawn_thread`](crate::platform::ThreadProvider::spawn_thread).
 pub trait InitThread: Send {
-    /// Initializes the thread.
+    /// The execution context type passed to the shim.
     ///
-    /// After calling this, the caller must run the thread in the shim until it
-    /// exits, or there may be hangs or leaks.
-    fn init(self: alloc::boxed::Box<Self>);
+    /// FUTURE: use a single per-architecture type for all shims and platforms.
+    type ExecutionContext;
+
+    /// Initializes the thread, returning the shim interface for the new thread.
+    #[must_use]
+    fn init(
+        self: alloc::boxed::Box<Self>,
+    ) -> alloc::boxed::Box<dyn crate::shim::EnterShim<ExecutionContext = Self::ExecutionContext>>;
 }
 
 /// An interface for entering the shim from the platform.
-pub trait EnterShim: Send + Sync {
+pub trait EnterShim {
     /// The execution context type passed to the shim.
     ///
     /// FUTURE: use a single per-architecture type for all shims and platforms.

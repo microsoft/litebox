@@ -227,7 +227,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     shim.set_load_filter(fixup_env);
-    platform.register_shim(shim.entrypoints());
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
         InterceptionBackend::Rewriter => {
@@ -261,8 +260,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let mut pt_regs = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
-    unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
+    let program = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
+    unsafe {
+        litebox_platform_linux_userland::run_thread(
+            program.entrypoints,
+            &mut litebox_common_linux::PtRegs::default(),
+        );
+    };
     Ok(())
 }
 
