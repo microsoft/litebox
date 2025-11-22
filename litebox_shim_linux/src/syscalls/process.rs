@@ -287,15 +287,6 @@ impl Task {
         true
     }
 
-    /// Attaches the thread handle to the process thread data.
-    pub(crate) fn attach_thread_handle(&self) {
-        self.thread
-            .remote
-            .handle
-            .set(Box::new(self.wait_state.thread_handle()))
-            .ok();
-    }
-
     /// Returns true if the task is exiting and should not continue running
     /// guest code.
     pub fn is_exiting(&self) -> bool {
@@ -1488,7 +1479,11 @@ impl Task {
     pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
         self.init_thread_context(ctx);
         // Attach the thread handle so that the thread can be interrupted.
-        self.attach_thread_handle();
+        self.thread
+            .remote
+            .handle
+            .set(Box::new(self.wait_state.thread_handle()))
+            .ok();
     }
 
     /// Initialize the thread context for a new process or thread, and perform any
