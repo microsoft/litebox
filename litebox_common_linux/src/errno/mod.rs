@@ -500,6 +500,7 @@ impl From<litebox::sync::futex::FutexError> for Errno {
                 litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
+            litebox::sync::futex::FutexError::Fault => Errno::EFAULT,
         }
     }
 }
