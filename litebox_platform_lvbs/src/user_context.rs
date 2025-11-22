@@ -163,7 +163,8 @@ impl<Host: HostInterface> UserSpaceManagement for LinuxKernel<Host> {
         // Currently, `litebox_platform_lvbs` uses `swapgs` to efficiently switch between
         // kernel and user GS base values during kernel-user mode transitions.
         // This `swapgs` usage can pontetially leak a kernel address to the user, so
-        // we clear the `KernelGsBase` MSR before running the user thread.
+        // we clear the `KernelGsBase` MSR before running the user thread (only for
+        // the first entry).
         crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
 
         unsafe {
