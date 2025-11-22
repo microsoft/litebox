@@ -70,13 +70,12 @@ impl TestLauncher {
 
     pub fn test_load_exec_common(mut self, executable_path: &str) {
         self.shim.set_fs(self.fs);
-        let shim = self.shim.build();
-        litebox_platform_multiplex::platform().register_shim(shim.entrypoints());
         let argv = vec![
             CString::new(executable_path).unwrap(),
             CString::new("hello").unwrap(),
         ];
         let envp = vec![CString::new("PATH=/bin").unwrap()];
+        let shim = self.shim.build();
         let program = shim
             .load_program(self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
