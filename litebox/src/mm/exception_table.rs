@@ -84,7 +84,7 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
     // and restore it manually.
     #[cfg(target_arch = "x86")]
     unsafe {
-        let remaining;
+        let remaining: usize;
         core::arch::asm! {
             "2:",
             "xchg esi, eax",
@@ -96,7 +96,9 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
             inout("ax") src => _,
             inout("cx") size => remaining,
         }
-        if remaining == 0 { Ok(()) } else { Err(Fault) }
+        if remaining != 0 {
+            return Err(Fault);
+        }
     }
     Ok(())
 }
@@ -124,6 +126,8 @@ macro_rules! read_fn {
                     failed = inout(reg) 1 => failed,
                 }
             }
+            // FUTURE: use a `label` like with the write functions once Rust
+            // supports them with `out` operands.
             if failed == 0 {
                 Ok((value as u64).truncate())
             } else {
