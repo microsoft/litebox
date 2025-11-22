@@ -1329,8 +1329,8 @@ mod test_utils {
     }
 
     impl Task {
-        /// Returns a function that clones this task with a new TID for testing.
-        pub(crate) fn clone_for_test(&self) -> Option<impl 'static + Send + FnOnce() -> Self> {
+        /// Returns a clone of this task with a new TID for testing.
+        pub(crate) fn clone_for_test(&self) -> Option<Self> {
             let tid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let task = Task {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
@@ -1345,10 +1345,7 @@ mod test_utils {
                 files: self.files.clone(),
                 pending_sigreturn: false.into(),
             };
-            Some(move || {
-                task.attach_thread_handle();
-                task
-            })
+            Some(task)
         }
 
         /// Spawns a thread that runs with a clone of this task and a new TID.
@@ -1362,8 +1359,8 @@ mod test_utils {
         where
             R: 'static + Send,
         {
-            let clone_task_fn = self.clone_for_test().unwrap();
-            std::thread::spawn(move || f(clone_task_fn()))
+            let task = self.clone_for_test().unwrap();
+            std::thread::spawn(move || f(task))
         }
     }
 }
