@@ -66,7 +66,9 @@ pub trait ThreadProvider: RawPointerProvider {
     unsafe fn spawn_thread(
         &self,
         ctx: &Self::ExecutionContext,
-        init_thread: alloc::boxed::Box<dyn crate::shim::InitThread>,
+        init_thread: alloc::boxed::Box<
+            dyn crate::shim::InitThread<ExecutionContext = Self::ExecutionContext>,
+        >,
     ) -> Result<(), Self::ThreadSpawnError>;
 
     /// Returns a handle to the current thread, which can be used to interrupt

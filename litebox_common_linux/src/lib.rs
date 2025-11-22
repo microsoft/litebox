@@ -3085,7 +3085,7 @@ impl<Platform: litebox::platform::RawPointerProvider> litebox::platform::Punchth
 /// pt_regs from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/arch/x86/include/asm/ptrace.h#L59)
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PtRegs {
     /*
      * C ABI says these regs are callee-preserved. They aren't saved on kernel entry
@@ -3127,7 +3127,7 @@ pub struct PtRegs {
 /// pt_regs from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/arch/x86/include/asm/ptrace.h#L12)
 #[cfg(target_arch = "x86")]
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PtRegs {
     pub ebx: usize,
     pub ecx: usize,

@@ -44,11 +44,6 @@ thread_local! {
     static THREAD_FS_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
-/// The registered shim.
-static SHIM: std::sync::OnceLock<
-    &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-> = std::sync::OnceLock::new();
-
 /// The userland Windows platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -131,7 +126,7 @@ unsafe extern "system" fn vectored_exception_handler(
         && unsafe { litebox_common_linux::rdfsbase() } == 0
         && WindowsUserland::get_thread_fs_base() != 0
     {
-        set_context_to_interrupt_callback(tls, context, regs);
+        set_context_to_interrupt_callback(tls, context);
     } else {
         // Push the exception record onto the host stack.
         let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
@@ -141,14 +136,13 @@ unsafe extern "system" fn vectored_exception_handler(
         // Re-align the stack pointer.
         let rsp = exception_record_ptr as usize & !15;
 
-        // Ensure that `run_thread` is linked in so that `exception_callback` is visible.
-        let _ = run_thread as usize;
+        // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
+        let _ = run_thread_arch as usize;
 
         // Update the thread context to jump to the exception handler.
         context.Rip = exception_callback as usize as u64;
         context.Rsp = rsp as u64;
         context.Rbp = tls.host_bp.get() as u64;
-        context.Rcx = core::ptr::from_mut(regs) as u64;
         context.Rdx = exception_record_ptr as u64;
     }
 
@@ -246,20 +240,6 @@ impl WindowsUserland {
         Box::leak(Box::new(platform))
     }
 
-    /// Register the shim to be used by this platform.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the function has already been invoked earlier.
-    pub fn register_shim(
-        &self,
-        shim: &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ) {
-        SHIM.set(shim)
-            .ok()
-            .expect("Should not register more than one shim");
-    }
-
     fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
         let mut reserved_pages = alloc::vec::Vec::new();
         let mut address = 0usize;
@@ -327,7 +307,7 @@ impl WindowsUserland {
 
 impl litebox::platform::Provider for WindowsUserland {}
 
-/// Runs a guest thread with the given initial context.
+/// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates.
 ///
@@ -337,7 +317,10 @@ impl litebox::platform::Provider for WindowsUserland {}
     clippy::missing_panics_doc,
     reason = "the caller cannot control whether this will panic"
 )]
-pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
+pub unsafe fn run_thread(
+    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
     // Allocate a TLS slot for this module if not already done. This is used as
     // a place to store data across calls to the guest, since all the registers
     // are used by the guest and will be clobbered.
@@ -355,6 +338,13 @@ pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
         );
         TLS_INDEX.store(index, Ordering::Relaxed);
     });
+    run_thread_inner(&shim, ctx);
+}
+
+fn run_thread_inner(
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
     let tls_index = TLS_INDEX.load(Ordering::Relaxed);
     let tls_state = TlsState {
         host_sp: Cell::new(core::ptr::null_mut()),
@@ -374,7 +364,14 @@ pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
     let _tls_guard = litebox::utils::defer(|| unsafe {
         windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null());
     });
-    ThreadHandle::run_with_handle(&tls_state, || unsafe { run_thread_inner(ctx, &tls_state) });
+    let mut thread_ctx = ThreadContext {
+        shim,
+        ctx,
+        tls: &tls_state,
+    };
+    ThreadHandle::run_with_handle(&tls_state, || unsafe {
+        run_thread_arch(&mut thread_ctx, &tls_state);
+    });
 }
 
 static TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -412,10 +409,7 @@ fn get_tls_ptr() -> Option<*const TlsState> {
 /// non-volatile register state.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-unsafe extern "C-unwind" fn run_thread_inner(
-    ctx: &mut litebox_common_linux::PtRegs,
-    tls_state: &TlsState,
-) {
+unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_state: &TlsState) {
     core::arch::naked_asm!(
     "
     .seh_proc run_thread
@@ -465,6 +459,9 @@ unsafe extern "C-unwind" fn run_thread_inner(
     // Offset into the TEB (gs segment) where TLS slots are stored.
     .equ TEB_TLS_SLOTS_OFFSET, 5248
 
+    push    rcx // Alignment
+    push    rcx // Save thread_ctx
+
     // Save the host rsp and rbp into the TLS state.
     mov     QWORD PTR [rdx + {HOST_SP}], rsp
     mov     QWORD PTR [rdx + {HOST_BP}], rbp
@@ -513,15 +510,13 @@ syscall_callback:
     push    r14
     push    r15
 
-    /// Pass the pt_regs to syscall_handler.
-    mov     rcx, rsp
-
     /// Reestablish the stack and frame pointers.
     mov     rsp, [r11 + {HOST_SP}]
     mov     rbp, [r11 + {HOST_BP}]
 
     // Handle the syscall. This will jump back to the guest but
     // will return if the thread is exiting.
+    mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {syscall_handler}
     jmp .Ldone
 
@@ -529,10 +524,12 @@ exception_callback:
     // Handle the exception. The stack and frame pointers are already restored,
     // and the guest context is up to date. rcx contains a pointer to the
     // guest pt_regs, and rdx contains a pointer to the exception record.
+    mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {exception_handler}
     jmp .Ldone
 
 interrupt_callback:
+    mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {interrupt_handler}
     jmp .Ldone
 
@@ -578,8 +575,8 @@ interrupt_callback:
 ///
 /// # Safety
 /// The context must be valid guest context. This can only be called if
-/// `run_thread_inner` is on the stack; after the guest exits, it will return to
-/// the interior of `run_thread_inner`.
+/// `run_thread_arch` is on the stack; after the guest exits, it will return to
+/// the interior of `run_thread_arch`.
 ///
 /// Do not call this at a point where the stack needs to be unwound to run
 /// destructors.
@@ -692,13 +689,15 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 }
 
 fn thread_start(
-    init_thread: Box<dyn litebox::shim::InitThread>,
+    init_thread: Box<
+        dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+    >,
     mut ctx: litebox_common_linux::PtRegs,
 ) {
     // Allow caller to run some code before we return to the new thread.
-    init_thread.init();
+    let shim = init_thread.init();
 
-    unsafe { run_thread(&mut ctx) };
+    run_thread_inner(shim.as_ref(), &mut ctx);
 }
 
 impl litebox::platform::ThreadProvider for WindowsUserland {
@@ -709,9 +708,11 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
-        init_thread: Box<dyn litebox::shim::InitThread>,
+        init_thread: Box<
+            dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+        >,
     ) -> Result<(), Self::ThreadSpawnError> {
-        let ctx = *ctx;
+        let ctx = ctx.clone();
         // TODO: do we need to wait for the handle in the main thread?
         let _handle = std::thread::spawn(move || thread_start(init_thread, ctx));
 
@@ -898,7 +899,7 @@ impl ThreadHandle {
             // SAFETY: `continue_context` is not accessed by user-mode code
             // while `is_in_guest` is true.
             let continue_context = unsafe { &mut *target_tls.continue_context.get() };
-            set_context_to_interrupt_callback(target_tls, continue_context, guest_context);
+            set_context_to_interrupt_callback(target_tls, continue_context);
             false
         } else {
             // Case 4: save the guest context and jump to interrupt callback.
@@ -906,7 +907,7 @@ impl ThreadHandle {
             true
         };
         if run_interrupt_callback {
-            set_context_to_interrupt_callback(target_tls, &mut context, guest_context);
+            set_context_to_interrupt_callback(target_tls, &mut context);
             unsafe {
                 windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(
                     inner.handle.as_raw_handle(),
@@ -922,13 +923,11 @@ impl ThreadHandle {
 fn set_context_to_interrupt_callback(
     tls: &TlsState,
     context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
-    guest_context: *mut litebox_common_linux::PtRegs,
 ) {
     let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
         | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64;
     assert!(context.ContextFlags & required_flags == required_flags);
     context.Rip = interrupt_callback as usize as u64;
-    context.Rcx = guest_context as usize as u64;
     context.Rsp = tls.host_sp.get().addr() as u64;
     context.Rbp = tls.host_bp.get().addr() as u64;
 }
@@ -1671,26 +1670,16 @@ unsafe extern "C" {
     fn switch_to_guest_end();
 }
 
-unsafe extern "C-unwind" fn init_handler(ctx: &mut litebox_common_linux::PtRegs) {
-    call_shim(ctx, |shim, ctx, _interrupt| shim.init(ctx));
+unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext<'_>) {
+    thread_ctx.call_shim(|shim, ctx, _interrupt| shim.init(ctx));
 }
 
-/// Windows syscall handler (placeholder - needs Windows implementation)
-///
-/// # Safety
-///
-/// - The `ctx` pointer must be valid pointer to a `litebox_common_linux::PtRegs` structure.
-/// - If any syscall argument is a pointer, it must be valid.
-///
-/// # Panics
-///
-/// Unsupported syscalls or arguments would trigger a panic for development purposes.
-unsafe extern "C-unwind" fn syscall_handler(ctx: &mut litebox_common_linux::PtRegs) {
-    call_shim(ctx, |shim, ctx, _interrupt| shim.syscall(ctx));
+unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext<'_>) {
+    thread_ctx.call_shim(|shim, ctx, _interrupt| shim.syscall(ctx));
 }
 
 unsafe extern "C-unwind" fn exception_handler(
-    ctx: &mut litebox_common_linux::PtRegs,
+    thread_ctx: &mut ThreadContext<'_>,
     exception_record: &EXCEPTION_RECORD,
 ) {
     let (exception, error_code, cr2) = match exception_record.ExceptionCode {
@@ -1718,11 +1707,11 @@ unsafe extern "C-unwind" fn exception_handler(
         cr2,
     };
 
-    call_shim(ctx, |shim, ctx, _interrupt| shim.exception(ctx, &info));
+    thread_ctx.call_shim(|shim, ctx, _interrupt| shim.exception(ctx, &info));
 }
 
-unsafe extern "C-unwind" fn interrupt_handler(ctx: &mut litebox_common_linux::PtRegs) {
-    call_shim(ctx, |shim, ctx, interrupt| {
+unsafe extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext<'_>) {
+    thread_ctx.call_shim(|shim, ctx, interrupt| {
         if interrupt {
             shim.interrupt(ctx)
         } else {
@@ -1733,24 +1722,30 @@ unsafe extern "C-unwind" fn interrupt_handler(ctx: &mut litebox_common_linux::Pt
     });
 }
 
-/// Calls `f` in order to call into a shim entrypoint.
-fn call_shim(
-    ctx: &mut litebox_common_linux::PtRegs,
-    f: impl FnOnce(
-        &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-        &mut litebox_common_linux::PtRegs,
-        bool,
-    ) -> ContinueOperation,
-) {
-    let &shim = SHIM.get().expect("Should have run `register_shim` by now");
-    // Clear the interrupt flag before calling the shim, since we've handled it
-    // now (by calling into the shim), and it might be set again by the shim
-    // before returning.
-    let interrupt = unsafe { (*get_tls_ptr().unwrap()).interrupt.replace(false) };
-    let op = f(shim, ctx, interrupt);
-    match op {
-        ContinueOperation::ResumeGuest => unsafe { switch_to_guest(ctx) },
-        ContinueOperation::ExitThread => {}
+struct ThreadContext<'a> {
+    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &'a mut litebox_common_linux::PtRegs,
+    tls: &'a TlsState,
+}
+
+impl ThreadContext<'_> {
+    /// Calls `f` in order to call into a shim entrypoint.
+    fn call_shim(
+        &mut self,
+        f: impl FnOnce(
+            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+            &mut litebox_common_linux::PtRegs,
+            bool,
+        ) -> ContinueOperation,
+    ) {
+        // Clear the interrupt flag before calling the shim, since we've handled it
+        // now (by calling into the shim), and it might be set again by the shim
+        // before returning.
+        let op = f(self.shim, self.ctx, self.tls.interrupt.replace(false));
+        match op {
+            ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::ExitThread => {}
+        }
     }
 }
 

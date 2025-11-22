@@ -5,6 +5,9 @@ use crate::MutPtr;
 use crate::Task;
 use crate::UserMutPointer;
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::cell::Cell;
 use core::mem::offset_of;
 use core::ops::Range;
 use core::sync::atomic::AtomicI32;
@@ -40,6 +43,42 @@ impl Process {
     }
 }
 
+/// Process-management-related state on [`Task`].
+pub(crate) struct ThreadState {
+    init_state: Cell<ThreadInitState>,
+    process: Arc<Process>,
+}
+
+impl ThreadState {
+    pub fn new_process() -> Self {
+        Self {
+            init_state: Cell::new(ThreadInitState::None),
+            process: Arc::new(Process::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn clone_for_test(&self) -> impl 'static + Send + FnOnce() -> Self {
+        let process = self.process.clone();
+        || Self {
+            init_state: Cell::new(ThreadInitState::None),
+            process,
+        }
+    }
+}
+
+#[derive(Default)]
+enum ThreadInitState {
+    #[default]
+    None,
+    NewProcess(crate::loader::elf::ElfLoadInfo),
+    NewThread {
+        stack: Option<usize>,
+        tls: Option<ThreadLocalDescriptor>,
+        set_child_tid: Option<UserMutPointer<i32>>,
+    },
+}
+
 /// Credentials of a process
 #[derive(Clone)]
 pub(crate) struct Credentials {
@@ -53,6 +92,10 @@ pub(crate) struct Credentials {
 pub(crate) static NEXT_THREAD_ID: AtomicI32 = AtomicI32::new(2); // start from 2, as 1 is used by the main thread
 
 impl Task {
+    pub(crate) fn process(&self) -> &Arc<Process> {
+        &self.thread.process
+    }
+
     /// Set the current task's command name.
     pub(crate) fn set_task_comm(&self, comm: &[u8]) {
         let mut new_comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
@@ -283,7 +326,8 @@ impl Task {
             let _ = wake_robust_list(robust_list);
         }
 
-        self.process
+        self.thread
+            .process
             .nr_threads
             .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     }
@@ -317,10 +361,6 @@ type ThreadLocalDescriptor = UserMutPointer<u8>;
 type ThreadLocalDescriptor = litebox_common_linux::UserDesc;
 
 struct NewThreadArgs {
-    /// Pointer to thread-local storage (TLS) given by the guest program
-    tls: Option<ThreadLocalDescriptor>,
-    /// Where to store child TID in child's memory
-    set_child_tid: Option<UserMutPointer<i32>>,
     /// Task struct that maintains all per-thread data
     task: Task,
 }
@@ -329,43 +369,20 @@ struct NewThreadArgs {
 unsafe impl Send for NewThreadArgs {}
 
 impl litebox::shim::InitThread for NewThreadArgs {
-    fn init(self: alloc::boxed::Box<Self>) {
-        let Self {
-            task,
-            tls,
-            set_child_tid,
-        } = *self;
+    type ExecutionContext = litebox_common_linux::PtRegs;
 
-        let child_tid = task.tid;
-
-        // Set the TLS for the guest program.
-        //
-        // Note that the following calls happen _before_ setting `SHIM_TLS`, so
-        // any calls to `with_current_task` will panic. This should be OK--only
-        // entry point code should be calling `with_current_task`.
-        #[cfg_attr(not(target_arch = "x86"), expect(unused_mut))]
-        if let Some(mut tls) = tls {
-            // Set the TLS base pointer for the new thread
-            #[cfg(target_arch = "x86")]
-            {
-                task.set_thread_area(&mut tls).unwrap();
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            {
-                use litebox::platform::RawConstPointer as _;
-                task.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
-                    .unwrap();
-            }
-        }
-
-        if let Some(child_tid_ptr) = set_child_tid {
-            // Set the child TID if requested
-            let _ = unsafe { child_tid_ptr.write_at_offset(0, child_tid) };
-        }
+    fn init(
+        self: alloc::boxed::Box<Self>,
+    ) -> alloc::boxed::Box<dyn litebox::shim::EnterShim<ExecutionContext = Self::ExecutionContext>>
+    {
+        let Self { task } = *self;
 
         // Set the shim TLS to point to the new task.
         crate::SHIM_TLS.init(crate::LinuxShimTls { current_task: task });
+
+        Box::new(crate::LinuxShimEntrypoints {
+            _not_send: core::marker::PhantomData,
+        })
     }
 }
 
@@ -532,38 +549,26 @@ impl Task {
             None
         };
 
-        let mut ctx_copy = *ctx;
-
-        // Update the context for the new thread. Note that the new thread gets a
-        // return value of 0.
-        #[cfg(target_arch = "x86_64")]
-        {
-            if let Some(sp) = sp {
-                ctx_copy.rsp = sp;
-            }
-            ctx_copy.rax = 0;
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            if let Some(sp) = sp {
-                ctx_copy.esp = sp;
-            }
-            ctx_copy.eax = 0;
-        }
-
-        self.process
+        self.thread
+            .process
             .nr_threads
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         let platform = litebox_platform_multiplex::platform();
         let r = unsafe {
             platform.spawn_thread(
-                &ctx_copy,
+                ctx,
                 Box::new(NewThreadArgs {
-                    tls,
-                    set_child_tid,
                     task: Task {
                         global: self.global.clone(),
+                        thread: ThreadState {
+                            init_state: Cell::new(ThreadInitState::NewThread {
+                                stack: sp,
+                                tls,
+                                set_child_tid,
+                            }),
+                            process: self.thread.process.clone(),
+                        },
                         wait_state: crate::wait::WaitState::new(platform),
                         pid: self.pid,
                         tid: child_tid,
@@ -573,7 +578,6 @@ impl Task {
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: fs.into(),
-                        process: self.process.clone(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         pending_sigreturn: false.into(),
                         is_exiting: false.into(),
@@ -583,7 +587,8 @@ impl Task {
         };
 
         if let Err(err) = r {
-            self.process
+            self.thread
+                .process
                 .nr_threads
                 .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
             return Err(err);
@@ -685,7 +690,7 @@ impl Task {
         let old_rlimit = match resource {
             litebox_common_linux::RlimitResource::NOFILE
             | litebox_common_linux::RlimitResource::STACK => {
-                self.process.limits.get_rlimit(resource)
+                self.thread.process.limits.get_rlimit(resource)
             }
             _ => unimplemented!("Unsupported resource for get_rlimit: {:?}", resource),
         };
@@ -705,7 +710,7 @@ impl Task {
             }
             match resource {
                 litebox_common_linux::RlimitResource::NOFILE => {
-                    self.process.limits.set_rlimit(resource, new_limit);
+                    self.thread.process.limits.set_rlimit(resource, new_limit);
                 }
                 _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
             }
@@ -1160,6 +1165,7 @@ impl Task {
 
         // Check if we are the only thread in the process
         if self
+            .thread
             .process
             .nr_threads
             .load(core::sync::atomic::Ordering::Relaxed)
@@ -1177,10 +1183,10 @@ impl Task {
             ctx.xgs.truncate(),
         );
 
-        *ctx = self
-            .load_program(loader, argv_vec, envp_vec)
+        self.load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
 
+        self.init_thread_state(ctx);
         Ok(0)
     }
 
@@ -1243,6 +1249,130 @@ impl Task {
             litebox::platform::PunchthroughError::Failure(errno) => errno,
             _ => unimplemented!("Unsupported punchthrough error {:?}", e),
         })
+    }
+
+    /// Loads the specified program into the process's address space and prepares the thread
+    /// to start executing it.
+    pub(crate) fn load_program(
+        &self,
+        mut loader: crate::loader::elf::ElfLoader<'_>,
+        argv: Vec<alloc::ffi::CString>,
+        mut envp: Vec<alloc::ffi::CString>,
+    ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        if let Some(&filter) = crate::LOAD_FILTER.get() {
+            filter(&mut envp);
+        }
+
+        let load_info = loader.load(argv, envp, self.init_auxv())?;
+
+        self.set_task_comm(loader.comm());
+
+        self.thread
+            .init_state
+            .set(ThreadInitState::NewProcess(load_info));
+        Ok(())
+    }
+
+    pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        self.init_thread_state(ctx);
+    }
+
+    fn init_thread_state(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        match self.thread.init_state.take() {
+            ThreadInitState::None => {}
+            ThreadInitState::NewProcess(load_info) => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    *ctx = litebox_common_linux::PtRegs {
+                        r15: 0,
+                        r14: 0,
+                        r13: 0,
+                        r12: 0,
+                        rbp: 0,
+                        rbx: 0,
+                        r11: 0,
+                        r10: 0,
+                        r9: 0,
+                        r8: 0,
+                        rax: 0,
+                        rcx: 0,
+                        rdx: 0,
+                        rsi: 0,
+                        rdi: 0,
+                        orig_rax: 0,
+                        rip: load_info.entry_point,
+                        cs: 0x33, // __USER_CS
+                        eflags: 0,
+                        rsp: load_info.user_stack_top,
+                        ss: 0x2b, // __USER_DS
+                    };
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    *ctx = litebox_common_linux::PtRegs {
+                        ebx: 0,
+                        ecx: 0,
+                        edx: 0,
+                        esi: 0,
+                        edi: 0,
+                        ebp: 0,
+                        eax: 0,
+                        xds: 0,
+                        xes: 0,
+                        xfs: 0,
+                        xgs: 0,
+                        orig_eax: 0,
+                        eip: load_info.entry_point,
+                        xcs: 0x23, // __USER_CS
+                        eflags: 0,
+                        esp: load_info.user_stack_top,
+                        xss: 0x2b, // __USER_DS
+                    };
+                }
+            }
+            ThreadInitState::NewThread {
+                tls,
+                stack,
+                set_child_tid,
+            } => {
+                // Set the stack and the return value from clone().
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if let Some(stack) = stack {
+                        ctx.rsp = stack;
+                    }
+                    ctx.rax = 0;
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    if let Some(stack) = stack {
+                        ctx.esp = stack;
+                    }
+                    ctx.eax = 0;
+                }
+
+                // Set the TLS for the new thread.
+                if let Some(tls) = tls {
+                    #[cfg(target_arch = "x86")]
+                    {
+                        let mut tls = tls;
+                        self.set_thread_area(&mut tls).unwrap();
+                    }
+
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use litebox::platform::RawConstPointer as _;
+                        self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
+                            .unwrap();
+                    }
+                }
+
+                if let Some(child_tid_ptr) = set_child_tid {
+                    // Set the child TID if requested.
+                    let _ = unsafe { child_tid_ptr.write_at_offset(0, self.tid) };
+                }
+            }
+        }
     }
 }
 

@@ -3,7 +3,6 @@ use litebox_platform_multiplex::{Platform, set_platform};
 fn init_platform() {
     let platform = Platform::new(None);
     set_platform(platform);
-    platform.register_shim(&litebox_shim_optee::OpteeShim);
 }
 
 #[test]

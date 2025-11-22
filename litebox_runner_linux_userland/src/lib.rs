@@ -5,6 +5,7 @@ use litebox_platform_multiplex::Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 extern crate alloc;
 
@@ -218,17 +219,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     if cli_args.tun_device_name.is_some() {
         std::thread::spawn(|| {
-            // TODO: use `poll` rather than busy-looping
-            // Also, we need to terminate this thread when the main program exits
             loop {
                 while litebox_shim_linux::perform_network_interaction().call_again_immediately() {}
-                core::hint::spin_loop();
+                litebox_platform_multiplex::platform().wait_on_tun(Some(Duration::from_millis(50)));
             }
         });
     }
 
     shim.set_load_filter(fixup_env);
-    platform.register_shim(shim.entrypoints());
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
         InterceptionBackend::Rewriter => {
@@ -262,8 +260,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let mut pt_regs = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
-    unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
+    let program = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
+    unsafe {
+        litebox_platform_linux_userland::run_thread(
+            program.entrypoints,
+            &mut litebox_common_linux::PtRegs::default(),
+        );
+    };
     Ok(())
 }
 

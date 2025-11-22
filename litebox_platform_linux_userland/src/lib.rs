@@ -21,11 +21,6 @@ mod syscall_intercept;
 
 extern crate alloc;
 
-/// The syscall handler passed down from the shim.
-static SHIM: std::sync::OnceLock<
-    &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-> = const { std::sync::OnceLock::new() };
-
 /// The userland Linux platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -165,20 +160,6 @@ impl LinuxUserland {
         Box::leak(Box::new(platform))
     }
 
-    /// Register the syscall handler (provided by the Linux shim)
-    ///
-    /// # Panics
-    ///
-    /// Panics if the function has already been invoked earlier.
-    pub fn register_shim(
-        &self,
-        shim: &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ) {
-        SHIM.set(shim)
-            .ok()
-            .expect("Should not register more than one shim");
-    }
-
     /// Enable seccomp syscall interception on the platform.
     ///
     /// # Panics
@@ -291,18 +272,61 @@ impl LinuxUserland {
                 .unwrap(),
         }
     }
+
+    /// Wait until there is data available on the TUN device.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TUN device is not initialized.
+    pub fn wait_on_tun(&self, timeout: Option<Duration>) {
+        let tun_fd = self.tun_socket_fd.read().unwrap();
+        let mut pfd = libc::pollfd {
+            fd: tun_fd.as_ref().unwrap().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let _ = unsafe {
+            libc::poll(
+                &raw mut pfd,
+                1,
+                timeout.map_or(-1, |t| {
+                    let ms = t.as_millis();
+                    i32::try_from(ms).unwrap_or(i32::MAX)
+                }),
+            )
+        };
+    }
 }
 
 impl litebox::platform::Provider for LinuxUserland {}
 
-/// Runs a guest thread with the given initial context.
+/// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates.
 ///
 /// # Safety
 /// The context must be valid guest context.
-pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
-    ThreadHandle::run_with_handle(|| with_signal_alt_stack(|| unsafe { run_thread_inner(ctx) }));
+pub unsafe fn run_thread(
+    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    run_thread_inner(&shim, ctx);
+}
+
+struct ThreadContext<'a> {
+    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &'a mut litebox_common_linux::PtRegs,
+}
+
+fn run_thread_inner(
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    let ctx_ptr = core::ptr::from_mut(ctx);
+    let mut thread_ctx = ThreadContext { shim, ctx };
+    ThreadHandle::run_with_handle(|| {
+        with_signal_alt_stack(|| unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr) });
+    });
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -365,7 +389,10 @@ fn get_guest_fsbase() -> usize {
 /// non-volatile register state.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
+unsafe extern "C-unwind" fn run_thread_arch(
+    thread_ctx: &mut ThreadContext,
+    ctx: *mut litebox_common_linux::PtRegs,
+) {
     core::arch::naked_asm!(
     "
     .cfi_startproc
@@ -378,12 +405,12 @@ unsafe extern "C-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtR
     push r13
     push r14
     push r15
-    push r15 // align
+    push rdi // save thread context
 
     // Save host rsp and rbp and guest context top in TLS.
     mov fs:host_sp@tpoff, rsp
     mov fs:host_bp@tpoff, rbp
-    lea r8, [rdi + {GUEST_CONTEXT_SIZE}]
+    lea r8, [rsi + {GUEST_CONTEXT_SIZE}]
     mov fs:guest_context_top@tpoff, r8
 
     // Save host fs base in gs base. This will stay set for the lifetime
@@ -442,15 +469,13 @@ syscall_callback:
     push    r14         // pt_regs->r14
     push    r15         // pt_regs->r15
 
-    // Pass pt_regs to syscall_handler.
-    mov     rdi, rsp
-
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
 
     // Handle the syscall. This will jump back to the guest but
     // will return if the thread is exiting.
+    mov rdi, [rsp] // pass thread_ctx
     call {syscall_handler}
     // This thread is done. Return.
     jmp .Ldone
@@ -460,6 +485,7 @@ exception_callback:
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
 
+    mov rdi, [rsp] // pass thread_ctx
     call {exception_handler}
     jmp .Ldone
 
@@ -468,6 +494,7 @@ interrupt_callback:
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
 
+    mov rdi, [rsp] // pass thread_ctx
     call {interrupt_handler}
 
 .Ldone:
@@ -503,7 +530,10 @@ interrupt_callback:
 /// non-volatile register state.
 #[cfg(target_arch = "x86")]
 #[unsafe(naked)]
-unsafe extern "fastcall-unwind" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
+unsafe extern "fastcall-unwind" fn run_thread_arch(
+    thread_ctx: &mut ThreadContext,
+    ctx: *mut litebox_common_linux::PtRegs,
+) {
     core::arch::naked_asm!(
     "
     .cfi_startproc
@@ -513,12 +543,13 @@ unsafe extern "fastcall-unwind" fn run_thread_inner(ctx: &mut litebox_common_lin
     push ebx
     push esi
     push edi
-    sub esp, 12 // align
+    sub esp, 8 // align
+    push ecx // save thread context
 
     // Save host esp and ebp and guest context top in TLS
     mov gs:host_sp@ntpoff, esp
     mov gs:host_bp@ntpoff, ebp
-    lea edi, [ecx + {GUEST_CONTEXT_SIZE}]
+    lea edi, [edx + {GUEST_CONTEXT_SIZE}]
     mov gs:guest_context_top@ntpoff, edi
 
     // Save host gs in fs
@@ -576,9 +607,6 @@ syscall_callback:
     push    ecx         // pt_regs->ecx
     push    ebx         // pt_regs->ebx
 
-    // Pass the pointer to pt_regs to syscall_handler.
-    mov ecx, esp
-
     // Restore esp and ebp
     mov esp, fs:host_sp@ntpoff
     mov ebp, fs:host_bp@ntpoff
@@ -589,6 +617,7 @@ syscall_callback:
 
     // Handle the syscall. This will jump back to the guest but
     // will return if the thread is exiting.
+    mov ecx, [esp] // pass thread_ctx
     call {syscall_handler_fast}
     jmp .Ldone
 
@@ -597,6 +626,7 @@ exception_callback:
     mov esp, gs:host_sp@ntpoff
     mov ebp, gs:host_bp@ntpoff
 
+    mov ecx, [esp] // pass thread_ctx
     push ecx
     push edx
     push esi
@@ -609,6 +639,7 @@ interrupt_callback:
     mov esp, gs:host_sp@ntpoff
     mov ebp, gs:host_bp@ntpoff
 
+    mov ecx, [esp] // pass thread_ctx
     sub esp, 12 // align
     push ecx
     call {interrupt_handler}
@@ -634,16 +665,16 @@ interrupt_callback:
 
 /// Wrapper around `syscall_handler` to use the fastcall convention.
 #[cfg(target_arch = "x86")]
-unsafe extern "fastcall-unwind" fn syscall_handler_fast(ctx: &mut litebox_common_linux::PtRegs) {
-    unsafe { syscall_handler(ctx) }
+unsafe extern "fastcall-unwind" fn syscall_handler_fast(thread_ctx: &mut ThreadContext) {
+    unsafe { syscall_handler(thread_ctx) }
 }
 
 /// Switches to the provided guest context.
 ///
 /// # Safety
 /// The context must be valid guest context. This can only be called if
-/// `run_thread_inner` is on the stack; after the guest exits, it will return to
-/// the interior of `run_thread_inner`.
+/// `run_thread_arch` is on the stack; after the guest exits, it will return to
+/// the interior of `run_thread_arch`.
 ///
 /// Do not call this at a point where the stack needs to be unwound to run
 /// destructors.
@@ -752,13 +783,15 @@ unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) 
 }
 
 fn thread_start(
-    init_thread: Box<dyn litebox::shim::InitThread>,
+    init_thread: Box<
+        dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+    >,
     mut ctx: litebox_common_linux::PtRegs,
 ) {
     // Allow caller to run some code before we return to the new thread.
-    init_thread.init();
+    let shim = init_thread.init();
 
-    unsafe { run_thread(&mut ctx) };
+    run_thread_inner(shim.as_ref(), &mut ctx);
     // TODO: have syscall_callback return if we need to terminate the process.
     // We should return this value to the caller so load_program can return it
     // to the user.
@@ -820,9 +853,11 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
-        init_thread: Box<dyn litebox::shim::InitThread>,
+        init_thread: Box<
+            dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+        >,
     ) -> Result<(), Self::ThreadSpawnError> {
-        let ctx = *ctx;
+        let ctx = ctx.clone();
         // TODO: do we need to wait for the handle in the main thread?
         let _handle = std::thread::spawn(move || thread_start(init_thread, ctx));
 
@@ -1612,8 +1647,8 @@ unsafe extern "C" {
     fn switch_to_guest_end();
 }
 
-unsafe extern "C-unwind" fn init_handler(ctx: &mut litebox_common_linux::PtRegs) {
-    call_shim(ctx, |shim, ctx| shim.init(ctx));
+unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
+    thread_ctx.call_shim(|shim, ctx| shim.init(ctx));
 }
 
 /// Handles Linux syscalls and dispatches them to LiteBox implementations.
@@ -1631,12 +1666,12 @@ unsafe extern "C-unwind" fn init_handler(ctx: &mut litebox_common_linux::PtRegs)
 /// Unsupported syscalls or arguments would trigger a panic for development
 /// purposes.
 #[allow(clippy::cast_sign_loss)]
-unsafe extern "C-unwind" fn syscall_handler(ctx: &mut litebox_common_linux::PtRegs) {
-    call_shim(ctx, |shim, ctx| shim.syscall(ctx));
+unsafe extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
 extern "C-unwind" fn exception_handler(
-    ctx: &mut litebox_common_linux::PtRegs,
+    thread_ctx: &mut ThreadContext,
     trapno: usize,
     error: usize,
     cr2: usize,
@@ -1646,44 +1681,42 @@ extern "C-unwind" fn exception_handler(
         error_code: error.try_into().unwrap(),
         cr2,
     };
-    call_shim(ctx, |shim, ctx| shim.exception(ctx, &info));
+    thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
 }
 
-extern "C-unwind" fn interrupt_handler(ctx: &mut litebox_common_linux::PtRegs) {
-    call_shim(ctx, |shim, ctx| shim.interrupt(ctx));
+extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
+    thread_ctx.call_shim(|shim, ctx| shim.interrupt(ctx));
 }
 
 /// Calls `f` in order to call into a shim entrypoint.
-fn call_shim(
-    ctx: &mut litebox_common_linux::PtRegs,
-    f: impl FnOnce(
-        &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-        &mut litebox_common_linux::PtRegs,
-    ) -> ContinueOperation,
-) {
-    let &shim = SHIM
-        .get()
-        .expect("should have called `register_shim` by now");
-
-    // Clear the interrupt flag before calling the shim, since we've handled it
-    // now (by calling into the shim), and it might be set again by the shim
-    // before returning.
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        core::arch::asm!(
-            "mov BYTE PTR fs:interrupt@tpoff, 0",
-            options(nostack, preserves_flags)
-        );
-        #[cfg(target_arch = "x86")]
-        core::arch::asm!(
-            "mov BYTE PTR gs:interrupt@ntpoff, 0",
-            options(nostack, preserves_flags)
-        );
-    }
-    let op = f(shim, ctx);
-    match op {
-        ContinueOperation::ResumeGuest => unsafe { switch_to_guest(ctx) },
-        ContinueOperation::ExitThread => {}
+impl ThreadContext<'_> {
+    fn call_shim(
+        &mut self,
+        f: impl FnOnce(
+            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+            &mut litebox_common_linux::PtRegs,
+        ) -> ContinueOperation,
+    ) {
+        // Clear the interrupt flag before calling the shim, since we've handled it
+        // now (by calling into the shim), and it might be set again by the shim
+        // before returning.
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!(
+                "mov BYTE PTR fs:interrupt@tpoff, 0",
+                options(nostack, preserves_flags)
+            );
+            #[cfg(target_arch = "x86")]
+            core::arch::asm!(
+                "mov BYTE PTR gs:interrupt@ntpoff, 0",
+                options(nostack, preserves_flags)
+            );
+        }
+        let op = f(self.shim, self.ctx);
+        match op {
+            ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::ExitThread => {}
+        }
     }
 }
 
@@ -2111,8 +2144,8 @@ unsafe extern "C" fn exception_signal_handler(
     };
     copy_signal_context(unsafe { &mut *regs }, context);
 
-    // Ensure that `run_thread` is linked in so that `exception_callback` is visible.
-    let _ = run_thread as usize;
+    // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
+    let _ = run_thread_arch as usize;
 
     // Jump to exception_callback.
     let sigctx = &context.uc_mcontext;
@@ -2128,7 +2161,7 @@ unsafe extern "C" fn exception_signal_handler(
         sigctx.gregs[libc::REG_ERR as usize] as isize,
         sigctx.cr2.reinterpret_as_signed() as isize,
     );
-    set_signal_return(context, exception_callback, regs as isize, trapno, err, cr2);
+    set_signal_return(context, exception_callback, 0, trapno, err, cr2);
 }
 
 /// Runs the next signal handler in the chain.
@@ -2253,7 +2286,7 @@ unsafe fn interrupt_signal_handler(
         copy_signal_context(unsafe { &mut *regs }, context);
     }
     // Cases 3 and 4: jump to interrupt handler.
-    set_signal_return(context, interrupt_callback, regs as isize, 0, 0, 0);
+    set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
 }
 
 impl litebox::platform::CrngProvider for LinuxUserland {
