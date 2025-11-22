@@ -8,7 +8,7 @@ use litebox_platform_multiplex::Platform;
 
 struct TestLauncher {
     platform: &'static Platform,
-    shim: litebox_shim_linux::LinuxShim,
+    shim: litebox_shim_linux::LinuxShimBuilder,
     fs: litebox_shim_linux::DefaultFS,
 }
 
@@ -22,7 +22,7 @@ impl TestLauncher {
     ) -> Self {
         let platform = Platform::new(tun_device_name);
         litebox_platform_multiplex::set_platform(platform);
-        let shim = litebox_shim_linux::LinuxShim::new();
+        let shim = litebox_shim_linux::LinuxShimBuilder::new();
         let litebox = shim.litebox();
 
         let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
@@ -84,8 +84,8 @@ impl TestLauncher {
             CString::new("HOME=/").unwrap(),
         ];
         self.shim.set_fs(self.fs);
-        let program = self
-            .shim
+        let shim = self.shim.build();
+        let program = shim
             .load_program(self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
         unsafe {

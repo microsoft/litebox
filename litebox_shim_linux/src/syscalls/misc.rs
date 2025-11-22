@@ -8,7 +8,6 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::errno::Errno;
-use litebox_platform_multiplex::Platform;
 
 impl Task {
     /// Handle syscall `getrandom`.
@@ -26,10 +25,7 @@ impl Task {
         while offset < count {
             let len = (count - offset).min(kbuf.len());
             let kbuf = &mut kbuf[..len];
-            <Platform as litebox::platform::CrngProvider>::fill_bytes_crng(
-                litebox_platform_multiplex::platform(),
-                kbuf,
-            );
+            <_ as litebox::platform::CrngProvider>::fill_bytes_crng(self.global.platform, kbuf);
             buf.copy_from_slice(offset, kbuf).ok_or(Errno::EFAULT)?;
             offset += len;
             // TODO: check for interrupt here and break out.
@@ -79,9 +75,12 @@ impl Task {
 
     /// Handle syscall `sysinfo`.
     pub(crate) fn sys_sysinfo(&self) -> litebox_common_linux::Sysinfo {
-        let now = litebox_platform_multiplex::platform().now();
+        let now = self.global.platform.now();
         litebox_common_linux::Sysinfo {
-            uptime: now.duration_since(crate::boot_time()).as_secs().truncate(),
+            uptime: now
+                .duration_since(&self.global.boot_time)
+                .as_secs()
+                .truncate(),
             // TODO: Populate these fields with actual values
             loads: [0; 3],
             #[cfg(target_arch = "x86_64")]

@@ -11,7 +11,7 @@ use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
 use thiserror::Error;
 
 use crate::{
-    MutPtr, litebox_page_manager,
+    MutPtr,
     loader::auxv::{AuxKey, AuxVec},
 };
 
@@ -230,7 +230,8 @@ impl<'a> ElfLoader<'a> {
         let sp = unsafe {
             let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
-            litebox_page_manager()
+            task.global
+                .pm
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?
         };

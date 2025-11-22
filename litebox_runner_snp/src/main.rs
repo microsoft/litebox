@@ -11,18 +11,31 @@ use alloc::borrow::ToOwned;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
+// FUTURE: replace this with some kind of OnceLock, or just eliminate this
+// entirely (ideal).
+static mut SHIM: Option<litebox_shim_linux::LinuxShim> = None;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn floating_point_handler(_pt_regs: &mut litebox_common_linux::PtRegs) {
     todo!()
 }
 
+/// # Panics
+///
+/// Panics if the shim has not been initialized.
 #[unsafe(no_mangle)]
 pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs) {
-    let addr = litebox_platform_linux_kernel::arch::instructions::cr2();
+    let addr: u64 = litebox_platform_linux_kernel::arch::instructions::cr2();
     let code = pt_regs.orig_rax;
 
+    let shim = &raw const SHIM;
+
     match unsafe {
-        litebox_shim_linux::litebox_page_manager().handle_page_fault(addr.truncate(), code as u64)
+        (*shim)
+            .as_ref()
+            .unwrap()
+            .page_manager()
+            .handle_page_fault(addr.truncate(), code as u64)
     } {
         Ok(()) => (),
         Err(e) => {
@@ -95,7 +108,7 @@ pub extern "C" fn sandbox_process_init(
     litebox::log_println!(platform, "sandbox_process_init called");
 
     litebox_platform_multiplex::set_platform(platform);
-    let mut shim = litebox_shim_linux::LinuxShim::new();
+    let mut shim = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim.litebox();
     let in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, ROOTFS.into());
@@ -137,6 +150,7 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_INVALID_PARAM,
         );
     };
+    let shim = shim.build();
     let program = match shim.load_program(platform.init_task(boot_params), &program, argv, envp) {
         Ok(program) => program,
         Err(err) => {
@@ -147,7 +161,7 @@ pub extern "C" fn sandbox_process_init(
             );
         }
     };
-
+    unsafe { SHIM = Some(shim) };
     litebox_platform_linux_kernel::host::snp::snp_impl::init_thread(
         alloc::boxed::Box::new(program.entrypoints),
         pt_regs,

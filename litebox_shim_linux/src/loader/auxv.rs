@@ -75,7 +75,7 @@ impl Task {
         aux.insert(AuxKey::AT_GID, user_info.gid as usize);
         aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
 
-        if let Some(vdso_base) = litebox_platform_multiplex::platform().get_vdso_address() {
+        if let Some(vdso_base) = self.global.platform.get_vdso_address() {
             aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
         }
 

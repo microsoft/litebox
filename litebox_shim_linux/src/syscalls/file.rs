@@ -19,7 +19,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
-use crate::{ConstPtr, Descriptor, Descriptors, MutPtr, Task, litebox, litebox_pipes};
+use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, MutPtr, Task};
 use core::sync::atomic::Ordering;
 
 /// Task state shared by `CLONE_FS`.
@@ -49,17 +49,20 @@ impl FsState {
 
 /// Task state shared by `CLONE_FILES`.
 pub(crate) struct FilesState {
+    pub global: alloc::sync::Arc<GlobalState>,
     pub file_descriptors: litebox::sync::RwLock<Platform, Descriptors>,
     pub raw_descriptor_store: litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
 }
 
 impl FilesState {
-    pub fn new(litebox: &litebox::LiteBox<Platform>) -> Self {
+    pub fn new(global: alloc::sync::Arc<GlobalState>) -> Self {
         Self {
-            file_descriptors: litebox.sync().new_rwlock(Descriptors::new()),
-            raw_descriptor_store: litebox
+            file_descriptors: global.litebox.sync().new_rwlock(Descriptors::new()),
+            raw_descriptor_store: global
+                .litebox
                 .sync()
                 .new_rwlock(litebox::fd::RawDescriptorStorage::new()),
+            global,
         }
     }
 }
@@ -131,7 +134,9 @@ impl Task {
         let mode = mode & !self.get_umask();
         let file = self.global.fs.open(path, flags - OFlags::CLOEXEC, mode)?;
         if flags.contains(OFlags::CLOEXEC) {
-            let None = litebox()
+            let None = self
+                .global
+                .litebox
                 .descriptor_table_mut()
                 .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
             else {
@@ -250,7 +255,7 @@ impl Task {
                                 .map_err(Errno::from)
                         },
                         |fd| {
-                            super::net::receive(
+                            self.global.receive(
                                 &self.wait_cx(),
                                 fd,
                                 &mut buf.borrow_mut(),
@@ -259,7 +264,8 @@ impl Task {
                             )
                         },
                         |fd| {
-                            litebox_pipes()
+                            self.global
+                                .pipes
                                 .read(&self.wait_cx(), fd, &mut buf.borrow_mut())
                                 .map_err(Errno::from)
                         },
@@ -300,7 +306,7 @@ impl Task {
                         raw_fd,
                         |fd| self.global.fs.write(fd, buf, offset).map_err(Errno::from),
                         |fd| {
-                            super::net::sendto(
+                            self.global.sendto(
                                 &self.wait_cx(),
                                 fd,
                                 buf,
@@ -309,7 +315,8 @@ impl Task {
                             )
                         },
                         |fd| {
-                            litebox_pipes()
+                            self.global
+                                .pipes
                                 .write(&self.wait_cx(), fd, buf)
                                 .map_err(Errno::from)
                         },
@@ -405,14 +412,14 @@ impl Task {
                     {
                         Ok(fd) => {
                             drop(rds);
-                            super::net::close_socket(&self.wait_cx(), fd)
+                            self.global.close_socket(&self.wait_cx(), fd)
                         },
                         Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                         Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
                             match rds.fd_consume_raw_integer::<litebox::pipes::Pipes<litebox_platform_multiplex::Platform>>(raw_fd) {
                                 Ok(fd) => {
                                     drop(rds);
-                                    litebox_pipes().close(&fd).map_err(Errno::from)
+                                    self.global.pipes.close(&fd).map_err(Errno::from)
                                 }
                                 Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                                 Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
@@ -560,7 +567,7 @@ impl Task {
                     },
                     |fd| {
                         write_to_iovec(iovs, |buf: &[u8]| {
-                            super::net::sendto(
+                            self.global.sendto(
                                 &self.wait_cx(),
                                 fd,
                                 buf,
@@ -679,7 +686,7 @@ impl Descriptor {
                     },
                     |_fd| todo!("net"),
                     |fd| {
-                        let half_pipe_type = litebox_pipes().half_pipe_type(fd)?;
+                        let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
                         let read_write_mode = match half_pipe_type {
                             litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
                             litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
@@ -741,16 +748,24 @@ impl Descriptor {
     ) -> Result<FileDescriptorFlags, Errno> {
         // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
         // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
-        fn get_flags<S: FdEnabledSubsystem>(fd: &TypedFd<S>) -> FileDescriptorFlags {
-            litebox()
+        fn get_flags<S: FdEnabledSubsystem>(
+            files: &FilesState,
+            fd: &TypedFd<S>,
+        ) -> FileDescriptorFlags {
+            files
+                .global
+                .litebox
                 .descriptor_table()
                 .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
                 .unwrap_or(FileDescriptorFlags::empty())
         }
         match self {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                files.run_on_raw_fd(*raw_fd, get_flags, get_flags, get_flags)
-            }
+            Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
+                *raw_fd,
+                |fd| get_flags(files, fd),
+                |fd| get_flags(files, fd),
+                |fd| get_flags(files, fd),
+            ),
             Descriptor::Eventfd { close_on_exec, .. } | Descriptor::Epoll { close_on_exec, .. } => {
                 Ok(
                     if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
@@ -859,13 +874,25 @@ impl Task {
                     Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                         *raw_fd,
                         |fd| {
-                            let _old = litebox().descriptor_table_mut().set_fd_metadata(fd, flags);
+                            let _old = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, flags);
                         },
                         |fd| {
-                            let _old = litebox().descriptor_table_mut().set_fd_metadata(fd, flags);
+                            let _old = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, flags);
                         },
                         |fd| {
-                            let _old = litebox().descriptor_table_mut().set_fd_metadata(fd, flags);
+                            let _old = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, flags);
                         },
                     )?,
                     Descriptor::Eventfd { close_on_exec, .. }
@@ -883,7 +910,9 @@ impl Task {
                     .run_on_raw_fd(
                         *raw_fd,
                         |fd| {
-                            Ok(litebox()
+                            Ok(self
+                                .global
+                                .litebox
                                 .descriptor_table()
                                 .with_metadata(fd, |crate::StdioStatusFlags(flags)| {
                                     *flags & OFlags::STATUS_FLAGS_MASK
@@ -891,7 +920,9 @@ impl Task {
                                 .unwrap_or(OFlags::empty()))
                         },
                         |fd| {
-                            Ok(litebox()
+                            Ok(self
+                                .global
+                                .litebox
                                 .descriptor_table()
                                 .with_metadata(fd, |crate::syscalls::net::SocketOFlags(flags)| {
                                     *flags & OFlags::STATUS_FLAGS_MASK
@@ -899,7 +930,7 @@ impl Task {
                                 .unwrap_or(OFlags::empty()))
                         },
                         |fd| {
-                            let pipes = litebox_pipes();
+                            let pipes = &self.global.pipes;
                             let flags = OFlags::from(pipes.get_flags(fd).map_err(Errno::from)?);
                             let dirn = match pipes.half_pipe_type(fd)? {
                                 litebox::pipes::HalfPipeType::SenderHalf => OFlags::WRONLY,
@@ -933,7 +964,8 @@ impl Task {
                     Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                         *raw_fd,
                         |fd| {
-                            litebox()
+                            self.global
+                                .litebox
                                 .descriptor_table_mut()
                                 .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| {
                                     let diff = *f ^ flags;
@@ -952,7 +984,8 @@ impl Task {
                                 })
                         },
                         |fd| {
-                            litebox()
+                            self.global
+                                .litebox
                                 .descriptor_table_mut()
                                 .with_metadata_mut(fd, |crate::syscalls::net::SocketOFlags(f)| {
                                     let diff = *f ^ flags;
@@ -974,7 +1007,8 @@ impl Task {
                             if flags.intersects(OFlags::NONBLOCK.complement()) {
                                 todo!("unsupported flags for pipes")
                             }
-                            litebox_pipes()
+                            self.global
+                                .pipes
                                 .update_flags(
                                     fd,
                                     litebox::pipes::Flags::NON_BLOCKING,
@@ -1081,7 +1115,7 @@ impl Task {
             (f, flags.contains(OFlags::CLOEXEC))
         };
 
-        let (writer, reader) = crate::litebox_pipes().create_pipe(
+        let (writer, reader) = self.global.pipes.create_pipe(
             DEFAULT_PIPE_BUF_SIZE,
             pipe_flags,
             // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
@@ -1089,7 +1123,7 @@ impl Task {
         );
 
         if cloexec {
-            let mut dt = litebox().descriptor_table_mut();
+            let mut dt = self.global.litebox.descriptor_table_mut();
             let None = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC) else {
                 unreachable!()
             };
@@ -1119,7 +1153,8 @@ impl Task {
             return Err(Errno::EINVAL);
         }
 
-        let eventfd = super::eventfd::EventFile::new(u64::from(initval), flags, litebox());
+        let eventfd =
+            super::eventfd::EventFile::new(u64::from(initval), flags, &self.global.litebox);
         let files = self.files.borrow();
         files
             .file_descriptors
@@ -1202,13 +1237,13 @@ impl Task {
                             // TODO: stdio NONBLOCK?
                             #[cfg(debug_assertions)]
                             litebox::log_println!(
-                                litebox_platform_multiplex::platform(),
+                                self.global.platform,
                                 "Attempted to set non-blocking on raw fd; currently unimplemented"
                             );
                             Ok(())
                         },
                         |socket_fd| {
-                            if let Err(e) = litebox().descriptor_table_mut().with_metadata_mut(
+                            if let Err(e) = self.global.litebox.descriptor_table_mut().with_metadata_mut(
                                 socket_fd,
                                 |crate::syscalls::net::SocketOFlags(flags)| {
                                     flags.set(OFlags::NONBLOCK, val != 0);
@@ -1222,8 +1257,7 @@ impl Task {
                             Ok(())
                         },
                         |fd| {
-                            litebox_pipes()
-                                .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
+self.global.pipes                                .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
                                 .map_err(Errno::from)
                         },
                     )
@@ -1241,7 +1275,7 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                 *raw_fd,
                 |fd| {
-                    litebox()
+                    self.global.litebox
                     .descriptor_table()
                     .with_metadata(fd, |crate::StdioStatusFlags(_)| self.stdio_ioctl(&arg))
                     .unwrap_or_else(|err| {
@@ -1257,7 +1291,7 @@ impl Task {
                                 files.run_on_raw_fd(
                                     *raw_fd,
                                     |fd| {
-                                        let _old = litebox()
+                                        let _old = self.global.litebox
                                             .descriptor_table_mut()
                                             .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                                     },
@@ -1269,7 +1303,7 @@ impl Task {
                             IoctlArg::TIOCGWINSZ(_) | IoctlArg::TCSETS(_) => {
                                 #[cfg(debug_assertions)]
                                 litebox::log_println!(
-                                    litebox_platform_multiplex::platform(),
+                                    self.global.platform,
                                     "Got {:?} for non-stdio file; this is likely temporary during the migration away from stdio and should get cleaned up at some point",
                                     arg
                                 );
@@ -1278,7 +1312,7 @@ impl Task {
                             _ => {
                                 #[cfg(debug_assertions)]
                                 litebox::log_println!(
-                                    litebox_platform_multiplex::platform(),
+                                    self.global.platform,
                                     "\n\n\n{:?}\n\n\n",
                                     arg
                                 );
@@ -1307,7 +1341,7 @@ impl Task {
             return Err(Errno::EINVAL);
         }
 
-        let epoll_file = super::epoll::EpollFile::new(litebox());
+        let epoll_file = super::epoll::EpollFile::new(self.global.clone());
         let files = self.files.borrow();
         files
             .file_descriptors
@@ -1627,7 +1661,7 @@ impl Task {
                     fd: &TypedFd<S>,
                     close_on_exec: bool,
                 ) -> Result<Descriptor, Errno> {
-                    let mut dt = litebox().descriptor_table_mut();
+                    let mut dt = files.global.litebox.descriptor_table_mut();
                     let fd = dt.duplicate(fd).ok_or(Errno::EBADF)?;
                     if close_on_exec {
                         let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
@@ -1747,7 +1781,9 @@ impl Task {
         files.run_on_raw_fd(
             *raw_fd,
             |file| {
-                let dir_off: Diroff = litebox()
+                let dir_off: Diroff = self
+                    .global
+                    .litebox
                     .descriptor_table()
                     .with_metadata(file, |off: &Diroff| *off)
                     .unwrap_or_default();
@@ -1791,7 +1827,9 @@ impl Task {
                     nbytes += len;
                     dir_off += 1;
                 }
-                let _old = litebox()
+                let _old = self
+                    .global
+                    .litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)

@@ -14,10 +14,6 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-// TODO(jayb) Replace out all uses of once_cell and such with our own implementation that uses
-// platform-specific things within it.
-use once_cell::race::OnceBox;
-
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
@@ -27,7 +23,8 @@ use litebox::{
     net::Network,
     pipes::Pipes,
     platform::{
-        PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutPointer as _,
+        PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
+        RawMutPointer as _, TimeProvider,
     },
     shim::ContinueOperation,
     sync::futex::FutexManager,
@@ -62,9 +59,6 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
 >;
 
 pub(crate) type FileFd = litebox::fd::TypedFd<LinuxFS>;
-
-static BOOT_TIME: once_cell::race::OnceBox<<Platform as litebox::platform::TimeProvider>::Instant> =
-    once_cell::race::OnceBox::new();
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
@@ -155,41 +149,35 @@ fn enter_shim(
     }
 }
 
-/// Get the `Instant` representing the boot time of the platform.
-///
-/// # Panics
-///
-/// Panics if [`litebox()`] has not been invoked before this
-pub(crate) fn boot_time() -> &'static <Platform as litebox::platform::TimeProvider>::Instant {
-    BOOT_TIME
-        .get()
-        .expect("litebox() should have already been called before this point")
-}
-
 /// The shim entry point structure.
-pub struct LinuxShim {
-    litebox: &'static LiteBox<Platform>,
+pub struct LinuxShimBuilder {
+    platform: &'static Platform,
+    litebox: LiteBox<Platform>,
     fs: Option<LinuxFS>,
+    load_filter: Option<LoadFilter>,
 }
 
-impl Default for LinuxShim {
+impl Default for LinuxShimBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LinuxShim {
-    /// Returns a new shim.
+impl LinuxShimBuilder {
+    /// Returns a new shim builder.
     pub fn new() -> Self {
+        let platform = litebox_platform_multiplex::platform();
         Self {
-            litebox: crate::litebox(),
+            platform,
+            litebox: LiteBox::new(platform),
             fs: None,
+            load_filter: None,
         }
     }
 
     /// Returns the litebox object for the shim.
     pub fn litebox(&self) -> &LiteBox<Platform> {
-        self.litebox
+        &self.litebox
     }
 
     /// Set the global file system
@@ -206,40 +194,53 @@ impl LinuxShim {
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
     ) -> DefaultFS {
-        default_fs(in_mem_fs, tar_ro_fs)
+        default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
     }
 
     /// Set the load filter, which can augment envp or auxv when starting a new program.
-    ///
-    /// # Panics
-    /// Panics if the load filter is already set.
     pub fn set_load_filter(&mut self, callback: LoadFilter) {
-        set_load_filter(callback);
+        self.load_filter = Some(callback);
     }
 
-    fn into_global(self) -> Arc<GlobalState> {
-        Arc::new(GlobalState {
-            fs: self
-                .fs
-                .expect("File system must be set before creating global state"),
-        })
-    }
-
-    /// Loads the program at `path` as the shim's initial task.
+    /// Build the shim.
     ///
     /// # Panics
     /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
     /// before calling this method.
+    pub fn build(self) -> LinuxShim {
+        let mut net = Network::new(&self.litebox);
+        net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        let global = Arc::new(GlobalState {
+            platform: self.platform,
+            pm: PageManager::new(&self.litebox),
+            fs: self
+                .fs
+                .expect("File system must be set before calling build"),
+            futex_manager: FutexManager::new(&self.litebox),
+            pipes: Pipes::new(&self.litebox),
+            net: self.litebox.sync().new_mutex(net),
+            boot_time: self.platform.now(),
+            load_filter: self.load_filter,
+            next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
+            litebox: self.litebox,
+        });
+        LinuxShim(global)
+    }
+}
+
+#[derive(Clone)]
+pub struct LinuxShim(Arc<GlobalState>);
+
+impl LinuxShim {
+    /// Loads the program at `path` as the shim's initial task, returning the
+    /// initial register state.
     pub fn load_program(
-        self,
+        &self,
         task: litebox_common_linux::TaskParams,
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
-        let litebox = self.litebox;
-        let global = self.into_global();
-
         let litebox_common_linux::TaskParams {
             pid,
             ppid,
@@ -249,12 +250,12 @@ impl LinuxShim {
             egid,
         } = task;
 
-        let files = Arc::new(syscalls::file::FilesState::new(litebox));
-        files.initialize_stdio_in_shared_descriptors_table(&global.fs);
+        let files = Arc::new(syscalls::file::FilesState::new(self.0.clone()));
+        files.initialize_stdio_in_shared_descriptors_table(&self.0.fs);
 
         SHIM_TLS.init(LinuxShimTls {
             current_task: Task {
-                global,
+                global: self.0.clone(),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 pid,
@@ -286,6 +287,20 @@ impl LinuxShim {
             process,
         })
     }
+
+    /// Get the global page manager
+    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
+        &self.0.pm
+    }
+
+    /// Perform queued network interactions with the outside world.
+    ///
+    /// This function should be invoked in a loop, based on the returned advice.
+    pub fn perform_network_interaction(
+        &self,
+    ) -> litebox::net::PlatformInteractionReinvocationAdvice {
+        self.0.net.lock().perform_platform_interaction()
+    }
 }
 
 pub struct LoadedProgram {
@@ -305,23 +320,12 @@ impl LinuxShimProcess {
     }
 }
 
-/// Get the global litebox object
-pub(crate) fn litebox<'a>() -> &'a LiteBox<Platform> {
-    static LITEBOX: OnceBox<LiteBox<Platform>> = OnceBox::new();
-    LITEBOX.get_or_init(|| {
-        use litebox::platform::TimeProvider as _;
-        let platform = litebox_platform_multiplex::platform();
-        let _ = BOOT_TIME.get_or_init(|| alloc::boxed::Box::new(platform.now()));
-        alloc::boxed::Box::new(LiteBox::new(platform))
-    })
-}
-
 /// Create a default layered file system with the given in-memory and tar read-only layers.
 fn default_fs(
+    litebox: &LiteBox<Platform>,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
 ) -> LinuxFS {
-    let litebox = crate::litebox();
     let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
     litebox::fs::layered::FileSystem::new(
         litebox,
@@ -334,44 +338,6 @@ fn default_fs(
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     )
-}
-
-/// Get the global page manager
-pub fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
-    static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
-    VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
-}
-
-pub(crate) fn litebox_net<'a>() -> &'a litebox::sync::Mutex<Platform, Network<Platform>> {
-    static NET: OnceBox<litebox::sync::Mutex<Platform, Network<Platform>>> = OnceBox::new();
-    NET.get_or_init(|| {
-        let mut net = Network::new(litebox());
-        net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
-        alloc::boxed::Box::new(litebox().sync().new_mutex(net))
-    })
-}
-
-/// Perform queued network interactions with the outside world.
-///
-/// This function should be invoked in a loop, based on the returned advice.
-pub fn perform_network_interaction() -> litebox::net::PlatformInteractionReinvocationAdvice {
-    litebox_net().lock().perform_platform_interaction()
-}
-
-pub(crate) fn litebox_pipes<'a>() -> &'a Pipes<Platform> {
-    static PIPES: OnceBox<Pipes<Platform>> = OnceBox::new();
-    PIPES.get_or_init(|| {
-        let pipes = Pipes::new(litebox());
-        alloc::boxed::Box::new(pipes)
-    })
-}
-
-pub(crate) fn litebox_futex_manager<'a>() -> &'a FutexManager<Platform> {
-    static FUTEX_MANAGER: OnceBox<FutexManager<Platform>> = OnceBox::new();
-    FUTEX_MANAGER.get_or_init(|| {
-        let futex_manager = FutexManager::new(litebox());
-        alloc::boxed::Box::new(futex_manager)
-    })
 }
 
 // Special override so that `GETFL` can return stdio-specific flags
@@ -389,7 +355,7 @@ impl syscalls::file::FilesState {
         let stderr = fs
             .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
             .unwrap();
-        let mut dt = litebox().descriptor_table_mut();
+        let mut dt = self.global.litebox.descriptor_table_mut();
         let mut rds = self.raw_descriptor_store.write();
         for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
             let status_flags = OFlags::APPEND | OFlags::RDWR;
@@ -1236,8 +1202,29 @@ impl Task {
     }
 }
 
+/// Global shim state, shared across all tasks.
 struct GlobalState {
+    /// The platform instance used throughout the shim.
+    platform: &'static Platform,
+    /// The LiteBox instance used throughout the shim.
+    litebox: litebox::LiteBox<Platform>,
+    /// The page manager for managing virtual memory.
+    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    /// The filesystem implementation.
     fs: LinuxFS,
+    /// The futex manager for handling futex operations.
+    futex_manager: FutexManager<Platform>,
+    /// The anonymous pipe implementation.
+    pipes: Pipes<Platform>,
+    /// The network subsystem.
+    net: litebox::sync::Mutex<Platform, Network<Platform>>,
+    /// The time when the shim was started.
+    boot_time: <Platform as TimeProvider>::Instant,
+    /// Optional load filter function to modify environment variables during program loading.
+    load_filter: Option<LoadFilter>,
+    /// Next thread ID to assign.
+    // TODO: better management of thread IDs
+    next_thread_id: core::sync::atomic::AtomicI32,
 }
 
 struct LinuxShimTls {
@@ -1284,29 +1271,19 @@ fn with_current_task<R>(f: impl FnOnce(&Task) -> R) -> R {
 }
 
 pub type LoadFilter = fn(envp: &mut alloc::vec::Vec<alloc::ffi::CString>);
-static LOAD_FILTER: once_cell::race::OnceBox<LoadFilter> = once_cell::race::OnceBox::new();
-
-/// Set the load filter, which can augment envp when starting a new program.
-///
-/// # Panics
-/// Panics if the load filter is already set.
-fn set_load_filter(callback: LoadFilter) {
-    LOAD_FILTER
-        .set(alloc::boxed::Box::new(callback))
-        .expect("load filter already set");
-}
 
 #[cfg(test)]
 mod test_utils {
     extern crate std;
     use super::*;
-    use crate::syscalls::process::NEXT_THREAD_ID;
 
     impl GlobalState {
         /// Make a new task with default values for testing.
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
-            let pid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let files = Arc::new(syscalls::file::FilesState::new(litebox()));
+            let pid = self
+                .next_thread_id
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let files = Arc::new(syscalls::file::FilesState::new(self.clone()));
             files.initialize_stdio_in_shared_descriptors_table(&self.fs);
             Task {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
@@ -1332,7 +1309,7 @@ mod test_utils {
     impl Task {
         /// Returns a clone of this task with a new TID for testing.
         pub(crate) fn clone_for_test(&self) -> Option<Self> {
-            let tid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let tid = self.global.next_thread_id.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let task = Task {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 global: self.global.clone(),

@@ -7,7 +7,7 @@ use litebox_platform_multiplex::Platform;
 
 pub struct TestLauncher {
     platform: &'static Platform,
-    shim: litebox_shim_linux::LinuxShim,
+    shim: litebox_shim_linux::LinuxShimBuilder,
     fs: litebox_shim_linux::DefaultFS,
 }
 
@@ -19,7 +19,7 @@ impl TestLauncher {
     ) -> Self {
         let platform = Platform::new();
         litebox_platform_multiplex::set_platform(platform);
-        let shim = litebox_shim_linux::LinuxShim::new();
+        let shim = litebox_shim_linux::LinuxShimBuilder::new();
         let litebox = shim.litebox();
 
         let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
@@ -70,13 +70,14 @@ impl TestLauncher {
 
     pub fn test_load_exec_common(mut self, executable_path: &str) {
         self.shim.set_fs(self.fs);
+        let shim = self.shim.build();
+        litebox_platform_multiplex::platform().register_shim(shim.entrypoints());
         let argv = vec![
             CString::new(executable_path).unwrap(),
             CString::new("hello").unwrap(),
         ];
         let envp = vec![CString::new("PATH=/bin").unwrap()];
-        let program = self
-            .shim
+        let program = shim
             .load_program(self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
         unsafe {
