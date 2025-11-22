@@ -587,11 +587,15 @@ impl Task {
         };
 
         if let Err(err) = r {
+            litebox::log_println!(platform, "failed to spawn thread: {}", err);
             self.thread
                 .process
                 .nr_threads
                 .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-            return Err(err);
+            // Treat all spawn errors as `ENOMEM`. `EAGAIN` and other errors are
+            // for conditions the user can control (such as "in-shim" rlimit
+            // violations).
+            return Err(Errno::ENOMEM);
         }
 
         Ok(usize::try_from(child_tid).unwrap())
