@@ -84,18 +84,19 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
     // and restore it manually.
     #[cfg(target_arch = "x86")]
     unsafe {
+        let remaining;
         core::arch::asm! {
             "2:",
             "xchg esi, eax",
             "rep movsb",
             "3:",
             "mov esi, eax",
-            ex_table_entry!("2b", "3b", "{fault}"),
+            ex_table_entry!("2b", "3b", "3b"),
             inout("di") dst => _,
             inout("ax") src => _,
-            inout("cx") size => _,
-            fault = label { return Err(Fault) }
+            inout("cx") size => remaining,
         }
+        if remaining == 0 { Ok(()) } else { Err(Fault) }
     }
     Ok(())
 }
