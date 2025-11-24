@@ -702,7 +702,7 @@ fn thread_start(
 
 impl litebox::platform::ThreadProvider for WindowsUserland {
     type ExecutionContext = litebox_common_linux::PtRegs;
-    type ThreadSpawnError = litebox_common_linux::errno::Errno;
+    type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
 
     unsafe fn spawn_thread(
@@ -714,7 +714,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::spawn(move || thread_start(init_thread, ctx));
+        let _handle = std::thread::Builder::new().spawn(move || thread_start(init_thread, ctx))?;
 
         Ok(())
     }
