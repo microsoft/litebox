@@ -418,7 +418,7 @@ impl Task {
         const MAX_SIGNAL_NUMBER: u64 = 64;
 
         let litebox_common_linux::CloneArgs {
-            flags,
+            mut flags,
             pidfd: _,
             child_tid,
             parent_tid,
@@ -430,6 +430,12 @@ impl Task {
             set_tid_size,
             cgroup,
         } = *args;
+
+        // `CLONE_DETACHED` is ignored but has been reserved for reuse with
+        // `clone3` or in combination with `CLONE_PIDFD`.
+        if !clone3 && !flags.contains(CloneFlags::PIDFD) {
+            flags.remove(CloneFlags::DETACHED);
+        }
 
         let required_clone_flags =
             CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
