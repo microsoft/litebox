@@ -17,7 +17,7 @@ struct CliArgs {
     output_binary: Option<PathBuf>,
     /// Absolute address to set in the trampoline (default = 0)
     #[arg(long)]
-    trampoline_addr: Option<usize>,
+    trampoline_addr: Option<u64>,
 }
 
 fn copy_file_permissions(

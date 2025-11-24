@@ -21,25 +21,28 @@ fn objdump(binary: &[u8]) -> String {
         .join("\n")
 }
 
-#[cfg(target_arch = "x86_64")]
-const HELLO_INPUT: &[u8] = include_bytes!("hello");
-#[cfg(target_arch = "x86")]
-const HELLO_INPUT: &[u8] = include_bytes!("hello-32");
+const HELLO_INPUT_64: &[u8] = include_bytes!("hello");
+const HELLO_INPUT_32: &[u8] = include_bytes!("hello-32");
 
-#[test]
-fn snapshot_test_hello_world() {
-    let output = litebox_syscall_rewriter::hook_syscalls_in_elf(HELLO_INPUT, None).unwrap();
+fn run_snapshot_test(input: &[u8], snapshot: &str) {
+    let output = litebox_syscall_rewriter::hook_syscalls_in_elf(input, None).unwrap();
     let diff = similar::udiff::unified_diff(
         similar::Algorithm::Myers,
-        &objdump(HELLO_INPUT),
+        &objdump(input),
         &objdump(&output),
         3,
         Some(("original", "rewritten")),
     );
 
-    match std::env::consts::ARCH {
-        "x86_64" => insta::assert_snapshot!("hello-diff", diff),
-        "x86" => insta::assert_snapshot!("hello-32-diff", diff),
-        _ => unimplemented!(),
-    }
+    insta::assert_snapshot!(snapshot, diff);
+}
+
+#[test]
+fn snapshot_test_hello_world_x86_64() {
+    run_snapshot_test(HELLO_INPUT_64, "hello-diff");
+}
+
+#[test]
+fn snapshot_test_hello_world_x86() {
+    run_snapshot_test(HELLO_INPUT_32, "hello-32-diff");
 }
