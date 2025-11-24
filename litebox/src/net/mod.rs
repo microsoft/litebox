@@ -715,23 +715,28 @@ where
     pub fn close(&mut self, fd: &SocketFd<Platform>) -> Result<(), CloseError> {
         // We close immediately if we can
         let mut dt = self.litebox.descriptor_table_mut();
-        if let Some(socket_handle) = dt.remove(fd) {
-            // Can immediately close it out.
-            drop(dt);
-            self.close_handle(socket_handle.entry);
-            Ok(())
-        } else {
-            // It seems like there might be other duplicates around (e.g., due to `dup`), so we
-            // can't immediately close it out (or this FD has already been closed out). We
-            // attempt to queue it for future closure and then just return.
-            let fd = dt.duplicate(fd).ok_or(CloseError::InvalidFd)?;
-            let Some(()) = dt.with_entry_mut(&fd, |entry| entry.entry.consider_closed = true)
-            else {
-                unreachable!()
-            };
-            self.queued_for_closure.push(fd);
-            Ok(())
+        match dt
+            .close_and_duplicate_if_shared(fd)
+            .ok_or(CloseError::InvalidFd)?
+        {
+            super::fd::CloseResult::Closed(socket_handle) => {
+                // Can immediately close it out.
+                drop(dt);
+                self.close_handle(socket_handle.entry);
+            }
+            super::fd::CloseResult::Duplicated(dup_fd) => {
+                // It seems like there might be other duplicates around (e.g., due to `dup`), so we
+                // can't immediately close it out.
+                // We attempt to queue it for future closure and then just return.
+                let Some(()) =
+                    dt.with_entry_mut(&dup_fd, |entry| entry.entry.consider_closed = true)
+                else {
+                    unreachable!()
+                };
+                self.queued_for_closure.push(dup_fd);
+            }
         }
+        Ok(())
     }
 
     /// Attempt to close as many queued-to-close FDs as possible. Returns `true` iff any of them

@@ -122,6 +122,35 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
     }
 
+    /// Close the provided `fd`, and remove the corresponding entry if it is unique.
+    /// If not unique, duplicate the `fd` for future closure.
+    pub(crate) fn close_and_duplicate_if_shared<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fd: &TypedFd<Subsystem>,
+    ) -> Option<CloseResult<Subsystem>> {
+        let idx = fd.x.as_usize()?;
+        let Some(old) = self.entries[idx].take() else {
+            unreachable!();
+        };
+        fd.x.mark_as_closed();
+        if Arc::strong_count(&old.x) == 1 {
+            // Unique, so we can just return it.
+            let entry = Arc::into_inner(old.x)
+                .map(RwLock::into_inner)
+                .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
+                .unwrap();
+            Some(CloseResult::Closed(entry))
+        } else {
+            // Shared, so we need to duplicate it.
+            let old = self.entries[idx].replace(old);
+            assert!(old.is_none());
+            Some(CloseResult::Duplicated(TypedFd {
+                _phantom: PhantomData,
+                x: OwnedFd::new(idx),
+            }))
+        }
+    }
+
     /// Drain all entries that are fully accounted for by the `fds`, removing those FDs from `fd`s,
     /// and returning their corresponding entries.
     ///
@@ -450,6 +479,14 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             .metadata
             .insert(metadata)
     }
+}
+
+/// Result of a [`Descriptors::close_and_duplicate_if_shared`] operation
+pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
+    /// The FD was the last reference and has been closed, returning the entry
+    Closed(Subsystem::Entry),
+    /// There are other references, so a new duplicate was created for queued closure
+    Duplicated(TypedFd<Subsystem>),
 }
 
 /// Safe(r) conversions between safely-typed file descriptors and unsafely-typed integers.
