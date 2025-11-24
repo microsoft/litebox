@@ -2,7 +2,6 @@
 
 use crate::{
     arch::{
-        MAX_CORES,
         instrs::rdmsr,
         msr::{MSR_EFER, MSR_IA32_CR_PAT},
     },
@@ -213,28 +212,31 @@ fn get_entry() -> u64 {
     &raw const _start as u64
 }
 
-/// Hyper-V Hypercall to initialize VTL (VTL1 for now) for all online cores (except core 0)
-///
-/// # Panics
-/// Panics if the number of online cores is greater than `MAX_CORES`.
+/// Hyper-V Hypercall to initialize VTL (VTL1 for now) for a core (except core 0)
 #[allow(
     clippy::similar_names,
     reason = "some versions of clippy trigger this warning due to rip/rsp"
 )]
-pub fn init_vtl_aps(online_cores: u32) -> Result<u64, HypervCallError> {
-    assert!(online_cores <= u32::try_from(MAX_CORES).expect("MAX_CORES"));
+pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
+    // Skip boot processor since VTL is already enabled for it by VTL0
+    if core == 0 {
+        serial_println!("Skipping boot processor (core 0)");
+        return Ok(0);
+    }
 
     let rip: u64 = get_entry() as *const () as u64;
     let rsp = get_address_of_special_page(VTL1_KERNEL_STACK_PAGE) + PAGE_SIZE as u64 - 1;
     let tss = get_address_of_special_page(VTL1_TSS_PAGE);
 
-    for core in 1..online_cores {
-        let result = hvcall_enable_vp_vtl(core, HV_VTL_SECURE, tss, rip, rsp);
-        if result.is_err() {
-            serial_println!("Failed to enable VTL for core {}: {:?}", core, result);
-            return result;
+    let result = hvcall_enable_vp_vtl(core, HV_VTL_SECURE, tss, rip, rsp);
+    match result {
+        Ok(_) => {
+            serial_println!("Enabled VTL for core {}", core);
+            Ok(0)
+        }
+        Err(e) => {
+            serial_println!("Failed to enable VTL for core {}: {:?}", core, e);
+            Err(e)
         }
     }
-
-    Ok(0)
 }
