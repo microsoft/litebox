@@ -637,7 +637,7 @@ impl Task {
         const MAX_SIGNAL_NUMBER: u64 = 64;
 
         let litebox_common_linux::CloneArgs {
-            flags,
+            mut flags,
             pidfd: _,
             child_tid,
             parent_tid,
@@ -649,6 +649,12 @@ impl Task {
             set_tid_size,
             cgroup,
         } = *args;
+
+        // `CLONE_DETACHED` is ignored but has been reserved for reuse with
+        // `clone3` or in combination with `CLONE_PIDFD`.
+        if !clone3 && !flags.contains(CloneFlags::PIDFD) {
+            flags.remove(CloneFlags::DETACHED);
+        }
 
         let required_clone_flags =
             CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
@@ -777,7 +783,7 @@ impl Task {
         thread.clear_child_tid.set(clear_child_tid);
 
         let platform = litebox_platform_multiplex::platform();
-        unsafe {
+        let r = unsafe {
             platform.spawn_thread(
                 ctx,
                 Box::new(NewThreadArgs {
@@ -795,7 +801,14 @@ impl Task {
                         pending_sigreturn: false.into(),
                     },
                 }),
-            )?;
+            )
+        };
+        if let Err(err) = r {
+            litebox::log_println!(platform, "failed to spawn thread: {}", err);
+            // Treat all spawn errors as `ENOMEM`. `EAGAIN` and other errors are
+            // for conditions the user can control (such as "in-shim" rlimit
+            // violations).
+            return Err(Errno::ENOMEM);
         }
 
         Ok(usize::try_from(child_tid).unwrap())

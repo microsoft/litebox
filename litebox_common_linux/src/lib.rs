@@ -1167,6 +1167,8 @@ bitflags::bitflags! {
         const PARENT_SETTID  = 0x00100000;
         /// Clear the TID in the child
         const CHILD_CLEARTID = 0x00200000;
+        /// Ignored.
+        const DETACHED      = 0x00400000;
         /// Set if the tracing process can't force CLONE_PTRACE on this clone
         const UNTRACED       = 0x00800000;
         /// Set the TID in the child
