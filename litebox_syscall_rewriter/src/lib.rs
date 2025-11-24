@@ -221,10 +221,6 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     builder.sections.get_mut(trampoline_section).sh_size = trampoline_vec.len() as u64;
     builder.sections.get_mut(trampoline_section).data =
         object::build::elf::SectionData::Data(trampoline_vec.into());
-    builder
-        .segments
-        .get_mut(last_segment_id)
-        .recalculate_ranges(&builder.sections);
 
     let mut out = vec![];
     builder
