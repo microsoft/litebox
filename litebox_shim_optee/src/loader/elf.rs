@@ -140,14 +140,18 @@ impl ElfLoaderMmap {
         prot: ProtFlags,
         flags: MapFlags,
     ) -> elf_loader::Result<usize> {
+        let flags = litebox_common_linux::MapFlags::from_bits(
+            flags.bits() | MapFlags::MAP_ANONYMOUS.bits(),
+        )
+        .expect("unsupported flags");
+        // TODO: implement demand paging in the following platforms to avoid MAP_POPULATE
+        #[cfg(any(feature = "platform_lvbs", feature = "platform_kernel"))]
+        let flags = flags | litebox_common_linux::MapFlags::MAP_POPULATE;
         match crate::syscalls::mm::sys_mmap(
             addr.unwrap_or(0),
             len,
             litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
-            litebox_common_linux::MapFlags::from_bits(
-                flags.bits() | MapFlags::MAP_ANONYMOUS.bits(),
-            )
-            .expect("unsupported flags"),
+            flags,
             -1,
             0,
         ) {

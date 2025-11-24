@@ -1,0 +1,201 @@
+#![cfg(target_arch = "x86_64")]
+#![no_std]
+#![no_main]
+
+use bootloader::{BootInfo, bootinfo::MemoryRegionType, entry_point};
+use core::panic::PanicInfo;
+use litebox_common_optee::{TeeIdentity, TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned};
+use litebox_platform_kernel::{
+    arch::{enable_extended_states, enable_fsgsbase, enable_smep, gdt, interrupts},
+    debug_serial_println,
+    mm::MemoryProvider,
+    per_cpu_variables::{PerCpuVariables, with_per_cpu_variables},
+    serial_println,
+    user_context::UserSpaceManagement,
+};
+use litebox_platform_multiplex::Platform;
+use litebox_shim_optee::loader::ElfLoadInfo;
+use x86_64::VirtAddr;
+
+#[cfg(not(feature = "qemu"))]
+use litebox_platform_kernel::arch::instrs::hlt_loop;
+
+entry_point!(kernel_start);
+
+fn kernel_start(bootinfo: &'static BootInfo) -> ! {
+    enable_fsgsbase();
+    enable_extended_states();
+
+    let stack_top = with_per_cpu_variables(PerCpuVariables::kernel_stack_top);
+
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, rax",
+            "and rsp, -16",
+            "call {kernel_main}",
+            in("rdi") bootinfo, in("rax") stack_top,
+            kernel_main = sym kernel_main,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    #[cfg(feature = "qemu")]
+    qemu_exit();
+    #[cfg(not(feature = "qemu"))]
+    hlt_loop();
+}
+
+unsafe extern "C" fn kernel_main(bootinfo: &'static BootInfo) -> ! {
+    serial_println!("===========================================");
+    serial_println!(" Hello from LiteBox for (Virtual) Machine! ");
+    serial_println!("===========================================");
+
+    let phys_mem_offset = VirtAddr::new(bootinfo.physical_memory_offset);
+    debug_serial_println!("Physical memory offset: {:#x}", phys_mem_offset.as_u64());
+
+    let memory_map = &bootinfo.memory_map;
+    for region in memory_map.iter() {
+        if region.region_type == MemoryRegionType::Usable {
+            let mem_fill_start =
+                usize::try_from(phys_mem_offset.as_u64() + region.range.start_frame_number * 4096)
+                    .unwrap();
+            let mem_fill_size = usize::try_from(
+                (region.range.end_frame_number - region.range.start_frame_number) * 4096,
+            )
+            .unwrap();
+            unsafe {
+                Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
+            }
+            debug_serial_println!(
+                "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
+                mem_fill_start,
+                mem_fill_size
+            );
+        }
+    }
+
+    let l4_table = unsafe { active_level_4_table_addr() };
+    debug_serial_println!("L4 table physical Address: {:#x}", l4_table.as_u64());
+
+    let platform = Platform::new(l4_table);
+    debug_serial_println!("LiteBox Platform created at {:p}.", platform);
+
+    gdt::init();
+    interrupts::init_idt();
+    debug_serial_println!("GDT and IDT initialized.");
+
+    litebox_platform_multiplex::set_platform(platform);
+    Platform::register_shim(&litebox_shim_optee::OpteeShim);
+    debug_serial_println!("OP-TEE Shim registered.");
+
+    enable_smep();
+
+    if let Ok(session_id) = platform.create_userspace() {
+        let loaded_ta = litebox_shim_optee::loader::load_elf_buffer(TA_BINARY).unwrap();
+        run_ta_with_default_commands(session_id, &loaded_ta);
+    }
+
+    serial_println!("BYE!");
+    // TODO: this is QEMU/KVM specific instructions to terminate VM/VMM via
+    // the `isa-debug-exit` device. Different VMMs have different ways for this.
+    #[cfg(feature = "qemu")]
+    qemu_exit();
+    #[cfg(not(feature = "qemu"))]
+    hlt_loop();
+}
+
+/// This function simply opens and closes a session to the TA to verify that
+/// it can be loaded and run. Note that an OP-TEE TA does nothing without
+/// a client invoking commands on it.
+fn run_ta_with_default_commands(session_id: usize, ta_info: &ElfLoadInfo) {
+    for func_id in [
+        UteeEntryFunc::OpenSession,
+        UteeEntryFunc::InvokeCommand,
+        UteeEntryFunc::CloseSession,
+    ] {
+        match func_id {
+            UteeEntryFunc::OpenSession => {
+                let _litebox = litebox_shim_optee::init_session(
+                    &TeeUuid::default(),
+                    &TeeIdentity {
+                        login: TeeLogin::User,
+                        uuid: TeeUuid::default(),
+                    },
+                );
+                let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
+
+                // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
+                // loaded binary and heap. In that sense, we can create (and destroy) a stack
+                // for each command freely.
+                let stack = litebox_shim_optee::loader::init_stack(
+                    Some(ta_info.stack_base),
+                    params.as_slice(),
+                )
+                .expect("Failed to initialize stack with parameters");
+                let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
+                    ta_info,
+                    &stack,
+                    u32::try_from(session_id).unwrap(),
+                    func_id as u32,
+                    None,
+                );
+                unsafe { litebox_platform_kernel::run_thread(&mut pt_regs) };
+            }
+            UteeEntryFunc::InvokeCommand => {
+                let mut params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
+                params[0] = UteeParamOwned::ValueInout {
+                    value_a: 200,
+                    value_b: 0,
+                    out_address: None,
+                };
+
+                let stack = litebox_shim_optee::loader::init_stack(
+                    Some(ta_info.stack_base),
+                    params.as_slice(),
+                )
+                .expect("Failed to initialize stack with parameters");
+                let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
+                    ta_info,
+                    &stack,
+                    u32::try_from(session_id).unwrap(),
+                    func_id as u32,
+                    Some(1),
+                );
+                unsafe { litebox_platform_kernel::run_thread(&mut pt_regs) };
+            }
+            UteeEntryFunc::CloseSession => {
+                litebox_shim_optee::deinit_session();
+            }
+            UteeEntryFunc::Unknown => panic!("BUG: Unsupported function ID"),
+        }
+    }
+}
+
+unsafe fn active_level_4_table_addr() -> x86_64::PhysAddr {
+    use x86_64::registers::control::Cr3;
+    let (level_4_table_frame, _) = Cr3::read();
+    level_4_table_frame.start_address()
+}
+
+#[cfg(feature = "qemu")]
+fn qemu_exit() -> ! {
+    const ISA_DEBUG_EXIT_IOBASE: u16 = 0xf4;
+    const EXIT_CODE: u8 = 1;
+    unsafe {
+        core::arch::asm!(
+            "mov dx, {}; mov al, {}; out dx, al; hlt",
+            const ISA_DEBUG_EXIT_IOBASE,
+            const EXIT_CODE,
+            options(noreturn)
+        )
+    }
+}
+
+// TODO: support loading other TAs (dynamically)
+const TA_BINARY: &[u8] =
+    include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop {}
+}

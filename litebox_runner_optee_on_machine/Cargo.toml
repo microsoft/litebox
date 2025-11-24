@@ -1,0 +1,24 @@
+[package]
+name = "litebox_runner_optee_on_machine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+litebox = { version = "0.1.0", path = "../litebox" }
+litebox_platform_kernel = { version = "0.1.0", path = "../litebox_platform_kernel", default-features = false, features = ["interrupt"] }
+litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_kernel"] }
+litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
+litebox_common_optee = { version = "0.1.0", path = "../litebox_common_optee" }
+litebox_shim_optee = { path = "../litebox_shim_optee/", version = "0.1.0", default-features = false, features = ["platform_kernel"] }
+bootloader = { version = "0.9", features = ["map_physical_memory"] }
+spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
+
+[features]
+default = ["qemu"]
+qemu = []
+
+[lints]
+workspace = true
