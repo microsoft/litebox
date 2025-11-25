@@ -349,7 +349,7 @@ impl<Host: HostInterface> litebox::platform::StdioProvider for LinuxKernel<Host>
 }
 
 /// Platform-Host Interface
-pub trait HostInterface {
+pub trait HostInterface: 'static {
     /// Page allocation from host.
     ///
     /// It can return more than requested size. On success, it returns the start address

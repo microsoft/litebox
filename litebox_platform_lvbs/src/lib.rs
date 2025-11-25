@@ -398,7 +398,7 @@ impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
 /// An implementation of [`litebox::platform::RawMutex`]
 pub struct RawMutex<Host: HostInterface> {
     inner: AtomicU32,
-    host: core::marker::PhantomData<Host>,
+    host: core::marker::PhantomData<fn(Host) -> Host>,
 }
 
 unsafe impl<Host: HostInterface> Send for RawMutex<Host> {}
@@ -584,7 +584,7 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
 }
 
 /// Platform-Host Interface
-pub trait HostInterface {
+pub trait HostInterface: 'static {
     /// Page allocation from host.
     ///
     /// It can return more than requested size. On success, it returns the start address
