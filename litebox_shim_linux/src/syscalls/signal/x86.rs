@@ -1,12 +1,11 @@
-use super::SignalState;
-use crate::{Errno, Task};
-use crate::{UserConstPointer, UserMutPointer};
+use super::{DeliverFault, SignalState};
+use crate::{ConstPtr, Errno, MutPtr, Task};
 use core::mem::offset_of;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
     PtRegs,
-    signal::{SaFlags, SigAction, SigSet, Siginfo, Ucontext, x86::Sigcontext},
+    signal::{SaFlags, SigAction, SigSet, Siginfo, Signal, Ucontext, x86::Sigcontext},
 };
 
 #[repr(C)]
@@ -40,8 +39,8 @@ impl Task {
     /// Legacy signal return syscall implementation for x86.
     pub(crate) fn sys_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
         let lctx_addr = ctx.esp.wrapping_sub(8);
-        let lctx_ptr = UserConstPointer::<LegacyContext>::from_usize(lctx_addr);
-        let Ok(lctx) = (unsafe { lctx_ptr.read_at_offset(0) }) else {
+        let lctx_ptr = ConstPtr::<LegacyContext>::from_usize(lctx_addr);
+        let Some(lctx) = (unsafe { lctx_ptr.read_at_offset(0) }) else {
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);
         };
@@ -103,33 +102,33 @@ impl SignalState {
 
         let last_exception = self.last_exception.get();
         let sigcontext = Sigcontext {
-            gs: ctx.xgs as u32,
-            fs: ctx.xfs as u32,
-            es: ctx.xes as u32,
-            ds: ctx.xds as u32,
-            edi: ctx.edi as u32,
-            esi: ctx.esi as u32,
-            ebp: ctx.ebp as u32,
-            esp: ctx.esp as u32,
-            ebx: ctx.ebx as u32,
-            edx: ctx.edx as u32,
-            ecx: ctx.ecx as u32,
-            eax: ctx.eax as u32,
-            eip: ctx.eip as u32,
+            gs: ctx.xgs.truncate(),
+            fs: ctx.xfs.truncate(),
+            es: ctx.xes.truncate(),
+            ds: ctx.xds.truncate(),
+            edi: ctx.edi.truncate(),
+            esi: ctx.esi.truncate(),
+            ebp: ctx.ebp.truncate(),
+            esp: ctx.esp.truncate(),
+            ebx: ctx.ebx.truncate(),
+            edx: ctx.edx.truncate(),
+            ecx: ctx.ecx.truncate(),
+            eax: ctx.eax.truncate(),
+            eip: ctx.eip.truncate(),
             cs: ctx.xcs.truncate(),
-            eflags: ctx.eflags as u32,
-            esp_at_signal: ctx.esp as u32,
+            eflags: ctx.eflags.truncate(),
+            esp_at_signal: ctx.esp.truncate(),
             ss: ctx.xss.truncate(),
-            err: last_exception.error_code as u32,
-            trapno: last_exception.exception.0 as u32,
+            err: last_exception.error_code,
+            trapno: last_exception.exception.0.into(),
             oldmask,
-            cr2: last_exception.cr2 as u32,
+            cr2: last_exception.cr2.truncate(),
             fpstate: 0, // TODO
         };
 
         let rt = action.flags.contains(SaFlags::SIGINFO);
         if rt {
-            let frame_ptr = UserMutPointer::from_usize(frame_addr);
+            let frame_ptr = MutPtr::from_usize(frame_addr);
             let frame = SignalFrameRt {
                 return_address: action.restorer,
                 signal: siginfo.signo,
@@ -146,7 +145,7 @@ impl SignalState {
             };
             unsafe { frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)? };
         } else {
-            let frame_ptr = UserMutPointer::from_usize(frame_addr);
+            let frame_ptr = MutPtr::from_usize(frame_addr);
             let frame = SignalFrame {
                 return_address: action.restorer,
                 signal: siginfo.signo,
@@ -157,7 +156,7 @@ impl SignalState {
                 },
             };
             unsafe { frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)? };
-        };
+        }
 
         ctx.esp = frame_addr;
         ctx.eip = action.sigaction;

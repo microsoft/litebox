@@ -422,7 +422,6 @@ impl Task {
         &self,
         user_desc: &mut litebox_common_linux::UserDesc,
     ) -> Result<(), Errno> {
-        use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
         let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea { user_desc };
         let token = litebox_platform_multiplex::platform()
             .get_punchthrough_token_for(punchthrough)
