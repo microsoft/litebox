@@ -299,7 +299,7 @@ impl Task {
 enum ThreadInitState {
     #[default]
     None,
-    NewProcess(crate::loader::ElfLoadInfo),
+    NewProcess(crate::loader::elf::ElfLoadInfo),
     NewThread {
         stack: Option<usize>,
         tls: Option<ThreadLocalDescriptor>,
@@ -1371,6 +1371,10 @@ impl Task {
             copy_vector(envp, "envp")?
         };
 
+        let loader = crate::loader::elf::ElfLoader::new(self, path)?;
+
+        // After this point, the old program is torn down and failures must terminate the process.
+
         // Kill all the other threads in this process and wait for them to exit.
         if !self.kill_other_threads() {
             // Another thread is already in the process of execve. This thread
@@ -1397,8 +1401,8 @@ impl Task {
             ctx.xgs.truncate(),
         );
 
-        // TODO: split this operation into pre-unmap and post-unmap parts, and handle failure properly for both cases.
-        self.load_program(path, argv_vec, envp_vec).unwrap();
+        self.load_program(loader, argv_vec, envp_vec)
+            .expect("TODO: terminate the process cleanly");
 
         self.init_thread_context(ctx);
         Ok(0)
@@ -1469,20 +1473,17 @@ impl Task {
     /// to start executing it.
     pub(crate) fn load_program(
         &self,
-        path: &str,
+        mut loader: crate::loader::elf::ElfLoader<'_>,
         argv: Vec<alloc::ffi::CString>,
         mut envp: Vec<alloc::ffi::CString>,
-    ) -> Result<(), crate::loader::ElfLoaderError> {
+    ) -> Result<(), crate::loader::elf::ElfLoaderError> {
         if let Some(&filter) = crate::LOAD_FILTER.get() {
             filter(&mut envp);
         }
 
-        // TODO: split parsing from mapping so that we can return an error code to execve that it
-        // can return to the guest.
-        let load_info = crate::loader::load_program(self, path, argv, envp, self.init_auxv())?;
+        let load_info = loader.load(argv, envp, self.init_auxv())?;
 
-        let comm = path.rsplit('/').next().unwrap_or("unknown");
-        self.set_task_comm(comm.as_bytes());
+        self.set_task_comm(loader.comm());
 
         self.thread
             .init_state

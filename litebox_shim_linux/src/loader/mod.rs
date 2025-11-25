@@ -2,27 +2,8 @@
 
 #![cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 pub mod auxv;
-mod elf;
+pub mod elf;
 mod stack;
-
-use crate::Task;
-pub use elf::{ElfLoadInfo, ElfLoaderError};
-
-/// Load a program into the LiteBox shim.
-pub(crate) fn load_program(
-    task: &Task,
-    path: &str,
-    argv: alloc::vec::Vec<alloc::ffi::CString>,
-    envp: alloc::vec::Vec<alloc::ffi::CString>,
-    aux: auxv::AuxVec,
-) -> Result<elf::ElfLoadInfo, elf::ElfLoaderError> {
-    elf::ElfLoader::load(task, path, argv, envp, aux)
-}
-
-/// The magic number used to identify the LiteBox rewriter and where we should
-/// update the syscall callback pointer.
-pub const REWRITER_MAGIC_NUMBER: u64 = u64::from_le_bytes(*b"LITE BOX");
-pub const REWRITER_VERSION_NUMBER: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
 pub(crate) const DEFAULT_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MB
 

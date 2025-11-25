@@ -13,6 +13,7 @@ use litebox::{
 use syscalls::Sysno;
 
 pub mod errno;
+pub mod loader;
 pub mod mm;
 
 extern crate alloc;

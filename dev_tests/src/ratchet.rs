@@ -10,7 +10,6 @@ fn ratchet_transmutes() -> Result<()> {
         &[
             ("dev_tests/", 2),
             ("litebox/", 1),
-            ("litebox_shim_linux/", 1),
             ("litebox_platform_linux_userland/", 2),
         ],
         |file| {

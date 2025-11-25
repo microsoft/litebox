@@ -236,7 +236,7 @@ impl LinuxShim {
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
-    ) -> Result<LoadedProgram, loader::ElfLoaderError> {
+    ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
         let litebox = self.litebox;
         let global = self.into_global();
 
@@ -278,11 +278,12 @@ impl LinuxShim {
             _not_send: core::marker::PhantomData,
         };
         with_current_task(|task| {
-            task.load_program(path, argv, envp)?;
-            Ok(LoadedProgram {
-                entrypoints,
-                process: LinuxShimProcess(task.process().clone()),
-            })
+            task.load_program(loader::elf::ElfLoader::new(task, path)?, argv, envp)?;
+            Ok(LinuxShimProcess(task.process().clone()))
+        })
+        .map(|process| LoadedProgram {
+            entrypoints,
+            process,
         })
     }
 }

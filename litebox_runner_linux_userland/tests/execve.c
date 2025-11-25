@@ -56,6 +56,11 @@ int main(int argc, char *argv[], char *envp[]) {
         new_envp[0] = "PHASE=after_exec";
         new_envp[1] = NULL;
 
+        execve("nonsense", new_argv, new_envp);  // should fail
+        if (errno != ENOENT) {
+            die("execve nonsense");
+        }
+
         // Spawn some threads that should be terminated on exec.
         for (int i = 0; i < 20; i++) {
             pthread_t thread;
