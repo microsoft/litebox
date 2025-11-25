@@ -134,19 +134,12 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
 impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
     type RawMutex = RawMutex<Host>;
-
-    fn new_raw_mutex(&self) -> Self::RawMutex {
-        Self::RawMutex {
-            inner: AtomicU32::new(0),
-            host: core::marker::PhantomData,
-        }
-    }
 }
 
 /// An implementation of [`litebox::platform::RawMutex`]
 pub struct RawMutex<Host: HostInterface> {
     inner: AtomicU32,
-    host: core::marker::PhantomData<Host>,
+    host: core::marker::PhantomData<fn(Host) -> Host>,
 }
 
 unsafe impl<Host: HostInterface> Send for RawMutex<Host> {}
@@ -154,6 +147,8 @@ unsafe impl<Host: HostInterface> Sync for RawMutex<Host> {}
 
 /// TODO: common mutex implementation could be moved to a shared crate
 impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
+    const INIT: Self = Self::new();
+
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
         &self.inner
     }
@@ -180,6 +175,13 @@ impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
 }
 
 impl<Host: HostInterface> RawMutex<Host> {
+    const fn new() -> Self {
+        Self {
+            inner: AtomicU32::new(0),
+            host: core::marker::PhantomData,
+        }
+    }
+
     fn block_or_maybe_timeout(
         &self,
         val: u32,

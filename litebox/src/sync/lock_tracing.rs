@@ -1,5 +1,7 @@
 //! Lock-tracing functionality
 
+use core::time::Duration;
+
 use arrayvec::{ArrayString, ArrayVec};
 
 use crate::platform::Instant as _;
@@ -121,38 +123,64 @@ impl Locked {
     }
 }
 
-pub(super) struct LockTracker<Platform: RawSyncPrimitivesProvider> {
-    x: alloc::sync::Arc<spin::Mutex<LockTrackerX<Platform>>>,
+struct LockTrackerPlatform<Platform: RawSyncPrimitivesProvider> {
+    platform: &'static Platform,
+    boot_time: Platform::Instant,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> Clone for LockTracker<Platform> {
-    fn clone(&self) -> Self {
-        Self { x: self.x.clone() }
+trait DynLockTrackerProvider: Send + Sync {
+    fn now(&self) -> Duration;
+    fn debug_log_print(&self, msg: &ArrayString<1024>);
+}
+
+impl<Platform: RawSyncPrimitivesProvider> DynLockTrackerProvider for LockTrackerPlatform<Platform> {
+    fn now(&self) -> Duration {
+        self.platform.now().duration_since(&self.boot_time)
+    }
+
+    fn debug_log_print(&self, msg: &ArrayString<1024>) {
+        self.platform.debug_log_print(msg);
     }
 }
+
+pub(super) struct LockTracker {
+    x: alloc::boxed::Box<spin::Mutex<LockTrackerX>>,
+}
+
+impl LockTracker {
+    fn new<Platform: RawSyncPrimitivesProvider>(platform: &'static Platform) -> Self {
+        Self {
+            x: alloc::boxed::Box::new(spin::Mutex::new(LockTrackerX {
+                held: ArrayVec::new_const(),
+                platform: LockTrackerPlatform {
+                    platform,
+                    boot_time: platform.now(),
+                },
+            })),
+        }
+    }
+
+    fn global() -> Option<&'static Self> {
+        LOCK_TRACKER.get()
+    }
+
+    /// Initializes the global lock tracker with the given platform.
+    pub(crate) fn init<Platform: RawSyncPrimitivesProvider>(platform: &'static Platform) {
+        LOCK_TRACKER.call_once(|| Self::new(platform));
+    }
+}
+
+static LOCK_TRACKER: spin::Once<LockTracker> = spin::Once::new();
 
 /// The main tracker, which manages both tracking and (if necessary) panicking upon invariant
 /// failure. Can/should only be accessed from the singleton that is automatically used upon usage of
 /// any of the `pub(crate)` functions available via the tracker.
-pub(super) struct LockTrackerX<Platform: RawSyncPrimitivesProvider> {
+struct LockTrackerX<T: ?Sized + DynLockTrackerProvider = dyn DynLockTrackerProvider> {
     held: ArrayVec<Option<Locked>, CONFIG_MAX_NUMBER_OF_TRACKED_LOCKS>,
-    platform: &'static Platform,
+    platform: T,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> LockTrackerX<Platform> {
-    /// This should be invoked exactly once at the point of the creation of the parent
-    /// synchronization object; it must NOT be created anywhere else.
-    pub(super) fn new_from_platform(platform: &'static Platform) -> LockTracker<Platform> {
-        LockTracker {
-            x: alloc::sync::Arc::new(spin::Mutex::new(Self {
-                held: ArrayVec::new_const(),
-                platform,
-            })),
-        }
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider> core::fmt::Display for LockTrackerX<Platform> {
+impl core::fmt::Display for LockTrackerX {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{{")?;
         let mut latest = None;
@@ -179,22 +207,22 @@ impl<Platform: RawSyncPrimitivesProvider> core::fmt::Display for LockTrackerX<Pl
     }
 }
 
-/// A witness to having invoked [`LockTracker::mark_lock`], must be explicitly marked with
+/// A witness to having invoked [`LockAttemptWitness::mark_lock`], must be explicitly marked with
 /// [`Self::mark_unlock`] when the relevant lock is unlocked, otherwise will panic upon drop.
-pub(crate) struct LockedWitness<Platform: RawSyncPrimitivesProvider> {
+pub(crate) struct LockedWitness {
     // Private: index into the tracker
     idx: usize,
     // Private: has this been marked as unlocked?
     unlocked: bool,
     // Access to the tracker
-    tracker: LockTracker<Platform>,
+    tracker: &'static LockTracker,
 }
-impl<Platform: RawSyncPrimitivesProvider> Drop for LockedWitness<Platform> {
+impl Drop for LockedWitness {
     fn drop(&mut self) {
         assert!(self.unlocked, "Someone forgot to call `mark_unlock`");
     }
 }
-impl<Platform: RawSyncPrimitivesProvider> LockedWitness<Platform> {
+impl LockedWitness {
     /// This function creates a new witness from a borrowed witness. This is only safe to run if
     /// `&self` is under a `ManuallyDrop` and thus won't be auto-dropped. This is intended to be
     /// used only with the mapped guards.
@@ -202,18 +230,19 @@ impl<Platform: RawSyncPrimitivesProvider> LockedWitness<Platform> {
         Self {
             idx: self.idx,
             unlocked: self.unlocked,
-            tracker: self.tracker.clone(),
+            tracker: self.tracker,
         }
     }
 }
 
-/// A witness to having invoked [`LockTracker::begin_lock_attempt`].
+/// A witness to having invoked [`begin_lock_attempt`].
 ///
 /// Explicitly is not copy/clone/...-able; acts essentially as a linear resource token.
-pub(crate) struct LockAttemptWitness<Platform: RawSyncPrimitivesProvider> {
+pub(crate) struct LockAttemptWitness {
     locked: Locked,
-    start_time: Platform::Instant,
+    start_time: Duration,
     contended_with: Option<Locked>,
+    tracker: &'static LockTracker,
 }
 
 // A `println!` style macro that uses `debug_log_print` but gives a nicer interface.
@@ -230,42 +259,42 @@ macro_rules! debug_log_println {
     }}
 }
 
-impl<Platform: RawSyncPrimitivesProvider> LockTracker<Platform> {
-    /// Mark the `lock_type` (at `lock_addr`) as being attempted to be locked. It is the caller's
-    /// job to make sure `#[track_caller]` is inserted, and that things are kept in sync with the
-    /// actual [`LockTracker::mark_lock`] invocations.
-    #[must_use]
-    #[track_caller]
-    pub(crate) fn begin_lock_attempt<T>(
-        &self,
-        lock_type: LockType,
-        lock_addr: *const T,
-    ) -> LockAttemptWitness<Platform> {
-        LockTrackerX::begin_lock_attempt(self, lock_type, lock_addr)
-    }
+/// Mark the `lock_type` (at `lock_addr`) as being attempted to be locked. It is the caller's
+/// job to make sure `#[track_caller]` is inserted, and that things are kept in sync with the
+/// actual [`mark_lock`] invocations.
+#[must_use]
+#[track_caller]
+pub(crate) fn begin_lock_attempt<T>(
+    lock_type: LockType,
+    lock_addr: *const T,
+) -> Option<LockAttemptWitness> {
+    Some(LockTrackerX::begin_lock_attempt(
+        LockTracker::global()?,
+        lock_type,
+        lock_addr,
+    ))
+}
 
+impl LockAttemptWitness {
     /// Mark the `lock_type` being locked. It is the caller's job to make sure `#[track_caller]` is
     /// inserted in all callers until the place where the user's locations want to be recorded;
     /// otherwise, might not get particularly useful traces.
     #[must_use]
     #[track_caller]
-    pub(crate) fn mark_lock(
-        &self,
-        attempt: LockAttemptWitness<Platform>,
-    ) -> LockedWitness<Platform> {
-        LockTrackerX::mark_lock(self, attempt)
+    pub(crate) fn mark_lock(self) -> LockedWitness {
+        LockTrackerX::mark_lock(self.tracker, self)
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> LockTrackerX<Platform> {
-    /// Access this via [`LockTracker::begin_lock_attempt`]
+impl LockTrackerX {
+    /// Access this via [`begin_lock_attempt`]
     #[must_use]
     #[track_caller]
     fn begin_lock_attempt<T>(
-        l_tracker: &LockTracker<Platform>,
+        l_tracker: &'static LockTracker,
         lock_type: LockType,
         lock_addr: *const T,
-    ) -> LockAttemptWitness<Platform> {
+    ) -> LockAttemptWitness {
         let location = core::panic::Location::caller();
         let locked = Locked {
             lock_type,
@@ -320,26 +349,25 @@ impl<Platform: RawSyncPrimitivesProvider> LockTrackerX<Platform> {
             locked,
             start_time: tracker.as_ref().unwrap().platform.now(),
             contended_with: contended.cloned(),
+            tracker: l_tracker,
         }
     }
 
-    /// Access this via [`LockTracker::mark_lock`]
+    /// Access this via [`LockedWitness::mark_lock`]
     #[must_use]
     #[track_caller]
-    fn mark_lock(
-        l_tracker: &LockTracker<Platform>,
-        attempt: LockAttemptWitness<Platform>,
-    ) -> LockedWitness<Platform> {
+    fn mark_lock(l_tracker: &'static LockTracker, attempt: LockAttemptWitness) -> LockedWitness {
         let LockAttemptWitness {
             locked,
             start_time,
             contended_with,
+            tracker: _,
         } = attempt;
         let mut tracker = l_tracker.x.lock();
         let idx = tracker.held.len();
         tracker.held.push(Some(locked));
         if let Some(max_allowed) = CONFIG_PRINT_LOCKS_SLOWER_THAN {
-            let elapsed = start_time.duration_since(&tracker.platform.now());
+            let elapsed = tracker.platform.now().saturating_sub(start_time);
             if elapsed > max_allowed {
                 if let Some(contended) = contended_with {
                     debug_log_println!(
@@ -381,7 +409,7 @@ impl<Platform: RawSyncPrimitivesProvider> LockTrackerX<Platform> {
         LockedWitness {
             idx,
             unlocked: false,
-            tracker: l_tracker.clone(),
+            tracker: l_tracker,
         }
     }
 
@@ -390,7 +418,7 @@ impl<Platform: RawSyncPrimitivesProvider> LockTrackerX<Platform> {
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> LockedWitness<Platform> {
+impl LockedWitness {
     /// Mark this witness as unlocked.
     pub(crate) fn mark_unlock(&mut self) {
         assert!(!self.unlocked);

@@ -216,12 +216,13 @@ where
 /// A provider of raw mutexes
 pub trait RawMutexProvider {
     type RawMutex: RawMutex;
-    /// Allocate a new [`RawMutex`].
-    fn new_raw_mutex(&self) -> Self::RawMutex;
 }
 
 /// A raw mutex/lock API; expected to roughly match (or even be implemented using) a Linux futex.
-pub trait RawMutex: Send + Sync {
+pub trait RawMutex: Send + Sync + 'static {
+    /// A const initializer for this raw mutex.
+    const INIT: Self;
+
     /// Returns a reference to the underlying atomic value
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32;
 
@@ -320,7 +321,7 @@ pub trait TimeProvider {
 /// Notable, the `Instant` is distinct from [`SystemTime`], in that the `Instant` is monotonic, and
 /// need not have any relation with "real" time. It does not matter if the world takes a step
 /// backwards in time, the `Instant` continues marching forward.
-pub trait Instant: Copy + Clone + PartialEq + Eq + PartialOrd + Ord {
+pub trait Instant: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + Send + Sync {
     /// Returns the amount of time elapsed from another instant to this one, or `None` if that
     /// instant is later than this one.
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration>;
@@ -339,7 +340,7 @@ pub trait Instant: Copy + Clone + PartialEq + Eq + PartialOrd + Ord {
 ///
 /// Notably, the `SystemTime` is distinct from [`Instant`], in that the `SystemTime` need not be
 /// monotonic, but instead is the best guess of "real" or "wall clock" time.
-pub trait SystemTime {
+pub trait SystemTime: Send + Sync {
     /// An anchor in time corresponding to "1970-01-01 00:00:00 UTC".
     const UNIX_EPOCH: Self;
     /// Returns the amount of time elapsed from an `earlier` point in time to this one. This is

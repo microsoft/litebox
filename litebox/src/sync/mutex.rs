@@ -6,7 +6,7 @@ use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use crate::platform::RawMutex as _;
 
 #[cfg(feature = "lock_tracing")]
-use crate::sync::lock_tracing::{LockTracker, LockType, LockedWitness};
+use crate::sync::lock_tracing::{LockType, LockedWitness};
 
 use super::RawSyncPrimitivesProvider;
 
@@ -22,7 +22,7 @@ struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
 impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
     /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](crate::platform::RawMutex).
     #[inline]
-    fn new(raw: Platform::RawMutex) -> Self {
+    const fn new(raw: Platform::RawMutex) -> Self {
         Self { raw }
     }
 
@@ -135,7 +135,7 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
 pub struct MutexGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized + 'a> {
     mutex: &'a Mutex<Platform, T>,
     #[cfg(feature = "lock_tracing")]
-    locked_witness: LockedWitness<Platform>,
+    locked_witness: Option<LockedWitness>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
@@ -161,7 +161,9 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
 impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for MutexGuard<'_, Platform, T> {
     fn drop(&mut self) {
         #[cfg(feature = "lock_tracing")]
-        self.locked_witness.mark_unlock();
+        if let Some(witness) = &mut self.locked_witness {
+            witness.mark_unlock();
+        }
 
         // SAFETY: Access to the guard means that the current thread is the only thread with access
         unsafe {
@@ -177,24 +179,18 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for MutexGuard<'_, Pla
 /// information, thus its [`lock`](Self::lock) functionality directly returns a locked guard.
 pub struct Mutex<Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     raw: SpinEnabledRawMutex<Platform>,
-
-    #[cfg(feature = "lock_tracing")]
-    tracker: LockTracker<Platform>,
-
     data: UnsafeCell<T>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
+    /// Returns a new mutex wrapping the given value.
     #[inline]
-    pub(super) fn new_from_synchronization(
-        sync: &super::Synchronization<Platform>,
-        val: T,
-    ) -> Self {
+    pub const fn new(val: T) -> Self {
         Self {
-            raw: SpinEnabledRawMutex::new(sync.platform.new_raw_mutex()),
+            raw: SpinEnabledRawMutex::new(
+                <Platform as crate::platform::RawMutexProvider>::RawMutex::INIT,
+            ),
             data: UnsafeCell::new(val),
-            #[cfg(feature = "lock_tracing")]
-            tracker: sync.tracker.clone(),
         }
     }
 }
@@ -211,16 +207,17 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, Platform, T> {
         #[cfg(feature = "lock_tracing")]
-        let attempt = self
-            .tracker
-            .begin_lock_attempt(LockType::Mutex, self.raw.raw.underlying_atomic());
+        let attempt = super::lock_tracing::begin_lock_attempt(
+            LockType::Mutex,
+            self.raw.raw.underlying_atomic(),
+        );
 
         self.raw.lock();
 
         MutexGuard {
             mutex: self,
             #[cfg(feature = "lock_tracing")]
-            locked_witness: self.tracker.mark_lock(attempt),
+            locked_witness: attempt.map(super::lock_tracing::LockAttemptWitness::mark_lock),
         }
     }
 }
