@@ -179,6 +179,7 @@ impl Process {
     /// Attaches a new thread to this process, returning a new remote state for
     /// the thread.
     fn attach_thread(&self, tid: i32) -> Option<Arc<ThreadRemote>> {
+        // Allocate outside the lock.
         let remote = Arc::new(ThreadRemote::new());
         let mut inner = self.inner.lock();
         if inner.group_exit || inner.is_killing_other_threads {
@@ -212,9 +213,9 @@ impl Process {
                 inner.group_exit = true;
             }
 
-            // Notify waiters if this is the last thread (`wait_for_exit`) or if
-            // this is the last thread from before an exec
-            // (`kill_other_threads`).
+            // Notify waiters if this is the last thread of the process
+            // (`wait_for_exit`) or if this is the last thread being killed
+            // during an exec (`kill_other_threads`).
             n == 1 || (n == 2 && inner.is_killing_other_threads)
         };
         if notify {
