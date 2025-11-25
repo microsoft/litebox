@@ -125,7 +125,7 @@ impl Locked {
 
 struct LockTrackerPlatform<Platform: RawSyncPrimitivesProvider> {
     platform: &'static Platform,
-    boot_time: Platform::Instant,
+    start_time: Platform::Instant,
 }
 
 trait DynLockTrackerProvider: Send + Sync {
@@ -135,7 +135,7 @@ trait DynLockTrackerProvider: Send + Sync {
 
 impl<Platform: RawSyncPrimitivesProvider> DynLockTrackerProvider for LockTrackerPlatform<Platform> {
     fn now(&self) -> Duration {
-        self.platform.now().duration_since(&self.boot_time)
+        self.platform.now().duration_since(&self.start_time)
     }
 
     fn debug_log_print(&self, msg: &ArrayString<1024>) {
@@ -154,7 +154,7 @@ impl LockTracker {
                 held: ArrayVec::new_const(),
                 platform: LockTrackerPlatform {
                     platform,
-                    boot_time: platform.now(),
+                    start_time: platform.now(),
                 },
             })),
         }
