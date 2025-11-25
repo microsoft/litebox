@@ -78,7 +78,6 @@ impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, H
                 Ok(0)
             }
             PunchthroughSyscall::GetFsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
-            _ => unimplemented!(),
         };
         match r {
             Ok(v) => Ok(v),
