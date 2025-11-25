@@ -279,7 +279,7 @@ impl LinuxShim {
         };
         let process = with_current_task(|task| {
             task.load_program(loader::elf::ElfLoader::new(task, path)?, argv, envp)?;
-            Ok(LinuxShimProcess(task.process.clone()))
+            Ok(LinuxShimProcess(task.process().clone()))
         })?;
         Ok(LoadedProgram {
             entrypoints,
