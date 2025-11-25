@@ -256,5 +256,5 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             &mut litebox_common_linux::PtRegs::default(),
         );
     }
-    Ok(())
+    std::process::exit(program.process.wait())
 }

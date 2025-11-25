@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,12 @@
 static void die(const char *msg) {
     perror(msg);
     exit(2);
+}
+
+void* spin_thread(void* arg) {
+    for (;;) {
+        __asm__ __volatile__("pause");
+    }
 }
 
 int main(int argc, char *argv[], char *envp[]) {
@@ -48,6 +55,17 @@ int main(int argc, char *argv[], char *envp[]) {
         char *new_envp[2];
         new_envp[0] = "PHASE=after_exec";
         new_envp[1] = NULL;
+
+        // Spawn some threads that should be terminated on exec.
+        for (int i = 0; i < 20; i++) {
+            pthread_t thread;
+            int rc = pthread_create(&thread, NULL, spin_thread, NULL);
+            if (rc) {
+                fprintf(stderr, "pthread_create: %s\n", strerror(rc));
+                abort();
+            }
+            pthread_detach(thread);
+        }
 
         execve(argv[0], new_argv, new_envp);
         die("execve");
