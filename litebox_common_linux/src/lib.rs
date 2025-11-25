@@ -2975,8 +2975,9 @@ pub enum PunchthroughSyscall<'a, Platform: litebox::platform::RawPointerProvider
     GetFsBase,
     #[cfg(target_arch = "x86")]
     SetThreadArea { user_desc: &'a mut UserDesc },
-    /// An uninhabited variant to ensure the generics are referenced. Providers
-    /// won't need to match on this variant.
+    /// An uninhabited variant to ensure the generics are referenced on all
+    /// architectures. Provider implementations won't need to match on this
+    /// variant, since Rust can see that it is uninhabited.
     #[doc(hidden)]
     _Phantom(
         core::marker::PhantomData<&'a mut ()>,
