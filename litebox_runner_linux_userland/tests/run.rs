@@ -496,13 +496,31 @@ fn test_tun_with_tcp_socket() {
     child.join().unwrap();
 }
 
+/// Test network performance with iperf3
+///
+/// To run it with release build and see output, use:
+/// ```
+/// cargo test --package litebox_runner_linux_userland --test run --release -- test_tun_and_runner_with_iperf3 --exact --nocapture
+/// ```
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[ignore = "reason"]
-fn test_runner_with_iperf3() {
+fn test_tun_and_runner_with_iperf3() {
     let iperf3_path = run_which("iperf3");
+    let cloned_path = iperf3_path.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let mut client = std::process::Command::new(&cloned_path)
+            .args(["-c", "10.0.0.2"])
+            .spawn()
+            .expect("Failed to start iperf3 server");
+        client.wait().expect("Failed to wait on iperf3 client");
+    });
     Runner::new(Backend::Rewriter, &iperf3_path, "iperf3_server_rewriter")
-        .args(["-s", "-B", "10.0.0.2"])
+        .args([
+            "-s", // run in server mode
+            "-1", // handle one client then exit
+            "-B", "10.0.0.2", // bind to this address
+        ])
         .tun_device_name("tun99")
         .run();
 }
