@@ -63,9 +63,6 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
 
 pub(crate) type FileFd = litebox::fd::TypedFd<LinuxFS>;
 
-type UserConstPointer<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
-type UserMutPointer<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
-
 static BOOT_TIME: once_cell::race::OnceBox<<Platform as litebox::platform::TimeProvider>::Instant> =
     once_cell::race::OnceBox::new();
 
@@ -97,11 +94,11 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        enter_shim(ctx, Task::handle_init_request)
+        enter_shim(true, ctx, Task::handle_init_request)
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        enter_shim(ctx, Task::handle_syscall_request)
+        enter_shim(false, ctx, Task::handle_syscall_request)
     }
 
     fn exception(
@@ -112,18 +109,24 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
         panic!("Unhandled exception: {info:#x?}");
     }
 
-    fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        ContinueOperation::ResumeGuest
+    fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        enter_shim(false, ctx, |_, _| {})
     }
 }
 
 fn enter_shim(
+    is_init: bool,
     ctx: &mut litebox_common_linux::PtRegs,
     f: impl FnOnce(&Task, &mut litebox_common_linux::PtRegs),
 ) -> ContinueOperation {
     let (exit_thread, pending_sigreturn) = with_current_task(|task| {
+        if !is_init {
+            task.enter_from_guest();
+        }
         f(task, ctx);
-        (task.is_exiting.get(), task.pending_sigreturn.take())
+        let pending_sigreturn = task.pending_sigreturn.take();
+        let exit_thread = !task.prepare_to_run_guest();
+        (exit_thread, pending_sigreturn)
     });
     if exit_thread {
         ContinueOperation::ExitThread
@@ -222,8 +225,7 @@ impl LinuxShim {
         })
     }
 
-    /// Loads the program at `path` as the shim's initial task, returning the
-    /// initial register state.
+    /// Loads the program at `path` as the shim's initial task.
     ///
     /// # Panics
     /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
@@ -253,13 +255,11 @@ impl LinuxShim {
         SHIM_TLS.init(LinuxShimTls {
             current_task: Task {
                 global,
-                thread: syscalls::process::ThreadState::new_process(),
+                thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 pid,
                 ppid,
                 tid: pid,
-                clear_child_tid: None.into(),
-                robust_list: None.into(),
                 credentials: syscalls::process::Credentials {
                     uid,
                     euid,
@@ -271,22 +271,38 @@ impl LinuxShim {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 pending_sigreturn: false.into(),
-                is_exiting: false.into(),
             },
         });
 
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
         };
-        with_current_task(|task| {
-            task.load_program(loader::elf::ElfLoader::new(task, path)?, argv, envp)
+        let process = with_current_task(|task| {
+            task.load_program(loader::elf::ElfLoader::new(task, path)?, argv, envp)?;
+            Ok(LinuxShimProcess(task.process.clone()))
         })?;
-        Ok(LoadedProgram { entrypoints })
+        Ok(LoadedProgram {
+            entrypoints,
+            process,
+        })
     }
 }
 
 pub struct LoadedProgram {
     pub entrypoints: LinuxShimEntrypoints,
+    pub process: LinuxShimProcess,
+}
+
+/// A handle to a process loaded via [`LinuxShim::load_program`].
+///
+/// This can be used to wait for the process to exit.
+pub struct LinuxShimProcess(Arc<syscalls::process::Process>);
+
+impl LinuxShimProcess {
+    /// Wait for the process to exit, returning its exit code.
+    pub fn wait(&self) -> i32 {
+        self.0.wait_for_exit()
+    }
 }
 
 /// Get the global litebox object
@@ -1238,19 +1254,6 @@ struct Task {
     ppid: i32,
     /// Thread ID
     tid: i32,
-    /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
-    /// the kernel writes 0 to the address specified by `clear_child_tid` and then executes:
-    ///
-    /// futex(clear_child_tid, FUTEX_WAKE, 1, NULL, NULL, 0);
-    ///
-    /// This operation wakes a single thread waiting on the specified memory location via futex.
-    /// Any errors from the futex wake operation are ignored.
-    clear_child_tid: Cell<Option<UserMutPointer<i32>>>,
-    /// The purpose of the robust futex list is to ensure that if a thread accidentally fails to unlock a futex before
-    /// terminating or calling execve(2), another thread that is waiting on that futex is notified that the former owner
-    /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
-    /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
-    robust_list: Cell<Option<UserConstPointer<litebox_common_linux::RobustListHead<Platform>>>>,
     /// Task credentials. These are set per task but are Arc'd to save space
     /// since most tasks never change their credentials.
     credentials: Arc<syscalls::process::Credentials>,
@@ -1263,8 +1266,6 @@ struct Task {
     /// If true, call the sigreturn punchthrough instead of returning to user mode.
     /// TODO: remove once signals are handled internally in the shim.
     pending_sigreturn: Cell<bool>,
-    /// If true, exit the thread instead of returning to user mode.
-    is_exiting: Cell<bool>,
 }
 
 impl Drop for Task {
@@ -1310,12 +1311,10 @@ mod test_utils {
             Task {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 global: self,
-                thread: syscalls::process::ThreadState::new_process(),
+                thread: syscalls::process::ThreadState::new_process(pid),
                 pid,
                 ppid: 0,
                 tid: pid,
-                clear_child_tid: Cell::new(None),
-                robust_list: Cell::new(None),
                 credentials: Arc::new(syscalls::process::Credentials {
                     uid: 0,
                     euid: 0,
@@ -1326,42 +1325,34 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 pending_sigreturn: false.into(),
-                is_exiting: false.into(),
             }
         }
     }
 
     impl Task {
-        /// Returns a function that clones this task with a new TID for testing.
-        pub(crate) fn clone_for_test(&self) -> impl 'static + Send + FnOnce() -> Self {
-            let global = self.global.clone();
-            let thread = self.thread.clone_for_test();
-            let credentials = self.credentials.clone();
-            let fs = self.fs.clone();
-            let comm = self.comm.clone();
-            let pid = self.pid;
+        /// Returns a clone of this task with a new TID for testing.
+        pub(crate) fn clone_for_test(&self) -> Option<Self> {
             let tid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let parent_pid = self.ppid;
-            let files = self.files.clone();
-            move || Task {
+            let task = Task {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
-                global,
-                thread: thread(),
-                pid,
-                ppid: parent_pid,
+                global: self.global.clone(),
+                thread: self.thread.new_thread(tid)?,
+                pid: self.pid,
+                ppid: self.ppid,
                 tid,
-                clear_child_tid: None.into(),
-                robust_list: None.into(),
-                credentials,
-                comm,
-                fs,
-                files,
+                credentials: self.credentials.clone(),
+                comm: self.comm.clone(),
+                fs: self.fs.clone(),
+                files: self.files.clone(),
                 pending_sigreturn: false.into(),
-                is_exiting: false.into(),
-            }
+            };
+            Some(task)
         }
 
         /// Spawns a thread that runs with a clone of this task and a new TID.
+        ///
+        /// # Panics
+        /// Panics if the test process is already terminating.
         pub(crate) fn spawn_clone_for_test<R>(
             &self,
             f: impl 'static + Send + FnOnce(Task) -> R,
@@ -1369,8 +1360,8 @@ mod test_utils {
         where
             R: 'static + Send,
         {
-            let clone_task_fn = self.clone_for_test();
-            std::thread::spawn(move || f(clone_task_fn()))
+            let task = self.clone_for_test().unwrap();
+            std::thread::spawn(move || f(task))
         }
     }
 }

@@ -636,8 +636,8 @@ bitflags::bitflags! {
 #[repr(C)]
 #[derive(Clone)]
 pub struct Linger {
-    pub onoff: i32,  /* Linger active		*/
-    pub linger: i32, /* How long to linger for	*/
+    pub onoff: u32,  /* Linger active		*/
+    pub linger: u32, /* How long to linger for	*/
 }
 
 #[repr(u8)]
