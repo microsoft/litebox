@@ -20,7 +20,7 @@ use litebox::platform::{
     Punchthrough, RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{
-    PunchthroughProvider, PunchthroughToken, RawMutPointer, RawMutex as _, RawPointerProvider,
+    PunchthroughProvider, PunchthroughToken, RawMutex as _, RawPointerProvider,
 };
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
