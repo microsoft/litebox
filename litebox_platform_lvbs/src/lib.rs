@@ -53,8 +53,8 @@ pub struct LinuxKernel<Host: HostInterface> {
     user_contexts: UserContextMap,
 }
 
-pub struct LinuxPunchthroughToken<Host: HostInterface> {
-    punchthrough: PunchthroughSyscall<LinuxKernel<Host>>,
+pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
+    punchthrough: PunchthroughSyscall<'a, LinuxKernel<Host>>,
     host: core::marker::PhantomData<Host>,
 }
 
@@ -63,8 +63,8 @@ impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawMutPointer<T: Clone> = ptr::UserMutPtr<T>;
 }
 
-impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
-    type Punchthrough = PunchthroughSyscall<LinuxKernel<Host>>;
+impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, Host> {
+    type Punchthrough = PunchthroughSyscall<'a, LinuxKernel<Host>>;
 
     fn execute(
         self,
@@ -88,12 +88,12 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
 }
 
 impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
-    type PunchthroughToken = LinuxPunchthroughToken<Host>;
+    type PunchthroughToken<'a> = LinuxPunchthroughToken<'a, Host>;
 
-    fn get_punchthrough_token_for(
+    fn get_punchthrough_token_for<'a>(
         &self,
-        punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken> {
+        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>> {
         Some(LinuxPunchthroughToken {
             punchthrough,
             host: core::marker::PhantomData,
