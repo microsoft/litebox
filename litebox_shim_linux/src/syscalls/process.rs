@@ -205,9 +205,9 @@ impl Process {
 
             let nr_threads = self.nr_threads.underlying_atomic();
             let n = nr_threads.load(Ordering::Relaxed);
-            assert!(n > 0, "decrementing from zero threads");
-            nr_threads.store(n - 1, Ordering::Release);
-            if n == 1 {
+            let new_count = n.checked_sub(1).expect("decrementing from zero threads");
+            nr_threads.store(new_count, Ordering::Release);
+            if new_count == 0 {
                 assert!(inner.threads.is_empty());
                 // The last thread exited. Prevent new threads.
                 inner.group_exit = true;
@@ -216,7 +216,7 @@ impl Process {
             // Notify waiters if this is the last thread of the process
             // (`wait_for_exit`) or if this is the last thread being killed
             // during an exec (`kill_other_threads`).
-            n == 1 || (n == 2 && inner.is_killing_other_threads)
+            new_count == 0 || (new_count == 1 && inner.is_killing_other_threads)
         };
         if notify {
             self.nr_threads.wake_all();
