@@ -13,11 +13,11 @@ use std::os::raw::c_void;
 use std::os::windows::io::AsRawHandle as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
-use litebox::platform::{ImmediatelyWokenUp, RawMutPointer};
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::PunchthroughSyscall;
@@ -1180,12 +1180,12 @@ impl litebox::platform::SystemTime for SystemTime {
     }
 }
 
-pub struct PunchthroughToken {
-    punchthrough: PunchthroughSyscall<WindowsUserland>,
+pub struct PunchthroughToken<'a> {
+    punchthrough: PunchthroughSyscall<'a, WindowsUserland>,
 }
 
-impl litebox::platform::PunchthroughToken for PunchthroughToken {
-    type Punchthrough = PunchthroughSyscall<WindowsUserland>;
+impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
+    type Punchthrough = PunchthroughSyscall<'a, WindowsUserland>;
     fn execute(
         self,
     ) -> Result<
@@ -1200,15 +1200,9 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 WindowsUserland::set_thread_fs_base(addr);
                 Ok(0)
             }
-            PunchthroughSyscall::GetFsBase { addr } => {
+            PunchthroughSyscall::GetFsBase => {
                 // Use the stored FS base value from our per-thread storage
-                let fs_base = WindowsUserland::get_thread_fs_base();
-                unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
-                    litebox::platform::PunchthroughError::Failure(
-                        litebox_common_linux::errno::Errno::EFAULT,
-                    ),
-                )?;
-                Ok(0)
+                Ok(WindowsUserland::get_thread_fs_base())
             }
             PunchthroughSyscall::RtSigprocmask { .. } => {
                 // Ignored for now.
@@ -1223,11 +1217,11 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
 }
 
 impl litebox::platform::PunchthroughProvider for WindowsUserland {
-    type PunchthroughToken = PunchthroughToken;
-    fn get_punchthrough_token_for(
+    type PunchthroughToken<'a> = PunchthroughToken<'a>;
+    fn get_punchthrough_token_for<'a>(
         &self,
-        punchthrough: <Self::PunchthroughToken as litebox::platform::PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken> {
+        punchthrough: <Self::PunchthroughToken<'a> as litebox::platform::PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>> {
         Some(PunchthroughToken { punchthrough })
     }
 }

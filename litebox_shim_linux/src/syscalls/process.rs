@@ -391,14 +391,18 @@ impl Task {
             }
             #[cfg(target_arch = "x86_64")]
             ArchPrctlArg::GetFs(addr) => {
-                let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase { addr };
+                let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase;
                 let token = litebox_platform_multiplex::platform()
                     .get_punchthrough_token_for(punchthrough)
                     .expect("Failed to get punchthrough token for GET_FS");
-                token.execute().map(|_| ()).map_err(|e| match e {
+                let fsbase = token.execute().map_err(|e| match e {
                     litebox::platform::PunchthroughError::Failure(errno) => errno,
                     _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-                })
+                })?;
+                unsafe {
+                    addr.write_at_offset(0, fsbase).ok_or(Errno::EFAULT)?;
+                }
+                Ok(())
             }
             ArchPrctlArg::CETStatus | ArchPrctlArg::CETDisable | ArchPrctlArg::CETLock => {
                 Err(Errno::EINVAL)
@@ -413,9 +417,7 @@ impl Task {
         user_desc: &mut litebox_common_linux::UserDesc,
     ) -> Result<(), Errno> {
         use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea {
-            user_desc: core::ptr::from_mut(user_desc),
-        };
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea { user_desc };
         let token = litebox_platform_multiplex::platform()
             .get_punchthrough_token_for(punchthrough)
             .expect("Failed to get punchthrough token for SET_THREAD_AREA");

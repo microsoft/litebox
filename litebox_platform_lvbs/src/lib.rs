@@ -77,13 +77,7 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                 unsafe { litebox_common_linux::wrfsbase(addr) };
                 Ok(0)
             }
-            PunchthroughSyscall::GetFsBase { addr } => {
-                let fs_base = unsafe { litebox_common_linux::rdfsbase() };
-                let ptr: UserMutPtr<usize> = addr.cast();
-                unsafe { ptr.write_at_offset(0, fs_base) }
-                    .map(|()| 0)
-                    .ok_or(Errno::EFAULT)
-            }
+            PunchthroughSyscall::GetFsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
             _ => unimplemented!(),
         };
         match r {

@@ -2919,7 +2919,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
 ///
 /// NOTE: It is assumed that all punchthroughs here are non-blocking.
 #[derive(Debug)]
-pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
+pub enum PunchthroughSyscall<'a, Platform: litebox::platform::RawPointerProvider> {
     /// Examine and change blocked signals
     RtSigprocmask {
         /// The behavior of the call is dependent on the value of how
@@ -2970,13 +2970,20 @@ pub enum PunchthroughSyscall<Platform: litebox::platform::RawPointerProvider> {
     /// Set the FS base register to the value in `addr`.
     #[cfg(target_arch = "x86_64")]
     SetFsBase { addr: usize },
-    /// Get the current value of the FS base register and store it in `addr`.
+    /// Return the current value of the FS base register.
     #[cfg(target_arch = "x86_64")]
-    GetFsBase {
-        addr: Platform::RawMutPointer<usize>,
-    },
+    GetFsBase,
     #[cfg(target_arch = "x86")]
-    SetThreadArea { user_desc: *mut UserDesc },
+    SetThreadArea { user_desc: &'a mut UserDesc },
+    /// An uninhabited variant to ensure the generics are referenced. Providers
+    /// won't need to match on this variant.
+    #[doc(hidden)]
+    _Phantom(
+        core::marker::PhantomData<&'a mut ()>,
+        core::marker::PhantomData<fn(Platform) -> Platform>,
+        // Make this variant uninhabited.
+        core::convert::Infallible,
+    ),
 }
 
 #[derive(Debug)]
@@ -3075,7 +3082,7 @@ impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> litebox::platform::Punchthrough
-    for PunchthroughSyscall<Platform>
+    for PunchthroughSyscall<'_, Platform>
 {
     type ReturnSuccess = usize;
     type ReturnFailure = errno::Errno;
