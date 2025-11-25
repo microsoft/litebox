@@ -57,9 +57,8 @@ impl Task {
 
 pub(super) fn uctx_addr(ctx: &PtRegs) -> usize {
     // Skip parameters.
-    ctx.esp.wrapping_add(
-        offset_of!(SignalFrameRt, ucontext_ptr) - offset_of!(SignalFrameRt, return_address),
-    )
+    ctx.esp
+        .wrapping_add(offset_of!(SignalFrameRt, ucontext) - offset_of!(SignalFrameRt, signal))
 }
 
 pub(super) fn sp(ctx: &PtRegs) -> usize {
@@ -132,8 +131,8 @@ impl SignalState {
             let frame = SignalFrameRt {
                 return_address: action.restorer,
                 signal: siginfo.signo,
-                siginfo_ptr: frame_addr + core::mem::offset_of!(SignalFrameRt, siginfo_ptr),
-                ucontext_ptr: frame_addr + core::mem::offset_of!(SignalFrameRt, ucontext_ptr),
+                siginfo_ptr: frame_addr + core::mem::offset_of!(SignalFrameRt, siginfo),
+                ucontext_ptr: frame_addr + core::mem::offset_of!(SignalFrameRt, ucontext),
                 ucontext: Ucontext {
                     flags: 0,
                     link: core::ptr::null_mut(),
@@ -162,8 +161,8 @@ impl SignalState {
         ctx.eip = action.sigaction;
         ctx.eax = siginfo.signo.reinterpret_as_unsigned() as usize;
         if rt {
-            ctx.edx = frame_addr + core::mem::offset_of!(SignalFrameRt, siginfo_ptr);
-            ctx.ecx = frame_addr + core::mem::offset_of!(SignalFrameRt, ucontext_ptr);
+            ctx.edx = frame_addr + core::mem::offset_of!(SignalFrameRt, siginfo);
+            ctx.ecx = frame_addr + core::mem::offset_of!(SignalFrameRt, ucontext);
         } else {
             ctx.edx = 0;
             ctx.ecx = 0;

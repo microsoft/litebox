@@ -175,7 +175,7 @@ impl PendingSignals {
             .position(|info| info.signo == signo.as_i32())
     }
 
-    fn next(&mut self, blocked: SigSet) -> Option<Signal> {
+    fn next(&self, blocked: SigSet) -> Option<Signal> {
         const EXCEPTION_SIGNALS: SigSet = SigSet::empty()
             .with(Signal::SIGSEGV)
             .with(Signal::SIGBUS)
@@ -507,14 +507,18 @@ impl Task {
 
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
-        let pending = &mut self.signals.pending.borrow_mut();
-        while let Some(signo) = pending.next(self.signals.blocked.get()) {
+        loop {
+            let mut pending = self.signals.pending.borrow_mut();
+            let Some(signo) = pending.next(self.signals.blocked.get()) else {
+                break;
+            };
             if self.is_exiting() {
                 // Don't deliver any more signals if exiting.
                 return;
             }
 
-            let siginfo = pending.remove(signo);
+            let siginfo: Siginfo = pending.remove(signo);
+            drop(pending);
             let action =
                 self.signals.handlers.borrow().inner.lock().handlers[signo.as_usize()].action;
             #[expect(clippy::match_same_arms)]

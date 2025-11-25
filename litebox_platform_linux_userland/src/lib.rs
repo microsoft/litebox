@@ -626,7 +626,7 @@ exception_callback:
     mov esp, gs:host_sp@ntpoff
     mov ebp, gs:host_bp@ntpoff
 
-    mov ecx, [esp] // pass thread_ctx
+    mov edi, [esp] // pass thread_ctx
     push ecx
     push edx
     push esi
