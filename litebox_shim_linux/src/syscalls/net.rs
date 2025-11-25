@@ -2,10 +2,15 @@
 
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
+use alloc::sync::Arc;
 use litebox::{
-    event::{Events, polling::TryOpError, wait::WaitContext},
+    event::{
+        Events,
+        polling::TryOpError,
+        wait::{WaitContext, WaitError},
+    },
     fs::OFlags,
-    net::{TcpOptionData, errors::AcceptError},
+    net::{CloseBehavior, TcpOptionData, errors::AcceptError},
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt as _,
 };
@@ -185,10 +190,14 @@ fn setsockopt(
                     let linger: crate::ConstPtr<litebox_common_linux::Linger> =
                         crate::ConstPtr::from_usize(optval.as_usize());
                     let linger = unsafe { linger.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
-                    // TODO: our current implementation of `close` does not support graceful close yet.
-                    if linger.onoff != 0 && linger.linger != 0 {
-                        unimplemented!("SO_LINGER with non-zero timeout is not supported yet");
-                    }
+                    let timeout = if linger.onoff != 0 {
+                        Some(core::time::Duration::from_secs(u64::from(linger.linger)))
+                    } else {
+                        None
+                    };
+                    with_socket_options_mut(fd, |opt| {
+                        opt.linger_timeout = timeout;
+                    });
                     return Ok(());
                 }
                 _ => {}
@@ -453,11 +462,11 @@ fn register_observer(
     fd: &SocketFd,
     observer: alloc::sync::Weak<dyn litebox::event::observer::Observer<Events>>,
     mask: Events,
-) {
+) -> Result<(), Errno> {
     litebox_net()
         .lock()
         .with_iopollable(fd, |poll| poll.register_observer(observer, mask))
-        .expect("fd should be valid");
+        .ok_or(Errno::EBADF)
 }
 
 fn try_accept(fd: &SocketFd, peer: Option<&mut SocketAddr>) -> Result<SocketFd, TryOpError<Errno>> {
@@ -494,30 +503,18 @@ fn connect(
     fd: &SocketFd,
     sockaddr: SocketAddr,
 ) -> Result<(), Errno> {
-    // Check if the socket is ready
-    let is_ready = |fd: &SocketFd| -> Result<bool, Errno> {
-        let events = litebox_net()
-            .lock()
-            .with_iopollable(fd, |poll| poll.check_io_events())
-            .ok_or(Errno::EBADF)?;
-        Ok(events.intersects(Events::IN | Events::OUT))
-    };
-
-    // Initiate connection, which is non-blocking
-    litebox_net()
-        .lock()
-        .connect(fd, &sockaddr)
-        .map_err(Errno::from)?;
+    let mut check_progress = false;
     cx.wait_on_events(
         get_status(fd).contains(OFlags::NONBLOCK),
         Events::IN | Events::OUT,
         |observer, filter| register_observer(fd, observer, filter),
-        || {
-            if is_ready(fd).map_err(TryOpError::Other)? {
-                Ok(())
-            } else {
+        || match litebox_net().lock().connect(fd, &sockaddr, check_progress) {
+            Ok(()) => Ok(()),
+            Err(litebox::net::errors::ConnectError::InProgress) => {
+                check_progress = true;
                 Err(TryOpError::TryAgain)
             }
+            Err(e) => Err(TryOpError::Other(e.into())),
         },
     )
     .map_err(|err| match err {
@@ -659,6 +656,35 @@ fn get_status(fd: &SocketFd) -> litebox::fs::OFlags {
         .with_metadata(fd, |SocketOFlags(flags)| *flags)
         .unwrap()
         & litebox::fs::OFlags::STATUS_FLAGS_MASK
+}
+
+pub(crate) fn close_socket(cx: &WaitContext<'_, Platform>, fd: Arc<SocketFd>) -> Result<(), Errno> {
+    let linger_timeout = with_socket_options(&fd, |opt| opt.linger_timeout);
+    let behavior = match linger_timeout {
+        Some(timeout) if timeout.is_zero() => CloseBehavior::Immediate,
+        Some(_) => CloseBehavior::GracefulIfNoPendingData,
+        None => CloseBehavior::Graceful,
+    };
+    match cx.with_timeout(linger_timeout).wait_on_events(
+        get_status(&fd).contains(OFlags::NONBLOCK),
+        Events::HUP,
+        |observer, filter| register_observer(&fd, observer, filter),
+        || match litebox_net().lock().close(&fd, behavior) {
+            Ok(()) => Ok(()),
+            Err(litebox::net::errors::CloseError::DataPending) => Err(TryOpError::TryAgain),
+            Err(litebox::net::errors::CloseError::InvalidFd) => {
+                Err(TryOpError::Other(Errno::EBADF))
+            }
+            Err(_) => unimplemented!(),
+        },
+    ) {
+        Ok(()) => Ok(()),
+        Err(TryOpError::WaitError(WaitError::TimedOut)) => litebox_net()
+            .lock()
+            .close(&fd, CloseBehavior::Immediate)
+            .map_err(Errno::from),
+        Err(e) => Err(e.into()),
+    }
 }
 
 impl Task {
@@ -1116,8 +1142,8 @@ mod tests {
     use litebox::platform::RawConstPointer as _;
     use litebox::utils::TruncateExt as _;
     use litebox_common_linux::{
-        AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOptionName, TcpOption,
-        errno::Errno,
+        AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
+        SocketOptionName, TcpOption, errno::Errno,
     };
 
     use super::SocketAddress;
@@ -1238,7 +1264,8 @@ mod tests {
             let n = epoll_wait(task, epfd, &mut events);
             assert_eq!(n, 1);
             for ev in &events[..n] {
-                assert!(ev.events & litebox::event::Events::IN.bits() != 0);
+                let events = ev.events;
+                assert!(events & litebox::event::Events::IN.bits() != 0);
             }
         }
 
@@ -1411,6 +1438,34 @@ mod tests {
     }
 
     #[test]
+    fn test_tun_tcp_connection_refused() {
+        let task = init_platform(Some("tun99"));
+        let socket_fd = task
+            .sys_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::empty(),
+                None,
+            )
+            .expect("failed to create socket");
+        let socket_fd = i32::try_from(socket_fd).unwrap();
+        let socket_fd2 = task.sys_dup(socket_fd, None, None).unwrap();
+        let socket_fd2 = i32::try_from(socket_fd2).unwrap();
+
+        task.sys_close(socket_fd).unwrap();
+        let err = task
+            .sys_connect(
+                socket_fd2,
+                SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+                    core::net::Ipv4Addr::from([10, 0, 0, 1]),
+                    SERVER_PORT,
+                ))),
+            )
+            .unwrap_err();
+        assert_eq!(err, litebox_common_linux::errno::Errno::ECONNREFUSED);
+    }
+
+    #[test]
     fn test_tun_tcp_socket_as_client() {
         let task = init_platform(Some("tun99"));
 
@@ -1453,8 +1508,19 @@ mod tests {
             .unwrap();
         assert_eq!(n, len);
 
-        // Before we support graceful shutdown, sleep a bit to ensure data is sent
-        std::thread::sleep(core::time::Duration::from_millis(500));
+        let linger = litebox_common_linux::Linger {
+            onoff: 1,      // enable linger
+            linger: 10000, // timeout in seconds
+        };
+        let optval = ConstPtr::from_usize((&raw const linger).cast::<u8>() as usize);
+        task.sys_setsockopt(
+            client_fd,
+            SocketOptionName::Socket(SocketOption::LINGER),
+            optval,
+            core::mem::size_of::<litebox_common_linux::Linger>(),
+        )
+        .expect("Failed to set SO_LINGER");
+
         task.sys_close(client_fd)
             .expect("failed to close client socket");
 

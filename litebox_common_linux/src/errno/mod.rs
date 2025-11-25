@@ -371,6 +371,8 @@ impl From<litebox::net::errors::ConnectError> for Errno {
             litebox::net::errors::ConnectError::UnsupportedAddress(_) => Errno::EAFNOSUPPORT,
             litebox::net::errors::ConnectError::PortAllocationFailure(_) => Errno::EADDRINUSE,
             litebox::net::errors::ConnectError::Unaddressable => Errno::EADDRNOTAVAIL,
+            litebox::net::errors::ConnectError::InProgress => Errno::EINPROGRESS,
+            litebox::net::errors::ConnectError::InvalidState => Errno::ECONNREFUSED,
             _ => unimplemented!(),
         }
     }

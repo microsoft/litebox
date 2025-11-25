@@ -26,6 +26,8 @@ pub enum SocketError {
 pub enum CloseError {
     #[error("Not a valid open file descriptor")]
     InvalidFd,
+    #[error("Socket closed with data still pending transmission")]
+    DataPending,
 }
 
 /// Possible errors from [`Network::connect`]
@@ -40,6 +42,10 @@ pub enum ConnectError {
     PortAllocationFailure(#[from] LocalPortAllocationError),
     #[error("Invalid address")]
     Unaddressable,
+    #[error("Connection is still in progress")]
+    InProgress,
+    #[error("Socket is in an invalid state")]
+    InvalidState,
 }
 
 /// Possible errors from [`Network::get_local_addr`]
