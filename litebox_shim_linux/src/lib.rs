@@ -277,11 +277,11 @@ impl LinuxShim {
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
         };
-        let process = with_current_task(|task| {
+        with_current_task(|task| {
             task.load_program(loader::elf::ElfLoader::new(task, path)?, argv, envp)?;
             Ok(LinuxShimProcess(task.process().clone()))
-        })?;
-        Ok(LoadedProgram {
+        })
+        .map(|process| LoadedProgram {
             entrypoints,
             process,
         })
