@@ -204,10 +204,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         in_mem.with_root_privileges(|fs| {
             let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
             if let Err(err) = fs.mkdir("/tmp", mode) {
-                if let litebox::fs::errors::MkdirError::AlreadyExists = err {
-                    fs.chmod("/tmp", mode).expect("Failed to call chmod");
-                } else {
-                    panic!();
+                match err {
+                    litebox::fs::errors::MkdirError::AlreadyExists => {
+                        fs.chmod("/tmp", mode).expect("Failed to call chmod");
+                    }
+                    _ => panic!(),
                 }
             }
         });
