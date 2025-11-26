@@ -963,11 +963,6 @@ pub enum LdelfSyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         num_bytes: usize,
         handle: u32,
     },
-    SetProt {
-        va: Platform::RawMutPointer<usize>,
-        num_bytes: usize,
-        flags: LdelfMapFlags,
-    },
     GenRndNum {
         buf: Platform::RawMutPointer<u8>,
         num_bytes: usize,
@@ -1022,11 +1017,6 @@ impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platfo
                 offs: ctx.syscall_arg(1),
                 num_bytes: ctx.syscall_arg(2),
                 handle: u32::try_from(ctx.syscall_arg(3)).map_err(|_| Errno::EINVAL)?,
-            },
-            LdelfSyscallNr::SetProt => LdelfSyscallRequest::SetProt {
-                va: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
-                num_bytes: ctx.syscall_arg(1),
-                flags: LdelfMapFlags::from_bits_truncate(ctx.syscall_arg(2)),
             },
             LdelfSyscallNr::GenRndNum => LdelfSyscallRequest::GenRndNum {
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),

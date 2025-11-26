@@ -17,6 +17,11 @@ fn align_down(addr: usize, align: usize) -> usize {
 
 const DUMMY_HANDLE: u32 = 1;
 
+/// OP-TEE's syscall to map zero-initialized memory with padding.
+/// This function pads `pad_begin` bytes before and `pad_end` bytes after the
+/// zero-initialized `num_bytes` bytes. `va` can contain a hint address which
+/// is `pad_begin` bytes lower than the starting address of the memory region.
+/// (`start - pad_begin`, ...,  `start`, ..., `start + num_bytes`, ..., `start + num_bytes + pad_end`)
 pub fn sys_map_zi(
     va: crate::MutPtr<usize>,
     num_bytes: usize,
@@ -76,6 +81,7 @@ pub fn sys_map_zi(
             )
             .expect("sys_map_zi: failed to set memory protection");
             unsafe {
+                core::ptr::write_bytes(padded_start as *mut u8, 0, num_bytes);
                 let _ = va.write_at_offset(0, padded_start);
             }
             Ok(())
@@ -84,6 +90,7 @@ pub fn sys_map_zi(
     }
 }
 
+/// OP-TEE's syscall to open a TA binary.
 #[expect(clippy::unnecessary_wraps)]
 pub fn sys_open_bin(ta_uuid: TeeUuid, handle: crate::MutPtr<u32>) -> Result<(), TeeResult> {
     // TODO: This function requires an RPC from the secure world to the normal world to
@@ -104,6 +111,7 @@ pub fn sys_open_bin(ta_uuid: TeeUuid, handle: crate::MutPtr<u32>) -> Result<(), 
     Ok(())
 }
 
+/// OP-TEE's syscall to close a TA binary.
 #[expect(clippy::unnecessary_wraps)]
 pub fn sys_close_bin(handle: u32) -> Result<(), TeeResult> {
     // TODO: This function requires an RPC from the secure world to the normal world to
@@ -122,6 +130,7 @@ pub fn sys_close_bin(handle: u32) -> Result<(), TeeResult> {
     Ok(())
 }
 
+/// OP-TEE's syscall to map a portion of a TA binary into memory.
 pub fn sys_map_bin(
     va: crate::MutPtr<usize>,
     num_bytes: usize,
@@ -243,6 +252,7 @@ pub fn sys_map_bin(
     }
 }
 
+/// OP-TEE's syscall to copy data from the TA binary to memory.
 pub fn sys_cp_from_bin(
     dst: usize,
     offs: usize,
@@ -265,25 +275,5 @@ pub fn sys_cp_from_bin(
         }
     }
 
-    Ok(())
-}
-
-pub fn sys_set_prot(
-    va: crate::MutPtr<usize>,
-    num_bytes: usize,
-    flags: LdelfMapFlags,
-) -> Result<(), TeeResult> {
-    let Some(addr) = (unsafe { va.read_at_offset(0) }) else {
-        return Err(TeeResult::BadParameters);
-    };
-    #[cfg(debug_assertions)]
-    litebox::log_println!(
-        litebox_platform_multiplex::platform(),
-        "sys_set_prot: va {:#x} (addr {:#x}), num_bytes {}, flags {:#x}",
-        va.as_usize(),
-        *addr,
-        num_bytes,
-        flags
-    );
     Ok(())
 }

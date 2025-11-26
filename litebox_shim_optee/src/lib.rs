@@ -426,11 +426,6 @@ fn handle_ldelf_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Conti
             num_bytes,
             handle,
         } => syscalls::ldelf::sys_cp_from_bin(dst, offs, num_bytes, handle),
-        LdelfSyscallRequest::SetProt {
-            va,
-            num_bytes,
-            flags,
-        } => syscalls::ldelf::sys_set_prot(va, num_bytes, flags),
         LdelfSyscallRequest::GenRndNum { buf, num_bytes } => {
             // This could take a long time for large sizes. But OP-TEE OS limits
             // the maximum size of random data generation to 4096 bytes, so
