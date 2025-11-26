@@ -9,6 +9,12 @@ fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
 
+#[inline]
+fn align_down(addr: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    addr & !(align - 1)
+}
+
 const DUMMY_HANDLE: u32 = 1;
 
 pub fn sys_map_zi(
@@ -55,10 +61,22 @@ pub fn sys_map_zi(
         MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED
     };
 
-    match crate::syscalls::mm::sys_mmap(*addr, total_size, prot, flags, -1, 0) {
+    match crate::syscalls::mm::sys_mmap(*addr, total_size, ProtFlags::PROT_NONE, flags, -1, 0) {
         Ok(addr) => {
+            let padded_start = addr.as_usize() + pad_begin;
+            crate::syscalls::mm::sys_mprotect(
+                litebox::platform::common_providers::userspace_pointers::UserMutPtr {
+                    inner: align_down(padded_start, PAGE_SIZE) as *mut u8,
+                },
+                align_up(
+                    num_bytes + padded_start - align_down(padded_start, PAGE_SIZE),
+                    PAGE_SIZE,
+                ),
+                prot,
+            )
+            .expect("sys_map_zi: failed to set memory protection");
             unsafe {
-                let _ = va.write_at_offset(0, addr.as_usize() + pad_begin);
+                let _ = va.write_at_offset(0, padded_start);
             }
             Ok(())
         }
@@ -165,15 +183,27 @@ pub fn sys_map_bin(
     match crate::syscalls::mm::sys_mmap(
         *addr,
         total_size,
-        ProtFlags::PROT_READ_WRITE,
+        ProtFlags::PROT_NONE,
         flags_internal,
         -1,
         0,
     ) {
         Ok(addr) => {
-            let padded_addr = addr.as_usize() + pad_begin;
+            let padded_start = addr.as_usize() + pad_begin;
+            crate::syscalls::mm::sys_mprotect(
+                litebox::platform::common_providers::userspace_pointers::UserMutPtr {
+                    inner: align_down(padded_start, PAGE_SIZE) as *mut u8,
+                },
+                align_up(
+                    num_bytes + padded_start - align_down(padded_start, PAGE_SIZE),
+                    PAGE_SIZE,
+                ),
+                ProtFlags::PROT_READ_WRITE,
+            )
+            .expect("sys_map_bin: failed to set memory protection");
+
             unsafe {
-                if crate::read_ta_bin(padded_addr as *mut u8, offs, num_bytes).is_none() {
+                if crate::read_ta_bin(padded_start as *mut u8, offs, num_bytes).is_none() {
                     return Err(TeeResult::ShortBuffer);
                 }
             }
@@ -184,18 +214,27 @@ pub fn sys_map_bin(
             } else if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE) {
                 prot |= ProtFlags::PROT_EXEC;
             }
-            crate::syscalls::mm::sys_mprotect(addr, total_size, prot)
-                .expect("sys_map_bin: failed to set memory protection");
+            crate::syscalls::mm::sys_mprotect(
+                litebox::platform::common_providers::userspace_pointers::UserMutPtr {
+                    inner: align_down(padded_start, PAGE_SIZE) as *mut u8,
+                },
+                align_up(
+                    num_bytes + padded_start - align_down(padded_start, PAGE_SIZE),
+                    PAGE_SIZE,
+                ),
+                prot,
+            )
+            .expect("sys_map_bin: failed to set memory protection");
 
             if offs == PAGE_SIZE
                 && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
                 && crate::get_ta_base_addr().is_none()
             {
-                crate::set_ta_base_addr(padded_addr);
+                crate::set_ta_base_addr(padded_start);
             }
 
             unsafe {
-                let _ = va.write_at_offset(0, padded_addr);
+                let _ = va.write_at_offset(0, padded_start);
             }
 
             Ok(())
