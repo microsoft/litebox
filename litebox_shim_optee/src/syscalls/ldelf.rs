@@ -66,10 +66,6 @@ pub fn sys_map_zi(
     }
 }
 
-pub fn sys_unmap(_va: crate::MutPtr<u8>, _num_bytes: usize) -> Result<(), TeeResult> {
-    todo!("implement sys_unmap which is aware of pad_begin and pad_end");
-}
-
 #[expect(clippy::unnecessary_wraps)]
 pub fn sys_open_bin(ta_uuid: TeeUuid, handle: crate::MutPtr<u32>) -> Result<(), TeeResult> {
     // TODO: This function requires an RPC from the secure world to the normal world to

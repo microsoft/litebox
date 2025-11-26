@@ -397,7 +397,6 @@ fn handle_ldelf_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Conti
             pad_end,
             flags,
         } => syscalls::ldelf::sys_map_zi(va, num_bytes, pad_begin, pad_end, flags),
-        LdelfSyscallRequest::Unmap { va, num_bytes } => syscalls::ldelf::sys_unmap(va, num_bytes),
         LdelfSyscallRequest::OpenBin {
             uuid,
             uuid_size,

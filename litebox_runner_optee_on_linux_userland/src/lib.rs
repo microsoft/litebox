@@ -157,7 +157,7 @@ fn run_ta_with_default_commands(ldelf_bin: &[u8], ta_bin: &[u8]) {
                 litebox_platform_linux_userland::run_thread(
                     litebox_shim_optee::OpteeShim,
                     &mut pt_regs,
-                )
+                );
             };
 
             let ldelf_arg_out = unsafe { &*(ldelf_arg_address as *const LdelfArg) };
@@ -201,7 +201,7 @@ fn run_ta_with_default_commands(ldelf_bin: &[u8], ta_bin: &[u8]) {
                 litebox_platform_linux_userland::run_thread(
                     litebox_shim_optee::OpteeShim,
                     &mut pt_regs,
-                )
+                );
             };
         } else if func_id == UteeEntryFunc::CloseSession {
             litebox_shim_optee::deinit_session();

@@ -73,7 +73,7 @@ pub fn run_ta_with_test_commands(
                 litebox_platform_linux_userland::run_thread(
                     litebox_shim_optee::OpteeShim,
                     &mut pt_regs,
-                )
+                );
             };
             assert!(
                 pt_regs.rax == 0,
@@ -130,7 +130,7 @@ pub fn run_ta_with_test_commands(
                 litebox_platform_linux_userland::run_thread(
                     litebox_shim_optee::OpteeShim,
                     &mut pt_regs,
-                )
+                );
             };
             assert!(
                 pt_regs.rax == 0,
