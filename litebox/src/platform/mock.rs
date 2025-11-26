@@ -262,11 +262,11 @@ impl TimeProvider for MockPlatform {
 }
 
 impl PunchthroughProvider for MockPlatform {
-    type PunchthroughToken = trivial_providers::ImpossiblePunchthroughToken;
-    fn get_punchthrough_token_for(
+    type PunchthroughToken<'a> = trivial_providers::ImpossiblePunchthroughToken;
+    fn get_punchthrough_token_for<'a>(
         &self,
-        punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken> {
+        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>> {
         None
     }
 }

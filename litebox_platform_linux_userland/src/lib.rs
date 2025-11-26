@@ -1113,12 +1113,12 @@ fn clear_thread_area(entry_number: u32) {
     set_thread_area(&mut user_desc).expect("failed to clear TLS entry");
 }
 
-pub struct PunchthroughToken {
-    punchthrough: PunchthroughSyscall<LinuxUserland>,
+pub struct PunchthroughToken<'a> {
+    punchthrough: PunchthroughSyscall<'a, LinuxUserland>,
 }
 
-impl litebox::platform::PunchthroughToken for PunchthroughToken {
-    type Punchthrough = PunchthroughSyscall<LinuxUserland>;
+impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
+    type Punchthrough = PunchthroughSyscall<'a, LinuxUserland>;
     fn execute(
         self,
     ) -> Result<
@@ -1234,20 +1234,10 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
                 Ok(0)
             }
             #[cfg(target_arch = "x86_64")]
-            PunchthroughSyscall::GetFsBase { addr } => {
-                use litebox::platform::RawMutPointer as _;
-                let fs_base = get_guest_fsbase();
-                unsafe { addr.write_at_offset(0, fs_base) }.ok_or(
-                    litebox::platform::PunchthroughError::Failure(
-                        litebox_common_linux::errno::Errno::EFAULT,
-                    ),
-                )?;
-                Ok(0)
-            }
+            PunchthroughSyscall::GetFsBase => Ok(get_guest_fsbase()),
             #[cfg(target_arch = "x86")]
             PunchthroughSyscall::SetThreadArea { user_desc } => {
-                set_thread_area(unsafe { &mut *user_desc })
-                    .map_err(litebox::platform::PunchthroughError::Failure)
+                set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
             }
             PunchthroughSyscall::Alarm { seconds } => unsafe {
                 let remain = syscalls::syscall2(
@@ -1306,11 +1296,11 @@ impl litebox::platform::PunchthroughToken for PunchthroughToken {
 }
 
 impl litebox::platform::PunchthroughProvider for LinuxUserland {
-    type PunchthroughToken = PunchthroughToken;
-    fn get_punchthrough_token_for(
+    type PunchthroughToken<'a> = PunchthroughToken<'a>;
+    fn get_punchthrough_token_for<'a>(
         &self,
-        punchthrough: <Self::PunchthroughToken as litebox::platform::PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken> {
+        punchthrough: <Self::PunchthroughToken<'a> as litebox::platform::PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>> {
         Some(PunchthroughToken { punchthrough })
     }
 }

@@ -11,11 +11,11 @@ use super::{
 /// A trivial provider, useful when no punchthrough is necessary.
 pub struct ImpossiblePunchthroughProvider {}
 impl PunchthroughProvider for ImpossiblePunchthroughProvider {
-    type PunchthroughToken = ImpossiblePunchthroughToken;
-    fn get_punchthrough_token_for(
+    type PunchthroughToken<'a> = ImpossiblePunchthroughToken;
+    fn get_punchthrough_token_for<'a>(
         &self,
-        _punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken> {
+        _punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>> {
         // Since `ImpossiblePunchthrough` is an empty enum, it is impossible to actually invoke
         // `execute` upon it, meaning that the implementation here is irrelevant, since anything
         // within it is provably unreachable.
@@ -51,11 +51,11 @@ impl PunchthroughToken for ImpossiblePunchthroughToken {
 /// simply caught as "unimplemented" temporarily, while more infrastructure is set up.
 pub struct IgnoredPunchthroughProvider {}
 impl PunchthroughProvider for IgnoredPunchthroughProvider {
-    type PunchthroughToken = IgnoredPunchthroughToken;
-    fn get_punchthrough_token_for(
+    type PunchthroughToken<'a> = IgnoredPunchthroughToken;
+    fn get_punchthrough_token_for<'a>(
         &self,
-        punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken> {
+        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>> {
         Some(IgnoredPunchthroughToken { punchthrough })
     }
 }

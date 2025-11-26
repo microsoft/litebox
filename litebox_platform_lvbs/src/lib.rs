@@ -20,7 +20,7 @@ use litebox::platform::{
     Punchthrough, RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{
-    PunchthroughProvider, PunchthroughToken, RawMutPointer, RawMutex as _, RawPointerProvider,
+    PunchthroughProvider, PunchthroughToken, RawMutex as _, RawPointerProvider,
 };
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
@@ -53,8 +53,8 @@ pub struct LinuxKernel<Host: HostInterface> {
     user_contexts: UserContextMap,
 }
 
-pub struct LinuxPunchthroughToken<Host: HostInterface> {
-    punchthrough: PunchthroughSyscall<LinuxKernel<Host>>,
+pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
+    punchthrough: PunchthroughSyscall<'a, LinuxKernel<Host>>,
     host: core::marker::PhantomData<Host>,
 }
 
@@ -63,8 +63,8 @@ impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawMutPointer<T: Clone> = ptr::UserMutPtr<T>;
 }
 
-impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
-    type Punchthrough = PunchthroughSyscall<LinuxKernel<Host>>;
+impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, Host> {
+    type Punchthrough = PunchthroughSyscall<'a, LinuxKernel<Host>>;
 
     fn execute(
         self,
@@ -77,13 +77,7 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                 unsafe { litebox_common_linux::wrfsbase(addr) };
                 Ok(0)
             }
-            PunchthroughSyscall::GetFsBase { addr } => {
-                let fs_base = unsafe { litebox_common_linux::rdfsbase() };
-                let ptr: UserMutPtr<usize> = addr.cast();
-                unsafe { ptr.write_at_offset(0, fs_base) }
-                    .map(|()| 0)
-                    .ok_or(Errno::EFAULT)
-            }
+            PunchthroughSyscall::GetFsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
             _ => unimplemented!(),
         };
         match r {
@@ -94,12 +88,12 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
 }
 
 impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
-    type PunchthroughToken = LinuxPunchthroughToken<Host>;
+    type PunchthroughToken<'a> = LinuxPunchthroughToken<'a, Host>;
 
-    fn get_punchthrough_token_for(
+    fn get_punchthrough_token_for<'a>(
         &self,
-        punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken> {
+        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>> {
         Some(LinuxPunchthroughToken {
             punchthrough,
             host: core::marker::PhantomData,
