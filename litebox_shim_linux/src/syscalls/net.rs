@@ -1509,8 +1509,8 @@ mod tests {
         assert_eq!(n, len);
 
         let linger = litebox_common_linux::Linger {
-            onoff: 1,      // enable linger
-            linger: 10000, // timeout in seconds
+            onoff: 1,   // enable linger
+            linger: 60, // timeout in seconds
         };
         let optval = ConstPtr::from_usize((&raw const linger).cast::<u8>() as usize);
         task.sys_setsockopt(

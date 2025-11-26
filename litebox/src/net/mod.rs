@@ -291,11 +291,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PollableSocketHandle<'_
 
         if let Protocol::Tcp = self.socket_handle.protocol() {
             let tcp_specific = self.socket_handle.specific.tcp();
-            let cur_state = self
+            let is_open = self
                 .socket_set
                 .get::<tcp::Socket>(self.socket_handle.handle)
-                .state();
-            if let tcp::State::Closed = cur_state {
+                .is_open();
+            if !is_open {
                 let should_emit_hup = if new_events_only {
                     tcp_specific
                         .was_connection_initiated
@@ -694,7 +694,7 @@ where
             let handle = *socket_handle;
             let tcp_socket = self.socket_set.get::<tcp::Socket>(handle);
             // a socket in the CLOSED state with the remote endpoint set means that an outgoing RST packet is pending
-            if tcp_socket.state() == tcp::State::Closed && tcp_socket.remote_endpoint().is_none() {
+            if !tcp_socket.is_open() && tcp_socket.remote_endpoint().is_none() {
                 self.socket_set.remove(handle);
                 false
             } else {
@@ -993,7 +993,9 @@ where
                             // already connected
                             Ok(())
                         }
-                        tcp::State::Closed => Err(ConnectError::InvalidState),
+                        tcp::State::Closed | tcp::State::TimeWait => {
+                            Err(ConnectError::InvalidState)
+                        }
                         tcp::State::SynSent => Err(ConnectError::InProgress),
                         s => unimplemented!("state: {:?}", s),
                     }
@@ -1304,7 +1306,7 @@ where
                 // that are not closed
                 server_socket.socket_set_handles.retain(|&h| {
                     let socket: &tcp::Socket = self.socket_set.get(h);
-                    socket.state() != tcp::State::Closed
+                    socket.is_open()
                 });
                 // Find a socket that has progressed further in its TCP state machine, by finding a
                 // socket in an established state
