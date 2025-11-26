@@ -1,5 +1,6 @@
 use litebox::mm::linux::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
-use litebox::platform::{RawConstPointer as _, page_mgmt};
+use litebox::platform::common_providers::userspace_pointers::UserMutPtr;
+use litebox::platform::page_mgmt;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -16,12 +17,9 @@ use x86_64::{
     },
 };
 
-use crate::{
-    UserMutPtr,
-    mm::{
-        MemoryProvider,
-        pgtable::{PageTableAllocator, PageTableImpl},
-    },
+use crate::mm::{
+    MemoryProvider,
+    pgtable::{PageTableAllocator, PageTableImpl},
 };
 
 #[cfg(not(test))]

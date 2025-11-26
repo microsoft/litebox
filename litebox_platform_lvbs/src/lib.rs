@@ -13,6 +13,7 @@ use core::{
     arch::asm,
     sync::atomic::{AtomicU32, AtomicU64},
 };
+use litebox::platform::common_providers::userspace_pointers::{UserConstPtr, UserMutPtr};
 use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
