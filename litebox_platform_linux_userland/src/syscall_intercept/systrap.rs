@@ -115,7 +115,10 @@ fn register_seccomp_filter() {
                         0,
                         SeccompCmpArgLen::Dword,
                         SeccompCmpOp::Ne,
-                        litebox_common_linux::signal::Signal::SIGSYS.as_usize() as u64,
+                        litebox_common_linux::signal::Signal::SIGSYS
+                            .as_i32()
+                            .try_into()
+                            .unwrap(),
                     )
                     .unwrap(),
                 ])
