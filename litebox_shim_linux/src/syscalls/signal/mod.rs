@@ -11,25 +11,21 @@ use x86 as arch;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
 
-use crate::ConstPtr;
-use crate::MutPtr;
-use crate::Task;
 use crate::syscalls::process::ExitStatus;
+use crate::{ConstPtr, MutPtr, Task};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
-use core::cell::Cell;
-use core::cell::RefCell;
-use litebox::LiteBox;
-use litebox::platform::RawConstPointer as _;
-use litebox::platform::RawMutPointer as _;
-use litebox::shim::Exception;
-use litebox::sync::Mutex;
-use litebox_common_linux::signal::MINSIGSTKSZ;
-use litebox_common_linux::signal::SIG_DFL;
-use litebox_common_linux::signal::SIG_IGN;
+use core::cell::{Cell, RefCell};
+use litebox::{
+    LiteBox,
+    platform::{RawConstPointer as _, RawMutPointer as _},
+    shim::Exception,
+    sync::Mutex,
+    utils::ReinterpretUnsignedExt as _,
+};
 use litebox_common_linux::signal::{
-    NSIG, SI_KERNEL, SI_USER, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData,
-    SigmaskHow, Signal, SsFlags, Ucontext,
+    MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
+    SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
 };
 use litebox_common_linux::{PtRegs, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -121,6 +117,27 @@ struct SignalHandlersInner {
     handlers: [Handler; NSIG],
 }
 
+impl SignalHandlersInner {
+    /// Returns the array index for the given signal.
+    fn sig_index(signal: Signal) -> usize {
+        (signal.as_i32().reinterpret_as_unsigned() - 1) as usize
+    }
+}
+
+impl core::ops::Index<Signal> for SignalHandlersInner {
+    type Output = Handler;
+
+    fn index(&self, signal: Signal) -> &Self::Output {
+        &self.handlers[Self::sig_index(signal)]
+    }
+}
+
+impl core::ops::IndexMut<Signal> for SignalHandlersInner {
+    fn index_mut(&mut self, signal: Signal) -> &mut Self::Output {
+        &mut self.handlers[Self::sig_index(signal)]
+    }
+}
+
 #[derive(Clone)]
 struct Handler {
     action: SigAction,
@@ -139,7 +156,8 @@ impl SignalHandlers {
                         flags: SaFlags::empty(),
                         mask: SigSet::empty(),
                     },
-                    immutable: i == Signal::SIGKILL.as_usize() || i == Signal::SIGSTOP.as_usize(),
+                    immutable: i == SignalHandlersInner::sig_index(Signal::SIGKILL)
+                        || i == SignalHandlersInner::sig_index(Signal::SIGSTOP),
                 }),
             }),
         }
@@ -169,10 +187,10 @@ impl PendingSignals {
         }
     }
 
-    fn find(&self, signo: Signal) -> Option<usize> {
+    fn find(&self, signal: Signal) -> Option<usize> {
         self.queue
             .iter()
-            .position(|info| info.signo == signo.as_i32())
+            .position(|info| info.signo == signal.as_i32())
     }
 
     fn next(&self, blocked: SigSet) -> Option<Signal> {
@@ -244,9 +262,9 @@ fn is_on_stack(stack: &SigAltStack, sp: usize) -> bool {
 }
 
 /// Creates a `Siginfo` for an exception signal.
-fn siginfo_exception(signo: Signal, fault_address: usize) -> Siginfo {
+fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
     Siginfo {
-        signo: signo.as_i32(),
+        signo: signal.as_i32(),
         errno: 0,
         code: SI_KERNEL,
         data: SiginfoData {
@@ -257,9 +275,9 @@ fn siginfo_exception(signo: Signal, fault_address: usize) -> Siginfo {
 
 /// Creates a `Siginfo` for a signal sent by a user process via `kill()`,
 /// `tkill()`, or `tgkill()`.
-fn siginfo_kill(signo: Signal) -> Siginfo {
+fn siginfo_kill(signal: Signal) -> Siginfo {
     Siginfo {
-        signo: signo.as_i32(),
+        signo: signal.as_i32(),
         errno: 0,
         code: SI_USER,
         data: SiginfoData { pad: [0; 29] },
@@ -430,12 +448,12 @@ impl Task {
 
     pub(crate) fn sys_rt_sigaction(
         &self,
-        signo: Signal,
+        signal: Signal,
         act_ptr: Option<ConstPtr<SigAction>>,
         oldact_ptr: Option<MutPtr<SigAction>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if signo == Signal::SIGKILL || signo == Signal::SIGSTOP {
+        if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
             return Err(Errno::EINVAL);
         }
         if sigsetsize != core::mem::size_of::<SigSet>() {
@@ -453,8 +471,8 @@ impl Task {
 
         let handlers = self.signals.handlers.borrow();
         let old_act = {
-            let mut list = handlers.inner.lock();
-            let handler = &mut list.handlers[signo.as_usize()];
+            let mut inner = handlers.inner.lock();
+            let handler = &mut inner[signal];
             if handler.immutable {
                 return Err(Errno::EINVAL);
             }
@@ -509,7 +527,7 @@ impl Task {
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
         loop {
             let mut pending = self.signals.pending.borrow_mut();
-            let Some(signo) = pending.next(self.signals.blocked.get()) else {
+            let Some(signal) = pending.next(self.signals.blocked.get()) else {
                 break;
             };
             if self.is_exiting() {
@@ -517,14 +535,13 @@ impl Task {
                 return;
             }
 
-            let siginfo: Siginfo = pending.remove(signo);
+            let siginfo: Siginfo = pending.remove(signal);
             drop(pending);
-            let action =
-                self.signals.handlers.borrow().inner.lock().handlers[signo.as_usize()].action;
+            let action = self.signals.handlers.borrow().inner.lock()[signal].action;
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
                 SIG_DFL => {
-                    match signo.default_disposition() {
+                    match signal.default_disposition() {
                         SignalDisposition::Terminate
                         | SignalDisposition::Core
                         | SignalDisposition::Stop => {
@@ -534,11 +551,11 @@ impl Task {
                             litebox::log_println!(
                                 litebox_platform_multiplex::platform(),
                                 "-- Fatal signal {:?}: terminating task {}:{}",
-                                signo,
+                                signal,
                                 self.pid,
                                 self.tid,
                             );
-                            self.exit_group(ExitStatus::Signal(signo));
+                            self.exit_group(ExitStatus::Signal(signal));
                         }
                         SignalDisposition::Ignore => {}
                         SignalDisposition::Continue => {
@@ -552,7 +569,7 @@ impl Task {
                         // Failed to deliver signal. Inject a SIGSEGV
                         // (terminating the process if we were trying to deliver
                         // a SIGSEGV).
-                        self.force_signal(Signal::SIGSEGV, signo == Signal::SIGSEGV);
+                        self.force_signal(Signal::SIGSEGV, signal == Signal::SIGSEGV);
                     }
                 }
             }
@@ -582,8 +599,8 @@ impl Task {
 
         // Update the handler if necessary to ensure the signal is handled.
         let handlers = self.signals.handlers.borrow();
-        let mut list = handlers.inner.lock();
-        let handler = &mut list.handlers[signal.as_usize()];
+        let mut inner = handlers.inner.lock();
+        let handler = &mut inner[signal];
         if force_exit
             || self.signals.blocked.get().contains(signal)
             || handler.action.sigaction == SIG_IGN

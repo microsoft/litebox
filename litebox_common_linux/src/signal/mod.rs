@@ -9,7 +9,7 @@ use x86::Sigcontext;
 use x86_64::Sigcontext;
 
 use int_enum::IntEnum;
-use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _};
+use litebox::utils::ReinterpretSignedExt as _;
 
 use crate::errno::Errno;
 
@@ -57,12 +57,6 @@ impl Signal {
     /// Get the signal number as an `i32`, the natural representation.
     pub const fn as_i32(&self) -> i32 {
         self.0
-    }
-
-    /// Get the signal number as a `usize`, useful for indexing or storing in
-    /// platform registers.
-    pub fn as_usize(&self) -> usize {
-        self.0.reinterpret_as_unsigned() as usize
     }
 
     /// Returns true if this is a real-time signal.
