@@ -123,6 +123,9 @@ where
 /// [`SocketHandle`] stores all relevant information for a specific [`SocketFd`], for easy access
 /// from [`SocketFd`], _except_ the `Socket` itself which is stored in the [`Network::socket_set`].
 pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    /// Whether this socket handle is going away soon (i.e., `close` has been invoked upon it but
+    /// it lingers for a bit to allow pending data to be sent).
+    consider_closed: bool,
     /// The handle into the `socket_set`
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
@@ -132,6 +135,60 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     previously_sendable: AtomicBool,
     /// Number of octets in the receive queue
     recv_queue: AtomicUsize,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> {
+    /// Convenience function to perform an operation depending on the socket type
+    fn with_socket<TCP, UDP, R>(
+        &self,
+        socket_set: &smoltcp::iface::SocketSet<'static>,
+        tcp: TCP,
+        udp: UDP,
+    ) -> R
+    where
+        TCP: FnOnce(&tcp::Socket) -> R,
+        UDP: FnOnce(&udp::Socket) -> R,
+    {
+        match self.protocol() {
+            crate::net::Protocol::Tcp => {
+                let tcp_socket = socket_set.get::<tcp::Socket>(self.handle);
+                tcp(tcp_socket)
+            }
+            crate::net::Protocol::Udp => {
+                let udp_socket = socket_set.get::<udp::Socket>(self.handle);
+                udp(udp_socket)
+            }
+            crate::net::Protocol::Icmp | crate::net::Protocol::Raw { protocol: _ } => {
+                unimplemented!()
+            }
+        }
+    }
+
+    // Convenience function to perform a mutable operation depending on the socket type
+    fn with_socket_mut<TCP, UDP, R>(
+        &mut self,
+        socket_set: &mut smoltcp::iface::SocketSet<'static>,
+        tcp: TCP,
+        udp: UDP,
+    ) -> R
+    where
+        TCP: FnOnce(&mut tcp::Socket) -> R,
+        UDP: FnOnce(&mut udp::Socket) -> R,
+    {
+        match self.protocol() {
+            crate::net::Protocol::Tcp => {
+                let tcp_socket = socket_set.get_mut::<tcp::Socket>(self.handle);
+                tcp(tcp_socket)
+            }
+            crate::net::Protocol::Udp => {
+                let udp_socket = socket_set.get_mut::<udp::Socket>(self.handle);
+                udp(udp_socket)
+            }
+            crate::net::Protocol::Icmp | crate::net::Protocol::Raw { protocol: _ } => {
+                unimplemented!()
+            }
+        }
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> core::ops::Deref
@@ -234,11 +291,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PollableSocketHandle<'_
 
         if let Protocol::Tcp = self.socket_handle.protocol() {
             let tcp_specific = self.socket_handle.specific.tcp();
-            let cur_state = self
+            let is_open = self
                 .socket_set
                 .get::<tcp::Socket>(self.socket_handle.handle)
-                .state();
-            if let tcp::State::Closed = cur_state {
+                .is_open();
+            if !is_open {
                 let should_emit_hup = if new_events_only {
                     tcp_specific
                         .was_connection_initiated
@@ -614,6 +671,7 @@ where
     )]
     fn check_and_update_events(&mut self) {
         self.remove_dead_sockets();
+        self.close_pending_sockets();
 
         for (internal_fd, socket_handle) in
             self.litebox.descriptor_table().iter::<Network<Platform>>()
@@ -636,13 +694,46 @@ where
             let handle = *socket_handle;
             let tcp_socket = self.socket_set.get::<tcp::Socket>(handle);
             // a socket in the CLOSED state with the remote endpoint set means that an outgoing RST packet is pending
-            if tcp_socket.state() == tcp::State::Closed && tcp_socket.remote_endpoint().is_none() {
+            if !tcp_socket.is_open() && tcp_socket.remote_endpoint().is_none() {
                 self.socket_set.remove(handle);
                 false
             } else {
                 true
             }
         });
+    }
+
+    /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
+    fn close_pending_sockets(&mut self) {
+        for (_, mut handle) in self
+            .litebox
+            .descriptor_table_mut()
+            .iter_mut::<Network<Platform>>()
+        {
+            let socket_handle = &mut handle.entry;
+            if socket_handle.consider_closed {
+                let closed = socket_handle.with_socket_mut(
+                    &mut self.socket_set,
+                    |tcp_socket| {
+                        let has_pending_data = tcp_socket.may_send() && tcp_socket.send_queue() > 0;
+                        if !has_pending_data {
+                            tcp_socket.close();
+                        }
+                        !has_pending_data
+                    },
+                    |udp_socket| {
+                        let has_pending_data = udp_socket.is_open() && udp_socket.send_queue() > 0;
+                        if !has_pending_data {
+                            udp_socket.close();
+                        }
+                        !has_pending_data
+                    },
+                );
+                if closed {
+                    socket_handle.consider_closed = false;
+                }
+            }
+        }
     }
 }
 
@@ -720,6 +811,7 @@ where
         };
 
         Ok(self.new_socket_fd_for(SocketHandle {
+            consider_closed: false,
             handle,
             specific: match protocol {
                 Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific {
@@ -771,20 +863,12 @@ where
                     CloseBehavior::GracefulIfNoPendingData => {}
                 }
                 let socket_handle = &entry.entry;
-                let has_data_pending = match socket_handle.protocol() {
-                    crate::net::Protocol::Tcp => {
-                        let tcp_socket = self.socket_set.get::<tcp::Socket>(socket_handle.handle);
-                        tcp_socket.may_send() && tcp_socket.send_queue() > 0
-                    }
-                    crate::net::Protocol::Udp => {
-                        let udp_socket = self.socket_set.get::<udp::Socket>(socket_handle.handle);
-                        udp_socket.is_open() && udp_socket.send_queue() > 0
-                    }
-                    crate::net::Protocol::Icmp | crate::net::Protocol::Raw { protocol: _ } => {
-                        unimplemented!()
-                    }
-                };
-                !has_data_pending
+                // check if there is pending data to be sent
+                !socket_handle.with_socket(
+                    &self.socket_set,
+                    |tcp_socket| tcp_socket.may_send() && tcp_socket.send_queue() > 0,
+                    |udp_socket| udp_socket.is_open() && udp_socket.send_queue() > 0,
+                )
             })
             .ok_or(CloseError::InvalidFd)?
         {
@@ -799,7 +883,13 @@ where
                 // We attempt to queue it for future closure and then just return.
                 self.queued_for_closure.push(dup_fd);
             }
-            super::fd::CloseResult::Deferred => return Err(CloseError::DataPending),
+            super::fd::CloseResult::Deferred => {
+                let Some(()) = dt.with_entry_mut(fd, |entry| entry.entry.consider_closed = true)
+                else {
+                    unreachable!()
+                };
+                return Err(CloseError::DataPending);
+            }
         }
         Ok(())
     }
@@ -826,6 +916,7 @@ where
     /// Close the `socket_handle`
     fn close_handle(&mut self, socket_handle: SocketHandle<Platform>) {
         let SocketHandle {
+            consider_closed: _,
             handle,
             mut specific,
             pollee,
@@ -902,7 +993,9 @@ where
                             // already connected
                             Ok(())
                         }
-                        tcp::State::Closed => Err(ConnectError::InvalidState),
+                        tcp::State::Closed | tcp::State::TimeWait => {
+                            Err(ConnectError::InvalidState)
+                        }
                         tcp::State::SynSent => Err(ConnectError::InProgress),
                         s => unimplemented!("state: {:?}", s),
                     }
@@ -1213,7 +1306,7 @@ where
                 // that are not closed
                 server_socket.socket_set_handles.retain(|&h| {
                     let socket: &tcp::Socket = self.socket_set.get(h);
-                    socket.state() != tcp::State::Closed
+                    socket.is_open()
                 });
                 // Find a socket that has progressed further in its TCP state machine, by finding a
                 // socket in an established state
@@ -1242,6 +1335,7 @@ where
                 self.automated_platform_interaction(PollDirection::Both);
                 // Create a new FD to hand it back out to the user
                 let handle = SocketHandle {
+                    consider_closed: false,
                     handle: ready_handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port,
