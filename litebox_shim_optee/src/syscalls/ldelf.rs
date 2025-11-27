@@ -1,13 +1,8 @@
 use litebox::mm::linux::PAGE_SIZE;
+use litebox::platform::common_providers::userspace_pointers::UserMutPtr;
 use litebox::platform::{RawConstPointer, RawMutPointer};
 use litebox_common_linux::{MapFlags, ProtFlags};
 use litebox_common_optee::{LdelfMapFlags, TeeResult, TeeUuid};
-
-#[inline]
-fn align_up(addr: usize, align: usize) -> usize {
-    debug_assert!(align.is_power_of_two());
-    (addr + align - 1) & !(align - 1)
-}
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
@@ -43,22 +38,25 @@ pub fn sys_map_zi(
         flags
     );
 
-    if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_WRITEABLE)
-        || flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
+    // `sys_map_zi` uses `flags` only to indicate whether the mapping is shareable or not.
+    // If `flags` contain any other bits, return error.
+    if !flags.is_empty()
+        && !flags
+            .intersection(LdelfMapFlags::LDELF_MAP_FLAG_SHAREABLE.complement())
+            .is_empty()
     {
         return Err(TeeResult::BadParameters);
     }
 
-    let total_size = align_up(
-        num_bytes
-            .checked_add(pad_begin)
-            .and_then(|t| t.checked_add(pad_end))
-            .ok_or(TeeResult::BadParameters)?,
-        PAGE_SIZE,
-    );
+    let total_size = num_bytes
+        .checked_add(pad_begin)
+        .and_then(|t| t.checked_add(pad_end))
+        .ok_or(TeeResult::BadParameters)?
+        .next_multiple_of(PAGE_SIZE);
     if (*addr).checked_add(total_size).is_none() {
         return Err(TeeResult::BadParameters);
     }
+    // `sys_map_zi` always creates read/writeable mapping
     let prot = ProtFlags::PROT_READ_WRITE;
     let flags = if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_SHAREABLE) {
         MapFlags::MAP_SHARED
@@ -66,28 +64,20 @@ pub fn sys_map_zi(
         MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED
     };
 
-    match crate::syscalls::mm::sys_mmap(*addr, total_size, ProtFlags::PROT_NONE, flags, -1, 0) {
-        Ok(addr) => {
-            let padded_start = addr.as_usize() + pad_begin;
-            crate::syscalls::mm::sys_mprotect(
-                litebox::platform::common_providers::userspace_pointers::UserMutPtr {
-                    inner: align_down(padded_start, PAGE_SIZE) as *mut u8,
-                },
-                align_up(
-                    num_bytes + padded_start - align_down(padded_start, PAGE_SIZE),
-                    PAGE_SIZE,
-                ),
-                prot,
-            )
-            .expect("sys_map_zi: failed to set memory protection");
-            unsafe {
-                core::ptr::write_bytes(padded_start as *mut u8, 0, num_bytes);
-                let _ = va.write_at_offset(0, padded_start);
-            }
-            Ok(())
-        }
-        Err(_) => Err(TeeResult::OutOfMemory),
+    let addr = crate::syscalls::mm::sys_mmap(*addr, total_size, ProtFlags::PROT_NONE, flags, -1, 0)
+        .map_err(|_| TeeResult::OutOfMemory)?;
+    let padded_start = addr.as_usize() + pad_begin;
+    crate::syscalls::mm::sys_mprotect(
+        UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
+        (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
+            .next_multiple_of(PAGE_SIZE),
+        prot,
+    )
+    .expect("sys_map_zi: failed to set memory protection");
+    unsafe {
+        let _ = va.write_at_offset(0, padded_start);
     }
+    Ok(())
 }
 
 /// OP-TEE's syscall to open a TA binary.
@@ -176,80 +166,67 @@ pub fn sys_map_bin(
         return Err(TeeResult::BadParameters);
     }
 
-    let total_size = align_up(
-        num_bytes
-            .checked_add(pad_begin)
-            .and_then(|t| t.checked_add(pad_end))
-            .ok_or(TeeResult::BadParameters)?,
-        PAGE_SIZE,
-    );
+    let total_size = num_bytes
+        .checked_add(pad_begin)
+        .and_then(|t| t.checked_add(pad_end))
+        .ok_or(TeeResult::BadParameters)?
+        .next_multiple_of(PAGE_SIZE);
     if (*addr).checked_add(total_size).is_none() {
         return Err(TeeResult::BadParameters);
     }
     // TODO: check whether shared mapping is needed
     let flags_internal = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
 
-    match crate::syscalls::mm::sys_mmap(
+    let addr = crate::syscalls::mm::sys_mmap(
         *addr,
         total_size,
         ProtFlags::PROT_NONE,
         flags_internal,
         -1,
         0,
-    ) {
-        Ok(addr) => {
-            let padded_start = addr.as_usize() + pad_begin;
-            crate::syscalls::mm::sys_mprotect(
-                litebox::platform::common_providers::userspace_pointers::UserMutPtr {
-                    inner: align_down(padded_start, PAGE_SIZE) as *mut u8,
-                },
-                align_up(
-                    num_bytes + padded_start - align_down(padded_start, PAGE_SIZE),
-                    PAGE_SIZE,
-                ),
-                ProtFlags::PROT_READ_WRITE,
-            )
-            .expect("sys_map_bin: failed to set memory protection");
+    )
+    .map_err(|_| TeeResult::OutOfMemory)?;
+    let padded_start = addr.as_usize() + pad_begin;
+    crate::syscalls::mm::sys_mprotect(
+        UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
+        (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
+            .next_multiple_of(PAGE_SIZE),
+        ProtFlags::PROT_READ_WRITE,
+    )
+    .expect("sys_map_bin: failed to set memory protection");
 
-            unsafe {
-                if crate::read_ta_bin(padded_start as *mut u8, offs, num_bytes).is_none() {
-                    return Err(TeeResult::ShortBuffer);
-                }
-            }
-
-            let mut prot = ProtFlags::PROT_READ;
-            if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_WRITEABLE) {
-                prot |= ProtFlags::PROT_WRITE;
-            } else if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE) {
-                prot |= ProtFlags::PROT_EXEC;
-            }
-            crate::syscalls::mm::sys_mprotect(
-                litebox::platform::common_providers::userspace_pointers::UserMutPtr {
-                    inner: align_down(padded_start, PAGE_SIZE) as *mut u8,
-                },
-                align_up(
-                    num_bytes + padded_start - align_down(padded_start, PAGE_SIZE),
-                    PAGE_SIZE,
-                ),
-                prot,
-            )
-            .expect("sys_map_bin: failed to set memory protection");
-
-            if offs == PAGE_SIZE
-                && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
-                && crate::get_ta_base_addr().is_none()
-            {
-                crate::set_ta_base_addr(padded_start);
-            }
-
-            unsafe {
-                let _ = va.write_at_offset(0, padded_start);
-            }
-
-            Ok(())
+    unsafe {
+        if crate::read_ta_bin(UserMutPtr::from_usize(padded_start), offs, num_bytes).is_none() {
+            return Err(TeeResult::ShortBuffer);
         }
-        Err(_) => Err(TeeResult::OutOfMemory),
     }
+
+    let mut prot = ProtFlags::PROT_READ;
+    if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_WRITEABLE) {
+        prot |= ProtFlags::PROT_WRITE;
+    } else if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE) {
+        prot |= ProtFlags::PROT_EXEC;
+    }
+    crate::syscalls::mm::sys_mprotect(
+        UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
+        (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
+            .next_multiple_of(PAGE_SIZE),
+        prot,
+    )
+    .expect("sys_map_bin: failed to set memory protection");
+
+    if offs == PAGE_SIZE
+        && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
+        && crate::get_ta_base_addr().is_none()
+    {
+        crate::set_ta_base_addr(padded_start);
+    }
+
+    unsafe {
+        let _ = va.write_at_offset(0, padded_start);
+    }
+
+    Ok(())
 }
 
 /// OP-TEE's syscall to copy data from the TA binary to memory.
@@ -270,9 +247,8 @@ pub fn sys_cp_from_bin(
     );
 
     unsafe {
-        if crate::read_ta_bin(dst as *mut u8, offs, num_bytes).is_none() {
-            return Err(TeeResult::ShortBuffer);
-        }
+        crate::read_ta_bin(UserMutPtr::from_usize(dst), offs, num_bytes)
+            .ok_or(TeeResult::ShortBuffer)?;
     }
 
     Ok(())

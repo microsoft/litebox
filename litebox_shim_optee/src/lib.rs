@@ -98,19 +98,21 @@ pub fn get_ta_base_addr() -> Option<usize> {
     })
 }
 
-/// Read `count` bytes of the TA binary of the current task from `offset` into `dst`.
+/// Read `count` bytes of the TA binary of the current task from `offset` into
+/// userspace `dst`.
 ///
 /// # Safety
 /// Ensure that `dst` is valid for `count` bytes.
-unsafe fn read_ta_bin(dst: *mut u8, offset: usize, count: usize) -> Option<()> {
+unsafe fn read_ta_bin(
+    dst: litebox::platform::common_providers::userspace_pointers::UserMutPtr<u8>,
+    offset: usize,
+    count: usize,
+) -> Option<()> {
     with_current_task(|task| {
         if let Some(ta_bin) = task.ta_bin.as_ref() {
             let end_offset = offset.checked_add(count)?;
             if end_offset <= ta_bin.len() {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(ta_bin.as_ptr().add(offset), dst, count);
-                }
-                Some(())
+                dst.copy_from_slice(0, &ta_bin[offset..end_offset])
             } else {
                 None
             }
