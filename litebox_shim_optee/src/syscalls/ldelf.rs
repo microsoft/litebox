@@ -38,7 +38,8 @@ pub fn sys_map_zi(
         flags
     );
 
-    // `sys_map_zi` uses `flags` only to indicate whether the mapping is shareable or not.
+    // `sys_map_zi` uses `flags` only to indicate whether the mapping is
+    // shareable or cacheable (Arm-specific).
     // If `flags` contain any other bits, return error.
     if !flags.is_empty()
         && !flags
@@ -58,11 +59,8 @@ pub fn sys_map_zi(
     }
     // `sys_map_zi` always creates read/writeable mapping
     let prot = ProtFlags::PROT_READ_WRITE;
-    let flags = if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_SHAREABLE) {
-        MapFlags::MAP_SHARED
-    } else {
-        MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED
-    };
+    let flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
+    // TODO: on Arm, check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` to control cache behaviors
 
     let addr = crate::syscalls::mm::sys_mmap(*addr, total_size, ProtFlags::PROT_NONE, flags, -1, 0)
         .map_err(|_| TeeResult::OutOfMemory)?;
@@ -174,8 +172,8 @@ pub fn sys_map_bin(
     if (*addr).checked_add(total_size).is_none() {
         return Err(TeeResult::BadParameters);
     }
-    // TODO: check whether shared mapping is needed
     let flags_internal = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
+    // TODO: on Arm, check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` to control cache behaviors
 
     let addr = crate::syscalls::mm::sys_mmap(
         *addr,
