@@ -565,10 +565,8 @@ impl litebox::shim::InitThread for NewThreadArgs {
     {
         let Self { task } = *self;
 
-        // Set the shim TLS to point to the new task.
-        crate::SHIM_TLS.init(crate::LinuxShimTls { current_task: task });
-
         Box::new(crate::LinuxShimEntrypoints {
+            task,
             _not_send: core::marker::PhantomData,
         })
     }

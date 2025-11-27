@@ -68,28 +68,21 @@ fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
 }
 
 pub struct LinuxShimEntrypoints {
-    // Data for the entrypoints is stored in TLS, so do not allow Send/Sync auto
-    // traits.
-    //
-    // FUTURE: move `Task` into here once we eliminate all use of TLS.
+    task: Task,
+    // The task should not be moved once it's bound to a platform thread so that
+    // we preserve the ability to use TLS in the future.
     _not_send: core::marker::PhantomData<*const ()>,
-}
-
-impl Drop for LinuxShimEntrypoints {
-    fn drop(&mut self) {
-        SHIM_TLS.deinit();
-    }
 }
 
 impl litebox::shim::EnterShim for LinuxShimEntrypoints {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        enter_shim(true, ctx, Task::handle_init_request)
+        self.enter_shim(true, ctx, Task::handle_init_request)
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        enter_shim(false, ctx, Task::handle_syscall_request)
+        self.enter_shim(false, ctx, Task::handle_syscall_request)
     }
 
     fn exception(
@@ -97,30 +90,31 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
+        self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        enter_shim(false, ctx, |_, _| {})
+        self.enter_shim(false, ctx, |_, _| {})
     }
 }
 
-fn enter_shim(
-    is_init: bool,
-    ctx: &mut litebox_common_linux::PtRegs,
-    f: impl FnOnce(&Task, &mut litebox_common_linux::PtRegs),
-) -> ContinueOperation {
-    with_current_task(|task| {
+impl LinuxShimEntrypoints {
+    fn enter_shim(
+        &self,
+        is_init: bool,
+        ctx: &mut litebox_common_linux::PtRegs,
+        f: impl FnOnce(&Task, &mut litebox_common_linux::PtRegs),
+    ) -> ContinueOperation {
         if !is_init {
-            task.enter_from_guest();
+            self.task.enter_from_guest();
         }
-        f(task, ctx);
-        if task.prepare_to_run_guest(ctx) {
+        f(&self.task, ctx);
+        if self.task.prepare_to_run_guest(ctx) {
             ContinueOperation::ResumeGuest
         } else {
             ContinueOperation::ExitThread
         }
-    })
+    }
 }
 
 /// The shim entry point structure.
@@ -227,8 +221,9 @@ impl LinuxShim {
         let files = Arc::new(syscalls::file::FilesState::new());
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
 
-        SHIM_TLS.init(LinuxShimTls {
-            current_task: Task {
+        let entrypoints = crate::LinuxShimEntrypoints {
+            _not_send: core::marker::PhantomData,
+            task: Task {
                 global: self.0.clone(),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.0.platform),
@@ -247,16 +242,14 @@ impl LinuxShim {
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
             },
-        });
-
-        let entrypoints = crate::LinuxShimEntrypoints {
-            _not_send: core::marker::PhantomData,
         };
-        with_current_task(|task| {
-            task.load_program(loader::elf::ElfLoader::new(task, path)?, argv, envp)?;
-            Ok(LinuxShimProcess(task.process().clone()))
-        })
-        .map(|process| LoadedProgram {
+        entrypoints.task.load_program(
+            loader::elf::ElfLoader::new(&entrypoints.task, path)?,
+            argv,
+            envp,
+        )?;
+        let process = LinuxShimProcess(entrypoints.task.process().clone());
+        Ok(LoadedProgram {
             entrypoints,
             process,
         })
@@ -499,36 +492,6 @@ impl syscalls::file::FilesState {
             StrongFd::Pipes(fd) => Ok(pipes(&fd)),
         }
     }
-}
-
-/// Open a file
-///
-/// # Safety
-///
-/// `pathname` must point to a valid nul-terminated C string
-#[expect(
-    clippy::missing_panics_doc,
-    reason = "the panics here are ideally never hit, and should not be user-facing"
-)]
-pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> i32 {
-    let Some(path) = pathname.to_cstring() else {
-        return Errno::EFAULT.as_neg();
-    };
-    with_current_task(|task| {
-        match task.sys_open(
-            path,
-            litebox::fs::OFlags::from_bits(flags).unwrap(),
-            litebox::fs::Mode::from_bits(mode).unwrap(),
-        ) {
-            Ok(fd) => fd.try_into().unwrap(),
-            Err(err) => err.as_neg(),
-        }
-    })
-}
-
-/// Closes the file
-pub extern "C" fn close(fd: i32) -> i32 {
-    with_current_task(|task| task.sys_close(fd).map_or_else(Errno::as_neg, |()| 0))
 }
 
 // This places size limits on maximum read/write sizes that might occur; it exists primarily to
@@ -1188,10 +1151,6 @@ struct GlobalState {
     next_thread_id: core::sync::atomic::AtomicI32,
 }
 
-struct LinuxShimTls {
-    current_task: Task,
-}
-
 struct Task {
     global: Arc<GlobalState>,
     wait_state: wait::WaitState,
@@ -1219,15 +1178,6 @@ impl Drop for Task {
     fn drop(&mut self) {
         self.prepare_for_exit();
     }
-}
-
-litebox::shim_thread_local! {
-    #[platform = Platform]
-    static SHIM_TLS: LinuxShimTls;
-}
-
-fn with_current_task<R>(f: impl FnOnce(&Task) -> R) -> R {
-    SHIM_TLS.with(|tls| f(&tls.current_task))
 }
 
 pub type LoadFilter = fn(envp: &mut alloc::vec::Vec<alloc::ffi::CString>);
