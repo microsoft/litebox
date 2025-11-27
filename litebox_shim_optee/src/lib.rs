@@ -50,8 +50,8 @@ pub fn init_session<'a>(
             tee_cryp_state_map: TeeCrypStateMap::new(),
             tee_obj_map: TeeObjMap::new(),
             ta_loaded: AtomicBool::new(false),
-            ta_bin: ta_bin.map(Box::from),
             ta_base_addr: AtomicUsize::new(0),
+            ta_bin: ta_bin.map(Box::from),
         },
     });
     litebox()
@@ -774,10 +774,10 @@ struct Task {
     tee_obj_map: TeeObjMap,
     /// Track whether a TA is loaded via ldelf
     ta_loaded: AtomicBool,
-    /// Optional TA binary data (for loading TA without RPC),
-    ta_bin: Option<Box<[u8]>>,
     /// Base address where the TA is loaded
     ta_base_addr: AtomicUsize,
+    /// Optional TA binary data (for loading TA without RPC),
+    ta_bin: Option<Box<[u8]>>,
     // TODO: add more fields as needed
 }
 

@@ -344,7 +344,9 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
     let start_addr = relo_off + trampoline.vaddr;
     let end_addr = (start_addr + trampoline.size).next_multiple_of(PAGE_SIZE);
     let mut need_copy = false;
-    // Unmap ldelf's trampoline area
+    // TODO: For now, we unmap `ldelf`'s memory area to load the trampoline.
+    // TAs might interact with `ldelf` to use its critical syscalls, so we might need to
+    // figure out how to deal with this potential memory area overlap.
     let _ = crate::syscalls::mm::sys_munmap(MutPtr::from_usize(start_addr), end_addr - start_addr);
     let ret = unsafe {
         ElfLoaderMmap::mmap(

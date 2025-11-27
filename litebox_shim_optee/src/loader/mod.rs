@@ -14,8 +14,10 @@ pub fn allocate_guest_tls(
     elf::allocate_guest_tls(tls_size)
 }
 
+/// Load the trampoline code based on the given base address.
+/// This function might overwrite (i.e., unmap) `ldelf`'s memory region if there is overlap.
 #[cfg(feature = "platform_linux_userland")]
-pub fn load_trampoline(elf_buf: &[u8], base: usize) -> Result<(), elf::ElfLoaderError> {
+pub fn load_ta_trampoline(elf_buf: &[u8], base: usize) -> Result<(), elf::ElfLoaderError> {
     elf::ElfLoader::load_trampoline(elf_buf, base)
 }
 
@@ -38,7 +40,7 @@ pub fn init_stack(
     Some(stack)
 }
 
-/// Initialize the LDELF stack with the given base address and argument.
+/// Initialize the ldelf stack with the given base address and argument.
 pub fn init_ldelf_stack(
     stack_base: Option<usize>,
     ldelf_arg: &litebox_common_optee::LdelfArg,

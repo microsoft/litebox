@@ -136,7 +136,7 @@ fn run_ta_with_default_commands(ldelf_bin: &[u8], ta_bin: &[u8]) {
                     login: TeeLogin::User,
                     uuid: TeeUuid::default(),
                 },
-                Some(ta_bin), // TODO: replace it with UUID-based TA loading
+                Some(ta_bin), // TODO: replace this with UUID-based TA loading
             );
 
             let ldelf_info = litebox_shim_optee::loader::load_elf_buffer(ldelf_bin)
@@ -144,13 +144,13 @@ fn run_ta_with_default_commands(ldelf_bin: &[u8], ta_bin: &[u8]) {
             let Some(ldelf_arg_address) = ldelf_info.ldelf_arg_address else {
                 panic!("ldelf_arg_address not found");
             };
-            let ldelf_arg = LdelfArg::new();
+            let ldelf_arg = LdelfArg::new(); // TODO: set TA UUID
 
             let stack = litebox_shim_optee::loader::init_ldelf_stack(
                 Some(ldelf_info.stack_base),
                 &ldelf_arg,
             )
-            .expect("Failed to initialize stack with parameters");
+            .expect("Failed to initialize stack for ldelf");
             let mut pt_regs =
                 litebox_shim_optee::loader::prepare_ldelf_registers(&ldelf_info, &stack);
             unsafe {
@@ -160,11 +160,15 @@ fn run_ta_with_default_commands(ldelf_bin: &[u8], ta_bin: &[u8]) {
                 );
             };
 
+            // Note: `ldelf` allocates stack (returned via `stack_ptr`) but we don't use it here.
+            // Need to revisit this to see whether the stack is large enough for our use cases (e.g.,
+            // copy owned data through stack to minimize TOCTTOU threats).
             let ldelf_arg_out = unsafe { &*(ldelf_arg_address as *const LdelfArg) };
             let entry_func = usize::try_from(ldelf_arg_out.entry_func).unwrap();
+            #[cfg(debug_assertions)]
             litebox::log_println!(
                 litebox_platform_multiplex::platform(),
-                "ldelf has loaded the TA: entry_func = {:#x}",
+                "ldelf has loaded TA: entry_func is at {:#x}",
                 entry_func,
             );
 
@@ -173,7 +177,7 @@ fn run_ta_with_default_commands(ldelf_bin: &[u8], ta_bin: &[u8]) {
             let base = litebox_shim_optee::get_ta_base_addr()
                 .ok_or(litebox_common_linux::errno::Errno::ENOENT)
                 .expect("TA base addr not set");
-            litebox_shim_optee::loader::load_trampoline(ta_bin, base)
+            litebox_shim_optee::loader::load_ta_trampoline(ta_bin, base)
                 .expect("Failed to load trampoline");
             litebox_shim_optee::loader::allocate_guest_tls(None).expect("Failed to allocate TLS");
 
