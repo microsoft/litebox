@@ -91,7 +91,14 @@ impl SignalState {
         ctx: &mut PtRegs,
     ) -> Result<(), DeliverFault> {
         if !action.flags.contains(SaFlags::RESTORER) {
-            // FUTURE: use the restorer in the vDSO, when we have one.
+            // No restorer was provided. This is optional on x86, but if one is
+            // not present then we have to provide one from the vDSO. Since we
+            // don't currently have a vDSO, we can't deliver the signal.
+            //
+            // Fortunately, if glibc sees that there is no vDSO, it will provide
+            // a restorer. musl always provides a restorer.
+            //
+            // FUTURE: add a vDSO with a restorer.
             return Err(DeliverFault);
         }
 

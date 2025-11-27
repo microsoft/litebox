@@ -82,6 +82,7 @@ impl SignalState {
         }
     }
 
+    /// Resets signal state for an `execve` call.
     pub(crate) fn reset_for_exec(&self, litebox: &LiteBox<Platform>) {
         let mut handlers = self.handlers.borrow_mut();
         // Ensure that the signal handlers are no longer shared.
@@ -624,6 +625,8 @@ impl Task {
             Exception::DIVIDE_ERROR => Signal::SIGFPE,
             Exception::BREAKPOINT => Signal::SIGTRAP,
             Exception::INVALID_OPCODE => Signal::SIGILL,
+            // Page faults and unknown exceptions map to SIGSEGV. There may be
+            // more appropriate signals in some other cases (e.g., SIGBUS).
             _ => Signal::SIGSEGV,
         };
         // For page faults, provide the faulting address.
