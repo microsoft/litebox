@@ -138,8 +138,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
     litebox_platform_multiplex::set_platform(platform);
-    let mut shim = litebox_shim_linux::LinuxShimBuilder::new();
-    let litebox = shim.litebox();
+    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let litebox = shim_builder.litebox();
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
         let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
@@ -214,7 +214,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         });
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        shim.default_fs(in_mem, tar_ro)
+        shim_builder.default_fs(in_mem, tar_ro)
     };
 
     // We need to get the file path before enabling seccomp
@@ -226,10 +226,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     })?;
 
-    shim.set_fs(initial_file_system);
+    shim_builder.set_fs(initial_file_system);
 
-    shim.set_load_filter(fixup_env);
-    let shim = shim.build();
+    shim_builder.set_load_filter(fixup_env);
+    let shim = shim_builder.build();
 
     if cli_args.tun_device_name.is_some() {
         let shim = shim.clone();
