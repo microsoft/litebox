@@ -1,8 +1,6 @@
 //! Process/thread related syscalls.
 
-use crate::ConstPtr;
-use crate::MutPtr;
-use crate::Task;
+use crate::{ConstPtr, GlobalState, MutPtr, Task};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::Arc;
@@ -54,11 +52,11 @@ pub(crate) struct ThreadState {
 unsafe impl Send for ThreadState {}
 
 impl ThreadState {
-    pub fn new_process(pid: i32) -> Self {
+    pub fn new_process(globals: &GlobalState, pid: i32) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(pid, remote.clone())),
+            process: Arc::new(Process::new(globals, pid, remote.clone())),
             remote,
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -141,13 +139,12 @@ struct ProcessInner {
 
 impl Process {
     /// Creates a new process with the given initial thread.
-    fn new(pid: i32, remote: Arc<ThreadRemote>) -> Self {
-        let platform = litebox_platform_multiplex::platform();
-        let nr_threads = platform.new_raw_mutex();
+    fn new(globals: &GlobalState, pid: i32, remote: Arc<ThreadRemote>) -> Self {
+        let nr_threads = globals.platform.new_raw_mutex();
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         Self {
             nr_threads,
-            inner: crate::litebox().sync().new_mutex(ProcessInner {
+            inner: globals.litebox.sync().new_mutex(ProcessInner {
                 exit_code: 0,
                 group_exit: false,
                 is_killing_other_threads: false,
@@ -389,7 +386,9 @@ impl Task {
             #[cfg(target_arch = "x86_64")]
             ArchPrctlArg::GetFs(addr) => {
                 let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase;
-                let token = self.global.platform
+                let token = self
+                    .global
+                    .platform
                     .get_punchthrough_token_for(punchthrough)
                     .expect("Failed to get punchthrough token for GET_FS");
                 let fsbase = token.execute().map_err(|e| match e {
@@ -415,7 +414,9 @@ impl Task {
     ) -> Result<(), Errno> {
         use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
         let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea { user_desc };
-        let token = self.global.platform
+        let token = self
+            .global
+            .platform
             .get_punchthrough_token_for(punchthrough)
             .expect("Failed to get punchthrough token for SET_THREAD_AREA");
         token.execute().map(|_| ()).map_err(|e| match e {
@@ -763,10 +764,7 @@ impl Task {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
 
-        let child_tid = self
-            .global
-            .next_thread_id
-            .fetch_add(1, Ordering::Relaxed);
+        let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         if let Some(parent_tid_ptr) = set_parent_tid {
             let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid) };
         }
@@ -810,7 +808,7 @@ impl Task {
             )
         };
         if let Err(err) = r {
-            litebox::log_println!(platform, "failed to spawn thread: {}", err);
+            litebox::log_println!(self.global.platform, "failed to spawn thread: {}", err);
             // Treat all spawn errors as `ENOMEM`. `EAGAIN` and other errors are
             // for conditions the user can control (such as "in-shim" rlimit
             // violations).

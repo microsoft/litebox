@@ -256,7 +256,7 @@ impl LinuxShim {
         SHIM_TLS.init(LinuxShimTls {
             current_task: Task {
                 global: self.0.clone(),
-                thread: syscalls::process::ThreadState::new_process(pid),
+                thread: syscalls::process::ThreadState::new_process(&self.0, pid),
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 pid,
                 ppid,
@@ -1287,8 +1287,8 @@ mod test_utils {
             files.initialize_stdio_in_shared_descriptors_table(&self.fs);
             Task {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
+                thread: syscalls::process::ThreadState::new_process(&self, pid),
                 global: self,
-                thread: syscalls::process::ThreadState::new_process(pid),
                 pid,
                 ppid: 0,
                 tid: pid,
@@ -1309,7 +1309,10 @@ mod test_utils {
     impl Task {
         /// Returns a clone of this task with a new TID for testing.
         pub(crate) fn clone_for_test(&self) -> Option<Self> {
-            let tid = self.global.next_thread_id.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let tid = self
+                .global
+                .next_thread_id
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let task = Task {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 global: self.global.clone(),

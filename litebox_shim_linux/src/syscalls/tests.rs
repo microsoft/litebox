@@ -17,24 +17,24 @@ const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
     static PLATFORM_INIT: std::sync::Once = std::sync::Once::new();
     PLATFORM_INIT.call_once(|| {
-            #[cfg(target_os = "linux")]
-            let platform = Platform::new(tun_device_name);
+        #[cfg(target_os = "linux")]
+        let platform = Platform::new(tun_device_name);
 
-            #[cfg(not(target_os = "linux"))]
-            let platform = Platform::new();
+        #[cfg(not(target_os = "linux"))]
+        let platform = Platform::new();
 
-            set_platform(platform);
+        set_platform(platform);
     });
 
     let mut shim = crate::LinuxShimBuilder::new();
-            let litebox = shim.litebox();
-            let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
-            in_mem_fs.with_root_privileges(|fs| {
-                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                    .expect("Failed to set permissions on root");
-            });
-            let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
-            shim.set_fs(shim.default_fs(in_mem_fs, tar_ro_fs));
+    let litebox = shim.litebox();
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    in_mem_fs.with_root_privileges(|fs| {
+        fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to set permissions on root");
+    });
+    let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
+    shim.set_fs(shim.default_fs(in_mem_fs, tar_ro_fs));
     shim.build().0.new_test_task()
 }
 

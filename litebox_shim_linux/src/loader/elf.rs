@@ -199,22 +199,26 @@ impl<'a> ElfLoader<'a> {
         envp: Vec<CString>,
         mut aux: AuxVec,
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
-        let platform = litebox_platform_multiplex::platform();
+        let global = &self.main.file.task.global;
 
         // Load the main ELF file first so that it gets privileged addresses.
         let info = self
             .main
             .parsed
-            .load(&mut self.main.file, &mut &*platform)?;
+            .load(&mut self.main.file, &mut &*global.platform)?;
 
         // Load the interpreter ELF file, if any.
         let interp = if let Some(interp) = &mut self.interp {
-            Some(interp.parsed.load(&mut interp.file, &mut &*platform)?)
+            Some(
+                interp
+                    .parsed
+                    .load(&mut interp.file, &mut &*global.platform)?,
+            )
         } else {
             None
         };
 
-        litebox_page_manager().set_initial_brk(info.brk);
+        global.pm.set_initial_brk(info.brk);
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
         aux.insert(AuxKey::AT_PHDR, info.phdrs_addr);
         aux.insert(AuxKey::AT_PHENT, info.phent_size());
@@ -230,7 +234,7 @@ impl<'a> ElfLoader<'a> {
         let sp = unsafe {
             let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
-            task.global
+            global
                 .pm
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?
