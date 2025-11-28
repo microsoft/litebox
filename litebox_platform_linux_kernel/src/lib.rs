@@ -16,7 +16,7 @@ use litebox::platform::{
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
-use ptr::{UserConstPtr, UserMutPtr};
+use ptr::UserMutPtr;
 
 extern crate alloc;
 

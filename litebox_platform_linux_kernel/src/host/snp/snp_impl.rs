@@ -5,20 +5,11 @@ use core::{
     cell::{Cell, OnceCell},
 };
 
-use litebox::{
-    platform::{RawConstPointer, RawMutPointer},
-    utils::ReinterpretUnsignedExt as _,
-};
-use litebox_common_linux::{
-    CloneFlags,
-    signal::{SigSet, SigmaskHow},
-};
+use litebox::utils::ReinterpretUnsignedExt as _;
+use litebox_common_linux::CloneFlags;
 
 use super::ghcb::ghcb_prints;
-use crate::{
-    Errno, HostInterface,
-    ptr::{UserConstPtr, UserMutPtr},
-};
+use crate::{Errno, HostInterface};
 
 #[expect(dead_code, reason = "bindings are generated from C header files")]
 mod bindings {

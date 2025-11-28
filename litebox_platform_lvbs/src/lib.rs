@@ -13,7 +13,6 @@ use core::{
     arch::asm,
     sync::atomic::{AtomicU32, AtomicU64},
 };
-use host::linux::sigset_t;
 use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
@@ -24,7 +23,7 @@ use litebox::platform::{
 };
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
-use ptr::{UserConstPtr, UserMutPtr};
+use ptr::UserMutPtr;
 use x86_64::structures::paging::{
     PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
     mapper::MapToError,
