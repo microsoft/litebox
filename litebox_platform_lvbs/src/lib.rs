@@ -609,13 +609,6 @@ pub trait HostInterface {
     // TODO: leave this for now for testing. LVBS does not terminate, so it should be no-op or
     // removed.
 
-    /// For Punchthrough
-    fn rt_sigprocmask(
-        how: i32,
-        set: UserConstPtr<sigset_t>,
-        old_set: UserMutPtr<sigset_t>,
-        sigsetsize: usize,
-    ) -> Result<usize, Errno>;
     // TODO: leave this for now for testing. We might need this if we plan to run Linux apps inside VTL1.
 
     fn wake_many(mutex: &AtomicU32, n: usize) -> Result<usize, Errno>;

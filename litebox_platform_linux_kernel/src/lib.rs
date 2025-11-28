@@ -352,13 +352,6 @@ pub trait HostInterface {
     /// Terminate LiteBox
     fn terminate(reason_set: u64, reason_code: u64) -> !;
 
-    /// For Punchthrough
-    fn rt_sigprocmask(
-        how: litebox_common_linux::signal::SigmaskHow,
-        set: Option<UserConstPtr<litebox_common_linux::signal::SigSet>>,
-        old_set: Option<UserMutPtr<litebox_common_linux::signal::SigSet>>,
-    ) -> Result<usize, Errno>;
-
     fn wake_many(mutex: &AtomicU32, n: usize) -> Result<usize, Errno>;
 
     fn block_or_maybe_timeout(

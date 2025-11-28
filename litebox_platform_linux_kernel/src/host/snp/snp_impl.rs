@@ -325,7 +325,6 @@ const PAGE_SIZE: u64 = litebox::mm::linux::PAGE_SIZE as u64;
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
 const NR_SYSCALL_FUTEX: u32 = 202;
-const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
 const NR_SYSCALL_READ: u32 = 0;
 const NR_SYSCALL_WRITE: u32 = 1;
 #[allow(dead_code)]
@@ -467,46 +466,6 @@ impl HostInterface for HostSnpInterface {
         // In case hypervisor fails to terminate it or intentionally reschedules it,
         // halt the CPU to prevent further execution
         unreachable!("Should not return to the caller after terminating the vm");
-    }
-
-    fn rt_sigprocmask(
-        how: SigmaskHow,
-        set: Option<UserConstPtr<SigSet>>,
-        oldset: Option<UserMutPtr<SigSet>>,
-    ) -> Result<usize, Errno> {
-        // Instead of passing the user space pointers to host, here we perform extra read and write
-        // and pass kernel pointers to host. As long as we don't have large data to deal with, this
-        // scheme is more straightforward. Alternative solution from previous implementation requires
-        // the user space memory has mapped to physical pages as host operates on physical pages.
-        // For kernel memory, it is always mapped to physical pages.
-        let kset: Option<SigSet> = match set {
-            Some(s) => Some(
-                unsafe { s.read_at_offset(0) }
-                    .ok_or(Errno::EFAULT)?
-                    .into_owned(),
-            ),
-            None => None,
-        };
-        let mut koldset: Option<SigSet> = if oldset.is_none() {
-            None
-        } else {
-            Some(SigSet::empty())
-        };
-        let args = SyscallN::<4, NR_SYSCALL_RT_SIGPROCMASK> {
-            args: [
-                u64::try_from(how as i32).unwrap(),
-                kset.as_ref().map_or(0, |v| core::ptr::from_ref(v) as u64),
-                koldset
-                    .as_mut()
-                    .map_or(0, |v| core::ptr::from_mut(v) as u64),
-                size_of::<SigSet>() as _,
-            ],
-        };
-        let r = Self::syscalls(args)?;
-        if let Some(v) = koldset {
-            unsafe { oldset.unwrap().write_at_offset(0, v) }.ok_or(Errno::EFAULT)?;
-        }
-        Ok(r)
     }
 
     fn wake_many(mutex: &core::sync::atomic::AtomicU32, n: usize) -> Result<usize, Errno> {

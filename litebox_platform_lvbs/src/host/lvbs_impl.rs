@@ -132,15 +132,6 @@ impl HostInterface for HostLvbsInterface {
         unimplemented!()
     }
 
-    fn rt_sigprocmask(
-        _how: i32,
-        _set: UserConstPtr<sigset_t>,
-        _oldset: UserMutPtr<sigset_t>,
-        _sigsetsize: usize,
-    ) -> Result<usize, Errno> {
-        unimplemented!()
-    }
-
     fn wake_many(_mutex: &core::sync::atomic::AtomicU32, _n: usize) -> Result<usize, Errno> {
         unimplemented!()
     }
