@@ -108,11 +108,11 @@ pub extern "C" fn sandbox_process_init(
     litebox::log_println!(platform, "sandbox_process_init called");
 
     litebox_platform_multiplex::set_platform(platform);
-    let mut shim = litebox_shim_linux::LinuxShimBuilder::new();
-    let litebox = shim.litebox();
+    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let litebox = shim_builder.litebox();
     let in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, ROOTFS.into());
-    shim.set_fs(shim.default_fs(in_mem_fs, tar_ro));
+    shim_builder.set_fs(shim_builder.default_fs(in_mem_fs, tar_ro));
 
     let parse_args =
         |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
@@ -150,7 +150,7 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_INVALID_PARAM,
         );
     };
-    let shim = shim.build();
+    let shim = shim_builder.build();
     let program = match shim.load_program(platform.init_task(boot_params), &program, argv, envp) {
         Ok(program) => program,
         Err(err) => {

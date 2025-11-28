@@ -7,7 +7,7 @@ use litebox_platform_multiplex::Platform;
 
 pub struct TestLauncher {
     platform: &'static Platform,
-    shim: litebox_shim_linux::LinuxShimBuilder,
+    shim_builder: litebox_shim_linux::LinuxShimBuilder,
     fs: litebox_shim_linux::DefaultFS,
 }
 
@@ -19,8 +19,8 @@ impl TestLauncher {
     ) -> Self {
         let platform = Platform::new();
         litebox_platform_multiplex::set_platform(platform);
-        let shim = litebox_shim_linux::LinuxShimBuilder::new();
-        let litebox = shim.litebox();
+        let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+        let litebox = shim_builder.litebox();
 
         let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
         in_mem_fs.with_root_privileges(|fs| {
@@ -35,8 +35,12 @@ impl TestLauncher {
                 tar_data.into()
             },
         );
-        let fs = shim.default_fs(in_mem_fs, tar_ro_fs);
-        let mut this = Self { platform, shim, fs };
+        let fs = shim_builder.default_fs(in_mem_fs, tar_ro_fs);
+        let mut this = Self {
+            platform,
+            shim_builder,
+            fs,
+        };
 
         for each in initial_dirs {
             this.install_dir(each);
@@ -69,13 +73,13 @@ impl TestLauncher {
     }
 
     pub fn test_load_exec_common(mut self, executable_path: &str) {
-        self.shim.set_fs(self.fs);
+        self.shim_builder.set_fs(self.fs);
         let argv = vec![
             CString::new(executable_path).unwrap(),
             CString::new("hello").unwrap(),
         ];
         let envp = vec![CString::new("PATH=/bin").unwrap()];
-        let shim = self.shim.build();
+        let shim = self.shim_builder.build();
         let program = shim
             .load_program(self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
