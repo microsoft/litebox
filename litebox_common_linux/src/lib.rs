@@ -12,9 +12,12 @@ use litebox::{
 };
 use syscalls::Sysno;
 
+use crate::signal::SigSet;
+
 pub mod errno;
 pub mod loader;
 pub mod mm;
+pub mod signal;
 
 extern crate alloc;
 
@@ -862,104 +865,6 @@ impl TimeZone {
             tz_dsttime,
         }
     }
-}
-
-#[repr(i32)]
-#[derive(Debug, IntEnum, PartialEq)]
-/// Signal numbers used in Linux.
-pub enum Signal {
-    SIGHUP = 1,
-    SIGINT = 2,
-    SIGQUIT = 3,
-    SIGILL = 4,
-    SIGTRAP = 5,
-    SIGABRT = 6,
-    // SIGIOT = 6, // Alias for SIGABRT
-    SIGBUS = 7,
-    SIGFPE = 8,
-    SIGKILL = 9,
-    SIGUSR1 = 10,
-    SIGSEGV = 11,
-    SIGUSR2 = 12,
-    SIGPIPE = 13,
-    SIGALRM = 14,
-    SIGTERM = 15,
-    SIGSTKFLT = 16,
-    SIGCHLD = 17,
-    SIGCONT = 18,
-    SIGSTOP = 19,
-    SIGTSTP = 20,
-    SIGTTIN = 21,
-    SIGTTOU = 22,
-    SIGURG = 23,
-    SIGXCPU = 24,
-    SIGXFSZ = 25,
-    SIGVTALRM = 26,
-    SIGPROF = 27,
-    SIGWINCH = 28,
-    SIGIO = 29,
-    // SIGPOLL = 29, // Alias for SIGIO
-    SIGPWR = 30,
-    SIGSYS = 31,
-}
-
-impl Signal {
-    pub const SIGIOT: Signal = Signal::SIGABRT;
-    pub const SIGPOLL: Signal = Signal::SIGIO;
-    pub const SIGUNUSED: Signal = Signal::SIGSYS;
-}
-
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub struct SigSet(u64);
-
-impl SigSet {
-    pub fn empty() -> Self {
-        Self(0)
-    }
-
-    pub fn add(&mut self, signum: Signal) {
-        self.0 |= 1 << (signum as u64 - 1);
-    }
-
-    pub fn remove(&mut self, signum: Signal) {
-        self.0 &= !(1 << (signum as u64 - 1));
-    }
-
-    pub fn contains(&self, signum: Signal) -> bool {
-        (self.0 & (1 << (signum as u64 - 1))) != 0
-    }
-}
-
-bitflags::bitflags! {
-    #[derive(Clone)]
-    pub struct SaFlags: u32 {
-        const NOCLDSTOP = 1;
-        const NOCLDWAIT = 2;
-        const SIGINFO = 4;
-        const ONSTACK   = 0x08000000;
-        const RESTART   = 0x10000000;
-        const NODEFER   = 0x40000000;
-        const RESETHAND = 0x80000000;
-    }
-}
-
-/// Linux's `sigaction` struct used by the `rt_sigaction` syscall.
-#[repr(C)]
-#[derive(Clone)]
-pub struct SigAction {
-    pub sigaction: usize,
-    pub flags: SaFlags,
-    pub restorer: Option<extern "C" fn()>,
-    pub mask: SigSet,
-}
-
-#[repr(i32)]
-#[derive(Debug, IntEnum)]
-pub enum SigmaskHow {
-    SIG_BLOCK = 0,
-    SIG_UNBLOCK = 1,
-    SIG_SETMASK = 2,
 }
 
 /// Codes for the `arch_prctl` syscall.
@@ -1905,18 +1810,37 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         addr: Platform::RawMutPointer<u8>,
     },
     RtSigprocmask {
-        how: SigmaskHow,
+        how: signal::SigmaskHow,
         set: Option<Platform::RawConstPointer<SigSet>>,
         oldset: Option<Platform::RawMutPointer<SigSet>>,
         sigsetsize: usize,
     },
     RtSigaction {
-        signum: Signal,
-        act: Option<Platform::RawConstPointer<SigAction>>,
-        oldact: Option<Platform::RawMutPointer<SigAction>>,
+        signum: signal::Signal,
+        act: Option<Platform::RawConstPointer<signal::SigAction>>,
+        oldact: Option<Platform::RawMutPointer<signal::SigAction>>,
         sigsetsize: usize,
     },
     RtSigreturn,
+    #[cfg(target_arch = "x86")]
+    Sigreturn,
+    Kill {
+        pid: i32,
+        sig: i32,
+    },
+    Tkill {
+        tid: i32,
+        sig: i32,
+    },
+    Tgkill {
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+    },
+    Sigaltstack {
+        ss: Option<Platform::RawConstPointer<signal::SigAltStack>>,
+        old_ss: Option<Platform::RawMutPointer<signal::SigAltStack>>,
+    },
     Ioctl {
         fd: i32,
         arg: IoctlArg<Platform>,
@@ -2233,11 +2157,6 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Alarm {
         seconds: u32,
     },
-    ThreadKill {
-        tgid: i32,
-        tid: i32,
-        sig: i32,
-    },
     SetITimer {
         which: IntervalTimer,
         new_value: Platform::RawConstPointer<ItimerVal>,
@@ -2356,7 +2275,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::mremap => sys_req!(Mremap { old_addr:*, old_size, new_size, flags, new_addr }),
             Sysno::rt_sigprocmask => {
                 let how: i32 = ctx.sys_req_arg(0);
-                if let Ok(how) = SigmaskHow::try_from(how) {
+                if let Ok(how) = signal::SigmaskHow::try_from(how) {
                     sys_req!(RtSigprocmask {
                         how: { how },
                         set:*,
@@ -2369,7 +2288,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }
             Sysno::rt_sigaction => {
                 let signum: i32 = ctx.sys_req_arg(0);
-                if let Ok(signum) = Signal::try_from(signum) {
+                if let Ok(signum) = signal::Signal::try_from(signum) {
                     sys_req!(RtSigaction {
                         signum: { signum },
                         act:*,
@@ -2381,6 +2300,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::rt_sigreturn => SyscallRequest::RtSigreturn,
+            #[cfg(target_arch = "x86")]
+            Sysno::sigreturn => SyscallRequest::Sigreturn,
+            Sysno::kill => sys_req!(Kill { pid, sig }),
+            Sysno::tkill => sys_req!(Tkill { tid, sig }),
+            Sysno::tgkill => sys_req!(Tgkill { tgid, tid, sig }),
+            Sysno::sigaltstack => sys_req!(Sigaltstack { ss:*, old_ss:* }),
             Sysno::ioctl => SyscallRequest::Ioctl {
                 fd: ctx.sys_req_arg(0),
                 arg: {
@@ -2855,7 +2780,6 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
-            Sysno::tgkill => sys_req!(ThreadKill { tgid, tid, sig }),
             Sysno::setitimer => {
                 let which: u32 = ctx.sys_req_arg(0);
                 if let Ok(which) = IntervalTimer::try_from(which) {
@@ -2921,53 +2845,6 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
 /// NOTE: It is assumed that all punchthroughs here are non-blocking.
 #[derive(Debug)]
 pub enum PunchthroughSyscall<'a, Platform: litebox::platform::RawPointerProvider> {
-    /// Examine and change blocked signals
-    RtSigprocmask {
-        /// The behavior of the call is dependent on the value of how
-        ///
-        /// * `SIG_BLOCK` (0): The set of blocked signals is the union of the current set and the `set`
-        ///   argument.
-        ///
-        /// * `SIG_UNBLOCK` (1): The signals in `set` are removed from the current set of blocked
-        ///   signals. It is permissible to attempt to unblock a signal which is not blocked.
-        ///
-        /// * `SIG_SETMASK` (2): The set of blocked signals is set to the argument `set`.
-        how: SigmaskHow,
-        /// If `set` is None, then the signal mask is unchanged (i.e., `how` is ignored), but the
-        /// current value of the signal mask is nevertheless returned in `oldset` (if it is not None).
-        set: Option<Platform::RawConstPointer<SigSet>>,
-        /// If `oldset` is not None, the previous value of the signal mask is stored in `oldset`.
-        oldset: Option<Platform::RawMutPointer<SigSet>>,
-    },
-    /// Change the action taken by a process on receipt of a specific signal
-    RtSigaction {
-        /// The signal number to change the action for.
-        signum: Signal,
-        /// If `act` is not None, the new action for signal `signum` is installed from `act`.
-        act: Option<Platform::RawConstPointer<SigAction>>,
-        /// If `oldact` is not None, the previous action for the signal is stored in `oldact`.
-        oldact: Option<Platform::RawMutPointer<SigAction>>,
-    },
-    /// Return from signal handler and cleanup stack
-    RtSigreturn {
-        /// The user stack pointer at the time of the signal.
-        stack: usize,
-    },
-    /// Arrange for a SIGALRM signal to be delivered to the calling process in `seconds` seconds.
-    /// If `seconds` is zero, any pending alarm is canceled.
-    /// In any event, any previously set alarm() is canceled.
-    Alarm { seconds: u32 },
-    /// Sends the signal `sig` to the thread with the thread ID `tid` in the thread group `tgid`.
-    ThreadKill {
-        thread_group_id: i32,
-        thread_id: i32,
-        sig: Signal,
-    },
-    SetITimer {
-        which: IntervalTimer,
-        new_value: Platform::RawConstPointer<ItimerVal>,
-        old_value: Option<Platform::RawMutPointer<ItimerVal>>,
-    },
     /// Set the FS base register to the value in `addr`.
     #[cfg(target_arch = "x86_64")]
     SetFsBase { addr: usize },
@@ -3157,6 +3034,9 @@ pub struct PtRegs {
     pub esp: usize,
     pub xss: usize,
 }
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+pub const EFLAGS_DF: usize = 0x400;
 
 impl PtRegs {
     /// Get the `idx`th syscall argument.

@@ -22,10 +22,7 @@ use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
-    platform::{
-        PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
-        RawMutPointer as _, TimeProvider,
-    },
+    platform::{RawConstPointer as _, RawMutPointer as _, TimeProvider},
     shim::ContinueOperation,
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
@@ -97,10 +94,10 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
 
     fn exception(
         &self,
-        _ctx: &mut Self::ExecutionContext,
+        ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        panic!("Unhandled exception: {info:#x?}");
+        enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -113,40 +110,17 @@ fn enter_shim(
     ctx: &mut litebox_common_linux::PtRegs,
     f: impl FnOnce(&Task, &mut litebox_common_linux::PtRegs),
 ) -> ContinueOperation {
-    let (exit_thread, pending_sigreturn) = with_current_task(|task| {
+    with_current_task(|task| {
         if !is_init {
             task.enter_from_guest();
         }
         f(task, ctx);
-        let pending_sigreturn = task.pending_sigreturn.take();
-        let exit_thread = !task.prepare_to_run_guest();
-        (exit_thread, pending_sigreturn)
-    });
-    if exit_thread {
-        ContinueOperation::ExitThread
-    } else if pending_sigreturn {
-        // TEMP: this must be done outside of with_current_task to avoid leaking a borrow.
-        // Remove this once rt_sigreturn is handled natively by the shim.
-        #[cfg(target_arch = "x86_64")]
-        let stack = ctx.rsp;
-        #[cfg(target_arch = "x86")]
-        let stack = ctx.esp;
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigreturn { stack };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for RT_SIGRETURN");
-        token
-            .execute()
-            .map(|_| ())
-            .map_err(|e| match e {
-                litebox::platform::PunchthroughError::Failure(errno) => errno,
-                _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-            })
-            .expect("rt_sigreturn failed");
-        unreachable!("rt_sigreturn should not return");
-    } else {
-        ContinueOperation::ResumeGuest
-    }
+        if task.prepare_to_run_guest(ctx) {
+            ContinueOperation::ResumeGuest
+        } else {
+            ContinueOperation::ExitThread
+        }
+    })
 }
 
 /// The shim entry point structure.
@@ -271,7 +245,7 @@ impl LinuxShim {
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                pending_sigreturn: false.into(),
+                signals: syscalls::signal::SignalState::new_process(&self.0.litebox),
             },
         });
 
@@ -316,7 +290,11 @@ pub struct LinuxShimProcess(Arc<syscalls::process::Process>);
 impl LinuxShimProcess {
     /// Wait for the process to exit, returning its exit code.
     pub fn wait(&self) -> i32 {
-        self.0.wait_for_exit()
+        match self.0.wait_for_exit() {
+            syscalls::process::ExitStatus::Exit(v) => v.into(),
+            // TODO: return the enum instead of just a code?
+            syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 256,
+        }
     }
 }
 
@@ -697,29 +675,16 @@ impl Task {
                 set,
                 oldset,
                 sigsetsize,
-            } => {
-                if sigsetsize == size_of::<litebox_common_linux::SigSet>() {
-                    self.sys_rt_sigprocmask(how, set, oldset).map(|()| 0)
-                } else {
-                    Err(Errno::EINVAL)
-                }
-            }
+            } => self.sys_rt_sigprocmask(how, set, oldset, sigsetsize),
             SyscallRequest::RtSigaction {
                 signum,
                 act,
                 oldact,
                 sigsetsize,
-            } => {
-                if sigsetsize == size_of::<litebox_common_linux::SigSet>() {
-                    self.sys_rt_sigaction(signum, act, oldact).map(|()| 0)
-                } else {
-                    Err(Errno::EINVAL)
-                }
-            }
-            SyscallRequest::RtSigreturn => {
-                self.pending_sigreturn.set(true);
-                Ok(0)
-            }
+            } => self.sys_rt_sigaction(signum, act, oldact, sigsetsize),
+            SyscallRequest::RtSigreturn => self.sys_rt_sigreturn(ctx),
+            #[cfg(target_arch = "x86")]
+            SyscallRequest::Sigreturn => self.sys_sigreturn(ctx),
             SyscallRequest::Ioctl { fd, arg } => self.sys_ioctl(fd, arg).map(|v| v as usize),
             SyscallRequest::Pread64 {
                 fd,
@@ -1186,17 +1151,10 @@ impl Task {
                 let old_mask = self.sys_umask(mask);
                 Ok(old_mask.bits() as usize)
             }
-            SyscallRequest::Alarm { seconds } => self.sys_alarm(seconds),
-            SyscallRequest::ThreadKill { tgid, tid, sig } => {
-                litebox_common_linux::Signal::try_from(sig)
-                    .map_err(|_| Errno::EINVAL)
-                    .and_then(|sig| self.sys_tgkill(tgid, tid, sig).map(|()| 0))
-            }
-            SyscallRequest::SetITimer {
-                which,
-                new_value,
-                old_value,
-            } => self.sys_setitimer(which, new_value, old_value).map(|()| 0),
+            SyscallRequest::Kill { pid, sig } => self.sys_kill(pid, sig),
+            SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
+            SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
+            SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)
@@ -1253,9 +1211,8 @@ struct Task {
     fs: RefCell<Arc<syscalls::file::FsState>>,
     /// File descriptors. `RefCell` to support `unshare` in the future.
     files: RefCell<Arc<syscalls::file::FilesState>>,
-    /// If true, call the sigreturn punchthrough instead of returning to user mode.
-    /// TODO: remove once signals are handled internally in the shim.
-    pending_sigreturn: Cell<bool>,
+    /// Signal state
+    signals: syscalls::signal::SignalState,
 }
 
 impl Drop for Task {
@@ -1291,7 +1248,6 @@ mod test_utils {
             Task {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 thread: syscalls::process::ThreadState::new_process(&self, pid),
-                global: self,
                 pid,
                 ppid: 0,
                 tid: pid,
@@ -1304,7 +1260,8 @@ mod test_utils {
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                pending_sigreturn: false.into(),
+                signals: syscalls::signal::SignalState::new_process(&self.litebox),
+                global: self,
             }
         }
     }
@@ -1327,7 +1284,7 @@ mod test_utils {
                 comm: self.comm.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
-                pending_sigreturn: false.into(),
+                signals: self.signals.clone_for_new_task(),
             };
             Some(task)
         }

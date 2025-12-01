@@ -1401,7 +1401,7 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
         events: MutPtr<litebox_common_linux::EpollEvent>,
         maxevents: u32,
         timeout: i32,
-        sigmask: Option<ConstPtr<litebox_common_linux::SigSet>>,
+        sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
         _sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if sigmask.is_some() {
@@ -1454,11 +1454,11 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
         fds: MutPtr<litebox_common_linux::Pollfd>,
         nfds: usize,
         timeout: TimeParam<Platform>,
-        sigmask: Option<ConstPtr<litebox_common_linux::SigSet>>,
+        sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if sigmask.is_some() {
-            if sigsetsize != core::mem::size_of::<litebox_common_linux::SigSet>() {
+            if sigsetsize != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
                 // Expected via ppoll(2) manpage
                 unimplemented!()
             }
