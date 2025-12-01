@@ -215,40 +215,44 @@ impl PendingSignals {
 
     fn remove(&mut self, signal: Signal) -> Siginfo {
         // Find the entry.
-        let siginfo = if let Some(pos) = self.find(signal) {
-            self.queue.remove(pos).unwrap()
-        } else {
-            // No entry. Synthesize a default siginfo.
-            Siginfo {
-                signo: signal.as_i32(),
-                errno: 0,
-                code: SI_USER,
-                data: SiginfoData { pad: [0; 29] },
-            }
-        };
+        let pos = self
+            .queue
+            .iter()
+            .position(|info| info.signo == signal.as_i32())
+            .expect("removing non-pending signal");
 
-        if self.find(signal).is_none() {
-            // No more entries of this signal number, remove from the pending
-            // mask.
+        // If there are no more entries with this signal number, remove it from
+        // the pending mask.
+        let more = self
+            .queue
+            .iter()
+            .skip(pos + 1)
+            .any(|info| info.signo == signal.as_i32());
+        if !more {
             self.pending.remove(signal);
         }
-        siginfo
+
+        self.queue.remove(pos).unwrap()
     }
 
-    fn push(&mut self, signal: Signal, siginfo: Siginfo) {
+    fn push(&mut self, rlimits: &super::process::ResourceLimits, signal: Signal, siginfo: Siginfo) {
         assert_eq!(signal.as_i32(), siginfo.signo);
-        let old_mask = self.pending;
-        self.pending.add(signal);
-        if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
-            // Don't bother to queue a siginfo since the task will never see it.
+
+        // Don't queue duplicates for standard signals.
+        if !signal.is_rt_signal() && self.pending.contains(signal) {
             return;
         }
-        if !signal.is_rt_signal() && old_mask.contains(signal) {
-            // Already pending, don't queue duplicates for standard signals.
-            return;
+
+        // Restrict maximum queued signals via rlimits when Linux would do so.
+        if signal.is_rt_signal() || (siginfo.code != SI_USER && siginfo.code != SI_KERNEL) {
+            let limit = rlimits.get_rlimit_cur(litebox_common_linux::RlimitResource::SIGPENDING);
+            if self.queue.len() >= limit {
+                // Drop the signal.
+                return;
+            }
         }
-        // TODO: handle rlimits for RT signals.
         self.queue.push_back(siginfo);
+        self.pending.add(signal);
     }
 }
 
@@ -579,7 +583,10 @@ impl Task {
 
     /// Only supports sending signals to self for now.
     fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
-        self.signals.pending.borrow_mut().push(signal, siginfo);
+        self.signals
+            .pending
+            .borrow_mut()
+            .push(&self.process().limits, signal, siginfo);
     }
 
     /// Forces a signal to be delivered on next call to `check_for_signals`.
@@ -596,7 +603,10 @@ impl Task {
     fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
         assert!(matches!(signal, Signal::SIGKILL | Signal::SIGSEGV));
 
-        self.signals.pending.borrow_mut().push(signal, siginfo);
+        self.signals
+            .pending
+            .borrow_mut()
+            .push(&self.process().limits, signal, siginfo);
 
         // Update the handler if necessary to ensure the signal is handled.
         let handlers = self.signals.handlers.borrow();
