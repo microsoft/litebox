@@ -697,6 +697,7 @@ bitflags::bitflags! {
         const TEE_MEMORY_ACCESS_ANY_OWNER = 0x4;
         const TEE_MEMORY_ACCESS_NONSECURE = 0x1000_0000;
         const TEE_MEMORY_ACCESS_SECURE = 0x2000_0000;
+        const _ = !0;
     }
 }
 
@@ -1041,6 +1042,7 @@ bitflags::bitflags! {
         const LDELF_MAP_FLAG_SHAREABLE = 0x1;
         const LDELF_MAP_FLAG_WRITEABLE = 0x2;
         const LDELF_MAP_FLAG_EXECUTABLE = 0x4;
+        const _ = !0;
     }
 }
 
