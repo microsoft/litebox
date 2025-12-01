@@ -49,20 +49,17 @@ impl FsState {
 
 /// Task state shared by `CLONE_FILES`.
 pub(crate) struct FilesState {
-    pub global: alloc::sync::Arc<GlobalState>,
     pub file_descriptors: litebox::sync::RwLock<Platform, Descriptors>,
     pub raw_descriptor_store: litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
 }
 
 impl FilesState {
-    pub fn new(global: alloc::sync::Arc<GlobalState>) -> Self {
+    pub fn new(litebox: &litebox::LiteBox<Platform>) -> Self {
         Self {
-            file_descriptors: global.litebox.sync().new_rwlock(Descriptors::new()),
-            raw_descriptor_store: global
-                .litebox
+            file_descriptors: litebox.sync().new_rwlock(Descriptors::new()),
+            raw_descriptor_store: litebox
                 .sync()
                 .new_rwlock(litebox::fd::RawDescriptorStorage::new()),
-            global,
         }
     }
 }
@@ -744,16 +741,16 @@ impl Descriptor {
 
     pub(crate) fn get_file_descriptor_flags(
         &self,
+        global: &GlobalState,
         files: &FilesState,
     ) -> Result<FileDescriptorFlags, Errno> {
         // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
         // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
         fn get_flags<S: FdEnabledSubsystem>(
-            files: &FilesState,
+            global: &GlobalState,
             fd: &TypedFd<S>,
         ) -> FileDescriptorFlags {
-            files
-                .global
+            global
                 .litebox
                 .descriptor_table()
                 .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
@@ -762,9 +759,9 @@ impl Descriptor {
         match self {
             Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                 *raw_fd,
-                |fd| get_flags(files, fd),
-                |fd| get_flags(files, fd),
-                |fd| get_flags(files, fd),
+                |fd| get_flags(global, fd),
+                |fd| get_flags(global, fd),
+                |fd| get_flags(global, fd),
             ),
             Descriptor::Eventfd { close_on_exec, .. } | Descriptor::Epoll { close_on_exec, .. } => {
                 Ok(
@@ -867,7 +864,7 @@ impl Task {
             FcntlArg::GETFD => Ok(locked_file_descriptors
                 .get_fd(fd)
                 .ok_or(Errno::EBADF)?
-                .get_file_descriptor_flags(&files)?
+                .get_file_descriptor_flags(&self.global, &files)?
                 .bits()),
             FcntlArg::SETFD(flags) => {
                 match locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)? {
@@ -1341,7 +1338,7 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
             return Err(Errno::EINVAL);
         }
 
-        let epoll_file = super::epoll::EpollFile::new(self.global.clone());
+        let epoll_file = super::epoll::EpollFile::new(&self.global.litebox);
         let files = self.files.borrow();
         files
             .file_descriptors
@@ -1394,7 +1391,7 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                     .into_owned(),
             )
         };
-        epoll.epoll_ctl(op, fd, &file_descriptor, event)
+        epoll.epoll_ctl(&self.global, op, fd, &file_descriptor, event)
     }
 
     /// Handle syscall `epoll_pwait`
@@ -1433,7 +1430,11 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                 _ => return Err(Errno::EBADF),
             }
         };
-        match epoll_file.wait(&self.wait_cx().with_timeout(timeout), maxevents) {
+        match epoll_file.wait(
+            &self.wait_cx().with_timeout(timeout),
+            &self.global,
+            maxevents,
+        ) {
             Ok(epoll_events) => {
                 if !epoll_events.is_empty() {
                     events
@@ -1478,7 +1479,11 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
             set.add_fd(fd.fd, events);
         }
 
-        match set.wait(&self.wait_cx().with_timeout(timeout), &self.files.borrow()) {
+        match set.wait(
+            &self.wait_cx().with_timeout(timeout),
+            &self.global,
+            &self.files.borrow(),
+        ) {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
                 // TODO: update the remaining time.
@@ -1486,7 +1491,7 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
             }
             Err(WaitError::TimedOut) => {
                 // A timeout occurred. Scan one last time.
-                set.scan(&self.files.borrow());
+                set.scan(&self.global, &self.files.borrow());
             }
         }
 
@@ -1542,7 +1547,11 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
             }
         }
 
-        match set.wait(&self.wait_cx().with_timeout(timeout), &self.files.borrow()) {
+        match set.wait(
+            &self.wait_cx().with_timeout(timeout),
+            &self.global,
+            &self.files.borrow(),
+        ) {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
                 // TODO: update the remaining time.
@@ -1550,7 +1559,7 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
             }
             Err(WaitError::TimedOut) => {
                 // A timeout occurred. Scan one last time.
-                set.scan(&self.files.borrow());
+                set.scan(&self.global, &self.files.borrow());
             }
         }
 
@@ -1657,12 +1666,13 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
         match file {
             Descriptor::LiteBoxRawFd(raw_fd) => {
                 fn dup<S: FdEnabledSubsystem>(
+                    global: &GlobalState,
                     files: &FilesState,
                     fd: &TypedFd<S>,
                     close_on_exec: bool,
                 ) -> Result<Descriptor, Errno> {
-                    let mut dt = files.global.litebox.descriptor_table_mut();
-                    let fd = dt.duplicate(fd).ok_or(Errno::EBADF)?;
+                    let mut dt = global.litebox.descriptor_table_mut();
+                    let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
                     if close_on_exec {
                         let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
                         assert!(old.is_none());
@@ -1673,9 +1683,9 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                 }
                 files.run_on_raw_fd(
                     *raw_fd,
-                    |fd| dup(&files, fd, close_on_exec),
-                    |fd| dup(&files, fd, close_on_exec),
-                    |fd| dup(&files, fd, close_on_exec),
+                    |fd| dup(&self.global, &files, fd, close_on_exec),
+                    |fd| dup(&self.global, &files, fd, close_on_exec),
+                    |fd| dup(&self.global, &files, fd, close_on_exec),
                 )?
             }
             Descriptor::Eventfd { file, .. } => Ok(Descriptor::Eventfd {

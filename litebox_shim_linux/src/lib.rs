@@ -250,8 +250,8 @@ impl LinuxShim {
             egid,
         } = task;
 
-        let files = Arc::new(syscalls::file::FilesState::new(self.0.clone()));
-        files.initialize_stdio_in_shared_descriptors_table(&self.0.fs);
+        let files = Arc::new(syscalls::file::FilesState::new(&self.0.litebox));
+        files.initialize_stdio_in_shared_descriptors_table(&self.0);
 
         SHIM_TLS.init(LinuxShimTls {
             current_task: Task {
@@ -344,18 +344,21 @@ fn default_fs(
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
 impl syscalls::file::FilesState {
-    fn initialize_stdio_in_shared_descriptors_table(&self, fs: &LinuxFS) {
+    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState) {
         use litebox::fs::{FileSystem as _, Mode, OFlags};
-        let stdin = fs
+        let stdin = global
+            .fs
             .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
             .unwrap();
-        let stdout = fs
+        let stdout = global
+            .fs
             .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
             .unwrap();
-        let stderr = fs
+        let stderr = global
+            .fs
             .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
             .unwrap();
-        let mut dt = self.global.litebox.descriptor_table_mut();
+        let mut dt = global.litebox.descriptor_table_mut();
         let mut rds = self.raw_descriptor_store.write();
         for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
             let status_flags = OFlags::APPEND | OFlags::RDWR;
@@ -438,7 +441,7 @@ impl Task {
             .iter_mut()
             .for_each(|slot| {
                 if let Some(desc) = slot.take()
-                    && let Ok(flags) = desc.get_file_descriptor_flags(&files)
+                    && let Ok(flags) = desc.get_file_descriptor_flags(&self.global, &files)
                 {
                     if flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
                         let _ = self.do_close(desc);

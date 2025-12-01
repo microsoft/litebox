@@ -118,7 +118,6 @@ impl EpollDescriptor {
 }
 
 pub(crate) struct EpollFile {
-    global: Arc<GlobalState>,
     interests: litebox::sync::Mutex<
         litebox_platform_multiplex::Platform,
         BTreeMap<EpollEntryKey, alloc::sync::Arc<EpollEntry>>,
@@ -128,24 +127,23 @@ pub(crate) struct EpollFile {
 }
 
 impl EpollFile {
-    pub(crate) fn new(global: Arc<GlobalState>) -> Self {
+    pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
         EpollFile {
-            interests: global.litebox.sync().new_mutex(BTreeMap::new()),
-            ready: Arc::new(ReadySet::new(&global.litebox)),
+            interests: litebox.sync().new_mutex(BTreeMap::new()),
+            ready: Arc::new(ReadySet::new(litebox)),
             status: core::sync::atomic::AtomicU32::new(0),
-            global,
         }
     }
 
     pub(crate) fn wait(
         &self,
         cx: &WaitContext<'_, Platform>,
+        global: &GlobalState,
         maxevents: usize,
     ) -> Result<Vec<EpollEvent>, WaitError> {
         let mut events = Vec::new();
         match self.ready.pollee.wait(cx, false, Events::IN, || {
-            self.ready
-                .pop_multiple(&self.global, maxevents, &mut events);
+            self.ready.pop_multiple(global, maxevents, &mut events);
             if events.is_empty() {
                 return Err(TryOpError::<Infallible>::TryAgain);
             }
@@ -159,13 +157,14 @@ impl EpollFile {
 
     pub(crate) fn epoll_ctl(
         &self,
+        global: &GlobalState,
         op: EpollOp,
         fd: u32,
         file: &EpollDescriptor,
         event: Option<EpollEvent>,
     ) -> Result<(), Errno> {
         match op {
-            EpollOp::EpollCtlAdd => self.add_interest(fd, file, event.unwrap()),
+            EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap()),
             EpollOp::EpollCtlMod => {
                 log_unsupported!("epoll_ctl mod");
                 Err(Errno::EINVAL)
@@ -182,6 +181,7 @@ impl EpollFile {
 
     fn add_interest(
         &self,
+        global: &GlobalState,
         fd: u32,
         file: &EpollDescriptor,
         event: EpollEvent,
@@ -198,7 +198,7 @@ impl EpollFile {
 
         let mask = Events::from_bits_truncate(event.events);
         let entry = EpollEntry::new(
-            &self.global,
+            &global.litebox,
             DescriptorRef::from(file),
             mask,
             EpollFlags::from_bits_truncate(event.events),
@@ -206,7 +206,7 @@ impl EpollFile {
             self.ready.clone(),
         );
         let events = file
-            .poll(&self.global, mask, Some(entry.weak_self.clone() as _))
+            .poll(global, mask, Some(entry.weak_self.clone() as _))
             .ok_or(Errno::EBADF)?;
         // Add the new entry to the ready list if the file is ready
         if !events.is_empty() {
@@ -219,6 +219,7 @@ impl EpollFile {
     #[expect(dead_code, reason = "currently unused, but might want to use soon")]
     fn mod_interest(
         &self,
+        global: &GlobalState,
         fd: u32,
         file: &EpollDescriptor,
         event: EpollEvent,
@@ -257,7 +258,7 @@ impl EpollFile {
         drop(inner);
 
         // re-register the observer with the new mask
-        if let Some(events) = file.poll(&self.global, mask, Some(observer as _)) {
+        if let Some(events) = file.poll(global, mask, Some(observer as _)) {
             if !events.is_empty() {
                 // Add the updated entry to the ready list if the file is ready
                 self.ready.push(entry);
@@ -306,7 +307,7 @@ struct EpollEntryInner {
 
 impl EpollEntry {
     fn new(
-        global: &GlobalState,
+        litebox: &LiteBox<Platform>,
         desc: DescriptorRef,
         mask: Events,
         flags: EpollFlags,
@@ -315,8 +316,7 @@ impl EpollEntry {
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| EpollEntry {
             desc,
-            inner: global
-                .litebox
+            inner: litebox
                 .sync()
                 .new_mutex(EpollEntryInner { mask, flags, data }),
             ready,
@@ -483,7 +483,12 @@ impl PollSet {
         });
     }
 
-    fn scan_once(&mut self, files: &FilesState, waker: Option<&Waker<Platform>>) -> bool {
+    fn scan_once(
+        &mut self,
+        global: &GlobalState,
+        files: &FilesState,
+        waker: Option<&Waker<Platform>>,
+    ) -> bool {
         let mut is_ready = false;
         let fds = files.file_descriptors.read();
         for entry in &mut self.entries {
@@ -511,7 +516,7 @@ impl PollSet {
                 };
                 // TODO: add machinery to unregister the observer to avoid leaks.
                 poll_descriptor
-                    .poll(&files.global, entry.mask, observer)
+                    .poll(global, entry.mask, observer)
                     .unwrap_or(Events::NVAL)
             } else {
                 Events::NVAL
@@ -524,23 +529,24 @@ impl PollSet {
     }
 
     /// Scans the poll set for ready fds once.
-    pub fn scan(&mut self, files: &FilesState) {
-        self.scan_once(files, None);
+    pub fn scan(&mut self, global: &GlobalState, files: &FilesState) {
+        self.scan_once(global, files, None);
     }
 
     /// Waits for any of the fds in the poll set to become ready.
     pub fn wait(
         &mut self,
         cx: &WaitContext<'_, Platform>,
+        global: &GlobalState,
         files: &FilesState,
     ) -> Result<(), WaitError> {
-        if self.scan_once(files, None) {
+        if self.scan_once(global, files, None) {
             return Ok(());
         }
 
         let mut register = true;
         cx.wait_until(|| {
-            if self.scan_once(files, register.then_some(cx.waker())) {
+            if self.scan_once(global, files, register.then_some(cx.waker())) {
                 return true;
             }
             // Don't register observers again in the next iteration.
