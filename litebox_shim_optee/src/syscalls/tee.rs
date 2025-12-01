@@ -249,6 +249,17 @@ pub fn sys_check_access_rights(
     buf: crate::ConstPtr<u8>,
     len: usize,
 ) -> Result<(), TeeResult> {
+    // Ignore the unknown bits of `TeeMemoryAccessRights` for now.
+    #[cfg(debug_assertions)]
+    if flags.bits() & !(TeeMemoryAccessRights::all().bits()) != 0 {
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "Unknown TeeMemoryAccessRights bits: {:#x}",
+            flags.bits()
+        );
+    }
+    let flags = TeeMemoryAccessRights::from_bits_truncate(flags.bits());
+
     if flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_NONSECURE)
         && flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_SECURE)
     {

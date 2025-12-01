@@ -143,11 +143,17 @@ impl ElfLoaderMmap {
         match crate::syscalls::mm::sys_mmap(
             addr.unwrap_or(0),
             len,
-            litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
+            litebox_common_linux::ProtFlags::from_bits(prot.bits()).ok_or(
+                elf_loader::Error::MmapError {
+                    msg: "unsupported prot flags".to_string(),
+                },
+            )?,
             litebox_common_linux::MapFlags::from_bits(
                 flags.bits() | MapFlags::MAP_ANONYMOUS.bits(),
             )
-            .expect("unsupported flags"),
+            .ok_or(elf_loader::Error::MmapError {
+                msg: "unsupported map flags".to_string(),
+            })?,
             -1,
             0,
         ) {
@@ -200,7 +206,11 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
             crate::syscalls::mm::sys_mprotect(
                 MutPtr::from_usize(mapped_addr),
                 len,
-                litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
+                litebox_common_linux::ProtFlags::from_bits(prot.bits()).ok_or(
+                    elf_loader::Error::MmapError {
+                        msg: "unsupported prot flags".to_string(),
+                    },
+                )?,
             )
             .expect("sys_mprotect failed");
 

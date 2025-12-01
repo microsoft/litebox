@@ -38,6 +38,17 @@ pub fn sys_map_zi(
         flags
     );
 
+    // OP-TEE ignores unknown flags. Log and truncate them.
+    #[cfg(debug_assertions)]
+    if flags.bits() & !(LdelfMapFlags::all().bits()) != 0 {
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "Unknown LdelfMapFlags bits: {:#x}",
+            flags.bits()
+        );
+    }
+    let flags = LdelfMapFlags::from_bits_truncate(flags.bits());
+
     // `sys_map_zi` uses `flags` only to indicate whether the mapping is
     // shareable or cacheable (Arm-specific).
     // If `flags` contain any other bits, return error.
@@ -149,6 +160,17 @@ pub fn sys_map_bin(
         pad_end,
         flags
     );
+
+    // OP-TEE ignores unknown flags. Log and truncate them.
+    #[cfg(debug_assertions)]
+    if flags.bits() & !(LdelfMapFlags::all().bits()) != 0 {
+        litebox::log_println!(
+            litebox_platform_multiplex::platform(),
+            "Unknown LdelfMapFlags bits: {:#x}",
+            flags.bits()
+        );
+    }
+    let flags = LdelfMapFlags::from_bits_truncate(flags.bits());
 
     assert!(handle == DUMMY_HANDLE, "invalid handle");
     // TODO: check whether `handle` is valid

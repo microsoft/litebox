@@ -175,7 +175,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 ret_orig: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
             TeeSyscallNr::CheckAccessRights => SyscallRequest::CheckAccessRights {
-                flags: TeeMemoryAccessRights::try_from_usize(ctx.syscall_arg(0))?,
+                flags: TeeMemoryAccessRights::try_from_usize_retain(ctx.syscall_arg(0))?,
                 buf: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
                 len: ctx.syscall_arg(2),
             },
@@ -689,6 +689,7 @@ impl TeePropSet {
 
 bitflags::bitflags! {
     /// Memory access rights constants from `optee_os/lib/libutee/include/tee_api_defines.h`
+    #[non_exhaustive]
     #[derive(Clone, Copy)]
     pub struct TeeMemoryAccessRights: u32 {
         const TEE_MEMORY_ACCESS_READ = 0x1;
@@ -696,8 +697,6 @@ bitflags::bitflags! {
         const TEE_MEMORY_ACCESS_ANY_OWNER = 0x4;
         const TEE_MEMORY_ACCESS_NONSECURE = 0x1000_0000;
         const TEE_MEMORY_ACCESS_SECURE = 0x2000_0000;
-
-        const _ = !0;
     }
 }
 
@@ -706,6 +705,11 @@ impl TeeMemoryAccessRights {
         u32::try_from(value)
             .map_err(|_| Errno::EINVAL)
             .and_then(|v| Self::from_bits(v).ok_or(Errno::EINVAL))
+    }
+    pub fn try_from_usize_retain(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .map_err(|_| Errno::EINVAL)
+            .map(Self::from_bits_retain)
     }
 }
 
@@ -989,7 +993,7 @@ impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platfo
                 num_bytes: ctx.syscall_arg(1),
                 pad_begin: ctx.syscall_arg(2),
                 pad_end: ctx.syscall_arg(3),
-                flags: LdelfMapFlags::from_bits_truncate(ctx.syscall_arg(4)),
+                flags: LdelfMapFlags::from_bits_retain(ctx.syscall_arg(4)),
             },
             LdelfSyscallNr::Unmap => LdelfSyscallRequest::Unmap {
                 va: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
@@ -1010,7 +1014,7 @@ impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platfo
                 offs: ctx.syscall_arg(3),
                 pad_begin: ctx.syscall_arg(4),
                 pad_end: ctx.syscall_arg(5),
-                flags: LdelfMapFlags::from_bits_truncate(ctx.syscall_arg(6)),
+                flags: LdelfMapFlags::from_bits_retain(ctx.syscall_arg(6)),
             },
             LdelfSyscallNr::CpFromBin => LdelfSyscallRequest::CpFromBin {
                 dst: ctx.syscall_arg(0),
@@ -1031,12 +1035,12 @@ impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platfo
 
 bitflags::bitflags! {
     /// `LDELF_MAP_FLAG_*` from `optee_os/ldelf/include/ldelf.h`
+    #[non_exhaustive]
     #[derive(Clone, Copy, Debug)]
     pub struct LdelfMapFlags: usize {
         const LDELF_MAP_FLAG_SHAREABLE = 0x1;
         const LDELF_MAP_FLAG_WRITEABLE = 0x2;
         const LDELF_MAP_FLAG_EXECUTABLE = 0x4;
-        const _ = !0;
     }
 }
 
