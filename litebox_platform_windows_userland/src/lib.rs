@@ -1204,14 +1204,6 @@ impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
                 // Use the stored FS base value from our per-thread storage
                 Ok(WindowsUserland::get_thread_fs_base())
             }
-            PunchthroughSyscall::RtSigprocmask { .. } => {
-                // Ignored for now.
-                eprintln!("WARNING: ignoring RtSigprocmask punchthrough");
-                Ok(0)
-            }
-            p => {
-                unimplemented!("unimplemented PunchthroughToken for WindowsUserland: {p:?}");
-            }
         }
     }
 }

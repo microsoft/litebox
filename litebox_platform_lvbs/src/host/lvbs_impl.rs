@@ -1,11 +1,8 @@
 //! An implementation of [`HostInterface`] for LVBS
 
 use crate::{
-    Errno, HostInterface,
-    arch::ioport::serial_print_string,
-    host::linux::sigset_t,
+    Errno, HostInterface, arch::ioport::serial_print_string,
     host::per_cpu_variables::with_per_cpu_variables_mut,
-    ptr::{UserConstPtr, UserMutPtr},
 };
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
@@ -129,15 +126,6 @@ impl HostInterface for HostLvbsInterface {
     }
 
     fn terminate(_reason_set: u64, _reason_code: u64) -> ! {
-        unimplemented!()
-    }
-
-    fn rt_sigprocmask(
-        _how: i32,
-        _set: UserConstPtr<sigset_t>,
-        _oldset: UserMutPtr<sigset_t>,
-        _sigsetsize: usize,
-    ) -> Result<usize, Errno> {
         unimplemented!()
     }
 
