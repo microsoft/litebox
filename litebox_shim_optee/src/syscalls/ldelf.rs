@@ -40,17 +40,8 @@ pub fn sys_map_zi(
         flags
     );
 
-    // OP-TEE ignores unknown flags.
-    let flags = LdelfMapFlags::from_bits_truncate(flags.bits());
-
-    // `sys_map_zi` uses `flags` only to indicate whether the mapping is
-    // shareable or cacheable (Arm-specific).
-    // If `flags` contain any other bits, return error.
-    if !flags.is_empty()
-        && !flags
-            .intersection(LdelfMapFlags::LDELF_MAP_FLAG_SHAREABLE.complement())
-            .is_empty()
-    {
+    let accept_flags = LdelfMapFlags::LDELF_MAP_FLAG_SHAREABLE;
+    if flags.bits() & !accept_flags.bits() != 0 {
         return Err(TeeResult::BadParameters);
     }
 
@@ -164,8 +155,12 @@ pub fn sys_map_bin(
         flags
     );
 
-    // OP-TEE ignores unknown flags.
-    let flags = LdelfMapFlags::from_bits_truncate(flags.bits());
+    let accept_flags = LdelfMapFlags::LDELF_MAP_FLAG_SHAREABLE
+        | LdelfMapFlags::LDELF_MAP_FLAG_WRITEABLE
+        | LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE;
+    if flags.bits() & !accept_flags.bits() != 0 {
+        return Err(TeeResult::BadParameters);
+    }
 
     assert!(handle == DUMMY_HANDLE, "invalid handle");
     // TODO: check whether `handle` is valid
