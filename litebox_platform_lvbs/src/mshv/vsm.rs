@@ -447,8 +447,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         // The system certificate is loaded into VTL1 and locked down before `end_of_boot` is signaled.
         // Its integrity depends on UEFI Secure Boot which ensures only trusted software is loaded during
         // the boot process.
-        let first_cert = &certs[0];
-        vtl0_info.set_system_certificate(first_cert.clone());
+        vtl0_info.set_system_certificates(certs.clone());
         serial_println!("VSM: Loaded {} system certificate(s)", certs.len());
     }
 
@@ -570,8 +569,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         &original_elf_data,
         crate::platform_low()
             .vtl0_kernel_info
-            .get_system_certificate()
-            .unwrap(),
+            .get_system_certificates()
+            .expect("No system certificates loaded"),
     ) {
         serial_println!("VSM: Failed to verify the module signature");
         return Err(result.into());
@@ -854,8 +853,8 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
         &kexec_kernel_blob_data,
         crate::platform_low()
             .vtl0_kernel_info
-            .get_system_certificate()
-            .unwrap(),
+            .get_system_certificates()
+            .expect("No system certificates loaded"),
     ) {
         serial_println!("VSM: Failed to verify the signature of kexec kernel blob");
         for kexec_mem_range in &kexec_memory_metadata {
@@ -1143,7 +1142,7 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
 pub struct Vtl0KernelInfo {
     module_memory_metadata: ModuleMemoryMetadataMap,
     boot_done: AtomicBool,
-    system_cert: once_cell::race::OnceBox<Certificate>,
+    system_certs: once_cell::race::OnceBox<Box<[Certificate]>>,
     kexec_metadata: KexecMemoryMetadataWrapper,
     crash_kexec_metadata: KexecMemoryMetadataWrapper,
     precomputed_patches: PatchDataMap,
@@ -1157,7 +1156,7 @@ impl Vtl0KernelInfo {
         Self {
             module_memory_metadata: ModuleMemoryMetadataMap::new(),
             boot_done: AtomicBool::new(false),
-            system_cert: once_cell::race::OnceBox::new(),
+            system_certs: once_cell::race::OnceBox::new(),
             kexec_metadata: KexecMemoryMetadataWrapper::new(),
             crash_kexec_metadata: KexecMemoryMetadataWrapper::new(),
             precomputed_patches: PatchDataMap::new(),
@@ -1178,12 +1177,13 @@ impl Vtl0KernelInfo {
         self.boot_done.load(core::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(crate) fn set_system_certificate(&self, cert: Certificate) {
-        let _ = self.system_cert.set(alloc::boxed::Box::new(cert));
+    pub fn set_system_certificates(&self, certs: Vec<Certificate>) {
+        let boxed_slice = certs.into_boxed_slice();
+        let _ = self.system_certs.set(boxed_slice.into());
     }
 
-    pub fn get_system_certificate(&self) -> Option<&Certificate> {
-        self.system_cert.get()
+    pub fn get_system_certificates(&self) -> Option<&[Certificate]> {
+        self.system_certs.get().map(|b| &**b)
     }
 
     // This function finds the precomputed patch data corresponding to the input patch data.
