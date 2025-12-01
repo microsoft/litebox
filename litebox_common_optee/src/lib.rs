@@ -175,7 +175,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 ret_orig: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
             TeeSyscallNr::CheckAccessRights => SyscallRequest::CheckAccessRights {
-                flags: TeeMemoryAccessRights::try_from_usize_retain(ctx.syscall_arg(0))?,
+                flags: TeeMemoryAccessRights::try_from_usize(ctx.syscall_arg(0))?,
                 buf: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
                 len: ctx.syscall_arg(2),
             },
@@ -706,11 +706,6 @@ impl TeeMemoryAccessRights {
         u32::try_from(value)
             .map_err(|_| Errno::EINVAL)
             .and_then(|v| Self::from_bits(v).ok_or(Errno::EINVAL))
-    }
-    pub fn try_from_usize_retain(value: usize) -> Result<Self, Errno> {
-        u32::try_from(value)
-            .map_err(|_| Errno::EINVAL)
-            .map(Self::from_bits_retain)
     }
 }
 

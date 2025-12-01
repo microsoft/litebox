@@ -1,5 +1,4 @@
 use core::sync::atomic::AtomicU32;
-use litebox::platform::common_providers::userspace_pointers::{UserConstPtr, UserMutPtr};
 
 use crate::HostInterface;
 

@@ -44,6 +44,7 @@ pub fn sys_map_zi(
     if flags.bits() & !accept_flags.bits() != 0 {
         return Err(TeeResult::BadParameters);
     }
+    // TODO: Check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` once we support sharing of file-based mappings.
 
     let total_size = num_bytes
         .checked_add(pad_begin)
@@ -56,7 +57,6 @@ pub fn sys_map_zi(
     // `sys_map_zi` always creates read/writeable mapping
     let prot = ProtFlags::PROT_READ_WRITE;
     let flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
-    // TODO: on Arm, check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` to control cache behaviors
 
     // OP-TEE maintains data structures to ensure padded regions are not used. It does not use page tables because
     // it targets systems with inefficient CPU and MMU. Instead of reproducing OP-TEE's behavior, we create

@@ -393,16 +393,17 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
     end_addr
 }
 
-/// Allocate the guest TLS for an OP-TEE TA to run it in an x86 environment.
+/// Allocate the guest TLS for an OP-TEE TA.
 /// This function is required to overcome the compatibility issue coming from
-/// architectural and build toolchain differences (x86 vs. Arm, Linux vs OP-TEE OS).
-/// OP-TEE `ldelf` and TAs currently only support Arm and OP-TEE OS environment.
-/// To this end, they do not use syscalls like `arch_prctl` and the `FS` register to
-/// set up the TLS area. In contrast, we do use an x86 toolchain to compile OP-TEE TAs.
-/// This toolchain assumes a loader will set up the TLS area with the `FS` register for
-/// programs such that it generates binaries using the `FS` register for TLS access.
-/// To avoid this issue, we might need to modify `ldelf` to make it set up the `FS` register or
-/// change/configure the toolchain not to use the `FS` register for TLS access.
+/// system and build toolchain differences. OP-TEE OS only supports a single thread and
+/// thus does not explicitly set up the TLS area. In contrast, we do use an x86 toolchain to
+/// compile OP-TEE TAs and this toolchain assumes there is a valid TLS areas for various purposes
+/// including stack protection. To this end, the toolchain generates binaries using
+/// the `FS` register for TLS access.
+/// This function allocates a TLS area on behalf of the TA to satisfy the toolchain's assumption.
+/// Instead of using this function, we could change the flags of the toolchain to not use TLS
+/// (e.g., `-fno-stack-protector`), but this might be insecure. Also, the toolchain might have
+/// other features relying on TLS.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn allocate_guest_tls(
     tls_size: Option<usize>,
