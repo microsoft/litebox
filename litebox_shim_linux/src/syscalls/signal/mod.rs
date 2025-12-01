@@ -188,12 +188,6 @@ impl PendingSignals {
         }
     }
 
-    fn find(&self, signal: Signal) -> Option<usize> {
-        self.queue
-            .iter()
-            .position(|info| info.signo == signal.as_i32())
-    }
-
     fn next(&self, blocked: SigSet) -> Option<Signal> {
         const EXCEPTION_SIGNALS: SigSet = SigSet::empty()
             .with(Signal::SIGSEGV)
@@ -299,7 +293,7 @@ impl SignalState {
     fn set_sigaltstack(&self, ss: SigAltStack) -> Result<(), Errno> {
         if !ss
             .flags
-            .difference(SsFlags::DISABLE | SsFlags::AUTODISARM)
+            .difference(SsFlags::DISABLE | SsFlags::ONSTACK | SsFlags::AUTODISARM)
             .is_empty()
         {
             Err(Errno::EINVAL)
@@ -311,7 +305,11 @@ impl SignalState {
         } else if ss.size < MINSIGSTKSZ {
             Err(Errno::ENOMEM)
         } else {
-            self.altstack.set(ss);
+            self.altstack.set(SigAltStack {
+                sp: ss.sp,
+                flags: ss.flags & SsFlags::AUTODISARM,
+                size: ss.size,
+            });
             Ok(())
         }
     }
@@ -327,6 +325,7 @@ impl SignalState {
 
     fn deliver_signal(
         &self,
+        signal: Signal,
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
@@ -345,15 +344,19 @@ impl SignalState {
 
         let frame_addr = arch::get_signal_frame(sp, action);
 
-        self.set_signal_mask(action.mask);
-
         if (switch_stacks || on_alt_stack) && !is_on_stack(&altstack, frame_addr) {
             return Err(DeliverFault);
         }
 
         self.write_signal_frame(frame_addr, siginfo, action, ctx)?;
 
-        if switch_stacks && altstack.flags.contains(SsFlags::AUTODISARM) {
+        let mut mask = self.blocked.get() | action.mask;
+        if !action.flags.contains(SaFlags::NODEFER) {
+            mask.add(signal);
+        }
+        self.set_signal_mask(mask);
+
+        if altstack.flags.contains(SsFlags::AUTODISARM) {
             self.clear_sigaltstack();
         }
         Ok(())
@@ -570,7 +573,9 @@ impl Task {
                 }
                 SIG_IGN => {}
                 _ => {
-                    if let Err(DeliverFault) = self.signals.deliver_signal(&siginfo, &action, ctx) {
+                    if let Err(DeliverFault) =
+                        self.signals.deliver_signal(signal, &siginfo, &action, ctx)
+                    {
                         // Failed to deliver signal. Inject a SIGSEGV
                         // (terminating the process if we were trying to deliver
                         // a SIGSEGV).

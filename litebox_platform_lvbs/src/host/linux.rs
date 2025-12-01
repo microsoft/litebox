@@ -54,9 +54,6 @@ pub struct Timespec {
     pub tv_nsec: i64,
 }
 
-#[allow(non_camel_case_types)]
-pub type sigset_t = ::core::ffi::c_ulong;
-
 const BITS_PER_LONG: usize = 64;
 
 #[repr(C)]

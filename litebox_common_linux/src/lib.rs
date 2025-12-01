@@ -3035,6 +3035,9 @@ pub struct PtRegs {
     pub xss: usize,
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+pub const EFLAGS_DF: usize = 0x400;
+
 impl PtRegs {
     /// Get the `idx`th syscall argument.
     ///

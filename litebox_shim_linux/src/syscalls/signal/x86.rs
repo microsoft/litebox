@@ -174,6 +174,7 @@ impl SignalState {
             ctx.edx = 0;
             ctx.ecx = 0;
         }
+        ctx.eflags &= !litebox_common_linux::EFLAGS_DF;
         Ok(())
     }
 }
