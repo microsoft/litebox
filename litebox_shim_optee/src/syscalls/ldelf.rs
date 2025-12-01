@@ -17,6 +17,8 @@ const DUMMY_HANDLE: u32 = 1;
 /// zero-initialized `num_bytes` bytes. `va` can contain a hint address which
 /// is `pad_begin` bytes lower than the starting address of the memory region.
 /// (`start - pad_begin`, ...,  `start`, ..., `start + num_bytes`, ..., `start + num_bytes + pad_end`)
+/// Memory regions between `start - pad_begin` and `start` and between
+/// `start + num_bytes` and `start + num_bytes + pad_end` are reserved and must not be used.
 pub fn sys_map_zi(
     va: crate::MutPtr<usize>,
     num_bytes: usize,
@@ -73,16 +75,23 @@ pub fn sys_map_zi(
     let flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
     // TODO: on Arm, check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` to control cache behaviors
 
+    // OP-TEE maintains data structures to ensure padded regions are not used. It does not use page tables because
+    // it targets systems with inefficient CPU and MMU. Instead of reproducing OP-TEE's behavior, we create
+    // mappings with `PROT_NONE` for padded regions to prevent others from using them.
     let addr = crate::syscalls::mm::sys_mmap(*addr, total_size, ProtFlags::PROT_NONE, flags, -1, 0)
         .map_err(|_| TeeResult::OutOfMemory)?;
     let padded_start = addr.as_usize() + pad_begin;
-    crate::syscalls::mm::sys_mprotect(
+    if crate::syscalls::mm::sys_mprotect(
         UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
         (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
             .next_multiple_of(PAGE_SIZE),
         prot,
     )
-    .expect("sys_map_zi: failed to set memory protection");
+    .is_err()
+    {
+        let _ = crate::syscalls::mm::sys_munmap(addr, total_size).ok();
+        return Err(TeeResult::OutOfMemory);
+    }
     unsafe {
         let _ = va.write_at_offset(0, padded_start);
     }
@@ -125,6 +134,8 @@ pub fn sys_close_bin(handle: u32) -> Result<(), TeeResult> {
 
     assert!(handle == DUMMY_HANDLE, "invalid handle");
     // TODO: check whether `handle` is valid
+
+    // TODO: unmap all mappings related to `handle` which are no longer used.
 
     Ok(())
 }
@@ -197,6 +208,8 @@ pub fn sys_map_bin(
     let flags_internal = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
     // TODO: on Arm, check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` to control cache behaviors
 
+    // Currently, we do not support TA binary mapping. So, we create an anonymous mapping and copy
+    // the content of the TA binary into it.
     let addr = crate::syscalls::mm::sys_mmap(
         *addr,
         total_size,
@@ -207,13 +220,17 @@ pub fn sys_map_bin(
     )
     .map_err(|_| TeeResult::OutOfMemory)?;
     let padded_start = addr.as_usize() + pad_begin;
-    crate::syscalls::mm::sys_mprotect(
+    if crate::syscalls::mm::sys_mprotect(
         UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
         (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
             .next_multiple_of(PAGE_SIZE),
         ProtFlags::PROT_READ_WRITE,
     )
-    .expect("sys_map_bin: failed to set memory protection");
+    .is_err()
+    {
+        let _ = crate::syscalls::mm::sys_munmap(addr, total_size).ok();
+        return Err(TeeResult::OutOfMemory);
+    }
 
     unsafe {
         if crate::read_ta_bin(UserMutPtr::from_usize(padded_start), offs, num_bytes).is_none() {
@@ -227,13 +244,17 @@ pub fn sys_map_bin(
     } else if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE) {
         prot |= ProtFlags::PROT_EXEC;
     }
-    crate::syscalls::mm::sys_mprotect(
+    if crate::syscalls::mm::sys_mprotect(
         UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
         (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
             .next_multiple_of(PAGE_SIZE),
         prot,
     )
-    .expect("sys_map_bin: failed to set memory protection");
+    .is_err()
+    {
+        let _ = crate::syscalls::mm::sys_munmap(addr, total_size).ok();
+        return Err(TeeResult::OutOfMemory);
+    }
 
     if offs == PAGE_SIZE
         && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
