@@ -1286,8 +1286,8 @@ mod test_utils {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let files = Arc::new(syscalls::file::FilesState::new(self.clone()));
-            files.initialize_stdio_in_shared_descriptors_table(&self.fs);
+            let files = Arc::new(syscalls::file::FilesState::new(&self.litebox));
+            files.initialize_stdio_in_shared_descriptors_table(&self);
             Task {
                 wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
                 thread: syscalls::process::ThreadState::new_process(&self, pid),

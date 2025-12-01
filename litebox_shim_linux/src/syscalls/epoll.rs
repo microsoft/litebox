@@ -590,22 +590,24 @@ mod test {
 
     extern crate std;
 
-    fn setup_epoll() -> EpollFile {
+    fn setup_epoll() -> (crate::Task, EpollFile) {
         let task = crate::syscalls::tests::init_platform(None);
 
-        EpollFile::new(task.global.clone())
+        let epoll = EpollFile::new(&task.global.litebox);
+        (task, epoll)
     }
 
     #[test]
     fn test_epoll_with_eventfd() {
-        let epoll = setup_epoll();
+        let (task, epoll) = setup_epoll();
         let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
             0,
             EfdFlags::CLOEXEC,
-            &epoll.global.litebox,
+            &task.global.litebox,
         ));
         epoll
             .add_interest(
+                &task.global,
                 10,
                 &super::EpollDescriptor::Eventfd(eventfd.clone()),
                 EpollEvent {
@@ -623,22 +625,22 @@ mod test {
                 .unwrap();
         });
         epoll
-            .wait(&WaitState::new(platform()).context(), 1024)
+            .wait(&WaitState::new(platform()).context(), &task.global, 1024)
             .unwrap();
     }
 
     #[test]
     fn test_epoll_with_pipe() {
-        let epoll = setup_epoll();
-        let global = epoll.global.clone();
+        let (task, epoll) = setup_epoll();
         let (producer, consumer) =
-            global
+            task.global
                 .pipes
                 .create_pipe(2, litebox::pipes::Flags::empty(), None);
         let consumer = Arc::new(consumer);
         let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
         epoll
             .add_interest(
+                &task.global,
                 10,
                 &reader,
                 EpollEvent {
@@ -649,6 +651,7 @@ mod test {
             .unwrap();
 
         // spawn a thread to write to the pipe
+        let global = task.global.clone();
         std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(100));
             assert_eq!(
@@ -660,11 +663,10 @@ mod test {
             );
         });
         epoll
-            .wait(&WaitState::new(platform()).context(), 1024)
+            .wait(&WaitState::new(platform()).context(), &task.global, 1024)
             .unwrap();
         let mut buf = [0; 2];
-        epoll
-            .global
+        task.global
             .pipes
             .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
             .unwrap();
@@ -688,8 +690,8 @@ mod test {
             close_on_exec: core::sync::atomic::AtomicBool::new(false),
         };
 
-        let no_fds = FilesState::new(task.global.clone());
-        let fds = FilesState::new(task.global.clone());
+        let no_fds = FilesState::new(&task.global.litebox);
+        let fds = FilesState::new(&task.global.litebox);
         fds.file_descriptors
             .write()
             .insert_at(descriptor, fd.reinterpret_as_unsigned() as usize);
@@ -701,14 +703,14 @@ mod test {
             revents[0]
         };
 
-        set.wait(&WaitState::new(platform()).context(), &no_fds)
+        set.wait(&WaitState::new(platform()).context(), &task.global, &no_fds)
             .unwrap();
         assert_eq!(revents(&set), Events::NVAL);
 
         eventfd
             .write(&WaitState::new(platform()).context(), 1)
             .unwrap();
-        set.wait(&WaitState::new(platform()).context(), &fds)
+        set.wait(&WaitState::new(platform()).context(), &task.global, &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
 
@@ -717,6 +719,7 @@ mod test {
             &WaitState::new(platform())
                 .context()
                 .with_timeout(core::time::Duration::from_millis(100)),
+            &task.global,
             &fds,
         )
         .unwrap_err();
@@ -730,7 +733,7 @@ mod test {
                 .unwrap();
         });
 
-        set.wait(&WaitState::new(platform()).context(), &fds)
+        set.wait(&WaitState::new(platform()).context(), &task.global, &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
     }
