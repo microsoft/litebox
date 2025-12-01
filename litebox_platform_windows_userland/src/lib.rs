@@ -1209,6 +1209,15 @@ impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
                 eprintln!("WARNING: ignoring RtSigprocmask punchthrough");
                 Ok(0)
             }
+            PunchthroughSyscall::RtSigaction {
+                signum,
+                act: _,
+                oldact: _,
+            } => {
+                // Ignored for now.
+                eprintln!("WARNING: ignoring RtSigaction punchthrough for signum={signum:?}");
+                Ok(0)
+            }
             p => {
                 unimplemented!("unimplemented PunchthroughToken for WindowsUserland: {p:?}");
             }
