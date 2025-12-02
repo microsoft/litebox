@@ -114,6 +114,10 @@ struct SocketOptions {
 
 pub(crate) struct SocketOFlags(pub OFlags);
 
+/// Socket-related implementation. Currently these methods are on `GlobalState`
+/// so that they can access `net` and the litebox descriptor table. This might
+/// change if the nature of the litebox descriptor table changes, or if network
+/// namespaces are implemented.
 impl GlobalState {
     fn initialize_socket(&self, fd: &SocketFd, sock_type: SockType, flags: SockFlags) {
         let mut status = OFlags::RDWR;

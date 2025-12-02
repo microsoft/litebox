@@ -137,8 +137,8 @@ impl EpollFile {
 
     pub(crate) fn wait(
         &self,
-        cx: &WaitContext<'_, Platform>,
         global: &GlobalState,
+        cx: &WaitContext<'_, Platform>,
         maxevents: usize,
     ) -> Result<Vec<EpollEvent>, WaitError> {
         let mut events = Vec::new();
@@ -536,8 +536,8 @@ impl PollSet {
     /// Waits for any of the fds in the poll set to become ready.
     pub fn wait(
         &mut self,
-        cx: &WaitContext<'_, Platform>,
         global: &GlobalState,
+        cx: &WaitContext<'_, Platform>,
         files: &FilesState,
     ) -> Result<(), WaitError> {
         if self.scan_once(global, files, None) {
@@ -625,7 +625,7 @@ mod test {
                 .unwrap();
         });
         epoll
-            .wait(&WaitState::new(platform()).context(), &task.global, 1024)
+            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
             .unwrap();
     }
 
@@ -663,7 +663,7 @@ mod test {
             );
         });
         epoll
-            .wait(&WaitState::new(platform()).context(), &task.global, 1024)
+            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
             .unwrap();
         let mut buf = [0; 2];
         task.global
@@ -703,23 +703,23 @@ mod test {
             revents[0]
         };
 
-        set.wait(&WaitState::new(platform()).context(), &task.global, &no_fds)
+        set.wait(&task.global, &WaitState::new(platform()).context(), &no_fds)
             .unwrap();
         assert_eq!(revents(&set), Events::NVAL);
 
         eventfd
             .write(&WaitState::new(platform()).context(), 1)
             .unwrap();
-        set.wait(&WaitState::new(platform()).context(), &task.global, &fds)
+        set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
 
         eventfd.read(&WaitState::new(platform()).context()).unwrap();
         set.wait(
+            &task.global,
             &WaitState::new(platform())
                 .context()
                 .with_timeout(core::time::Duration::from_millis(100)),
-            &task.global,
             &fds,
         )
         .unwrap_err();
@@ -733,7 +733,7 @@ mod test {
                 .unwrap();
         });
 
-        set.wait(&WaitState::new(platform()).context(), &task.global, &fds)
+        set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
     }

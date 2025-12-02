@@ -1431,8 +1431,8 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
             }
         };
         match epoll_file.wait(
-            &self.wait_cx().with_timeout(timeout),
             &self.global,
+            &self.wait_cx().with_timeout(timeout),
             maxevents,
         ) {
             Ok(epoll_events) => {
@@ -1480,8 +1480,8 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
         }
 
         match set.wait(
-            &self.wait_cx().with_timeout(timeout),
             &self.global,
+            &self.wait_cx().with_timeout(timeout),
             &self.files.borrow(),
         ) {
             Ok(()) => {}
@@ -1548,8 +1548,8 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
         }
 
         match set.wait(
-            &self.wait_cx().with_timeout(timeout),
             &self.global,
+            &self.wait_cx().with_timeout(timeout),
             &self.files.borrow(),
         ) {
             Ok(()) => {}

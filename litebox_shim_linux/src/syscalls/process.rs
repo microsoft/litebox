@@ -52,11 +52,11 @@ pub(crate) struct ThreadState {
 unsafe impl Send for ThreadState {}
 
 impl ThreadState {
-    pub fn new_process(globals: &GlobalState, pid: i32) -> Self {
+    pub fn new_process(global: &GlobalState, pid: i32) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(globals, pid, remote.clone())),
+            process: Arc::new(Process::new(global, pid, remote.clone())),
             remote,
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -145,12 +145,12 @@ pub(crate) enum ExitStatus {
 
 impl Process {
     /// Creates a new process with the given initial thread.
-    fn new(globals: &GlobalState, pid: i32, remote: Arc<ThreadRemote>) -> Self {
-        let nr_threads = globals.platform.new_raw_mutex();
+    fn new(global: &GlobalState, pid: i32, remote: Arc<ThreadRemote>) -> Self {
+        let nr_threads = global.platform.new_raw_mutex();
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         Self {
             nr_threads,
-            inner: globals.litebox.sync().new_mutex(ProcessInner {
+            inner: global.litebox.sync().new_mutex(ProcessInner {
                 exit_status: ExitStatus::Exit(0),
                 group_exit: false,
                 is_killing_other_threads: false,
