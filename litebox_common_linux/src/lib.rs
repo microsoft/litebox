@@ -626,7 +626,7 @@ pub enum SockType {
 }
 
 bitflags::bitflags! {
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     pub struct SockFlags: core::ffi::c_uint {
         const NONBLOCK = OFlags::NONBLOCK.bits();
         const CLOEXEC = OFlags::CLOEXEC.bits();

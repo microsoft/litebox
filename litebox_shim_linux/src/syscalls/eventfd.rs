@@ -88,7 +88,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             .map_err(Errno::from)
     }
 
-    crate::syscalls::common_functions_for_file_status!();
+    super::common_functions_for_file_status!();
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFile<Platform> {

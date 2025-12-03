@@ -1,7 +1,13 @@
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 
-use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use core::{
+    ffi::CStr,
+    mem::offset_of,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::atomic::AtomicBool,
+};
 
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use litebox::{
     event::{
@@ -19,7 +25,7 @@ use litebox_common_linux::{
     TcpOption, errno::Errno,
 };
 
-use crate::Platform;
+use crate::{Platform, syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr}};
 use crate::{ConstPtr, Descriptor, MutPtr};
 use crate::{GlobalState, Task};
 
@@ -89,6 +95,7 @@ impl From<SocketAddrV4> for CSockInetAddr {
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum SocketAddress {
     Inet(SocketAddr),
+    Unix(UnixSocketAddr),
 }
 
 impl Default for SocketAddress {
@@ -97,8 +104,24 @@ impl Default for SocketAddress {
     }
 }
 
+impl SocketAddress {
+    pub(crate) fn inet(self) -> Option<SocketAddr> {
+        match self {
+            SocketAddress::Inet(addr) => Some(addr),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn unix(self) -> Option<UnixSocketAddr> {
+        match self {
+            SocketAddress::Unix(addr) => Some(addr),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
-struct SocketOptions {
+pub(super) struct SocketOptions {
     reuse_address: bool,
     keep_alive: bool,
     /// Receiving timeout, None (default value) means no timeout
@@ -786,7 +809,14 @@ impl Task {
                         .fd_into_raw_integer(socket),
                 )
             }
-            AddressFamily::UNIX => todo!(),
+            AddressFamily::UNIX => {
+                let socket =
+                    UnixSocket::new(ty, flags).ok_or(Errno::EPROTONOSUPPORT)?;
+                Descriptor::Unix {
+                    file: Arc::new(socket),
+                    close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
+                }
+            }
             AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
             _ => unimplemented!(),
         };
@@ -829,6 +859,25 @@ pub(crate) fn read_sockaddr_from_user(
                 inet_addr,
             ))))
         }
+        AddressFamily::UNIX => {
+            let path = unsafe { sockaddr.to_cow_slice(addrlen) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+            // skip the first two bytes (sa_family)
+            let path = &path[offset_of!(CSockUnixAddr, path)..];
+            if path.is_empty() {
+                return Ok(SocketAddress::Unix(UnixSocketAddr::Unnamed));
+            }
+            if path[0] == 0 {
+                return Ok(SocketAddress::Unix(UnixSocketAddr::Abstract(
+                    path[1..].to_vec(),
+                )));
+            }
+            let s = CStr::from_bytes_until_nul(path).map_err(|_| Errno::EINVAL)?;
+            Ok(SocketAddress::Unix(UnixSocketAddr::Path(
+                s.to_string_lossy().to_string(),
+            )))
+        }
         _ => todo!("unsupported family {family:?}"),
     }
 }
@@ -856,6 +905,47 @@ pub(crate) fn write_sockaddr_to_user(
             };
             unsafe { addr.write_slice_at_offset(0, &bytes[..addrlen_val]) }.ok_or(Errno::EFAULT)?;
             size_of::<CSockInetAddr>()
+        }
+        SocketAddress::Unix(v) => {
+            let family_ptr = MutPtr::<u16>::from_usize(addr.as_usize());
+            unsafe { family_ptr.write_at_offset(0, AddressFamily::UNIX as u16) }
+                .ok_or(Errno::EFAULT)?;
+            match v {
+                UnixSocketAddr::Unnamed => {
+                    // only write family
+                    size_of::<u16>()
+                }
+                UnixSocketAddr::Abstract(name) => {
+                    let offset = offset_of!(CSockUnixAddr, path);
+                    if addrlen_val as usize > offset {
+                        unsafe { addr.write_at_offset(isize::try_from(offset).unwrap(), 0) }
+                            .ok_or(Errno::EFAULT)?;
+                        let max_len = addrlen_val as usize - offset - 1;
+                        unsafe {
+                            addr.write_slice_at_offset(
+                                isize::try_from(offset + 1).unwrap(),
+                                &name[..name.len().min(max_len)],
+                            )
+                        }
+                        .ok_or(Errno::EFAULT)?;
+                    }
+                    offset + 1 + name.len()
+                }
+                UnixSocketAddr::Path(path) => {
+                    let offset = offset_of!(CSockUnixAddr, path);
+                    let max_len = addrlen_val as usize - offset;
+                    let name = &path.as_bytes()[..path.len().min(max_len)];
+                    unsafe { addr.write_slice_at_offset(isize::try_from(offset).unwrap(), name) }
+                        .ok_or(Errno::EFAULT)?;
+                    let null_offset = offset + name.len();
+                    // write null terminator if there is space
+                    if addrlen_val as usize > null_offset {
+                        unsafe { addr.write_at_offset(isize::try_from(null_offset).unwrap(), 0) }
+                            .ok_or(Errno::EFAULT)?;
+                    }
+                    offset + path.len() + 1
+                }
+            }
         }
         SocketAddress::Inet(SocketAddr::V6(_)) => todo!("copy_sockaddr_to_user for IPv6"),
     }
@@ -922,6 +1012,19 @@ impl Task {
                     ))
                 })?
             }
+            Descriptor::Unix { file, .. } => {
+                let file = file.clone();
+                drop(file_table); // Drop before possibly-blocking `accept`
+                let mut socket_addr = peer.is_some().then_some(UnixSocketAddr::Unnamed);
+                let accepted_file = file.accept(flags, socket_addr.as_mut())?;
+                if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
+                    *peer = SocketAddress::Unix(socket_addr);
+                }
+                Descriptor::Unix {
+                    file: Arc::new(accepted_file),
+                    close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
+                }
+            }
             _ => return Err(Errno::ENOTSOCK),
         };
         files
@@ -953,10 +1056,16 @@ impl Task {
         let file_table = files.file_descriptors.read();
         match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                let SocketAddress::Inet(addr) = sockaddr;
+                let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
                 drop(file_table); // Drop before possibly-blocking `connect`
                 self.global.connect(&self.wait_cx(), fd, addr)
             }),
+            Descriptor::Unix { file, .. } => {
+                let addr = sockaddr.unix().ok_or(Errno::EAFNOSUPPORT)?;
+                let file = file.clone();
+                drop(file_table); // Drop before possibly-blocking `connect`
+                file.connect(self, addr)
+            }
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -983,9 +1092,13 @@ impl Task {
             .ok_or(Errno::EBADF)?
         {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                let SocketAddress::Inet(addr) = sockaddr;
+                let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
                 self.global.bind(fd, addr)
             }),
+            Descriptor::Unix { file, .. } => {
+                let addr = sockaddr.unix().ok_or(Errno::EAFNOSUPPORT)?;
+                file.bind(self, addr)
+            }
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1008,6 +1121,7 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => {
                 files.with_socket_fd(*raw_fd, |fd| self.global.listen(fd, backlog))
             }
+            Descriptor::Unix { file, .. } => file.listen(backlog),
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1044,11 +1158,21 @@ impl Task {
         let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
         match socket {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                let sockaddr = sockaddr.map(|SocketAddress::Inet(addr)| addr);
+                let sockaddr = sockaddr
+                    .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                    .transpose()?;
                 drop(file_table); // Drop before possibly-blocking `sendto`
                 self.global
                     .sendto(&self.wait_cx(), fd, &buf, flags, sockaddr)
             }),
+            Descriptor::Unix { file, .. } => {
+                let addr = sockaddr
+                    .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
+                    .transpose()?;
+                let file = file.clone();
+                drop(file_table); // Drop before possibly-blocking `sendto`
+                file.sendto(&buf, flags, addr)
+            }
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1094,7 +1218,9 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |socket| {
                 // drop file table as `sendto` may block
                 drop(file_table);
-                let sock_addr = sock_addr.map(|SocketAddress::Inet(addr)| addr);
+                let sock_addr = sock_addr
+                    .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                    .transpose()?;
                 let mut total_sent = 0;
                 for iov in iovs.iter() {
                     if iov.iov_len == 0 {
@@ -1182,6 +1308,32 @@ impl Task {
                     .ok_or(Errno::EFAULT)?;
                 Ok(size)
             }),
+            Descriptor::Unix { file, .. } => {
+                const MAX_LEN: usize = 4096;
+                let file = file.clone();
+                drop(file_table); // Drop before possibly-blocking `receive`
+                let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
+                let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
+                let mut addr = None;
+                let size = file.recvfrom(
+                    buffer,
+                    flags,
+                    if source_addr.is_some() {
+                        Some(&mut addr)
+                    } else {
+                        None
+                    },
+                )?;
+                if let Some(source_addr) = source_addr {
+                    *source_addr = addr.map(SocketAddress::Unix);
+                }
+                if !flags.contains(ReceiveFlags::TRUNC) {
+                    assert!(size <= len, "{size} should be smaller than {len}");
+                }
+                buf.copy_from_slice(0, &buffer[..size.min(buffer.len())])
+                    .ok_or(Errno::EFAULT)?;
+                Ok(size)
+            }
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1292,6 +1444,7 @@ impl Task {
                     .map(SocketAddress::Inet)
                     .map_err(Errno::from)
             }),
+            Descriptor::Unix { file, .. } => Ok(SocketAddress::Unix(file.get_local_addr())),
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1996,7 +2149,9 @@ mod tests {
             assert_eq!(n, msg.len());
             assert_eq!(recv_buf[..n], msg.as_bytes()[..n]);
         }
-        let SocketAddress::Inet(sender_addr) = sender_addr.unwrap();
+        let SocketAddress::Inet(sender_addr) = sender_addr.unwrap() else {
+            panic!("Expected Inet socket address");
+        };
         assert_eq!(sender_addr.port(), CLIENT_PORT);
 
         close_socket(&task, server_fd);
@@ -2054,7 +2209,10 @@ mod tests {
 
         // Client implicitly bound to an ephemeral port via sendto
         let SocketAddress::Inet(client_addr) =
-            task.do_getsockname(client_fd).expect("getsockname failed");
+            task.do_getsockname(client_fd).expect("getsockname failed")
+        else {
+            panic!("Expected Inet socket address");
+        };
         assert_ne!(client_addr.port(), 0);
 
         // Client connects to server address

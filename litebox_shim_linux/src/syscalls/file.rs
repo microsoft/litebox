@@ -280,6 +280,9 @@ impl Task {
                 buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
                 Ok(size_of::<u64>())
             }
+            Descriptor::Unix { file, .. } => {
+                file.recvfrom(buf, litebox_common_linux::ReceiveFlags::empty(), None)
+            }
         }
     }
 
@@ -330,6 +333,9 @@ impl Task {
                         .map_err(|_| Errno::EINVAL)?,
                 );
                 file.write(&self.wait_cx(), value)
+            }
+            Descriptor::Unix { file, .. } => {
+                file.sendto(buf, litebox_common_linux::SendFlags::empty(), None)
             }
         };
         if let Err(Errno::EPIPE) = res {
@@ -382,7 +388,9 @@ impl Task {
                     |_| Err(Errno::ESPIPE),
                 )
                 .flatten(),
-            Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } => Err(Errno::ESPIPE),
+            Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } | Descriptor::Unix { .. } => {
+                Err(Errno::ESPIPE)
+            }
         }
     }
 
@@ -430,7 +438,9 @@ impl Task {
                     }
                 }
             }
-            Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } => Ok(()),
+            Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
+                Ok(())
+            }
         }
     }
 
@@ -500,6 +510,7 @@ impl Task {
                     .flatten()?,
                 Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
                 Descriptor::Eventfd { .. } => todo!(),
+                Descriptor::Unix { .. } => todo!(),
             };
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
@@ -578,6 +589,7 @@ impl Task {
                 .flatten(),
             Descriptor::Epoll { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { .. } => todo!(),
+            Descriptor::Unix { .. } => todo!(),
         };
         if let Err(Errno::EPIPE) = res {
             unimplemented!("send SIGPIPE to the current task");
@@ -735,6 +747,22 @@ impl Descriptor {
                 st_blocks: 0,
                 ..Default::default()
             },
+            Descriptor::Unix { .. } => FileStat {
+                // TODO: give correct values
+                st_dev: 0,
+                st_ino: 0,
+                st_nlink: 1,
+                st_mode: (litebox_common_linux::InodeType::Socket as u32
+                    | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+                .truncate(),
+                st_uid: 0,
+                st_gid: 0,
+                st_rdev: 0,
+                st_size: 0,
+                st_blksize: 4096,
+                st_blocks: 0,
+                ..Default::default()
+            },
         };
         Ok(fstat)
     }
@@ -763,15 +791,15 @@ impl Descriptor {
                 |fd| get_flags(global, fd),
                 |fd| get_flags(global, fd),
             ),
-            Descriptor::Eventfd { close_on_exec, .. } | Descriptor::Epoll { close_on_exec, .. } => {
-                Ok(
-                    if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
-                        FileDescriptorFlags::FD_CLOEXEC
-                    } else {
-                        FileDescriptorFlags::empty()
-                    },
-                )
-            }
+            Descriptor::Eventfd { close_on_exec, .. }
+            | Descriptor::Epoll { close_on_exec, .. }
+            | Descriptor::Unix { close_on_exec, .. } => Ok(
+                if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
+                    FileDescriptorFlags::FD_CLOEXEC
+                } else {
+                    FileDescriptorFlags::empty()
+                },
+            ),
         }
     }
 }
@@ -893,7 +921,8 @@ impl Task {
                         },
                     )?,
                     Descriptor::Eventfd { close_on_exec, .. }
-                    | Descriptor::Epoll { close_on_exec, .. } => {
+                    | Descriptor::Epoll { close_on_exec, .. }
+                    | Descriptor::Unix { close_on_exec, .. } => {
                         close_on_exec.store(
                             flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                             core::sync::atomic::Ordering::Relaxed,
@@ -940,6 +969,7 @@ impl Task {
                     .bits()),
                 Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
+                Descriptor::Unix { file, .. } => Ok(file.get_status().bits()),
             },
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
@@ -1018,6 +1048,9 @@ impl Task {
                         toggle_flags!(file);
                     }
                     Descriptor::Epoll { .. } => todo!(),
+                    Descriptor::Unix { file, .. } => {
+                        toggle_flags!(file);
+                    }
                 }
                 Ok(0)
             }
@@ -1263,6 +1296,9 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                 Descriptor::Epoll { file, .. } => {
                     file.set_status(OFlags::NONBLOCK, val != 0);
                 }
+                Descriptor::Unix { file, .. } => {
+                    file.set_status(OFlags::NONBLOCK, val != 0);
+                }
             }
             return Ok(0);
         }
@@ -1325,6 +1361,10 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                 close_on_exec: _,
             } => todo!(),
             Descriptor::Epoll {
+                file: _,
+                close_on_exec: _,
+            } => todo!(),
+            Descriptor::Unix {
                 file: _,
                 close_on_exec: _,
             } => todo!(),
@@ -1692,6 +1732,10 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
             }),
             Descriptor::Epoll { file, .. } => Ok(Descriptor::Epoll {
+                file: file.clone(),
+                close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+            }),
+            Descriptor::Unix { file, .. } => Ok(Descriptor::Unix {
                 file: file.clone(),
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
             }),

@@ -7,6 +7,7 @@ pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;
 pub mod process;
+pub(crate) mod unix;
 
 pub(crate) mod signal;
 #[cfg(test)]
