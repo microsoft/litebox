@@ -507,8 +507,13 @@ fn test_tun_with_tcp_socket() {
 fn test_tun_and_runner_with_iperf3() {
     let iperf3_path = run_which("iperf3");
     let cloned_path = iperf3_path.clone();
+    let has_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let has_started_clone = has_started.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        // Rewrite iperf3 and its dependencies may take some time, wait until the server is started
+        while !has_started_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         std::println!("Starting iperf3 client...");
         let mut client = std::process::Command::new(&cloned_path)
             .args(["-c", "10.0.0.2"])
@@ -516,12 +521,14 @@ fn test_tun_and_runner_with_iperf3() {
             .expect("Failed to start iperf3 server");
         client.wait().expect("Failed to wait on iperf3 client");
     });
-    Runner::new(Backend::Rewriter, &iperf3_path, "iperf3_server_rewriter")
+    let mut runner = Runner::new(Backend::Rewriter, &iperf3_path, "iperf3_server_rewriter");
+    runner
         .args([
             "-s", // run in server mode
             "-1", // handle one client then exit
             "-B", "10.0.0.2", // bind to this address
         ])
-        .tun_device_name("tun99")
-        .run();
+        .tun_device_name("tun99");
+    has_started.store(true, std::sync::atomic::Ordering::Relaxed);
+    runner.run();
 }
