@@ -93,7 +93,7 @@ pub struct ExceptionInfo {
 /// An x86 exception type.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[repr(transparent)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Exception(pub u8);
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

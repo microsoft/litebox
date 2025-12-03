@@ -94,6 +94,11 @@ impl TestLauncher {
                 &mut litebox_common_linux::PtRegs::default(),
             );
         };
+        assert_eq!(
+            program.process.wait(),
+            0,
+            "process exited with non-zero code"
+        );
     }
 }
 
@@ -241,7 +246,7 @@ fn test_syscall_rewriter() {
         &hooked_path,
         &[
             "--trampoline-addr",
-            (litebox_shim_linux::loader::REWRITER_MAGIC_NUMBER & usize::MAX as u64)
+            (litebox_common_linux::loader::REWRITER_MAGIC_NUMBER & usize::MAX as u64)
                 .to_string()
                 .as_str(),
         ],

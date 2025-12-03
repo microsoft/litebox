@@ -220,4 +220,13 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
             locked_witness: attempt.map(super::lock_tracing::LockTracker::mark_lock),
         }
     }
+
+    /// Returns a mutable reference to the underlying data.
+    ///
+    /// This is safe because we have `&mut self`, so no other threads can access
+    /// the data.
+    pub fn get_mut(&mut self) -> &mut T {
+        // SAFETY: We have &mut self, so no other threads can have access to the data.
+        unsafe { &mut *self.data.get() }
+    }
 }

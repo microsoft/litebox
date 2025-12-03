@@ -427,9 +427,9 @@ dependencies = [
 
 [[package]]
 name = "delegate"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6178a82cf56c836a3ba61a7935cdb1c49bfaa6fa4327cd5bf554a503087de26b"
+checksum = "780eb241654bf097afb00fc5f054a09b687dad862e485fdcf8399bb056565370"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -493,6 +493,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4445909572dbd556c457c849c4ca58623d84b27c8fff1e74b0b4227d8b90d17b"
 
 [[package]]
+name = "elf"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
+
+[[package]]
 name = "elf_loader"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -501,7 +507,7 @@ dependencies = [
  "bitflags 2.9.4",
  "cfg-if",
  "delegate",
- "elf",
+ "elf 0.7.4",
 ]
 
 [[package]]
@@ -775,10 +781,12 @@ dependencies = [
  "bitfield",
  "bitflags 2.9.4",
  "cfg-if",
+ "elf 0.8.0",
  "int-enum",
  "litebox",
  "syscalls",
  "thiserror",
+ "zerocopy",
 ]
 
 [[package]]
@@ -837,7 +845,7 @@ dependencies = [
  "cms",
  "const-oid",
  "digest",
- "elf",
+ "elf 0.8.0",
  "hashbrown 0.15.5",
  "libc",
  "litebox",
@@ -966,8 +974,6 @@ dependencies = [
  "arrayvec",
  "bitflags 2.9.4",
  "bitvec",
- "elf",
- "elf_loader",
  "libc",
  "litebox",
  "litebox_common_linux",
@@ -988,7 +994,7 @@ dependencies = [
  "bitflags 2.9.4",
  "cfg-if",
  "ctr",
- "elf",
+ "elf 0.8.0",
  "elf_loader",
  "hashbrown 0.15.5",
  "litebox",
