@@ -84,10 +84,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ///
     /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
     /// potential deadlocks.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "after initialization, this will never panic"
-    )]
     pub fn descriptor_table(
         &self,
     ) -> impl core::ops::Deref<Target = Descriptors<Platform>> + use<'_, Platform> {
@@ -98,10 +94,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ///
     /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
     /// potential deadlocks.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "after initialization, this will never panic"
-    )]
     pub fn descriptor_table_mut(
         &self,
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
