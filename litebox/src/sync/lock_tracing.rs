@@ -138,9 +138,9 @@ struct LockTrackerPlatform<Platform: RawSyncPrimitivesProvider> {
 /// The main tracker, which manages both tracking and (if necessary) panicking upon invariant
 /// failure. Can/should only be accessed from the singleton that is initialized by
 /// [`LockTracker::init`].
-struct LockTrackerX<T: ?Sized + DynLockTrackerProvider = dyn DynLockTrackerProvider> {
+struct LockTrackerX<Platform: ?Sized = dyn DynLockTrackerProvider> {
     held: ArrayVec<Option<Locked>, CONFIG_MAX_NUMBER_OF_TRACKED_LOCKS>,
-    platform: T,
+    platform: Platform,
 }
 
 /// A dyn-compatible trait with just the methods we need from the platform for
