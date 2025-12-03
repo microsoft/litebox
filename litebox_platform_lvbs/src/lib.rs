@@ -13,14 +13,13 @@ use core::{
     arch::asm,
     sync::atomic::{AtomicU32, AtomicU64},
 };
-use host::linux::sigset_t;
 use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
     Punchthrough, RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox::platform::{
-    PunchthroughProvider, PunchthroughToken, RawMutPointer, RawMutex as _, RawPointerProvider,
+    PunchthroughProvider, PunchthroughToken, RawMutex as _, RawPointerProvider,
 };
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
@@ -51,8 +50,8 @@ pub struct LinuxKernel<Host: HostInterface> {
     user_contexts: UserContextMap,
 }
 
-pub struct LinuxPunchthroughToken<Host: HostInterface> {
-    punchthrough: PunchthroughSyscall<LinuxKernel<Host>>,
+pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
+    punchthrough: PunchthroughSyscall<'a, LinuxKernel<Host>>,
     host: core::marker::PhantomData<Host>,
 }
 
@@ -71,8 +70,8 @@ impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawMutPointer<T: Clone> = UserMutPtr<T>;
 }
 
-impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
-    type Punchthrough = PunchthroughSyscall<LinuxKernel<Host>>;
+impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, Host> {
+    type Punchthrough = PunchthroughSyscall<'a, LinuxKernel<Host>>;
 
     fn execute(
         self,
@@ -85,13 +84,7 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
                 unsafe { litebox_common_linux::wrfsbase(addr) };
                 Ok(0)
             }
-            PunchthroughSyscall::GetFsBase { addr } => {
-                let fs_base = unsafe { litebox_common_linux::rdfsbase() };
-                unsafe { addr.write_at_offset(0, fs_base) }
-                    .map(|()| 0)
-                    .ok_or(Errno::EFAULT)
-            }
-            _ => unimplemented!(),
+            PunchthroughSyscall::GetFsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
         };
         match r {
             Ok(v) => Ok(v),
@@ -101,12 +94,12 @@ impl<Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<Host> {
 }
 
 impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
-    type PunchthroughToken = LinuxPunchthroughToken<Host>;
+    type PunchthroughToken<'a> = LinuxPunchthroughToken<'a, Host>;
 
-    fn get_punchthrough_token_for(
+    fn get_punchthrough_token_for<'a>(
         &self,
-        punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken> {
+        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>> {
         Some(LinuxPunchthroughToken {
             punchthrough,
             host: core::marker::PhantomData,
@@ -388,7 +381,11 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// Register the shim. This function must be called for each core to program
     /// its MSRs.
     pub fn register_shim(
-        shim: &'static dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+        shim: &'static (
+                     dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>
+                         + Send
+                         + Sync
+                 ),
     ) {
         syscall_entry::init(shim);
     }
@@ -619,13 +616,6 @@ pub trait HostInterface {
     // TODO: leave this for now for testing. LVBS does not terminate, so it should be no-op or
     // removed.
 
-    /// For Punchthrough
-    fn rt_sigprocmask(
-        how: i32,
-        set: UserConstPtr<sigset_t>,
-        old_set: UserMutPtr<sigset_t>,
-        sigsetsize: usize,
-    ) -> Result<usize, Errno>;
     // TODO: leave this for now for testing. We might need this if we plan to run Linux apps inside VTL1.
 
     fn wake_many(mutex: &AtomicU32, n: usize) -> Result<usize, Errno>;

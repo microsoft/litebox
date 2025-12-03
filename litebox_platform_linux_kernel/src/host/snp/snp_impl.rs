@@ -1,15 +1,15 @@
 //! An implementation of [`HostInterface`] for SNP VMM
 use ::alloc::boxed::Box;
-use core::arch::asm;
-
-use litebox::{
-    platform::{RawConstPointer, RawMutPointer},
-    utils::ReinterpretUnsignedExt as _,
+use core::{
+    arch::asm,
+    cell::{Cell, OnceCell},
 };
-use litebox_common_linux::{CloneFlags, SigSet, SigmaskHow};
+
+use litebox::utils::ReinterpretUnsignedExt as _;
+use litebox_common_linux::CloneFlags;
 
 use super::ghcb::ghcb_prints;
-use crate::{Errno, HostInterface, UserConstPtr, UserMutPtr};
+use crate::{Errno, HostInterface};
 
 #[expect(dead_code, reason = "bindings are generated from C header files")]
 mod bindings {
@@ -105,15 +105,13 @@ impl SnpLinuxKernel {
 
 unsafe impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
     fn get_thread_local_storage() -> *mut () {
-        current()
-            .expect("Current task must be available")
-            .tls
-            .cast()
+        let tls = get_tls();
+        unsafe { (*tls).shim_tls.get() }
     }
 
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
-        let current_task = current().expect("Current task must be available");
-        core::mem::replace(&mut current_task.tls, value.cast()).cast()
+        let tls = get_tls();
+        unsafe { (*tls).shim_tls.replace(value) }
     }
 }
 
@@ -121,11 +119,19 @@ core::arch::global_asm!(include_str!("entry.S"));
 
 struct ThreadStartArgs {
     ctx: litebox_common_linux::PtRegs,
-    init_thread: Box<dyn litebox::shim::InitThread>,
+    init_thread:
+        Box<dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>>,
 }
 
 const RIP_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, rip);
 const EFLAGS_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, eflags);
+
+struct ThreadState {
+    shim: OnceCell<
+        Box<dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>>,
+    >,
+    shim_tls: Cell<*mut ()>,
+}
 
 /// Callback function for a new thread
 ///
@@ -140,7 +146,9 @@ extern "C" fn thread_start(
 
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
-    thread_start_args.init_thread.init();
+    let shim = thread_start_args.init_thread.init();
+
+    init_thread(shim, regs);
 
     // Restore the context
     unsafe {
@@ -174,6 +182,62 @@ extern "C" fn thread_start(
     unreachable!("Thread should not return");
 }
 
+fn get_tls() -> *const ThreadState {
+    let tls = current().unwrap().tls;
+    if !tls.is_null() {
+        return tls.cast();
+    }
+    let tls = Box::new(ThreadState {
+        shim: OnceCell::new(),
+        shim_tls: Cell::new(core::ptr::null_mut()),
+    });
+    let tls = Box::into_raw(tls);
+    current().unwrap().tls = tls.cast();
+    tls
+}
+
+/// Calls the shim's `init` method to initialize the thread and the register
+/// context, preparing the thread for calls to [`handle_syscall`].
+///
+/// # Panics
+/// Panics if the thread shim is initialized more than once.
+pub fn init_thread(
+    shim: Box<dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>>,
+    pt_regs: &mut litebox_common_linux::PtRegs,
+) {
+    let tls = unsafe { &*get_tls() };
+    tls.shim
+        .set(shim)
+        .ok()
+        .expect("thread shim should not be initialized twice");
+    match tls.shim.get().unwrap().init(pt_regs) {
+        litebox::shim::ContinueOperation::ResumeGuest => {}
+        litebox::shim::ContinueOperation::ExitThread => exit_thread(),
+    }
+}
+
+fn exit_thread() -> ! {
+    let tls = current().unwrap().tls.cast::<ThreadState>();
+    if !tls.is_null() {
+        let tls = unsafe { Box::from_raw(tls) };
+        drop(tls);
+    }
+    let r = HostSnpInterface::syscalls(SyscallN::<1, NR_SYSCALL_EXIT> { args: [0] });
+    unreachable!("thread has exited: {:?}", r);
+}
+
+/// Handles a syscall from the guest.
+///
+/// # Panics
+/// Panics if the thread shim has not been initialized with [`init_thread`].
+pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) {
+    let tls = unsafe { &*get_tls() };
+    match tls.shim.get().unwrap().syscall(pt_regs) {
+        litebox::shim::ContinueOperation::ResumeGuest => {}
+        litebox::shim::ContinueOperation::ExitThread => exit_thread(),
+    }
+}
+
 impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
@@ -182,7 +246,9 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     unsafe fn spawn_thread(
         &self,
         ctx: &Self::ExecutionContext,
-        init_thread: Box<dyn litebox::shim::InitThread>,
+        init_thread: Box<
+            dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+        >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let flags = CloneFlags::THREAD
             | CloneFlags::VM
@@ -192,7 +258,7 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
             | CloneFlags::SYSVSEM
             | CloneFlags::CHILD_SETTID;
         let thread_start_args = Box::new(ThreadStartArgs {
-            ctx: *ctx,
+            ctx: ctx.clone(),
             init_thread,
         });
         let thread_start_arg_ptr = Box::into_raw(thread_start_args);
@@ -250,7 +316,6 @@ const PAGE_SIZE: u64 = litebox::mm::linux::PAGE_SIZE as u64;
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
 const NR_SYSCALL_FUTEX: u32 = 202;
-const NR_SYSCALL_RT_SIGPROCMASK: u32 = 14;
 const NR_SYSCALL_READ: u32 = 0;
 const NR_SYSCALL_WRITE: u32 = 1;
 #[allow(dead_code)]
@@ -392,46 +457,6 @@ impl HostInterface for HostSnpInterface {
         // In case hypervisor fails to terminate it or intentionally reschedules it,
         // halt the CPU to prevent further execution
         unreachable!("Should not return to the caller after terminating the vm");
-    }
-
-    fn rt_sigprocmask(
-        how: SigmaskHow,
-        set: Option<UserConstPtr<SigSet>>,
-        oldset: Option<UserMutPtr<SigSet>>,
-    ) -> Result<usize, Errno> {
-        // Instead of passing the user space pointers to host, here we perform extra read and write
-        // and pass kernel pointers to host. As long as we don't have large data to deal with, this
-        // scheme is more straightforward. Alternative solution from previous implementation requires
-        // the user space memory has mapped to physical pages as host operates on physical pages.
-        // For kernel memory, it is always mapped to physical pages.
-        let kset: Option<SigSet> = match set {
-            Some(s) => Some(
-                unsafe { s.read_at_offset(0) }
-                    .ok_or(Errno::EFAULT)?
-                    .into_owned(),
-            ),
-            None => None,
-        };
-        let mut koldset: Option<SigSet> = if oldset.is_none() {
-            None
-        } else {
-            Some(SigSet::empty())
-        };
-        let args = SyscallN::<4, NR_SYSCALL_RT_SIGPROCMASK> {
-            args: [
-                u64::try_from(how as i32).unwrap(),
-                kset.as_ref().map_or(0, |v| core::ptr::from_ref(v) as u64),
-                koldset
-                    .as_mut()
-                    .map_or(0, |v| core::ptr::from_mut(v) as u64),
-                size_of::<SigSet>() as _,
-            ],
-        };
-        let r = Self::syscalls(args)?;
-        if let Some(v) = koldset {
-            unsafe { oldset.unwrap().write_at_offset(0, v) }.ok_or(Errno::EFAULT)?;
-        }
-        Ok(r)
     }
 
     fn wake_many(mutex: &core::sync::atomic::AtomicU32, n: usize) -> Result<usize, Errno> {

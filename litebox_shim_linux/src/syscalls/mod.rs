@@ -8,6 +8,7 @@ pub(crate) mod mm;
 pub(crate) mod net;
 pub mod process;
 
+pub(crate) mod signal;
 #[cfg(test)]
 pub(crate) mod tests;
 

@@ -93,10 +93,7 @@ impl Task {
             bufferram: 0,
             totalswap: 0,
             freeswap: 0,
-            procs: self
-                .process
-                .nr_threads
-                .load(core::sync::atomic::Ordering::Relaxed),
+            procs: self.process().nr_threads().truncate(),
             totalhigh: 0,
             freehigh: 0,
             mem_unit: 1,

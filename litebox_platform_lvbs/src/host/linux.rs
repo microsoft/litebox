@@ -1,5 +1,7 @@
 //! Linux Structs
 
+use crate::arch::MAX_CORES;
+
 /// Context saved when entering the kernel
 ///
 /// pt_regs from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/arch/x86/include/asm/ptrace.h#L12)
@@ -52,37 +54,37 @@ pub struct Timespec {
     pub tv_nsec: i64,
 }
 
-#[allow(non_camel_case_types)]
-pub type sigset_t = ::core::ffi::c_ulong;
-
-const CONFIG_NR_CPUS: usize = 512;
 const BITS_PER_LONG: usize = 64;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CpuMask {
-    bits: [u64; CONFIG_NR_CPUS.div_ceil(BITS_PER_LONG)],
+    bits: [u64; MAX_CORES.div_ceil(BITS_PER_LONG)],
 }
 
 impl CpuMask {
     #[expect(dead_code)]
     fn new() -> Self {
         CpuMask {
-            bits: [0; CONFIG_NR_CPUS.div_ceil(BITS_PER_LONG)],
+            bits: [0; MAX_CORES.div_ceil(BITS_PER_LONG)],
         }
     }
 
-    pub fn decode_cpu_mask(&self) -> [bool; CONFIG_NR_CPUS] {
-        let mut cpu_mask = [false; CONFIG_NR_CPUS];
+    pub fn for_each_cpu<F>(&self, mut f: F)
+    where
+        F: FnMut(usize),
+    {
         for (i, &word) in self.bits.iter().enumerate() {
+            if word == 0 {
+                continue;
+            }
+
             for j in 0..BITS_PER_LONG {
                 if (word & (1 << j)) != 0 {
-                    cpu_mask[i * BITS_PER_LONG + j] = true;
+                    f(i * BITS_PER_LONG + j);
                 }
             }
         }
-
-        cpu_mask
     }
 }
 

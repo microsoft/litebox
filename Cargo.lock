@@ -231,36 +231,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
-name = "capstone"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "015ef5d5ca1743e3f94af9509ba6bd2886523cfee46e48d15c2ef5216fd4ac9a"
-dependencies = [
- "capstone-sys",
- "libc",
-]
-
-[[package]]
-name = "capstone-sys"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2267cb8d16a1e4197863ec4284ffd1aec26fe7e57c58af46b02590a0235809a0"
-dependencies = [
- "cc",
- "libc",
-]
-
-[[package]]
-name = "cc"
-version = "1.2.41"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac9fe6cdbb24b6ade63616c0a0688e45bb56732262c158df3c0c4bea4ca47cb7"
-dependencies = [
- "find-msvc-tools",
- "shlex",
-]
-
-[[package]]
 name = "cexpr"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -457,9 +427,9 @@ dependencies = [
 
 [[package]]
 name = "delegate"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6178a82cf56c836a3ba61a7935cdb1c49bfaa6fa4327cd5bf554a503087de26b"
+checksum = "780eb241654bf097afb00fc5f054a09b687dad862e485fdcf8399bb056565370"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -523,6 +493,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4445909572dbd556c457c849c4ca58623d84b27c8fff1e74b0b4227d8b90d17b"
 
 [[package]]
+name = "elf"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
+
+[[package]]
 name = "elf_loader"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -531,7 +507,7 @@ dependencies = [
  "bitflags 2.9.4",
  "cfg-if",
  "delegate",
- "elf",
+ "elf 0.7.4",
 ]
 
 [[package]]
@@ -581,12 +557,6 @@ name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
-
-[[package]]
-name = "find-msvc-tools"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52051878f80a721bb68ebfbc930e07b65ba72f2da88968ea5c06fd6ca3d3a127"
 
 [[package]]
 name = "flagset"
@@ -684,6 +654,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "iced-x86"
+version = "1.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+dependencies = [
+ "lazy_static",
+]
 
 [[package]]
 name = "indexmap"
@@ -803,10 +782,12 @@ dependencies = [
  "bitfield",
  "bitflags 2.9.4",
  "cfg-if",
+ "elf 0.8.0",
  "int-enum",
  "litebox",
  "syscalls",
  "thiserror",
+ "zerocopy",
 ]
 
 [[package]]
@@ -865,7 +846,7 @@ dependencies = [
  "cms",
  "const-oid",
  "digest",
- "elf",
+ "elf 0.8.0",
  "hashbrown 0.15.5",
  "libc",
  "litebox",
@@ -994,8 +975,6 @@ dependencies = [
  "arrayvec",
  "bitflags 2.9.4",
  "bitvec",
- "elf",
- "elf_loader",
  "libc",
  "litebox",
  "litebox_common_linux",
@@ -1016,7 +995,7 @@ dependencies = [
  "bitflags 2.9.4",
  "cfg-if",
  "ctr",
- "elf",
+ "elf 0.8.0",
  "elf_loader",
  "hashbrown 0.15.5",
  "litebox",
@@ -1034,8 +1013,8 @@ name = "litebox_syscall_rewriter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "capstone",
  "clap",
+ "iced-x86",
  "insta",
  "memmap2",
  "object",

@@ -49,8 +49,6 @@ impl TestLauncher {
             this.install_file(data, each);
         }
 
-        platform.register_shim(this.shim.entrypoints());
-
         if enable_syscall_interception {
             platform.enable_seccomp_based_syscall_interception();
         }
@@ -86,11 +84,21 @@ impl TestLauncher {
             CString::new("HOME=/").unwrap(),
         ];
         self.shim.set_fs(self.fs);
-        let mut pt_regs = self
+        let program = self
             .shim
             .load_program(self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
-        unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
+        unsafe {
+            litebox_platform_linux_userland::run_thread(
+                program.entrypoints,
+                &mut litebox_common_linux::PtRegs::default(),
+            );
+        };
+        assert_eq!(
+            program.process.wait(),
+            0,
+            "process exited with non-zero code"
+        );
     }
 }
 
@@ -238,7 +246,7 @@ fn test_syscall_rewriter() {
         &hooked_path,
         &[
             "--trampoline-addr",
-            litebox_shim_linux::loader::REWRITER_MAGIC_NUMBER
+            (litebox_common_linux::loader::REWRITER_MAGIC_NUMBER & usize::MAX as u64)
                 .to_string()
                 .as_str(),
         ],

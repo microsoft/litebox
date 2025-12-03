@@ -1,10 +1,11 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use litebox::fs::FileSystem as _;
+use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 extern crate alloc;
 
@@ -200,6 +201,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         } else {
             open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
         }
+        in_mem.with_root_privileges(|fs| {
+            let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+            if let Err(err) = fs.mkdir("/tmp", mode) {
+                match err {
+                    litebox::fs::errors::MkdirError::AlreadyExists => {
+                        fs.chmod("/tmp", mode).expect("Failed to call chmod");
+                    }
+                    _ => panic!(),
+                }
+            }
+        });
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
         shim.default_fs(in_mem, tar_ro)
@@ -218,17 +230,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     if cli_args.tun_device_name.is_some() {
         std::thread::spawn(|| {
-            // TODO: use `poll` rather than busy-looping
-            // Also, we need to terminate this thread when the main program exits
             loop {
                 while litebox_shim_linux::perform_network_interaction().call_again_immediately() {}
-                core::hint::spin_loop();
+                litebox_platform_multiplex::platform().wait_on_tun(Some(Duration::from_millis(50)));
             }
         });
     }
 
     shim.set_load_filter(fixup_env);
-    platform.register_shim(shim.entrypoints());
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
         InterceptionBackend::Rewriter => {
@@ -262,9 +271,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let mut pt_regs = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
-    unsafe { litebox_platform_linux_userland::run_thread(&mut pt_regs) };
-    Ok(())
+    let program = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
+    unsafe {
+        litebox_platform_linux_userland::run_thread(
+            program.entrypoints,
+            &mut litebox_common_linux::PtRegs::default(),
+        );
+    };
+    std::process::exit(program.process.wait())
 }
 
 fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {

@@ -11,9 +11,6 @@
 //!
 //! This crate currently only supports x86-64 (i.e., amd64) ELFs.
 
-use capstone::arch::x86::X86InsnGroup::{X86_GRP_CALL, X86_GRP_JUMP, X86_GRP_RET};
-use capstone::prelude::*;
-
 use std::collections::HashSet;
 
 use thiserror::Error;
@@ -38,12 +35,8 @@ pub enum Error {
     DisassemblyFailure(String),
     #[error("insufficient bytes before or after syscall at {0:#x}")]
     InsufficientBytesBeforeOrAfter(u64),
-}
-
-impl From<capstone::Error> for Error {
-    fn from(error: capstone::Error) -> Self {
-        Error::DisassemblyFailure(error.to_string())
-    }
+    #[error("provided trampoline address is too large for 32-bit executable")]
+    TrampolineAddressTooLarge,
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -85,7 +78,7 @@ const TRAMPOLINE_SECTION_SIZE: usize = 0x18;
     clippy::missing_panics_doc,
     reason = "any panics in here are not part of the public contract and should be fixed within this module"
 )]
-pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> Result<Vec<u8>> {
+pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
     let mut input_workaround: Vec<u64>;
     let input_binary: &[u8] = if (&raw const input_binary[0] as usize).is_multiple_of(8) {
         input_binary
@@ -132,8 +125,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     let trampoline_section = setup_trampoline_section(&mut builder)?;
 
     // Get control transfer targets
-    let control_transfer_targets =
-        get_control_transfer_targets(arch, &builder, &text_sections).unwrap();
+    let control_transfer_targets = get_control_transfer_targets(arch, &builder, &text_sections);
 
     let last_segment_id = {
         let s: Vec<_> = builder
@@ -182,7 +174,13 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     // (litebox_shim_linux/src/loader/mod.rs)
     trampoline_data.extend_from_slice("LITEBOX0".as_bytes());
     // The placeholder for the address of the new syscall entry point
-    trampoline_data.extend_from_slice(&trampoline.unwrap_or(0).to_le_bytes());
+    let trampoline = trampoline.unwrap_or(0);
+    if arch == Arch::X86_64 {
+        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
+    } else {
+        let trampoline = u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
+        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
+    }
 
     let mut syscall_insns_found = false;
     for s in &text_sections {
@@ -221,10 +219,6 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<usize>) -> R
     builder.sections.get_mut(trampoline_section).sh_size = trampoline_vec.len() as u64;
     builder.sections.get_mut(trampoline_section).data =
         object::build::elf::SectionData::Data(trampoline_vec.into());
-    builder
-        .segments
-        .get_mut(last_segment_id)
-        .recalculate_ranges(&builder.sections);
 
     let mut out = vec![];
     builder
@@ -294,65 +288,56 @@ fn hook_syscalls_in_section(
     trampoline_data: &mut Vec<u8>,
 ) -> Result<()> {
     // Disassemble the section
-    let cs = capstone::Capstone::new()
-        .x86()
-        .mode(match arch {
-            Arch::X86_32 => capstone::arch::x86::ArchMode::Mode32,
-            Arch::X86_64 => capstone::arch::x86::ArchMode::Mode64,
-        })
-        .syntax(capstone::arch::x86::ArchSyntax::Intel)
-        .detail(true)
-        .build()?;
-    let instructions = cs.disasm_all(section_data, section_base_addr)?;
-
+    let mut decoder = iced_x86::Decoder::new(
+        match arch {
+            Arch::X86_32 => 32,
+            Arch::X86_64 => 64,
+        },
+        section_data,
+        iced_x86::DecoderOptions::NONE,
+    );
+    decoder.set_ip(section_base_addr);
+    let instructions = decoder.iter().collect::<Vec<_>>();
     for (i, inst) in instructions.iter().enumerate() {
         // Forward search for `syscall` / `int 0x80` / `call DWORD PTR gs:0x10`
         match arch {
             Arch::X86_32 => {
-                if dl_sysinfo_int80.is_some_and(|x| x == inst.address()) {
+                if dl_sysinfo_int80.is_some_and(|x| x == inst.ip()) {
                     continue; // Skip the `dl_sysinfo_int80` instruction
                 }
                 // `call DWORD PTR gs:0x10` or `int 0x80`
-                if inst.bytes() != [0x65, 0xff, 0x15, 0x10, 0x00, 0x00, 0x00]
-                    && inst.bytes() != [0xcd, 0x80]
+                if !((inst.code() == iced_x86::Code::Call_rm32
+                    && inst.segment_prefix() == iced_x86::Register::GS
+                    && inst.memory_displacement32() == 0x10)
+                    || (inst.code() == iced_x86::Code::Int_imm8 && inst.immediate8() == 0x80))
                 {
                     continue;
                 }
             }
             Arch::X86_64 => {
-                if capstone::arch::x86::X86Insn::from(inst.id().0)
-                    != capstone::arch::x86::X86Insn::X86_INS_SYSCALL
-                {
+                if inst.code() != iced_x86::Code::Syscall {
                     continue;
                 }
             }
         }
 
-        let replace_end = inst
-            .address()
-            .checked_add(inst.bytes().len().try_into().unwrap())
-            .unwrap();
+        let replace_end = inst.next_ip();
 
         let mut replace_start = None;
         for inst_id in (0..=i).rev() {
             let prev_inst = &instructions[inst_id];
-            let prev_inst_detail = cs.insn_detail(prev_inst).unwrap();
             // Check if the instruction does control transfer
             // TODO: Check if the instruction is an instruction-relative control transfer
-            let is_control_transfer = inst_id != i
-                && prev_inst_detail.groups().iter().any(|&grp| {
-                    grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
-                        || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
-                        || grp.0 == u8::try_from(X86_GRP_RET).unwrap()
-                });
+            let is_control_transfer =
+                inst_id != i && prev_inst.flow_control() != iced_x86::FlowControl::Next;
             if is_control_transfer {
                 // If it's a control transfer, we don't want to cross it
                 break;
             }
-            if replace_end - prev_inst.address() >= 5 {
-                replace_start = Some(prev_inst.address());
+            if replace_end - prev_inst.ip() >= 5 {
+                replace_start = Some(prev_inst.ip());
                 break;
-            } else if control_transfer_targets.contains(&prev_inst.address()) {
+            } else if control_transfer_targets.contains(&prev_inst.ip()) {
                 // If the previous instruction is a control transfer target, we don't want to cross it
                 break;
             }
@@ -366,7 +351,6 @@ fn hook_syscalls_in_section(
                 section_data,
                 trampoline_base_addr,
                 trampoline_data,
-                &cs,
                 &instructions,
                 i,
             )?;
@@ -379,14 +363,14 @@ fn hook_syscalls_in_section(
         let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
 
         // Copy the original instructions to the trampoline
-        if replace_start < inst.address() {
+        if replace_start < inst.ip() {
             trampoline_data.extend_from_slice(
                 &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
-                    ..usize::try_from(inst.address() - section_base_addr).unwrap()],
+                    ..usize::try_from(inst.ip() - section_base_addr).unwrap()],
             );
         }
 
-        let return_addr = inst.address() + inst.bytes().len() as u64;
+        let return_addr = inst.next_ip();
         if arch == Arch::X86_64 {
             // Put jump back location into rcx.
             let jmp_back_offset = i64::try_from(return_addr).unwrap()
@@ -467,7 +451,7 @@ fn get_control_transfer_targets(
     arch: Arch,
     builder: &object::build::elf::Builder<'_>,
     text_sections: &[object::build::elf::SectionId],
-) -> Result<HashSet<u64>> {
+) -> HashSet<u64> {
     let mut control_transfer_targets = HashSet::new();
     for s in text_sections {
         let s = builder.sections.get(*s);
@@ -475,42 +459,22 @@ fn get_control_transfer_targets(
             unimplemented!()
         };
         // Disassemble the section
-        let cs = capstone::Capstone::new()
-            .x86()
-            .mode(match arch {
-                Arch::X86_32 => capstone::arch::x86::ArchMode::Mode32,
-                Arch::X86_64 => capstone::arch::x86::ArchMode::Mode64,
-            })
-            .syntax(capstone::arch::x86::ArchSyntax::Intel)
-            .detail(true)
-            .build()?;
-        let instructions = cs.disasm_all(section_data, s.sh_addr)?;
-
-        for inst in instructions.iter() {
-            let inst_detail = cs.insn_detail(inst).unwrap();
-
-            // Check if the instruction does control transfer
-            let is_jmp_or_call = inst_detail.groups().iter().any(|&grp| {
-                grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
-                    || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
-            });
-            if !is_jmp_or_call {
-                continue;
-            }
-            let arch_detail = inst_detail.arch_detail();
-            let ops = arch_detail.operands();
-            if ops.len() != 1 {
-                continue; // We expect a single operand when it's a direct control transfer
-            }
-            if let capstone::arch::ArchOperand::X86Operand(op) = &ops[0]
-                && let capstone::arch::x86::X86OperandType::Imm(imm) = op.op_type
-            {
-                control_transfer_targets.insert(u64::try_from(imm).unwrap());
-            }
-        }
+        let mut decoder = iced_x86::Decoder::new(
+            match arch {
+                Arch::X86_32 => 32,
+                Arch::X86_64 => 64,
+            },
+            section_data,
+            iced_x86::DecoderOptions::NONE,
+        );
+        decoder.set_ip(s.sh_addr);
+        control_transfer_targets.extend(decoder.into_iter().filter_map(|inst| {
+            let target = inst.near_branch_target();
+            (target != 0).then_some(target)
+        }));
     }
 
-    Ok(control_transfer_targets)
+    control_transfer_targets
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -521,46 +485,33 @@ fn hook_syscall_and_after(
     section_data: &mut [u8],
     trampoline_base_addr: u64,
     trampoline_data: &mut Vec<u8>,
-    cs: &capstone::Capstone,
-    instructions: &[capstone::Insn],
+    instructions: &[iced_x86::Instruction],
     inst_index: usize,
 ) -> Result<()> {
     let syscall_inst = &instructions[inst_index];
 
-    let replace_start = syscall_inst.address();
-
+    let replace_start = syscall_inst.ip();
     let mut replace_end = None;
 
     for next_inst in instructions.iter().skip(inst_index) {
-        if next_inst.id() != syscall_inst.id()
-            && control_transfer_targets.contains(&next_inst.address())
+        if next_inst.code() != syscall_inst.code()
+            && control_transfer_targets.contains(&next_inst.ip())
         {
             // If the next instruction is a control transfer target, we don't want to cross it
-            println!(
-                "Skipping control transfer target at {:#x}",
-                next_inst.address()
-            );
+            println!("Skipping control transfer target at {:#x}", next_inst.ip());
             break;
         }
-        let next_inst_detail = cs.insn_detail(next_inst).unwrap();
         // Check if the instruction does control transfer
         // TODO: Check if the instruction is an instruction-relative control transfer
-        let is_control_transfer = next_inst.id() != syscall_inst.id()
-            && next_inst_detail.groups().iter().any(|&grp| {
-                grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
-                    || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
-                    || grp.0 == u8::try_from(X86_GRP_RET).unwrap()
-            });
+        let is_control_transfer = next_inst.code() != syscall_inst.code()
+            && next_inst.flow_control() != iced_x86::FlowControl::Next;
         if is_control_transfer {
             // If it's a control transfer, we don't want to cross it
             break;
         }
-        let next_end = next_inst
-            .address()
-            .checked_add(next_inst.bytes().len().try_into().unwrap())
-            .unwrap();
+        let next_end = next_inst.next_ip();
 
-        if next_end - syscall_inst.address() >= 5 {
+        if next_end - syscall_inst.ip() >= 5 {
             replace_end = Some(next_end);
             break;
         }
@@ -574,7 +525,6 @@ fn hook_syscall_and_after(
             section_data,
             trampoline_base_addr,
             trampoline_data,
-            cs,
             instructions,
             inst_index,
         );
@@ -606,10 +556,7 @@ fn hook_syscall_and_after(
     }
 
     // Copy the original instructions to the trampoline
-    let syscall_inst_end = syscall_inst
-        .address()
-        .checked_add(syscall_inst.bytes().len().try_into().unwrap())
-        .unwrap();
+    let syscall_inst_end = syscall_inst.next_ip();
     if syscall_inst_end < replace_end {
         trampoline_data.extend_from_slice(
             &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
@@ -648,13 +595,11 @@ fn hook_syscall_before_and_after(
     section_data: &mut [u8],
     trampoline_base_addr: u64,
     trampoline_data: &mut Vec<u8>,
-    cs: &capstone::Capstone,
-    instructions: &[capstone::Insn],
+    instructions: &[iced_x86::Instruction],
     inst_index: usize,
 ) -> Result<()> {
     let syscall_inst = &instructions[inst_index];
-    let syscall_inst_addr = syscall_inst.address();
-
+    let syscall_inst_addr = syscall_inst.ip();
     // We only support this case for x86
     if arch != Arch::X86_32 {
         return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
@@ -676,77 +621,47 @@ fn hook_syscall_before_and_after(
 
     // Both the syscall and its following instructions cannot be a control transfer target
     if control_transfer_targets.contains(&syscall_inst_addr)
-        || control_transfer_targets.contains(&next_inst.address())
+        || control_transfer_targets.contains(&next_inst.ip())
     {
         return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
     }
 
     // We don't support the case when the previous instruction is a control transfer instruction
-    let prev_inst_detail = cs.insn_detail(prev_inst).unwrap();
-    if prev_inst_detail.groups().iter().any(|&grp| {
-        grp.0 == u8::try_from(X86_GRP_JUMP).unwrap()
-            || grp.0 == u8::try_from(X86_GRP_CALL).unwrap()
-            || grp.0 == u8::try_from(X86_GRP_RET).unwrap()
-    }) {
+    if prev_inst.flow_control() != iced_x86::FlowControl::Next {
         return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
     }
 
-    let next_inst_detail = cs.insn_detail(next_inst).unwrap();
     // We currently only support relative jmp or ret instructions
     // if it's a control transfer instruction.
-    if next_inst_detail
-        .groups()
-        .iter()
-        .any(|&grp| grp.0 == u8::try_from(X86_GRP_CALL).unwrap())
-    {
-        return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
-    }
-
-    let mut need_jump_back = true;
-
-    if next_inst_detail
-        .groups()
-        .iter()
-        .any(|&grp| grp.0 == u8::try_from(X86_GRP_JUMP).unwrap())
-    {
-        // If it's a jump instruction, we require it to be a relative
-        // jump to the previous instruction.
-        let arch_detail = next_inst_detail.arch_detail();
-        let ops = arch_detail.operands();
-        // We expect a single operand when it's a direct control transfer
-        if ops.len() != 1 {
+    let need_jump_back = match next_inst.flow_control() {
+        iced_x86::FlowControl::Next => true,
+        iced_x86::FlowControl::Return => false,
+        iced_x86::FlowControl::UnconditionalBranch => {
+            if next_inst.near_branch_target() != prev_inst.ip() {
+                return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
+            }
+            false
+        }
+        iced_x86::FlowControl::IndirectBranch
+        | iced_x86::FlowControl::ConditionalBranch
+        | iced_x86::FlowControl::Call
+        | iced_x86::FlowControl::IndirectCall
+        | iced_x86::FlowControl::Interrupt
+        | iced_x86::FlowControl::XbeginXabortXend
+        | iced_x86::FlowControl::Exception => {
             return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
         }
-        if let capstone::arch::ArchOperand::X86Operand(op) = &ops[0]
-            && let capstone::arch::x86::X86OperandType::Imm(imm) = op.op_type
-            && u64::try_from(imm).unwrap() != prev_inst.address()
-        {
-            return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
-        }
-        need_jump_back = false;
-    }
-
-    if next_inst_detail
-        .groups()
-        .iter()
-        .any(|&grp| grp.0 == u8::try_from(X86_GRP_RET).unwrap())
-    {
-        need_jump_back = false;
-    }
+    };
 
     let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
-    let replace_start = prev_inst.address();
-    let replace_len = usize::try_from(
-        next_inst
-            .address()
-            .checked_add(next_inst.bytes().len().try_into().unwrap())
-            .unwrap()
-            - replace_start,
-    )
-    .unwrap();
+    let replace_start = prev_inst.ip();
+    let replace_len = usize::try_from(next_inst.next_ip() - replace_start).unwrap();
 
     // Copy the prev instructions to the trampoline
-    trampoline_data.extend_from_slice(prev_inst.bytes());
+    trampoline_data.extend_from_slice(
+        &section_data[usize::try_from(prev_inst.ip() - section_base_addr).unwrap()..]
+            [..prev_inst.len()],
+    );
 
     // For 32-bit, use a different approach to simulate `call [rip + disp32]`
     trampoline_data.push(0x50); // PUSH EAX
@@ -759,11 +674,14 @@ fn hook_syscall_before_and_after(
     // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
 
     // Copy the next inst
-    trampoline_data.extend_from_slice(next_inst.bytes());
+    trampoline_data.extend_from_slice(
+        &section_data[usize::try_from(next_inst.ip() - section_base_addr).unwrap()..]
+            [..next_inst.len()],
+    );
 
     // Add jmp back to original after syscall if needed
     if need_jump_back {
-        let return_addr = next_inst.address() + next_inst.bytes().len() as u64;
+        let return_addr = next_inst.next_ip();
         let jmp_back_offset = i64::try_from(return_addr).unwrap()
             - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 5).unwrap();
         trampoline_data.push(0xE9);

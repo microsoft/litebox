@@ -71,3 +71,8 @@ pub fn enable_extended_states() {
         x86_64::registers::xcontrol::XCr0::write(flags);
     }
 }
+
+#[inline]
+pub fn write_kernel_gsbase_msr(addr: VirtAddr) {
+    x86_64::registers::model_specific::KernelGsBase::write(addr);
+}

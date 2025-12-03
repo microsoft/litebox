@@ -3,41 +3,314 @@
 use crate::ConstPtr;
 use crate::MutPtr;
 use crate::Task;
-use crate::UserMutPointer;
 use alloc::boxed::Box;
+use alloc::collections::btree_map::BTreeMap;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::cell::Cell;
 use core::mem::offset_of;
 use core::ops::Range;
+use core::sync::atomic::AtomicBool;
 use core::sync::atomic::AtomicI32;
+use core::sync::atomic::Ordering;
 use core::time::Duration;
 use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
+use litebox::platform::RawMutPointer as _;
+use litebox::platform::ThreadProvider;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
-    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _,
-    ThreadLocalStorageProvider as _,
+    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
+    RawMutexProvider as _, ThreadLocalStorageProvider as _,
 };
-use litebox::platform::{RawMutPointer as _, ThreadProvider as _};
+use litebox::sync::Mutex;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
-/// A structure representing a process
+/// Process-management-related state on [`Task`].
+pub(crate) struct ThreadState {
+    init_state: Cell<ThreadInitState>,
+    process: Arc<Process>,
+    /// Thread state that can be accessed from a remote thread.
+    remote: Arc<ThreadRemote>,
+    attached_tid: Cell<Option<i32>>,
+    /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
+    /// the kernel writes 0 to the address specified by `clear_child_tid` and then executes:
+    ///
+    /// futex(clear_child_tid, FUTEX_WAKE, 1, NULL, NULL, 0);
+    ///
+    /// This operation wakes a single thread waiting on the specified memory location via futex.
+    /// Any errors from the futex wake operation are ignored.
+    clear_child_tid: Cell<Option<MutPtr<i32>>>,
+    /// The purpose of the robust futex list is to ensure that if a thread accidentally fails to unlock a futex before
+    /// terminating or calling execve(2), another thread that is waiting on that futex is notified that the former owner
+    /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
+    /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
+    robust_list: Cell<Option<ConstPtr<litebox_common_linux::RobustListHead<Platform>>>>,
+}
+
+// TODO: remove once we figure out how to handle Send/Sync for raw pointers.
+unsafe impl Send for ThreadState {}
+
+impl ThreadState {
+    pub fn new_process(pid: i32) -> Self {
+        let remote = Arc::new(ThreadRemote::new());
+        Self {
+            init_state: Cell::new(ThreadInitState::None),
+            process: Arc::new(Process::new(pid, remote.clone())),
+            remote,
+            attached_tid: Cell::new(Some(pid)),
+            clear_child_tid: Cell::new(None),
+            robust_list: Cell::new(None),
+        }
+    }
+
+    pub(crate) fn new_thread(&self, tid: i32) -> Option<Self> {
+        let remote = self.process.attach_thread(tid)?;
+        Some(Self {
+            init_state: Cell::new(ThreadInitState::None),
+            process: self.process.clone(),
+            remote,
+            attached_tid: Cell::new(Some(tid)),
+            clear_child_tid: Cell::new(None),
+            robust_list: Cell::new(None),
+        })
+    }
+
+    fn detach_from_process(&self) {
+        if let Some(tid) = self.attached_tid.take() {
+            self.process.detach_thread(tid);
+        }
+    }
+}
+
+impl Drop for ThreadState {
+    fn drop(&mut self) {
+        self.detach_from_process();
+    }
+}
+
+/// Thread state that can be accessed from a remote thread.
+struct ThreadRemote {
+    /// Always set under the process `inner` lock, but can be read without
+    /// locking.
+    is_exiting: AtomicBool,
+    /// Handle to interrupt waits on this thread.
+    handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
+}
+
+impl ThreadRemote {
+    fn new() -> Self {
+        Self {
+            is_exiting: AtomicBool::new(false),
+            handle: once_cell::race::OnceBox::new(),
+        }
+    }
+
+    fn interrupt(&self) {
+        if let Some(handle) = self.handle.get() {
+            handle.interrupt();
+        }
+    }
+}
+
+/// A Linux process, which may have multiple threads.
 pub(crate) struct Process {
-    /// number of threads in this process
-    pub(crate) nr_threads: core::sync::atomic::AtomicU16,
-    /// resource limits for this process
+    /// Number of threads in this process. Always updated under the `inner`
+    /// mutex lock.
+    nr_threads:
+        <litebox_platform_multiplex::Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    inner: Mutex<Platform, ProcessInner>,
+    /// Resource limits for this process.
     pub(crate) limits: ResourceLimits,
 }
 
+/// The locked portion of the process state.
+struct ProcessInner {
+    /// If true, the whole process is exiting.
+    group_exit: bool,
+    /// If true, one thread is waiting for other threads to exit.
+    is_killing_other_threads: bool,
+    /// The exit code of the last exited thread in the process. Not updated once
+    /// `group_exit` is set.
+    exit_status: ExitStatus,
+    /// The thread list for the process, mapped by thread ID.
+    threads: BTreeMap<i32, Arc<ThreadRemote>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ExitStatus {
+    Exit(i8),
+    Signal(litebox_common_linux::signal::Signal),
+}
+
 impl Process {
-    pub fn new() -> Self {
+    /// Creates a new process with the given initial thread.
+    fn new(pid: i32, remote: Arc<ThreadRemote>) -> Self {
+        let platform = litebox_platform_multiplex::platform();
+        let nr_threads = platform.new_raw_mutex();
+        nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         Self {
-            nr_threads: 1.into(),
+            nr_threads,
+            inner: crate::litebox().sync().new_mutex(ProcessInner {
+                exit_status: ExitStatus::Exit(0),
+                group_exit: false,
+                is_killing_other_threads: false,
+                threads: BTreeMap::from_iter([(pid, remote)]),
+            }),
             limits: ResourceLimits::default(),
         }
     }
+
+    /// Returns the current number of threads in this process.
+    pub fn nr_threads(&self) -> u32 {
+        self.nr_threads.underlying_atomic().load(Ordering::Relaxed)
+    }
+
+    /// Waits for all threads in this process to exit, returning the exit code.
+    pub fn wait_for_exit(&self) -> ExitStatus {
+        loop {
+            let n = self.nr_threads.underlying_atomic().load(Ordering::Acquire);
+            if n == 0 {
+                break;
+            }
+            let _ = self.nr_threads.block(n);
+        }
+        self.inner.lock().exit_status
+    }
+
+    /// Attaches a new thread to this process, returning a new remote state for
+    /// the thread.
+    fn attach_thread(&self, tid: i32) -> Option<Arc<ThreadRemote>> {
+        // Allocate outside the lock.
+        let remote = Arc::new(ThreadRemote::new());
+        let mut inner = self.inner.lock();
+        if inner.group_exit || inner.is_killing_other_threads {
+            return None;
+        }
+        let old_thread = inner.threads.insert(tid, remote.clone());
+        assert!(old_thread.is_none(), "thread ID {tid} already exists");
+        let nr_threads = self.nr_threads.underlying_atomic();
+        nr_threads.store(nr_threads.load(Ordering::Relaxed) + 1, Ordering::Release);
+        Some(remote)
+    }
+
+    /// Detaches a thread from this process.
+    ///
+    /// # Panics
+    /// Panics if the thread ID does not exist in this process.
+    fn detach_thread(&self, tid: i32) {
+        let data;
+        let notify = {
+            let mut inner = self.inner.lock();
+            data = inner.threads.remove(&tid);
+            assert!(data.is_some());
+
+            let nr_threads = self.nr_threads.underlying_atomic();
+            let n = nr_threads.load(Ordering::Relaxed);
+            let new_count = n.checked_sub(1).expect("decrementing from zero threads");
+            nr_threads.store(new_count, Ordering::Release);
+            if new_count == 0 {
+                assert!(inner.threads.is_empty());
+                // The last thread exited. Prevent new threads.
+                inner.group_exit = true;
+            }
+
+            // Notify waiters if this is the last thread of the process
+            // (`wait_for_exit`) or if this is the last thread being killed
+            // during an exec (`kill_other_threads`).
+            new_count == 0 || (new_count == 1 && inner.is_killing_other_threads)
+        };
+        if notify {
+            self.nr_threads.wake_all();
+        }
+    }
+}
+
+impl Task {
+    /// Updates the process exit status for a thread exit.
+    fn exit_thread(&self, code: i8) {
+        let mut inner = self.thread.process.inner.lock();
+        if self.is_exiting() {
+            return;
+        }
+        inner.exit_status = ExitStatus::Exit(code);
+        self.thread.remote.is_exiting.store(true, Ordering::Relaxed);
+    }
+
+    /// Updates the process exit status for a group exit and signals all threads
+    /// to exit.
+    pub(crate) fn exit_group(&self, status: ExitStatus) {
+        let mut inner = self.thread.process.inner.lock();
+        if self.is_exiting() {
+            return;
+        }
+        assert!(!inner.group_exit);
+        inner.exit_status = status;
+        inner.group_exit = true;
+        for thread in inner.threads.values() {
+            thread.is_exiting.store(true, Ordering::Relaxed);
+            thread.interrupt();
+        }
+    }
+
+    /// Kills all other threads in the process, waiting for them to exit.
+    ///
+    /// Returns false if this thread is already exiting.
+    #[must_use]
+    fn kill_other_threads(&self) -> bool {
+        {
+            let mut inner = self.thread.process.inner.lock();
+            if self.is_exiting() {
+                return false;
+            }
+            for (&tid, thread) in &inner.threads {
+                if tid == self.tid {
+                    continue;
+                }
+                thread.is_exiting.store(true, Ordering::Relaxed);
+                thread.interrupt();
+            }
+            assert!(!inner.is_killing_other_threads);
+            inner.is_killing_other_threads = true;
+        }
+        // Wait for other threads to exit.
+        loop {
+            let n = self
+                .thread
+                .process
+                .nr_threads
+                .underlying_atomic()
+                .load(Ordering::Acquire);
+            if n == 1 {
+                break;
+            }
+            let _ = self.thread.process.nr_threads.block(n);
+        }
+        self.thread.process.inner.lock().is_killing_other_threads = false;
+        true
+    }
+
+    /// Returns true if the task is exiting and should not continue running
+    /// guest code.
+    pub fn is_exiting(&self) -> bool {
+        self.thread.remote.is_exiting.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Default)]
+enum ThreadInitState {
+    #[default]
+    None,
+    NewProcess(crate::loader::elf::ElfLoadInfo),
+    NewThread {
+        stack: Option<usize>,
+        tls: Option<ThreadLocalDescriptor>,
+        set_child_tid: Option<MutPtr<i32>>,
+    },
 }
 
 /// Credentials of a process
@@ -53,6 +326,10 @@ pub(crate) struct Credentials {
 pub(crate) static NEXT_THREAD_ID: AtomicI32 = AtomicI32::new(2); // start from 2, as 1 is used by the main thread
 
 impl Task {
+    pub(crate) fn process(&self) -> &Arc<Process> {
+        &self.thread.process
+    }
+
     /// Set the current task's command name.
     pub(crate) fn set_task_comm(&self, comm: &[u8]) {
         let mut new_comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
@@ -120,14 +397,18 @@ impl Task {
             }
             #[cfg(target_arch = "x86_64")]
             ArchPrctlArg::GetFs(addr) => {
-                let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase { addr };
+                let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase;
                 let token = litebox_platform_multiplex::platform()
                     .get_punchthrough_token_for(punchthrough)
                     .expect("Failed to get punchthrough token for GET_FS");
-                token.execute().map(|_| ()).map_err(|e| match e {
+                let fsbase = token.execute().map_err(|e| match e {
                     litebox::platform::PunchthroughError::Failure(errno) => errno,
                     _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-                })
+                })?;
+                unsafe {
+                    addr.write_at_offset(0, fsbase).ok_or(Errno::EFAULT)?;
+                }
+                Ok(())
             }
             ArchPrctlArg::CETStatus | ArchPrctlArg::CETDisable | ArchPrctlArg::CETLock => {
                 Err(Errno::EINVAL)
@@ -141,50 +422,10 @@ impl Task {
         &self,
         user_desc: &mut litebox_common_linux::UserDesc,
     ) -> Result<(), Errno> {
-        use litebox::platform::{PunchthroughProvider as _, PunchthroughToken as _};
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea {
-            user_desc: core::ptr::from_mut(user_desc),
-        };
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea { user_desc };
         let token = litebox_platform_multiplex::platform()
             .get_punchthrough_token_for(punchthrough)
             .expect("Failed to get punchthrough token for SET_THREAD_AREA");
-        token.execute().map(|_| ()).map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        })
-    }
-
-    pub(crate) fn sys_rt_sigprocmask(
-        &self,
-        how: litebox_common_linux::SigmaskHow,
-        set: Option<crate::ConstPtr<litebox_common_linux::SigSet>>,
-        oldset: Option<crate::MutPtr<litebox_common_linux::SigSet>>,
-    ) -> Result<(), Errno> {
-        let punchthrough =
-            litebox_common_linux::PunchthroughSyscall::RtSigprocmask { how, set, oldset };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for RT_SIGPROCMASK");
-        token.execute().map(|_| ()).map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        })
-    }
-
-    pub(crate) fn sys_rt_sigaction(
-        &self,
-        signum: litebox_common_linux::Signal,
-        act: Option<crate::ConstPtr<litebox_common_linux::SigAction>>,
-        oldact: Option<crate::MutPtr<litebox_common_linux::SigAction>>,
-    ) -> Result<(), Errno> {
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::RtSigaction {
-            signum,
-            act,
-            oldact,
-        };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for RT_SIGACTION");
         token.execute().map(|_| ()).map_err(|e| match e {
             litebox::platform::PunchthroughError::Failure(errno) => errno,
             _ => unimplemented!("Unsupported punchthrough error {:?}", e),
@@ -267,7 +508,9 @@ fn wake_robust_list(
 impl Task {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
-        if let Some(clear_child_tid) = self.clear_child_tid.take() {
+        self.thread.detach_from_process();
+
+        if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
             let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
@@ -279,26 +522,20 @@ impl Task {
                 count: 1,
             });
         }
-        if let Some(robust_list) = self.robust_list.take() {
+        if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = wake_robust_list(robust_list);
         }
-
-        self.process
-            .nr_threads
-            .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(crate) fn sys_exit(&self, _status: i32) {
-        // Set the task to exit. The `Task` will be dropped on the way out of
-        // the shim, which will call `self.prepare_for_exit()`.
-        self.is_exiting.set(true);
+    pub(crate) fn sys_exit(&self, status: i32) {
+        // The `Task` will be dropped on the way out of the shim, which will
+        // call `self.prepare_for_exit()`.
+        self.exit_thread(status.truncate());
     }
 
-    pub(crate) fn sys_exit_group(&self, _status: i32) {
+    pub(crate) fn sys_exit_group(&self, status: i32) {
         // Tear down occurs similarly to `sys_exit`.
-        //
-        // TODO: remotely kill other threads.
-        self.is_exiting.set(true);
+        self.exit_group(ExitStatus::Exit(status.truncate()));
     }
 }
 
@@ -307,7 +544,7 @@ impl Task {
 /// On `x86_64`, this is represented as a `*mut u8`. The TLS pointer can point to
 /// an arbitrary-sized memory region.
 #[cfg(target_arch = "x86_64")]
-type ThreadLocalDescriptor = UserMutPointer<u8>;
+type ThreadLocalDescriptor = MutPtr<u8>;
 
 /// A descriptor for thread-local storage (TLS).
 ///
@@ -317,55 +554,25 @@ type ThreadLocalDescriptor = UserMutPointer<u8>;
 type ThreadLocalDescriptor = litebox_common_linux::UserDesc;
 
 struct NewThreadArgs {
-    /// Pointer to thread-local storage (TLS) given by the guest program
-    tls: Option<ThreadLocalDescriptor>,
-    /// Where to store child TID in child's memory
-    set_child_tid: Option<UserMutPointer<i32>>,
     /// Task struct that maintains all per-thread data
     task: Task,
 }
 
-// FUTURE: Consider revisiting this impl, see <https://github.com/microsoft/litebox/issues/431>.
-unsafe impl Send for NewThreadArgs {}
-
 impl litebox::shim::InitThread for NewThreadArgs {
-    fn init(self: alloc::boxed::Box<Self>) {
-        let Self {
-            task,
-            tls,
-            set_child_tid,
-        } = *self;
+    type ExecutionContext = litebox_common_linux::PtRegs;
 
-        let child_tid = task.tid;
-
-        // Set the TLS for the guest program.
-        //
-        // Note that the following calls happen _before_ setting `SHIM_TLS`, so
-        // any calls to `with_current_task` will panic. This should be OK--only
-        // entry point code should be calling `with_current_task`.
-        #[cfg_attr(not(target_arch = "x86"), expect(unused_mut))]
-        if let Some(mut tls) = tls {
-            // Set the TLS base pointer for the new thread
-            #[cfg(target_arch = "x86")]
-            {
-                task.set_thread_area(&mut tls).unwrap();
-            }
-
-            #[cfg(target_arch = "x86_64")]
-            {
-                use litebox::platform::RawConstPointer as _;
-                task.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
-                    .unwrap();
-            }
-        }
-
-        if let Some(child_tid_ptr) = set_child_tid {
-            // Set the child TID if requested
-            let _ = unsafe { child_tid_ptr.write_at_offset(0, child_tid) };
-        }
+    fn init(
+        self: alloc::boxed::Box<Self>,
+    ) -> alloc::boxed::Box<dyn litebox::shim::EnterShim<ExecutionContext = Self::ExecutionContext>>
+    {
+        let Self { task } = *self;
 
         // Set the shim TLS to point to the new task.
         crate::SHIM_TLS.init(crate::LinuxShimTls { current_task: task });
+
+        Box::new(crate::LinuxShimEntrypoints {
+            _not_send: core::marker::PhantomData,
+        })
     }
 }
 
@@ -401,7 +608,7 @@ impl Task {
         const MAX_SIGNAL_NUMBER: u64 = 64;
 
         let litebox_common_linux::CloneArgs {
-            flags,
+            mut flags,
             pidfd: _,
             child_tid,
             parent_tid,
@@ -413,6 +620,12 @@ impl Task {
             set_tid_size,
             cgroup,
         } = *args;
+
+        // `CLONE_DETACHED` is ignored but has been reserved for reuse with
+        // `clone3` or in combination with `CLONE_PIDFD`.
+        if !clone3 && !flags.contains(CloneFlags::PIDFD) {
+            flags.remove(CloneFlags::DETACHED);
+        }
 
         let required_clone_flags =
             CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
@@ -517,7 +730,7 @@ impl Task {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
 
-        let child_tid = NEXT_THREAD_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let child_tid = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
         if let Some(parent_tid_ptr) = set_parent_tid {
             let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid) };
         }
@@ -532,61 +745,41 @@ impl Task {
             None
         };
 
-        let mut ctx_copy = *ctx;
-
-        // Update the context for the new thread. Note that the new thread gets a
-        // return value of 0.
-        #[cfg(target_arch = "x86_64")]
-        {
-            if let Some(sp) = sp {
-                ctx_copy.rsp = sp;
-            }
-            ctx_copy.rax = 0;
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            if let Some(sp) = sp {
-                ctx_copy.esp = sp;
-            }
-            ctx_copy.eax = 0;
-        }
-
-        self.process
-            .nr_threads
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let thread = self.thread.new_thread(child_tid).ok_or(Errno::EBUSY)?;
+        thread.init_state.set(ThreadInitState::NewThread {
+            stack: sp,
+            tls,
+            set_child_tid,
+        });
+        thread.clear_child_tid.set(clear_child_tid);
 
         let platform = litebox_platform_multiplex::platform();
         let r = unsafe {
             platform.spawn_thread(
-                &ctx_copy,
+                ctx,
                 Box::new(NewThreadArgs {
-                    tls,
-                    set_child_tid,
                     task: Task {
                         global: self.global.clone(),
                         wait_state: crate::wait::WaitState::new(platform),
+                        thread,
                         pid: self.pid,
                         tid: child_tid,
                         ppid: self.ppid,
-                        clear_child_tid: clear_child_tid.into(),
-                        robust_list: None.into(),
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: fs.into(),
-                        process: self.process.clone(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
-                        pending_sigreturn: false.into(),
-                        is_exiting: false.into(),
+                        signals: self.signals.clone_for_new_task(),
                     },
                 }),
             )
         };
-
         if let Err(err) = r {
-            self.process
-                .nr_threads
-                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-            return Err(err);
+            litebox::log_println!(platform, "failed to spawn thread: {}", err);
+            // Treat all spawn errors as `ENOMEM`. `EAGAIN` and other errors are
+            // for conditions the user can control (such as "in-shim" rlimit
+            // violations).
+            return Err(Errno::ENOMEM);
         }
 
         Ok(usize::try_from(child_tid).unwrap())
@@ -594,7 +787,7 @@ impl Task {
 
     /// Handle syscall `set_tid_address`.
     pub(crate) fn sys_set_tid_address(&self, tidptr: crate::MutPtr<i32>) -> i32 {
-        self.clear_child_tid.set(Some(tidptr));
+        self.thread.clear_child_tid.set(Some(tidptr));
         self.tid
     }
 
@@ -652,14 +845,14 @@ impl ResourceLimits {
     ) -> litebox_common_linux::Rlimit {
         let r = &self.limits[resource as usize];
         litebox_common_linux::Rlimit {
-            rlim_cur: r.cur.load(core::sync::atomic::Ordering::Relaxed),
-            rlim_max: r.max.load(core::sync::atomic::Ordering::Relaxed),
+            rlim_cur: r.cur.load(Ordering::Relaxed),
+            rlim_max: r.max.load(Ordering::Relaxed),
         }
     }
 
     pub(crate) fn get_rlimit_cur(&self, resource: litebox_common_linux::RlimitResource) -> usize {
         let r = &self.limits[resource as usize];
-        r.cur.load(core::sync::atomic::Ordering::Relaxed)
+        r.cur.load(Ordering::Relaxed)
     }
 
     fn set_rlimit(
@@ -668,10 +861,8 @@ impl ResourceLimits {
         new_limit: litebox_common_linux::Rlimit,
     ) {
         let r = &self.limits[resource as usize];
-        r.cur
-            .store(new_limit.rlim_cur, core::sync::atomic::Ordering::Relaxed);
-        r.max
-            .store(new_limit.rlim_max, core::sync::atomic::Ordering::Relaxed);
+        r.cur.store(new_limit.rlim_cur, Ordering::Relaxed);
+        r.max.store(new_limit.rlim_max, Ordering::Relaxed);
     }
 }
 
@@ -685,7 +876,7 @@ impl Task {
         let old_rlimit = match resource {
             litebox_common_linux::RlimitResource::NOFILE
             | litebox_common_linux::RlimitResource::STACK => {
-                self.process.limits.get_rlimit(resource)
+                self.thread.process.limits.get_rlimit(resource)
             }
             _ => unimplemented!("Unsupported resource for get_rlimit: {:?}", resource),
         };
@@ -705,7 +896,7 @@ impl Task {
             }
             match resource {
                 litebox_common_linux::RlimitResource::NOFILE => {
-                    self.process.limits.set_rlimit(resource, new_limit);
+                    self.thread.process.limits.set_rlimit(resource, new_limit);
                 }
                 _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
             }
@@ -770,7 +961,7 @@ impl Task {
     /// Handle syscall `set_robust_list`.
     pub(crate) fn sys_set_robust_list(&self, head: usize) {
         let head = crate::ConstPtr::from_usize(head);
-        self.robust_list.set(Some(head));
+        self.thread.robust_list.set(Some(head));
     }
 
     /// Handle syscall `get_robust_list`.
@@ -782,7 +973,11 @@ impl Task {
         if pid.is_some() {
             unimplemented!("Getting robust list for a specific PID is not supported yet");
         }
-        let head = self.robust_list.get().map_or(0, |ptr| ptr.as_usize());
+        let head = self
+            .thread
+            .robust_list
+            .get()
+            .map_or(0, |ptr| ptr.as_usize());
         unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
     }
 
@@ -1146,23 +1341,28 @@ impl Task {
             copy_vector(envp, "envp")?
         };
 
+        let loader = crate::loader::elf::ElfLoader::new(self, path)?;
+
+        // After this point, the old program is torn down and failures must terminate the process.
+
+        // Kill all the other threads in this process and wait for them to exit.
+        if !self.kill_other_threads() {
+            // Another thread is already in the process of execve. This thread
+            // will exit; return any error code.
+            return Err(Errno::EBUSY);
+        }
+
         // Close CLOEXEC descriptors
         self.close_on_exec();
 
         // unmmap all memory mappings and reset brk
-        if let Some(robust_list) = self.robust_list.take() {
+        if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = wake_robust_list(robust_list);
         }
+        self.thread.clear_child_tid.set(None);
 
-        // Check if we are the only thread in the process
-        if self
-            .process
-            .nr_threads
-            .load(core::sync::atomic::Ordering::Relaxed)
-            != 1
-        {
-            unimplemented!("execve when multiple threads exist is not supported yet");
-        }
+        self.signals.reset_for_exec(crate::litebox());
+
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
         let page_manager = crate::litebox_page_manager();
@@ -1173,71 +1373,143 @@ impl Task {
             ctx.xgs.truncate(),
         );
 
-        // TODO: split this operation into pre-unmap and post-unmap parts, and handle failure properly for both cases.
-        *ctx = self.load_program(path, argv_vec, envp_vec).unwrap();
+        self.load_program(loader, argv_vec, envp_vec)
+            .expect("TODO: terminate the process cleanly");
 
+        self.init_thread_context(ctx);
         Ok(0)
     }
 
-    /// Handle syscall `alarm`.
-    pub(crate) fn sys_alarm(&self, seconds: u32) -> Result<usize, Errno> {
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(litebox_common_linux::PunchthroughSyscall::Alarm {
-                seconds,
-            })
-            .expect("Failed to get punchthrough token for SET_ALARM");
-        token.execute().map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        })
+    /// Loads the specified program into the process's address space and prepares the thread
+    /// to start executing it.
+    pub(crate) fn load_program(
+        &self,
+        mut loader: crate::loader::elf::ElfLoader<'_>,
+        argv: Vec<alloc::ffi::CString>,
+        mut envp: Vec<alloc::ffi::CString>,
+    ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        if let Some(&filter) = crate::LOAD_FILTER.get() {
+            filter(&mut envp);
+        }
+
+        let load_info = loader.load(argv, envp, self.init_auxv())?;
+
+        self.set_task_comm(loader.comm());
+
+        self.thread
+            .init_state
+            .set(ThreadInitState::NewProcess(load_info));
+        Ok(())
     }
 
-    /// Handle syscall `tgkill`.
-    pub(crate) fn sys_tgkill(
-        &self,
-        thread_group_id: i32,
-        thread_id: i32,
-        sig: litebox_common_linux::Signal,
-    ) -> Result<(), Errno> {
-        if thread_id <= 0 || thread_group_id <= 0 {
-            return Err(Errno::EINVAL);
-        }
-        if thread_group_id != self.sys_getpid() {
-            unimplemented!("Sending signal to other processes is not supported yet");
-        }
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::ThreadKill {
-            thread_group_id,
-            thread_id,
-            sig,
-        };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for TGKILL");
-        token.execute().map(|_| ()).map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        })
+    pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        self.init_thread_context(ctx);
+        // Attach the thread handle so that the thread can be interrupted.
+        self.thread
+            .remote
+            .handle
+            .set(Box::new(self.wait_state.thread_handle()))
+            .ok();
     }
 
-    /// Handle syscall `setitimer`
-    pub(crate) fn sys_setitimer(
-        &self,
-        which: litebox_common_linux::IntervalTimer,
-        new_value: crate::ConstPtr<litebox_common_linux::ItimerVal>,
-        old_value: Option<crate::MutPtr<litebox_common_linux::ItimerVal>>,
-    ) -> Result<(), Errno> {
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetITimer {
-            which,
-            new_value,
-            old_value,
-        };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for SETITIMER");
-        token.execute().map(|_| ()).map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        })
+    /// Initialize the thread context for a new process or thread, and perform any
+    /// other initial setup required.
+    fn init_thread_context(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        match self.thread.init_state.take() {
+            ThreadInitState::None => {}
+            ThreadInitState::NewProcess(load_info) => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    *ctx = litebox_common_linux::PtRegs {
+                        r15: 0,
+                        r14: 0,
+                        r13: 0,
+                        r12: 0,
+                        rbp: 0,
+                        rbx: 0,
+                        r11: 0,
+                        r10: 0,
+                        r9: 0,
+                        r8: 0,
+                        rax: 0,
+                        rcx: 0,
+                        rdx: 0,
+                        rsi: 0,
+                        rdi: 0,
+                        orig_rax: 0,
+                        rip: load_info.entry_point,
+                        cs: 0x33, // __USER_CS
+                        eflags: 0,
+                        rsp: load_info.user_stack_top,
+                        ss: 0x2b, // __USER_DS
+                    };
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    *ctx = litebox_common_linux::PtRegs {
+                        ebx: 0,
+                        ecx: 0,
+                        edx: 0,
+                        esi: 0,
+                        edi: 0,
+                        ebp: 0,
+                        eax: 0,
+                        xds: 0,
+                        xes: 0,
+                        xfs: 0,
+                        xgs: 0,
+                        orig_eax: 0,
+                        eip: load_info.entry_point,
+                        xcs: 0x23, // __USER_CS
+                        eflags: 0,
+                        esp: load_info.user_stack_top,
+                        xss: 0x2b, // __USER_DS
+                    };
+                }
+            }
+            ThreadInitState::NewThread {
+                tls,
+                stack,
+                set_child_tid,
+            } => {
+                // Set the stack and the return value from clone().
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if let Some(stack) = stack {
+                        ctx.rsp = stack;
+                    }
+                    ctx.rax = 0;
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    if let Some(stack) = stack {
+                        ctx.esp = stack;
+                    }
+                    ctx.eax = 0;
+                }
+
+                // Set the TLS for the new thread.
+                if let Some(tls) = tls {
+                    #[cfg(target_arch = "x86")]
+                    {
+                        let mut tls = tls;
+                        self.set_thread_area(&mut tls).unwrap();
+                    }
+
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use litebox::platform::RawConstPointer as _;
+                        self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
+                            .unwrap();
+                    }
+                }
+
+                if let Some(child_tid_ptr) = set_child_tid {
+                    // Set the child TID if requested.
+                    let _ = unsafe { child_tid_ptr.write_at_offset(0, self.tid) };
+                }
+            }
+        }
     }
 }
 

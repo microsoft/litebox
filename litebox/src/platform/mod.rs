@@ -66,7 +66,9 @@ pub trait ThreadProvider: RawPointerProvider {
     unsafe fn spawn_thread(
         &self,
         ctx: &Self::ExecutionContext,
-        init_thread: alloc::boxed::Box<dyn crate::shim::InitThread>,
+        init_thread: alloc::boxed::Box<
+            dyn crate::shim::InitThread<ExecutionContext = Self::ExecutionContext>,
+        >,
     ) -> Result<(), Self::ThreadSpawnError>;
 
     /// Returns a handle to the current thread, which can be used to interrupt
@@ -101,7 +103,7 @@ pub trait ThreadProvider: RawPointerProvider {
 /// punchthrough, their code is suspicious; if all host invocations pass through the punchthrough,
 /// then it is sufficient to audit the punchthrough interface".
 pub trait PunchthroughProvider {
-    type PunchthroughToken: PunchthroughToken;
+    type PunchthroughToken<'a>: PunchthroughToken;
     /// Give permission token to invoke `punchthrough`, possibly after checking that it is ok.
     ///
     /// Even though `&self` is taken shared, the intention with the tokens is to use them
@@ -109,10 +111,10 @@ pub trait PunchthroughProvider {
     /// an `&mut self` to guarantee exclusivity, but this would limit us from supporting the ability
     /// for other threads being blocked when a punchthrough is done. Thus, this is kept as a
     /// `&self`. Morally this should be viewed as a `&mut self`.
-    fn get_punchthrough_token_for(
+    fn get_punchthrough_token_for<'a>(
         &self,
-        punchthrough: <Self::PunchthroughToken as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken>;
+        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
+    ) -> Option<Self::PunchthroughToken<'a>>;
 }
 
 /// A token that demonstrates that the platform is allowing access for a particular [`Punchthrough`]

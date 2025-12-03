@@ -277,6 +277,20 @@ where
         unsafe { self.create_pages(suggested_address, length, flags, perms, perms, |_| Ok(0)) }
     }
 
+    /// Set the initial program break address.
+    ///
+    /// This function should be called once to set the initial program break,
+    /// which is usually the end of the data segment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the initial program break is already set.
+    pub fn set_initial_brk(&self, brk: usize) {
+        let mut vmem = self.vmem.write();
+        assert_eq!(vmem.brk, 0, "initial brk is already set");
+        vmem.brk = brk;
+    }
+
     /// Set the program break to the given address.
     ///
     /// Increasing the program break has the effect of allocating memory to the process;
@@ -290,18 +304,16 @@ where
     ///
     /// If the operation is successful, it returns the new program break address.
     ///
+    /// # Panics
+    ///
+    /// Panics if the initial program break is not set yet.
+    ///
     /// # Safety
     ///
     /// If shrinking the program break, the caller must ensure that the released memory region is no longer used.
     pub unsafe fn brk(&self, brk: usize) -> Result<usize, MappingError> {
         let mut vmem = self.vmem.write();
-        if vmem.brk == 0 {
-            // If the old brk is not set yet, we set it to the new brk
-            // Note the first call should be made by the loader to set the initial brk
-            // to the end of the data segment.
-            vmem.brk = brk;
-            return Ok(brk);
-        }
+        assert_ne!(vmem.brk, 0, "initial brk is not set yet");
         if brk == 0 {
             // Calling `brk` with 0 can be used to find the current location of the program break.
             return Ok(vmem.brk);
