@@ -510,10 +510,11 @@ fn test_tun_and_runner_with_iperf3() {
     let has_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let has_started_clone = has_started.clone();
     std::thread::spawn(move || {
-        // Rewrite iperf3 and its dependencies may take some time, wait until the server is started
+        // Rewrite iperf3 and its dependencies may take some time, wait until it's done.
         while !has_started_clone.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        std::thread::sleep(std::time::Duration::from_secs(2)); // wait a bit more to ensure server is ready
         std::println!("Starting iperf3 client...");
         let mut client = std::process::Command::new(&cloned_path)
             .args(["-c", "10.0.0.2"])
