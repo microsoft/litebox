@@ -12,6 +12,7 @@ members = [
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_windows_userland",
     "litebox_runner_lvbs",
+    "litebox_runner_lvbs_v2",
     "litebox_runner_optee_on_linux_userland",
     "litebox_shim_linux",
     "litebox_syscall_rewriter",

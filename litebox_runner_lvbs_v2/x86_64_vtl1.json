@@ -1,0 +1,31 @@
+{
+	"llvm-target": "x86_64-unknown-none",
+	"data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+	"arch": "x86_64",
+	"target-endian": "little",
+	"target-pointer-width": 64,
+	"target-c-int-width": 32,
+	"os": "none",
+	"executables": true,
+	"linker-flavor": "ld.lld",
+	"linker": "rust-lld",
+	"pre-link-args": {
+		"ld": [
+			"-Tlitebox_runner_lvbs/x86_64_vtl1.ld",
+			"--gc-sections",
+			"--static",
+			"--pie"
+		],
+		"ld.lld": [
+			"--script=litebox_runner_lvbs/x86_64_vtl1.ld",
+			"--gc-sections",
+			"--static",
+			"--pie"
+		]
+	},
+	"relocation-model": "pie",
+	"panic-strategy": "abort",
+	"disable-redzone": true,
+	"features": "-avx,-avx2,-avx512f",
+	"dynamic-linking": false
+}

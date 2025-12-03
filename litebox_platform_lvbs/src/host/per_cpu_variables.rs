@@ -52,7 +52,7 @@ impl PerCpuVariables {
         &raw const self.interrupt_stack as u64 + (self.interrupt_stack.len() - 1) as u64
     }
 
-    pub(crate) fn hv_vp_assist_page_as_ptr(&self) -> *const HvVpAssistPage {
+    pub fn hv_vp_assist_page_as_ptr(&self) -> *const HvVpAssistPage {
         (&raw const self.hv_vp_assist_page).cast::<HvVpAssistPage>()
     }
 
@@ -76,7 +76,7 @@ impl PerCpuVariables {
         &raw mut self.hvcall_output
     }
 
-    pub(crate) fn set_vtl_return_value(&mut self, value: u64) {
+    pub fn set_vtl_return_value(&mut self, value: u64) {
         self.vtl0_state.r8 = value; // LVBS uses R8 to return a value from VTL1 to VTL0
     }
 

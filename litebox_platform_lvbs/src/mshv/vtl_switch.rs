@@ -21,7 +21,7 @@ static mut VTL_RETURN_ADDRESS: u64 = 0;
 /// Return to VTL0
 #[expect(clippy::inline_always)]
 #[inline(always)]
-fn vtl_return() {
+pub fn vtl_return() {
     unsafe {
         asm!(
             "call rax",
@@ -89,7 +89,7 @@ fn save_vtl_state_to_per_cpu_variables(vtl: u8, vtl_state: *const VtlState) {
 
 // Save CPU registers to a global data structure through using a stack
 #[unsafe(naked)]
-unsafe extern "C" fn save_vtl0_state() {
+pub unsafe extern "C" fn save_vtl0_state() {
     naked_asm!(
         "push r15",
         "push r14",
@@ -125,7 +125,7 @@ unsafe extern "C" fn save_vtl0_state() {
 const STACK_ALIGNMENT: isize = -16;
 
 #[unsafe(naked)]
-unsafe extern "C" fn save_vtl1_state() {
+pub unsafe extern "C" fn save_vtl1_state() {
     naked_asm!(
         "push r15",
         "push r14",
@@ -169,7 +169,7 @@ fn load_vtl_state_from_per_cpu_variables(vtl: u8, vtl_state: *mut VtlState) {
 
 // Restore CPU registers from the global data structure through using a stack.
 #[unsafe(naked)]
-unsafe extern "C" fn load_vtl_state(vtl: u8) {
+pub unsafe extern "C" fn load_vtl_state(vtl: u8) {
     naked_asm!(
         "sub rsp, {register_space}",
         "mov rbp, rsp",
@@ -308,7 +308,7 @@ fn vtl_switch_loop() -> ! {
     }
 }
 
-fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
+pub fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
     let func_id = VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
         .unwrap_or(VsmFunction::Unknown);
     match func_id {
