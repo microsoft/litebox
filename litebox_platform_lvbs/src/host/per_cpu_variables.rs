@@ -110,7 +110,7 @@ impl PerCpuVariables {
     }
 
     /// Save the extended states of each core (VTL0 or VTL1).
-    pub(crate) fn save_extended_states(&self, vtl: u8) {
+    pub fn save_extended_states(&self, vtl: u8) {
         if self.vtl0_xsave_area_addr.is_null() || self.vtl1_xsave_area_addr.is_null() {
             panic!("XSAVE areas are not allocated");
         } else {
@@ -132,7 +132,7 @@ impl PerCpuVariables {
     }
 
     /// Restore the extended states of each core (VTL0 or VTL1).
-    pub(crate) fn restore_extended_states(&self, vtl: u8) {
+    pub fn restore_extended_states(&self, vtl: u8) {
         if self.vtl0_xsave_area_addr.is_null() || self.vtl1_xsave_area_addr.is_null() {
             panic!("XSAVE areas are not allocated");
         } else {

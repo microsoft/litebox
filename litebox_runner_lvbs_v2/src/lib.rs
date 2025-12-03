@@ -97,11 +97,11 @@ pub fn init() -> Option<&'static Platform> {
 use litebox_platform_lvbs::host::per_cpu_variables::{
     with_per_cpu_variables, with_per_cpu_variables_mut,
 };
-use litebox_platform_lvbs::mshv::VsmFunction;
 use litebox_platform_lvbs::mshv::vsm_intercept::vsm_handle_intercept;
 use litebox_platform_lvbs::mshv::vtl_switch::{
     VtlEntryReason, load_vtl_state, save_vtl0_state, save_vtl1_state, vtl_return, vtlcall_dispatch,
 };
+use litebox_platform_lvbs::mshv::{HV_VTL_NORMAL, HV_VTL_SECURE, VsmFunction};
 
 pub fn run(platform: Option<&'static Platform>) -> ! {
     if let Some(platform) = platform {
@@ -115,15 +115,26 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
     loop {
         unsafe {
             save_vtl1_state();
-            load_vtl_state(0);
+            load_vtl_state(HV_VTL_NORMAL);
         }
+
+        with_per_cpu_variables_mut(|per_cpu_variables| {
+            per_cpu_variables.restore_extended_states(HV_VTL_NORMAL);
+        });
 
         vtl_return();
 
         unsafe {
             save_vtl0_state();
-            load_vtl_state(1);
+            load_vtl_state(HV_VTL_SECURE);
         }
+
+        // Since we do not know whether the VTL0 kernel saves its extended states (e.g., if a VTL switch
+        // is due to memory or register access violation, the VTL0 kernel might not have saved
+        // its states), we conservatively save and restore its extended states on every VTL switch.
+        with_per_cpu_variables_mut(|per_cpu_variables| {
+            per_cpu_variables.save_extended_states(HV_VTL_NORMAL);
+        });
 
         let reason = with_per_cpu_variables(|per_cpu_variables| unsafe {
             (*per_cpu_variables.hv_vp_assist_page_as_ptr()).vtl_entry_reason
@@ -145,9 +156,11 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
                         per_cpu_variables.set_vtl_return_value(result as u64);
                     });
                 }
+                // jump_to_vtl_switch_loop_with_stack_cleanup();
             }
             VtlEntryReason::Interrupt => {
                 vsm_handle_intercept();
+                // jump_to_vtl_switch_loop_with_stack_cleanup();
             }
             VtlEntryReason::Unknown => {
                 panic!("Unknown VTL entry reason");
