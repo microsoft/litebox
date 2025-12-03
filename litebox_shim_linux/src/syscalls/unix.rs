@@ -498,8 +498,12 @@ impl UnixConnectedStream {
                 }
             }) {
                 Ok(n) => n,
-                Err(Errno::EAGAIN) if total_read > 0 => break,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if total_read > 0 {
+                        break;
+                    }
+                    return Err(e);
+                }
             };
             total_read += n;
             buf = &mut buf[n..];
@@ -522,9 +526,9 @@ impl UnixConnectedStream {
             // TODO: use polling instead of busy loop
             loop {
                 match self.try_recvfrom(buf) {
-                    Ok(size) => return Ok(size),
+                    Ok(size) => break Ok(size),
                     Err(Errno::EAGAIN) => {}
-                    Err(err) => return Err(err),
+                    Err(err) => break Err(err),
                 }
                 core::hint::spin_loop();
             }
@@ -727,7 +731,6 @@ impl UnixSocket {
             return Err(Errno::EINVAL);
         }
 
-        // TODO: return destination address?
         self.with_state_ref(|state| match state {
             UnixSocketState::InitStream(_) | UnixSocketState::ListenStream(_) => Err(Errno::EINVAL),
             UnixSocketState::ConnectedStream(connect) => connect.recvfrom(
