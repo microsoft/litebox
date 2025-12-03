@@ -78,9 +78,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         lower: Lower,
         layering_semantics: LayeringSemantics,
     ) -> Self {
-        let sync = litebox.sync();
-        let root = sync.new_rwlock(RootDir::new());
-        let node_info_lookup = sync.new_rwlock(HashMap::new());
+        let root = sync::RwLock::new(RootDir::new());
+        let node_info_lookup = sync::RwLock::new(HashMap::new());
         Self {
             litebox: litebox.clone(),
             upper,

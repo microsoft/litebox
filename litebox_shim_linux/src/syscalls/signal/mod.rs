@@ -17,7 +17,6 @@ use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
-    LiteBox,
     platform::{RawConstPointer as _, RawMutPointer as _},
     shim::Exception,
     sync::Mutex,
@@ -44,11 +43,11 @@ pub(crate) struct SignalState {
 }
 
 impl SignalState {
-    pub fn new_process(litebox: &LiteBox<Platform>) -> Self {
+    pub fn new_process() -> Self {
         Self {
             pending: RefCell::new(PendingSignals::new()),
             blocked: Cell::new(SigSet::empty()),
-            handlers: RefCell::new(Arc::new(SignalHandlers::new(litebox))),
+            handlers: RefCell::new(Arc::new(SignalHandlers::new())),
             altstack: Cell::new(SigAltStack {
                 sp: 0,
                 flags: SsFlags::DISABLE,
@@ -83,15 +82,10 @@ impl SignalState {
     }
 
     /// Resets signal state for an `execve` call.
-    pub(crate) fn reset_for_exec(&self, litebox: &LiteBox<Platform>) {
+    pub(crate) fn reset_for_exec(&self) {
         let mut handlers = self.handlers.borrow_mut();
         // Ensure that the signal handlers are no longer shared.
-        let handlers = if let Some(handlers) = Arc::get_mut(&mut handlers) {
-            handlers
-        } else {
-            *handlers = Arc::new(handlers.clone_with_litebox(litebox));
-            Arc::get_mut(&mut handlers).unwrap()
-        };
+        let handlers = Arc::make_mut(&mut handlers);
         // Reset the handlers to defaults.
         for handler in &mut handlers.inner.get_mut().handlers {
             handler.action = SigAction {
@@ -147,9 +141,9 @@ struct Handler {
 }
 
 impl SignalHandlers {
-    fn new(litebox: &LiteBox<Platform>) -> Self {
+    fn new() -> Self {
         Self {
-            inner: litebox.sync().new_mutex(SignalHandlersInner {
+            inner: Mutex::new(SignalHandlersInner {
                 handlers: core::array::from_fn(|i| Handler {
                     action: SigAction {
                         sigaction: SIG_DFL,
@@ -163,12 +157,12 @@ impl SignalHandlers {
             }),
         }
     }
+}
 
-    // FUTURE: implement Clone directly if it becomes possible to create a
-    // `Mutex` without needing to go through `LiteBox`.
-    fn clone_with_litebox(&self, litebox: &LiteBox<Platform>) -> Self {
+impl Clone for SignalHandlers {
+    fn clone(&self) -> Self {
         Self {
-            inner: litebox.sync().new_mutex(self.inner.lock().clone()),
+            inner: Mutex::new(self.inner.lock().clone()),
         }
     }
 }
@@ -557,7 +551,7 @@ impl Task {
                             // terminate. Core dumps are also not currently
                             // supported.
                             litebox::log_println!(
-                                litebox_platform_multiplex::platform(),
+                                self.global.platform,
                                 "-- Fatal signal {:?}: terminating task {}:{}",
                                 signal,
                                 self.pid,

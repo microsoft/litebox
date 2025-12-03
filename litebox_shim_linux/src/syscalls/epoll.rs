@@ -6,7 +6,6 @@ use alloc::{
     vec::Vec,
 };
 use litebox::{
-    LiteBox,
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -127,10 +126,10 @@ pub(crate) struct EpollFile {
 }
 
 impl EpollFile {
-    pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
+    pub(crate) fn new() -> Self {
         EpollFile {
-            interests: litebox.sync().new_mutex(BTreeMap::new()),
-            ready: Arc::new(ReadySet::new(litebox)),
+            interests: litebox::sync::Mutex::new(BTreeMap::new()),
+            ready: Arc::new(ReadySet::new()),
             status: core::sync::atomic::AtomicU32::new(0),
         }
     }
@@ -198,7 +197,6 @@ impl EpollFile {
 
         let mask = Events::from_bits_truncate(event.events);
         let entry = EpollEntry::new(
-            &global.litebox,
             DescriptorRef::from(file),
             mask,
             EpollFlags::from_bits_truncate(event.events),
@@ -307,7 +305,6 @@ struct EpollEntryInner {
 
 impl EpollEntry {
     fn new(
-        litebox: &LiteBox<Platform>,
         desc: DescriptorRef,
         mask: Events,
         flags: EpollFlags,
@@ -316,9 +313,7 @@ impl EpollEntry {
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| EpollEntry {
             desc,
-            inner: litebox
-                .sync()
-                .new_mutex(EpollEntryInner { mask, flags, data }),
+            inner: litebox::sync::Mutex::new(EpollEntryInner { mask, flags, data }),
             ready,
             is_ready: AtomicBool::new(false),
             is_enabled: AtomicBool::new(true),
@@ -376,10 +371,10 @@ struct ReadySet {
 }
 
 impl ReadySet {
-    fn new(litebox: &LiteBox<Platform>) -> Self {
+    fn new() -> Self {
         Self {
-            entries: litebox.sync().new_mutex(VecDeque::new()),
-            pollee: Pollee::new(litebox),
+            entries: litebox::sync::Mutex::new(VecDeque::new()),
+            pollee: Pollee::new(),
         }
     }
 
@@ -593,7 +588,7 @@ mod test {
     fn setup_epoll() -> (crate::Task, EpollFile) {
         let task = crate::syscalls::tests::init_platform(None);
 
-        let epoll = EpollFile::new(&task.global.litebox);
+        let epoll = EpollFile::new();
         (task, epoll)
     }
 
@@ -603,7 +598,6 @@ mod test {
         let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
             0,
             EfdFlags::CLOEXEC,
-            &task.global.litebox,
         ));
         epoll
             .add_interest(
@@ -681,7 +675,6 @@ mod test {
         let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
             0,
             EfdFlags::empty(),
-            &task.global.litebox,
         ));
 
         let fd = 10i32;
@@ -690,8 +683,8 @@ mod test {
             close_on_exec: core::sync::atomic::AtomicBool::new(false),
         };
 
-        let no_fds = FilesState::new(&task.global.litebox);
-        let fds = FilesState::new(&task.global.litebox);
+        let no_fds = FilesState::new();
+        let fds = FilesState::new();
         fds.file_descriptors
             .write()
             .insert_at(descriptor, fd.reinterpret_as_unsigned() as usize);

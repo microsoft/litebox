@@ -72,7 +72,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> LoanListEntry<'a, Platform, T> 
     ///
     /// The entry is not yet inserted into any list. Use [`Self::insert`] to add
     /// it to a list.
-    pub fn new(_platform: &Platform, value: T) -> Self {
+    pub fn new(value: T) -> Self {
         Self {
             node: Node {
                 ptrs: UnsafeCell::new(ListPointers::new()),
@@ -133,8 +133,8 @@ impl<Platform: RawSyncPrimitivesProvider, T> Drop for LoanListEntry<'_, Platform
 
 impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
     /// Creates a new empty list.
-    pub fn new(litebox: &crate::LiteBox<Platform>) -> Self {
-        Self(litebox.sync().new_mutex(LinkedList::new()))
+    pub fn new() -> Self {
+        Self(Mutex::new(LinkedList::new()))
     }
 
     /// Inserts a node into the list.
@@ -533,11 +533,11 @@ mod tests {
     #[test]
     fn test_loan_list_basic() {
         let platform = MockPlatform::new();
-        let litebox = crate::LiteBox::new(platform);
-        let list = LoanList::new(&litebox);
+        let _litebox = crate::LiteBox::new(platform);
+        let list = LoanList::<MockPlatform, _>::new();
 
-        let mut entry1 = pin!(LoanListEntry::new(platform, 42));
-        let mut entry2 = pin!(LoanListEntry::new(platform, 84));
+        let mut entry1 = pin!(LoanListEntry::new(42));
+        let mut entry2 = pin!(LoanListEntry::new(84));
 
         entry1.as_mut().insert(&list);
         entry2.as_mut().insert(&list);
@@ -559,8 +559,8 @@ mod tests {
     #[test]
     fn test_loan_list() {
         let platform = MockPlatform::new();
-        let litebox = crate::LiteBox::new(platform);
-        let list = LoanList::new(&litebox);
+        let _litebox = crate::LiteBox::new(platform);
+        let list = LoanList::<MockPlatform, _>::new();
         let inserted = AtomicUsize::new(0);
         let mut removed = 0;
         let observed_removed = AtomicUsize::new(0);
@@ -580,14 +580,11 @@ mod tests {
                     let done = &done;
                     let observed_removed = &observed_removed;
                     move || {
-                        let mut v = pin!(LoanListEntry::new(
-                            platform,
-                            Value {
-                                key: i / entries_per_key,
-                                str: String::from("one"),
-                                removed: AtomicBool::new(false),
-                            },
-                        ));
+                        let mut v = pin!(LoanListEntry::new(Value {
+                            key: i / entries_per_key,
+                            str: String::from("one"),
+                            removed: AtomicBool::new(false),
+                        },));
                         v.as_mut().insert(list);
                         if i % 2 == 0 {
                             v.remove();

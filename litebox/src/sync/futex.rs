@@ -14,10 +14,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::RawSyncPrimitivesProvider;
 use crate::event::wait::{WaitContext, WaitError, Waker};
+use crate::platform::RawPointerProvider;
 use crate::platform::{RawConstPointer as _, TimeProvider};
 use crate::utilities::loan_list::{LoanList, LoanListEntry};
 use crate::utils::TruncateExt as _;
-use crate::{LiteBox, platform::RawPointerProvider};
 use thiserror::Error;
 
 /// A manager of all available futexes.
@@ -28,7 +28,6 @@ pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
     /// Chaining hash table to map from futex address to waiter lists.
     table: alloc::boxed::Box<[LoanList<Platform, FutexEntry<Platform>>; HASH_TABLE_ENTRIES]>,
     hash_builder: hashbrown::DefaultHashBuilder,
-    platform: &'static Platform,
 }
 
 /// The number of buckets in the hash table.
@@ -52,11 +51,11 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     /// A new futex manager.
     // TODO(jayb): Integrate this into the `litebox` object itself, to prevent the possibility of
     // double-creation.
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+    #[expect(clippy::new_without_default)]
+    pub fn new() -> Self {
         Self {
-            table: alloc::boxed::Box::new(core::array::from_fn(|_| LoanList::new(litebox))),
+            table: alloc::boxed::Box::new(core::array::from_fn(|_| LoanList::new())),
             hash_builder: hashbrown::DefaultHashBuilder::default(),
-            platform: litebox.x.platform,
         }
     }
 
@@ -92,15 +91,12 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         }
 
         let bucket = self.bucket(addr);
-        let mut entry = pin!(LoanListEntry::new(
-            self.platform,
-            FutexEntry {
-                addr,
-                waker: cx.waker().clone(),
-                bitset,
-                done: AtomicBool::new(false),
-            },
-        ));
+        let mut entry = pin!(LoanListEntry::new(FutexEntry {
+            addr,
+            waker: cx.waker().clone(),
+            bitset,
+            done: AtomicBool::new(false),
+        },));
 
         // Insert into the bucket's list. It will be removed when woken or the
         // entry goes out of scope.
@@ -204,8 +200,8 @@ mod tests {
     #[test]
     fn test_futex_wait_wake_single_thread() {
         let platform = MockPlatform::new();
-        let litebox = LiteBox::new(platform);
-        let futex_manager = Arc::new(FutexManager::new(&litebox));
+        let _litebox = LiteBox::new(platform);
+        let futex_manager = Arc::new(FutexManager::new());
 
         let futex_word = Arc::new(AtomicU32::new(0));
         let barrier = Arc::new(Barrier::new(2));
@@ -249,8 +245,8 @@ mod tests {
     #[test]
     fn test_futex_wait_wake_single_thread_with_timeout() {
         let platform = MockPlatform::new();
-        let litebox = LiteBox::new(platform);
-        let futex_manager = Arc::new(FutexManager::new(&litebox));
+        let _litebox = LiteBox::new(platform);
+        let futex_manager = Arc::new(FutexManager::new());
 
         let futex_word = Arc::new(AtomicU32::new(0));
         let barrier = Arc::new(Barrier::new(2));
@@ -301,8 +297,8 @@ mod tests {
     #[test]
     fn test_futex_multiple_waiters_with_timeout() {
         let platform = MockPlatform::new();
-        let litebox = LiteBox::new(platform);
-        let futex_manager = Arc::new(FutexManager::new(&litebox));
+        let _litebox = LiteBox::new(platform);
+        let futex_manager = Arc::new(FutexManager::new());
 
         let futex_word = Arc::new(AtomicU32::new(0));
         let barrier = Arc::new(Barrier::new(4)); // 3 waiters + 1 waker

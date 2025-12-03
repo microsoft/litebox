@@ -126,7 +126,7 @@ impl Locked {
 /// The lock tracker, which manages both tracking and (if necessary) panicking
 /// upon invariant failure. The public methods are backed by a singleton, which
 /// is initialized by [`LockTracker::init`].
-pub(super) struct LockTracker {
+pub(crate) struct LockTracker {
     x: alloc::boxed::Box<spin::Mutex<LockTrackerX>>,
 }
 
