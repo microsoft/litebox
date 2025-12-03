@@ -72,12 +72,12 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> LoanListEntry<'a, Platform, T> 
     ///
     /// The entry is not yet inserted into any list. Use [`Self::insert`] to add
     /// it to a list.
-    pub fn new(platform: &Platform, value: T) -> Self {
+    pub fn new(_platform: &Platform, value: T) -> Self {
         Self {
             node: Node {
                 ptrs: UnsafeCell::new(ListPointers::new()),
                 data: EntryData {
-                    state: platform.new_raw_mutex(),
+                    state: <Platform::RawMutex as RawMutex>::INIT,
                     value,
                 },
             },

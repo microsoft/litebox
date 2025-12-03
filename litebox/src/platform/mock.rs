@@ -67,6 +67,16 @@ struct MockRawMutexInternalState {
 }
 
 impl MockRawMutex {
+    const fn new() -> Self {
+        Self {
+            inner: AtomicU32::new(0),
+            internal_state: std::sync::RwLock::new(MockRawMutexInternalState {
+                number_to_wake_up: 0,
+                number_blocked: 0,
+            }),
+        }
+    }
+
     fn block_or_maybe_timeout(
         &self,
         val: u32,
@@ -131,6 +141,8 @@ impl MockRawMutex {
 }
 
 impl RawMutex for MockRawMutex {
+    const INIT: Self = Self::new();
+
     fn underlying_atomic(&self) -> &AtomicU32 {
         &self.inner
     }
@@ -172,16 +184,6 @@ impl RawMutex for MockRawMutex {
 
 impl RawMutexProvider for MockPlatform {
     type RawMutex = MockRawMutex;
-
-    fn new_raw_mutex(&self) -> Self::RawMutex {
-        MockRawMutex {
-            inner: AtomicU32::new(0),
-            internal_state: std::sync::RwLock::new(MockRawMutexInternalState {
-                number_to_wake_up: 0,
-                number_blocked: 0,
-            }),
-        }
-    }
 }
 
 impl IPInterfaceProvider for MockPlatform {

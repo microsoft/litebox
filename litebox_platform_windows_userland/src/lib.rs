@@ -974,12 +974,6 @@ fn is_in_ntdll_or_this(ip: usize) -> bool {
 
 impl litebox::platform::RawMutexProvider for WindowsUserland {
     type RawMutex = RawMutex;
-
-    fn new_raw_mutex(&self) -> Self::RawMutex {
-        RawMutex {
-            inner: AtomicU32::new(0),
-        }
-    }
 }
 
 // A skeleton of a raw mutex for Windows.
@@ -989,6 +983,12 @@ pub struct RawMutex {
 }
 
 impl RawMutex {
+    const fn new() -> Self {
+        Self {
+            inner: AtomicU32::new(0),
+        }
+    }
+
     fn block_or_maybe_timeout(
         &self,
         val: u32,
@@ -1039,6 +1039,8 @@ impl RawMutex {
 }
 
 impl litebox::platform::RawMutex for RawMutex {
+    const INIT: Self = Self::new();
+
     fn underlying_atomic(&self) -> &AtomicU32 {
         &self.inner
     }
