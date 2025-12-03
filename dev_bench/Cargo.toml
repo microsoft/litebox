@@ -1,0 +1,15 @@
+[package]
+name = "dev_bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.99"
+glob = "0.3.3"
+fs-err = "3.1.2"
+clap = { version = "4.5.33", features = ["derive"] }
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[lints]
+workspace = true
