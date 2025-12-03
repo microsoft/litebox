@@ -122,7 +122,8 @@ impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
         }
         Some(match size_of::<T>() {
             // Try to ensure a single access for primitive types. The use of
-            // volatile here is dubious--this should really use inline asm.
+            // volatile here is dubious--this should really use inline asm or
+            // perhaps atomic loads.
             1 | 2 | 4 | 8 => alloc::borrow::Cow::Owned(unsafe { self.inner.read_volatile() }),
             _ => alloc::borrow::Cow::Borrowed(unsafe { &*self.inner.offset(count) }),
         })
@@ -167,7 +168,8 @@ impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
         }
         Some(match size_of::<T>() {
             // Try to ensure a single access for primitive types. The use of
-            // volatile here is dubious--this should really use inline asm.
+            // volatile here is dubious--this should really use inline asm or
+            // perhaps atomic loads.
             1 | 2 | 4 | 8 => alloc::borrow::Cow::Owned(unsafe { self.inner.read_volatile() }),
             _ => alloc::borrow::Cow::Borrowed(unsafe { &*self.inner.offset(count) }),
         })

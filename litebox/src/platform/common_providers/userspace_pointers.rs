@@ -1,7 +1,7 @@
 //! Userspace Pointer Abstraction with Fallible Memory Access
 //!
 //! This module implements fallible userspace pointers that can safely handle invalid
-//! memory accesses from userspace. The pointers use failable memory access routines
+//! memory accesses from userspace. The pointers use fallible memory access routines
 //! internally, which relies on an exception table mechanism to recover from memory
 //! faults.
 //!
@@ -102,8 +102,12 @@ unsafe fn read_at_offset<'a, V: ValidateAccess, T: Clone>(
     ptr: *const T,
     count: isize,
 ) -> Option<alloc::borrow::Cow<'a, T>> {
-    let ptr = V::validate(ptr.cast_mut())?.cast_const();
     let src = unsafe { ptr.add(usize::try_from(count).ok()?) };
+    let src = V::validate(src.cast_mut())?.cast_const();
+    // Match on the size of `T` to use the appropriate fallible read function to
+    // ensure that small aligned reads are atomic (and faster than a full
+    // memcpy). This match will be evaluated at compile time, so there is no
+    // runtime overhead.
     let val = unsafe {
         match size_of::<T>() {
             1 => core::mem::transmute_copy(
@@ -227,6 +231,10 @@ impl<V: ValidateAccess, T: Clone> RawMutPointer<T> for UserMutPtr<V, T> {
     unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()> {
         let dst = unsafe { self.inner.add(usize::try_from(count).ok()?) };
         let dst = V::validate(dst)?;
+        // Match on the size of `T` to use the appropriate fallible write function to
+        // ensure that small aligned writes are atomic (and faster than a full
+        // memcpy). This match will be evaluated at compile time, so there is no
+        // runtime overhead.
         unsafe {
             match size_of::<T>() {
                 1 => crate::mm::exception_table::write_u8_fallible(
