@@ -21,7 +21,7 @@ use litebox::platform::ThreadProvider;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
-    RawMutexProvider as _, ThreadLocalStorageProvider as _,
+    ThreadLocalStorageProvider as _,
 };
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt as _;
@@ -150,8 +150,7 @@ pub(crate) enum ExitStatus {
 impl Process {
     /// Creates a new process with the given initial thread.
     fn new(pid: i32, remote: Arc<ThreadRemote>) -> Self {
-        let platform = litebox_platform_multiplex::platform();
-        let nr_threads = platform.new_raw_mutex();
+        let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         Self {
             nr_threads,
