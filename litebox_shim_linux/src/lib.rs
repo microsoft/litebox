@@ -38,6 +38,7 @@ macro_rules! log_unsupported {
     };
 }
 
+pub(crate) mod channel;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
@@ -432,6 +433,10 @@ enum Descriptor {
     },
     Epoll {
         file: alloc::sync::Arc<syscalls::epoll::EpollFile>,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
+    Unix {
+        file: alloc::sync::Arc<syscalls::unix::UnixSocket>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
 }
