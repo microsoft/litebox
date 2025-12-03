@@ -235,10 +235,10 @@ pub struct SigAltStack {
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
     pub struct SsFlags: u32 {
-        /// Stack disabled
-        const DISABLE = 1;
         /// Stack on signal stack
-        const ONSTACK = 2;
+        const ONSTACK = 1;
+        /// Stack disabled
+        const DISABLE = 2;
         /// Automatically disarm the stack
         const AUTODISARM = 0x8000_0000;
     }

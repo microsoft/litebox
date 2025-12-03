@@ -48,8 +48,7 @@ const MAX_PACKET_COUNT: usize = 32;
 /// [`set_platform_interaction`](Self::set_platform_interaction), whose docs explain this further.
 ///
 /// A user of `Network` who does not care about [events](crate::event) can choose to have a trivial
-/// provider for [`platform::RawMutexProvider`] that panics on all calls except `new_raw_mutex` and
-/// `underlying_atomic`.
+/// provider for [`platform::RawMutexProvider`] that panics on all calls except `underlying_atomic`.
 pub struct Network<Platform>
 where
     Platform:

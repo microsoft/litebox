@@ -80,7 +80,7 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
         Self {
             waker: Waker(Arc::new(WaitStateInner {
                 platform,
-                condvar: platform.new_raw_mutex(),
+                condvar: <Platform::RawMutex as RawMutex>::INIT,
             })),
             _phantom: PhantomData,
         }

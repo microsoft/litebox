@@ -12,9 +12,9 @@ pub struct Condvar<Platform: RawMutexProvider> {
 
 impl<Platform: RawMutexProvider> Condvar<Platform> {
     #[inline]
-    pub(super) fn new_from_platform(platform: &Platform) -> Self {
+    pub(super) const fn new() -> Self {
         Self {
-            futex: platform.new_raw_mutex(),
+            futex: <Platform::RawMutex as crate::platform::RawMutex>::INIT,
         }
     }
 }

@@ -25,7 +25,7 @@ fn ratchet_transmutes() -> Result<()> {
 fn ratchet_globals() -> Result<()> {
     ratchet(
         &[
-            ("litebox/", 7),
+            ("litebox/", 8),
             ("litebox_platform_linux_kernel/", 5),
             ("litebox_platform_linux_userland/", 5),
             ("litebox_platform_lvbs/", 20),
