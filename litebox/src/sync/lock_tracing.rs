@@ -123,14 +123,35 @@ impl Locked {
     }
 }
 
+/// The lock tracker, which manages both tracking and (if necessary) panicking
+/// upon invariant failure. The public methods are backed by a singleton, which
+/// is initialized by [`LockTracker::init`].
+pub(super) struct LockTracker {
+    x: alloc::boxed::Box<spin::Mutex<LockTrackerX>>,
+}
+
 struct LockTrackerPlatform<Platform: RawSyncPrimitivesProvider> {
     platform: &'static Platform,
     start_time: Platform::Instant,
 }
 
+/// The main tracker, which manages both tracking and (if necessary) panicking upon invariant
+/// failure. Can/should only be accessed from the singleton that is initialized by
+/// [`LockTracker::init`].
+struct LockTrackerX<T: ?Sized + DynLockTrackerProvider = dyn DynLockTrackerProvider> {
+    held: ArrayVec<Option<Locked>, CONFIG_MAX_NUMBER_OF_TRACKED_LOCKS>,
+    platform: T,
+}
+
+/// A dyn-compatible trait with just the methods we need from the platform for
+/// lock tracking. This is necessary so that `LOCK_TRACKER` can be a singleton
+/// (no generics allowed in statics). The backing platform traits are not
+/// dyn-compatible.
 trait DynLockTrackerProvider: Send + Sync {
+    /// Gets the current time, relative to some unspecified epoch.
     fn now(&self) -> Duration;
-    fn debug_log_print(&self, msg: &ArrayString<1024>);
+    /// Print a debug log message.
+    fn debug_log_print(&self, msg: &str);
 }
 
 impl<Platform: RawSyncPrimitivesProvider> DynLockTrackerProvider for LockTrackerPlatform<Platform> {
@@ -138,13 +159,9 @@ impl<Platform: RawSyncPrimitivesProvider> DynLockTrackerProvider for LockTracker
         self.platform.now().duration_since(&self.start_time)
     }
 
-    fn debug_log_print(&self, msg: &ArrayString<1024>) {
+    fn debug_log_print(&self, msg: &str) {
         self.platform.debug_log_print(msg);
     }
-}
-
-pub(super) struct LockTracker {
-    x: alloc::boxed::Box<spin::Mutex<LockTrackerX>>,
 }
 
 impl LockTracker {
@@ -171,14 +188,6 @@ impl LockTracker {
 }
 
 static LOCK_TRACKER: spin::Once<LockTracker> = spin::Once::new();
-
-/// The main tracker, which manages both tracking and (if necessary) panicking upon invariant
-/// failure. Can/should only be accessed from the singleton that is automatically used upon usage of
-/// any of the `pub(crate)` functions available via the tracker.
-struct LockTrackerX<T: ?Sized + DynLockTrackerProvider = dyn DynLockTrackerProvider> {
-    held: ArrayVec<Option<Locked>, CONFIG_MAX_NUMBER_OF_TRACKED_LOCKS>,
-    platform: T,
-}
 
 impl core::fmt::Display for LockTrackerX {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -207,7 +216,7 @@ impl core::fmt::Display for LockTrackerX {
     }
 }
 
-/// A witness to having invoked [`LockAttemptWitness::mark_lock`], must be explicitly marked with
+/// A witness to having invoked [`LockTracker::mark_lock`], must be explicitly marked with
 /// [`Self::mark_unlock`] when the relevant lock is unlocked, otherwise will panic upon drop.
 pub(crate) struct LockedWitness {
     // Private: index into the tracker
@@ -235,7 +244,7 @@ impl LockedWitness {
     }
 }
 
-/// A witness to having invoked [`begin_lock_attempt`].
+/// A witness to having invoked [`LockTracker::begin_lock_attempt`].
 ///
 /// Explicitly is not copy/clone/...-able; acts essentially as a linear resource token.
 pub(crate) struct LockAttemptWitness {
@@ -259,35 +268,35 @@ macro_rules! debug_log_println {
     }}
 }
 
-/// Mark the `lock_type` (at `lock_addr`) as being attempted to be locked. It is the caller's
-/// job to make sure `#[track_caller]` is inserted, and that things are kept in sync with the
-/// actual [`LockAttemptWitness::mark_lock`] invocations.
-#[must_use]
-#[track_caller]
-pub(crate) fn begin_lock_attempt<T>(
-    lock_type: LockType,
-    lock_addr: *const T,
-) -> Option<LockAttemptWitness> {
-    Some(LockTrackerX::begin_lock_attempt(
-        LockTracker::global()?,
-        lock_type,
-        lock_addr,
-    ))
-}
+impl LockTracker {
+    /// Mark the `lock_type` (at `lock_addr`) as being attempted to be locked. It is the caller's
+    /// job to make sure `#[track_caller]` is inserted, and that things are kept in sync with the
+    /// actual [`LockTracker::mark_lock`] invocations.
+    #[must_use]
+    #[track_caller]
+    pub(crate) fn begin_lock_attempt<T>(
+        lock_type: LockType,
+        lock_addr: *const T,
+    ) -> Option<LockAttemptWitness> {
+        Some(LockTrackerX::begin_lock_attempt(
+            LockTracker::global()?,
+            lock_type,
+            lock_addr,
+        ))
+    }
 
-impl LockAttemptWitness {
     /// Mark the `lock_type` being locked. It is the caller's job to make sure `#[track_caller]` is
     /// inserted in all callers until the place where the user's locations want to be recorded;
     /// otherwise, might not get particularly useful traces.
     #[must_use]
     #[track_caller]
-    pub(crate) fn mark_lock(self) -> LockedWitness {
-        LockTrackerX::mark_lock(self.tracker, self)
+    pub(crate) fn mark_lock(attempt: LockAttemptWitness) -> LockedWitness {
+        LockTrackerX::mark_lock(attempt)
     }
 }
 
 impl LockTrackerX {
-    /// Access this via [`begin_lock_attempt`]
+    /// Access this via [`LockTracker::begin_lock_attempt`]
     #[must_use]
     #[track_caller]
     fn begin_lock_attempt<T>(
@@ -353,15 +362,15 @@ impl LockTrackerX {
         }
     }
 
-    /// Access this via [`LockAttemptWitness::mark_lock`]
+    /// Access this via [`LockTracker::mark_lock`]
     #[must_use]
     #[track_caller]
-    fn mark_lock(l_tracker: &'static LockTracker, attempt: LockAttemptWitness) -> LockedWitness {
+    fn mark_lock(attempt: LockAttemptWitness) -> LockedWitness {
         let LockAttemptWitness {
             locked,
             start_time,
             contended_with,
-            tracker: _,
+            tracker: l_tracker,
         } = attempt;
         let mut tracker = l_tracker.x.lock();
         let idx = tracker.held.len();

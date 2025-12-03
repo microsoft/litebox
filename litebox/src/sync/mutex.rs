@@ -207,7 +207,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, Platform, T> {
         #[cfg(feature = "lock_tracing")]
-        let attempt = super::lock_tracing::begin_lock_attempt(
+        let attempt = super::lock_tracing::LockTracker::begin_lock_attempt(
             LockType::Mutex,
             self.raw.raw.underlying_atomic(),
         );
@@ -217,7 +217,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
         MutexGuard {
             mutex: self,
             #[cfg(feature = "lock_tracing")]
-            locked_witness: attempt.map(super::lock_tracing::LockAttemptWitness::mark_lock),
+            locked_witness: attempt.map(super::lock_tracing::LockTracker::mark_lock),
         }
     }
 }

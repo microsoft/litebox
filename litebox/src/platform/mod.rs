@@ -220,7 +220,8 @@ pub trait RawMutexProvider {
 
 /// A raw mutex/lock API; expected to roughly match (or even be implemented using) a Linux futex.
 pub trait RawMutex: Send + Sync + 'static {
-    /// A const initializer for this raw mutex.
+    /// The initial value for a raw mutex, with an underlying atomic with a
+    /// value of zero.
     const INIT: Self;
 
     /// Returns a reference to the underlying atomic value
