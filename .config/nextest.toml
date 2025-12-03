@@ -16,11 +16,11 @@ default-filter = 'not test(test_runner_with_python)'
 tun-access = { max-threads = 1 }
 
 [[profile.ci.overrides]]
-filter = 'package(litebox_shim_linux) and test(test_tun)'
+filter = 'test(test_tun)'
 test-group = "tun-access"
 
 [[profile.default.overrides]]
-filter = 'package(litebox_shim_linux) and test(test_tun)'
+filter = 'test(test_tun)'
 test-group = "tun-access"
 
 # For flaky tests on the CI, we attempt to re-run a couple of times before

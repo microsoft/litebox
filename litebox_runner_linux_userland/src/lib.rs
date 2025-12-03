@@ -231,15 +231,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     shim_builder.set_load_filter(fixup_env);
     let shim = shim_builder.build();
 
-    if cli_args.tun_device_name.is_some() {
+    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let net_worker = if cli_args.tun_device_name.is_some() {
         let shim = shim.clone();
-        std::thread::spawn(move || {
-            loop {
+        let shutdown_clone = shutdown.clone();
+        let child = std::thread::spawn(move || {
+            while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
                 while shim.perform_network_interaction().call_again_immediately() {}
                 litebox_platform_multiplex::platform().wait_on_tun(Some(Duration::from_millis(50)));
             }
+            // Final flush
+            // TODO: keep running until all sockets are closed?
+            while shim.perform_network_interaction().call_again_immediately() {}
         });
-    }
+        Some(child)
+    } else {
+        None
+    };
 
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
@@ -281,6 +289,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             &mut litebox_common_linux::PtRegs::default(),
         );
     };
+
+    if let Some(net_worker) = net_worker {
+        shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
+        net_worker.join().unwrap();
+    }
     std::process::exit(program.process.wait())
 }
 
