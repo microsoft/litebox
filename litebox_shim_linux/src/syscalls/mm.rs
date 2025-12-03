@@ -7,8 +7,8 @@ use litebox::{
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
+use crate::MutPtr;
 use crate::Task;
-use crate::{MutPtr, litebox_page_manager};
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -38,7 +38,7 @@ impl Task {
         op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
     ) -> Result<MutPtr<u8>, MappingError> {
         litebox_common_linux::mm::do_mmap(
-            litebox_page_manager(),
+            &self.global.pm,
             suggested_addr,
             len,
             prot,
@@ -159,7 +159,7 @@ impl Task {
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_munmap(litebox_page_manager(), addr, len)
+        litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len)
     }
 
     /// Handle syscall `mprotect`
@@ -170,7 +170,7 @@ impl Task {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_mprotect(litebox_page_manager(), addr, len, prot)
+        litebox_common_linux::mm::sys_mprotect(&self.global.pm, addr, len, prot)
     }
 
     #[inline]
@@ -183,7 +183,7 @@ impl Task {
         new_addr: usize,
     ) -> Result<crate::MutPtr<u8>, Errno> {
         litebox_common_linux::mm::sys_mremap(
-            litebox_page_manager(),
+            &self.global.pm,
             old_addr,
             old_size,
             new_size,
@@ -195,7 +195,7 @@ impl Task {
     /// Handle syscall `brk`
     #[inline]
     pub(crate) fn sys_brk(&self, addr: MutPtr<u8>) -> Result<usize, Errno> {
-        litebox_common_linux::mm::sys_brk(litebox_page_manager(), addr)
+        litebox_common_linux::mm::sys_brk(&self.global.pm, addr)
     }
 
     /// Handle syscall `madvise`
@@ -206,7 +206,7 @@ impl Task {
         len: usize,
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_madvise(litebox_page_manager(), addr, len, advice)
+        litebox_common_linux::mm::sys_madvise(&self.global.pm, addr, len, advice)
     }
 }
 
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn test_collision_with_global_allocator() {
         let task = init_platform(None);
-        let platform = litebox_platform_multiplex::platform();
+        let platform = task.global.platform;
         let mut data = alloc::vec::Vec::new();
         // Find an address that is allocated to the global allocator but not in reserved regions.
         // LiteBox's page manager is not aware of the global allocator's allocations.

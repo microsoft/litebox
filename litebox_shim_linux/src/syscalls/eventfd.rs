@@ -123,12 +123,12 @@ mod tests {
 
     #[test]
     fn test_semaphore_eventfd() {
-        let _task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
             EfdFlags::SEMAPHORE,
-            crate::litebox(),
+            &task.global.litebox,
         ));
         let total = 8;
         for _ in 0..total {
@@ -148,12 +148,12 @@ mod tests {
 
     #[test]
     fn test_blocking_eventfd() {
-        let _task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
             EfdFlags::empty(),
-            crate::litebox(),
+            &task.global.litebox,
         ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
@@ -177,12 +177,12 @@ mod tests {
 
     #[test]
     fn test_blocking_eventfd_no_race_on_massive_readwrite() {
-        let _task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
             EfdFlags::empty(),
-            crate::litebox(),
+            &task.global.litebox,
         ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
@@ -201,12 +201,12 @@ mod tests {
 
     #[test]
     fn test_nonblocking_eventfd() {
-        let _task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         let eventfd = alloc::sync::Arc::new(super::EventFile::new(
             0,
             EfdFlags::NONBLOCK,
-            crate::litebox(),
+            &task.global.litebox,
         ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {

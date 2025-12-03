@@ -1,8 +1,6 @@
 //! Process/thread related syscalls.
 
-use crate::ConstPtr;
-use crate::MutPtr;
-use crate::Task;
+use crate::{ConstPtr, GlobalState, MutPtr, Task};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::Arc;
@@ -10,9 +8,7 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 use core::mem::offset_of;
 use core::ops::Range;
-use core::sync::atomic::AtomicBool;
-use core::sync::atomic::AtomicI32;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
@@ -56,11 +52,11 @@ pub(crate) struct ThreadState {
 unsafe impl Send for ThreadState {}
 
 impl ThreadState {
-    pub fn new_process(pid: i32) -> Self {
+    pub fn new_process(global: &GlobalState, pid: i32) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(pid, remote.clone())),
+            process: Arc::new(Process::new(global, pid, remote.clone())),
             remote,
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -149,12 +145,12 @@ pub(crate) enum ExitStatus {
 
 impl Process {
     /// Creates a new process with the given initial thread.
-    fn new(pid: i32, remote: Arc<ThreadRemote>) -> Self {
+    fn new(global: &GlobalState, pid: i32, remote: Arc<ThreadRemote>) -> Self {
         let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         Self {
             nr_threads,
-            inner: crate::litebox().sync().new_mutex(ProcessInner {
+            inner: global.litebox.sync().new_mutex(ProcessInner {
                 exit_status: ExitStatus::Exit(0),
                 group_exit: false,
                 is_killing_other_threads: false,
@@ -321,9 +317,6 @@ pub(crate) struct Credentials {
     pub egid: u32,
 }
 
-// TODO: better management of thread IDs
-pub(crate) static NEXT_THREAD_ID: AtomicI32 = AtomicI32::new(2); // start from 2, as 1 is used by the main thread
-
 impl Task {
     pub(crate) fn process(&self) -> &Arc<Process> {
         &self.thread.process
@@ -386,7 +379,9 @@ impl Task {
             #[cfg(target_arch = "x86_64")]
             ArchPrctlArg::SetFs(addr) => {
                 let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr };
-                let token = litebox_platform_multiplex::platform()
+                let token = self
+                    .global
+                    .platform
                     .get_punchthrough_token_for(punchthrough)
                     .expect("Failed to get punchthrough token for SET_FS");
                 token.execute().map(|_| ()).map_err(|e| match e {
@@ -397,7 +392,9 @@ impl Task {
             #[cfg(target_arch = "x86_64")]
             ArchPrctlArg::GetFs(addr) => {
                 let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase;
-                let token = litebox_platform_multiplex::platform()
+                let token = self
+                    .global
+                    .platform
                     .get_punchthrough_token_for(punchthrough)
                     .expect("Failed to get punchthrough token for GET_FS");
                 let fsbase = token.execute().map_err(|e| match e {
@@ -422,7 +419,9 @@ impl Task {
         user_desc: &mut litebox_common_linux::UserDesc,
     ) -> Result<(), Errno> {
         let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea { user_desc };
-        let token = litebox_platform_multiplex::platform()
+        let token = self
+            .global
+            .platform
             .get_punchthrough_token_for(punchthrough)
             .expect("Failed to get punchthrough token for SET_THREAD_AREA");
         token.execute().map(|_| ()).map_err(|e| match e {
@@ -729,7 +728,7 @@ impl Task {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
 
-        let child_tid = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+        let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         if let Some(parent_tid_ptr) = set_parent_tid {
             let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid) };
         }
@@ -752,14 +751,13 @@ impl Task {
         });
         thread.clear_child_tid.set(clear_child_tid);
 
-        let platform = litebox_platform_multiplex::platform();
         let r = unsafe {
-            platform.spawn_thread(
+            self.global.platform.spawn_thread(
                 ctx,
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
-                        wait_state: crate::wait::WaitState::new(platform),
+                        wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
                         pid: self.pid,
                         tid: child_tid,
@@ -774,7 +772,7 @@ impl Task {
             )
         };
         if let Err(err) = r {
-            litebox::log_println!(platform, "failed to spawn thread: {}", err);
+            litebox::log_println!(self.global.platform, "failed to spawn thread: {}", err);
             // Treat all spawn errors as `ENOMEM`. `EAGAIN` and other errors are
             // for conditions the user can control (such as "in-shim" rlimit
             // violations).
@@ -981,7 +979,7 @@ impl Task {
     }
 
     fn real_time_as_duration_since_epoch(&self) -> core::time::Duration {
-        let now = litebox_platform_multiplex::platform().current_time();
+        let now = self.global.platform.current_time();
         let unix_epoch =
             <litebox_platform_multiplex::Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
         now.duration_since(&unix_epoch)
@@ -994,7 +992,7 @@ impl Task {
         clockid: litebox_common_linux::ClockId,
         tp: TimeParam<Platform>,
     ) -> Result<(), Errno> {
-        let duration = self.gettime_as_duration(litebox_platform_multiplex::platform(), clockid)?;
+        let duration = self.gettime_as_duration(self.global.platform, clockid)?;
         tp.write(duration)
     }
 
@@ -1010,13 +1008,13 @@ impl Task {
             }
             litebox_common_linux::ClockId::Monotonic => {
                 // CLOCK_MONOTONIC
-                platform.now().duration_since(crate::boot_time())
+                platform.now().duration_since(&self.global.boot_time)
             }
             litebox_common_linux::ClockId::MonotonicCoarse => {
                 // CLOCK_MONOTONIC_COARSE - provides faster but less precise monotonic time
                 // For simplicity, we can reuse the same monotonic time as CLOCK_MONOTONIC
                 // In a real implementation, this would typically have lower resolution
-                platform.now().duration_since(crate::boot_time())
+                platform.now().duration_since(&self.global.boot_time)
             }
             _ => {
                 log_unsupported!("gettime for {clockid:?}");
@@ -1042,7 +1040,7 @@ impl Task {
             | litebox_common_linux::ClockId::MonotonicCoarse => {
                 // No need to compute the current time since the offset from the
                 // request to `Instant` is known.
-                Ok(crate::boot_time().checked_add(duration))
+                Ok(self.global.boot_time.checked_add(duration))
             }
             _ => {
                 // Convert between time domains. If the requested time is in the past,
@@ -1230,8 +1228,7 @@ impl Task {
                 let Some(count) = core::num::NonZeroU32::new(count) else {
                     return Ok(0);
                 };
-                let futex_manager = crate::litebox_futex_manager();
-                futex_manager.wake(addr, count, None)? as usize
+                self.global.futex_manager.wake(addr, count, None)? as usize
             }
             FutexArgs::Wait {
                 addr,
@@ -1240,9 +1237,13 @@ impl Task {
                 timeout,
             } => {
                 warn_shared_futex!(flags);
-                let futex_manager = crate::litebox_futex_manager();
                 let timeout = timeout.read()?;
-                futex_manager.wait(&self.wait_cx().with_timeout(timeout), addr, val, None)?;
+                self.global.futex_manager.wait(
+                    &self.wait_cx().with_timeout(timeout),
+                    addr,
+                    val,
+                    None,
+                )?;
                 0
             }
             litebox_common_linux::FutexArgs::WaitBitset {
@@ -1253,7 +1254,6 @@ impl Task {
                 bitmask,
             } => {
                 warn_shared_futex!(flags);
-                let futex_manager = crate::litebox_futex_manager();
                 let deadline = if let Some(timeout) = timeout.read()? {
                     let clock_id =
                         if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
@@ -1265,7 +1265,7 @@ impl Task {
                 } else {
                     None
                 };
-                futex_manager.wait(
+                self.global.futex_manager.wait(
                     &self.wait_cx().with_deadline(deadline),
                     addr,
                     val,
@@ -1360,12 +1360,12 @@ impl Task {
         }
         self.thread.clear_child_tid.set(None);
 
-        self.signals.reset_for_exec(crate::litebox());
+        self.signals.reset_for_exec(&self.global.litebox);
 
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        let page_manager = crate::litebox_page_manager();
-        unsafe { page_manager.release_memory(release) }.expect("failed to release memory mappings");
+        unsafe { self.global.pm.release_memory(release) }
+            .expect("failed to release memory mappings");
 
         litebox_platform_multiplex::Platform::clear_guest_thread_local_storage(
             #[cfg(target_arch = "x86")]
@@ -1387,7 +1387,7 @@ impl Task {
         argv: Vec<alloc::ffi::CString>,
         mut envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
-        if let Some(&filter) = crate::LOAD_FILTER.get() {
+        if let Some(filter) = self.global.load_filter {
             filter(&mut envp);
         }
 

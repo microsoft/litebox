@@ -19,7 +19,7 @@ use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
 use super::file::FilesState;
-use crate::{Descriptor, StrongFd};
+use crate::{Descriptor, GlobalState, StrongFd};
 
 bitflags::bitflags! {
     /// Linux's epoll flags.
@@ -87,7 +87,12 @@ impl DescriptorRef {
 impl EpollDescriptor {
     /// Returns the interesting events now and monitors their occurrence in the future if the
     /// observer is provided.
-    fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Option<Events> {
+    fn poll(
+        &self,
+        global: &GlobalState,
+        mask: Events,
+        observer: Option<Weak<dyn Observer<Events>>>,
+    ) -> Option<Events> {
         let poll = |iop: &dyn IOPollable| {
             if let Some(observer) = observer {
                 iop.register_observer(observer, mask);
@@ -102,10 +107,10 @@ impl EpollDescriptor {
                 return Some(Events::OUT & mask);
             }
             EpollDescriptor::Socket(fd) => {
-                return crate::litebox_net().lock().with_iopollable(fd, poll);
+                return global.net.lock().with_iopollable(fd, poll);
             }
             EpollDescriptor::Pipe(fd) => {
-                return crate::litebox_pipes().with_iopollable(fd, poll).ok();
+                return global.pipes.with_iopollable(fd, poll).ok();
             }
         };
         Some(poll(io_pollable))
@@ -132,12 +137,13 @@ impl EpollFile {
 
     pub(crate) fn wait(
         &self,
+        global: &GlobalState,
         cx: &WaitContext<'_, Platform>,
         maxevents: usize,
     ) -> Result<Vec<EpollEvent>, WaitError> {
         let mut events = Vec::new();
         match self.ready.pollee.wait(cx, false, Events::IN, || {
-            self.ready.pop_multiple(maxevents, &mut events);
+            self.ready.pop_multiple(global, maxevents, &mut events);
             if events.is_empty() {
                 return Err(TryOpError::<Infallible>::TryAgain);
             }
@@ -151,13 +157,14 @@ impl EpollFile {
 
     pub(crate) fn epoll_ctl(
         &self,
+        global: &GlobalState,
         op: EpollOp,
         fd: u32,
         file: &EpollDescriptor,
         event: Option<EpollEvent>,
     ) -> Result<(), Errno> {
         match op {
-            EpollOp::EpollCtlAdd => self.add_interest(fd, file, event.unwrap()),
+            EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap()),
             EpollOp::EpollCtlMod => {
                 log_unsupported!("epoll_ctl mod");
                 Err(Errno::EINVAL)
@@ -174,6 +181,7 @@ impl EpollFile {
 
     fn add_interest(
         &self,
+        global: &GlobalState,
         fd: u32,
         file: &EpollDescriptor,
         event: EpollEvent,
@@ -190,6 +198,7 @@ impl EpollFile {
 
         let mask = Events::from_bits_truncate(event.events);
         let entry = EpollEntry::new(
+            &global.litebox,
             DescriptorRef::from(file),
             mask,
             EpollFlags::from_bits_truncate(event.events),
@@ -197,7 +206,7 @@ impl EpollFile {
             self.ready.clone(),
         );
         let events = file
-            .poll(mask, Some(entry.weak_self.clone() as _))
+            .poll(global, mask, Some(entry.weak_self.clone() as _))
             .ok_or(Errno::EBADF)?;
         // Add the new entry to the ready list if the file is ready
         if !events.is_empty() {
@@ -210,6 +219,7 @@ impl EpollFile {
     #[expect(dead_code, reason = "currently unused, but might want to use soon")]
     fn mod_interest(
         &self,
+        global: &GlobalState,
         fd: u32,
         file: &EpollDescriptor,
         event: EpollEvent,
@@ -248,7 +258,7 @@ impl EpollFile {
         drop(inner);
 
         // re-register the observer with the new mask
-        if let Some(events) = file.poll(mask, Some(observer as _)) {
+        if let Some(events) = file.poll(global, mask, Some(observer as _)) {
             if !events.is_empty() {
                 // Add the updated entry to the ready list if the file is ready
                 self.ready.push(entry);
@@ -297,6 +307,7 @@ struct EpollEntryInner {
 
 impl EpollEntry {
     fn new(
+        litebox: &LiteBox<Platform>,
         desc: DescriptorRef,
         mask: Events,
         flags: EpollFlags,
@@ -305,7 +316,7 @@ impl EpollEntry {
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| EpollEntry {
             desc,
-            inner: crate::litebox()
+            inner: litebox
                 .sync()
                 .new_mutex(EpollEntryInner { mask, flags, data }),
             ready,
@@ -315,7 +326,7 @@ impl EpollEntry {
         })
     }
 
-    fn poll(&self) -> Option<(Option<EpollEvent>, bool)> {
+    fn poll(&self, global: &GlobalState) -> Option<(Option<EpollEvent>, bool)> {
         let file = self.desc.upgrade()?;
         let inner = self.inner.lock();
 
@@ -324,7 +335,7 @@ impl EpollEntry {
             return None;
         }
 
-        let events = file.poll(inner.mask, None)?;
+        let events = file.poll(global, inner.mask, None)?;
         if events.is_empty() {
             Some((None, false))
         } else {
@@ -389,7 +400,7 @@ impl ReadySet {
         self.pollee.notify_observers(Events::IN);
     }
 
-    fn pop_multiple(&self, maxevents: usize, events: &mut Vec<EpollEvent>) {
+    fn pop_multiple(&self, global: &GlobalState, maxevents: usize, events: &mut Vec<EpollEvent>) {
         let mut nums = self.entries.lock().len();
         while nums > 0 {
             nums -= 1;
@@ -413,7 +424,7 @@ impl ReadySet {
                 .is_ready
                 .store(false, core::sync::atomic::Ordering::Relaxed);
 
-            let Some((event, is_still_ready)) = entry.poll() else {
+            let Some((event, is_still_ready)) = entry.poll(global) else {
                 // the entry is disabled or the associated file is closed
                 continue;
             };
@@ -472,7 +483,12 @@ impl PollSet {
         });
     }
 
-    fn scan_once(&mut self, files: &FilesState, waker: Option<&Waker<Platform>>) -> bool {
+    fn scan_once(
+        &mut self,
+        global: &GlobalState,
+        files: &FilesState,
+        waker: Option<&Waker<Platform>>,
+    ) -> bool {
         let mut is_ready = false;
         let fds = files.file_descriptors.read();
         for entry in &mut self.entries {
@@ -500,7 +516,7 @@ impl PollSet {
                 };
                 // TODO: add machinery to unregister the observer to avoid leaks.
                 poll_descriptor
-                    .poll(entry.mask, observer)
+                    .poll(global, entry.mask, observer)
                     .unwrap_or(Events::NVAL)
             } else {
                 Events::NVAL
@@ -513,23 +529,24 @@ impl PollSet {
     }
 
     /// Scans the poll set for ready fds once.
-    pub fn scan(&mut self, files: &FilesState) {
-        self.scan_once(files, None);
+    pub fn scan(&mut self, global: &GlobalState, files: &FilesState) {
+        self.scan_once(global, files, None);
     }
 
     /// Waits for any of the fds in the poll set to become ready.
     pub fn wait(
         &mut self,
+        global: &GlobalState,
         cx: &WaitContext<'_, Platform>,
         files: &FilesState,
     ) -> Result<(), WaitError> {
-        if self.scan_once(files, None) {
+        if self.scan_once(global, files, None) {
             return Ok(());
         }
 
         let mut register = true;
         cx.wait_until(|| {
-            if self.scan_once(files, register.then_some(cx.waker())) {
+            if self.scan_once(global, files, register.then_some(cx.waker())) {
                 return true;
             }
             // Don't register observers again in the next iteration.
@@ -569,26 +586,28 @@ mod test {
     use litebox_platform_multiplex::platform;
 
     use super::EpollFile;
-    use crate::{litebox, syscalls::file::FilesState};
+    use crate::syscalls::file::FilesState;
 
     extern crate std;
 
-    fn setup_epoll() -> EpollFile {
-        let _task = crate::syscalls::tests::init_platform(None);
+    fn setup_epoll() -> (crate::Task, EpollFile) {
+        let task = crate::syscalls::tests::init_platform(None);
 
-        EpollFile::new(litebox())
+        let epoll = EpollFile::new(&task.global.litebox);
+        (task, epoll)
     }
 
     #[test]
     fn test_epoll_with_eventfd() {
-        let epoll = setup_epoll();
+        let (task, epoll) = setup_epoll();
         let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
             0,
             EfdFlags::CLOEXEC,
-            litebox(),
+            &task.global.litebox,
         ));
         epoll
             .add_interest(
+                &task.global,
                 10,
                 &super::EpollDescriptor::Eventfd(eventfd.clone()),
                 EpollEvent {
@@ -606,19 +625,22 @@ mod test {
                 .unwrap();
         });
         epoll
-            .wait(&WaitState::new(platform()).context(), 1024)
+            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
             .unwrap();
     }
 
     #[test]
     fn test_epoll_with_pipe() {
-        let epoll = setup_epoll();
-        let pipes = crate::litebox_pipes();
-        let (producer, consumer) = pipes.create_pipe(2, litebox::pipes::Flags::empty(), None);
+        let (task, epoll) = setup_epoll();
+        let (producer, consumer) =
+            task.global
+                .pipes
+                .create_pipe(2, litebox::pipes::Flags::empty(), None);
         let consumer = Arc::new(consumer);
         let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
         epoll
             .add_interest(
+                &task.global,
                 10,
                 &reader,
                 EpollEvent {
@@ -629,20 +651,23 @@ mod test {
             .unwrap();
 
         // spawn a thread to write to the pipe
+        let global = task.global.clone();
         std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(100));
             assert_eq!(
-                crate::litebox_pipes()
+                global
+                    .pipes
                     .write(&WaitState::new(platform()).context(), &producer, &[1, 2])
                     .unwrap(),
                 2
             );
         });
         epoll
-            .wait(&WaitState::new(platform()).context(), 1024)
+            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
             .unwrap();
         let mut buf = [0; 2];
-        crate::litebox_pipes()
+        task.global
+            .pipes
             .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
             .unwrap();
         assert_eq!(buf, [1, 2]);
@@ -650,13 +675,13 @@ mod test {
 
     #[test]
     fn test_poll() {
-        let _task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
         let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
             0,
             EfdFlags::empty(),
-            litebox(),
+            &task.global.litebox,
         ));
 
         let fd = 10i32;
@@ -665,8 +690,8 @@ mod test {
             close_on_exec: core::sync::atomic::AtomicBool::new(false),
         };
 
-        let no_fds = FilesState::new(litebox());
-        let fds = FilesState::new(litebox());
+        let no_fds = FilesState::new(&task.global.litebox);
+        let fds = FilesState::new(&task.global.litebox);
         fds.file_descriptors
             .write()
             .insert_at(descriptor, fd.reinterpret_as_unsigned() as usize);
@@ -678,19 +703,20 @@ mod test {
             revents[0]
         };
 
-        set.wait(&WaitState::new(platform()).context(), &no_fds)
+        set.wait(&task.global, &WaitState::new(platform()).context(), &no_fds)
             .unwrap();
         assert_eq!(revents(&set), Events::NVAL);
 
         eventfd
             .write(&WaitState::new(platform()).context(), 1)
             .unwrap();
-        set.wait(&WaitState::new(platform()).context(), &fds)
+        set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
 
         eventfd.read(&WaitState::new(platform()).context()).unwrap();
         set.wait(
+            &task.global,
             &WaitState::new(platform())
                 .context()
                 .with_timeout(core::time::Duration::from_millis(100)),
@@ -707,7 +733,7 @@ mod test {
                 .unwrap();
         });
 
-        set.wait(&WaitState::new(platform()).context(), &fds)
+        set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
     }
