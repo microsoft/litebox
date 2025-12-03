@@ -364,10 +364,10 @@ impl Drop for UnixListenStream {
         let key = self.backlog.addr.to_key();
         let mut table = unix_addr_table().write();
         // Only remove the entry if it still points to our backlog
-        if let Some(UnixEntry::Stream(backlog)) = table.get(&key) {
-            if Arc::ptr_eq(backlog, &self.backlog) {
-                table.remove(&key);
-            }
+        if let Some(UnixEntry::Stream(backlog)) = table.get(&key)
+            && Arc::ptr_eq(backlog, &self.backlog)
+        {
+            table.remove(&key);
         }
     }
 }
