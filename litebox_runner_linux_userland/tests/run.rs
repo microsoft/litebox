@@ -509,6 +509,7 @@ fn test_tun_and_runner_with_iperf3() {
     let cloned_path = iperf3_path.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(5));
+        std::println!("Starting iperf3 client...");
         let mut client = std::process::Command::new(&cloned_path)
             .args(["-c", "10.0.0.2"])
             .spawn()
