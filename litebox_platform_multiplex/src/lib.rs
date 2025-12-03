@@ -39,7 +39,7 @@ cfg_if::cfg_if! {
     }
 }
 
-static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
+static PLATFORM: once_cell::race::OnceRef<'static, Platform> = once_cell::race::OnceRef::new();
 
 /// Initialize the shim by providing a [LiteBox platform](../litebox/platform/index.html).
 ///
@@ -54,7 +54,7 @@ static PLATFORM: once_cell::race::OnceBox<&'static Platform> = once_cell::race::
     reason = "the platform itself is not Debug thus we cannot use `expect`"
 )]
 pub fn set_platform(platform: &'static Platform) {
-    match PLATFORM.set(alloc::boxed::Box::new(platform)) {
+    match PLATFORM.set(platform) {
         Ok(()) => {}
         Err(_) => panic!("set_platform should only be called once per crate"),
     }

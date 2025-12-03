@@ -760,7 +760,7 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
 
 pub type Platform = crate::host::LvbsLinuxKernel;
 
-static PLATFORM_LOW: once_cell::race::OnceBox<&'static Platform> = once_cell::race::OnceBox::new();
+static PLATFORM_LOW: once_cell::race::OnceRef<'static, Platform> = once_cell::race::OnceRef::new();
 
 /// # Panics
 ///
@@ -770,7 +770,7 @@ static PLATFORM_LOW: once_cell::race::OnceBox<&'static Platform> = once_cell::ra
     reason = "the platform itself is not Debug thus we cannot use `expect`"
 )]
 pub fn set_platform_low(platform: &'static Platform) {
-    match PLATFORM_LOW.set(alloc::boxed::Box::new(platform)) {
+    match PLATFORM_LOW.set(platform) {
         Ok(()) => {}
         Err(_) => panic!("set_platform should only be called once per crate"),
     }
