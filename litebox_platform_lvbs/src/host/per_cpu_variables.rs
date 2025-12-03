@@ -60,7 +60,7 @@ impl PerCpuVariables {
         &raw const self.hv_vp_assist_page as u64
     }
 
-    pub(crate) fn hv_simp_page_as_mut_ptr(&mut self) -> *mut HvMessagePage {
+    pub fn hv_simp_page_as_mut_ptr(&mut self) -> *mut HvMessagePage {
         (&raw mut self.hv_simp_page).cast::<HvMessagePage>()
     }
 

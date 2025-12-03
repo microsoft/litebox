@@ -1,6 +1,14 @@
 #![no_std]
 
 use core::panic::PanicInfo;
+use litebox_platform_lvbs::host::per_cpu_variables::{
+    PerCpuVariables, with_per_cpu_variables, with_per_cpu_variables_mut,
+};
+use litebox_platform_lvbs::mshv::vsm_intercept::vsm_handle_intercept;
+use litebox_platform_lvbs::mshv::vtl_switch::{
+    VtlEntryReason, load_vtl_state, save_vtl0_state, save_vtl1_state, vtl_return, vtlcall_dispatch,
+};
+use litebox_platform_lvbs::mshv::{HV_VTL_NORMAL, HV_VTL_SECURE, VsmFunction};
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
     debug_serial_println,
@@ -94,33 +102,50 @@ pub fn init() -> Option<&'static Platform> {
     ret
 }
 
-use litebox_platform_lvbs::host::per_cpu_variables::{
-    with_per_cpu_variables, with_per_cpu_variables_mut,
-};
-use litebox_platform_lvbs::mshv::vsm_intercept::vsm_handle_intercept;
-use litebox_platform_lvbs::mshv::vtl_switch::{
-    VtlEntryReason, load_vtl_state, save_vtl0_state, save_vtl1_state, vtl_return, vtlcall_dispatch,
-};
-use litebox_platform_lvbs::mshv::{HV_VTL_NORMAL, HV_VTL_SECURE, VsmFunction};
-
 pub fn run(platform: Option<&'static Platform>) -> ! {
     if let Some(platform) = platform {
         litebox_platform_lvbs::set_platform_low(platform);
     }
 
+    // This is a dummy call to satisfy load_vtl0_state() with reasonable register values.
+    // We do not save VTL0 registers during VTL1 initialization.
     unsafe {
         save_vtl0_state();
     }
 
+    jump_to_vtl_switch_loop_with_stack_cleanup()
+}
+
+const STACK_ALIGNMENT: isize = -16;
+
+/// This function lets VTL1 return to VTL0. Before returning to VTL0, it re-initializes
+/// the VTL1 kernel stack to discard any leftovers (e.g., unwind, panic, ...).
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
+    with_per_cpu_variables_mut(|per_cpu_variables| {
+        per_cpu_variables.restore_extended_states(HV_VTL_NORMAL);
+    });
+
+    let stack_top = with_per_cpu_variables(PerCpuVariables::kernel_stack_top);
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, rax",
+            "and rsp, {stack_alignment}",
+            "call {loop}",
+            in("rax") stack_top, loop = sym vtl_switch_loop,
+            stack_alignment = const STACK_ALIGNMENT,
+            options(noreturn)
+        );
+    }
+}
+
+fn vtl_switch_loop() -> ! {
     loop {
         unsafe {
             save_vtl1_state();
             load_vtl_state(HV_VTL_NORMAL);
         }
-
-        with_per_cpu_variables_mut(|per_cpu_variables| {
-            per_cpu_variables.restore_extended_states(HV_VTL_NORMAL);
-        });
 
         vtl_return();
 
@@ -156,11 +181,11 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
                         per_cpu_variables.set_vtl_return_value(result as u64);
                     });
                 }
-                // jump_to_vtl_switch_loop_with_stack_cleanup();
+                jump_to_vtl_switch_loop_with_stack_cleanup();
             }
             VtlEntryReason::Interrupt => {
                 vsm_handle_intercept();
-                // jump_to_vtl_switch_loop_with_stack_cleanup();
+                jump_to_vtl_switch_loop_with_stack_cleanup();
             }
             VtlEntryReason::Unknown => {
                 panic!("Unknown VTL entry reason");
