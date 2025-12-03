@@ -38,6 +38,11 @@ impl<T> ReadEnd<T> {
         }
     }
 
+    /// Peeks at the first item in the channel and conditionally consumes it.
+    ///
+    /// This method allows examining and potentially modifying the first item in the
+    /// channel through a closure. The closure decides whether to consume the item
+    /// by returning a boolean in its result tuple.
     pub(crate) fn peek_and_consume_one<R>(
         &self,
         mut f: impl FnMut(&mut T) -> Result<(bool, R), Errno>,

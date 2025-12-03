@@ -117,6 +117,8 @@ void* client_thread(void* arg) {
         printf("Client: Sent '%s'\n", message);
     }
     
+    usleep(500000);  // Wait for server to process and stop
+
     // Receive response
     memset(recv_buf, 0, sizeof(recv_buf));
     ssize_t n = recv(client_fd, recv_buf, sizeof(recv_buf), 0);
@@ -125,9 +127,9 @@ void* client_thread(void* arg) {
     } else {
         printf("Client: Received '%s'\n", recv_buf);
     }
-    
+
     close(client_fd);
-    
+
     return NULL;
 }
 
