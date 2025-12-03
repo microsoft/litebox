@@ -10,6 +10,8 @@ fs-err = "3.1.2"
 clap = { version = "4.5.33", features = ["derive"] }
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+xshell = "0.2.7"
+petname = "2.0.2"
 
 [lints]
 workspace = true
