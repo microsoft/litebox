@@ -100,20 +100,31 @@ unsafe extern "system" fn vectored_exception_handler(
         return EXCEPTION_CONTINUE_SEARCH;
     };
     let tls = unsafe { &*tls };
-    // Only handle exceptions that happen inside the guest.
-    if !tls.is_in_guest.get() {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    tls.is_in_guest.set(false);
-
-    let (info, exception_record, context, regs);
+    let (info, exception_record, context);
     unsafe {
         info = *exception_info;
         exception_record = &*info.ExceptionRecord;
         context = &mut *info.ContextRecord;
-        regs = &mut *tls.guest_context_top.get().wrapping_sub(1);
     }
 
+    if !tls.is_in_guest.get() {
+        // This might be a faulting guest memory access in LiteBox code. Try to
+        // recover.
+        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+            && let Some(recover) =
+                litebox::mm::exception_table::search_exception_tables(context.Rip.truncate())
+        {
+            // Found a matching exception table entry.
+            context.Rip = recover as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        } else {
+            // Not one of our exceptions; let other handlers process it.
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
+    tls.is_in_guest.set(false);
+
+    let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
     save_guest_context(regs, context);
 
     // If it looks like fs base was cleared, then go through the interrupt path
@@ -1229,9 +1240,18 @@ impl litebox::platform::DebugLogProvider for WindowsUserland {
     }
 }
 
+type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+
 impl litebox::platform::RawPointerProvider for WindowsUserland {
-    type RawConstPointer<T: Clone> = litebox::platform::trivial_providers::TransparentConstPtr<T>;
-    type RawMutPointer<T: Clone> = litebox::platform::trivial_providers::TransparentMutPtr<T>;
+    type RawConstPointer<T: Clone> = UserConstPtr<T>;
+    type RawMutPointer<T: Clone> = UserMutPtr<T>;
 }
 
 #[allow(
@@ -1484,9 +1504,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     },
                 )
                 .unwrap();
-                return Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-                    inner: base_addr.cast::<u8>(),
-                });
+                return Ok(UserMutPtr::from_ptr(base_addr.cast()));
             }
         }
 
@@ -1503,9 +1521,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         if populate_pages_immediately {
             do_prefetch_on_range(ptr as usize, size);
         }
-        Ok(litebox::platform::trivial_providers::TransparentMutPtr {
-            inner: ptr.cast::<u8>(),
-        })
+        Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 
     unsafe fn deallocate_pages(

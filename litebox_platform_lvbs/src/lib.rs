@@ -23,7 +23,6 @@ use litebox::platform::{
 };
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
-use ptr::UserMutPtr;
 use x86_64::structures::paging::{
     PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
     mapper::MapToError,
@@ -35,7 +34,6 @@ pub mod arch;
 pub mod host;
 pub mod mm;
 pub mod mshv;
-pub mod ptr;
 
 pub mod syscall_entry;
 pub(crate) mod user_context;
@@ -57,9 +55,19 @@ pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
     host: core::marker::PhantomData<Host>,
 }
 
+// TODO: implement pointer validation to ensure the pointers are in user space.
+type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
-    type RawConstPointer<T: Clone> = ptr::UserConstPtr<T>;
-    type RawMutPointer<T: Clone> = ptr::UserMutPtr<T>;
+    type RawConstPointer<T: Clone> = UserConstPtr<T>;
+    type RawMutPointer<T: Clone> = UserMutPtr<T>;
 }
 
 impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, Host> {

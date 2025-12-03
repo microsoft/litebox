@@ -15,7 +15,7 @@ use litebox::{
 use spin::mutex::SpinMutex;
 
 use crate::{
-    HostInterface,
+    HostInterface, UserMutPtr,
     arch::{
         MappedFrame, Page, PageFaultErrorCode, PageTableFlags, PhysAddr, Size4KiB, TranslateResult,
         VirtAddr,
@@ -24,7 +24,6 @@ use crate::{
     host::mock::{MockHostInterface, MockKernel},
     mm::{MemoryProvider, pgtable::PageTableAllocator},
     mock_log_println,
-    ptr::UserMutPtr,
 };
 
 use super::pgtable::PageTableImpl;

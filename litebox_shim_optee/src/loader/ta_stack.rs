@@ -260,9 +260,7 @@ impl TaStack {
 /// Normally, `sp` should be the return value of this function's previous call (with `None`).
 pub(crate) fn allocate_stack(stack_base: Option<usize>) -> Option<TaStack> {
     let sp = if let Some(stack_base) = stack_base {
-        MutPtr {
-            inner: stack_base as *mut u8,
-        }
+        MutPtr::from_usize(stack_base)
     } else {
         let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
             .expect("DEFAULT_STACK_SIZE is not page-aligned");

@@ -8,9 +8,9 @@
 // fruitful.
 
 use core::hash::BuildHasher as _;
+use core::num::NonZeroU32;
 use core::pin::pin;
 use core::sync::atomic::{AtomicBool, Ordering};
-use core::{num::NonZeroU32, sync::atomic::AtomicU32};
 
 use super::RawSyncPrimitivesProvider;
 use crate::event::wait::{WaitContext, WaitError, Waker};
@@ -66,23 +66,6 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         &self.table[hash % HASH_TABLE_ENTRIES]
     }
 
-    /// (Private-only) convert the `futex_addr` to an atomic u32. The lifetime created by this MUST
-    /// NOT be used outside of its immediately-invoking function.
-    fn futex_addr_as_atomic<'a>(
-        futex_addr: Platform::RawMutPointer<u32>,
-    ) -> Result<&'a AtomicU32, FutexError> {
-        let addr: usize = futex_addr.as_usize();
-        if !addr.is_multiple_of(align_of::<AtomicU32>()) {
-            return Err(FutexError::NotAligned);
-        }
-        let ptr = addr as *mut u32;
-        // SAFETY: we've ensured that it is aligned. The read/write lifetimes of `ptr` are going to
-        // be valid as long as we don't actually expose the created `AtomicU32` lifetime outside
-        // this module. And for the memory model, we are explicitly using it only on things that are
-        // supposed to be for futex operations.
-        Ok(unsafe { AtomicU32::from_ptr(ptr) })
-    }
-
     /// Performs a futex wait.
     ///
     /// This function tests once if the futex word matches the expected value,
@@ -104,7 +87,9 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     ) -> Result<(), FutexError> {
         let bitset = bitset.unwrap_or(ALL_BITS).get();
         let addr = futex_addr.as_usize();
-        let futex_addr = Self::futex_addr_as_atomic(futex_addr)?;
+        if !addr.is_multiple_of(align_of::<u32>()) {
+            return Err(FutexError::NotAligned);
+        }
 
         let bucket = self.bucket(addr);
         let mut entry = pin!(LoanListEntry::new(
@@ -123,7 +108,13 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
 
         // Check the value once. Do this only after inserting into the list so
         // that we don't miss a wakeup.
-        if futex_addr.load(Ordering::Relaxed) != expected_value {
+        let value = unsafe {
+            futex_addr
+                .read_at_offset(0)
+                .ok_or(FutexError::Fault)?
+                .into_owned()
+        };
+        if value != expected_value {
             return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
         }
         // Only return when woken--don't reevaluate the futex word. This
@@ -154,7 +145,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         bitset: Option<NonZeroU32>,
     ) -> Result<u32, FutexError> {
         let addr = futex_addr.as_usize();
-        if !addr.is_multiple_of(align_of::<AtomicU32>()) {
+        if !addr.is_multiple_of(align_of::<u32>()) {
             return Err(FutexError::NotAligned);
         }
         let bitset = bitset.unwrap_or(ALL_BITS).get();
@@ -191,6 +182,8 @@ pub enum FutexError {
     ImmediatelyWokenBecauseValueMismatch,
     #[error("wait error")]
     WaitError(WaitError),
+    #[error("fault reading futex word")]
+    Fault,
 }
 
 #[cfg(test)]
@@ -360,7 +353,11 @@ mod tests {
             let result = waiter.join().unwrap();
             match result {
                 Ok(()) | Err(FutexError::WaitError(_)) => {}
-                Err(FutexError::ImmediatelyWokenBecauseValueMismatch | FutexError::NotAligned) => {
+                Err(
+                    FutexError::ImmediatelyWokenBecauseValueMismatch
+                    | FutexError::NotAligned
+                    | FutexError::Fault,
+                ) => {
                     unreachable!()
                 }
             }

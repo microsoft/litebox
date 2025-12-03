@@ -16,14 +16,12 @@ use litebox::platform::{
 use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
-use ptr::UserMutPtr;
 
 extern crate alloc;
 
 pub mod arch;
 pub mod host;
 pub mod mm;
-pub mod ptr;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
@@ -79,9 +77,19 @@ impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, H
 
 impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
 
+// TODO: implement pointer validation to ensure the pointers are in user space.
+type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
-    type RawConstPointer<T: Clone> = ptr::UserConstPtr<T>;
-    type RawMutPointer<T: Clone> = ptr::UserMutPtr<T>;
+    type RawConstPointer<T: Clone> = UserConstPtr<T>;
+    type RawMutPointer<T: Clone> = UserMutPtr<T>;
 }
 
 impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {

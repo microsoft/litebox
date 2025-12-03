@@ -19,6 +19,15 @@ buddy_system_allocator = { version = "0.11.0", default-features = false, feature
 # Depend on (currently unreleased) slabmalloc `main`, which contains some fixes on top of `0.11.0`
 slabmalloc = { git = "https://github.com/gz/rust-slabmalloc.git", rev = "19480b2e82704210abafe575fb9699184c1be110" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+]}
+
 [features]
 lock_tracing = ["dep:arrayvec", "spin/mutex"]
 panic_on_unclosed_fd_drop = []
