@@ -49,14 +49,10 @@ static PLATFORM: once_cell::race::OnceRef<'static, Platform> = once_cell::race::
 /// # Panics
 ///
 /// Panics if invoked more than once
-#[expect(
-    clippy::match_wild_err_arm,
-    reason = "the platform itself is not Debug thus we cannot use `expect`"
-)]
 pub fn set_platform(platform: &'static Platform) {
     match PLATFORM.set(platform) {
         Ok(()) => {}
-        Err(_) => panic!("set_platform should only be called once per crate"),
+        Err(()) => panic!("set_platform should only be called once per crate"),
     }
 }
 
