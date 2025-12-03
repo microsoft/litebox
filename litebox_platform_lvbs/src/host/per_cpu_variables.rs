@@ -23,6 +23,7 @@ pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
 pub struct PerCpuVariables {
+    _ktls: [u8; PAGE_SIZE],
     hv_vp_assist_page: [u8; PAGE_SIZE],
     hv_simp_page: [u8; PAGE_SIZE],
     interrupt_stack: [u8; INTERRUPT_STACK_SIZE],
@@ -154,8 +155,22 @@ impl PerCpuVariables {
     }
 }
 
+/// Kernel TLS value offsets to read and write some values through assmebly code (i.e., GS register).
+/// We need controlling CPU registers like `rsp` and `rip` often require direct global memory access.
+/// This is based on our Shim TLS usage.
+/// Since we use `RefCell` for `PerCpuVariables` and `PerCpuVariables` is 4096-byte aligned,
+/// `gs:[0x0]` to `gs:[0x1000]` contain `RefCell` stuffs and padding.
+/// Note: This might a bit arbitrary and can be broken if `RefCell` layout changes in the future.
+#[non_exhaustive]
+#[repr(usize)]
+pub enum KernelTlsOffset {
+    KernelStackPtr = 0x1000 + 0,
+    InterruptStackPtr = 0x1000 + 8,
+}
+
 /// per-CPU variables for core 0 (or BSP). This must use static memory because kernel heap is not ready.
 static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
+    _ktls: [0u8; PAGE_SIZE],
     hv_vp_assist_page: [0u8; PAGE_SIZE],
     hv_simp_page: [0u8; PAGE_SIZE],
     interrupt_stack: [0u8; INTERRUPT_STACK_SIZE],
