@@ -1,5 +1,5 @@
+use crate::UserMutPtr;
 use litebox::mm::linux::PAGE_SIZE;
-use litebox::platform::common_providers::userspace_pointers::UserMutPtr;
 use litebox::platform::{RawConstPointer, RawMutPointer};
 use litebox_common_linux::{MapFlags, ProtFlags};
 use litebox_common_optee::{LdelfMapFlags, TeeResult, TeeUuid};
@@ -20,7 +20,7 @@ const DUMMY_HANDLE: u32 = 1;
 /// Memory regions between `start - pad_begin` and `start` and between
 /// `start + num_bytes` and `start + num_bytes + pad_end` are reserved and must not be used.
 pub fn sys_map_zi(
-    va: crate::MutPtr<usize>,
+    va: UserMutPtr<usize>,
     num_bytes: usize,
     pad_begin: usize,
     pad_end: usize,
@@ -83,7 +83,7 @@ pub fn sys_map_zi(
 
 /// OP-TEE's syscall to open a TA binary.
 #[expect(clippy::unnecessary_wraps)]
-pub fn sys_open_bin(ta_uuid: TeeUuid, handle: crate::MutPtr<u32>) -> Result<(), TeeResult> {
+pub fn sys_open_bin(ta_uuid: TeeUuid, handle: UserMutPtr<u32>) -> Result<(), TeeResult> {
     // TODO: This function requires an RPC from the secure world to the normal world to
     // open the TA binary identified by `ta_uuid` and return a handle to it in `handle`.
     // Since we don't have RPC implementation yet, we just return a dummy handle value.
@@ -125,7 +125,7 @@ pub fn sys_close_bin(handle: u32) -> Result<(), TeeResult> {
 
 /// OP-TEE's syscall to map a portion of a TA binary into memory.
 pub fn sys_map_bin(
-    va: crate::MutPtr<usize>,
+    va: UserMutPtr<usize>,
     num_bytes: usize,
     handle: u32,
     offs: usize,

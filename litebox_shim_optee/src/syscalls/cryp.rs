@@ -12,14 +12,14 @@ use litebox_common_optee::{
     TeeObjectType, TeeOperationMode, TeeResult, UteeAttribute,
 };
 
-use crate::{Cipher, MutPtr, TeeCrypState, TeeObj};
+use crate::{Cipher, TeeCrypState, TeeObj, UserMutPtr};
 
 pub(crate) fn sys_cryp_state_alloc(
     algo: TeeAlgorithm,
     mode: TeeOperationMode,
     key1: TeeObjHandle,
     key2: TeeObjHandle,
-    state: MutPtr<TeeCrypStateHandle>,
+    state: UserMutPtr<TeeCrypStateHandle>,
 ) -> Result<(), TeeResult> {
     with_current_task(|task| {
         let tee_cryp_state_map = &task.tee_cryp_state_map;
@@ -210,7 +210,7 @@ fn do_cipher_update(
 
 pub(crate) fn sys_cryp_obj_get_info(
     obj: TeeObjHandle,
-    info: MutPtr<TeeObjectInfo>,
+    info: UserMutPtr<TeeObjectInfo>,
 ) -> Result<(), TeeResult> {
     with_current_task(|task| {
         let tee_obj_map = &task.tee_obj_map;
@@ -229,7 +229,7 @@ pub(crate) fn sys_cryp_obj_get_info(
 pub(crate) fn sys_cryp_obj_alloc(
     typ: TeeObjectType,
     max_size: u32,
-    obj: crate::MutPtr<TeeObjHandle>,
+    obj: UserMutPtr<TeeObjHandle>,
 ) -> Result<(), TeeResult> {
     with_current_task(|task| {
         let tee_obj_map = &task.tee_obj_map;

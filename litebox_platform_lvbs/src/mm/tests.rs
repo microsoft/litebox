@@ -3,7 +3,6 @@ use core::alloc::{GlobalAlloc, Layout};
 use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
-use litebox::platform::common_providers::userspace_pointers::UserMutPtr;
 use litebox::{
     LiteBox,
     mm::{

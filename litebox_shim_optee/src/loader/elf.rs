@@ -18,7 +18,7 @@ use once_cell::race::OnceBox;
 use thiserror::Error;
 
 use super::ElfLoadInfo;
-use crate::MutPtr;
+use crate::UserMutPtr;
 
 #[cfg(feature = "platform_linux_userland")]
 use crate::litebox_page_manager;
@@ -204,7 +204,7 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
                 .expect("fd_elf_map.read failed");
 
             crate::syscalls::mm::sys_mprotect(
-                MutPtr::from_usize(mapped_addr),
+                UserMutPtr::from_usize(mapped_addr),
                 len,
                 litebox_common_linux::ProtFlags::from_bits(prot.bits()).ok_or(
                     elf_loader::Error::MmapError {
@@ -357,7 +357,8 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
     // TODO: For now, we unmap `ldelf`'s memory area to load the trampoline.
     // TAs might interact with `ldelf` to use its critical syscalls, so we might need to
     // figure out how to deal with this potential memory area overlap.
-    let _ = crate::syscalls::mm::sys_munmap(MutPtr::from_usize(start_addr), end_addr - start_addr);
+    let _ =
+        crate::syscalls::mm::sys_munmap(UserMutPtr::from_usize(start_addr), end_addr - start_addr);
     let ret = unsafe {
         ElfLoaderMmap::mmap(
             Some(start_addr),
@@ -386,7 +387,7 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
     unsafe {
         placeholder.write(litebox_platform_multiplex::platform().get_syscall_entry_point());
     }
-    let ptr = crate::MutPtr::from_usize(start_addr);
+    let ptr = UserMutPtr::from_usize(start_addr);
     let pm = litebox_page_manager();
     unsafe { pm.make_pages_executable(ptr, end_addr - start_addr) }
         .expect("failed to make pages executable");

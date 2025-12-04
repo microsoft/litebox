@@ -103,11 +103,7 @@ pub fn get_ta_base_addr() -> Option<usize> {
 ///
 /// # Safety
 /// Ensure that `dst` is valid for `count` bytes.
-unsafe fn read_ta_bin(
-    dst: litebox::platform::common_providers::userspace_pointers::UserMutPtr<u8>,
-    offset: usize,
-    count: usize,
-) -> Option<()> {
+unsafe fn read_ta_bin(dst: UserMutPtr<u8>, offset: usize, count: usize) -> Option<()> {
     with_current_task(|task| {
         if let Some(ta_bin) = task.ta_bin.as_ref() {
             let end_offset = offset.checked_add(count)?;
@@ -135,9 +131,14 @@ pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE>
     VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
 }
 
-// Convenience type aliases
-type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
-type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
+type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
+type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
+    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    T,
+>;
 
 pub struct OpteeShim;
 
@@ -455,10 +456,10 @@ fn handle_ldelf_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> Conti
 #[inline]
 fn handle_cipher_update_or_final<F>(
     state: TeeCrypStateHandle,
-    src: ConstPtr<u8>,
+    src: UserConstPtr<u8>,
     src_len: usize,
-    dst: MutPtr<u8>,
-    dst_len: MutPtr<u64>,
+    dst: UserMutPtr<u8>,
+    dst_len: UserMutPtr<u64>,
     syscall_fn: F,
 ) -> Result<(), TeeResult>
 where

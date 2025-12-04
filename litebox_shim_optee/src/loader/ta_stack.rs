@@ -6,7 +6,7 @@ use litebox::{
 };
 use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 
-use crate::{MutPtr, litebox_page_manager};
+use crate::{UserMutPtr, litebox_page_manager};
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
@@ -47,7 +47,7 @@ fn align_down(addr: usize, align: usize) -> usize {
 /// NOTE: The above layout diagram is for 64-bit processes.
 pub struct TaStack {
     /// The top of the stack (base address)
-    stack_top: MutPtr<u8>,
+    stack_top: UserMutPtr<u8>,
     /// The length of the stack
     len: usize,
     /// The current position of the stack pointer
@@ -65,7 +65,7 @@ impl TaStack {
     /// Create a new stack for the user process.
     ///
     /// `stack_top` and `len` must be aligned to [`Self::STACK_ALIGNMENT`]
-    pub(super) fn new(stack_top: MutPtr<u8>, len: usize) -> Option<Self> {
+    pub(super) fn new(stack_top: UserMutPtr<u8>, len: usize) -> Option<Self> {
         if !stack_top.as_usize().is_multiple_of(Self::STACK_ALIGNMENT)
             || !len.is_multiple_of(Self::STACK_ALIGNMENT)
         {
@@ -278,7 +278,7 @@ impl TaStack {
 /// Normally, `sp` should be the return value of this function's previous call (with `None`).
 pub(crate) fn allocate_stack(stack_base: Option<usize>) -> Option<TaStack> {
     let sp = if let Some(stack_base) = stack_base {
-        MutPtr::from_usize(stack_base)
+        UserMutPtr::from_usize(stack_base)
     } else {
         let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
             .expect("DEFAULT_STACK_SIZE is not page-aligned");
