@@ -441,7 +441,7 @@ impl Task {
         };
         self.sys_close_inner(fd).map(|()| 0)
     }
-    pub(crate) fn sys_close_inner(&self, fd: u32) -> Result<(), Errno> {
+    fn sys_close_inner(&self, fd: u32) -> Result<(), Errno> {
         let files = self.files.borrow();
         let mut file_table = files.file_descriptors.write();
         match file_table.remove(fd) {

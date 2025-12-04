@@ -752,7 +752,7 @@ impl Task {
         self.sys_socket_inner(domain, ty, flags, protocol)
             .map(|fd| fd as usize)
     }
-    pub(super) fn sys_socket_inner(
+    fn sys_socket_inner(
         &self,
         domain: AddressFamily,
         ty: SockType,
@@ -998,7 +998,7 @@ impl Task {
         };
         self.sys_listen_inner(sockfd, backlog).map(|()| 0)
     }
-    pub(crate) fn sys_listen_inner(&self, sockfd: u32, backlog: u16) -> Result<(), Errno> {
+    fn sys_listen_inner(&self, sockfd: u32, backlog: u16) -> Result<(), Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -1245,7 +1245,7 @@ impl Task {
         self.sys_getsockopt_inner(sockfd, optname, optval, optlen)
             .map(|()| 0)
     }
-    pub(crate) fn sys_getsockopt_inner(
+    fn sys_getsockopt_inner(
         &self,
         sockfd: u32,
         optname: SocketOptionName,
@@ -1540,6 +1540,11 @@ mod tests {
         task
     }
 
+    fn close_socket(task: &crate::Task, fd: u32) {
+        task.sys_close(i32::try_from(fd).unwrap())
+            .expect("close socket failed");
+    }
+
     fn epoll_add(task: &crate::Task, epfd: i32, target_fd: u32, events: litebox::event::Events) {
         let ev = litebox_common_linux::EpollEvent {
             events: events.bits(),
@@ -1747,10 +1752,8 @@ mod tests {
             _ => panic!("Unknown option"),
         }
 
-        task.sys_close_inner(client_fd)
-            .expect("Failed to close client socket");
-        task.sys_close_inner(server)
-            .expect("Failed to close server socket");
+        close_socket(task, client_fd);
+        close_socket(task, server);
     }
 
     fn test_tcp_socket_with_external_client(
@@ -1823,7 +1826,7 @@ mod tests {
             .sys_dup(i32::try_from(socket_fd).unwrap(), None, None)
             .unwrap();
 
-        task.sys_close_inner(socket_fd).unwrap();
+        close_socket(&task, socket_fd);
         let err = task
             .sys_connect_inner(
                 socket_fd2,
@@ -1891,8 +1894,7 @@ mod tests {
         )
         .expect("Failed to set SO_LINGER");
 
-        task.sys_close_inner(client_fd)
-            .expect("failed to close client socket");
+        close_socket(&task, client_fd);
 
         let output = child_handle
             .join()
@@ -2003,8 +2005,7 @@ mod tests {
         let SocketAddress::Inet(sender_addr) = sender_addr.unwrap();
         assert_eq!(sender_addr.port(), CLIENT_PORT);
 
-        task.sys_close_inner(server_fd)
-            .expect("failed to close server");
+        close_socket(&task, server_fd);
 
         child.wait().expect("Failed to wait for client");
     }
@@ -2073,8 +2074,7 @@ mod tests {
         task.sys_sendto_inner(client_fd, msg_ptr, msg.len(), SendFlags::empty(), None)
             .expect("failed to sendto");
 
-        task.sys_close_inner(client_fd)
-            .expect("failed to close client");
+        close_socket(&task, client_fd);
     }
 
     #[test]
@@ -2122,5 +2122,23 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, Errno::EINVAL);
+    }
+
+    #[test]
+    fn test_socket_dup_and_close() {
+        let task = init_platform(None);
+        let socket_fd = task
+            .sys_socket_inner(
+                litebox_common_linux::AddressFamily::INET,
+                litebox_common_linux::SockType::Stream,
+                litebox_common_linux::SockFlags::empty(),
+                None,
+            )
+            .unwrap();
+        let socket_fd2 = task
+            .sys_dup(i32::try_from(socket_fd).unwrap(), None, None)
+            .unwrap();
+        close_socket(&task, socket_fd);
+        close_socket(&task, socket_fd2);
     }
 }
