@@ -247,9 +247,34 @@ fn compare_runs(print_on_missing: bool, run1: &str, run2: &str, cli_args: &CliAr
     let all_benches: BTreeSet<&str> = r1.keys().chain(r2.keys()).copied().collect();
 
     info!(run1, run2, "Comparing runs");
-    println!("| Benchmark                      | {run1:>22} (ms) | {run2:>22} (ms) | Diff (ms) |");
+    let bench_width = all_benches
+        .iter()
+        .map(|b| b.len())
+        .max()
+        .unwrap_or(9)
+        .max(9);
+    let run1_header = format!("{} (ms)", run1);
+    let run2_header = format!("{} (ms)", run2);
+    let max_time1_width = r1
+        .values()
+        .map(|d| d.as_millis().to_string().len())
+        .max()
+        .unwrap_or(0);
+    let max_time2_width = r2
+        .values()
+        .map(|d| d.as_millis().to_string().len())
+        .max()
+        .unwrap_or(0);
+    let run1_width = run1_header.len().max(max_time1_width);
+    let run2_width = run2_header.len().max(max_time2_width);
+    let diff_width = 9;
     println!(
-        "|:-------------------------------|----------------------------:|----------------------------:|----------:|"
+        "| {:<bench_width$} | {:>run1_width$} | {:>run2_width$} | {:>diff_width$} |",
+        "Benchmark", run1_header, run2_header, "Diff (ms)"
+    );
+    println!(
+        "|:{:-<bench_width$}-|-{:-<run1_width$}:|-{:-<run2_width$}:|-{:-<diff_width$}:|",
+        "", "", "", ""
     );
 
     let mut total_counted = 0i128;
@@ -261,7 +286,7 @@ fn compare_runs(print_on_missing: bool, run1: &str, run2: &str, cli_args: &CliAr
                 let abs_diff = t2.abs_diff(*t1).as_millis() as i128;
                 let diff = if t1 > t2 { -abs_diff } else { abs_diff };
                 println!(
-                    "| {:<30} | {:>27} | {:>27} | {:>9} |",
+                    "| {:<bench_width$} | {:>run1_width$} | {:>run2_width$} | {:>diff_width$} |",
                     bench,
                     t1.as_millis(),
                     t2.as_millis(),
