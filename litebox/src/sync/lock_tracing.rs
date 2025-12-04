@@ -1,4 +1,31 @@
-//! Lock-tracing functionality
+//! Lock-tracing functionality for debugging lock ordering and contention
+//! issues.
+//!
+//! This module provides runtime tracking of lock acquisitions and releases to
+//! help detect potential deadlocks, lock ordering violations, and performance
+//! issues related to lock contention. When enabled, it records which locks are
+//! held by the current thread and can detect and report various problematic
+//! patterns.
+//!
+//! # Feature flag
+//!
+//! Lock tracing is only compiled in when the `lock_tracing` cargo feature is
+//! enabled. Without this feature, lock tracing functionality is not available,
+//! and the LiteBox synchronization objects do not include any lock-tracing
+//! state or runtime overhead.
+//!
+//! # Initialization
+//!
+//! The lock tracker is initialized when [`LiteBox`](crate::LiteBox) is
+//! instantiated, via [`LockTracker::init`]. Until initialization occurs, lock
+//! tracing is silently disabled: locks can be acquired and released normally,
+//! but no tracking or debugging output will occur. This allows early
+//! initialization code to use locks before the full LiteBox environment is set
+//! up.
+//!
+//! Once initialized, the tracker will begin monitoring all subsequent lock
+//! operations and reporting issues according to the configuration constants
+//! defined below.
 
 use core::time::Duration;
 

@@ -56,7 +56,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             );
         }
 
-        // Enable lock tracing using this platform for time keeping and debug
+        // Enable lock tracing, using this platform for time keeping and debug
         // prints, if the feature is enabled.
         #[cfg(feature = "lock_tracing")]
         crate::sync::lock_tracing::LockTracker::init(platform);
