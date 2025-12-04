@@ -514,7 +514,7 @@ fn test_tun_and_runner_with_iperf3() {
         while !has_started_clone.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        std::thread::sleep(std::time::Duration::from_secs(2)); // wait a bit more to ensure server is ready
+        std::thread::sleep(std::time::Duration::from_secs(5)); // wait a bit more to ensure server is ready
         std::println!("Starting iperf3 client...");
         let mut client = std::process::Command::new(&cloned_path)
             .args(["-c", "10.0.0.2"])
