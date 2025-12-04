@@ -4,7 +4,7 @@ use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::sync::{Mutex, RawSyncPrimitivesProvider, Synchronization};
+use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 /// A trait for filtering events of type `E`.
 pub trait EventsFilter<E>: Send + Sync + 'static {
@@ -73,11 +73,19 @@ pub struct Subject<E, F: EventsFilter<E>, Platform: RawSyncPrimitivesProvider> {
     nums: AtomicUsize,
 }
 
+impl<E, F: EventsFilter<E> + Default, Platform: RawSyncPrimitivesProvider> Default
+    for Subject<E, F, Platform>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<E, F: EventsFilter<E>, Platform: RawSyncPrimitivesProvider> Subject<E, F, Platform> {
     /// Create a new subject.
-    pub fn new(sync: &Synchronization<Platform>) -> Self {
+    pub fn new() -> Self {
         Self {
-            observers: sync.new_mutex(BTreeMap::new()),
+            observers: Mutex::new(BTreeMap::new()),
             nums: AtomicUsize::new(0),
         }
     }

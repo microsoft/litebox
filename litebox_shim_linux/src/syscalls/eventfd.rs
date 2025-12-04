@@ -24,15 +24,15 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> 
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
-    pub(crate) fn new(count: u64, flags: EfdFlags, litebox: &litebox::LiteBox<Platform>) -> Self {
+    pub(crate) fn new(count: u64, flags: EfdFlags) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
 
         Self {
-            counter: litebox.sync().new_mutex(count),
+            counter: litebox::sync::Mutex::new(count),
             status: AtomicU32::new(status.bits()),
             semaphore: flags.contains(EfdFlags::SEMAPHORE),
-            pollee: Pollee::new(litebox),
+            pollee: Pollee::new(),
         }
     }
 
@@ -123,13 +123,9 @@ mod tests {
 
     #[test]
     fn test_semaphore_eventfd() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(
-            0,
-            EfdFlags::SEMAPHORE,
-            &task.global.litebox,
-        ));
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::SEMAPHORE));
         let total = 8;
         for _ in 0..total {
             let copied_eventfd = eventfd.clone();
@@ -148,13 +144,9 @@ mod tests {
 
     #[test]
     fn test_blocking_eventfd() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(
-            0,
-            EfdFlags::empty(),
-            &task.global.litebox,
-        ));
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::empty()));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             copied_eventfd
@@ -177,13 +169,9 @@ mod tests {
 
     #[test]
     fn test_blocking_eventfd_no_race_on_massive_readwrite() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(
-            0,
-            EfdFlags::empty(),
-            &task.global.litebox,
-        ));
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::empty()));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             for _ in 0..10000 {
@@ -201,13 +189,9 @@ mod tests {
 
     #[test]
     fn test_nonblocking_eventfd() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(
-            0,
-            EfdFlags::NONBLOCK,
-            &task.global.litebox,
-        ));
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::NONBLOCK));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             // first write should succeed immediately

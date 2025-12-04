@@ -1,6 +1,6 @@
 //! Process/thread related syscalls.
 
-use crate::{ConstPtr, GlobalState, MutPtr, Task};
+use crate::{ConstPtr, MutPtr, Task};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::Arc;
@@ -52,11 +52,11 @@ pub(crate) struct ThreadState {
 unsafe impl Send for ThreadState {}
 
 impl ThreadState {
-    pub fn new_process(global: &GlobalState, pid: i32) -> Self {
+    pub fn new_process(pid: i32) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(global, pid, remote.clone())),
+            process: Arc::new(Process::new(pid, remote.clone())),
             remote,
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -145,12 +145,12 @@ pub(crate) enum ExitStatus {
 
 impl Process {
     /// Creates a new process with the given initial thread.
-    fn new(global: &GlobalState, pid: i32, remote: Arc<ThreadRemote>) -> Self {
+    fn new(pid: i32, remote: Arc<ThreadRemote>) -> Self {
         let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         Self {
             nr_threads,
-            inner: global.litebox.sync().new_mutex(ProcessInner {
+            inner: Mutex::new(ProcessInner {
                 exit_status: ExitStatus::Exit(0),
                 group_exit: false,
                 is_killing_other_threads: false,
@@ -992,13 +992,12 @@ impl Task {
         clockid: litebox_common_linux::ClockId,
         tp: TimeParam<Platform>,
     ) -> Result<(), Errno> {
-        let duration = self.gettime_as_duration(self.global.platform, clockid)?;
+        let duration = self.gettime_as_duration(clockid)?;
         tp.write(duration)
     }
 
     fn gettime_as_duration(
         &self,
-        platform: &litebox_platform_multiplex::Platform,
         clockid: litebox_common_linux::ClockId,
     ) -> Result<core::time::Duration, Errno> {
         let duration = match clockid {
@@ -1008,13 +1007,19 @@ impl Task {
             }
             litebox_common_linux::ClockId::Monotonic => {
                 // CLOCK_MONOTONIC
-                platform.now().duration_since(&self.global.boot_time)
+                self.global
+                    .platform
+                    .now()
+                    .duration_since(&self.global.boot_time)
             }
             litebox_common_linux::ClockId::MonotonicCoarse => {
                 // CLOCK_MONOTONIC_COARSE - provides faster but less precise monotonic time
                 // For simplicity, we can reuse the same monotonic time as CLOCK_MONOTONIC
                 // In a real implementation, this would typically have lower resolution
-                platform.now().duration_since(&self.global.boot_time)
+                self.global
+                    .platform
+                    .now()
+                    .duration_since(&self.global.boot_time)
             }
             _ => {
                 log_unsupported!("gettime for {clockid:?}");
@@ -1045,9 +1050,10 @@ impl Task {
             _ => {
                 // Convert between time domains. If the requested time is in the past,
                 // return the current time.
-                let platform = litebox_platform_multiplex::platform();
-                let current_time = self.gettime_as_duration(platform, clock_id)?;
-                Ok(platform
+                let current_time = self.gettime_as_duration(clock_id)?;
+                Ok(self
+                    .global
+                    .platform
                     .now()
                     .checked_add(duration.checked_sub(current_time).unwrap_or(Duration::ZERO)))
             }
@@ -1360,7 +1366,7 @@ impl Task {
         }
         self.thread.clear_child_tid.set(None);
 
-        self.signals.reset_for_exec(&self.global.litebox);
+        self.signals.reset_for_exec();
 
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();

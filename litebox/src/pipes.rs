@@ -63,12 +63,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         flags: Flags,
         atomic_slice_guarantee_size: Option<NonZeroUsize>,
     ) -> (PipeFd<Platform>, PipeFd<Platform>) {
-        let (sender, receiver) = new_pipe::<Platform, u8>(
-            &self.litebox,
-            capacity,
-            OFlags::from(flags),
-            atomic_slice_guarantee_size,
-        );
+        let (sender, receiver) =
+            new_pipe::<Platform, u8>(capacity, OFlags::from(flags), atomic_slice_guarantee_size);
         let sender = PipeEnd::Sender(sender);
         let receiver = PipeEnd::Receiver(receiver);
         let mut dt = self.litebox.descriptor_table_mut();
@@ -277,10 +273,10 @@ struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform, T> {
-    fn new(rb: T, litebox: &LiteBox<Platform>) -> Self {
+    fn new(rb: T) -> Self {
         Self {
-            rb: litebox.sync().new_mutex(rb),
-            pollee: Pollee::new(litebox),
+            rb: Mutex::new(rb),
+            pollee: Pollee::new(),
             is_shutdown: AtomicBool::new(false),
         }
     }
@@ -389,14 +385,9 @@ impl From<TryOpError<PipeError>> for PipeError {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T> {
-    fn new(
-        rb: HeapProd<T>,
-        flags: OFlags,
-        atomic_slice_guarantee_size: usize,
-        litebox: &LiteBox<Platform>,
-    ) -> Self {
+    fn new(rb: HeapProd<T>, flags: OFlags, atomic_slice_guarantee_size: usize) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, litebox),
+            endpoint: EndPointer::new(rb),
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
             atomic_slice_guarantee_size,
@@ -514,9 +505,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for ReadE
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T> {
-    fn new(rb: HeapCons<T>, flags: OFlags, litebox: &LiteBox<Platform>) -> Self {
+    fn new(rb: HeapCons<T>, flags: OFlags) -> Self {
         Self {
-            endpoint: EndPointer::new(rb, litebox),
+            endpoint: EndPointer::new(rb),
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
         }
@@ -601,7 +592,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> Drop for ReadEnd<Pla
     reason = "clippy believes this result type to be complex, but factoring it out into a type def would not help readability in any way"
 )]
 fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
-    litebox: &LiteBox<Platform>,
     capacity: usize,
     flags: OFlags,
     atomic_slice_guarantee_size: Option<NonZeroUsize>,
@@ -616,11 +606,10 @@ fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
         atomic_slice_guarantee_size
             .map(NonZeroUsize::get)
             .unwrap_or_default(),
-        litebox,
     ));
     let consumer = Arc::new_cyclic(|weak_self| {
         Arc::get_mut(&mut producer).unwrap().peer = weak_self.clone();
-        let mut consumer = ReadEnd::new(rb_cons, flags, litebox);
+        let mut consumer = ReadEnd::new(rb_cons, flags);
         consumer.peer = Arc::downgrade(&producer);
         consumer
     });

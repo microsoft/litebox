@@ -190,9 +190,9 @@ impl LinuxShimBuilder {
             fs: self
                 .fs
                 .expect("File system must be set before calling build"),
-            futex_manager: FutexManager::new(&self.litebox),
+            futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
-            net: self.litebox.sync().new_mutex(net),
+            net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
             load_filter: self.load_filter,
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
@@ -224,14 +224,14 @@ impl LinuxShim {
             egid,
         } = task;
 
-        let files = Arc::new(syscalls::file::FilesState::new(&self.0.litebox));
+        let files = Arc::new(syscalls::file::FilesState::new());
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
 
         SHIM_TLS.init(LinuxShimTls {
             current_task: Task {
                 global: self.0.clone(),
-                thread: syscalls::process::ThreadState::new_process(&self.0, pid),
-                wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
+                thread: syscalls::process::ThreadState::new_process(pid),
+                wait_state: wait::WaitState::new(self.0.platform),
                 pid,
                 ppid,
                 tid: pid,
@@ -245,7 +245,7 @@ impl LinuxShim {
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(&self.0.litebox),
+                signals: syscalls::signal::SignalState::new_process(),
             },
         });
 
@@ -1243,11 +1243,11 @@ mod test_utils {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let files = Arc::new(syscalls::file::FilesState::new(&self.litebox));
+            let files = Arc::new(syscalls::file::FilesState::new());
             files.initialize_stdio_in_shared_descriptors_table(&self);
             Task {
-                wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
-                thread: syscalls::process::ThreadState::new_process(&self, pid),
+                wait_state: wait::WaitState::new(self.platform),
+                thread: syscalls::process::ThreadState::new_process(pid),
                 pid,
                 ppid: 0,
                 tid: pid,
@@ -1260,7 +1260,7 @@ mod test_utils {
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(&self.litebox),
+                signals: syscalls::signal::SignalState::new_process(),
                 global: self,
             }
         }
@@ -1274,7 +1274,7 @@ mod test_utils {
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let task = Task {
-                wait_state: wait::WaitState::new(litebox_platform_multiplex::platform()),
+                wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
                 thread: self.thread.new_thread(tid)?,
                 pid: self.pid,

@@ -10,7 +10,6 @@ use super::{
     observer::{Observer, Subject},
 };
 use crate::{
-    LiteBox,
     event::wait::{WaitContext, WaitError},
     platform::TimeProvider,
     sync::RawSyncPrimitivesProvider,
@@ -83,11 +82,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'_, Platfor
     }
 }
 
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Default for Pollee<Platform> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     /// Create a new pollee.
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
+    pub fn new() -> Self {
         Self {
-            subject: Subject::new(litebox.sync()),
+            subject: Subject::new(),
         }
     }
 

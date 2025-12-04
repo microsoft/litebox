@@ -826,7 +826,7 @@ where
                 Protocol::Icmp => unimplemented!(),
                 Protocol::Raw { protocol: _ } => unimplemented!(),
             },
-            pollee: crate::event::polling::Pollee::new(&self.litebox),
+            pollee: crate::event::polling::Pollee::new(),
             previously_sendable: AtomicBool::new(false),
             recv_queue: AtomicUsize::new(0),
         }))
@@ -1343,7 +1343,7 @@ where
                         was_connection_initiated: AtomicBool::new(true),
                         immediate_close: AtomicBool::new(false),
                     }),
-                    pollee: crate::event::polling::Pollee::new(&self.litebox),
+                    pollee: crate::event::polling::Pollee::new(),
                     previously_sendable: AtomicBool::new(true),
                     recv_queue: AtomicUsize::new(0),
                 };

@@ -50,8 +50,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         let litebox = litebox.clone();
-        let sync = litebox.sync();
-        let root = sync.new_rwlock(RootDir::new(sync));
+        let root = sync::RwLock::new(RootDir::new());
         Self {
             litebox,
             root,
@@ -180,7 +179,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     FileType::RegularFile,
                 );
                 assert!(old.is_none());
-                let entry = Entry::File(Arc::new(self.litebox.sync().new_rwlock(FileX {
+                let entry = Entry::File(Arc::new(sync::RwLock::new(FileX {
                     perms: Permissions {
                         mode,
                         userinfo: self.current_user,
@@ -522,7 +521,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         assert!(old.is_none());
         let old = root.entries.insert(
             path,
-            Entry::Dir(Arc::new(self.litebox.sync().new_rwlock(DirX {
+            Entry::Dir(Arc::new(sync::RwLock::new(DirX {
                 perms: Permissions {
                     mode,
                     userinfo: self.current_user,
@@ -736,11 +735,11 @@ struct RootDir<Platform: sync::RawSyncPrimitivesProvider> {
 type ParentAndEntry<'a, D, E> = Result<(Option<(&'a str, D)>, Option<E>), PathError>;
 
 impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
-    fn new(sync: &sync::Synchronization<Platform>) -> Self {
+    fn new() -> Self {
         Self {
             entries: [(
                 String::new(),
-                Entry::Dir(Arc::new(sync.new_rwlock(DirX {
+                Entry::Dir(Arc::new(sync::RwLock::new(DirX {
                     perms: Permissions {
                         mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                         userinfo: UserInfo { user: 0, group: 0 },

@@ -166,11 +166,10 @@ struct FileAndParsed<'a> {
 
 impl<'a> FileAndParsed<'a> {
     fn new(task: &'a Task, path: impl litebox::path::Arg) -> Result<Self, ElfLoaderError> {
-        let platform = litebox_platform_multiplex::platform();
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        parsed.parse_trampoline(&mut &file, platform.get_syscall_entry_point())?;
+        parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point())?;
         Ok(Self { file, parsed })
     }
 }

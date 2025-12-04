@@ -39,9 +39,7 @@ where
 {
     /// Create a new `PageManager` instance.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        let vmem = litebox
-            .sync()
-            .new_rwlock(linux::Vmem::new(litebox.x.platform));
+        let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
         Self { vmem }
     }
 

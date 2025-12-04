@@ -54,12 +54,12 @@ pub(crate) struct FilesState {
 }
 
 impl FilesState {
-    pub fn new(litebox: &litebox::LiteBox<Platform>) -> Self {
+    pub fn new() -> Self {
         Self {
-            file_descriptors: litebox.sync().new_rwlock(Descriptors::new()),
-            raw_descriptor_store: litebox
-                .sync()
-                .new_rwlock(litebox::fd::RawDescriptorStorage::new()),
+            file_descriptors: litebox::sync::RwLock::new(Descriptors::new()),
+            raw_descriptor_store: litebox::sync::RwLock::new(
+                litebox::fd::RawDescriptorStorage::new(),
+            ),
         }
     }
 }
@@ -1150,8 +1150,7 @@ impl Task {
             return Err(Errno::EINVAL);
         }
 
-        let eventfd =
-            super::eventfd::EventFile::new(u64::from(initval), flags, &self.global.litebox);
+        let eventfd = super::eventfd::EventFile::new(u64::from(initval), flags);
         let files = self.files.borrow();
         files
             .file_descriptors
@@ -1338,7 +1337,7 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
             return Err(Errno::EINVAL);
         }
 
-        let epoll_file = super::epoll::EpollFile::new(&self.global.litebox);
+        let epoll_file = super::epoll::EpollFile::new();
         let files = self.files.borrow();
         files
             .file_descriptors

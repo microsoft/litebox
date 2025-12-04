@@ -13,7 +13,6 @@ use core::sync::atomic::AtomicBool;
 use hashbrown::HashMap;
 use thiserror::Error;
 
-use crate::LiteBox;
 use crate::sync::{RawSyncPrimitivesProvider, RwLock};
 use crate::utilities::anymap::AnyMap;
 
@@ -22,7 +21,6 @@ mod tests;
 
 /// Storage of file descriptors and their entries.
 pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
-    litebox: LiteBox<Platform>,
     entries: Vec<Option<IndividualEntry<Platform>>>,
 }
 
@@ -31,12 +29,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ///
     /// This is expected to be invoked only by [`crate::LiteBox`]'s creation method, and should not
     /// be invoked anywhere else in the codebase.
-    pub(crate) fn new_from_litebox_creation(litebox: &LiteBox<Platform>) -> Self {
-        let litebox = litebox.clone();
-        Self {
-            litebox,
-            entries: vec![],
-        }
+    pub(crate) fn new_from_litebox_creation() -> Self {
+        Self { entries: vec![] }
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
@@ -56,9 +50,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let old = self.entries[idx].replace(IndividualEntry::new(Arc::new(
-            self.litebox.sync().new_rwlock(entry),
-        )));
+        let old = self.entries[idx].replace(IndividualEntry::new(Arc::new(RwLock::new(entry))));
         assert!(old.is_none());
         TypedFd {
             _phantom: PhantomData,
