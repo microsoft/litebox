@@ -188,9 +188,8 @@ fn vtl_switch_loop_body() {
     unsafe {
         save_vtl1_state();
         load_vtl_state(HV_VTL_NORMAL);
+        vtl_return();
     }
-
-    vtl_return();
 
     // *** This is where VTL1 starts to execute code (i.e., VTL0-to-VTL1 switch lands here) ***
 

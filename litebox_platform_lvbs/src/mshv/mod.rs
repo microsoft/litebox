@@ -11,7 +11,7 @@ mod heki;
 mod hvcall_mm;
 mod mem_integrity;
 
-use crate::host::hv_hypercall_page_address;
+use crate::host::{hv_hypercall_page_address, per_cpu_variables::KernelTlsOffset};
 use crate::mshv::hvcall_vp::hvcall_get_vp_registers;
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use litebox_common_linux::errno::Errno;
@@ -850,6 +850,33 @@ impl HvPendingExceptionEvent {
     }
 }
 
+pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), Errno> {
+    let value =
+        hvcall_get_vp_registers(HV_REGISTER_VSM_CODEPAGE_OFFSETS).map_err(|_| Errno::EIO)?;
+    let code_page_offsets = HvRegisterVsmCodePageOffsets::from_u64(value);
+    let vtl_return_address =
+        hv_hypercall_page_address() + u64::from(code_page_offsets.vtl_return_offset());
+    unsafe {
+        core::arch::asm!(
+            "mov gs:[{vtl_ret_addr_offset}], {vtl_return_address}",
+            vtl_ret_addr_offset = const {KernelTlsOffset::VtlReturnAddr as usize},
+            vtl_return_address = in(reg) vtl_return_address,
+            options(nostack, preserves_flags),
+        );
+    }
+    Ok(())
+}
+
+#[unsafe(naked)]
+pub unsafe extern "C" fn vtl_return() {
+    core::arch::naked_asm!(
+        "mov rax, gs:[{vtl_ret_addr_offset}]",
+        "xor ecx, ecx",
+        "call rax",
+        vtl_ret_addr_offset = const { KernelTlsOffset::VtlReturnAddr as usize },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,28 +1160,5 @@ mod tests {
         assert_eq!(default_exception.vector(), 0);
         assert_eq!(default_exception.error_code(), 0);
         assert_eq!(default_exception.as_u64(), 0);
-    }
-}
-
-static mut VTL_RETURN_ADDRESS: u64 = 0;
-pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), Errno> {
-    let value =
-        hvcall_get_vp_registers(HV_REGISTER_VSM_CODEPAGE_OFFSETS).map_err(|_| Errno::EIO)?;
-    let code_page_offsets = HvRegisterVsmCodePageOffsets::from_u64(value);
-    unsafe {
-        VTL_RETURN_ADDRESS =
-            hv_hypercall_page_address() + u64::from(code_page_offsets.vtl_return_offset());
-    }
-    Ok(())
-}
-
-#[expect(clippy::inline_always)]
-#[inline(always)]
-pub fn vtl_return() {
-    unsafe {
-        core::arch::asm!(
-            "call rax",
-            in("rax") VTL_RETURN_ADDRESS, in("rcx") 0x0,
-        );
     }
 }
