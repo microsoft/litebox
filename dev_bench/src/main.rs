@@ -1,19 +1,26 @@
-#![expect(unused_imports)]
-
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use fs_err as fs;
+use std::sync::atomic::Ordering::Relaxed;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
     time::Duration,
 };
+#[expect(unused_imports, reason = "some of these are unused for now")]
 use tracing::{debug, error, info, trace, warn};
 
+static COMMAND_EXECUTION_IS_QUIET: AtomicBool = AtomicBool::new(true);
+
 macro_rules! cmd {
-    ($($tt:tt)*) => {
-        xshell::cmd!($($tt)*).quiet()
-    }
+    ($($tt:tt)*) => {{
+        let mut cmd = xshell::cmd!($($tt)*);
+        let quiet = COMMAND_EXECUTION_IS_QUIET.load(Relaxed);
+        cmd.set_quiet(quiet);
+        cmd.set_ignore_stdout(quiet);
+        cmd.set_ignore_stderr(quiet);
+        cmd
+    }}
 }
 
 #[derive(Debug, Parser)]
@@ -59,6 +66,9 @@ fn main() -> Result<()> {
             "Too much verbosity, capping to TRACE (equivalent to -vv)"
         );
     }
+    if cli_args.verbose > 0 {
+        COMMAND_EXECUTION_IS_QUIET.store(false, Relaxed);
+    }
     debug!(cli_args.verbose);
 
     if cli_args.list {
@@ -73,7 +83,7 @@ fn main() -> Result<()> {
 
     if let Some(runs) = cli_args.compare.as_ref() {
         assert_eq!(runs.len(), 2);
-        return compare_runs(&runs[0], &runs[1], &cli_args);
+        return compare_runs(true, &runs[0], &runs[1], &cli_args);
     }
 
     let run_name = match cli_args.record.as_ref() {
@@ -110,6 +120,17 @@ fn main() -> Result<()> {
 
     info!(run_name, "Completed");
 
+    // If a run called `main` exists, then we compare the current run against it; otherwise, we warn
+    // the user that no automatic comparison was done.
+    if run_name == "main" {
+        info!("Current run is 'main'; not performing automatic comparison against itself");
+    } else if let Ok(_) = compare_runs(false, "main", &run_name, &cli_args) {
+        // Awesome!
+    } else {
+        warn!("No comparison was printed; to compare runs, use the --compare option");
+        warn!("For automatic comparison against 'main', use `--record main` to create one");
+    }
+
     Ok(())
 }
 
@@ -134,12 +155,23 @@ const BENCH_DIR_BASE: &str = "target/dev_bench";
 
 fn run_benchmark(name: &str, func: BenchFn, cli_args: &CliArgs) -> Result<()> {
     let sh = xshell::Shell::new()?;
+    sh.create_dir(BENCH_DIR_BASE)?;
     sh.change_dir(BENCH_DIR_BASE);
     info!(benchmark = %name, "Initializing benchmark");
-    func(true, &sh, cli_args)?;
+    func(BenchCtx {
+        sh: &sh,
+        cli_args,
+        project_root: &std::env::current_dir()?,
+        is_init: true,
+    })?;
     info!(benchmark = %name, "Running benchmark");
     let start = std::time::Instant::now();
-    func(false, &sh, cli_args)?;
+    func(BenchCtx {
+        sh: &sh,
+        cli_args,
+        project_root: &std::env::current_dir()?,
+        is_init: false,
+    })?;
     let duration = start.elapsed();
     info!(benchmark = %name, ?duration, "Completed benchmark");
 
@@ -150,13 +182,20 @@ fn run_benchmark(name: &str, func: BenchFn, cli_args: &CliArgs) -> Result<()> {
     Ok(())
 }
 
-fn compare_runs(run1: &str, run2: &str, cli_args: &CliArgs) -> Result<()> {
+fn compare_runs(print_on_missing: bool, run1: &str, run2: &str, cli_args: &CliArgs) -> Result<()> {
     let sh = xshell::Shell::new()?;
     sh.change_dir(BENCH_DIR_BASE);
 
     fn available_runs(sh: &xshell::Shell) -> Result<Vec<String>> {
-        Ok(sh
-            .read_dir("runs")?
+        let mut files = sh.read_dir("runs")?.into_iter().collect::<Vec<PathBuf>>();
+        files.sort_by_key(|file| {
+            if let Ok(metadata) = file.metadata() {
+                metadata.modified().ok()
+            } else {
+                None
+            }
+        });
+        let runs = files
             .into_iter()
             .filter_map(|entry| {
                 let file_name = entry.file_name()?;
@@ -167,24 +206,29 @@ fn compare_runs(run1: &str, run2: &str, cli_args: &CliArgs) -> Result<()> {
                     None
                 }
             })
-            .collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        Ok(runs)
     }
 
     let Ok(run1_csv) = sh.read_file(format!("runs/{}.csv", run1)) else {
-        error!(run1, "Could not find run");
+        warn!(run1, "Could not find run");
         let available = available_runs(&sh)?;
-        eprintln!("Available runs:");
-        for run in available {
-            eprintln!(" - {}", run);
+        if print_on_missing {
+            eprintln!("Available runs (oldest to newest):");
+            for run in available {
+                eprintln!(" - {}", run);
+            }
         }
         return Err(anyhow!("Run '{}' not found", run1));
     };
     let Ok(run2_csv) = sh.read_file(format!("runs/{}.csv", run2)) else {
-        error!(run2, "Could not find run");
+        warn!(run2, "Could not find run");
         let available = available_runs(&sh)?;
-        eprintln!("Available runs:");
-        for run in available {
-            eprintln!(" - {}", run);
+        if print_on_missing {
+            eprintln!("Available runs (oldest to newest):");
+            for run in available {
+                eprintln!(" - {}", run);
+            }
         }
         return Err(anyhow!("Run '{}' not found", run2));
     };
@@ -203,23 +247,28 @@ fn compare_runs(run1: &str, run2: &str, cli_args: &CliArgs) -> Result<()> {
     let all_benches: BTreeSet<&str> = r1.keys().chain(r2.keys()).copied().collect();
 
     info!(run1, run2, "Comparing runs");
-    println!("| Benchmark            | {run1:>20} (ms) | {run2:>20} (ms) | Diff (ms) |");
+    println!("| Benchmark                      | {run1:>22} (ms) | {run2:>22} (ms) | Diff (ms) |");
     println!(
-        "|:---------------------|--------------------------:|--------------------------:|----------:|"
+        "|:-------------------------------|----------------------------:|----------------------------:|----------:|"
     );
+
+    let mut total_counted = 0i128;
+    let mut diff_total = 0i128;
+
     for bench in all_benches {
         match (r1.get(bench), r2.get(bench)) {
             (Some(t1), Some(t2)) => {
-                let abs_diff = t2.abs_diff(*t1).as_millis();
-                let neg = if t1 < t2 { "-" } else { "" };
-                let diff = format!("{neg}{abs_diff}");
+                let abs_diff = t2.abs_diff(*t1).as_millis() as i128;
+                let diff = if t1 > t2 { -abs_diff } else { abs_diff };
                 println!(
-                    "| {:<20} | {:>25} | {:>25} | {:>9} |",
+                    "| {:<30} | {:>27} | {:>27} | {:>9} |",
                     bench,
                     t1.as_millis(),
                     t2.as_millis(),
                     diff
                 );
+                diff_total += diff;
+                total_counted += 1;
             }
             (Some(t1), None) => {
                 warn!(benchmark = %bench, time1 = ?t1, "Only present in run 1");
@@ -231,16 +280,33 @@ fn compare_runs(run1: &str, run2: &str, cli_args: &CliArgs) -> Result<()> {
         }
     }
 
+    let avg_diff = diff_total as f64 / total_counted as f64;
+    let reaction = if diff_total < 0 {
+        "🚀 run 2 is faster than run 1"
+    } else if diff_total > 0 {
+        "🐌 run 2 is slower than run 1"
+    } else {
+        "⚖️ perfectly balanced"
+    };
+
+    info!(total_counted, avg_diff, %reaction, "Summarized change");
+
     Ok(())
 }
 
+#[derive(Clone)]
+struct BenchCtx<'a> {
+    /// The shell is in a working directory shared across benchmark runs, so if the benchmark needs a
+    /// temporary directory, it should create its own.
+    sh: &'a xshell::Shell,
+    #[expect(dead_code, reason = "unused for now")]
+    cli_args: &'a CliArgs,
+    project_root: &'a Path,
+    is_init: bool,
+}
+
 /// Type alias for benchmark functions.
-///
-/// Args: (is_init: bool, sh: &xshell::Shell, cli_args: &CliArgs)
-///
-/// The shell is in a working directory shared across benchmark runs, so if the benchmark needs a
-/// temporary directory, it should create its own.
-type BenchFn = fn(bool, &xshell::Shell, &CliArgs) -> Result<()>;
+type BenchFn = fn(BenchCtx<'_>) -> Result<()>;
 
 macro_rules! benchtable {
     ($($func_name:ident),* $(,)?) => {
@@ -251,15 +317,43 @@ macro_rules! benchtable {
 /// All available benchmarks
 const BENCHMARKS: &[(&str, BenchFn)] = benchtable![
     //
-    example_benchmark,
+    rewriter_hello_static,
+    run_rewritten_hello_static,
     //
 ];
 
-fn example_benchmark(is_init: bool, sh: &xshell::Shell, cli_args: &CliArgs) -> Result<()> {
+fn rewriter_hello_static(ctx: BenchCtx) -> Result<()> {
+    let BenchCtx {
+        sh,
+        cli_args: _,
+        project_root,
+        is_init,
+    } = ctx;
     if is_init {
-        cmd!(sh, "sleep 1").run()?;
+        cmd!(sh, "gcc -o hello_static {project_root}/litebox_runner_linux_userland/tests/hello.c -static -m64").run()?;
+        cmd!(sh, "cargo build -p litebox_syscall_rewriter --release").run()?;
     } else {
-        cmd!(sh, "sleep 2").run()?;
+        cmd!(sh, "{project_root}/target/release/litebox_syscall_rewriter hello_static -o hello_static_rewritten").run()?;
+    }
+    Ok(())
+}
+
+fn run_rewritten_hello_static(ctx: BenchCtx<'_>) -> Result<()> {
+    let BenchCtx {
+        sh,
+        cli_args: _,
+        project_root,
+        is_init,
+    } = ctx;
+    if is_init {
+        cmd!(sh, "gcc -o hello_static {project_root}/litebox_runner_linux_userland/tests/hello.c -static -m64").run()?;
+        cmd!(sh, "cargo build -p litebox_runner_linux_userland --release").run()?;
+        cmd!(sh, "cargo run -p litebox_syscall_rewriter --release -- hello_static -o hello_static_rewritten").run()?;
+    } else {
+        cmd!(
+            sh,
+            "{project_root}/target/release/litebox_runner_linux_userland --unstable --interception-backend rewriter hello_static_rewritten"
+        ).run()?;
     }
     Ok(())
 }
