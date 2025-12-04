@@ -7,7 +7,6 @@ use std::{
     sync::atomic::AtomicBool,
     time::Duration,
 };
-#[expect(unused_imports, reason = "some of these are unused for now")]
 use tracing::{debug, error, info, trace, warn};
 
 static COMMAND_EXECUTION_IS_QUIET: AtomicBool = AtomicBool::new(true);
@@ -72,10 +71,7 @@ fn main() -> Result<()> {
     debug!(cli_args.verbose);
 
     if cli_args.list {
-        println!("Available benchmarks:");
-        for (name, _func) in BENCHMARKS {
-            println!(" - {}", name);
-        }
+        list_benchmarks();
         return Ok(());
     }
 
@@ -102,9 +98,13 @@ fn main() -> Result<()> {
         let (name, func) = match (matches.next(), matches.next()) {
             (Some(matched), None) => matched,
             (Some(_), Some(_)) => {
+                error!(filter, "Multiple benchmarks match filter");
+                list_benchmarks();
                 return Err(anyhow!("Multiple benchmarks match filter '{}'", filter));
             }
             (None, None) => {
+                error!(filter, "No benchmarks match filter");
+                list_benchmarks();
                 return Err(anyhow!("No benchmarks match filter '{}'", filter));
             }
             (None, Some(_)) => unreachable!(),
@@ -134,6 +134,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn list_benchmarks() {
+    println!("Available benchmarks:");
+    for (name, _func) in BENCHMARKS {
+        println!(" - {}", name);
+    }
+}
+
 /// Finds and switches to the project root directory.
 ///
 /// This is to make the rest of the reasoning easier.
@@ -158,20 +165,16 @@ fn run_benchmark(name: &str, func: BenchFn, cli_args: &CliArgs) -> Result<()> {
     sh.create_dir(BENCH_DIR_BASE)?;
     sh.change_dir(BENCH_DIR_BASE);
     info!(benchmark = %name, "Initializing benchmark");
-    func(BenchCtx {
+    let ctx = BenchCtx {
         sh: &sh,
         cli_args,
         project_root: &std::env::current_dir()?,
         is_init: true,
-    })?;
+    };
+    func(ctx.with_init(true))?;
     info!(benchmark = %name, "Running benchmark");
     let start = std::time::Instant::now();
-    func(BenchCtx {
-        sh: &sh,
-        cli_args,
-        project_root: &std::env::current_dir()?,
-        is_init: false,
-    })?;
+    func(ctx.with_init(false))?;
     let duration = start.elapsed();
     info!(benchmark = %name, ?duration, "Completed benchmark");
 
@@ -330,6 +333,15 @@ struct BenchCtx<'a> {
     is_init: bool,
 }
 
+impl<'a> BenchCtx<'a> {
+    fn with_init(&self, is_init: bool) -> Self {
+        Self {
+            is_init,
+            ..self.clone()
+        }
+    }
+}
+
 /// Type alias for benchmark functions.
 type BenchFn = fn(BenchCtx<'_>) -> Result<()>;
 
@@ -344,6 +356,8 @@ const BENCHMARKS: &[(&str, BenchFn)] = benchtable![
     //
     rewriter_hello_static,
     run_rewritten_hello_static,
+    rewriter_node,
+    run_rewritten_node,
     //
 ];
 
@@ -371,13 +385,139 @@ fn run_rewritten_hello_static(ctx: BenchCtx<'_>) -> Result<()> {
         is_init,
     } = ctx;
     if is_init {
-        cmd!(sh, "gcc -o hello_static {project_root}/litebox_runner_linux_userland/tests/hello.c -static -m64").run()?;
+        rewriter_hello_static(ctx.with_init(true))?;
+        rewriter_hello_static(ctx.with_init(false))?;
         cmd!(sh, "cargo build -p litebox_runner_linux_userland --release").run()?;
-        cmd!(sh, "cargo run -p litebox_syscall_rewriter --release -- hello_static -o hello_static_rewritten").run()?;
     } else {
         cmd!(
             sh,
             "{project_root}/target/release/litebox_runner_linux_userland --unstable --interception-backend rewriter hello_static_rewritten"
+        ).run()?;
+    }
+    Ok(())
+}
+
+// XXX: This is not ideal, because it means that we have differing tests/benchmarks depending on
+// different machines. Ideally we'd switch this out to a more deterministic approach.
+fn locate_command(sh: &xshell::Shell, command: &str) -> Result<PathBuf> {
+    let r = cmd!(sh, "which {command}").output()?.stdout;
+    let r = PathBuf::from(String::from_utf8_lossy(&r).trim());
+    Ok(r)
+}
+
+/// Find all dependencies for `command` via `ldd`
+fn find_dependencies(sh: &xshell::Shell, command: &str) -> Result<Vec<PathBuf>> {
+    let executable = locate_command(sh, command)?;
+    let output = cmd!(sh, "ldd {executable}").output()?;
+    let dependencies = String::from_utf8_lossy(&output.stdout);
+    trace!("Dependencies:\n{dependencies}");
+    let mut paths = Vec::new();
+    for line in dependencies.lines().filter(|l| !l.trim().is_empty()) {
+        if let Some(idx) = line.find("=>") {
+            // Format: "libc.so.6 => /lib/.../libc.so.6 (0x...)"
+            let right = line[idx + 2..].trim();
+            // Skip "not found"
+            if right.starts_with("not found") {
+                warn!(line, "dependency not found");
+                continue;
+            }
+            // Extract token before whitespace or '('
+            if let Some(token) = right.split_whitespace().next()
+                && token.starts_with('/')
+            {
+                paths.push(token.to_string());
+            } else {
+                warn!(line, "unexpected ldd output line format");
+            }
+        } else {
+            // Format: "/lib64/ld-linux-x86-64.so.2 (0x...)" or "linux-vdso.so.1 (0x...)"
+            if let Some(token) = line.split_whitespace().next()
+                && token.starts_with('/')
+            {
+                paths.push(token.to_string());
+            }
+        }
+    }
+    let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    paths.iter().for_each(|p| {
+        if !p.exists() {
+            warn!(path = %p.display(), "Resolved dependency path does not exist");
+        }
+    });
+    trace!("Resolved dependency paths: {paths:?}");
+    Ok(paths)
+}
+
+fn rewriter_node(ctx: BenchCtx) -> Result<()> {
+    let BenchCtx {
+        sh,
+        cli_args: _,
+        project_root,
+        is_init,
+    } = ctx;
+    let node = locate_command(sh, "node")?;
+    if is_init {
+        cmd!(sh, "cargo build -p litebox_syscall_rewriter --release").run()?;
+    } else {
+        cmd!(
+            sh,
+            "{project_root}/target/release/litebox_syscall_rewriter {node} -o node_rewritten"
+        )
+        .run()?;
+    }
+    Ok(())
+}
+
+fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
+    let BenchCtx {
+        sh,
+        cli_args: _,
+        project_root,
+        is_init,
+    } = ctx;
+    let tar_file = sh.current_dir().join("node_rootfs.tar");
+    let release_mode = true;
+    if is_init {
+        const HELLO_WORLD_JS: &str = r"
+            const content = 'Hello World!';
+            console.log(content);
+        ";
+        rewriter_node(ctx.with_init(true))?;
+        rewriter_node(ctx.with_init(false))?;
+
+        let tar_base_dir = sh.current_dir().join("node_tar_base");
+        sh.write_file(tar_base_dir.join("hello_world.js"), HELLO_WORLD_JS)?;
+        let libs = find_dependencies(sh, "node")?;
+        sh.create_dir(&tar_base_dir)?;
+        for lib in libs {
+            let dest_path = tar_base_dir
+                .join(lib.strip_prefix("/").unwrap_or_else(|_| {
+                    panic!("Library path '{}' is not absolute", lib.display())
+                }));
+            if let Some(parent) = dest_path.parent() {
+                sh.create_dir(parent)?;
+            }
+            cmd!(
+                sh,
+                "{project_root}/target/release/litebox_syscall_rewriter {lib} -o {dest_path}"
+            )
+            .run()?;
+        }
+
+        sh.remove_path(&tar_file)?;
+        // ustar allows longer file names
+        cmd!(sh, "tar --format=ustar -C {tar_base_dir} -cvf {tar_file} .").run()?;
+        let release = release_mode.then_some("--release");
+        cmd!(
+            sh,
+            "cargo build -p litebox_runner_linux_userland {release...}"
+        )
+        .run()?;
+    } else {
+        let mode = release_mode.then_some("release").unwrap_or("debug");
+        cmd!(
+            sh,
+            "{project_root}/target/{mode}/litebox_runner_linux_userland --unstable --interception-backend rewriter --env HOME=/ --initial-files {tar_file} node_rewritten hello_world.js"
         ).run()?;
     }
     Ok(())
