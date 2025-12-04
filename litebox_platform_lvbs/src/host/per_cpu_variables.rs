@@ -22,7 +22,6 @@ pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
 pub struct PerCpuVariables {
-    _kernel_tls: [u8; PAGE_SIZE],
     hv_vp_assist_page: [u8; PAGE_SIZE],
     hv_simp_page: [u8; PAGE_SIZE],
     interrupt_stack: [u8; INTERRUPT_STACK_SIZE],
@@ -153,26 +152,8 @@ impl PerCpuVariables {
     }
 }
 
-/// Kernel TLS value offsets to read and write some values through assmebly code (i.e., GS register).
-/// We need it because controlling CPU registers (e.g., `rsp` and `rip`) without side effects require
-/// direct global memory access. This is based on our Shim TLS usage.
-/// Since we use `RefCell` for `PerCpuVariables` and `PerCpuVariables` is 4096-byte aligned,
-/// `gs:[0x0]` to `gs:[0x1000]` contain `RefCell` stuffs and padding.
-/// Note: This might a bit arbitrary and can be broken if `RefCell` layout changes in the future.
-#[non_exhaustive]
-#[repr(usize)]
-pub enum KernelTlsOffset {
-    /// Kernel stack pointer (top and 16-byte aligned)
-    KernelStackPtr = 0x1000,
-    /// Interrupt stack pointer (top and 16-byte aligned)
-    InterruptStackPtr = 0x1000 + 8,
-    /// VTL return address (to be used when returning from VTL1 to VTL0 with the `call` instruction)
-    VtlReturnAddr = 0x1000 + 16,
-}
-
 /// per-CPU variables for core 0 (or BSP). This must use static memory because kernel heap is not ready.
 static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
-    _kernel_tls: [0u8; PAGE_SIZE],
     hv_vp_assist_page: [0u8; PAGE_SIZE],
     hv_simp_page: [0u8; PAGE_SIZE],
     interrupt_stack: [0u8; INTERRUPT_STACK_SIZE],
@@ -226,11 +207,63 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     tls: VirtAddr::zero(),
 };
 
+#[non_exhaustive]
+#[repr(C)]
+#[derive(Clone)]
+pub struct KernelTls {
+    pub vtl_return_addr: u64,
+    pub interrupt_stack_ptr: u64,
+    pub kernel_stack_ptr: u64,
+}
+
+/// Kernel TLS offsets. The value of GS register - one of these offsets is used to access
+/// the corresponding variable.
+#[non_exhaustive]
+#[repr(usize)]
+pub enum KernelTlsOffset {
+    KernelStackPtr =
+        core::mem::size_of::<KernelTls>() - core::mem::offset_of!(KernelTls, kernel_stack_ptr),
+    InterruptStackPtr =
+        core::mem::size_of::<KernelTls>() - core::mem::offset_of!(KernelTls, interrupt_stack_ptr),
+    VtlReturnAddr =
+        core::mem::size_of::<KernelTls>() - core::mem::offset_of!(KernelTls, vtl_return_addr),
+}
+
+/// Wrapper struct to store a `RefCell` along with `KernelTls`.
+///
+/// TODO: Figure out a better way to store per-CPU variables along with TLS area
+/// accessible via GS. It is unclear whether full assembly code would be better
+/// than this approach (at least for now it provides partial Rust-side safety with a "backdoor")
+#[repr(C)]
+#[derive(Clone)]
+pub struct RefCellWrapper<T> {
+    /// Make some TLS area be accessible via the GS register. This is for assembly code and
+    /// never meant to be used in Rust code (unsafe).
+    ktls: KernelTls,
+    /// RefCell which will be stored in the GS register
+    inner: RefCell<T>,
+}
+impl<T> RefCellWrapper<T> {
+    pub const fn new(value: T) -> Self {
+        RefCellWrapper {
+            ktls: KernelTls {
+                vtl_return_addr: 0,
+                interrupt_stack_ptr: 0,
+                kernel_stack_ptr: 0,
+            },
+            inner: RefCell::new(value),
+        }
+    }
+    pub fn get_refcell(&self) -> &RefCell<T> {
+        &self.inner
+    }
+}
+
 /// Store the addresses of per-CPU variables. The kernel threads are expected to access
 /// the corresponding per-CPU variables via the GS registers which will store the addresses later.
 /// Instead of maintaining this map, we might be able to use a hypercall to directly program each core's GS register.
-static mut PER_CPU_VARIABLE_ADDRESSES: [RefCell<*mut PerCpuVariables>; MAX_CORES] =
-    [const { RefCell::new(core::ptr::null_mut()) }; MAX_CORES];
+static mut PER_CPU_VARIABLE_ADDRESSES: [RefCellWrapper<*mut PerCpuVariables>; MAX_CORES] =
+    [const { RefCellWrapper::new(core::ptr::null_mut()) }; MAX_CORES];
 
 /// Execute a closure with a reference to the current core's per-CPU variables.
 ///
@@ -290,15 +323,16 @@ fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut Pe
     let gsbase = unsafe { rdgsbase() };
     if gsbase == 0 {
         let core_id = get_core_id();
-        let refcell = if core_id == 0 {
+        let refcell_wrapper = if core_id == 0 {
             let addr = &raw mut BSP_VARIABLES;
             unsafe {
-                PER_CPU_VARIABLE_ADDRESSES[0] = RefCell::new(addr);
+                PER_CPU_VARIABLE_ADDRESSES[0] = RefCellWrapper::new(addr);
                 &PER_CPU_VARIABLE_ADDRESSES[0]
             }
         } else {
             unsafe { &PER_CPU_VARIABLE_ADDRESSES[core_id] }
         };
+        let refcell = refcell_wrapper.get_refcell();
         if refcell.borrow().is_null() {
             None
         } else {
@@ -352,7 +386,7 @@ pub fn allocate_per_cpu_variables() {
             per_cpu_variables.assume_init()
         };
         unsafe {
-            PER_CPU_VARIABLE_ADDRESSES[i] = RefCell::new(Box::into_raw(per_cpu_variables));
+            PER_CPU_VARIABLE_ADDRESSES[i] = RefCellWrapper::new(Box::into_raw(per_cpu_variables));
         }
     }
 }

@@ -156,9 +156,9 @@ pub fn vtl_switch_loop() -> ! {
     let stack_top = stack_top & !0xf;
     unsafe {
         core::arch::asm!(
-            "mov gs:[{kernel_sp_offset}], {stack_top}",
+            "mov gs:[-{kernel_sp_off}], {stack_top}",
             stack_top = in(reg) stack_top,
-            kernel_sp_offset = const {KernelTlsOffset::KernelStackPtr as usize},
+            kernel_sp_off = const {KernelTlsOffset::KernelStackPtr as usize},
             options(nostack, preserves_flags),
         );
     }
@@ -177,10 +177,10 @@ unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
     core::arch::naked_asm!(
         "1:",
         "call {loop_body}",
-        "mov rsp, gs:[{kernel_sp_offset}]",
+        "mov rsp, gs:[-{kernel_sp_off}]",
         "jmp 1b",
         loop_body = sym vtl_switch_loop_body,
-        kernel_sp_offset = const {KernelTlsOffset::KernelStackPtr as usize},
+        kernel_sp_off = const {KernelTlsOffset::KernelStackPtr as usize},
     );
 }
 
@@ -188,9 +188,9 @@ fn vtl_switch_loop_body() {
     unsafe {
         save_vtl1_state();
         load_vtl_state(HV_VTL_NORMAL);
-        vtl_return();
     }
 
+    vtl_return();
     // *** This is where VTL1 starts to execute code (i.e., VTL0-to-VTL1 switch lands here) ***
 
     unsafe {
