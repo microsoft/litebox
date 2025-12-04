@@ -1,5 +1,5 @@
 use litebox::mm::linux::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
-use litebox::platform::{RawConstPointer as _, page_mgmt};
+use litebox::platform::page_mgmt;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -16,12 +16,10 @@ use x86_64::{
     },
 };
 
-use crate::{
-    UserMutPtr,
-    mm::{
-        MemoryProvider,
-        pgtable::{PageTableAllocator, PageTableImpl},
-    },
+use crate::UserMutPtr;
+use crate::mm::{
+    MemoryProvider,
+    pgtable::{PageTableAllocator, PageTableImpl},
 };
 
 #[cfg(not(test))]
@@ -98,7 +96,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 .expect("Failed to handle page fault");
             }
         }
-        UserMutPtr::from_usize(range.start)
+        UserMutPtr::from_ptr(range.start as *mut u8)
     }
 
     /// Unmap 4KiB pages from the page table
@@ -209,7 +207,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             new_start += 1;
         }
 
-        Ok(UserMutPtr::from_usize(new_range.start))
+        Ok(UserMutPtr::from_ptr(new_range.start as *mut u8))
     }
 
     pub(crate) unsafe fn mprotect_pages(

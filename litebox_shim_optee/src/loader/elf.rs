@@ -18,7 +18,7 @@ use once_cell::race::OnceBox;
 use thiserror::Error;
 
 use super::ElfLoadInfo;
-use crate::MutPtr;
+use crate::UserMutPtr;
 
 #[cfg(feature = "platform_linux_userland")]
 use crate::litebox_page_manager;
@@ -48,7 +48,7 @@ impl FdElfMap {
         self.inner.lock().get(&fd).cloned()
     }
 
-    /// Ths function finds the ELF file in memory by its fd and reads the content
+    /// This function finds the ELF file in memory by its fd and reads the content
     /// into the provided buffer from the specified offset.
     fn read(&self, buf: &mut [u8], offset: usize, fd: i32) -> Result<(), Errno> {
         let mut inner = self.inner.lock();
@@ -143,11 +143,17 @@ impl ElfLoaderMmap {
         match crate::syscalls::mm::sys_mmap(
             addr.unwrap_or(0),
             len,
-            litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
+            litebox_common_linux::ProtFlags::from_bits(prot.bits()).ok_or(
+                elf_loader::Error::MmapError {
+                    msg: "unsupported prot flags".to_string(),
+                },
+            )?,
             litebox_common_linux::MapFlags::from_bits(
                 flags.bits() | MapFlags::MAP_ANONYMOUS.bits(),
             )
-            .expect("unsupported flags"),
+            .ok_or(elf_loader::Error::MmapError {
+                msg: "unsupported map flags".to_string(),
+            })?,
             -1,
             0,
         ) {
@@ -198,9 +204,13 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
                 .expect("fd_elf_map.read failed");
 
             crate::syscalls::mm::sys_mprotect(
-                MutPtr::from_usize(mapped_addr),
+                UserMutPtr::from_usize(mapped_addr),
                 len,
-                litebox_common_linux::ProtFlags::from_bits_truncate(prot.bits()),
+                litebox_common_linux::ProtFlags::from_bits(prot.bits()).ok_or(
+                    elf_loader::Error::MmapError {
+                        msg: "unsupported prot flags".to_string(),
+                    },
+                )?,
             )
             .expect("sys_mprotect failed");
 
@@ -329,8 +339,9 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
     #[cfg(debug_assertions)]
     litebox::log_println!(
         litebox_platform_multiplex::platform(),
-        "Loading trampoline {:?}",
-        trampoline
+        "Loading trampoline {:?} with relo_off {:#x}",
+        trampoline,
+        relo_off,
     );
     assert!(
         trampoline.vaddr.is_multiple_of(PAGE_SIZE),
@@ -343,6 +354,11 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
     let start_addr = relo_off + trampoline.vaddr;
     let end_addr = (start_addr + trampoline.size).next_multiple_of(PAGE_SIZE);
     let mut need_copy = false;
+    // TODO: For now, we unmap `ldelf`'s memory area to load the trampoline.
+    // TAs might interact with `ldelf` to use its critical syscalls, so we might need to
+    // figure out how to deal with this potential memory area overlap.
+    let _ =
+        crate::syscalls::mm::sys_munmap(UserMutPtr::from_usize(start_addr), end_addr - start_addr);
     let ret = unsafe {
         ElfLoaderMmap::mmap(
             Some(start_addr),
@@ -371,11 +387,50 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
     unsafe {
         placeholder.write(litebox_platform_multiplex::platform().get_syscall_entry_point());
     }
-    let ptr = crate::MutPtr::from_usize(start_addr);
+    let ptr = UserMutPtr::from_usize(start_addr);
     let pm = litebox_page_manager();
     unsafe { pm.make_pages_executable(ptr, end_addr - start_addr) }
         .expect("failed to make pages executable");
     end_addr
+}
+
+/// Allocate the guest TLS for an OP-TEE TA.
+/// This function is required to overcome the compatibility issue coming from
+/// system and build toolchain differences. OP-TEE OS only supports a single thread and
+/// thus does not explicitly set up the TLS area. In contrast, we do use an x86 toolchain to
+/// compile OP-TEE TAs and this toolchain assumes there is a valid TLS areas for various purposes
+/// including stack protection. To this end, the toolchain generates binaries using
+/// the `FS` register for TLS access.
+/// This function allocates a TLS area on behalf of the TA to satisfy the toolchain's assumption.
+/// Instead of using this function, we could change the flags of the toolchain to not use TLS
+/// (e.g., `-fno-stack-protector`), but this might be insecure. Also, the toolchain might have
+/// other features relying on TLS.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn allocate_guest_tls(
+    tls_size: Option<usize>,
+) -> Result<(), litebox_common_linux::errno::Errno> {
+    let tls_size = tls_size.unwrap_or(PAGE_SIZE).next_multiple_of(PAGE_SIZE);
+    let addr = crate::syscalls::mm::sys_mmap(
+        0,
+        tls_size,
+        litebox_common_linux::ProtFlags::PROT_READ | litebox_common_linux::ProtFlags::PROT_WRITE,
+        litebox_common_linux::MapFlags::MAP_PRIVATE
+            | litebox_common_linux::MapFlags::MAP_ANONYMOUS
+            | litebox_common_linux::MapFlags::MAP_POPULATE,
+        -1,
+        0,
+    )?;
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase {
+        addr: addr.as_usize(),
+    };
+    let token = litebox_platform_multiplex::platform()
+        .get_punchthrough_token_for(punchthrough)
+        .expect("Failed to get punchthrough token for SET_FS");
+    let _ = token.execute().map(|_| ()).map_err(|e| match e {
+        litebox::platform::PunchthroughError::Failure(errno) => errno,
+        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+    });
+    Ok(())
 }
 
 const DEFAULT_ELF_LOAD_BASE: usize = (1 << 46) - PAGE_SIZE;
@@ -412,44 +467,6 @@ impl ElfLoader {
             load_trampoline(trampoline, base, fd);
         }
 
-        // Initialize the guest TLS for an OP-TEE TA.
-        // Typically, the loader (e.g., OP-TEE's ldelf) or libc initializes the guest TLS before
-        // calling the main function. However, currently, LiteBox does not use ldelf or libc for
-        // OP-TEE TAs such that no guest code attempts to initialize the guest TLS.
-        // To avoid this problem, `litebox_shim_optee` initializes the guest TLS by
-        // allocating a guest page and programming the FS base to point to the allocated page.
-        // Note that we use `PunchthroughSyscall::SetFsBase` for this purpose not to deal with
-        // the underlying platform behaviors.
-        // Two alternatives:
-        // 1) Initialize the guest TLS at the runner.
-        // 2) Write a minimal ldelf and bundle it with each OP-TEE TA.
-        let addr = crate::syscalls::mm::sys_mmap(
-            0,
-            PAGE_SIZE,
-            litebox_common_linux::ProtFlags::PROT_READ
-                | litebox_common_linux::ProtFlags::PROT_WRITE,
-            litebox_common_linux::MapFlags::MAP_PRIVATE
-                | litebox_common_linux::MapFlags::MAP_ANONYMOUS
-                | litebox_common_linux::MapFlags::MAP_FIXED
-                | litebox_common_linux::MapFlags::MAP_POPULATE,
-            -1,
-            0,
-        );
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase {
-            addr: addr.unwrap().as_usize(),
-        };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for SET_FS");
-        let _ = token.execute().map(|_| ()).map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        });
-
-        // Since LiteBox does not use ldelf or libc for OP-TEE TAs, it should relocate the TA ELF's symbols.
-        elf.easy_relocate([].into_iter(), &|_| None)
-            .map_err(ElfLoaderError::LoaderError)?;
-
         fd_elf_map
             .remove(fd)
             .expect("fd_elf_map.remove(fd) should return Some(ElfFileInMemory)");
@@ -472,7 +489,32 @@ impl ElfLoader {
             entry_point: entry,
             stack_base: stack.get_stack_base(),
             params_address: stack.get_params_address(),
+            ldelf_arg_address: Some(stack.get_ldelf_arg_address()),
         })
+    }
+
+    #[cfg(feature = "platform_linux_userland")]
+    pub(super) fn load_trampoline(elf_buf: &[u8], base: usize) -> Result<(), ElfLoaderError> {
+        let fd_elf_map = fd_elf_map();
+        let fd = fd_elf_map
+            .register_elf(elf_buf)
+            .map_err(ElfLoaderError::OpenError)?;
+        #[allow(unused_mut)]
+        let mut object = fd_elf_map
+            .get(fd)
+            .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
+
+        let trampoline = get_trampoline_hdr(&mut object);
+
+        if let Some(trampoline) = trampoline {
+            load_trampoline(trampoline, base, fd);
+        }
+
+        fd_elf_map
+            .remove(fd)
+            .expect("fd_elf_map.remove(fd) should return Some(ElfFileInMemory)");
+
+        Ok(())
     }
 }
 

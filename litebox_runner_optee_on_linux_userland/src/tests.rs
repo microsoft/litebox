@@ -2,19 +2,27 @@
 //! OP-TEE TAs need clients to work with that this Linux userland runner lacks.
 //! Instead, these tests use pre-defined JSON-formatted command sequences to test TAs.
 
-use litebox_common_optee::{TeeIdentity, TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned};
-use litebox_common_optee::{TeeParamType, UteeParams};
+use litebox_common_optee::{
+    LdelfArg, TeeIdentity, TeeLogin, TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned,
+    UteeParams,
+};
 use litebox_shim_optee::loader::ElfLoadInfo;
 use serde::Deserialize;
 use std::path::PathBuf;
 
 /// Run the loaded TA with a sequence of test commands
-pub fn run_ta_with_test_commands(ta_info: &ElfLoadInfo, prog_name: &str, json_path: &PathBuf) {
+pub fn run_ta_with_test_commands(
+    ldelf_bin: &[u8],
+    ta_bin: &[u8],
+    prog_name: &str,
+    json_path: &PathBuf,
+) {
     let ta_commands: Vec<TaCommandBase64> = {
         let json_str = std::fs::read_to_string(json_path).unwrap();
         serde_json::from_str(&json_str).unwrap()
     };
     let is_kmpp_ta = prog_name.contains("kmpp-ta.elf.hooked");
+    let mut ta_info: Option<ElfLoadInfo> = None;
 
     for cmd in ta_commands {
         assert!(
@@ -32,6 +40,10 @@ pub fn run_ta_with_test_commands(ta_info: &ElfLoadInfo, prog_name: &str, json_pa
             TaEntryFunc::CloseSession => UteeEntryFunc::CloseSession,
             TaEntryFunc::InvokeCommand => UteeEntryFunc::InvokeCommand,
         };
+        if func_id == UteeEntryFunc::CloseSession {
+            litebox_shim_optee::deinit_session();
+            continue;
+        }
 
         if func_id == UteeEntryFunc::OpenSession {
             let _litebox = litebox_shim_optee::init_session(
@@ -40,48 +52,96 @@ pub fn run_ta_with_test_commands(ta_info: &ElfLoadInfo, prog_name: &str, json_pa
                     login: TeeLogin::User,
                     uuid: TeeUuid::default(),
                 },
+                Some(ta_bin), // TODO: replace it with UUID-based TA loading
             );
-        }
 
-        // special handling for the KMPP TA whose `OpenSession` expects a session ID that we cannot determine in advance
-        if is_kmpp_ta
-            && func_id == UteeEntryFunc::OpenSession
-            && let UteeParamOwned::ValueInput {
-                ref mut value_a,
-                value_b: _,
-            } = params[0]
-        {
-            *value_a = u64::from(litebox_shim_optee::get_session_id());
-        }
+            let ldelf_info = litebox_shim_optee::loader::load_elf_buffer(ldelf_bin)
+                .expect("Failed to load ldelf");
+            let Some(ldelf_arg_address) = ldelf_info.ldelf_arg_address else {
+                panic!("ldelf_arg_address not found");
+            };
+            let ldelf_arg = LdelfArg::new(); // TODO: set TA UUID
 
-        let stack =
-            litebox_shim_optee::loader::init_stack(Some(ta_info.stack_base), params.as_slice())
-                .expect("Failed to initialize stack with parameters");
-        let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
-            ta_info,
-            &stack,
-            litebox_shim_optee::get_session_id(),
-            func_id as u32,
-            Some(cmd.cmd_id),
-        );
-        unsafe {
-            litebox_platform_linux_userland::run_thread(
-                litebox_shim_optee::OpteeShim,
-                &mut pt_regs,
+            let stack = litebox_shim_optee::loader::init_ldelf_stack(
+                Some(ldelf_info.stack_base),
+                &ldelf_arg,
+            )
+            .expect("Failed to initialize stack for ldelf");
+            let mut pt_regs =
+                litebox_shim_optee::loader::prepare_ldelf_registers(&ldelf_info, &stack);
+            unsafe {
+                litebox_platform_linux_userland::run_thread(
+                    litebox_shim_optee::OpteeShim,
+                    &mut pt_regs,
+                );
+            };
+            assert!(
+                pt_regs.rax == 0,
+                "TA exits with error: return_code={:#x}",
+                pt_regs.rax
             );
+
+            let ldelf_arg_out = unsafe { &*(ldelf_arg_address as *const LdelfArg) };
+            let entry_func = usize::try_from(ldelf_arg_out.entry_func).unwrap();
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "ldelf has loaded TA: entry_func = {:#x}",
+                entry_func,
+            );
+
+            litebox_shim_optee::set_ta_loaded();
+            let base = litebox_shim_optee::get_ta_base_addr()
+                .ok_or(litebox_common_linux::errno::Errno::ENOENT)
+                .expect("TA base addr not set");
+            litebox_shim_optee::loader::load_ta_trampoline(ta_bin, base)
+                .expect("Failed to load trampoline");
+            litebox_shim_optee::loader::allocate_guest_tls(None).expect("Failed to allocate TLS");
+
+            ta_info = Some(ElfLoadInfo {
+                entry_point: entry_func,
+                stack_base: ldelf_info.stack_base,
+                params_address: ldelf_info.params_address,
+                ldelf_arg_address: None,
+            });
+
+            // special handling for the KMPP TA whose `OpenSession` expects a session ID that we cannot determine in advance
+            if is_kmpp_ta
+                && let UteeParamOwned::ValueInput {
+                    ref mut value_a,
+                    value_b: _,
+                } = params[0]
+            {
+                *value_a = u64::from(litebox_shim_optee::get_session_id());
+            }
         }
-        assert!(
-            pt_regs.rax == 0,
-            "TA exits with error: return_code={:#x}",
-            pt_regs.rax
-        );
 
-        // TA stores results in the `UteeParams` structure and/or buffers it refers to.
-        let params = unsafe { &*(ta_info.params_address as *const UteeParams) };
-        handle_ta_command_output(params);
-
-        if func_id == UteeEntryFunc::CloseSession {
-            litebox_shim_optee::deinit_session();
+        if let Some(ta_info) = ta_info {
+            let stack =
+                litebox_shim_optee::loader::init_stack(Some(ta_info.stack_base), params.as_slice())
+                    .expect("Failed to initialize stack with parameters");
+            let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
+                &ta_info,
+                &stack,
+                litebox_shim_optee::get_session_id(),
+                func_id as u32,
+                Some(cmd.cmd_id),
+            );
+            unsafe {
+                litebox_platform_linux_userland::run_thread(
+                    litebox_shim_optee::OpteeShim,
+                    &mut pt_regs,
+                );
+            };
+            assert!(
+                pt_regs.rax == 0,
+                "TA exits with error: return_code={:#x}",
+                pt_regs.rax
+            );
+            // TA stores results in the `UteeParams` structure and/or buffers it refers to.
+            let params = unsafe { &*(ta_info.params_address as *const UteeParams) };
+            handle_ta_command_output(params);
+        } else {
+            panic!("TA info is not available.");
         }
     }
 }

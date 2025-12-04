@@ -11,7 +11,7 @@ use litebox_common_linux::{PtRegs, errno::Errno};
 use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B4, B48};
 use num_enum::TryFromPrimitive;
-use syscall_nr::TeeSyscallNr;
+use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
 
 pub mod syscall_nr;
 
@@ -689,6 +689,7 @@ impl TeePropSet {
 
 bitflags::bitflags! {
     /// Memory access rights constants from `optee_os/lib/libutee/include/tee_api_defines.h`
+    #[non_exhaustive]
     #[derive(Clone, Copy)]
     pub struct TeeMemoryAccessRights: u32 {
         const TEE_MEMORY_ACCESS_READ = 0x1;
@@ -696,7 +697,6 @@ bitflags::bitflags! {
         const TEE_MEMORY_ACCESS_ANY_OWNER = 0x4;
         const TEE_MEMORY_ACCESS_NONSECURE = 0x1000_0000;
         const TEE_MEMORY_ACCESS_SECURE = 0x2000_0000;
-
         const _ = !0;
     }
 }
@@ -915,4 +915,173 @@ pub enum UserTaPropType {
     Identity = USER_TA_PROP_TYPE_IDENTITY,
     String = USER_TA_PROP_TYPE_STRING,
     BinaryBlock = USER_TA_PROP_TYPE_BINARY_BLOCK,
+}
+
+#[non_exhaustive]
+pub enum LdelfSyscallRequest<Platform: litebox::platform::RawPointerProvider> {
+    Return {
+        ret: usize,
+    },
+    Log {
+        buf: Platform::RawConstPointer<u8>,
+        len: usize,
+    },
+    Panic {
+        code: usize,
+    },
+    MapZi {
+        va: Platform::RawMutPointer<usize>,
+        num_bytes: usize,
+        pad_begin: usize,
+        pad_end: usize,
+        flags: LdelfMapFlags,
+    },
+    Unmap {
+        va: Platform::RawMutPointer<u8>,
+        num_bytes: usize,
+    },
+    OpenBin {
+        uuid: Platform::RawConstPointer<TeeUuid>,
+        uuid_size: usize,
+        handle: Platform::RawMutPointer<u32>,
+    },
+    CloseBin {
+        handle: u32,
+    },
+    MapBin {
+        va: Platform::RawMutPointer<usize>,
+        num_bytes: usize,
+        handle: u32,
+        offs: usize,
+        pad_begin: usize,
+        pad_end: usize,
+        flags: LdelfMapFlags,
+    },
+    CpFromBin {
+        dst: usize,
+        offs: usize,
+        num_bytes: usize,
+        handle: u32,
+    },
+    GenRndNum {
+        buf: Platform::RawMutPointer<u8>,
+        num_bytes: usize,
+    },
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platform> {
+    pub fn try_from_raw(syscall_number: usize, ctx: &PtRegs) -> Result<Self, Errno> {
+        let ctx = SyscallContext::from_pt_regs(ctx);
+        let sysnr = u32::try_from(syscall_number).map_err(|_| Errno::ENOSYS)?;
+        let dispatcher = match LdelfSyscallNr::try_from(sysnr).unwrap_or(LdelfSyscallNr::Unknown) {
+            LdelfSyscallNr::Return => LdelfSyscallRequest::Return {
+                ret: ctx.syscall_arg(0),
+            },
+            LdelfSyscallNr::Log => LdelfSyscallRequest::Log {
+                buf: Platform::RawConstPointer::from_usize(ctx.syscall_arg(0)),
+                len: ctx.syscall_arg(1),
+            },
+            LdelfSyscallNr::Panic => LdelfSyscallRequest::Panic {
+                code: ctx.syscall_arg(0),
+            },
+            LdelfSyscallNr::MapZi => LdelfSyscallRequest::MapZi {
+                va: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+                num_bytes: ctx.syscall_arg(1),
+                pad_begin: ctx.syscall_arg(2),
+                pad_end: ctx.syscall_arg(3),
+                flags: LdelfMapFlags::from_bits_retain(ctx.syscall_arg(4)),
+            },
+            LdelfSyscallNr::Unmap => LdelfSyscallRequest::Unmap {
+                va: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+                num_bytes: ctx.syscall_arg(1),
+            },
+            LdelfSyscallNr::OpenBin => LdelfSyscallRequest::OpenBin {
+                uuid: Platform::RawConstPointer::from_usize(ctx.syscall_arg(0)),
+                uuid_size: ctx.syscall_arg(1),
+                handle: Platform::RawMutPointer::from_usize(ctx.syscall_arg(2)),
+            },
+            LdelfSyscallNr::CloseBin => LdelfSyscallRequest::CloseBin {
+                handle: u32::try_from(ctx.syscall_arg(0)).map_err(|_| Errno::EINVAL)?,
+            },
+            LdelfSyscallNr::MapBin => LdelfSyscallRequest::MapBin {
+                va: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+                num_bytes: ctx.syscall_arg(1),
+                handle: u32::try_from(ctx.syscall_arg(2)).map_err(|_| Errno::EINVAL)?,
+                offs: ctx.syscall_arg(3),
+                pad_begin: ctx.syscall_arg(4),
+                pad_end: ctx.syscall_arg(5),
+                flags: LdelfMapFlags::from_bits_retain(ctx.syscall_arg(6)),
+            },
+            LdelfSyscallNr::CpFromBin => LdelfSyscallRequest::CpFromBin {
+                dst: ctx.syscall_arg(0),
+                offs: ctx.syscall_arg(1),
+                num_bytes: ctx.syscall_arg(2),
+                handle: u32::try_from(ctx.syscall_arg(3)).map_err(|_| Errno::EINVAL)?,
+            },
+            LdelfSyscallNr::GenRndNum => LdelfSyscallRequest::GenRndNum {
+                buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
+                num_bytes: ctx.syscall_arg(1),
+            },
+            _ => todo!("implement ldelf syscall number: {}", sysnr),
+        };
+
+        Ok(dispatcher)
+    }
+}
+
+bitflags::bitflags! {
+    /// `LDELF_MAP_FLAG_*` from `optee_os/ldelf/include/ldelf.h`
+    #[non_exhaustive]
+    #[derive(Clone, Copy, Debug)]
+    pub struct LdelfMapFlags: usize {
+        const LDELF_MAP_FLAG_SHAREABLE = 0x1;
+        const LDELF_MAP_FLAG_WRITEABLE = 0x2;
+        const LDELF_MAP_FLAG_EXECUTABLE = 0x4;
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `TEE_MATTR_*` from `optee_os/core/include/mm/tee_mmu_types.h`
+    #[non_exhaustive]
+    #[derive(Clone, Copy, Debug)]
+    pub struct TeeMemAttr: usize {
+        const TEE_MATTR_VALID_BLOCK = 0x1;
+        const TEE_MATTR_TABLE = 0x8;
+        const TEE_MATTR_PR = 0x10;
+        const TEE_MATTR_PW = 0x20;
+        const TEE_MATTR_PX = 0x40;
+        const TEE_MATTR_PRW = Self::TEE_MATTR_PR.bits() | Self::TEE_MATTR_PW.bits();
+        const TEE_MATTR_PRWX = Self::TEE_MATTR_PRW.bits() | Self::TEE_MATTR_PX.bits();
+        const TEE_MATTR_UR = 0x80;
+        const TEE_MATTR_UW = 0x100;
+        const TEE_MATTR_UX = 0x200;
+        const TEE_MATTR_URW = Self::TEE_MATTR_UR.bits() | Self::TEE_MATTR_UW.bits();
+        const TEE_MATTR_URWX = Self::TEE_MATTR_URW.bits() | Self::TEE_MATTR_UX.bits();
+        const TEE_MATTR_PROT_MASK = Self::TEE_MATTR_PRWX.bits() | Self::TEE_MATTR_URWX.bits();
+        const TEE_MATTR_GLOBAL = 0x400;
+        const TEE_MATTR_SECURE = 0x800;
+        const _ = !0;
+    }
+}
+
+/// `ldef_arg` from `optee_os/ldelf/include/ldelf.h`
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct LdelfArg {
+    pub uuid: TeeUuid,
+    pub is_32bit: u32,
+    pub flags: u32,
+    pub entry_func: u64,
+    pub stack_ptr: u64,
+    pub dump_entry: u64,
+    pub ftrace_entry: u64,
+    pub dl_entry: u64,
+    pub fbuf: u64,
+}
+
+impl LdelfArg {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }

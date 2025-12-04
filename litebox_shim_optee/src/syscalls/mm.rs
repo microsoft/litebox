@@ -3,7 +3,7 @@
 use litebox::mm::linux::{MappingError, PAGE_SIZE};
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
-use crate::{MutPtr, litebox_page_manager};
+use crate::{UserMutPtr, litebox_page_manager};
 
 // `litebox_shim_optee` memory management
 // OP-TEE OS does have `ldelf_*` syscalls for memory management, but they are for LDELF (an ELF loader) not TAs.
@@ -24,7 +24,7 @@ fn do_mmap_anonymous(
     len: usize,
     prot: ProtFlags,
     flags: MapFlags,
-) -> Result<MutPtr<u8>, MappingError> {
+) -> Result<UserMutPtr<u8>, MappingError> {
     let op = |_| Ok(0);
     litebox_common_linux::mm::do_mmap(
         litebox_page_manager(),
@@ -45,7 +45,7 @@ pub(crate) fn sys_mmap(
     flags: MapFlags,
     _fd: i32,
     offset: usize,
-) -> Result<MutPtr<u8>, Errno> {
+) -> Result<UserMutPtr<u8>, Errno> {
     // check alignment
     if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
         return Err(Errno::EINVAL);
@@ -83,19 +83,15 @@ pub(crate) fn sys_mmap(
 }
 
 /// Handle syscall `munmap`
-#[expect(dead_code)]
-pub(crate) fn sys_munmap(addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
+#[allow(dead_code)]
+pub(crate) fn sys_munmap(addr: UserMutPtr<u8>, len: usize) -> Result<(), Errno> {
     let pm = litebox_page_manager();
     litebox_common_linux::mm::sys_munmap(pm, addr, len)
 }
 
 /// Handle syscall `mprotect`
 #[inline]
-pub(crate) fn sys_mprotect(
-    addr: crate::MutPtr<u8>,
-    len: usize,
-    prot: ProtFlags,
-) -> Result<(), Errno> {
+pub(crate) fn sys_mprotect(addr: UserMutPtr<u8>, len: usize, prot: ProtFlags) -> Result<(), Errno> {
     let pm = litebox_page_manager();
     litebox_common_linux::mm::sys_mprotect(pm, addr, len, prot)
 }

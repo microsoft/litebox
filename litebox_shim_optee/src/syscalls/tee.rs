@@ -11,7 +11,7 @@ use litebox_common_optee::{
 use num_enum::TryFromPrimitive;
 
 use crate::{
-    litebox_page_manager,
+    UserConstPtr, UserMutPtr, litebox_page_manager,
     syscalls::pta::{close_pta_session, handle_system_pta_command, is_pta, is_pta_session},
 };
 
@@ -53,12 +53,6 @@ pub fn sys_panic(code: usize) -> usize {
 
 /// A system call to print out a message.
 pub fn sys_log(buf: &[u8]) -> Result<(), TeeResult> {
-    #[cfg(debug_assertions)]
-    litebox::log_println!(
-        litebox_platform_multiplex::platform(),
-        "sys_log: buf {:#x}",
-        buf.as_ptr() as usize
-    );
     let msg = core::str::from_utf8(buf).map_err(|_| TeeResult::BadFormat)?;
     litebox::log_println!(litebox_platform_multiplex::platform(), "{}", msg);
     Ok(())
@@ -80,10 +74,10 @@ pub fn sys_get_property(
     prop_set: TeePropSet,
     index: u32,
     name_buf: Option<&mut [u8]>,
-    name_len: Option<crate::MutPtr<u32>>,
+    name_len: Option<UserMutPtr<u32>>,
     prop_buf: &mut [u8],
-    prop_len: crate::MutPtr<u32>,
-    prop_type: crate::MutPtr<u32>,
+    prop_len: UserMutPtr<u32>,
+    prop_type: UserMutPtr<u32>,
 ) -> Result<(), TeeResult> {
     if name_buf.is_some() && name_len.is_some() {
         todo!("return the name of a given property index")
@@ -148,7 +142,7 @@ pub fn sys_get_property(
 pub fn sys_get_property_name_to_index(
     prop_set: TeePropSet,
     name: &[u8],
-    index: crate::MutPtr<u32>,
+    index: UserMutPtr<u32>,
 ) -> Result<(), TeeResult> {
     let name_str =
         core::ffi::CStr::from_bytes_with_nul(name).map_err(|_| TeeResult::BadParameters)?;
@@ -189,8 +183,8 @@ pub fn sys_open_ta_session(
     ta_uuid: TeeUuid,
     _cancel_req_to: u32,
     usr_params: UteeParams,
-    ta_sess_id: crate::MutPtr<u32>,
-    ret_orig: crate::MutPtr<TeeOrigin>,
+    ta_sess_id: UserMutPtr<u32>,
+    ret_orig: UserMutPtr<TeeOrigin>,
 ) -> Result<(), TeeResult> {
     // `cancel_req_to` is a timeout value. Ignore it for now.
     unsafe {
@@ -233,7 +227,7 @@ pub fn sys_invoke_ta_command(
     _cancel_req_to: u32,
     cmd_id: u32,
     params: UteeParams,
-    ret_orig: crate::MutPtr<TeeOrigin>,
+    ret_orig: UserMutPtr<TeeOrigin>,
 ) -> Result<(), TeeResult> {
     // `cancel_req_to` is a timeout value. Ignore it for now.
     unsafe {
@@ -252,9 +246,12 @@ pub fn sys_invoke_ta_command(
 /// A system call to check the memory permissions of a given buffer.
 pub fn sys_check_access_rights(
     flags: TeeMemoryAccessRights,
-    buf: crate::ConstPtr<u8>,
+    buf: UserConstPtr<u8>,
     len: usize,
 ) -> Result<(), TeeResult> {
+    // Ignore the unknown bits of `TeeMemoryAccessRights` for now.
+    let flags = TeeMemoryAccessRights::from_bits_truncate(flags.bits());
+
     if flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_NONSECURE)
         && flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_SECURE)
     {

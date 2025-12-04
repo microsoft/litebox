@@ -4,9 +4,9 @@ use litebox::{
     mm::linux::CreatePagesFlags,
     platform::{RawConstPointer, RawMutPointer},
 };
-use litebox_common_optee::{TeeParamType, UteeParamOwned, UteeParams};
+use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 
-use crate::{MutPtr, litebox_page_manager};
+use crate::{UserMutPtr, litebox_page_manager};
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
@@ -47,7 +47,7 @@ fn align_down(addr: usize, align: usize) -> usize {
 /// NOTE: The above layout diagram is for 64-bit processes.
 pub struct TaStack {
     /// The top of the stack (base address)
-    stack_top: MutPtr<u8>,
+    stack_top: UserMutPtr<u8>,
     /// The length of the stack
     len: usize,
     /// The current position of the stack pointer
@@ -65,7 +65,7 @@ impl TaStack {
     /// Create a new stack for the user process.
     ///
     /// `stack_top` and `len` must be aligned to [`Self::STACK_ALIGNMENT`]
-    pub(super) fn new(stack_top: MutPtr<u8>, len: usize) -> Option<Self> {
+    pub(super) fn new(stack_top: UserMutPtr<u8>, len: usize) -> Option<Self> {
         if !stack_top.as_usize().is_multiple_of(Self::STACK_ALIGNMENT)
             || !len.is_multiple_of(Self::STACK_ALIGNMENT)
         {
@@ -92,6 +92,11 @@ impl TaStack {
     /// Get the address of `UteeParams` on the stack.
     pub(crate) fn get_params_address(&self) -> usize {
         self.stack_top.as_usize() + self.len - core::mem::size_of::<UteeParams>()
+    }
+
+    /// Get the address of `LdelfArg` on the stack.
+    pub(crate) fn get_ldelf_arg_address(&self) -> usize {
+        self.stack_top.as_usize() + self.len - core::mem::size_of::<LdelfArg>()
     }
 
     /// Push `bytes` to the stack.
@@ -251,6 +256,19 @@ impl TaStack {
         assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
         Some(())
     }
+
+    pub(crate) fn init_with_ldelf_arg(&mut self, ldelf_arg: &LdelfArg) -> Option<()> {
+        self.push_bytes(unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(ldelf_arg).cast::<u8>(),
+                core::mem::size_of::<LdelfArg>(),
+            )
+        })?;
+
+        self.pos = align_down(self.pos, Self::STACK_ALIGNMENT);
+        assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
+        Some(())
+    }
 }
 
 /// Allocate stack pages for a TA session. if `sp` is `Some`, it re-uses the allocated stack pages.
@@ -260,7 +278,7 @@ impl TaStack {
 /// Normally, `sp` should be the return value of this function's previous call (with `None`).
 pub(crate) fn allocate_stack(stack_base: Option<usize>) -> Option<TaStack> {
     let sp = if let Some(stack_base) = stack_base {
-        MutPtr::from_usize(stack_base)
+        UserMutPtr::from_usize(stack_base)
     } else {
         let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
             .expect("DEFAULT_STACK_SIZE is not page-aligned");
