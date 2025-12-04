@@ -8,7 +8,6 @@ use litebox_platform_lvbs::{
     mm::MemoryProvider,
     mshv::{
         hvcall,
-        vtl_switch::vtl_switch_loop_entry,
         vtl1_mem_layout::{
             PAGE_SIZE, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
             VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
@@ -17,6 +16,9 @@ use litebox_platform_lvbs::{
     serial_println,
 };
 use litebox_platform_multiplex::Platform;
+
+mod vtl_switch;
+use crate::vtl_switch::vtl_switch_loop;
 
 /// # Panics
 ///
@@ -96,7 +98,10 @@ pub fn init() -> Option<&'static Platform> {
 }
 
 pub fn run(platform: Option<&'static Platform>) -> ! {
-    vtl_switch_loop_entry(platform)
+    if let Some(platform) = platform {
+        litebox_platform_lvbs::set_platform_low(platform);
+    }
+    vtl_switch_loop()
 }
 
 #[panic_handler]
