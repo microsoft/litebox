@@ -1043,6 +1043,7 @@ bitflags::bitflags! {
 
 bitflags::bitflags! {
     /// `TEE_MATTR_*` from `optee_os/core/include/mm/tee_mmu_types.h`
+    #[non_exhaustive]
     #[derive(Clone, Copy, Debug)]
     pub struct TeeMemAttr: usize {
         const TEE_MATTR_VALID_BLOCK = 0x1;
@@ -1060,6 +1061,7 @@ bitflags::bitflags! {
         const TEE_MATTR_PROT_MASK = Self::TEE_MATTR_PRWX.bits() | Self::TEE_MATTR_URWX.bits();
         const TEE_MATTR_GLOBAL = 0x400;
         const TEE_MATTR_SECURE = 0x800;
+        const _ = !0;
     }
 }
 

@@ -65,33 +65,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let ldelf_data: Vec<u8> = {
         let ldelf = PathBuf::from(&cli_args.ldelf);
         let data = std::fs::read(ldelf).unwrap();
-        #[allow(clippy::let_and_return)]
-        let data = if cli_args.rewrite_syscalls {
-            // capstone declares a global allocator in conflict with our own.
-            // https://github.com/capstone-rust/capstone-rs/blob/14e855ca58400f454cb7ceb87d2c5e7b635ce498/capstone-rs/src/lib.rs#L16
-            // litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
-            // Might be a bug in `capstone-rs`: https://github.com/capstone-rust/capstone-rs/pull/171
-            todo!()
+        if cli_args.rewrite_syscalls {
+            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
         } else {
             data
-        };
-        data
+        }
     };
 
     let prog_data: Vec<u8> = {
         let prog = PathBuf::from(&cli_args.program);
         let data = std::fs::read(prog).unwrap();
-        #[allow(clippy::let_and_return)]
-        let data = if cli_args.rewrite_syscalls {
-            // capstone declares a global allocator in conflict with our own.
-            // https://github.com/capstone-rust/capstone-rs/blob/14e855ca58400f454cb7ceb87d2c5e7b635ce498/capstone-rs/src/lib.rs#L16
-            // litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
-            // Might be a bug in `capstone-rs`: https://github.com/capstone-rust/capstone-rs/pull/171
-            todo!()
+        if cli_args.rewrite_syscalls {
+            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
         } else {
             data
-        };
-        data
+        }
     };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
