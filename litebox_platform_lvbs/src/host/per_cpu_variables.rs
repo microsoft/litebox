@@ -4,9 +4,8 @@ use crate::{
     arch::{MAX_CORES, gdt, get_core_id},
     host::bootparam::get_num_possible_cpus,
     mshv::{
-        HV_VTL_NORMAL, HV_VTL_SECURE, HvMessagePage, HvVpAssistPage,
+        HV_VTL_NORMAL, HV_VTL_SECURE, HvMessagePage, HvVpAssistPage, NUM_VTLCALL_PARAMS,
         vsm::{ControlRegMap, NUM_CONTROL_REGS},
-        vtl_switch::VtlState,
         vtl1_mem_layout::PAGE_SIZE,
     },
 };
@@ -112,13 +111,14 @@ impl PerCpuVariables {
 
     /// Save the extended states of each core (VTL0 or VTL1).
     pub fn save_extended_states(&self, vtl: u8) {
-        if self.vtl0_xsave_area_addr.is_null() || self.vtl1_xsave_area_addr.is_null() {
-            panic!("XSAVE areas are not allocated");
-        } else {
+        if !self.vtl0_xsave_area_addr.is_null() && !self.vtl1_xsave_area_addr.is_null() {
             let xsave_area_addr = match vtl {
                 HV_VTL_NORMAL => self.vtl0_xsave_area_addr.as_u64(),
                 HV_VTL_SECURE => self.vtl1_xsave_area_addr.as_u64(),
-                _ => panic!("Invalid VTL value: {}", vtl),
+                _ => {
+                    // do nothing VTL is invalid
+                    return;
+                }
             };
             unsafe {
                 core::arch::asm!(
@@ -134,9 +134,7 @@ impl PerCpuVariables {
 
     /// Restore the extended states of each core (VTL0 or VTL1).
     pub fn restore_extended_states(&self, vtl: u8) {
-        if self.vtl0_xsave_area_addr.is_null() || self.vtl1_xsave_area_addr.is_null() {
-            panic!("XSAVE areas are not allocated");
-        } else {
+        if !self.vtl0_xsave_area_addr.is_null() && !self.vtl1_xsave_area_addr.is_null() {
             let xsave_area_addr = match vtl {
                 HV_VTL_NORMAL => self.vtl0_xsave_area_addr.as_u64(),
                 HV_VTL_SECURE => self.vtl1_xsave_area_addr.as_u64(),
@@ -164,7 +162,7 @@ impl PerCpuVariables {
 #[non_exhaustive]
 #[repr(usize)]
 pub enum KernelTlsOffset {
-    KernelStackPtr = 0x1000 + 0,
+    KernelStackPtr = 0x1000,
     InterruptStackPtr = 0x1000 + 8,
 }
 
@@ -366,4 +364,49 @@ fn get_xsave_area_size() -> usize {
         .get_extended_state_info()
         .expect("Failed to get cpuid extended state info");
     usize::try_from(sinfo.xsave_area_size_enabled_features()).unwrap()
+}
+
+// The following registers are shared between different VTLs.
+// If VTL entry is due to VTL call, we don't need to worry about VTL0 registers because
+// the caller saves them. However, if VTL entry is due to interrupt or intercept,
+// we should save/restore VTL0 registers. For now, we conservatively save/restore all
+// VTL0/VTL1 registers (results in performance degradation) but we can optimize it later.
+/// Struct to save VTL state (general-purpose registers)
+#[derive(Default, Clone, Copy)]
+#[repr(C)]
+pub struct VtlState {
+    pub rbp: u64,
+    pub cr2: u64,
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    // DR[0-6]
+    // X87, XMM, AVX, XCR
+}
+
+impl VtlState {
+    pub fn new() -> Self {
+        VtlState {
+            ..VtlState::default()
+        }
+    }
+
+    pub fn get_rax_rcx(&self) -> (u64, u64) {
+        (self.rax, self.rcx)
+    }
+
+    pub fn get_vtlcall_params(&self) -> [u64; NUM_VTLCALL_PARAMS] {
+        [self.rdi, self.rsi, self.rdx, self.r8]
+    }
 }

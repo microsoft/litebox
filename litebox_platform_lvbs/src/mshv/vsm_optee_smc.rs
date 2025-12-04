@@ -20,7 +20,7 @@ impl OpteeSmcArgs {
     const NUM_OPTEE_SMC_ARGS: usize = 9;
 }
 
-pub(crate) fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
+pub fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
     if let Ok(optee_smc_args_page_addr) = PhysAddr::try_new(optee_smc_args_pfn << 12)
         && let Some(mut _optee_smc_args) = unsafe {
             crate::platform_low().copy_from_vtl0_phys::<OpteeSmcArgs>(optee_smc_args_page_addr)

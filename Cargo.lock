@@ -945,6 +945,7 @@ dependencies = [
  "litebox_platform_lvbs",
  "litebox_platform_multiplex",
  "litebox_shim_optee",
+ "num_enum",
  "x86_64",
 ]
 

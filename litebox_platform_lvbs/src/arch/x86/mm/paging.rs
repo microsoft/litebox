@@ -334,6 +334,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     ///
     /// # Panics
     /// Panics if the page table is invalid
+    #[expect(dead_code)]
     #[allow(clippy::similar_names)]
     pub(crate) fn change_address_space(&self) -> PhysFrame {
         let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
