@@ -877,19 +877,17 @@ impl Task {
             return Err(Errno::EBADF);
         };
         let mut remote_addr = addr.is_some().then(SocketAddress::default);
-        self.sys_accept_inner(sockfd, remote_addr.as_mut(), flags)
-            .and_then(|fd| {
-                if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
-                    let addrlen = addrlen.ok_or(Errno::EFAULT)?;
-                    if let Err(err) = write_sockaddr_to_user(remote_addr, addr, addrlen) {
-                        // If we fail to write the address back to user, we need to close the accepted socket.
-                        self.sys_close(i32::try_from(fd).unwrap())
-                            .expect("close a newly-accepted socket failed");
-                        return Err(err);
-                    }
-                }
-                Ok(fd as usize)
-            })
+        let fd = self.sys_accept_inner(sockfd, remote_addr.as_mut(), flags)?;
+        if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
+            let addrlen = addrlen.ok_or(Errno::EFAULT)?;
+            if let Err(err) = write_sockaddr_to_user(remote_addr, addr, addrlen) {
+                // If we fail to write the address back to user, we need to close the accepted socket.
+                self.sys_close(i32::try_from(fd).unwrap())
+                    .expect("close a newly-accepted socket failed");
+                return Err(err);
+            }
+        }
+        Ok(fd as usize)
     }
     fn sys_accept_inner(
         &self,
@@ -1200,6 +1198,7 @@ impl Task {
             return Err(Errno::EBADF);
         };
         self.sys_setsockopt_inner(sockfd, optname, optval, optlen)
+            .map(|()| 0)
     }
     fn sys_setsockopt_inner(
         &self,
@@ -1207,7 +1206,7 @@ impl Task {
         optname: SocketOptionName,
         optval: ConstPtr<u8>,
         optlen: usize,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(), Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -1216,9 +1215,7 @@ impl Task {
             .ok_or(Errno::EBADF)?
         {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                self.global
-                    .setsockopt(fd, optname, optval, optlen)
-                    .map(|()| 0)
+                self.global.setsockopt(fd, optname, optval, optlen)
             }),
             _ => Err(Errno::ENOTSOCK),
         }
