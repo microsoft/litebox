@@ -1190,13 +1190,18 @@ impl Task {
     pub(crate) fn sys_setsockopt(
         &self,
         sockfd: i32,
-        optname: SocketOptionName,
+        level: u32,
+        optname: u32,
         optval: ConstPtr<u8>,
         optlen: usize,
     ) -> Result<usize, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
+        let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
+            log_unsupported!("setsockopt(level = {level}, optname = {optname})");
+            Errno::EINVAL
+        })?;
         self.sys_setsockopt_inner(sockfd, optname, optval, optlen)
             .map(|()| 0)
     }
@@ -1225,13 +1230,18 @@ impl Task {
     pub(crate) fn sys_getsockopt(
         &self,
         sockfd: i32,
-        optname: SocketOptionName,
+        level: u32,
+        optname: u32,
         optval: MutPtr<u8>,
         optlen: MutPtr<u32>,
     ) -> Result<usize, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
+        let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
+            log_unsupported!("setsockopt(level = {level}, optname = {optname})");
+            Errno::EINVAL
+        })?;
         self.sys_getsockopt_inner(sockfd, optname, optval, optlen)
             .map(|()| 0)
     }
@@ -1454,33 +1464,23 @@ impl Task {
                     addrlen: [ 2 ],
                 })
             }
-            SocketcallType::Setsockopt | SocketcallType::Getsockopt => {
-                let args = unsafe { args.to_cow_slice(5) }.ok_or(Errno::EFAULT)?;
-                let level: u32 = args[1].truncate();
-                let name: u32 = args[2].truncate();
-                let optname = SocketOptionName::try_from(level, name).ok_or_else(|| {
-                    log_unsupported!("setsockopt(level = {level}, optname = {name})");
-                    Errno::EINVAL
-                })?;
-                match socketcall_type {
-                    SocketcallType::Setsockopt => {
-                        parse_socketcall_args!(5 => sys_setsockopt {
-                            sockfd: 0,
-                            optname: optname,
-                            optval: [ 3 ],
-                            optlen: 4,
-                        })
-                    }
-                    SocketcallType::Getsockopt => {
-                        parse_socketcall_args!(5 => sys_getsockopt {
-                            sockfd: 0,
-                            optname: optname,
-                            optval: [ 3 ],
-                            optlen: [ 4 ],
-                        })
-                    }
-                    _ => unreachable!(),
-                }
+            SocketcallType::Setsockopt => {
+                parse_socketcall_args!(5 => sys_setsockopt {
+                    sockfd: 0,
+                    level: 1,
+                    optname: 2,
+                    optval: [ 3 ],
+                    optlen: 4,
+                })
+            }
+            SocketcallType::Getsockopt => {
+                parse_socketcall_args!(5 => sys_getsockopt {
+                    sockfd: 0,
+                    level: 1,
+                    optname: 2,
+                    optval: [ 3 ],
+                    optlen: [ 4 ],
+                })
             }
             SocketcallType::Sendmsg => {
                 parse_socketcall_args!(3 => sys_sendmsg {

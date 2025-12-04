@@ -787,16 +787,18 @@ impl Task {
             SyscallRequest::Listen { sockfd, backlog } => self.sys_listen(sockfd, backlog),
             SyscallRequest::Setsockopt {
                 sockfd,
+                level,
                 optname,
                 optval,
                 optlen,
-            } => self.sys_setsockopt(sockfd, optname, optval, optlen),
+            } => self.sys_setsockopt(sockfd, level, optname, optval, optlen),
             SyscallRequest::Getsockopt {
                 sockfd,
+                level,
                 optname,
                 optval,
                 optlen,
-            } => self.sys_getsockopt(sockfd, optname, optval, optlen),
+            } => self.sys_getsockopt(sockfd, level, optname, optval, optlen),
             SyscallRequest::Getsockname {
                 sockfd,
                 addr,

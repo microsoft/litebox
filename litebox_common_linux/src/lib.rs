@@ -1959,13 +1959,15 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Setsockopt {
         sockfd: i32,
-        optname: SocketOptionName,
+        level: u32,
+        optname: u32,
         optval: Platform::RawConstPointer<u8>,
         optlen: usize,
     },
     Getsockopt {
         sockfd: i32,
-        optname: SocketOptionName,
+        level: u32,
+        optname: u32,
         optval: Platform::RawMutPointer<u8>,
         optlen: Platform::RawMutPointer<u32>,
     },
@@ -2426,31 +2428,20 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
-            Sysno::setsockopt | Sysno::getsockopt => {
-                let level: u32 = ctx.sys_req_arg(1);
-                let name: u32 = ctx.sys_req_arg(2);
-                let optname = SocketOptionName::try_from(level, name).ok_or_else(|| {
-                    unsupported_einval(format_args!(
-                        "setsockopt(level = {level}, optname = {name})",
-                    ))
-                })?;
-                let sockfd = ctx.sys_req_arg(0);
-                match sysno {
-                    Sysno::setsockopt => SyscallRequest::Setsockopt {
-                        sockfd,
-                        optname,
-                        optval: ctx.sys_req_ptr(3),
-                        optlen: ctx.sys_req_arg(4),
-                    },
-                    Sysno::getsockopt => SyscallRequest::Getsockopt {
-                        sockfd,
-                        optname,
-                        optval: ctx.sys_req_ptr(3),
-                        optlen: ctx.sys_req_ptr(4),
-                    },
-                    _ => unreachable!(),
-                }
-            }
+            Sysno::setsockopt => sys_req!(Setsockopt {
+                sockfd,
+                level,
+                optname,
+                optval:*,
+                optlen,
+            }),
+            Sysno::getsockopt => sys_req!(Getsockopt {
+                sockfd,
+                level,
+                optname,
+                optval:*,
+                optlen:*,
+            }),
             Sysno::getsockname => sys_req!(Getsockname { sockfd, addr:*, addrlen:* }),
             Sysno::getpeername => sys_req!(Getpeername { sockfd, addr:*, addrlen:* }),
             Sysno::exit => sys_req!(Exit { status }),
