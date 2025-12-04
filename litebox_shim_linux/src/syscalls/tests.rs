@@ -110,7 +110,7 @@ fn test_dup() {
 
     // test socket dup
     let socket_fd = task
-        .sys_socket(
+        .sys_socket_inner(
             litebox_common_linux::AddressFamily::INET,
             litebox_common_linux::SockType::Stream,
             litebox_common_linux::SockFlags::empty(),

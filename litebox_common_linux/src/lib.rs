@@ -1763,63 +1763,6 @@ pub enum SocketcallType {
     Sendmmsg = 20,
 }
 
-fn parse_socket<Platform: litebox::platform::RawPointerProvider>(
-    domain: u32,
-    type_and_flags: u32,
-    protocol: u8,
-    unsupported_einval: impl Fn(core::fmt::Arguments) -> errno::Errno,
-) -> Result<SyscallRequest<Platform>, errno::Errno> {
-    let ty = type_and_flags & 0x0f;
-    let flags = type_and_flags & !0x0f;
-    Ok(SyscallRequest::Socket {
-        domain: AddressFamily::try_from(domain)
-            .map_err(|_| unsupported_einval(format_args!("socket(domain = {domain})")))?,
-        ty: SockType::try_from(ty)
-            .map_err(|_| unsupported_einval(format_args!("socket(type = {ty})")))?,
-        flags: SockFlags::from_bits_truncate(flags),
-        protocol: if protocol == 0 {
-            None
-        } else {
-            Some(
-                Protocol::try_from(protocol).map_err(|_| {
-                    unsupported_einval(format_args!("socket(protocol = {protocol})"))
-                })?,
-            )
-        },
-    })
-}
-
-#[cfg(target_arch = "x86")]
-mod socketcall {
-    pub(super) fn syscall_arg<T: super::ReinterpretTruncatedFromUsize>(arg: usize) -> T {
-        T::reinterpret_truncated_from_usize(arg)
-    }
-
-    macro_rules! parse_socketcall_args {
-        ($args_ptr:ident, $nargs:literal => $variant:ident { $($field:ident: $tt:tt),* $(,)? }) => {{
-            let args = unsafe { $args_ptr.to_cow_slice($nargs) }.ok_or(errno::Errno::EFAULT)?;
-            SyscallRequest::$variant {
-                $($field: socketcall::parse_socketcall_args!(@convert args $tt )),*
-            }
-        }};
-
-        // Convert with pointer marker - use from_usize for pointer types
-        (@convert $args:ident [ $idx:literal ]) => {
-            <_ as ReinterpretUsizeAsPtr<_>>::reinterpret_usize_as_ptr($args[$idx])
-        };
-
-        // Convert without marker - use reinterpret_truncated_from_usize for regular types
-        (@convert $args:ident $idx:literal) => {
-            ReinterpretTruncatedFromUsize::reinterpret_truncated_from_usize($args[$idx])
-        };
-
-        (@convert $args:ident $v:ident) => {
-            $v
-        };
-    }
-    pub(super) use parse_socketcall_args;
-}
-
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -1964,14 +1907,14 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         flags: Option<litebox::fs::OFlags>,
     },
     Socket {
-        domain: AddressFamily,
-        ty: SockType,
-        flags: SockFlags,
-        /// The `protocol` specifies a particular protocol to be used with the
-        /// socket.  Normally only a single protocol exists to support a
-        /// particular socket type within a given protocol family, in which case
-        /// protocol can be specified as `None`.
-        protocol: Option<Protocol>,
+        domain: u32,
+        type_and_flags: u32,
+        protocol: u8,
+    },
+    #[cfg(target_arch = "x86")]
+    Socketcall {
+        call: i32,
+        args: Platform::RawConstPointer<usize>,
     },
     Connect {
         sockfd: i32,
@@ -2462,169 +2405,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 newfd: Some(ctx.sys_req_arg(1)),
                 flags: Some(ctx.sys_req_arg(2)),
             },
-            Sysno::socket => {
-                let domain: u32 = ctx.sys_req_arg(0);
-                let type_and_flags: u32 = ctx.sys_req_arg(1);
-                let protocol: u8 = ctx.sys_req_arg(2);
-                parse_socket(domain, type_and_flags, protocol, unsupported_einval)?
-            }
+            Sysno::socket => sys_req!(Socket {
+                domain,
+                type_and_flags,
+                protocol,
+            }),
             #[cfg(target_arch = "x86")]
-            Sysno::socketcall => {
-                let call_type: i32 = ctx.sys_req_arg(0);
-                let args_ptr: Platform::RawConstPointer<usize> = ctx.sys_req_ptr(1);
-                let socketcall_type =
-                    SocketcallType::try_from(call_type).map_err(|_| errno::Errno::EINVAL)?;
-                match socketcall_type {
-                    SocketcallType::Socket => {
-                        let args =
-                            unsafe { args_ptr.to_cow_slice(3) }.ok_or(errno::Errno::EFAULT)?;
-                        parse_socket(
-                            socketcall::syscall_arg(args[0]),
-                            socketcall::syscall_arg(args[1]),
-                            socketcall::syscall_arg(args[2]),
-                            unsupported_einval,
-                        )?
-                    }
-                    SocketcallType::Bind => {
-                        socketcall::parse_socketcall_args!(args_ptr, 3 => Bind {
-                            sockfd: 0,
-                            sockaddr: [ 1 ],
-                            addrlen: 2,
-                        })
-                    }
-                    SocketcallType::Connect => {
-                        socketcall::parse_socketcall_args!(args_ptr, 3 => Connect {
-                            sockfd: 0,
-                            sockaddr: [ 1 ],
-                            addrlen: 2,
-                        })
-                    }
-                    SocketcallType::Listen => {
-                        socketcall::parse_socketcall_args!(args_ptr, 2 => Listen {
-                            sockfd: 0,
-                            backlog: 1,
-                        })
-                    }
-                    SocketcallType::Accept => {
-                        let flags = SockFlags::empty();
-                        socketcall::parse_socketcall_args!(args_ptr, 3 => Accept {
-                            sockfd: 0,
-                            addr: [ 1 ],
-                            addrlen: [ 2 ],
-                            flags: flags,
-                        })
-                    }
-                    SocketcallType::Accept4 => {
-                        socketcall::parse_socketcall_args!(args_ptr, 4 => Accept {
-                            sockfd: 0,
-                            addr: [ 1 ],
-                            addrlen: [ 2 ],
-                            flags: 3,
-                        })
-                    }
-                    SocketcallType::Send => {
-                        let addr = None;
-                        let addrlen = 0;
-                        socketcall::parse_socketcall_args!(args_ptr, 4 => Sendto {
-                            sockfd: 0,
-                            buf: [ 1 ],
-                            len: 2,
-                            flags: 3,
-                            addr: addr,
-                            addrlen: addrlen,
-                        })
-                    }
-                    SocketcallType::Sendto => {
-                        socketcall::parse_socketcall_args!(args_ptr, 6 => Sendto {
-                            sockfd: 0,
-                            buf: [ 1 ],
-                            len: 2,
-                            flags: 3,
-                            addr: [ 4 ],
-                            addrlen: 5,
-                        })
-                    }
-                    SocketcallType::Recv => {
-                        let addr = None;
-                        let addrlen = Platform::RawMutPointer::from_usize(0);
-                        socketcall::parse_socketcall_args!(args_ptr, 4 => Recvfrom {
-                            sockfd: 0,
-                            buf: [ 1 ],
-                            len: 2,
-                            flags: 3,
-                            addr: addr,
-                            addrlen: addrlen,
-                        })
-                    }
-                    SocketcallType::Recvfrom => {
-                        socketcall::parse_socketcall_args!(args_ptr, 6 => Recvfrom {
-                            sockfd: 0,
-                            buf: [ 1 ],
-                            len: 2,
-                            flags: 3,
-                            addr: [ 4 ],
-                            addrlen: [ 5 ],
-                        })
-                    }
-                    SocketcallType::GetSockname => {
-                        socketcall::parse_socketcall_args!(args_ptr, 3 => Getsockname {
-                            sockfd: 0,
-                            addr: [ 1 ],
-                            addrlen: [ 2 ],
-                        })
-                    }
-                    SocketcallType::GetPeername => {
-                        socketcall::parse_socketcall_args!(args_ptr, 3 => Getpeername {
-                            sockfd: 0,
-                            addr: [ 1 ],
-                            addrlen: [ 2 ],
-                        })
-                    }
-                    SocketcallType::Setsockopt | SocketcallType::Getsockopt => {
-                        let args =
-                            unsafe { args_ptr.to_cow_slice(5) }.ok_or(errno::Errno::EFAULT)?;
-                        let level: u32 = args[1].truncate();
-                        let name: u32 = args[2].truncate();
-                        let optname = SocketOptionName::try_from(level, name).ok_or_else(|| {
-                            unsupported_einval(format_args!(
-                                "setsockopt(level = {level}, optname = {name})",
-                            ))
-                        })?;
-                        match socketcall_type {
-                            SocketcallType::Setsockopt => {
-                                socketcall::parse_socketcall_args!(args_ptr, 5 => Setsockopt {
-                                    sockfd: 0,
-                                    optname: optname,
-                                    optval: [ 3 ],
-                                    optlen: 4,
-                                })
-                            }
-                            SocketcallType::Getsockopt => {
-                                socketcall::parse_socketcall_args!(args_ptr, 5 => Getsockopt {
-                                    sockfd: 0,
-                                    optname: optname,
-                                    optval: [ 3 ],
-                                    optlen: [ 4 ],
-                                })
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                    SocketcallType::Sendmsg => {
-                        socketcall::parse_socketcall_args!(args_ptr, 3 => Sendmsg {
-                            sockfd: 0,
-                            msg: [ 1 ],
-                            flags: 2,
-                        })
-                    }
-                    _ => {
-                        unsupported_einval(format_args!(
-                            "socketcall type {socketcall_type:?} is not supported",
-                        ));
-                        return Err(errno::Errno::EINVAL);
-                    }
-                }
-            }
+            Sysno::socketcall => sys_req!(Socketcall { call, args:* }),
             Sysno::connect => sys_req!(Connect { sockfd, sockaddr:*, addrlen }),
             #[cfg(target_arch = "x86_64")]
             Sysno::accept => sys_req!(Accept {
@@ -3331,7 +3118,7 @@ impl PtRegs {
 #[diagnostic::on_unimplemented(
     message = "If you are trying to use a pointer for the sys_req macro, you might want to `:*` it. Alternatively, you might be looking for `sys_req_ptr` rather than `sys_req_arg`."
 )]
-trait ReinterpretTruncatedFromUsize: Sized {
+pub trait ReinterpretTruncatedFromUsize: Sized {
     fn reinterpret_truncated_from_usize(v: usize) -> Self;
 }
 impl ReinterpretTruncatedFromUsize for u64 {
@@ -3415,7 +3202,7 @@ reinterpret_truncated_from_usize_for! {
 #[diagnostic::on_unimplemented(
     message = "If you are trying to use a non-pointer for the sys_req macro, you might want remove the `:*` for it. Alternatively, you might be looking for `sys_req_arg` rather than `sys_req_ptr`."
 )]
-trait ReinterpretUsizeAsPtr<T>: Sized {
+pub trait ReinterpretUsizeAsPtr<T>: Sized {
     fn reinterpret_usize_as_ptr(v: usize) -> Self;
 }
 impl<T: Clone, P: RawConstPointer<T>> ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>>

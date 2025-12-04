@@ -724,6 +724,36 @@ impl Task {
     /// Handle syscall `socket`
     pub(crate) fn sys_socket(
         &self,
+        domain: u32,
+        type_and_flags: u32,
+        protocol: u8,
+    ) -> Result<usize, Errno> {
+        let ty = type_and_flags & 0x0f;
+        let flags = type_and_flags & !0x0f;
+        let domain = AddressFamily::try_from(domain).map_err(|_| {
+            log_unsupported!("socket(domain = {domain})");
+            Errno::EINVAL
+        })?;
+        let ty = SockType::try_from(ty).map_err(|_| {
+            log_unsupported!("socket(type = {ty})");
+            Errno::EINVAL
+        })?;
+        let flags = SockFlags::from_bits_truncate(flags);
+        let protocol = if protocol == 0 {
+            None
+        } else {
+            Some(
+                litebox_common_linux::Protocol::try_from(protocol).map_err(|_| {
+                    log_unsupported!("socket(protocol = {protocol})");
+                    Errno::EINVAL
+                })?,
+            )
+        };
+        self.sys_socket_inner(domain, ty, flags, protocol)
+            .map(|fd| fd as usize)
+    }
+    pub(super) fn sys_socket_inner(
+        &self,
         domain: AddressFamily,
         ty: SockType,
         flags: SockFlags,
@@ -839,13 +869,34 @@ impl Task {
     pub(crate) fn sys_accept(
         &self,
         sockfd: i32,
-        peer: Option<&mut SocketAddress>,
+        addr: Option<MutPtr<u8>>,
+        addrlen: Option<MutPtr<u32>>,
         flags: SockFlags,
-    ) -> Result<u32, Errno> {
+    ) -> Result<usize, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-
+        let mut remote_addr = addr.is_some().then(SocketAddress::default);
+        self.sys_accept_inner(sockfd, remote_addr.as_mut(), flags)
+            .and_then(|fd| {
+                if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
+                    let addrlen = addrlen.ok_or(Errno::EFAULT)?;
+                    if let Err(err) = write_sockaddr_to_user(remote_addr, addr, addrlen) {
+                        // If we fail to write the address back to user, we need to close the accepted socket.
+                        self.sys_close(i32::try_from(fd).unwrap())
+                            .expect("close a newly-accepted socket failed");
+                        return Err(err);
+                    }
+                }
+                Ok(fd as usize)
+            })
+    }
+    fn sys_accept_inner(
+        &self,
+        sockfd: u32,
+        peer: Option<&mut SocketAddress>,
+        flags: SockFlags,
+    ) -> Result<u32, Errno> {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
@@ -888,11 +939,19 @@ impl Task {
     }
 
     /// Handle syscall `connect`
-    pub(crate) fn sys_connect(&self, fd: i32, sockaddr: SocketAddress) -> Result<(), Errno> {
+    pub(crate) fn sys_connect(
+        &self,
+        fd: i32,
+        sockaddr: ConstPtr<u8>,
+        addrlen: usize,
+    ) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-
+        let sockaddr = read_sockaddr_from_user(sockaddr, addrlen)?;
+        self.sys_connect_inner(fd, sockaddr).map(|()| 0)
+    }
+    fn sys_connect_inner(&self, fd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
@@ -906,11 +965,19 @@ impl Task {
     }
 
     /// Handle syscall `bind`
-    pub(crate) fn sys_bind(&self, sockfd: i32, sockaddr: SocketAddress) -> Result<(), Errno> {
+    pub(crate) fn sys_bind(
+        &self,
+        sockfd: i32,
+        sockaddr: ConstPtr<u8>,
+        addrlen: usize,
+    ) -> Result<usize, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-
+        let sockaddr = read_sockaddr_from_user(sockaddr, addrlen)?;
+        self.sys_bind_inner(sockfd, sockaddr).map(|()| 0)
+    }
+    fn sys_bind_inner(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -927,11 +994,13 @@ impl Task {
     }
 
     /// Handle syscall `listen`
-    pub(crate) fn sys_listen(&self, sockfd: i32, backlog: u16) -> Result<(), Errno> {
+    pub(crate) fn sys_listen(&self, sockfd: i32, backlog: u16) -> Result<usize, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-
+        self.sys_listen_inner(sockfd, backlog).map(|()| 0)
+    }
+    pub(crate) fn sys_listen_inner(&self, sockfd: u32, backlog: u16) -> Result<(), Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -953,12 +1022,25 @@ impl Task {
         buf: ConstPtr<u8>,
         len: usize,
         flags: SendFlags,
-        sockaddr: Option<SocketAddress>,
+        addr: Option<ConstPtr<u8>>,
+        addrlen: u32,
     ) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-
+        let sockaddr = addr
+            .map(|addr| read_sockaddr_from_user(addr, addrlen as usize))
+            .transpose()?;
+        self.sys_sendto_inner(fd, buf, len, flags, sockaddr)
+    }
+    fn sys_sendto_inner(
+        &self,
+        fd: u32,
+        buf: ConstPtr<u8>,
+        len: usize,
+        flags: SendFlags,
+        sockaddr: Option<SocketAddress>,
+    ) -> Result<usize, Errno> {
         let buf = unsafe { buf.to_cow_slice(len).ok_or(Errno::EFAULT) }?;
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
@@ -978,13 +1060,21 @@ impl Task {
     pub(crate) fn sys_sendmsg(
         &self,
         fd: i32,
-        msg: &litebox_common_linux::UserMsgHdr<Platform>,
+        msg: ConstPtr<litebox_common_linux::UserMsgHdr<Platform>>,
         flags: SendFlags,
     ) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-
+        let msg = unsafe { msg.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+        self.sys_sendmsg_inner(fd, &msg, flags)
+    }
+    fn sys_sendmsg_inner(
+        &self,
+        fd: u32,
+        msg: &litebox_common_linux::UserMsgHdr<Platform>,
+        flags: SendFlags,
+    ) -> Result<usize, Errno> {
         let sock_addr = if msg.msg_name.as_usize() != 0 {
             Some(read_sockaddr_from_user(
                 msg.msg_name,
@@ -1032,15 +1122,42 @@ impl Task {
         buf: MutPtr<u8>,
         len: usize,
         flags: ReceiveFlags,
-        source_addr: Option<&mut Option<SocketAddress>>,
+        addr: Option<MutPtr<u8>>,
+        addrlen: MutPtr<u32>,
     ) -> Result<usize, Errno> {
-        let Ok(fd) = u32::try_from(fd) else {
+        let Ok(sockfd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-
+        let mut source_addr = None;
+        let size = self.sys_recvfrom_inner(
+            sockfd,
+            buf,
+            len,
+            flags,
+            if addr.is_some() {
+                Some(&mut source_addr)
+            } else {
+                None
+            },
+        )?;
+        if let Some(src_addr) = source_addr
+            && let Some(sock_ptr) = addr
+        {
+            write_sockaddr_to_user(src_addr, sock_ptr, addrlen)?;
+        }
+        Ok(size)
+    }
+    fn sys_recvfrom_inner(
+        &self,
+        sockfd: u32,
+        buf: MutPtr<u8>,
+        len: usize,
+        flags: ReceiveFlags,
+        source_addr: Option<&mut Option<SocketAddress>>,
+    ) -> Result<usize, Errno> {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
-        match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
+        match file_table.get_fd(sockfd).ok_or(Errno::EBADF)? {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 const MAX_LEN: usize = 4096;
                 let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
@@ -1078,11 +1195,19 @@ impl Task {
         optname: SocketOptionName,
         optval: ConstPtr<u8>,
         optlen: usize,
-    ) -> Result<(), Errno> {
+    ) -> Result<usize, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-
+        self.sys_setsockopt_inner(sockfd, optname, optval, optlen)
+    }
+    fn sys_setsockopt_inner(
+        &self,
+        sockfd: u32,
+        optname: SocketOptionName,
+        optval: ConstPtr<u8>,
+        optlen: usize,
+    ) -> Result<usize, Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -1091,7 +1216,9 @@ impl Task {
             .ok_or(Errno::EBADF)?
         {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                self.global.setsockopt(fd, optname, optval, optlen)
+                self.global
+                    .setsockopt(fd, optname, optval, optlen)
+                    .map(|()| 0)
             }),
             _ => Err(Errno::ENOTSOCK),
         }
@@ -1104,11 +1231,20 @@ impl Task {
         optname: SocketOptionName,
         optval: MutPtr<u8>,
         optlen: MutPtr<u32>,
-    ) -> Result<(), Errno> {
+    ) -> Result<usize, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-
+        self.sys_getsockopt_inner(sockfd, optname, optval, optlen)
+            .map(|()| 0)
+    }
+    pub(crate) fn sys_getsockopt_inner(
+        &self,
+        sockfd: u32,
+        optname: SocketOptionName,
+        optval: MutPtr<u8>,
+        optlen: MutPtr<u32>,
+    ) -> Result<(), Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -1124,11 +1260,19 @@ impl Task {
     }
 
     /// Handle syscall `getsockname`
-    pub(crate) fn sys_getsockname(&self, sockfd: i32) -> Result<SocketAddress, Errno> {
+    pub(crate) fn sys_getsockname(
+        &self,
+        sockfd: i32,
+        addr: MutPtr<u8>,
+        addrlen: MutPtr<u32>,
+    ) -> Result<usize, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-
+        let sockaddr = self.sys_getsockname_inner(sockfd)?;
+        write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
+    }
+    fn sys_getsockname_inner(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -1149,11 +1293,19 @@ impl Task {
     }
 
     /// Handle syscall `getpeername`
-    pub(crate) fn sys_getpeername(&self, sockfd: i32) -> Result<SocketAddress, Errno> {
+    pub(crate) fn sys_getpeername(
+        &self,
+        sockfd: i32,
+        addr: MutPtr<u8>,
+        addrlen: MutPtr<u32>,
+    ) -> Result<usize, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-
+        let sockaddr = self.sys_getpeername_inner(sockfd)?;
+        write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
+    }
+    fn sys_getpeername_inner(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -1170,6 +1322,180 @@ impl Task {
                     .map_err(Errno::from)
             }),
             _ => Err(Errno::ENOTSOCK),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86")]
+impl Task {
+    pub(crate) fn sys_socketcall(&self, call: i32, args: ConstPtr<usize>) -> Result<usize, Errno> {
+        use litebox_common_linux::SocketcallType;
+        macro_rules! parse_socketcall_args {
+            ($nargs:literal => $func:ident { $($field:ident: $tt:tt),* $(,)? }) => {{
+                let args = unsafe { args.to_cow_slice($nargs) }.ok_or(Errno::EFAULT)?;
+                self.$func (
+                    $(parse_socketcall_args!(@convert args $tt )),*
+                )
+            }};
+
+            // Convert with pointer marker - use from_usize for pointer types
+            (@convert $args:ident [ $idx:literal ]) => {
+                <_ as litebox_common_linux::ReinterpretUsizeAsPtr<_>>::reinterpret_usize_as_ptr($args[$idx])
+            };
+
+            // Convert without marker - use reinterpret_truncated_from_usize for regular types
+            (@convert $args:ident $idx:literal) => {
+                litebox_common_linux::ReinterpretTruncatedFromUsize::reinterpret_truncated_from_usize($args[$idx])
+            };
+
+            (@convert $args:ident $v:ident) => {
+                $v
+            };
+        }
+
+        let socketcall_type = SocketcallType::try_from(call).map_err(|_| Errno::EINVAL)?;
+        match socketcall_type {
+            SocketcallType::Socket => {
+                parse_socketcall_args!(3 => sys_socket {
+                    domain: 0,
+                    type_and_flags: 1,
+                    protocol: 2,
+                })
+            }
+            SocketcallType::Bind => {
+                parse_socketcall_args!(3 => sys_bind {
+                    sockfd: 0,
+                    sockaddr: [ 1 ],
+                    addrlen: 2,
+                })
+            }
+            SocketcallType::Connect => {
+                parse_socketcall_args!(3 => sys_connect {
+                    sockfd: 0,
+                    sockaddr: [ 1 ],
+                    addrlen: 2,
+                })
+            }
+            SocketcallType::Listen => {
+                parse_socketcall_args!(2 => sys_listen {
+                    sockfd: 0,
+                    backlog: 1,
+                })
+            }
+            SocketcallType::Accept => {
+                let flags = SockFlags::empty();
+                parse_socketcall_args!(3 => sys_accept {
+                    sockfd: 0,
+                    addr: [ 1 ],
+                    addrlen: [ 2 ],
+                    flags: flags,
+                })
+            }
+            SocketcallType::Accept4 => {
+                parse_socketcall_args!(4 => sys_accept {
+                    sockfd: 0,
+                    addr: [ 1 ],
+                    addrlen: [ 2 ],
+                    flags: 3,
+                })
+            }
+            SocketcallType::Send => {
+                let addr = None;
+                let addrlen = 0;
+                parse_socketcall_args!(4 => sys_sendto {
+                    sockfd: 0,
+                    buf: [ 1 ],
+                    len: 2,
+                    flags: 3,
+                    addr: addr,
+                    addrlen: addrlen,
+                })
+            }
+            SocketcallType::Sendto => {
+                parse_socketcall_args!(6 => sys_sendto {
+                    sockfd: 0,
+                    buf: [ 1 ],
+                    len: 2,
+                    flags: 3,
+                    addr: [ 4 ],
+                    addrlen: 5,
+                })
+            }
+            SocketcallType::Recv => {
+                let addr = None;
+                let addrlen = MutPtr::from_usize(0);
+                parse_socketcall_args!(4 => sys_recvfrom {
+                    sockfd: 0,
+                    buf: [ 1 ],
+                    len: 2,
+                    flags: 3,
+                    addr: addr,
+                    addrlen: addrlen,
+                })
+            }
+            SocketcallType::Recvfrom => {
+                parse_socketcall_args!(6 => sys_recvfrom {
+                    sockfd: 0,
+                    buf: [ 1 ],
+                    len: 2,
+                    flags: 3,
+                    addr: [ 4 ],
+                    addrlen: [ 5 ],
+                })
+            }
+            SocketcallType::GetSockname => {
+                parse_socketcall_args!(3 => sys_getsockname {
+                    sockfd: 0,
+                    addr: [ 1 ],
+                    addrlen: [ 2 ],
+                })
+            }
+            SocketcallType::GetPeername => {
+                parse_socketcall_args!(3 => sys_getpeername {
+                    sockfd: 0,
+                    addr: [ 1 ],
+                    addrlen: [ 2 ],
+                })
+            }
+            SocketcallType::Setsockopt | SocketcallType::Getsockopt => {
+                let args = unsafe { args.to_cow_slice(5) }.ok_or(Errno::EFAULT)?;
+                let level: u32 = args[1].truncate();
+                let name: u32 = args[2].truncate();
+                let optname = SocketOptionName::try_from(level, name).ok_or_else(|| {
+                    log_unsupported!("setsockopt(level = {level}, optname = {name})");
+                    Errno::EINVAL
+                })?;
+                match socketcall_type {
+                    SocketcallType::Setsockopt => {
+                        parse_socketcall_args!(5 => sys_setsockopt {
+                            sockfd: 0,
+                            optname: optname,
+                            optval: [ 3 ],
+                            optlen: 4,
+                        })
+                    }
+                    SocketcallType::Getsockopt => {
+                        parse_socketcall_args!(5 => sys_getsockopt {
+                            sockfd: 0,
+                            optname: optname,
+                            optval: [ 3 ],
+                            optlen: [ 4 ],
+                        })
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            SocketcallType::Sendmsg => {
+                parse_socketcall_args!(3 => sys_sendmsg {
+                    sockfd: 0,
+                    msg: [ 1 ],
+                    flags: 2,
+                })
+            }
+            _ => {
+                log_unsupported!("socketcall type {socketcall_type:?} is not supported");
+                Err(Errno::EINVAL)
+            }
         }
     }
 }
@@ -1217,17 +1543,17 @@ mod tests {
         task
     }
 
-    fn epoll_add(task: &crate::Task, epfd: i32, target_fd: i32, events: litebox::event::Events) {
+    fn epoll_add(task: &crate::Task, epfd: i32, target_fd: u32, events: litebox::event::Events) {
         let ev = litebox_common_linux::EpollEvent {
             events: events.bits(),
-            data: u64::try_from(target_fd).unwrap(),
+            data: u64::from(target_fd),
         };
         let ev_ptr = (&raw const ev).cast::<litebox_common_linux::EpollEvent>();
         let ev_const = crate::ConstPtr::from_usize(ev_ptr as usize);
         task.sys_epoll_ctl(
             epfd,
             litebox_common_linux::EpollOp::EpollCtlAdd,
-            target_fd,
+            i32::try_from(target_fd).unwrap(),
             ev_const,
         )
         .expect("epoll_ctl add server failed");
@@ -1252,7 +1578,7 @@ mod tests {
         option: &'static str,
     ) {
         let server = task
-            .sys_socket(
+            .sys_socket_inner(
                 AddressFamily::INET,
                 SockType::Stream,
                 if is_nonblocking {
@@ -1263,14 +1589,13 @@ mod tests {
                 None,
             )
             .unwrap();
-        let server = i32::try_from(server).unwrap();
         let server_sockaddr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from(ip),
             port,
         )));
-        task.sys_bind(server, server_sockaddr.clone())
+        task.sys_bind_inner(server, server_sockaddr.clone())
             .expect("Failed to bind socket");
-        task.sys_listen(server, 1)
+        task.sys_listen_inner(server, 1)
             .expect("Failed to listen on socket");
 
         // Create an epoll instance and register the server fd for EPOLLIN
@@ -1318,7 +1643,7 @@ mod tests {
 
         let mut remote_addr = super::SocketAddress::default();
         let client_fd = task
-            .sys_accept(
+            .sys_accept_inner(
                 server,
                 Some(&mut remote_addr),
                 if is_nonblocking {
@@ -1328,9 +1653,11 @@ mod tests {
                 },
             )
             .expect("Failed to accept connection");
-        let client_fd = i32::try_from(client_fd).unwrap();
-        assert_eq!(server_sockaddr, task.sys_getsockname(client_fd).unwrap());
-        assert_eq!(remote_addr, task.sys_getpeername(client_fd).unwrap());
+        assert_eq!(
+            server_sockaddr,
+            task.sys_getsockname_inner(client_fd).unwrap()
+        );
+        assert_eq!(remote_addr, task.sys_getpeername_inner(client_fd).unwrap());
         let super::SocketAddress::Inet(SocketAddr::V4(remote_addr)) = remote_addr else {
             panic!("Expected IPv4 address");
         };
@@ -1341,7 +1668,7 @@ mod tests {
             "sendto" => {
                 let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
                 let n = task
-                    .sys_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None)
+                    .sys_sendto_inner(client_fd, ptr, buf.len(), SendFlags::empty(), None)
                     .expect("Failed to send data");
                 assert_eq!(n, buf.len());
                 let output = child_handle
@@ -1374,7 +1701,7 @@ mod tests {
                     msg_flags: SendFlags::empty(),
                 };
                 assert_eq!(
-                    task.sys_sendmsg(client_fd, &hdr, SendFlags::empty())
+                    task.sys_sendmsg_inner(client_fd, &hdr, SendFlags::empty())
                         .expect("Failed to sendmsg"),
                     buf1.len() + buf2.len()
                 );
@@ -1393,14 +1720,14 @@ mod tests {
                     assert_eq!(n, 1);
                     for ev in &events[..n] {
                         assert!(ev.events & litebox::event::Events::IN.bits() != 0);
-                        let fd = i32::try_from(ev.data).unwrap();
+                        let fd = u32::try_from(ev.data).unwrap();
                         assert_eq!(fd, client_fd);
                     }
                 }
                 let mut recv_buf = [0u8; 48];
                 let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
                 let n = task
-                    .sys_recvfrom(
+                    .sys_recvfrom_inner(
                         client_fd,
                         recv_ptr,
                         recv_buf.len(),
@@ -1423,9 +1750,9 @@ mod tests {
             _ => panic!("Unknown option"),
         }
 
-        task.sys_close(client_fd)
+        task.sys_close_inner(client_fd)
             .expect("Failed to close client socket");
-        task.sys_close(server)
+        task.sys_close_inner(server)
             .expect("Failed to close server socket");
     }
 
@@ -1488,20 +1815,20 @@ mod tests {
     fn test_tun_tcp_connection_refused() {
         let task = init_platform(Some("tun99"));
         let socket_fd = task
-            .sys_socket(
+            .sys_socket_inner(
                 AddressFamily::INET,
                 SockType::Stream,
                 SockFlags::empty(),
                 None,
             )
             .expect("failed to create socket");
-        let socket_fd = i32::try_from(socket_fd).unwrap();
-        let socket_fd2 = task.sys_dup(socket_fd, None, None).unwrap();
-        let socket_fd2 = i32::try_from(socket_fd2).unwrap();
+        let socket_fd2 = task
+            .sys_dup(i32::try_from(socket_fd).unwrap(), None, None)
+            .unwrap();
 
-        task.sys_close(socket_fd).unwrap();
+        task.sys_close_inner(socket_fd).unwrap();
         let err = task
-            .sys_connect(
+            .sys_connect_inner(
                 socket_fd2,
                 SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
                     core::net::Ipv4Addr::from([10, 0, 0, 1]),
@@ -1531,27 +1858,26 @@ mod tests {
 
         // Client socket
         let client_fd = task
-            .sys_socket(
+            .sys_socket_inner(
                 AddressFamily::INET,
                 SockType::Stream,
                 SockFlags::empty(),
                 None,
             )
             .expect("failed to create client socket");
-        let client_fd = i32::try_from(client_fd).unwrap();
 
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from([10, 0, 0, 1]),
             SERVER_PORT,
         )));
-        task.sys_connect(client_fd, server_addr)
+        task.sys_connect_inner(client_fd, server_addr)
             .expect("failed to connect to server");
 
         let buf = "Hello, world!";
         let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
         let len = buf.len();
         let n = task
-            .sys_sendto(client_fd, ptr, len, SendFlags::empty(), None)
+            .sys_sendto_inner(client_fd, ptr, len, SendFlags::empty(), None)
             .unwrap();
         assert_eq!(n, len);
 
@@ -1560,7 +1886,7 @@ mod tests {
             linger: 60, // timeout in seconds
         };
         let optval = ConstPtr::from_usize((&raw const linger).cast::<u8>() as usize);
-        task.sys_setsockopt(
+        task.sys_setsockopt_inner(
             client_fd,
             SocketOptionName::Socket(SocketOption::LINGER),
             optval,
@@ -1568,7 +1894,7 @@ mod tests {
         )
         .expect("Failed to set SO_LINGER");
 
-        task.sys_close(client_fd)
+        task.sys_close_inner(client_fd)
             .expect("failed to close client socket");
 
         let output = child_handle
@@ -1584,7 +1910,7 @@ mod tests {
 
         // Server socket and bind
         let server_fd = task
-            .sys_socket(
+            .sys_socket_inner(
                 AddressFamily::INET,
                 SockType::Datagram,
                 if is_nonblocking {
@@ -1595,16 +1921,16 @@ mod tests {
                 Some(litebox_common_linux::Protocol::UDP),
             )
             .expect("failed to create server socket");
-        let server_fd = i32::try_from(server_fd).unwrap();
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from(TUN_IP_ADDR),
             SERVER_PORT,
         )));
-        task.sys_bind(server_fd, server_addr.clone())
+        task.sys_bind_inner(server_fd, server_addr.clone())
             .expect("failed to bind server");
         assert_eq!(
             server_addr,
-            task.sys_getsockname(server_fd).expect("getsockname failed")
+            task.sys_getsockname_inner(server_fd)
+                .expect("getsockname failed")
         );
 
         // Create an epoll instance and register the server fd for EPOLLIN
@@ -1653,12 +1979,12 @@ mod tests {
             assert_eq!(n, 1);
             for ev in &events[..n] {
                 assert!(ev.events & litebox::event::Events::IN.bits() != 0);
-                let fd = i32::try_from(ev.data).unwrap();
+                let fd = u32::try_from(ev.data).unwrap();
                 assert_eq!(fd, server_fd);
             }
         }
         let n = task
-            .sys_recvfrom(
+            .sys_recvfrom_inner(
                 server_fd,
                 recv_ptr,
                 if test_trunc {
@@ -1680,7 +2006,8 @@ mod tests {
         let SocketAddress::Inet(sender_addr) = sender_addr.unwrap();
         assert_eq!(sender_addr.port(), CLIENT_PORT);
 
-        task.sys_close(server_fd).expect("failed to close server");
+        task.sys_close_inner(server_fd)
+            .expect("failed to close server");
 
         child.wait().expect("Failed to wait for client");
     }
@@ -1708,14 +2035,13 @@ mod tests {
 
         // Client socket and explicit bind
         let client_fd = task
-            .sys_socket(
+            .sys_socket_inner(
                 AddressFamily::INET,
                 SockType::Datagram,
                 SockFlags::empty(),
                 Some(litebox_common_linux::Protocol::UDP),
             )
             .expect("failed to create client socket");
-        let client_fd = i32::try_from(client_fd).unwrap();
 
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from([127, 0, 0, 1]),
@@ -1725,7 +2051,7 @@ mod tests {
         // Send from client to server
         let msg = "Hello without connect()";
         let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
-        task.sys_sendto(
+        task.sys_sendto_inner(
             client_fd,
             msg_ptr,
             msg.len(),
@@ -1735,39 +2061,40 @@ mod tests {
         .expect("failed to sendto");
 
         // Client implicitly bound to an ephemeral port via sendto
-        let SocketAddress::Inet(client_addr) =
-            task.sys_getsockname(client_fd).expect("getsockname failed");
+        let SocketAddress::Inet(client_addr) = task
+            .sys_getsockname_inner(client_fd)
+            .expect("getsockname failed");
         assert_ne!(client_addr.port(), 0);
 
         // Client connects to server address
-        task.sys_connect(client_fd, server_addr.clone())
+        task.sys_connect_inner(client_fd, server_addr.clone())
             .expect("failed to connect");
 
         // Now client can send without specifying addr
         let msg = "Hello with connect()";
         let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
-        task.sys_sendto(client_fd, msg_ptr, msg.len(), SendFlags::empty(), None)
+        task.sys_sendto_inner(client_fd, msg_ptr, msg.len(), SendFlags::empty(), None)
             .expect("failed to sendto");
 
-        task.sys_close(client_fd).expect("failed to close client");
+        task.sys_close_inner(client_fd)
+            .expect("failed to close client");
     }
 
     #[test]
     fn test_tun_tcp_sockopt() {
         let task = init_platform(Some("tun99"));
         let sockfd = task
-            .sys_socket(
+            .sys_socket_inner(
                 AddressFamily::INET,
                 SockType::Stream,
                 SockFlags::empty(),
                 None,
             )
             .expect("failed to create socket");
-        let sockfd = i32::try_from(sockfd).unwrap();
 
         let mut congestion_name = [0u8; 16];
         let mut optlen: u32 = congestion_name.len().truncate();
-        task.sys_getsockopt(
+        task.sys_getsockopt_inner(
             sockfd,
             SocketOptionName::TCP(TcpOption::CONGESTION),
             MutPtr::from_usize(congestion_name.as_mut_ptr() as usize),
@@ -1780,7 +2107,7 @@ mod tests {
             "none"
         );
 
-        task.sys_setsockopt(
+        task.sys_setsockopt_inner(
             sockfd,
             SocketOptionName::TCP(TcpOption::CONGESTION),
             ConstPtr::from_usize(congestion_name.as_ptr() as usize),
@@ -1790,7 +2117,7 @@ mod tests {
 
         let congestion_name = b"cubic\0";
         let err = task
-            .sys_setsockopt(
+            .sys_setsockopt_inner(
                 sockfd,
                 SocketOptionName::TCP(TcpOption::CONGESTION),
                 ConstPtr::from_usize(congestion_name.as_ptr() as usize),

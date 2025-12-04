@@ -435,10 +435,13 @@ impl Task {
     }
 
     /// Handle syscall `close`
-    pub fn sys_close(&self, fd: i32) -> Result<(), Errno> {
+    pub(crate) fn sys_close(&self, fd: i32) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
+        self.sys_close_inner(fd).map(|()| 0)
+    }
+    pub(crate) fn sys_close_inner(&self, fd: u32) -> Result<(), Errno> {
         let files = self.files.borrow();
         let mut file_table = files.file_descriptors.write();
         match file_table.remove(fd) {

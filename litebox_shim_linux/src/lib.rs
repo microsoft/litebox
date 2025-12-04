@@ -528,7 +528,7 @@ pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> 
 
 /// Closes the file
 pub extern "C" fn close(fd: i32) -> i32 {
-    with_current_task(|task| task.sys_close(fd).map_or_else(Errno::as_neg, |()| 0))
+    with_current_task(|task| task.sys_close(fd).map_or_else(Errno::as_neg, |_| 0))
 }
 
 // This places size limits on maximum read/write sizes that might occur; it exists primarily to
@@ -658,7 +658,7 @@ impl Task {
                 Some(buf) => self.sys_write(fd, &buf, None),
                 None => Err(Errno::EFAULT),
             },
-            SyscallRequest::Close { fd } => self.sys_close(fd).map(|()| 0),
+            SyscallRequest::Close { fd } => self.sys_close(fd),
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
                 syscalls::file::try_into_whence(whence.truncate())
@@ -746,41 +746,22 @@ impl Task {
                 .map(|newfd| newfd as usize),
             SyscallRequest::Socket {
                 domain,
-                ty,
-                flags,
+                type_and_flags,
                 protocol,
-            } => self
-                .sys_socket(domain, ty, flags, protocol)
-                .map(|fd| fd as usize),
+            } => self.sys_socket(domain, type_and_flags, protocol),
+            #[cfg(target_arch = "x86")]
+            SyscallRequest::Socketcall { call, args } => self.sys_socketcall(call, args),
             SyscallRequest::Connect {
                 sockfd,
                 sockaddr,
                 addrlen,
-            } => syscalls::net::read_sockaddr_from_user(sockaddr, addrlen)
-                .and_then(|sockaddr| self.sys_connect(sockfd, sockaddr).map(|()| 0)),
+            } => self.sys_connect(sockfd, sockaddr, addrlen),
             SyscallRequest::Accept {
                 sockfd,
                 addr,
                 addrlen,
                 flags,
-            } => {
-                let mut remote_addr = addr.is_some().then(syscalls::net::SocketAddress::default);
-                self.sys_accept(sockfd, remote_addr.as_mut(), flags)
-                    .and_then(|fd| {
-                        if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
-                            let addrlen = addrlen.ok_or(Errno::EFAULT)?;
-                            if let Err(err) =
-                                syscalls::net::write_sockaddr_to_user(remote_addr, addr, addrlen)
-                            {
-                                // If we fail to write the address back to user, we need to close the accepted socket.
-                                self.sys_close(i32::try_from(fd).unwrap())
-                                    .expect("close a newly-accepted socket failed");
-                                return Err(err);
-                            }
-                        }
-                        Ok(fd as usize)
-                    })
-            }
+            } => self.sys_accept(sockfd, addr, addrlen, flags),
             SyscallRequest::Sendto {
                 sockfd,
                 buf,
@@ -788,13 +769,8 @@ impl Task {
                 flags,
                 addr,
                 addrlen,
-            } => addr
-                .map(|addr| syscalls::net::read_sockaddr_from_user(addr, addrlen as usize))
-                .transpose()
-                .and_then(|sockaddr| self.sys_sendto(sockfd, buf, len, flags, sockaddr)),
-            SyscallRequest::Sendmsg { sockfd, msg, flags } => unsafe { msg.read_at_offset(0) }
-                .ok_or(Errno::EFAULT)
-                .and_then(|msg| self.sys_sendmsg(sockfd, &msg, flags)),
+            } => self.sys_sendto(sockfd, buf, len, flags, addr, addrlen),
+            SyscallRequest::Sendmsg { sockfd, msg, flags } => self.sys_sendmsg(sockfd, msg, flags),
             SyscallRequest::Recvfrom {
                 sockfd,
                 buf,
@@ -802,67 +778,35 @@ impl Task {
                 flags,
                 addr,
                 addrlen,
-            } => {
-                let mut source_addr = None;
-                self.sys_recvfrom(
-                    sockfd,
-                    buf,
-                    len,
-                    flags,
-                    if addr.is_some() {
-                        Some(&mut source_addr)
-                    } else {
-                        None
-                    },
-                )
-                .and_then(|size| {
-                    if let Some(src_addr) = source_addr
-                        && let Some(sock_ptr) = addr
-                    {
-                        syscalls::net::write_sockaddr_to_user(src_addr, sock_ptr, addrlen)?;
-                    }
-                    Ok(size)
-                })
-            }
+            } => self.sys_recvfrom(sockfd, buf, len, flags, addr, addrlen),
             SyscallRequest::Bind {
                 sockfd,
                 sockaddr,
                 addrlen,
-            } => syscalls::net::read_sockaddr_from_user(sockaddr, addrlen)
-                .and_then(|sockaddr| self.sys_bind(sockfd, sockaddr).map(|()| 0)),
-            SyscallRequest::Listen { sockfd, backlog } => {
-                self.sys_listen(sockfd, backlog).map(|()| 0)
-            }
+            } => self.sys_bind(sockfd, sockaddr, addrlen),
+            SyscallRequest::Listen { sockfd, backlog } => self.sys_listen(sockfd, backlog),
             SyscallRequest::Setsockopt {
                 sockfd,
                 optname,
                 optval,
                 optlen,
-            } => self
-                .sys_setsockopt(sockfd, optname, optval, optlen)
-                .map(|()| 0),
+            } => self.sys_setsockopt(sockfd, optname, optval, optlen),
             SyscallRequest::Getsockopt {
                 sockfd,
                 optname,
                 optval,
                 optlen,
-            } => self
-                .sys_getsockopt(sockfd, optname, optval, optlen)
-                .map(|()| 0),
+            } => self.sys_getsockopt(sockfd, optname, optval, optlen),
             SyscallRequest::Getsockname {
                 sockfd,
                 addr,
                 addrlen,
-            } => self.sys_getsockname(sockfd).and_then(|sockaddr| {
-                syscalls::net::write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
-            }),
+            } => self.sys_getsockname(sockfd, addr, addrlen),
             SyscallRequest::Getpeername {
                 sockfd,
                 addr,
                 addrlen,
-            } => self.sys_getpeername(sockfd).and_then(|sockaddr| {
-                syscalls::net::write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
-            }),
+            } => self.sys_getpeername(sockfd, addr, addrlen),
             SyscallRequest::Uname { buf } => self.sys_uname(buf).map(|()| 0usize),
             SyscallRequest::Fcntl { fd, arg } => self.sys_fcntl(fd, arg).map(|v| v as usize),
             SyscallRequest::Getcwd { buf, size: count } => {
