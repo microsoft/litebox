@@ -376,7 +376,7 @@ pub fn parse_modinfo(original_elf_data: &[u8]) -> Result<(), KernelElfError> {
 /// We should consider using HW-accelerated SHA-512 in the future (need to save/restore vector registers).
 pub fn verify_kernel_module_signature(
     signed_module: &[u8],
-    cert: &Certificate,
+    certs: &[Certificate],
 ) -> Result<(), VerificationError> {
     let (module_data, signature_der) = extract_module_data_and_signature(signed_module)?;
     let (signature, digest_alg, signature_alg) = decode_signature(signature_der)?;
@@ -389,14 +389,20 @@ pub fn verify_kernel_module_signature(
             signature_alg
         );
     }
-
-    let key_info = &cert.tbs_certificate.subject_public_key_info;
-    let rsa_pubkey = RsaPublicKey::from_pkcs1_der(key_info.subject_public_key.raw_bytes())
-        .map_err(|_| VerificationError::InvalidCertificate)?;
-    let rsa_verifier = RsaPkcs1v15Verifier::new(rsa_pubkey, digest_alg)?;
-    rsa_verifier
-        .verify(module_data, &signature)
-        .map_err(|_| VerificationError::AuthenticationFailed)
+    for cert in certs {
+        let key_info = &cert.tbs_certificate.subject_public_key_info;
+        let Ok(rsa_pubkey) = RsaPublicKey::from_pkcs1_der(key_info.subject_public_key.raw_bytes())
+        else {
+            continue;
+        };
+        let Ok(rsa_verifier) = RsaPkcs1v15Verifier::new(rsa_pubkey, digest_alg) else {
+            continue;
+        };
+        if rsa_verifier.verify(module_data, &signature).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(VerificationError::AuthenticationFailed)
 }
 
 // Wrapper for RSA PKCS#1 v1.5 verifier with a specified digest algorithm
@@ -514,7 +520,7 @@ fn decode_signature(
 /// Secure Boot. The Authenticode signature is computed over the PE image digest and other attributes.
 pub fn verify_kernel_pe_signature(
     kernel_blob: &[u8],
-    cert: &Certificate,
+    certs: &[Certificate],
 ) -> Result<(), VerificationError> {
     // extract the Authenticode signature and its signed attributes from the kernel blob PE
     let authenticode_signature =
@@ -530,24 +536,29 @@ pub fn verify_kernel_pe_signature(
     if digest_algorithm_oid != ID_SHA_256 && digest_algorithm_oid != ID_SHA_512 {
         todo!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
     }
+    let mut signature_verified = false;
 
     // verify the authenticity of the signed attributes using the system certificate
-    let key_info = &cert.tbs_certificate.subject_public_key_info;
-    let rsa_pubkey = RsaPublicKey::from_pkcs1_der(key_info.subject_public_key.raw_bytes())
-        .map_err(|_| VerificationError::InvalidCertificate)?;
-    let rsa_verifier = RsaPkcs1v15Verifier::new(rsa_pubkey, digest_algorithm_oid)
-        .map_err(|_| VerificationError::Unsupported)?;
-    rsa_verifier
-        .verify(&signed_attrs_der, &signature)
-        .map_err(|_| VerificationError::AuthenticationFailed)?;
-
+    for cert in certs {
+        let key_info = &cert.tbs_certificate.subject_public_key_info;
+        let Ok(rsa_pubkey) = RsaPublicKey::from_pkcs1_der(key_info.subject_public_key.raw_bytes())
+        else {
+            continue;
+        };
+        let Ok(rsa_verifier) = RsaPkcs1v15Verifier::new(rsa_pubkey, digest_algorithm_oid) else {
+            continue;
+        };
+        if rsa_verifier.verify(&signed_attrs_der, &signature).is_ok() {
+            signature_verified = true;
+            break;
+        }
+    }
     // check whether the computed digest matches the one in the Authenticode signature
     let computed_digest = compute_authenticode_digest(kernel_blob, digest_algorithm_oid)?;
-    if authenticode_signature.digest() == computed_digest {
-        Ok(())
-    } else {
-        Err(VerificationError::AuthenticationFailed)
+    if signature_verified && authenticode_signature.digest() == computed_digest {
+        return Ok(());
     }
+    Err(VerificationError::AuthenticationFailed)
 }
 
 /// This function extracts the Authenticode signature from a kernel blob PE.
