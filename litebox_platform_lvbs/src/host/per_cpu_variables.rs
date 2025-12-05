@@ -12,6 +12,7 @@ use crate::{
 use aligned_vec::avec;
 use alloc::boxed::Box;
 use core::cell::RefCell;
+use core::mem::{offset_of, size_of};
 use litebox_common_linux::{rdgsbase, wrgsbase};
 use x86_64::VirtAddr;
 
@@ -207,13 +208,14 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     tls: VirtAddr::zero(),
 };
 
+/// Specify the layout of Kernel TLS area.
 #[non_exhaustive]
 #[repr(C)]
 #[derive(Clone)]
 pub struct KernelTls {
-    pub vtl_return_addr: u64,
-    pub interrupt_stack_ptr: u64,
-    pub kernel_stack_ptr: u64,
+    pub vtl_return_addr: u64,     // gs:[-24]
+    pub interrupt_stack_ptr: u64, // gs:[-16]
+    pub kernel_stack_ptr: u64,    // gs:[-8]
 }
 
 /// Kernel TLS offsets. The value of GS register - one of these offsets is used to access
@@ -221,12 +223,9 @@ pub struct KernelTls {
 #[non_exhaustive]
 #[repr(usize)]
 pub enum KernelTlsOffset {
-    KernelStackPtr =
-        core::mem::size_of::<KernelTls>() - core::mem::offset_of!(KernelTls, kernel_stack_ptr),
-    InterruptStackPtr =
-        core::mem::size_of::<KernelTls>() - core::mem::offset_of!(KernelTls, interrupt_stack_ptr),
-    VtlReturnAddr =
-        core::mem::size_of::<KernelTls>() - core::mem::offset_of!(KernelTls, vtl_return_addr),
+    KernelStackPtr = size_of::<KernelTls>() - offset_of!(KernelTls, kernel_stack_ptr),
+    InterruptStackPtr = size_of::<KernelTls>() - offset_of!(KernelTls, interrupt_stack_ptr),
+    VtlReturnAddr = size_of::<KernelTls>() - offset_of!(KernelTls, vtl_return_addr),
 }
 
 /// Wrapper struct to store a `RefCell` along with `KernelTls`.
@@ -413,22 +412,22 @@ fn get_xsave_area_size() -> usize {
 #[derive(Default, Clone, Copy)]
 #[repr(C)]
 pub struct VtlState {
-    pub rbp: u64,
-    pub cr2: u64,
-    pub rax: u64,
-    pub rbx: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
     pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub cr2: u64,
+    pub rbp: u64,
     // DR[0-6]
     // X87, XMM, AVX, XCR
 }
