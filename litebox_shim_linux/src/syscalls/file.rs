@@ -435,7 +435,7 @@ impl Task {
     }
 
     /// Handle syscall `close`
-    pub(crate) fn sys_close(&self, fd: i32) -> Result<usize, Errno> {
+    pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
@@ -444,7 +444,7 @@ impl Task {
         match file_table.remove(fd) {
             Some(desc) => {
                 drop(file_table); // drop before potentially blocking `close`
-                self.do_close(desc).map(|()| 0)
+                self.do_close(desc)
             }
             None => Err(Errno::EBADF),
         }

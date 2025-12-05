@@ -871,7 +871,7 @@ impl Task {
         addr: Option<MutPtr<u8>>,
         addrlen: Option<MutPtr<u32>>,
         flags: SockFlags,
-    ) -> Result<usize, Errno> {
+    ) -> Result<u32, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
@@ -886,7 +886,7 @@ impl Task {
                 return Err(err);
             }
         }
-        Ok(fd as usize)
+        Ok(fd)
     }
     fn do_accept(
         &self,

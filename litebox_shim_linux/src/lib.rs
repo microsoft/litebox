@@ -528,7 +528,7 @@ pub unsafe extern "C" fn open(pathname: ConstPtr<i8>, flags: u32, mode: u32) -> 
 
 /// Closes the file
 pub extern "C" fn close(fd: i32) -> i32 {
-    with_current_task(|task| task.sys_close(fd).map_or_else(Errno::as_neg, |_| 0))
+    with_current_task(|task| task.sys_close(fd).map_or_else(Errno::as_neg, |()| 0))
 }
 
 // This places size limits on maximum read/write sizes that might occur; it exists primarily to
@@ -609,6 +609,13 @@ impl Task {
     }
 
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
+        // Helper macro to unify the return value from `sys_*`.
+        macro_rules! syscall {
+            ($func:ident($($args:expr),*)) => {
+                self.$func($($args),*).to_syscall_result()
+            };
+        }
+
         #[cfg(target_arch = "x86")]
         let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
@@ -677,18 +684,16 @@ impl Task {
                 Some(buf) => self.sys_write(fd, &buf, None),
                 None => Err(Errno::EFAULT),
             },
-            SyscallRequest::Close { fd } => self.sys_close(fd),
+            SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
                 syscalls::file::try_into_whence(whence.truncate())
                     .map_err(|_| Errno::EINVAL)
                     .and_then(|seekwhence| self.sys_lseek(fd, offset, seekwhence))
             }
-            SyscallRequest::Mkdir { pathname, mode } => {
-                pathname.to_cstring().map_or(Err(Errno::EINVAL), |path| {
-                    self.sys_mkdir(path, mode).map(|()| 0)
-                })
-            }
+            SyscallRequest::Mkdir { pathname, mode } => pathname
+                .to_cstring()
+                .map_or(Err(Errno::EINVAL), |path| syscall!(sys_mkdir(path, mode))),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
@@ -704,7 +709,7 @@ impl Task {
             SyscallRequest::RtSigreturn => self.sys_rt_sigreturn(ctx),
             #[cfg(target_arch = "x86")]
             SyscallRequest::Sigreturn => self.sys_sigreturn(ctx),
-            SyscallRequest::Ioctl { fd, arg } => self.sys_ioctl(fd, arg).map(|v| v as usize),
+            SyscallRequest::Ioctl { fd, arg } => syscall!(sys_ioctl(fd, arg)),
             SyscallRequest::Pread64 {
                 fd,
                 buf,
@@ -731,7 +736,7 @@ impl Task {
                 .sys_mmap(addr, length, prot, flags, fd, offset)
                 .map(|ptr| ptr.as_usize()),
             SyscallRequest::Mprotect { addr, length, prot } => {
-                self.sys_mprotect(addr, length, prot).map(|()| 0)
+                syscall!(sys_mprotect(addr, length, prot))
             }
             SyscallRequest::Mremap {
                 old_addr,
@@ -742,49 +747,41 @@ impl Task {
             } => self
                 .sys_mremap(old_addr, old_size, new_size, flags, new_addr)
                 .map(|ptr| ptr.as_usize()),
-            SyscallRequest::Munmap { addr, length } => self.sys_munmap(addr, length).map(|()| 0),
+            SyscallRequest::Munmap { addr, length } => syscall!(sys_munmap(addr, length)),
             SyscallRequest::Brk { addr } => self.sys_brk(addr),
             SyscallRequest::Readv { fd, iovec, iovcnt } => self.sys_readv(fd, iovec, iovcnt),
             SyscallRequest::Writev { fd, iovec, iovcnt } => self.sys_writev(fd, iovec, iovcnt),
-            SyscallRequest::Access { pathname, mode } => {
-                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                    self.sys_access(path, mode).map(|()| 0)
-                })
-            }
+            SyscallRequest::Access { pathname, mode } => pathname
+                .to_cstring()
+                .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),
             SyscallRequest::Madvise {
                 addr,
                 length,
                 behavior,
-            } => self.sys_madvise(addr, length, behavior).map(|()| 0),
+            } => syscall!(sys_madvise(addr, length, behavior)),
             SyscallRequest::Dup {
                 oldfd,
                 newfd,
                 flags,
-            } => self
-                .sys_dup(oldfd, newfd, flags)
-                .map(|newfd| newfd as usize),
+            } => syscall!(sys_dup(oldfd, newfd, flags)),
             SyscallRequest::Socket {
                 domain,
                 type_and_flags,
                 protocol,
-            } => self
-                .sys_socket(domain, type_and_flags, protocol)
-                .to_syscall_result(),
+            } => syscall!(sys_socket(domain, type_and_flags, protocol)),
             #[cfg(target_arch = "x86")]
             SyscallRequest::Socketcall { call, args } => self.sys_socketcall(call, args),
             SyscallRequest::Connect {
                 sockfd,
                 sockaddr,
                 addrlen,
-            } => self
-                .sys_connect(sockfd, sockaddr, addrlen)
-                .to_syscall_result(),
+            } => syscall!(sys_connect(sockfd, sockaddr, addrlen)),
             SyscallRequest::Accept {
                 sockfd,
                 addr,
                 addrlen,
                 flags,
-            } => self.sys_accept(sockfd, addr, addrlen, flags),
+            } => syscall!(sys_accept(sockfd, addr, addrlen, flags)),
             SyscallRequest::Sendto {
                 sockfd,
                 buf,
@@ -806,9 +803,9 @@ impl Task {
                 sockfd,
                 sockaddr,
                 addrlen,
-            } => self.sys_bind(sockfd, sockaddr, addrlen).to_syscall_result(),
+            } => syscall!(sys_bind(sockfd, sockaddr, addrlen)),
             SyscallRequest::Listen { sockfd, backlog } => {
-                self.sys_listen(sockfd, backlog).to_syscall_result()
+                syscall!(sys_listen(sockfd, backlog))
             }
             SyscallRequest::Setsockopt {
                 sockfd,
@@ -816,34 +813,26 @@ impl Task {
                 optname,
                 optval,
                 optlen,
-            } => self
-                .sys_setsockopt(sockfd, level, optname, optval, optlen)
-                .to_syscall_result(),
+            } => syscall!(sys_setsockopt(sockfd, level, optname, optval, optlen)),
             SyscallRequest::Getsockopt {
                 sockfd,
                 level,
                 optname,
                 optval,
                 optlen,
-            } => self
-                .sys_getsockopt(sockfd, level, optname, optval, optlen)
-                .to_syscall_result(),
+            } => syscall!(sys_getsockopt(sockfd, level, optname, optval, optlen)),
             SyscallRequest::Getsockname {
                 sockfd,
                 addr,
                 addrlen,
-            } => self
-                .sys_getsockname(sockfd, addr, addrlen)
-                .to_syscall_result(),
+            } => syscall!(sys_getsockname(sockfd, addr, addrlen)),
             SyscallRequest::Getpeername {
                 sockfd,
                 addr,
                 addrlen,
-            } => self
-                .sys_getpeername(sockfd, addr, addrlen)
-                .to_syscall_result(),
-            SyscallRequest::Uname { buf } => self.sys_uname(buf).map(|()| 0usize),
-            SyscallRequest::Fcntl { fd, arg } => self.sys_fcntl(fd, arg).map(|v| v as usize),
+            } => syscall!(sys_getpeername(sockfd, addr, addrlen)),
+            SyscallRequest::Uname { buf } => syscall!(sys_uname(buf)),
+            SyscallRequest::Fcntl { fd, arg } => syscall!(sys_fcntl(fd, arg)),
             SyscallRequest::Getcwd { buf, size: count } => {
                 let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
                 self.sys_getcwd(&mut kernel_buf).and_then(|size| {
@@ -857,9 +846,9 @@ impl Task {
                 op,
                 fd,
                 event,
-            } => self.sys_epoll_ctl(epfd, op, fd, event).map(|()| 0),
+            } => syscall!(sys_epoll_ctl(epfd, op, fd, event)),
             SyscallRequest::EpollCreate { flags } => {
-                self.sys_epoll_create(flags).map(|fd| fd as usize)
+                syscall!(sys_epoll_create(flags))
             }
             SyscallRequest::EpollPwait {
                 epfd,
@@ -870,7 +859,7 @@ impl Task {
                 sigsetsize,
             } => self.sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize),
             SyscallRequest::Prctl { args } => self.sys_prctl(args),
-            SyscallRequest::ArchPrctl { arg } => self.sys_arch_prctl(arg).map(|()| 0),
+            SyscallRequest::ArchPrctl { arg } => syscall!(sys_arch_prctl(arg)),
             SyscallRequest::Readlink {
                 pathname,
                 buf,
@@ -912,14 +901,14 @@ impl Task {
                             .ok_or(Errno::EFAULT)
                     })
             }),
-            SyscallRequest::Gettimeofday { tv, tz } => self.sys_gettimeofday(tv, tz).map(|()| 0),
+            SyscallRequest::Gettimeofday { tv, tz } => syscall!(sys_gettimeofday(tv, tz)),
             SyscallRequest::ClockGettime { clockid, tp } => {
                 litebox_common_linux::ClockId::try_from(clockid)
                     .map_err(|_| {
                         log_unsupported!("clock_gettime(clockid = {clockid})");
                         Errno::EINVAL
                     })
-                    .and_then(|clock_id| self.sys_clock_gettime(clock_id, tp).map(|()| 0))
+                    .and_then(|clock_id| syscall!(sys_clock_gettime(clock_id, tp)))
             }
             SyscallRequest::ClockGetres { clockid, res } => {
                 litebox_common_linux::ClockId::try_from(clockid)
@@ -927,7 +916,7 @@ impl Task {
                         log_unsupported!("clock_getres(clockid = {clockid})");
                         Errno::EINVAL
                     })
-                    .and_then(|clock_id| self.sys_clock_getres(clock_id, res).map(|()| 0))
+                    .and_then(|clock_id| syscall!(sys_clock_getres(clock_id, res)))
             }
             SyscallRequest::ClockNanosleep {
                 clockid,
@@ -940,8 +929,7 @@ impl Task {
                     Errno::EINVAL
                 })
                 .and_then(|clock_id| {
-                    self.sys_clock_nanosleep(clock_id, flags, request, remain)
-                        .map(|()| 0)
+                    syscall!(sys_clock_nanosleep(clock_id, flags, request, remain))
                 }),
             SyscallRequest::Time { tloc } => self
                 .sys_time(tloc)
@@ -952,16 +940,15 @@ impl Task {
                 flags,
                 mode,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                self.sys_openat(dirfd, path, flags, mode)
-                    .map(|fd| fd as usize)
+                syscall!(sys_openat(dirfd, path, flags, mode))
             }),
-            SyscallRequest::Ftruncate { fd, length } => self.sys_ftruncate(fd, length).map(|()| 0),
+            SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
             SyscallRequest::Unlinkat {
                 dirfd,
                 pathname,
                 flags,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                self.sys_unlinkat(dirfd, path, flags).map(|()| 0)
+                syscall!(sys_unlinkat(dirfd, path, flags))
             }),
             SyscallRequest::Stat { pathname, buf } => {
                 pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
@@ -1013,7 +1000,7 @@ impl Task {
                 })
             }),
             SyscallRequest::Eventfd2 { initval, flags } => {
-                self.sys_eventfd2(initval, flags).map(|fd| fd as usize)
+                syscall!(sys_eventfd2(initval, flags))
             }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
@@ -1054,19 +1041,17 @@ impl Task {
             }
             SyscallRequest::Gettid => Ok(self.sys_gettid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getrlimit { resource, rlim } => {
-                self.sys_getrlimit(resource, rlim).map(|()| 0)
+                syscall!(sys_getrlimit(resource, rlim))
             }
             SyscallRequest::Setrlimit { resource, rlim } => {
-                self.sys_setrlimit(resource, rlim).map(|()| 0)
+                syscall!(sys_setrlimit(resource, rlim))
             }
             SyscallRequest::Prlimit {
                 pid,
                 resource,
                 new_limit,
                 old_limit,
-            } => self
-                .sys_prlimit(pid, resource, new_limit, old_limit)
-                .map(|()| 0),
+            } => syscall!(sys_prlimit(pid, resource, new_limit, old_limit)),
             SyscallRequest::SetRobustList { head } => {
                 self.sys_set_robust_list(head);
                 Ok(0)
@@ -1102,7 +1087,7 @@ impl Task {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }
-            SyscallRequest::CapGet { header, data } => self.sys_capget(header, data).map(|()| 0),
+            SyscallRequest::CapGet { header, data } => syscall!(sys_capget(header, data)),
             SyscallRequest::GetDirent64 { fd, dirp, count } => {
                 self.sys_getdirent64(fd, dirp, count)
             }
