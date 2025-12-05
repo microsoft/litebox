@@ -536,6 +536,7 @@ pub fn verify_kernel_pe_signature(
     if digest_algorithm_oid != ID_SHA_256 && digest_algorithm_oid != ID_SHA_512 {
         todo!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
     }
+    let mut signature_verified = false;
 
     // verify the authenticity of the signed attributes using the system certificate
     for cert in certs {
@@ -548,12 +549,14 @@ pub fn verify_kernel_pe_signature(
             continue;
         };
         if rsa_verifier.verify(&signed_attrs_der, &signature).is_ok() {
-            // check whether the computed digest matches the one in the Authenticode signature
-            let computed_digest = compute_authenticode_digest(kernel_blob, digest_algorithm_oid)?;
-            if authenticode_signature.digest() == computed_digest {
-                return Ok(());
-            }
+            signature_verified = true;
+            break;
         }
+    }
+    // check whether the computed digest matches the one in the Authenticode signature
+    let computed_digest = compute_authenticode_digest(kernel_blob, digest_algorithm_oid)?;
+    if signature_verified && authenticode_signature.digest() == computed_digest {
+        return Ok(());
     }
     Err(VerificationError::AuthenticationFailed)
 }
