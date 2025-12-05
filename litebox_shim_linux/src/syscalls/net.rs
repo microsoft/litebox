@@ -727,7 +727,7 @@ impl Task {
         domain: u32,
         type_and_flags: u32,
         protocol: u8,
-    ) -> Result<usize, Errno> {
+    ) -> Result<u32, Errno> {
         let ty = type_and_flags & 0x0f;
         let flags = type_and_flags & !0x0f;
         let domain = AddressFamily::try_from(domain).map_err(|_| {
@@ -750,7 +750,6 @@ impl Task {
             )
         };
         self.do_socket(domain, ty, flags, protocol)
-            .map(|fd| fd as usize)
     }
     fn do_socket(
         &self,
@@ -942,12 +941,12 @@ impl Task {
         fd: i32,
         sockaddr: ConstPtr<u8>,
         addrlen: usize,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(), Errno> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
         let sockaddr = read_sockaddr_from_user(sockaddr, addrlen)?;
-        self.do_connect(fd, sockaddr).map(|()| 0)
+        self.do_connect(fd, sockaddr)
     }
     fn do_connect(&self, fd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         let files = self.files.borrow();
@@ -968,12 +967,12 @@ impl Task {
         sockfd: i32,
         sockaddr: ConstPtr<u8>,
         addrlen: usize,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
         let sockaddr = read_sockaddr_from_user(sockaddr, addrlen)?;
-        self.do_bind(sockfd, sockaddr).map(|()| 0)
+        self.do_bind(sockfd, sockaddr)
     }
     fn do_bind(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         let files = self.files.borrow();
@@ -992,11 +991,11 @@ impl Task {
     }
 
     /// Handle syscall `listen`
-    pub(crate) fn sys_listen(&self, sockfd: i32, backlog: u16) -> Result<usize, Errno> {
+    pub(crate) fn sys_listen(&self, sockfd: i32, backlog: u16) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-        self.do_listen(sockfd, backlog).map(|()| 0)
+        self.do_listen(sockfd, backlog)
     }
     fn do_listen(&self, sockfd: u32, backlog: u16) -> Result<(), Errno> {
         let files = self.files.borrow();
@@ -1194,7 +1193,7 @@ impl Task {
         optname: u32,
         optval: ConstPtr<u8>,
         optlen: usize,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
@@ -1203,7 +1202,6 @@ impl Task {
             Errno::EINVAL
         })?;
         self.do_setsockopt(sockfd, optname, optval, optlen)
-            .map(|()| 0)
     }
     fn do_setsockopt(
         &self,
@@ -1234,7 +1232,7 @@ impl Task {
         optname: u32,
         optval: MutPtr<u8>,
         optlen: MutPtr<u32>,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
@@ -1243,7 +1241,6 @@ impl Task {
             Errno::EINVAL
         })?;
         self.do_getsockopt(sockfd, optname, optval, optlen)
-            .map(|()| 0)
     }
     fn do_getsockopt(
         &self,
@@ -1272,12 +1269,12 @@ impl Task {
         sockfd: i32,
         addr: MutPtr<u8>,
         addrlen: MutPtr<u32>,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
         let sockaddr = self.do_getsockname(sockfd)?;
-        write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
+        write_sockaddr_to_user(sockaddr, addr, addrlen)
     }
     fn do_getsockname(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
         let files = self.files.borrow();
@@ -1305,12 +1302,12 @@ impl Task {
         sockfd: i32,
         addr: MutPtr<u8>,
         addrlen: MutPtr<u32>,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
         let sockaddr = self.do_getpeername(sockfd)?;
-        write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
+        write_sockaddr_to_user(sockaddr, addr, addrlen)
     }
     fn do_getpeername(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
         let files = self.files.borrow();
@@ -1336,13 +1333,14 @@ impl Task {
 #[cfg(target_arch = "x86")]
 impl Task {
     pub(crate) fn sys_socketcall(&self, call: i32, args: ConstPtr<usize>) -> Result<usize, Errno> {
+        use crate::ToSyscallResult;
         use litebox_common_linux::SocketcallType;
         macro_rules! parse_socketcall_args {
             ($nargs:literal => $func:ident { $($field:ident: $tt:tt),* $(,)? }) => {{
                 let args = unsafe { args.to_cow_slice($nargs) }.ok_or(Errno::EFAULT)?;
                 self.$func (
                     $(parse_socketcall_args!(@convert args $tt )),*
-                )
+                ).to_syscall_result()
             }};
 
             // Convert with pointer marker - use from_usize for pointer types

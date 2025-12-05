@@ -538,6 +538,25 @@ pub extern "C" fn close(fd: i32) -> i32 {
 // hopefully-reasonable middle ground.
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
+trait ToSyscallResult {
+    fn to_syscall_result(self) -> Result<usize, Errno>;
+}
+impl ToSyscallResult for Result<(), Errno> {
+    fn to_syscall_result(self) -> Result<usize, Errno> {
+        self.map(|()| 0)
+    }
+}
+impl ToSyscallResult for Result<usize, Errno> {
+    fn to_syscall_result(self) -> Result<usize, Errno> {
+        self
+    }
+}
+impl ToSyscallResult for Result<u32, Errno> {
+    fn to_syscall_result(self) -> Result<usize, Errno> {
+        self.map(|v| v as usize)
+    }
+}
+
 impl Task {
     /// A wrapper function around `sys_pread64` that copies data in chunks to avoid OOMing.
     fn pread_with_user_buf(
@@ -748,14 +767,18 @@ impl Task {
                 domain,
                 type_and_flags,
                 protocol,
-            } => self.sys_socket(domain, type_and_flags, protocol),
+            } => self
+                .sys_socket(domain, type_and_flags, protocol)
+                .to_syscall_result(),
             #[cfg(target_arch = "x86")]
             SyscallRequest::Socketcall { call, args } => self.sys_socketcall(call, args),
             SyscallRequest::Connect {
                 sockfd,
                 sockaddr,
                 addrlen,
-            } => self.sys_connect(sockfd, sockaddr, addrlen),
+            } => self
+                .sys_connect(sockfd, sockaddr, addrlen)
+                .to_syscall_result(),
             SyscallRequest::Accept {
                 sockfd,
                 addr,
@@ -783,32 +806,42 @@ impl Task {
                 sockfd,
                 sockaddr,
                 addrlen,
-            } => self.sys_bind(sockfd, sockaddr, addrlen),
-            SyscallRequest::Listen { sockfd, backlog } => self.sys_listen(sockfd, backlog),
+            } => self.sys_bind(sockfd, sockaddr, addrlen).to_syscall_result(),
+            SyscallRequest::Listen { sockfd, backlog } => {
+                self.sys_listen(sockfd, backlog).to_syscall_result()
+            }
             SyscallRequest::Setsockopt {
                 sockfd,
                 level,
                 optname,
                 optval,
                 optlen,
-            } => self.sys_setsockopt(sockfd, level, optname, optval, optlen),
+            } => self
+                .sys_setsockopt(sockfd, level, optname, optval, optlen)
+                .to_syscall_result(),
             SyscallRequest::Getsockopt {
                 sockfd,
                 level,
                 optname,
                 optval,
                 optlen,
-            } => self.sys_getsockopt(sockfd, level, optname, optval, optlen),
+            } => self
+                .sys_getsockopt(sockfd, level, optname, optval, optlen)
+                .to_syscall_result(),
             SyscallRequest::Getsockname {
                 sockfd,
                 addr,
                 addrlen,
-            } => self.sys_getsockname(sockfd, addr, addrlen),
+            } => self
+                .sys_getsockname(sockfd, addr, addrlen)
+                .to_syscall_result(),
             SyscallRequest::Getpeername {
                 sockfd,
                 addr,
                 addrlen,
-            } => self.sys_getpeername(sockfd, addr, addrlen),
+            } => self
+                .sys_getpeername(sockfd, addr, addrlen)
+                .to_syscall_result(),
             SyscallRequest::Uname { buf } => self.sys_uname(buf).map(|()| 0usize),
             SyscallRequest::Fcntl { fd, arg } => self.sys_fcntl(fd, arg).map(|v| v as usize),
             SyscallRequest::Getcwd { buf, size: count } => {
