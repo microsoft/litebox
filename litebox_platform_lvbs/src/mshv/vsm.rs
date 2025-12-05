@@ -70,7 +70,7 @@ pub(crate) fn init() {
     );
 
     assert!(
-        !(get_core_id() == 0 && mshv_vsm_get_code_page_offsets().is_err()),
+        mshv_vsm_get_code_page_offsets().is_ok(),
         "Failed to retrieve Hypercall page offsets to execute VTL returns"
     );
 

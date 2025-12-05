@@ -312,13 +312,13 @@ pub enum KernelTlsOffset {
 ///      |        KernelTls          |
 /// low  +---------------------------+
 ///
-/// Come out with this design because we require some TLS area that assembly code can access via
-/// the GS register (e.g., to save/restore RIP/RSP). Currently `PerCpuVariables` is protected by
-/// `RefCell` such that assembly code cannot easily access it.
-/// TODO: Let us consider whether we should maintain these two types of TLS areas (for Rust and
-/// assembly, respectively). This design secures Rust-side access to `PerCpuVariables` with `RefCell`
-/// but it might be unnecessarily complex. We can use assembly code all the time instead, but this
-/// might be unsafe.
+/// This layout allows assembly code to read/write some TLS area via the GS register (e.g., to
+/// save/restore RIP/RSP). Currently, `PerCpuVariables` is protected by `RefCell` such that
+/// assembly code cannot easily access it.
+/// TODO: Let's consider whether we should maintain these two types of TLS areas (for Rust and
+/// assembly, respectively). This design secures Rust-side access to `PerCpuVariables` with `RefCell`,
+/// but it might be unnecessarily complex. Instead, we could use assembly code in all cases, but
+/// this might be unsafe.
 #[repr(C)]
 #[derive(Clone)]
 pub struct RefCellWrapper<T> {
