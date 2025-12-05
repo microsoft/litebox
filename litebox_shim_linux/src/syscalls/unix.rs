@@ -14,9 +14,8 @@ use litebox::{
     sync::{Mutex, RwLock},
 };
 use litebox_common_linux::{ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno};
-use once_cell::race::OnceBox;
 
-use crate::{FileFd, Task, with_current_task};
+use crate::{FileFd, GlobalState, Task, with_current_task};
 
 /// C-compatible structure for Unix socket addresses.
 const UNIX_PATH_MAX: usize = 108;
@@ -54,7 +53,7 @@ enum UnixBoundSocketAddr {
 /// This is used internally to track which addresses are currently bound
 /// by listening sockets.
 #[derive(PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
-enum UnixSocketAddrKey {
+pub(crate) enum UnixSocketAddrKey {
     Path(String),
     Abstract(Vec<u8>),
 }
@@ -179,15 +178,16 @@ impl UnixInitStream {
     /// # Arguments
     ///
     /// * `backlog` - Maximum number of pending connections to queue
-    fn listen(self, backlog: u16) -> Result<UnixListenStream, (Self, Errno)> {
+    fn listen(self, backlog: u16, global: &GlobalState) -> Result<UnixListenStream, (Self, Errno)> {
         let Some(addr) = self.addr else {
             return Err((self, Errno::EINVAL));
         };
         let key = addr.to_key();
         let backlog = Arc::new(Backlog::new(addr, backlog));
-        unix_addr_table()
+        global
+            .unix_addr_table
             .write()
-            .insert(key, UnixEntry::Stream(backlog.clone()));
+            .insert(key, UnixEntry(UnixEntryInner::Stream(backlog.clone())));
         Ok(UnixListenStream { backlog })
     }
 
@@ -212,7 +212,7 @@ impl UnixInitStream {
         addr: UnixSocketAddr,
         is_nonblocking: bool,
     ) -> Result<UnixConnectedStream, (Self, Errno)> {
-        let guard = unix_addr_table().read();
+        let guard = task.global.unix_addr_table.read();
         let Some(key) = addr.to_key() else {
             return Err((self, Errno::EINVAL));
         };
@@ -223,8 +223,12 @@ impl UnixInitStream {
         if let Err(err) = addr.bind(task, false) {
             return Err((self, err));
         }
-        match entry {
-            UnixEntry::Stream(backlog) => backlog.connect(self, is_nonblocking),
+        match &entry.0 {
+            UnixEntryInner::Stream(backlog) => {
+                let backlog = backlog.clone();
+                drop(guard);
+                backlog.connect(self, is_nonblocking)
+            }
         }
     }
 }
@@ -362,13 +366,15 @@ impl Drop for UnixListenStream {
         self.backlog.shutdown();
 
         let key = self.backlog.addr.to_key();
-        let mut table = unix_addr_table().write();
-        // Only remove the entry if it still points to our backlog
-        if let Some(UnixEntry::Stream(backlog)) = table.get(&key)
-            && Arc::ptr_eq(backlog, &self.backlog)
-        {
-            table.remove(&key);
-        }
+        with_current_task(|task| {
+            let mut table = task.global.unix_addr_table.write();
+            // Only remove the entry if it still points to our backlog
+            if let Some(UnixEntry(UnixEntryInner::Stream(backlog))) = table.get(&key)
+                && Arc::ptr_eq(backlog, &self.backlog)
+            {
+                table.remove(&key);
+            }
+        });
     }
 }
 
@@ -554,10 +560,7 @@ pub struct UnixSocket {
 }
 
 impl UnixSocket {
-    fn new_with_state(
-        state: UnixSocketState,
-        flags: SockFlags,
-    ) -> Self {
+    fn new_with_state(state: UnixSocketState, flags: SockFlags) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
         Self {
@@ -567,10 +570,7 @@ impl UnixSocket {
         }
     }
 
-    pub(super) fn new(
-        sock_type: SockType,
-        flags: SockFlags,
-    ) -> Option<Self> {
+    pub(super) fn new(sock_type: SockType, flags: SockFlags) -> Option<Self> {
         let state = match sock_type {
             SockType::Stream => UnixSocketState::InitStream(UnixInitStream::new()),
             SockType::Datagram => unimplemented!("Datagram sockets are not yet implemented"),
@@ -622,11 +622,11 @@ impl UnixSocket {
         })
     }
 
-    pub(super) fn listen(&self, backlog: u16) -> Result<(), Errno> {
+    pub(super) fn listen(&self, backlog: u16, global: &GlobalState) -> Result<(), Errno> {
         self.with_state(|state| {
             let ret = match state {
                 UnixSocketState::InitStream(init) => {
-                    return match init.listen(backlog) {
+                    return match init.listen(backlog, global) {
                         Ok(listen) => (UnixSocketState::ListenStream(listen), Ok(())),
                         Err((init, err)) => (UnixSocketState::InitStream(init), Err(err)),
                     };
@@ -770,16 +770,14 @@ impl IOPollable for UnixSocket {
     }
 }
 
-enum UnixEntry {
+pub(crate) struct UnixEntry(UnixEntryInner);
+// TODO: add datagram entry
+enum UnixEntryInner {
     Stream(Arc<Backlog>),
 }
 
-fn unix_addr_table<'a>() -> &'a RwLock<crate::Platform, BTreeMap<UnixSocketAddrKey, UnixEntry>> {
-    static ADDR_TABLE: OnceBox<RwLock<crate::Platform, BTreeMap<UnixSocketAddrKey, UnixEntry>>> =
-        OnceBox::new();
-    ADDR_TABLE
-        .get_or_init(|| alloc::boxed::Box::new(litebox::sync::RwLock::new(BTreeMap::new())))
-}
+/// Type alias for the global Unix socket address table.
+pub(crate) type UnixAddrTable = BTreeMap<UnixSocketAddrKey, UnixEntry>;
 
 #[cfg(test)]
 mod tests {

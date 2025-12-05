@@ -266,9 +266,9 @@ pub mod errors {
     }
 }
 
-pub struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
-    pub rb: Mutex<Platform, T>,
-    pub pollee: Pollee<Platform>,
+struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
+    rb: Mutex<Platform, T>,
+    pollee: Pollee<Platform>,
     is_shutdown: AtomicBool,
 }
 
@@ -281,11 +281,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform,
         }
     }
 
-    pub fn is_shutdown(&self) -> bool {
+    fn is_shutdown(&self) -> bool {
         self.is_shutdown.load(Ordering::Acquire)
     }
 
-    pub fn shutdown(&self) {
+    fn shutdown(&self) {
         self.is_shutdown.store(true, Ordering::Release);
     }
 }

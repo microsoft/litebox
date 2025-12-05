@@ -25,9 +25,12 @@ use litebox_common_linux::{
     TcpOption, errno::Errno,
 };
 
-use crate::{Platform, syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr}};
 use crate::{ConstPtr, Descriptor, MutPtr};
 use crate::{GlobalState, Task};
+use crate::{
+    Platform,
+    syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr},
+};
 
 macro_rules! convert_flags {
     ($src:expr, $src_type:ty, $dst_type:ty, $($flag:ident),+ $(,)?) => {
@@ -810,8 +813,7 @@ impl Task {
                 )
             }
             AddressFamily::UNIX => {
-                let socket =
-                    UnixSocket::new(ty, flags).ok_or(Errno::EPROTONOSUPPORT)?;
+                let socket = UnixSocket::new(ty, flags).ok_or(Errno::EPROTONOSUPPORT)?;
                 Descriptor::Unix {
                     file: Arc::new(socket),
                     close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
@@ -1121,7 +1123,7 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => {
                 files.with_socket_fd(*raw_fd, |fd| self.global.listen(fd, backlog))
             }
-            Descriptor::Unix { file, .. } => file.listen(backlog),
+            Descriptor::Unix { file, .. } => file.listen(backlog, &self.global),
             _ => Err(Errno::ENOTSOCK),
         }
     }
