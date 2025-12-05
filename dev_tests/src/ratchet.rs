@@ -34,7 +34,7 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_runner_linux_userland/", 1),
             ("litebox_runner_lvbs/", 3),
             ("litebox_runner_snp/", 1),
-            ("litebox_shim_linux/", 2),
+            ("litebox_shim_linux/", 1),
             ("litebox_shim_optee/", 6),
         ],
         |file| {
