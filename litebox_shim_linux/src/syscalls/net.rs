@@ -749,10 +749,10 @@ impl Task {
                 })?,
             )
         };
-        self.sys_socket_inner(domain, ty, flags, protocol)
+        self.do_socket(domain, ty, flags, protocol)
             .map(|fd| fd as usize)
     }
-    fn sys_socket_inner(
+    fn do_socket(
         &self,
         domain: AddressFamily,
         ty: SockType,
@@ -877,7 +877,7 @@ impl Task {
             return Err(Errno::EBADF);
         };
         let mut remote_addr = addr.is_some().then(SocketAddress::default);
-        let fd = self.sys_accept_inner(sockfd, remote_addr.as_mut(), flags)?;
+        let fd = self.do_accept(sockfd, remote_addr.as_mut(), flags)?;
         if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
             let addrlen = addrlen.ok_or(Errno::EFAULT)?;
             if let Err(err) = write_sockaddr_to_user(remote_addr, addr, addrlen) {
@@ -889,7 +889,7 @@ impl Task {
         }
         Ok(fd as usize)
     }
-    fn sys_accept_inner(
+    fn do_accept(
         &self,
         sockfd: u32,
         peer: Option<&mut SocketAddress>,
@@ -947,9 +947,9 @@ impl Task {
             return Err(Errno::EBADF);
         };
         let sockaddr = read_sockaddr_from_user(sockaddr, addrlen)?;
-        self.sys_connect_inner(fd, sockaddr).map(|()| 0)
+        self.do_connect(fd, sockaddr).map(|()| 0)
     }
-    fn sys_connect_inner(&self, fd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
+    fn do_connect(&self, fd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
@@ -973,9 +973,9 @@ impl Task {
             return Err(Errno::EBADF);
         };
         let sockaddr = read_sockaddr_from_user(sockaddr, addrlen)?;
-        self.sys_bind_inner(sockfd, sockaddr).map(|()| 0)
+        self.do_bind(sockfd, sockaddr).map(|()| 0)
     }
-    fn sys_bind_inner(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
+    fn do_bind(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -996,9 +996,9 @@ impl Task {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-        self.sys_listen_inner(sockfd, backlog).map(|()| 0)
+        self.do_listen(sockfd, backlog).map(|()| 0)
     }
-    fn sys_listen_inner(&self, sockfd: u32, backlog: u16) -> Result<(), Errno> {
+    fn do_listen(&self, sockfd: u32, backlog: u16) -> Result<(), Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -1029,9 +1029,9 @@ impl Task {
         let sockaddr = addr
             .map(|addr| read_sockaddr_from_user(addr, addrlen as usize))
             .transpose()?;
-        self.sys_sendto_inner(fd, buf, len, flags, sockaddr)
+        self.do_sendto(fd, buf, len, flags, sockaddr)
     }
-    fn sys_sendto_inner(
+    fn do_sendto(
         &self,
         fd: u32,
         buf: ConstPtr<u8>,
@@ -1065,9 +1065,9 @@ impl Task {
             return Err(Errno::EBADF);
         };
         let msg = unsafe { msg.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
-        self.sys_sendmsg_inner(fd, &msg, flags)
+        self.do_sendmsg(fd, &msg, flags)
     }
-    fn sys_sendmsg_inner(
+    fn do_sendmsg(
         &self,
         fd: u32,
         msg: &litebox_common_linux::UserMsgHdr<Platform>,
@@ -1127,7 +1127,7 @@ impl Task {
             return Err(Errno::EBADF);
         };
         let mut source_addr = None;
-        let size = self.sys_recvfrom_inner(
+        let size = self.do_recvfrom(
             sockfd,
             buf,
             len,
@@ -1145,7 +1145,7 @@ impl Task {
         }
         Ok(size)
     }
-    fn sys_recvfrom_inner(
+    fn do_recvfrom(
         &self,
         sockfd: u32,
         buf: MutPtr<u8>,
@@ -1202,10 +1202,10 @@ impl Task {
             log_unsupported!("setsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
         })?;
-        self.sys_setsockopt_inner(sockfd, optname, optval, optlen)
+        self.do_setsockopt(sockfd, optname, optval, optlen)
             .map(|()| 0)
     }
-    fn sys_setsockopt_inner(
+    fn do_setsockopt(
         &self,
         sockfd: u32,
         optname: SocketOptionName,
@@ -1242,10 +1242,10 @@ impl Task {
             log_unsupported!("setsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
         })?;
-        self.sys_getsockopt_inner(sockfd, optname, optval, optlen)
+        self.do_getsockopt(sockfd, optname, optval, optlen)
             .map(|()| 0)
     }
-    fn sys_getsockopt_inner(
+    fn do_getsockopt(
         &self,
         sockfd: u32,
         optname: SocketOptionName,
@@ -1276,10 +1276,10 @@ impl Task {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-        let sockaddr = self.sys_getsockname_inner(sockfd)?;
+        let sockaddr = self.do_getsockname(sockfd)?;
         write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
     }
-    fn sys_getsockname_inner(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
+    fn do_getsockname(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -1309,10 +1309,10 @@ impl Task {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-        let sockaddr = self.sys_getpeername_inner(sockfd)?;
+        let sockaddr = self.do_getpeername(sockfd)?;
         write_sockaddr_to_user(sockaddr, addr, addrlen).map(|()| 0)
     }
-    fn sys_getpeername_inner(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
+    fn do_getpeername(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
         let files = self.files.borrow();
         match files
             .file_descriptors
@@ -1580,7 +1580,7 @@ mod tests {
         option: &'static str,
     ) {
         let server = task
-            .sys_socket_inner(
+            .do_socket(
                 AddressFamily::INET,
                 SockType::Stream,
                 if is_nonblocking {
@@ -1595,9 +1595,9 @@ mod tests {
             core::net::Ipv4Addr::from(ip),
             port,
         )));
-        task.sys_bind_inner(server, server_sockaddr.clone())
+        task.do_bind(server, server_sockaddr.clone())
             .expect("Failed to bind socket");
-        task.sys_listen_inner(server, 1)
+        task.do_listen(server, 1)
             .expect("Failed to listen on socket");
 
         // Create an epoll instance and register the server fd for EPOLLIN
@@ -1645,7 +1645,7 @@ mod tests {
 
         let mut remote_addr = super::SocketAddress::default();
         let client_fd = task
-            .sys_accept_inner(
+            .do_accept(
                 server,
                 Some(&mut remote_addr),
                 if is_nonblocking {
@@ -1655,11 +1655,8 @@ mod tests {
                 },
             )
             .expect("Failed to accept connection");
-        assert_eq!(
-            server_sockaddr,
-            task.sys_getsockname_inner(client_fd).unwrap()
-        );
-        assert_eq!(remote_addr, task.sys_getpeername_inner(client_fd).unwrap());
+        assert_eq!(server_sockaddr, task.do_getsockname(client_fd).unwrap());
+        assert_eq!(remote_addr, task.do_getpeername(client_fd).unwrap());
         let super::SocketAddress::Inet(SocketAddr::V4(remote_addr)) = remote_addr else {
             panic!("Expected IPv4 address");
         };
@@ -1670,7 +1667,7 @@ mod tests {
             "sendto" => {
                 let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
                 let n = task
-                    .sys_sendto_inner(client_fd, ptr, buf.len(), SendFlags::empty(), None)
+                    .do_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None)
                     .expect("Failed to send data");
                 assert_eq!(n, buf.len());
                 let output = child_handle
@@ -1703,7 +1700,7 @@ mod tests {
                     msg_flags: SendFlags::empty(),
                 };
                 assert_eq!(
-                    task.sys_sendmsg_inner(client_fd, &hdr, SendFlags::empty())
+                    task.do_sendmsg(client_fd, &hdr, SendFlags::empty())
                         .expect("Failed to sendmsg"),
                     buf1.len() + buf2.len()
                 );
@@ -1729,7 +1726,7 @@ mod tests {
                 let mut recv_buf = [0u8; 48];
                 let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
                 let n = task
-                    .sys_recvfrom_inner(
+                    .do_recvfrom(
                         client_fd,
                         recv_ptr,
                         recv_buf.len(),
@@ -1815,7 +1812,7 @@ mod tests {
     fn test_tun_tcp_connection_refused() {
         let task = init_platform(Some("tun99"));
         let socket_fd = task
-            .sys_socket_inner(
+            .do_socket(
                 AddressFamily::INET,
                 SockType::Stream,
                 SockFlags::empty(),
@@ -1828,7 +1825,7 @@ mod tests {
 
         close_socket(&task, socket_fd);
         let err = task
-            .sys_connect_inner(
+            .do_connect(
                 socket_fd2,
                 SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
                     core::net::Ipv4Addr::from([10, 0, 0, 1]),
@@ -1858,7 +1855,7 @@ mod tests {
 
         // Client socket
         let client_fd = task
-            .sys_socket_inner(
+            .do_socket(
                 AddressFamily::INET,
                 SockType::Stream,
                 SockFlags::empty(),
@@ -1870,14 +1867,14 @@ mod tests {
             core::net::Ipv4Addr::from([10, 0, 0, 1]),
             SERVER_PORT,
         )));
-        task.sys_connect_inner(client_fd, server_addr)
+        task.do_connect(client_fd, server_addr)
             .expect("failed to connect to server");
 
         let buf = "Hello, world!";
         let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
         let len = buf.len();
         let n = task
-            .sys_sendto_inner(client_fd, ptr, len, SendFlags::empty(), None)
+            .do_sendto(client_fd, ptr, len, SendFlags::empty(), None)
             .unwrap();
         assert_eq!(n, len);
 
@@ -1886,7 +1883,7 @@ mod tests {
             linger: 60, // timeout in seconds
         };
         let optval = ConstPtr::from_usize((&raw const linger).cast::<u8>() as usize);
-        task.sys_setsockopt_inner(
+        task.do_setsockopt(
             client_fd,
             SocketOptionName::Socket(SocketOption::LINGER),
             optval,
@@ -1909,7 +1906,7 @@ mod tests {
 
         // Server socket and bind
         let server_fd = task
-            .sys_socket_inner(
+            .do_socket(
                 AddressFamily::INET,
                 SockType::Datagram,
                 if is_nonblocking {
@@ -1924,12 +1921,11 @@ mod tests {
             core::net::Ipv4Addr::from(TUN_IP_ADDR),
             SERVER_PORT,
         )));
-        task.sys_bind_inner(server_fd, server_addr.clone())
+        task.do_bind(server_fd, server_addr.clone())
             .expect("failed to bind server");
         assert_eq!(
             server_addr,
-            task.sys_getsockname_inner(server_fd)
-                .expect("getsockname failed")
+            task.do_getsockname(server_fd).expect("getsockname failed")
         );
 
         // Create an epoll instance and register the server fd for EPOLLIN
@@ -1983,7 +1979,7 @@ mod tests {
             }
         }
         let n = task
-            .sys_recvfrom_inner(
+            .do_recvfrom(
                 server_fd,
                 recv_ptr,
                 if test_trunc {
@@ -2033,7 +2029,7 @@ mod tests {
 
         // Client socket and explicit bind
         let client_fd = task
-            .sys_socket_inner(
+            .do_socket(
                 AddressFamily::INET,
                 SockType::Datagram,
                 SockFlags::empty(),
@@ -2049,7 +2045,7 @@ mod tests {
         // Send from client to server
         let msg = "Hello without connect()";
         let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
-        task.sys_sendto_inner(
+        task.do_sendto(
             client_fd,
             msg_ptr,
             msg.len(),
@@ -2059,19 +2055,18 @@ mod tests {
         .expect("failed to sendto");
 
         // Client implicitly bound to an ephemeral port via sendto
-        let SocketAddress::Inet(client_addr) = task
-            .sys_getsockname_inner(client_fd)
-            .expect("getsockname failed");
+        let SocketAddress::Inet(client_addr) =
+            task.do_getsockname(client_fd).expect("getsockname failed");
         assert_ne!(client_addr.port(), 0);
 
         // Client connects to server address
-        task.sys_connect_inner(client_fd, server_addr.clone())
+        task.do_connect(client_fd, server_addr.clone())
             .expect("failed to connect");
 
         // Now client can send without specifying addr
         let msg = "Hello with connect()";
         let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
-        task.sys_sendto_inner(client_fd, msg_ptr, msg.len(), SendFlags::empty(), None)
+        task.do_sendto(client_fd, msg_ptr, msg.len(), SendFlags::empty(), None)
             .expect("failed to sendto");
 
         close_socket(&task, client_fd);
@@ -2081,7 +2076,7 @@ mod tests {
     fn test_tun_tcp_sockopt() {
         let task = init_platform(Some("tun99"));
         let sockfd = task
-            .sys_socket_inner(
+            .do_socket(
                 AddressFamily::INET,
                 SockType::Stream,
                 SockFlags::empty(),
@@ -2091,7 +2086,7 @@ mod tests {
 
         let mut congestion_name = [0u8; 16];
         let mut optlen: u32 = congestion_name.len().truncate();
-        task.sys_getsockopt_inner(
+        task.do_getsockopt(
             sockfd,
             SocketOptionName::TCP(TcpOption::CONGESTION),
             MutPtr::from_usize(congestion_name.as_mut_ptr() as usize),
@@ -2104,7 +2099,7 @@ mod tests {
             "none"
         );
 
-        task.sys_setsockopt_inner(
+        task.do_setsockopt(
             sockfd,
             SocketOptionName::TCP(TcpOption::CONGESTION),
             ConstPtr::from_usize(congestion_name.as_ptr() as usize),
@@ -2114,7 +2109,7 @@ mod tests {
 
         let congestion_name = b"cubic\0";
         let err = task
-            .sys_setsockopt_inner(
+            .do_setsockopt(
                 sockfd,
                 SocketOptionName::TCP(TcpOption::CONGESTION),
                 ConstPtr::from_usize(congestion_name.as_ptr() as usize),
@@ -2128,7 +2123,7 @@ mod tests {
     fn test_socket_dup_and_close() {
         let task = init_platform(None);
         let socket_fd = task
-            .sys_socket_inner(
+            .do_socket(
                 litebox_common_linux::AddressFamily::INET,
                 litebox_common_linux::SockType::Stream,
                 litebox_common_linux::SockFlags::empty(),

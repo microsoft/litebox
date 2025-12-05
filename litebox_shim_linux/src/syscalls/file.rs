@@ -439,15 +439,12 @@ impl Task {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-        self.sys_close_inner(fd).map(|()| 0)
-    }
-    fn sys_close_inner(&self, fd: u32) -> Result<(), Errno> {
         let files = self.files.borrow();
         let mut file_table = files.file_descriptors.write();
         match file_table.remove(fd) {
             Some(desc) => {
                 drop(file_table); // drop before potentially blocking `close`
-                self.do_close(desc)
+                self.do_close(desc).map(|()| 0)
             }
             None => Err(Errno::EBADF),
         }
