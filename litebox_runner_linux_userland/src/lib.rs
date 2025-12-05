@@ -217,6 +217,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // in the filesystem so tests and users don't need to include it in tar files
         match cli_args.interception_backend {
             InterceptionBackend::Rewriter => {
+                #[cfg(not(target_arch = "x86_64"))]
+                eprintln!("WARN: litebox_rtld_audit not currently supported on non-x86_64 arch");
+                #[cfg(target_arch = "x86_64")]
                 in_mem.with_root_privileges(|fs| {
                     let rwxr_xr_x = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
                     let _ = fs.mkdir("/lib", rwxr_xr_x);
