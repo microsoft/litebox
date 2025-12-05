@@ -1,4 +1,11 @@
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use alloc::sync::Arc;
+use litebox::{
+    event::polling::Pollee,
+    platform::TimeProvider,
+    sync::{Mutex, RawSyncPrimitivesProvider},
+};
 use litebox_common_linux::errno::Errno;
 use ringbuf::traits::{Consumer as _, Producer as _};
 
@@ -26,9 +33,33 @@ macro_rules! common_functions_for_channel {
     };
 }
 
+struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
+    rb: Mutex<Platform, T>,
+    pollee: Pollee<Platform>,
+    is_shutdown: AtomicBool,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform, T> {
+    fn new(rb: T) -> Self {
+        Self {
+            rb: Mutex::new(rb),
+            pollee: Pollee::new(),
+            is_shutdown: AtomicBool::new(false),
+        }
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.is_shutdown.load(Ordering::Acquire)
+    }
+
+    fn shutdown(&self) {
+        self.is_shutdown.store(true, Ordering::Release);
+    }
+}
+
 pub(crate) struct ReadEnd<T> {
-    endpoint: alloc::sync::Arc<litebox::pipes::EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
-    peer: alloc::sync::Weak<litebox::pipes::EndPointer<crate::Platform, ringbuf::HeapProd<T>>>,
+    endpoint: alloc::sync::Arc<EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
+    peer: alloc::sync::Weak<EndPointer<crate::Platform, ringbuf::HeapProd<T>>>,
 }
 
 impl<T> ReadEnd<T> {
@@ -76,8 +107,8 @@ impl<T> ReadEnd<T> {
 }
 
 pub(crate) struct WriteEnd<T> {
-    endpoint: alloc::sync::Arc<litebox::pipes::EndPointer<crate::Platform, ringbuf::HeapProd<T>>>,
-    peer: alloc::sync::Weak<litebox::pipes::EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
+    endpoint: alloc::sync::Arc<EndPointer<crate::Platform, ringbuf::HeapProd<T>>>,
+    peer: alloc::sync::Weak<EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
 }
 
 impl<T> WriteEnd<T> {
@@ -113,11 +144,11 @@ impl<T> Channel<T> {
         let (rb_prod, rb_cons) = rb.split();
 
         let mut writer = WriteEnd {
-            endpoint: Arc::new(litebox::pipes::EndPointer::new(rb_prod, crate::litebox())),
+            endpoint: Arc::new(EndPointer::new(rb_prod)),
             peer: alloc::sync::Weak::new(),
         };
         let mut reader = ReadEnd {
-            endpoint: Arc::new(litebox::pipes::EndPointer::new(rb_cons, crate::litebox())),
+            endpoint: Arc::new(EndPointer::new(rb_cons)),
             peer: alloc::sync::Weak::new(),
         };
 
