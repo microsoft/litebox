@@ -3,7 +3,7 @@
 use crate::{
     host::{
         hv_hypercall_page_address,
-        per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
+        per_cpu_variables::{KernelTlsOffset, with_per_cpu_variables, with_per_cpu_variables_mut},
     },
     mshv::{
         HV_REGISTER_VSM_CODEPAGE_OFFSETS, HV_VTL_NORMAL, HV_VTL_SECURE,
@@ -16,16 +16,18 @@ use core::arch::{asm, naked_asm};
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 
-static mut VTL_RETURN_ADDRESS: u64 = 0;
-
-/// Return to VTL0
+/// A function to return to VTL0 using the Hyper-V hypercall stub.
+/// Although Hyper-V lets each core use the same VTL return address, this implementation
+/// uses per-TLS return address to avoid using a mutable global variable.
 #[expect(clippy::inline_always)]
 #[inline(always)]
-fn vtl_return() {
+pub fn vtl_return() {
     unsafe {
-        asm!(
+        core::arch::asm!(
+            "xor ecx, ecx",
+            "mov rax, gs:[-{vtl_ret_addr_off}]",
             "call rax",
-            in("rax") VTL_RETURN_ADDRESS, in("rcx") 0x0,
+            vtl_ret_addr_off = const { KernelTlsOffset::VtlReturnAddr as usize },
         );
     }
 }
@@ -322,9 +324,15 @@ pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), Errno> {
     let value =
         hvcall_get_vp_registers(HV_REGISTER_VSM_CODEPAGE_OFFSETS).map_err(|_| Errno::EIO)?;
     let code_page_offsets = HvRegisterVsmCodePageOffsets::from_u64(value);
+    let vtl_return_address =
+        hv_hypercall_page_address() + u64::from(code_page_offsets.vtl_return_offset());
     unsafe {
-        VTL_RETURN_ADDRESS =
-            hv_hypercall_page_address() + u64::from(code_page_offsets.vtl_return_offset());
+        core::arch::asm!(
+            "mov gs:[-{vtl_ret_addr_off}], {vtl_ret_addr}",
+            vtl_ret_addr = in(reg) vtl_return_address,
+            vtl_ret_addr_off = const {KernelTlsOffset::VtlReturnAddr as usize},
+            options(nostack, preserves_flags),
+        );
     }
     Ok(())
 }
