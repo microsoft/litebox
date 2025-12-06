@@ -15,8 +15,8 @@ use crate::{
 };
 use aligned_vec::avec;
 use alloc::boxed::Box;
-use core::cell::RefCell;
-use core::mem::{offset_of, size_of};
+use core::cell::{Cell, RefCell};
+use core::mem::offset_of;
 use litebox_common_linux::{rdgsbase, wrgsbase};
 use x86_64::VirtAddr;
 
@@ -287,9 +287,9 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 #[repr(C)]
 #[derive(Clone)]
 pub struct KernelTls {
-    pub vtl_return_addr: u64,     // gs:[-24]
-    pub interrupt_stack_ptr: u64, // gs:[-16]
-    pub kernel_stack_ptr: u64,    // gs:[-8]
+    pub kernel_stack_ptr: Cell<usize>,    // gs:[0x0]
+    pub interrupt_stack_ptr: Cell<usize>, // gs:[0x8]
+    pub vtl_return_addr: Cell<usize>,     // gs:[0x10]
 }
 
 /// Kernel TLS offsets. Difference between the GS value and an offset is used to access
@@ -297,22 +297,13 @@ pub struct KernelTls {
 #[non_exhaustive]
 #[repr(usize)]
 pub enum KernelTlsOffset {
-    KernelStackPtr = size_of::<KernelTls>() - offset_of!(KernelTls, kernel_stack_ptr),
-    InterruptStackPtr = size_of::<KernelTls>() - offset_of!(KernelTls, interrupt_stack_ptr),
-    VtlReturnAddr = size_of::<KernelTls>() - offset_of!(KernelTls, vtl_return_addr),
+    KernelStackPtr = offset_of!(KernelTls, kernel_stack_ptr),
+    InterruptStackPtr = offset_of!(KernelTls, interrupt_stack_ptr),
+    VtlReturnAddr = offset_of!(KernelTls, vtl_return_addr),
 }
 
 /// Wrapper struct to maintain `RefCell` along with `KernelTls`.
-///
-/// high +---------------------------+
-///      |   *mut PerCpuVariables    |
-///      +---------------------------+
-/// gs ->|      RefCell.borrow       |
-///      +---------------------------+
-///      |        KernelTls          |
-/// low  +---------------------------+
-///
-/// This layout allows assembly code to read/write some TLS area via the GS register (e.g., to
+/// This struct allows assembly code to read/write some TLS area via the GS register (e.g., to
 /// save/restore RIP/RSP). Currently, `PerCpuVariables` is protected by `RefCell` such that
 /// assembly code cannot easily access it.
 /// TODO: Let's consider whether we should maintain these two types of TLS areas (for Rust and
@@ -320,10 +311,8 @@ pub enum KernelTlsOffset {
 /// but it might be unnecessarily complex. Instead, we could use assembly code in all cases, but
 /// this might be unsafe.
 #[repr(C)]
-#[derive(Clone)]
 pub struct RefCellWrapper<T> {
-    /// Make some TLS area be accessible via the GS register. This is for assembly code and
-    /// never meant to be used in Rust code (unsafe).
+    /// Make some TLS area be accessible via the GS register. This is mainly for assembly code
     ktls: KernelTls,
     /// RefCell which will be stored in the GS register
     inner: RefCell<T>,
@@ -332,9 +321,9 @@ impl<T> RefCellWrapper<T> {
     pub const fn new(value: T) -> Self {
         RefCellWrapper {
             ktls: KernelTls {
-                vtl_return_addr: 0,
-                interrupt_stack_ptr: 0,
-                kernel_stack_ptr: 0,
+                kernel_stack_ptr: Cell::new(0),
+                interrupt_stack_ptr: Cell::new(0),
+                vtl_return_addr: Cell::new(0),
             },
             inner: RefCell::new(value),
         }
@@ -403,6 +392,48 @@ where
     f(per_cpu_variables)
 }
 
+/// Execute a closure with a reference to the current kernel TLS.
+///
+/// # Panics
+/// Panics if GSBASE is not set or it contains a non-canonical address.
+pub fn with_kernel_tls<F, R>(f: F) -> R
+where
+    F: FnOnce(&KernelTls) -> R,
+    R: Sized + 'static,
+{
+    let ktls_addr = unsafe {
+        let gsbase = rdgsbase();
+        let addr = VirtAddr::try_new(u64::try_from(gsbase).unwrap())
+            .expect("GS contains a non-canonical address");
+        addr.as_ptr::<RefCellWrapper<*mut PerCpuVariables>>()
+            .cast::<KernelTls>()
+    };
+    let ktls = unsafe { &*ktls_addr };
+
+    f(ktls)
+}
+
+/// Execute a closure with a mutable reference to the current kernel TLS.
+///
+/// # Panics
+/// Panics if GSBASE is not set or it contains a non-canonical address.
+pub fn with_kernel_tls_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut KernelTls) -> R,
+    R: Sized + 'static,
+{
+    let ktls_addr: *mut KernelTls = unsafe {
+        let gsbase = rdgsbase();
+        let addr = VirtAddr::try_new(u64::try_from(gsbase).unwrap())
+            .expect("GS contains a non-canonical address");
+        addr.as_mut_ptr::<RefCellWrapper<*mut PerCpuVariables>>()
+            .cast::<KernelTls>()
+    };
+    let ktls = unsafe { &mut *ktls_addr };
+
+    f(ktls)
+}
+
 /// Get or initialize a `RefCell` that contains a pointer to the current core's per-CPU variables.
 /// This `RefCell` is expected to be stored in the GS register.
 fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut PerCpuVariables>> {
@@ -429,7 +460,7 @@ fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut Pe
         if refcell.borrow().is_null() {
             None
         } else {
-            let addr = x86_64::VirtAddr::new(&raw const *refcell as u64);
+            let addr = x86_64::VirtAddr::new(&raw const *refcell_wrapper as u64);
             unsafe {
                 wrgsbase(usize::try_from(addr.as_u64()).unwrap());
             }
@@ -438,7 +469,8 @@ fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut Pe
     } else {
         let addr = x86_64::VirtAddr::try_new(u64::try_from(gsbase).unwrap())
             .expect("GS contains a non-canonical address");
-        let refcell = unsafe { &*addr.as_ptr::<RefCell<*mut PerCpuVariables>>() };
+        let refcell_wrapper = unsafe { &*addr.as_ptr::<RefCellWrapper<*mut PerCpuVariables>>() };
+        let refcell = refcell_wrapper.get_refcell();
         if refcell.borrow().is_null() {
             None
         } else {
