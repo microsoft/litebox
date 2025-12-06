@@ -15,7 +15,7 @@ use litebox::{
 };
 use litebox_common_linux::{ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno};
 
-use crate::{FileFd, GlobalState, Task, with_current_task};
+use crate::{FileFd, GlobalState, Task};
 
 /// C-compatible structure for Unix socket addresses.
 const UNIX_PATH_MAX: usize = 108;
@@ -43,9 +43,8 @@ pub(crate) enum UnixSocketAddr {
 /// For path-based sockets, this includes a file descriptor to ensure
 /// the socket file remains accessible. The file is automatically closed
 /// when this structure is dropped.
-/// TODO: use an inode reference instead of a file descriptor.
 enum UnixBoundSocketAddr {
-    Path((String, FileFd)),
+    Path((String, FileFd, Arc<GlobalState>)),
     Abstract(Vec<u8>),
 }
 
@@ -55,6 +54,7 @@ enum UnixBoundSocketAddr {
 /// by listening sockets.
 #[derive(PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
 pub(crate) enum UnixSocketAddrKey {
+    // TODO: add inode reference once the file system supports it.
     Path(String),
     Abstract(Vec<u8>),
 }
@@ -90,7 +90,7 @@ impl UnixSocketAddr {
                     flags,
                     Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                 )?;
-                Ok(UnixBoundSocketAddr::Path((path, file)))
+                Ok(UnixBoundSocketAddr::Path((path, file, task.global.clone())))
             }
             UnixSocketAddr::Abstract(data) => {
                 // TODO: check if the abstract address is already in use
@@ -116,7 +116,7 @@ impl UnixBoundSocketAddr {
     /// Converts this bound address to a key for the global address table.
     fn to_key(&self) -> UnixSocketAddrKey {
         match self {
-            Self::Path((path, _)) => UnixSocketAddrKey::Path(path.clone()),
+            Self::Path((path, ..)) => UnixSocketAddrKey::Path(path.clone()),
             Self::Abstract(addr) => UnixSocketAddrKey::Abstract(addr.clone()),
         }
     }
@@ -125,8 +125,8 @@ impl UnixBoundSocketAddr {
 impl Drop for UnixBoundSocketAddr {
     fn drop(&mut self) {
         match self {
-            Self::Path((_, file)) => {
-                let _ = with_current_task(|task| task.global.fs.close(file));
+            Self::Path((_, file, global)) => {
+                let _ = global.fs.close(file);
             }
             Self::Abstract(_) => {}
         }
@@ -136,7 +136,7 @@ impl Drop for UnixBoundSocketAddr {
 impl From<&UnixBoundSocketAddr> for UnixSocketAddr {
     fn from(addr: &UnixBoundSocketAddr) -> Self {
         match addr {
-            UnixBoundSocketAddr::Path((path, _)) => UnixSocketAddr::Path(path.clone()),
+            UnixBoundSocketAddr::Path((path, ..)) => UnixSocketAddr::Path(path.clone()),
             UnixBoundSocketAddr::Abstract(data) => UnixSocketAddr::Abstract(data.clone()),
         }
     }
@@ -179,7 +179,11 @@ impl UnixInitStream {
     /// # Arguments
     ///
     /// * `backlog` - Maximum number of pending connections to queue
-    fn listen(self, backlog: u16, global: &GlobalState) -> Result<UnixListenStream, (Self, Errno)> {
+    fn listen(
+        self,
+        backlog: u16,
+        global: &Arc<GlobalState>,
+    ) -> Result<UnixListenStream, (Self, Errno)> {
         let Some(addr) = self.addr else {
             return Err((self, Errno::EINVAL));
         };
@@ -189,7 +193,10 @@ impl UnixInitStream {
             .unix_addr_table
             .write()
             .insert(key, UnixEntry(UnixEntryInner::Stream(backlog.clone())));
-        Ok(UnixListenStream { backlog })
+        Ok(UnixListenStream {
+            backlog,
+            global: global.clone(),
+        })
     }
 
     /// Converts this initial socket into a connected stream pair.
@@ -343,6 +350,7 @@ impl Backlog {
 /// Represents a Unix stream socket in listening state.
 struct UnixListenStream {
     backlog: Arc<Backlog>,
+    global: Arc<GlobalState>,
 }
 
 impl UnixListenStream {
@@ -367,15 +375,13 @@ impl Drop for UnixListenStream {
         self.backlog.shutdown();
 
         let key = self.backlog.addr.to_key();
-        with_current_task(|task| {
-            let mut table = task.global.unix_addr_table.write();
-            // Only remove the entry if it still points to our backlog
-            if let Some(UnixEntry(UnixEntryInner::Stream(backlog))) = table.get(&key)
-                && Arc::ptr_eq(backlog, &self.backlog)
-            {
-                table.remove(&key);
-            }
-        });
+        let mut table = self.global.unix_addr_table.write();
+        // Only remove the entry if it still points to our backlog
+        if let Some(UnixEntry(UnixEntryInner::Stream(backlog))) = table.get(&key)
+            && Arc::ptr_eq(backlog, &self.backlog)
+        {
+            table.remove(&key);
+        }
     }
 }
 
@@ -588,7 +594,7 @@ impl UnixSocket {
         F: FnOnce(&UnixSocketState) -> R,
     {
         let old = self.state.read();
-        f(old.as_ref().unwrap())
+        f(old.as_ref().expect("state should never be None"))
     }
 
     fn with_state_mut_ref<F, R>(&self, f: F) -> R
@@ -596,7 +602,7 @@ impl UnixSocket {
         F: FnOnce(&mut UnixSocketState) -> R,
     {
         let mut old = self.state.write();
-        f(old.as_mut().unwrap())
+        f(old.as_mut().expect("state should never be None"))
     }
 
     fn with_state<F, R>(&self, f: F) -> R
@@ -604,7 +610,7 @@ impl UnixSocket {
         F: FnOnce(UnixSocketState) -> (UnixSocketState, R),
     {
         let mut old = self.state.write();
-        let (new, result) = f(old.take().unwrap());
+        let (new, result) = f(old.take().expect("state should never be None"));
         *old = Some(new);
         result
     }
@@ -623,7 +629,7 @@ impl UnixSocket {
         })
     }
 
-    pub(super) fn listen(&self, backlog: u16, global: &GlobalState) -> Result<(), Errno> {
+    pub(super) fn listen(&self, backlog: u16, global: &Arc<GlobalState>) -> Result<(), Errno> {
         self.with_state(|state| {
             let ret = match state {
                 UnixSocketState::InitStream(init) => {
