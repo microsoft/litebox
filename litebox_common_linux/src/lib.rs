@@ -1738,6 +1738,31 @@ impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platf
     }
 }
 
+#[repr(i32)]
+#[derive(Debug, IntEnum)]
+pub enum SocketcallType {
+    Socket = 1,
+    Bind = 2,
+    Connect = 3,
+    Listen = 4,
+    Accept = 5,
+    GetSockname = 6,
+    GetPeername = 7,
+    Socketpair = 8,
+    Send = 9,
+    Recv = 10,
+    Sendto = 11,
+    Recvfrom = 12,
+    Shutdown = 13,
+    Setsockopt = 14,
+    Getsockopt = 15,
+    Sendmsg = 16,
+    Recvmsg = 17,
+    Accept4 = 18,
+    Recvmmsg = 19,
+    Sendmmsg = 20,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -1882,14 +1907,14 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         flags: Option<litebox::fs::OFlags>,
     },
     Socket {
-        domain: AddressFamily,
-        ty: SockType,
-        flags: SockFlags,
-        /// The `protocol` specifies a particular protocol to be used with the
-        /// socket.  Normally only a single protocol exists to support a
-        /// particular socket type within a given protocol family, in which case
-        /// protocol can be specified as `None`.
-        protocol: Option<Protocol>,
+        domain: u32,
+        type_and_flags: u32,
+        protocol: u8,
+    },
+    #[cfg(target_arch = "x86")]
+    Socketcall {
+        call: i32,
+        args: Platform::RawConstPointer<usize>,
     },
     Connect {
         sockfd: i32,
@@ -1934,13 +1959,15 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Setsockopt {
         sockfd: i32,
-        optname: SocketOptionName,
+        level: u32,
+        optname: u32,
         optval: Platform::RawConstPointer<u8>,
         optlen: usize,
     },
     Getsockopt {
         sockfd: i32,
-        optname: SocketOptionName,
+        level: u32,
+        optname: u32,
         optval: Platform::RawMutPointer<u8>,
         optlen: Platform::RawMutPointer<u32>,
     },
@@ -2380,28 +2407,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 newfd: Some(ctx.sys_req_arg(1)),
                 flags: Some(ctx.sys_req_arg(2)),
             },
-            Sysno::socket => {
-                let domain: u32 = ctx.sys_req_arg(0);
-                let type_and_flags: u32 = ctx.sys_req_arg(1);
-                let ty = type_and_flags & 0x0f;
-                let flags = type_and_flags & !0x0f;
-                SyscallRequest::Socket {
-                    domain: AddressFamily::try_from(domain).map_err(|_| {
-                        unsupported_einval(format_args!("socket(domain = {domain})"))
-                    })?,
-                    ty: SockType::try_from(ty)
-                        .map_err(|_| unsupported_einval(format_args!("socket(type = {ty})")))?,
-                    flags: SockFlags::from_bits_truncate(flags),
-                    protocol: if ctx.sys_req_arg::<u8>(2) == 0 {
-                        None
-                    } else {
-                        let protocol: u8 = ctx.sys_req_arg(2);
-                        Some(Protocol::try_from(protocol).map_err(|_| {
-                            unsupported_einval(format_args!("socket(protocol = {protocol})"))
-                        })?)
-                    },
-                }
-            }
+            Sysno::socket => sys_req!(Socket {
+                domain,
+                type_and_flags,
+                protocol,
+            }),
+            #[cfg(target_arch = "x86")]
+            Sysno::socketcall => sys_req!(Socketcall { call, args:* }),
             Sysno::connect => sys_req!(Connect { sockfd, sockaddr:*, addrlen }),
             #[cfg(target_arch = "x86_64")]
             Sysno::accept => sys_req!(Accept {
@@ -2416,31 +2428,20 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
-            Sysno::setsockopt | Sysno::getsockopt => {
-                let level: u32 = ctx.sys_req_arg(1);
-                let name: u32 = ctx.sys_req_arg(2);
-                let optname = SocketOptionName::try_from(level, name).ok_or_else(|| {
-                    unsupported_einval(format_args!(
-                        "setsockopt(level = {level}, optname = {name})",
-                    ))
-                })?;
-                let sockfd = ctx.sys_req_arg(0);
-                match sysno {
-                    Sysno::setsockopt => SyscallRequest::Setsockopt {
-                        sockfd,
-                        optname,
-                        optval: ctx.sys_req_ptr(3),
-                        optlen: ctx.sys_req_arg(4),
-                    },
-                    Sysno::getsockopt => SyscallRequest::Getsockopt {
-                        sockfd,
-                        optname,
-                        optval: ctx.sys_req_ptr(3),
-                        optlen: ctx.sys_req_ptr(4),
-                    },
-                    _ => unreachable!(),
-                }
-            }
+            Sysno::setsockopt => sys_req!(Setsockopt {
+                sockfd,
+                level,
+                optname,
+                optval:*,
+                optlen,
+            }),
+            Sysno::getsockopt => sys_req!(Getsockopt {
+                sockfd,
+                level,
+                optname,
+                optval:*,
+                optlen:*,
+            }),
             Sysno::getsockname => sys_req!(Getsockname { sockfd, addr:*, addrlen:* }),
             Sysno::getpeername => sys_req!(Getpeername { sockfd, addr:*, addrlen:* }),
             Sysno::exit => sys_req!(Exit { status }),
@@ -3108,7 +3109,7 @@ impl PtRegs {
 #[diagnostic::on_unimplemented(
     message = "If you are trying to use a pointer for the sys_req macro, you might want to `:*` it. Alternatively, you might be looking for `sys_req_ptr` rather than `sys_req_arg`."
 )]
-trait ReinterpretTruncatedFromUsize: Sized {
+pub trait ReinterpretTruncatedFromUsize: Sized {
     fn reinterpret_truncated_from_usize(v: usize) -> Self;
 }
 impl ReinterpretTruncatedFromUsize for u64 {
@@ -3192,7 +3193,7 @@ reinterpret_truncated_from_usize_for! {
 #[diagnostic::on_unimplemented(
     message = "If you are trying to use a non-pointer for the sys_req macro, you might want remove the `:*` for it. Alternatively, you might be looking for `sys_req_arg` rather than `sys_req_ptr`."
 )]
-trait ReinterpretUsizeAsPtr<T>: Sized {
+pub trait ReinterpretUsizeAsPtr<T>: Sized {
     fn reinterpret_usize_as_ptr(v: usize) -> Self;
 }
 impl<T: Clone, P: RawConstPointer<T>> ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>>

@@ -435,7 +435,7 @@ impl Task {
     }
 
     /// Handle syscall `close`
-    pub fn sys_close(&self, fd: i32) -> Result<(), Errno> {
+    pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };

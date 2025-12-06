@@ -147,7 +147,6 @@ impl Runner {
         self
     }
 
-    #[expect(dead_code)]
     fn tun_device_name(&mut self, tun_name: &str) -> &mut Self {
         self.command.arg("--tun-device-name").arg(tun_name);
         self
@@ -465,4 +464,34 @@ fn test_runner_with_python() {
             }
         })
         .run();
+}
+
+#[test]
+fn test_tun_with_tcp_socket() {
+    let tcp_server_path = PathBuf::from("./tests/net/tcp_server.c");
+    let tcp_client_path = PathBuf::from("./tests/net/tcp_client.c");
+    let unique_name = "tcp_server_exec_rewriter";
+    let server_target =
+        common::compile(tcp_server_path.to_str().unwrap(), unique_name, true, false);
+    let client_target = common::compile(
+        tcp_client_path.to_str().unwrap(),
+        "tcp_client",
+        false,
+        false,
+    );
+
+    let child = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2)); // wait for server to start
+        std::process::Command::new(client_target.to_str().unwrap())
+            .arg("10.0.0.2")
+            .arg("12345")
+            .status()
+            .expect("failed to execute client");
+    });
+    Runner::new(Backend::Rewriter, &server_target, unique_name)
+        .arg("10.0.0.2")
+        .arg("12345")
+        .tun_device_name("tun99")
+        .run();
+    child.join().unwrap();
 }
