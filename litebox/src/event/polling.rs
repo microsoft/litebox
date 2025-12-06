@@ -18,7 +18,7 @@ use crate::{
 /// A pollable entity that can be observed for events.
 ///
 /// This supports polling, waiting, and notifications for observers.
-pub struct Pollee<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+pub struct Pollee<Platform: RawSyncPrimitivesProvider> {
     subject: Subject<Events, Events, Platform>,
 }
 
