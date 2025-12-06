@@ -3,7 +3,10 @@
 use crate::{
     host::{
         hv_hypercall_page_address,
-        per_cpu_variables::{KernelTlsOffset, with_per_cpu_variables, with_per_cpu_variables_mut},
+        per_cpu_variables::{
+            KernelTlsOffset, with_kernel_tls_mut, with_per_cpu_variables,
+            with_per_cpu_variables_mut,
+        },
     },
     mshv::{
         HV_REGISTER_VSM_CODEPAGE_OFFSETS, HV_VTL_NORMAL, HV_VTL_SECURE,
@@ -25,7 +28,7 @@ pub fn vtl_return() {
     unsafe {
         core::arch::asm!(
             "xor ecx, ecx",
-            "mov rax, gs:[-{vtl_ret_addr_off}]",
+            "mov rax, gs:[{vtl_ret_addr_off}]",
             "call rax",
             vtl_ret_addr_off = const { KernelTlsOffset::VtlReturnAddr as usize },
         );
@@ -324,16 +327,13 @@ pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), Errno> {
     let value =
         hvcall_get_vp_registers(HV_REGISTER_VSM_CODEPAGE_OFFSETS).map_err(|_| Errno::EIO)?;
     let code_page_offsets = HvRegisterVsmCodePageOffsets::from_u64(value);
-    let vtl_return_address =
-        hv_hypercall_page_address() + u64::from(code_page_offsets.vtl_return_offset());
-    unsafe {
-        core::arch::asm!(
-            "mov gs:[-{vtl_ret_addr_off}], {vtl_ret_addr}",
-            vtl_ret_addr = in(reg) vtl_return_address,
-            vtl_ret_addr_off = const {KernelTlsOffset::VtlReturnAddr as usize},
-            options(nostack, preserves_flags),
-        );
-    }
+    let hvcall_page = usize::try_from(hv_hypercall_page_address()).unwrap();
+    let vtl_return_address = hvcall_page
+        .checked_add(usize::from(code_page_offsets.vtl_return_offset()))
+        .ok_or(Errno::EOVERFLOW)?;
+    with_kernel_tls_mut(|ktls| {
+        ktls.vtl_return_addr.set(vtl_return_address);
+    });
     Ok(())
 }
 
