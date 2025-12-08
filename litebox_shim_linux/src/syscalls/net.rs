@@ -21,8 +21,8 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption, SocketOptionName,
-    TcpOption, errno::Errno,
+    AddressFamily, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
+    SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
 };
 
 use crate::{ConstPtr, Descriptor, MutPtr};
@@ -765,16 +765,6 @@ impl Task {
             Errno::EINVAL
         })?;
         let flags = SockFlags::from_bits_truncate(flags);
-        let protocol = if protocol == 0 {
-            None
-        } else {
-            Some(
-                litebox_common_linux::Protocol::try_from(protocol).map_err(|_| {
-                    log_unsupported!("socket(protocol = {protocol})");
-                    Errno::EINVAL
-                })?,
-            )
-        };
         self.do_socket(domain, ty, flags, protocol)
     }
     fn do_socket(
@@ -782,20 +772,24 @@ impl Task {
         domain: AddressFamily,
         ty: SockType,
         flags: SockFlags,
-        protocol: Option<litebox_common_linux::Protocol>,
+        protocol: u8,
     ) -> Result<u32, Errno> {
         let files = self.files.borrow();
         let file = match domain {
             AddressFamily::INET => {
+                let protocol = IPProtocol::try_from(protocol).map_err(|_| {
+                    log_unsupported!("protocol = {protocol}");
+                    Errno::EPROTONOSUPPORT
+                })?;
                 let protocol = match ty {
                     SockType::Stream => {
-                        if protocol.is_some_and(|p| p != litebox_common_linux::Protocol::TCP) {
+                        if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
                             return Err(Errno::EINVAL);
                         }
                         litebox::net::Protocol::Tcp
                     }
                     SockType::Datagram => {
-                        if protocol.is_some_and(|p| p != litebox_common_linux::Protocol::UDP) {
+                        if !matches!(protocol, IPProtocol::Default | IPProtocol::UDP) {
                             return Err(Errno::EINVAL);
                         }
                         litebox::net::Protocol::Udp
@@ -813,7 +807,8 @@ impl Task {
                 )
             }
             AddressFamily::UNIX => {
-                let socket = UnixSocket::new(ty, flags).ok_or(Errno::EPROTONOSUPPORT)?;
+                let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
+                let socket = UnixSocket::new(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
                 Descriptor::Unix {
                     file: Arc::new(socket),
                     close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
@@ -1741,7 +1736,7 @@ mod tests {
                 } else {
                     SockFlags::empty()
                 },
-                None,
+                0,
             )
             .unwrap();
         let server_sockaddr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
@@ -1965,12 +1960,7 @@ mod tests {
     fn test_tun_tcp_connection_refused() {
         let task = init_platform(Some("tun99"));
         let socket_fd = task
-            .do_socket(
-                AddressFamily::INET,
-                SockType::Stream,
-                SockFlags::empty(),
-                None,
-            )
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");
         let socket_fd2 = task
             .sys_dup(i32::try_from(socket_fd).unwrap(), None, None)
@@ -2008,12 +1998,7 @@ mod tests {
 
         // Client socket
         let client_fd = task
-            .do_socket(
-                AddressFamily::INET,
-                SockType::Stream,
-                SockFlags::empty(),
-                None,
-            )
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create client socket");
 
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
@@ -2067,7 +2052,7 @@ mod tests {
                 } else {
                     SockFlags::empty()
                 },
-                Some(litebox_common_linux::Protocol::UDP),
+                litebox_common_linux::IPProtocol::UDP as u8,
             )
             .expect("failed to create server socket");
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
@@ -2188,7 +2173,7 @@ mod tests {
                 AddressFamily::INET,
                 SockType::Datagram,
                 SockFlags::empty(),
-                Some(litebox_common_linux::Protocol::UDP),
+                litebox_common_linux::IPProtocol::UDP as u8,
             )
             .expect("failed to create client socket");
 
@@ -2234,12 +2219,7 @@ mod tests {
     fn test_tun_tcp_sockopt() {
         let task = init_platform(Some("tun99"));
         let sockfd = task
-            .do_socket(
-                AddressFamily::INET,
-                SockType::Stream,
-                SockFlags::empty(),
-                None,
-            )
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");
 
         let mut congestion_name = [0u8; 16];
@@ -2285,7 +2265,7 @@ mod tests {
                 litebox_common_linux::AddressFamily::INET,
                 litebox_common_linux::SockType::Stream,
                 litebox_common_linux::SockFlags::empty(),
-                None,
+                0,
             )
             .unwrap();
         let socket_fd2 = task
@@ -2310,7 +2290,7 @@ mod unix_tests {
     };
 
     fn create_unix_socket(task: &Task, flags: SockFlags) -> u32 {
-        task.do_socket(AddressFamily::UNIX, SockType::Stream, flags, None)
+        task.do_socket(AddressFamily::UNIX, SockType::Stream, flags, 0)
             .unwrap()
     }
 
