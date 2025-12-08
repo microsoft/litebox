@@ -1,57 +1,37 @@
-const SRC_PATH: &str = "../litebox_rtld_audit/rtld_audit.c";
+use std::path::PathBuf;
+
+const RTLD_AUDIT_DIR: &str = "../litebox_rtld_audit";
 
 fn main() {
-    // Compile the C code into a dynamic library
-    let dir_path = std::env::var("OUT_DIR").unwrap();
-    let output_path = std::path::Path::new(dir_path.as_str()).join("litebox_rtld_audit.so");
-
-    let mut cc_args = vec![
-        "-Wall",
-        "-Werror",
-        "-fPIC",
-        "-shared",
-        "-nostdlib",
-        "-o",
-        output_path.to_str().unwrap(),
-        SRC_PATH,
-    ];
-
-    // Use the target architecture provided by Cargo.
-    // Prefer CARGO_CFG_TARGET_ARCH (gives "x86_64", "x86", "arm", etc.)
-    // Fall back to parsing TARGET triple if necessary.
-    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH")
-        .or_else(|_| std::env::var("TARGET"))
-        .unwrap();
-
-    let arch_flag = if target_arch.starts_with("x86_64") {
-        "-m64"
-    } else if target_arch.starts_with("x86")
-        || target_arch.starts_with("i686")
-        || target_arch.starts_with("i386")
-    {
-        // Don't build it as we do not support x86 yet
-        // "-m32"
+    let mut make_cmd = std::process::Command::new("make");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    if target_arch != "x86_64" {
+        // XXX: Currently 32-bit x86 is unsupported (unimplemented), skip building
         return;
-    } else {
-        panic!("build.rs: unsupported target arch '{target_arch}'");
-    };
-    cc_args.push(arch_flag);
-
-    // Add -DDEBUG if in debug mode
-    if std::env::var("PROFILE").unwrap_or_default() == "debug" {
-        cc_args.push("-DDEBUG");
     }
-    let output = std::process::Command::new("cc")
-        .args(cc_args)
+    make_cmd
+        .current_dir(RTLD_AUDIT_DIR)
+        .env("OUT_DIR", &out_dir)
+        .env("ARCH", target_arch);
+    if std::env::var("PROFILE").unwrap_or_default() == "debug" {
+        make_cmd.env("DEBUG", "1");
+    }
+    let output = make_cmd
         .output()
-        .expect("Failed to compile rtld_audit.c");
-
+        .expect("Failed to execute make for rtld_audit");
     assert!(
         output.status.success(),
-        "failed to compile rtld_audit.c {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
+        "failed to build rtld_audit.so via make:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        out_dir.join("litebox_rtld_audit.so").exists(),
+        "Build failed to create necessary file"
     );
 
-    println!("cargo:rerun-if-changed={SRC_PATH}");
+    println!("cargo:rerun-if-changed={RTLD_AUDIT_DIR}/rtld_audit.c");
+    println!("cargo:rerun-if-changed={RTLD_AUDIT_DIR}/Makefile");
     println!("cargo:rerun-if-changed=build.rs");
 }
