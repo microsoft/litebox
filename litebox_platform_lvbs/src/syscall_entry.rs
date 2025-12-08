@@ -1,9 +1,6 @@
 use crate::debug_serial_println;
-use crate::{
-    host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
-    user_context::UserSpaceManagement,
-};
-use core::arch::{asm, naked_asm};
+use crate::{host::per_cpu_variables::with_per_cpu_variables, user_context::UserSpaceManagement};
+use core::arch::naked_asm;
 use litebox::shim::ContinueOperation;
 use litebox_common_linux::PtRegs;
 use litebox_common_optee::SyscallContext;
@@ -174,20 +171,8 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
         return sysret;
     }
 
-    let stack_top = with_per_cpu_variables_mut(|per_cpu_variables| {
-        per_cpu_variables.set_vtl_return_value(0);
-        per_cpu_variables.kernel_stack_top()
-    });
-    unsafe {
-        asm!(
-            "mov rsp, rax",
-            "and rsp, -16",
-            in("rax") stack_top
-        );
-    }
-
+    // TODO: catch up up-to-date syscall handler's return path.
     crate::platform_low().page_table.change_address_space();
-    // TODO: modernize syscall handler's return path.
     unreachable!()
 }
 

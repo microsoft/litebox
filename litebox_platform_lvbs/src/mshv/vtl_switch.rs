@@ -4,7 +4,7 @@ use crate::{
     host::{
         hv_hypercall_page_address,
         per_cpu_variables::{
-            KernelTlsOffset, PerCpuVariables, with_kernel_tls_mut, with_per_cpu_variables,
+            KernelTlsOffset, with_kernel_tls_mut, with_per_cpu_variables,
             with_per_cpu_variables_mut,
         },
     },
@@ -22,17 +22,14 @@ use num_enum::TryFromPrimitive;
 /// A function to return to VTL0 using the Hyper-V hypercall stub.
 /// Although Hyper-V lets each core use the same VTL return address, this implementation
 /// uses per-TLS return address to avoid using a mutable global variable.
-#[expect(clippy::inline_always)]
-#[inline(always)]
-pub fn vtl_return() {
-    unsafe {
-        core::arch::asm!(
-            "xor ecx, ecx",
-            "mov rax, gs:[{vtl_ret_addr_off}]",
-            "call rax",
-            vtl_ret_addr_off = const { KernelTlsOffset::VtlReturnAddr as usize },
-        );
-    }
+macro_rules! VTL_RETURN_ASM {
+    () => {
+        "
+        xor ecx, ecx
+        mov rax, gs:[{vtl_ret_addr_off}]
+        call rax
+        "
+    };
 }
 
 // The following registers are shared between different VTLs.
@@ -89,28 +86,13 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
 }
 
 fn vtl_switch_loop() -> ! {
-    let stack_top = with_per_cpu_variables(PerCpuVariables::kernel_stack_top);
-    let stack_top = stack_top & !0xf; // align to 16 bytes
     unsafe {
         asm!(
-            "mov gs:[-{kernel_sp_off}], {stack_top}",
             "jmp {vtl_switch_loop_asm}",
-            stack_top = in(reg) stack_top,
-            kernel_sp_off = const {KernelTlsOffset::KernelStackPtr as usize},
             vtl_switch_loop_asm = sym vtl_switch_loop_asm,
             options(noreturn, nostack, preserves_flags),
         );
     }
-}
-
-macro_rules! VTL_RETURN_ASM {
-    () => {
-        "
-        xor ecx, ecx
-        mov rax, gs:[{vtl_ret_addr_off}]
-        call rax
-        "
-    };
 }
 
 macro_rules! SAVE_VTL0_STATE_ASM {
@@ -174,8 +156,8 @@ unsafe extern "C" fn save_vtl0_state(vtl_state: *const VtlState) {
     let addr = with_per_cpu_variables(|per_cpu_variables| &raw const per_cpu_variables.vtl0_state);
     unsafe {
         core::ptr::copy_nonoverlapping(
-            vtl_state as *const u8,
-            addr as *const u8 as *mut u8,
+            vtl_state.cast::<u8>(),
+            addr.cast::<u8>().cast_mut(),
             size_of::<VtlState>(),
         );
     }
@@ -185,8 +167,8 @@ unsafe extern "C" fn load_vtl0_state(vtl_state: *mut VtlState) {
     let addr = with_per_cpu_variables(|pcv| &raw const pcv.vtl0_state);
     unsafe {
         core::ptr::copy_nonoverlapping(
-            addr as *const u8 as *mut u8,
-            vtl_state as *const u8 as *mut u8,
+            addr.cast::<u8>(),
+            vtl_state.cast::<u8>(),
             size_of::<VtlState>(),
         );
     }
@@ -196,10 +178,11 @@ unsafe extern "C" fn load_vtl0_state(vtl_state: *mut VtlState) {
 unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
     naked_asm!(
         "1:",
-        "mov rsp, gs:[{kernel_sp_off}]", // reset kernel stack pointer. VTL1's entry point should be stateless.
+        "mov rsp, gs:[{kernel_sp_off}]", // reset kernel stack pointer. Hyper-V saves/restores rsp and rip.
         VTL_RETURN_ASM!(),
-        // *** VTL1 resumes here regardless of the reason (VTL switch or intercept) ***
+        // *** VTL1 resumes here regardless of the entry reason (VTL switch or intercept) ***
         SAVE_VTL0_STATE_ASM!(),
+        "mov rbp, rsp", // rbp contains VTL0's stack frame, so update it.
         "call {loop_body}",
         LOAD_VTL0_STATE_ASM!(),
         "jmp 1b",
@@ -278,7 +261,7 @@ pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), Errno> {
         .checked_add(usize::from(code_page_offsets.vtl_return_offset()))
         .ok_or(Errno::EOVERFLOW)?;
     with_kernel_tls_mut(|ktls| {
-        ktls.vtl_return_addr.set(vtl_return_address);
+        ktls.set_vtl_return_addr(vtl_return_address);
     });
     Ok(())
 }

@@ -33,7 +33,6 @@ pub struct PerCpuVariables {
     hvcall_input: [u8; PAGE_SIZE],
     hvcall_output: [u8; PAGE_SIZE],
     pub vtl0_state: VtlState,
-    pub vtl1_state: VtlState,
     pub vtl0_locked_regs: ControlRegMap,
     pub gdt: Option<&'static gdt::GdtWrapper>,
     vtl0_xsave_area_addr: VirtAddr,
@@ -45,7 +44,7 @@ impl PerCpuVariables {
     const XSAVE_ALIGNMENT: usize = 64; // XSAVE and XRSTORE require a 64-byte aligned buffer
     const XSAVE_MASK: u64 = 0b11; // let XSAVE and XRSTORE deal with x87 and SSE states
 
-    pub fn kernel_stack_top(&self) -> u64 {
+    pub(crate) fn kernel_stack_top(&self) -> u64 {
         &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
     }
 
@@ -182,23 +181,6 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
         r14: 0,
         r15: 0,
     },
-    vtl1_state: VtlState {
-        rbp: 0,
-        rax: 0,
-        rbx: 0,
-        rcx: 0,
-        rdx: 0,
-        rsi: 0,
-        rdi: 0,
-        r8: 0,
-        r9: 0,
-        r10: 0,
-        r11: 0,
-        r12: 0,
-        r13: 0,
-        r14: 0,
-        r15: 0,
-    },
     vtl0_locked_regs: ControlRegMap {
         entries: [(0, 0); NUM_CONTROL_REGS],
     },
@@ -213,10 +195,25 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 #[repr(C)]
 #[derive(Clone)]
 pub struct KernelTls {
-    pub kernel_stack_ptr: Cell<usize>,    // gs:[0x0]
-    pub interrupt_stack_ptr: Cell<usize>, // gs:[0x8]
-    pub vtl_return_addr: Cell<usize>,     // gs:[0x10]
-    pub scratch: Cell<usize>,             // gs:[0x18]
+    kernel_stack_ptr: Cell<usize>,    // gs:[0x0]
+    interrupt_stack_ptr: Cell<usize>, // gs:[0x8]
+    vtl_return_addr: Cell<usize>,     // gs:[0x10]
+    scratch: Cell<usize>,             // gs:[0x18]
+}
+
+impl KernelTls {
+    pub fn set_kernel_stack_ptr(&self, sp: usize) {
+        self.kernel_stack_ptr.set(sp);
+    }
+    pub fn set_interrupt_stack_ptr(&self, sp: usize) {
+        self.interrupt_stack_ptr.set(sp);
+    }
+    pub fn get_interrupt_stack_ptr(&self) -> usize {
+        self.interrupt_stack_ptr.get()
+    }
+    pub fn set_vtl_return_addr(&self, addr: usize) {
+        self.vtl_return_addr.set(addr);
+    }
 }
 
 /// Kernel TLS offsets. Difference between the GS value and an offset is used to access
@@ -443,6 +440,24 @@ pub fn allocate_per_cpu_variables() {
             PER_CPU_VARIABLE_ADDRESSES[i] = RefCellWrapper::new(Box::into_raw(per_cpu_variables));
         }
     }
+}
+
+/// Initialize the kernel and interrupt stack pointers in the Kernel TLS area with 16-byte alignment.
+///
+/// # Panics
+/// Panics if the per-CPU variables are not properly initialized.
+pub fn init_ktls_stack_pointers() {
+    const STACK_ALIGNMENT: usize = 16;
+    with_per_cpu_variables_mut(|per_cpu_variables| {
+        let kernel_sp =
+            usize::try_from(per_cpu_variables.kernel_stack_top()).unwrap() & !(STACK_ALIGNMENT - 1);
+        let interrupt_sp = usize::try_from(per_cpu_variables.interrupt_stack_top()).unwrap()
+            & !(STACK_ALIGNMENT - 1);
+        with_kernel_tls_mut(|ktls| {
+            ktls.kernel_stack_ptr.set(kernel_sp);
+            ktls.interrupt_stack_ptr.set(interrupt_sp);
+        });
+    });
 }
 
 /// Get the XSAVE area size based on enabled features (XCR0)
