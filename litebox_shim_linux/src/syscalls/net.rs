@@ -872,7 +872,9 @@ impl Task {
                 };
                 (file1, file2)
             }
-            AddressFamily::INET => todo!(),
+            AddressFamily::INET | AddressFamily::INET6 | AddressFamily::NETLINK => {
+                return Err(Errno::EOPNOTSUPP);
+            }
             _ => {
                 log_unsupported!("socketpair(domain = {domain:?})");
                 return Err(Errno::EAFNOSUPPORT);
@@ -2605,5 +2607,73 @@ mod unix_tests {
         .unwrap();
         close_socket(&task, client2_fd);
         close_socket(&task, server2_fd);
+    }
+
+    #[test]
+    fn test_unix_socketpair_bidirectional() {
+        let task = init_platform(None);
+        let mut sv_ptr = alloc::vec![0u32; 2];
+        let sv_mut_ptr = MutPtr::from_usize(sv_ptr.as_mut_ptr() as usize);
+
+        task.sys_socketpair(
+            AddressFamily::UNIX as u32,
+            SockType::Stream as u32,
+            0,
+            sv_mut_ptr,
+        )
+        .unwrap();
+
+        let sock1 = sv_ptr[0];
+        let sock2 = sv_ptr[1];
+
+        // Send from sock1 to sock2
+        let msg1 = "Message from sock1";
+        task.do_sendto(
+            sock1,
+            ConstPtr::from_usize(msg1.as_ptr().expose_provenance()),
+            msg1.len(),
+            SendFlags::empty(),
+            None,
+        )
+        .expect("sendto failed");
+
+        // Send from sock2 to sock1
+        let msg2 = "Message from sock2";
+        task.do_sendto(
+            sock2,
+            ConstPtr::from_usize(msg2.as_ptr().expose_provenance()),
+            msg2.len(),
+            SendFlags::empty(),
+            None,
+        )
+        .expect("sendto failed");
+
+        // Receive on sock2 (from sock1)
+        let mut buf = [0u8; 64];
+        let n = task
+            .do_recvfrom(
+                sock2,
+                MutPtr::from_usize(buf.as_mut_ptr() as usize),
+                buf.len(),
+                ReceiveFlags::empty(),
+                None,
+            )
+            .expect("recvfrom failed");
+        assert_eq!(&buf[..n], msg1.as_bytes());
+
+        // Receive on sock1 (from sock2)
+        let n = task
+            .do_recvfrom(
+                sock1,
+                MutPtr::from_usize(buf.as_mut_ptr() as usize),
+                buf.len(),
+                ReceiveFlags::empty(),
+                None,
+            )
+            .expect("recvfrom failed");
+        assert_eq!(&buf[..n], msg2.as_bytes());
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
     }
 }
