@@ -213,6 +213,41 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         });
 
+        // When using the rewriter backend, automatically include litebox_rtld_audit.so
+        // in the filesystem so tests and users don't need to include it in tar files
+        match cli_args.interception_backend {
+            InterceptionBackend::Rewriter => {
+                #[cfg(not(target_arch = "x86_64"))]
+                eprintln!("WARN: litebox_rtld_audit not currently supported on non-x86_64 arch");
+                #[cfg(target_arch = "x86_64")]
+                in_mem.with_root_privileges(|fs| {
+                    let rwxr_xr_x = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+                    let _ = fs.mkdir("/lib", rwxr_xr_x);
+                    let fd = fs
+                        .open(
+                            "/lib/litebox_rtld_audit.so",
+                            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                            rwxr_xr_x,
+                        )
+                        .expect("Failed to create /lib/litebox_rtld_audit.so");
+                    let mut data =
+                        include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so"))
+                            .as_slice();
+                    while !data.is_empty() {
+                        let len = fs
+                            .write(&fd, data, None)
+                            .expect("Failed to write to /lib/litebox_rtld_audit.so");
+                        data = &data[len..];
+                    }
+                    fs.close(&fd)
+                        .expect("Failed to close /lib/litebox_rtld_audit.so");
+                });
+            }
+            InterceptionBackend::Seccomp => {
+                // No need to include rtld_audit.so for seccomp backend
+            }
+        }
+
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
         shim_builder.default_fs(in_mem, tar_ro)
     };

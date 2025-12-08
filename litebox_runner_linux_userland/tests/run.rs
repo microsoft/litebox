@@ -75,22 +75,6 @@ impl Runner {
             }
         }
 
-        // litebox_rtld_audit.so is already built by build.rs and available in OUT_DIR
-        if let Backend::Rewriter = backend
-            && !libs.is_empty()
-        {
-            println!(
-                "Copying {} to {}",
-                dir_path.join("litebox_rtld_audit.so").to_str().unwrap(),
-                tar_dir.join("lib/litebox_rtld_audit.so").to_str().unwrap()
-            );
-            std::fs::copy(
-                dir_path.join("litebox_rtld_audit.so"),
-                tar_dir.join("lib/litebox_rtld_audit.so"),
-            )
-            .unwrap();
-        }
-
         // Get the path to the litebox_runner_linux_userland binary
         let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
             .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
