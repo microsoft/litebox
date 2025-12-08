@@ -36,7 +36,6 @@ pub struct PerCpuVariables {
     hvcall_input: [u8; PAGE_SIZE],
     hvcall_output: [u8; PAGE_SIZE],
     pub vtl0_state: VtlState,
-    pub vtl1_state: VtlState,
     pub vtl0_locked_regs: ControlRegMap,
     pub gdt: Option<&'static gdt::GdtWrapper>,
     vtl0_xsave_area_addr: VirtAddr,
@@ -53,7 +52,7 @@ impl PerCpuVariables {
     // XSAVE area size for VTL1: 512 bytes (legacy x87+SSE area) + 64 bytes (XSAVE header)
     const VTL1_XSAVE_AREA_SIZE: usize = 512 + 64;
 
-    pub fn kernel_stack_top(&self) -> u64 {
+    pub(crate) fn kernel_stack_top(&self) -> u64 {
         &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
     }
 
@@ -236,25 +235,6 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     hvcall_output: [0u8; PAGE_SIZE],
     vtl0_state: VtlState {
         rbp: 0,
-        cr2: 0,
-        rax: 0,
-        rbx: 0,
-        rcx: 0,
-        rdx: 0,
-        rsi: 0,
-        rdi: 0,
-        r8: 0,
-        r9: 0,
-        r10: 0,
-        r11: 0,
-        r12: 0,
-        r13: 0,
-        r14: 0,
-        r15: 0,
-    },
-    vtl1_state: VtlState {
-        rbp: 0,
-        cr2: 0,
         rax: 0,
         rbx: 0,
         rcx: 0,
@@ -282,28 +262,84 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     tls: VirtAddr::zero(),
 };
 
-/// Specify the layout of Kernel TLS area.
+/// Specify the layout of PerCpuVariables for Assembly area.
+///
+/// Unlike userland platforms, this kernel platform does't rely on the `tbss` section
+/// to specify Kernel TLS because there is no ELF loader that will set up TLS for it.
+///
+/// Note that kernel & host and user & guest are interchangeable in this context.
+/// We use "kernel" and "user" here to emphasize that there must be hardware-enforced
+/// mode transitions (i.e., ring transitions through iretq/syscall) unlike userland
+/// platforms.
+///
+/// TODO: Consider unifying with `PerCpuVariables` if possible.
 #[non_exhaustive]
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone)]
-pub struct KernelTls {
-    pub kernel_stack_ptr: Cell<usize>,    // gs:[0x0]
-    pub interrupt_stack_ptr: Cell<usize>, // gs:[0x8]
-    pub vtl_return_addr: Cell<usize>,     // gs:[0x10]
+pub struct PerCpuVariablesAsm {
+    /// Initial kernel stack pointer to reset the kernel stack on VTL switch
+    kernel_stack_ptr: Cell<usize>, // gs:[0x0]
+    /// Initial interrupt stack pointer for x86 IST
+    interrupt_stack_ptr: Cell<usize>, // gs:[0x8]
+    /// Return address for call-based VTL switching
+    vtl_return_addr: Cell<usize>, // gs:[0x10]
+    /// Scratch pad
+    scratch: Cell<usize>, // gs:[0x18]
+    /// Top address of VTL0 VTLState
+    vtl0_state_top_addr: Cell<usize>, // gs:[0x20]
+    /// Current kernel stack pointer
+    cur_kernel_stack_ptr: Cell<usize>, // gs:[0x28]
+    /// Current kernel base pointer
+    cur_kernel_base_ptr: Cell<usize>, // gs:[0x30]
+    /// Top address of the user context area
+    user_context_top_addr: Cell<usize>, // gs:[0x38]
 }
 
-/// Kernel TLS offsets. Difference between the GS value and an offset is used to access
-/// the corresponding variable.
-#[non_exhaustive]
-#[repr(usize)]
-pub enum KernelTlsOffset {
-    KernelStackPtr = offset_of!(KernelTls, kernel_stack_ptr),
-    InterruptStackPtr = offset_of!(KernelTls, interrupt_stack_ptr),
-    VtlReturnAddr = offset_of!(KernelTls, vtl_return_addr),
+impl PerCpuVariablesAsm {
+    pub fn set_kernel_stack_ptr(&self, sp: usize) {
+        self.kernel_stack_ptr.set(sp);
+    }
+    pub fn set_interrupt_stack_ptr(&self, sp: usize) {
+        self.interrupt_stack_ptr.set(sp);
+    }
+    pub fn get_interrupt_stack_ptr(&self) -> usize {
+        self.interrupt_stack_ptr.get()
+    }
+    pub fn set_vtl_return_addr(&self, addr: usize) {
+        self.vtl_return_addr.set(addr);
+    }
+    pub fn set_vtl0_state_top_addr(&self, addr: usize) {
+        self.vtl0_state_top_addr.set(addr);
+    }
+    pub const fn kernel_stack_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, kernel_stack_ptr)
+    }
+    pub const fn interrupt_stack_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, interrupt_stack_ptr)
+    }
+    pub const fn vtl_return_addr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, vtl_return_addr)
+    }
+    pub const fn scratch_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, scratch)
+    }
+    pub const fn vtl0_state_top_addr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, vtl0_state_top_addr)
+    }
+    pub const fn cur_kernel_stack_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, cur_kernel_stack_ptr)
+    }
+    pub const fn cur_kernel_base_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, cur_kernel_base_ptr)
+    }
+    pub const fn user_context_top_addr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, user_context_top_addr)
+    }
 }
 
-/// Wrapper struct to maintain `RefCell` along with `KernelTls`.
-/// This struct allows assembly code to read/write some TLS area via the GS register (e.g., to
+/// Wrapper struct to maintain `RefCell` along with `PerCpuVariablesAsm`.
+/// This struct allows assembly code to read/write some PerCpuVariables area via the GS register (e.g., to
 /// save/restore RIP/RSP). Currently, `PerCpuVariables` is protected by `RefCell` such that
 /// assembly code cannot easily access it.
 /// TODO: Let's consider whether we should maintain these two types of TLS areas (for Rust and
@@ -312,18 +348,23 @@ pub enum KernelTlsOffset {
 /// this might be unsafe.
 #[repr(C)]
 pub struct RefCellWrapper<T> {
-    /// Make some TLS area be accessible via the GS register. This is mainly for assembly code
-    ktls: KernelTls,
+    /// Make some PerCpuVariablesAsm area be accessible via the GS register. This is mainly for assembly code
+    pcv_asm: PerCpuVariablesAsm,
     /// RefCell which will be stored in the GS register
     inner: RefCell<T>,
 }
 impl<T> RefCellWrapper<T> {
     pub const fn new(value: T) -> Self {
         RefCellWrapper {
-            ktls: KernelTls {
+            pcv_asm: PerCpuVariablesAsm {
                 kernel_stack_ptr: Cell::new(0),
                 interrupt_stack_ptr: Cell::new(0),
                 vtl_return_addr: Cell::new(0),
+                scratch: Cell::new(0),
+                vtl0_state_top_addr: Cell::new(0),
+                cur_kernel_stack_ptr: Cell::new(0),
+                cur_kernel_base_ptr: Cell::new(0),
+                user_context_top_addr: Cell::new(0),
             },
             inner: RefCell::new(value),
         }
@@ -392,46 +433,46 @@ where
     f(per_cpu_variables)
 }
 
-/// Execute a closure with a reference to the current kernel TLS.
+/// Execute a closure with a reference to the current PerCpuVariablesAsm.
 ///
 /// # Panics
 /// Panics if GSBASE is not set or it contains a non-canonical address.
-pub fn with_kernel_tls<F, R>(f: F) -> R
+pub fn with_per_cpu_variables_asm<F, R>(f: F) -> R
 where
-    F: FnOnce(&KernelTls) -> R,
+    F: FnOnce(&PerCpuVariablesAsm) -> R,
     R: Sized + 'static,
 {
-    let ktls_addr = unsafe {
+    let pcv_asm_addr = unsafe {
         let gsbase = rdgsbase();
         let addr = VirtAddr::try_new(u64::try_from(gsbase).unwrap())
             .expect("GS contains a non-canonical address");
         addr.as_ptr::<RefCellWrapper<*mut PerCpuVariables>>()
-            .cast::<KernelTls>()
+            .cast::<PerCpuVariablesAsm>()
     };
-    let ktls = unsafe { &*ktls_addr };
+    let pcv_asm = unsafe { &*pcv_asm_addr };
 
-    f(ktls)
+    f(pcv_asm)
 }
 
-/// Execute a closure with a mutable reference to the current kernel TLS.
+/// Execute a closure with a mutable reference to the current PerCpuVariablesAsm.
 ///
 /// # Panics
 /// Panics if GSBASE is not set or it contains a non-canonical address.
-pub fn with_kernel_tls_mut<F, R>(f: F) -> R
+pub fn with_per_cpu_variables_asm_mut<F, R>(f: F) -> R
 where
-    F: FnOnce(&mut KernelTls) -> R,
+    F: FnOnce(&mut PerCpuVariablesAsm) -> R,
     R: Sized + 'static,
 {
-    let ktls_addr: *mut KernelTls = unsafe {
+    let pcv_asm_addr: *mut PerCpuVariablesAsm = unsafe {
         let gsbase = rdgsbase();
         let addr = VirtAddr::try_new(u64::try_from(gsbase).unwrap())
             .expect("GS contains a non-canonical address");
         addr.as_mut_ptr::<RefCellWrapper<*mut PerCpuVariables>>()
-            .cast::<KernelTls>()
+            .cast::<PerCpuVariablesAsm>()
     };
-    let ktls = unsafe { &mut *ktls_addr };
+    let pcv_asm = unsafe { &mut *pcv_asm_addr };
 
-    f(ktls)
+    f(pcv_asm)
 }
 
 /// Get or initialize a `RefCell` that contains a pointer to the current core's per-CPU variables.
@@ -514,6 +555,32 @@ pub fn allocate_per_cpu_variables() {
             PER_CPU_VARIABLE_ADDRESSES[i] = RefCellWrapper::new(Box::into_raw(per_cpu_variables));
         }
     }
+}
+
+/// Initialize PerCpuVariable and PerCpuVariableAsm for the current core.
+///
+/// Currently, it initializes the kernel and interrupt stack pointers in the PerCpuVariablesAsm area.
+///
+/// # Panics
+/// Panics if the per-CPU variables are not properly initialized.
+pub fn init_per_cpu_variables() {
+    const STACK_ALIGNMENT: usize = 16;
+    with_per_cpu_variables_mut(|per_cpu_variables| {
+        let kernel_sp =
+            usize::try_from(per_cpu_variables.kernel_stack_top()).unwrap() & !(STACK_ALIGNMENT - 1);
+        let interrupt_sp = usize::try_from(per_cpu_variables.interrupt_stack_top()).unwrap()
+            & !(STACK_ALIGNMENT - 1);
+        let vtl0_state_top_addr = usize::try_from(
+            &raw const per_cpu_variables.vtl0_state as u64
+                + core::mem::size_of::<VtlState>() as u64,
+        )
+        .unwrap();
+        with_per_cpu_variables_asm_mut(|pcv_asm| {
+            pcv_asm.set_kernel_stack_ptr(kernel_sp);
+            pcv_asm.set_interrupt_stack_ptr(interrupt_sp);
+            pcv_asm.set_vtl0_state_top_addr(vtl0_state_top_addr);
+        });
+    });
 }
 
 /// Get the XSAVE area size for VTL0 based on enabled features in XCR0
