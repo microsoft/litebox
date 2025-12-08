@@ -85,6 +85,7 @@ impl UnixSocketAddr {
                 } else {
                     OFlags::RDWR
                 };
+                // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
                 let file = task.global.fs.open(
                     path.as_str(),
                     flags,
@@ -156,21 +157,15 @@ impl UnixInitStream {
         Self { addr: None }
     }
 
-    /// Attempts to bind to an unnamed address (only succeeds if already bound).
-    fn bind_unnamed(&self, addr: UnixSocketAddr) -> Result<(), Errno> {
-        if !addr.is_unnamed() {
-            return Err(Errno::EINVAL);
-        }
-        Ok(())
-    }
-
     /// Binds this socket to the given address.
     fn bind(&mut self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
-        if self.addr.is_some() {
-            return self.bind_unnamed(addr);
+        if self.addr.is_some() && !addr.is_unnamed() {
+            return Err(Errno::EINVAL);
         }
-        let bound_addr = addr.bind(task, true)?;
-        self.addr = Some(bound_addr);
+        if self.addr.is_none() {
+            let bound_addr = addr.bind(task, true)?;
+            self.addr = Some(bound_addr);
+        }
         Ok(())
     }
 
