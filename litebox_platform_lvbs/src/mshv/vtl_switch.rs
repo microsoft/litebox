@@ -4,15 +4,15 @@ use crate::{
     host::{
         hv_hypercall_page_address,
         per_cpu_variables::{
-            KernelTlsOffset, with_kernel_tls_mut, with_per_cpu_variables,
+            KernelTlsOffset, PerCpuVariables, with_kernel_tls_mut, with_per_cpu_variables,
             with_per_cpu_variables_mut,
         },
     },
     mshv::{
-        HV_REGISTER_VSM_CODEPAGE_OFFSETS, HV_VTL_NORMAL, HV_VTL_SECURE,
-        HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
-        VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, hvcall_vp::hvcall_get_vp_registers,
-        vsm::vsm_dispatch, vsm_intercept::vsm_handle_intercept, vsm_optee_smc,
+        HV_REGISTER_VSM_CODEPAGE_OFFSETS, HV_VTL_NORMAL, HvRegisterVsmCodePageOffsets,
+        NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
+        VsmFunction, hvcall_vp::hvcall_get_vp_registers, vsm::vsm_dispatch,
+        vsm_intercept::vsm_handle_intercept, vsm_optee_smc,
     },
 };
 use core::arch::{asm, naked_asm};
@@ -45,7 +45,6 @@ pub fn vtl_return() {
 #[repr(C)]
 pub struct VtlState {
     pub rbp: u64,
-    pub cr2: u64,
     pub rax: u64,
     pub rbx: u64,
     pub rcx: u64,
@@ -60,7 +59,9 @@ pub struct VtlState {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
+    // CR2
     // DR[0-6]
+    // We use a separeate buffer to save/register extended states
     // X87, XMM, AVX, XCR
 }
 
@@ -80,237 +81,182 @@ impl VtlState {
     }
 }
 
-fn save_vtl_state_to_per_cpu_variables(vtl: u8, vtl_state: *const VtlState) {
-    with_per_cpu_variables_mut(|per_cpu_variables| match vtl {
-        HV_VTL_NORMAL => per_cpu_variables
-            .vtl0_state
-            .clone_from(unsafe { &*vtl_state }),
-        HV_VTL_SECURE => per_cpu_variables
-            .vtl1_state
-            .clone_from(unsafe { &*vtl_state }),
-        _ => panic!("Invalid VTL number: {}", vtl),
-    });
-}
-
-// Save CPU registers to a global data structure through using a stack
-#[unsafe(naked)]
-unsafe extern "C" fn save_vtl0_state() {
-    naked_asm!(
-        "push r15",
-        "push r14",
-        "push r13",
-        "push r12",
-        "push r11",
-        "push r10",
-        "push r9",
-        "push r8",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push rbx",
-        "push rax",
-        "mov rax, cr2",
-        "push rax",
-        "push rbp",
-        "mov rbp, rsp",
-        "mov edi, {vtl}",
-        "mov rsi, rsp",
-        "and rsp, {stack_alignment}",
-        "call {save_vtl_state_to_per_cpu_variables}",
-        "mov rsp, rbp",
-        "add rsp, {register_space}",
-        "ret",
-        vtl = const HV_VTL_NORMAL,
-        stack_alignment = const STACK_ALIGNMENT,
-        save_vtl_state_to_per_cpu_variables = sym save_vtl_state_to_per_cpu_variables,
-        register_space = const core::mem::size_of::<VtlState>(),
-    );
-}
-const STACK_ALIGNMENT: isize = -16;
-
-#[unsafe(naked)]
-unsafe extern "C" fn save_vtl1_state() {
-    naked_asm!(
-        "push r15",
-        "push r14",
-        "push r13",
-        "push r12",
-        "push r11",
-        "push r10",
-        "push r9",
-        "push r8",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push rbx",
-        "push rax",
-        "mov rax, cr2",
-        "push rax",
-        "push rbp",
-        "mov rbp, rsp",
-        "mov edi, {vtl}",
-        "mov rsi, rsp",
-        "and rsp, {stack_alignment}",
-        "call {save_vtl_state_to_per_cpu_variables}",
-        "mov rsp, rbp",
-        "add rsp, {register_space}",
-        "ret",
-        vtl = const HV_VTL_SECURE,
-        stack_alignment = const STACK_ALIGNMENT,
-        save_vtl_state_to_per_cpu_variables = sym save_vtl_state_to_per_cpu_variables,
-        register_space = const core::mem::size_of::<VtlState>(),
-    );
-}
-
-fn load_vtl_state_from_per_cpu_variables(vtl: u8, vtl_state: *mut VtlState) {
-    with_per_cpu_variables_mut(|per_cpu_variables| match vtl {
-        HV_VTL_NORMAL => unsafe { vtl_state.copy_from(&raw const per_cpu_variables.vtl0_state, 1) },
-        HV_VTL_SECURE => unsafe { vtl_state.copy_from(&raw const per_cpu_variables.vtl1_state, 1) },
-        _ => panic!("Invalid VTL number: {}", vtl),
-    });
-}
-
-// Restore CPU registers from the global data structure through using a stack.
-#[unsafe(naked)]
-unsafe extern "C" fn load_vtl_state(vtl: u8) {
-    naked_asm!(
-        "sub rsp, {register_space}",
-        "mov rbp, rsp",
-        // rdi holds the VTL number
-        "mov rsi, rsp",
-        "and rsp, {stack_alignment}",
-        "call {load_vtl_state_from_per_cpu_variables}",
-        "mov rsp, rbp",
-        "pop rbp",
-        "pop rax",
-        "mov cr2, rax",
-        "pop rax",
-        "pop rbx",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "pop r8",
-        "pop r9",
-        "pop r10",
-        "pop r11",
-        "pop r12",
-        "pop r13",
-        "pop r14",
-        "pop r15",
-        "ret",
-        register_space = const core::mem::size_of::<VtlState>(),
-        stack_alignment = const STACK_ALIGNMENT,
-        load_vtl_state_from_per_cpu_variables = sym load_vtl_state_from_per_cpu_variables,
-    );
-}
-
 pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
     if let Some(platform) = platform {
         crate::set_platform_low(platform);
     }
-
-    unsafe {
-        save_vtl0_state();
-    }
-    // This is a dummy call to satisfy load_vtl0_state() with reasonable register values.
-    // We do not save VTL0 registers during VTL1 initialization.
-
-    jump_to_vtl_switch_loop_with_stack_cleanup();
+    vtl_switch_loop()
 }
 
-/// This function lets VTL1 return to VTL0. Before returning to VTL0, it re-initializes
-/// the VTL1 kernel stack to discard any leftovers (e.g., unwind, panic, ...).
-#[allow(clippy::inline_always)]
-#[inline(always)]
-fn jump_to_vtl_switch_loop_with_stack_cleanup() -> ! {
-    with_per_cpu_variables_mut(|per_cpu_variables| {
-        per_cpu_variables.restore_extended_states(HV_VTL_NORMAL);
-    });
-
-    let stack_top =
-        with_per_cpu_variables(crate::host::per_cpu_variables::PerCpuVariables::kernel_stack_top);
+fn vtl_switch_loop() -> ! {
+    let stack_top = with_per_cpu_variables(PerCpuVariables::kernel_stack_top);
+    let stack_top = stack_top & !0xf; // align to 16 bytes
     unsafe {
         asm!(
-            "mov rsp, rax",
-            "and rsp, {stack_alignment}",
-            "call {loop}",
-            in("rax") stack_top, loop = sym vtl_switch_loop,
-            stack_alignment = const STACK_ALIGNMENT,
-            options(noreturn)
+            "mov gs:[-{kernel_sp_off}], {stack_top}",
+            "jmp {vtl_switch_loop_asm}",
+            stack_top = in(reg) stack_top,
+            kernel_sp_off = const {KernelTlsOffset::KernelStackPtr as usize},
+            vtl_switch_loop_asm = sym vtl_switch_loop_asm,
+            options(noreturn, nostack, preserves_flags),
         );
     }
 }
 
-/// expose `vtl_switch_loop` to the outside (e.g., the syscall handler)
-#[unsafe(naked)]
-pub(crate) unsafe extern "C" fn jump_to_vtl_switch_loop() -> ! {
-    naked_asm!(
-        "call {loop}",
-        loop = sym vtl_switch_loop,
-    );
+macro_rules! VTL_RETURN_ASM {
+    () => {
+        "
+        xor ecx, ecx
+        mov rax, gs:[{vtl_ret_addr_off}]
+        call rax
+        "
+    };
 }
 
-/// VTL switch loop
-///
-/// # Panics
-/// Panic if it encounters an unknown VTL entry reason.
-fn vtl_switch_loop() -> ! {
-    loop {
-        unsafe {
-            save_vtl1_state();
-            load_vtl_state(HV_VTL_NORMAL);
-        }
+macro_rules! SAVE_VTL0_STATE_ASM {
+    () => {
+        "
+        mov gs:[{scratch_off}], rsp
+        push r15
+        push r14
+        push r13
+        push r12
+        push r11
+        push r10
+        push r9
+        push r8
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push rbx
+        push rax
+        push rbp /*  15 * 8 = 120. 120 % 16 == 8 */
+        lea rdi, [rsp]
+        push rbp /* alignment */
+        call {save_vtl0_state}
+        mov rsp, gs:[{scratch_off}]
+        "
+    };
+}
 
-        vtl_return();
-        // VTL calls and intercepts (i.e., returns from synthetic interrupt handlers) land here.
+macro_rules! LOAD_VTL0_STATE_ASM {
+    () => {
+        "
+        mov gs:[{scratch_off}], rsp
+        sub rsp, {vtl_state_size} /* 15 * 8 = 120. 120 % 16 == 8 */
+        lea rdi, [rsp]
+        push rbp /* alignment */
+        call {load_vtl0_state}
+        mov rsp, gs:[{scratch_off}] /* anchor */
+        sub rsp, {vtl_state_size}
+        pop rbp
+        pop rax
+        pop rbx
+        pop rcx
+        pop rdx
+        pop rsi
+        pop rdi
+        pop r8
+        pop r9
+        pop r10
+        pop r11
+        pop r12
+        pop r13
+        pop r14
+        pop r15
+        mov rsp, gs:[{scratch_off}]
+        "
+    };
+}
 
-        unsafe {
-            save_vtl0_state();
-            load_vtl_state(HV_VTL_SECURE);
-        }
-
-        // Since we do not know whether the VTL0 kernel saves its extended states (e.g., if a VTL switch
-        // is due to memory or register access violation, the VTL0 kernel might not have saved
-        // its states), we conservatively save and restore its extended states on every VTL switch.
-        with_per_cpu_variables_mut(|per_cpu_variables| {
-            per_cpu_variables.save_extended_states(HV_VTL_NORMAL);
-        });
-
-        let reason = with_per_cpu_variables(|per_cpu_variables| unsafe {
-            (*per_cpu_variables.hv_vp_assist_page_as_ptr()).vtl_entry_reason
-        });
-        match VtlEntryReason::try_from(reason).unwrap_or(VtlEntryReason::Unknown) {
-            #[allow(clippy::cast_sign_loss)]
-            VtlEntryReason::VtlCall => {
-                let params = with_per_cpu_variables(|per_cpu_variables| {
-                    per_cpu_variables.vtl0_state.get_vtlcall_params()
-                });
-                if VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
-                    .unwrap_or(VsmFunction::Unknown)
-                    == VsmFunction::Unknown
-                {
-                    todo!("unknown function ID = {:#x}", params[0]);
-                } else {
-                    let result = vtlcall_dispatch(&params);
-                    with_per_cpu_variables_mut(|per_cpu_variables| {
-                        per_cpu_variables.set_vtl_return_value(result as u64);
-                    });
-                    jump_to_vtl_switch_loop_with_stack_cleanup();
-                }
-            }
-            VtlEntryReason::Interrupt => {
-                vsm_handle_intercept();
-                jump_to_vtl_switch_loop_with_stack_cleanup();
-            }
-            VtlEntryReason::Unknown => {
-                panic!("Unknown VTL entry reason");
-            }
-        }
-        // do not put any code which might corrupt registers
+unsafe extern "C" fn save_vtl0_state(vtl_state: *const VtlState) {
+    let addr = with_per_cpu_variables(|per_cpu_variables| &raw const per_cpu_variables.vtl0_state);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            vtl_state as *const u8,
+            addr as *const u8 as *mut u8,
+            size_of::<VtlState>(),
+        );
     }
+}
+
+unsafe extern "C" fn load_vtl0_state(vtl_state: *mut VtlState) {
+    let addr = with_per_cpu_variables(|pcv| &raw const pcv.vtl0_state);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            addr as *const u8 as *mut u8,
+            vtl_state as *const u8 as *mut u8,
+            size_of::<VtlState>(),
+        );
+    }
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
+    naked_asm!(
+        "1:",
+        "mov rsp, gs:[{kernel_sp_off}]", // reset kernel stack pointer. VTL1's entry point should be stateless.
+        VTL_RETURN_ASM!(),
+        // *** VTL1 resumes here regardless of the reason (VTL switch or intercept) ***
+        SAVE_VTL0_STATE_ASM!(),
+        "call {loop_body}",
+        LOAD_VTL0_STATE_ASM!(),
+        "jmp 1b",
+        kernel_sp_off = const { KernelTlsOffset::KernelStackPtr as usize },
+        vtl_ret_addr_off = const { KernelTlsOffset::VtlReturnAddr as usize },
+        scratch_off = const { KernelTlsOffset::Scratch as usize },
+        save_vtl0_state = sym save_vtl0_state,
+        load_vtl0_state = sym load_vtl0_state,
+        vtl_state_size = const core::mem::size_of::<VtlState>(),
+        loop_body = sym vtl_switch_loop_body,
+    )
+}
+
+unsafe extern "C" fn vtl_switch_loop_body() {
+    // TODO: We must save/restore VTL1's state when there is RPC from VTL1 to VTL0 (e.g., dynamically
+    // loading OP-TEE TAs). This should use global data structures since the core which makes the RPC
+    // can be different from the core where the VTL1 is running.
+    // TODO: Even if we don't have RPC from VTL1 to VTL0, we may still need to save VTL1's state for
+    // debugging purposes.
+
+    // Since we do not know whether the VTL0 kernel saves its extended states (e.g., if a VTL switch
+    // is due to memory or register access violation, the VTL0 kernel might not have saved
+    // its states), we conservatively save and restore its extended states on every VTL switch.
+    with_per_cpu_variables_mut(|per_cpu_variables| {
+        per_cpu_variables.save_extended_states(HV_VTL_NORMAL);
+    });
+
+    let reason = with_per_cpu_variables(|per_cpu_variables| unsafe {
+        (*per_cpu_variables.hv_vp_assist_page_as_ptr()).vtl_entry_reason
+    });
+    match VtlEntryReason::try_from(reason).unwrap_or(VtlEntryReason::Unknown) {
+        #[allow(clippy::cast_sign_loss)]
+        VtlEntryReason::VtlCall => {
+            let params = with_per_cpu_variables(|per_cpu_variables| {
+                per_cpu_variables.vtl0_state.get_vtlcall_params()
+            });
+            if VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
+                .unwrap_or(VsmFunction::Unknown)
+                == VsmFunction::Unknown
+            {
+                todo!("unknown function ID = {:#x}", params[0]);
+            } else {
+                let result = vtlcall_dispatch(&params);
+                with_per_cpu_variables_mut(|per_cpu_variables| {
+                    per_cpu_variables.set_vtl_return_value(result as u64);
+                });
+            }
+        }
+        VtlEntryReason::Interrupt => {
+            vsm_handle_intercept();
+        }
+        VtlEntryReason::Unknown => {}
+    }
+
+    with_per_cpu_variables(|per_cpu_variables| {
+        per_cpu_variables.restore_extended_states(HV_VTL_NORMAL);
+    });
 }
 
 fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {

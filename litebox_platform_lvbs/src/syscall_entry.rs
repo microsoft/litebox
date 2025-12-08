@@ -1,7 +1,6 @@
 use crate::debug_serial_println;
 use crate::{
     host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
-    mshv::vtl_switch::jump_to_vtl_switch_loop,
     user_context::UserSpaceManagement,
 };
 use core::arch::{asm, naked_asm};
@@ -188,7 +187,7 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
     }
 
     crate::platform_low().page_table.change_address_space();
-    unsafe { jump_to_vtl_switch_loop() }
+    // TODO: modernize syscall handler's return path.
     unreachable!()
 }
 

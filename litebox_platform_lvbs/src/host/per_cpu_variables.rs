@@ -167,7 +167,6 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     hvcall_output: [0u8; PAGE_SIZE],
     vtl0_state: VtlState {
         rbp: 0,
-        cr2: 0,
         rax: 0,
         rbx: 0,
         rcx: 0,
@@ -185,7 +184,6 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     },
     vtl1_state: VtlState {
         rbp: 0,
-        cr2: 0,
         rax: 0,
         rbx: 0,
         rcx: 0,
@@ -218,6 +216,7 @@ pub struct KernelTls {
     pub kernel_stack_ptr: Cell<usize>,    // gs:[0x0]
     pub interrupt_stack_ptr: Cell<usize>, // gs:[0x8]
     pub vtl_return_addr: Cell<usize>,     // gs:[0x10]
+    pub scratch: Cell<usize>,             // gs:[0x18]
 }
 
 /// Kernel TLS offsets. Difference between the GS value and an offset is used to access
@@ -228,6 +227,7 @@ pub enum KernelTlsOffset {
     KernelStackPtr = offset_of!(KernelTls, kernel_stack_ptr),
     InterruptStackPtr = offset_of!(KernelTls, interrupt_stack_ptr),
     VtlReturnAddr = offset_of!(KernelTls, vtl_return_addr),
+    Scratch = offset_of!(KernelTls, scratch),
 }
 
 /// Wrapper struct to maintain `RefCell` along with `KernelTls`.
@@ -252,6 +252,7 @@ impl<T> RefCellWrapper<T> {
                 kernel_stack_ptr: Cell::new(0),
                 interrupt_stack_ptr: Cell::new(0),
                 vtl_return_addr: Cell::new(0),
+                scratch: Cell::new(0),
             },
             inner: RefCell::new(value),
         }
