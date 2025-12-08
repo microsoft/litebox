@@ -5,10 +5,10 @@ use crate::mshv::mem_integrity::parse_modinfo;
 use crate::{
     arch::get_core_id,
     debug_serial_print, debug_serial_println,
-    host::per_cpu_variables::with_per_cpu_variables_mut,
     host::{
         bootparam::get_vtl1_memory_info,
         linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
+        per_cpu_variables::with_per_cpu_variables_mut,
     },
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
@@ -36,8 +36,7 @@ use crate::{
     },
     serial_println,
 };
-use aligned_vec::avec;
-use alloc::{boxed::Box, collections::BTreeMap, ffi::CString, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};
 use core::{
     mem,
     ops::Range,
@@ -55,12 +54,6 @@ use x509_cert::{Certificate, der::Decode};
 #[derive(Copy, Clone)]
 #[repr(align(4096))]
 struct AlignedPage([u8; PAGE_SIZE]);
-
-impl AlignedPage {
-    pub fn new() -> Self {
-        AlignedPage([0; PAGE_SIZE])
-    }
-}
 
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
@@ -375,69 +368,54 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
     let mut kinfo_mem = MemoryContainer::new();
     let mut kdata_mem = MemoryContainer::new();
 
-    if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
-        for heki_page in heki_pages {
-            for heki_range in &heki_page {
-                let va = heki_range.va;
-                let pa = heki_range.pa;
-                let epa = heki_range.epa;
-                // TODO: load kernel data (e.g., into `BTreeMap` or other data structures) once we implement data consumers like `mshv_vsm_validate_guest_module`.
-                // for now, this function is a no-op and just prints the memory range we should load.
-                debug_serial_println!(
-                    "VSM: Load kernel data: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
-                    va,
-                    pa,
-                    epa,
-                    heki_range.heki_kdata_type(),
-                    epa - pa
-                );
-
-                match heki_range.heki_kdata_type() {
-                    HekiKdataType::SystemCerts => {
-                        system_certs_mem
-                            .write_bytes_from_heki_range(heki_range)
-                            .map_err(|_| Errno::EINVAL)?;
-                    }
-                    HekiKdataType::KexecTrampoline => {
-                        kexec_trampoline_metadata.insert_heki_range(heki_range);
-                    }
-                    HekiKdataType::PatchInfo => {
-                        patch_info_mem
-                            .write_bytes_from_heki_range(heki_range)
-                            .map_err(|_| Errno::EINVAL)?;
-                    }
-                    HekiKdataType::KernelInfo => {
-                        kinfo_mem
-                            .write_bytes_from_heki_range(heki_range)
-                            .map_err(|_| Errno::EINVAL)?;
-                    }
-                    HekiKdataType::KernelData => {
-                        kdata_mem
-                            .write_bytes_from_heki_range(heki_range)
-                            .map_err(|_| Errno::EINVAL)?;
-                    }
-                    HekiKdataType::Unknown => {
-                        serial_println!("VSM: Invalid kernel data type");
-                        return Err(Errno::EINVAL);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    } else {
+    let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) else {
         return Err(Errno::EINVAL);
+    };
+
+    for heki_page in &heki_pages {
+        for heki_range in heki_page {
+            debug_serial_println!("VSM: Load kernel data {heki_range:?}");
+            let Some(mem) = (match heki_range.heki_kdata_type() {
+                HekiKdataType::SystemCerts => Some(&mut system_certs_mem),
+                HekiKdataType::KexecTrampoline => {
+                    kexec_trampoline_metadata.insert_heki_range(heki_range);
+                    None
+                }
+                HekiKdataType::PatchInfo => Some(&mut patch_info_mem),
+                HekiKdataType::KernelInfo => Some(&mut kinfo_mem),
+                HekiKdataType::KernelData => Some(&mut kdata_mem),
+                HekiKdataType::Unknown => {
+                    serial_println!("VSM: Invalid kernel data type",);
+                    return Err(Errno::EINVAL);
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            mem.extend_range(heki_range);
+        }
     }
+
+    system_certs_mem
+        .write_bytes_from_heki_range()
+        .map_err(|_| Errno::EINVAL)?;
+    patch_info_mem
+        .write_bytes_from_heki_range()
+        .map_err(|_| Errno::EINVAL)?;
+    kinfo_mem
+        .write_bytes_from_heki_range()
+        .map_err(|_| Errno::EINVAL)?;
+    kdata_mem
+        .write_bytes_from_heki_range()
+        .map_err(|_| Errno::EINVAL)?;
 
     if system_certs_mem.is_empty() {
         serial_println!("VSM: No system certificate found");
         return Err(Errno::EINVAL);
     } else {
-        let mut cert_buf = vec![0u8; system_certs_mem.len()];
-        system_certs_mem
-            .read_bytes(system_certs_mem.start().unwrap(), &mut cert_buf)
-            .map_err(|_| Errno::EINVAL)?;
+        let cert_buf = &system_certs_mem[..];
 
-        let certs = parse_certs(&cert_buf);
+        let certs = parse_certs(cert_buf);
 
         if certs.is_empty() {
             serial_println!("VSM: No valid system certificates parsed");
@@ -460,13 +438,10 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
 
     // pre-computed patch data for the kernel text
     if !patch_info_mem.is_empty() {
-        let mut patch_info_buf = vec![0u8; patch_info_mem.len()];
-        patch_info_mem
-            .read_bytes(patch_info_mem.start().unwrap(), &mut patch_info_buf)
-            .map_err(|_| Errno::EINVAL)?;
+        let patch_info_buf = &patch_info_mem[..];
         vtl0_info
             .precomputed_patches
-            .insert_patch_data_from_bytes(&patch_info_buf, None)
+            .insert_patch_data_from_bytes(patch_info_buf, None)
             .map_err(|_| Errno::EINVAL)?;
     }
 
@@ -475,31 +450,22 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    let mut kinfo_buf = avec![[{ core::mem::align_of::<HekiKernelInfo>() }] | 0u8; kinfo_mem.len()];
-    let mut kdata_buf =
-        avec![[{ core::mem::align_of::<HekiKernelSymbol>() }] | 0u8; kdata_mem.len()];
-
-    kinfo_mem
-        .read_bytes(kinfo_mem.start().unwrap(), &mut kinfo_buf)
-        .map_err(|_| Errno::EINVAL)?;
-    let kinfo = HekiKernelInfo::from_bytes(&kinfo_buf)?;
-
-    kdata_mem
-        .read_bytes(kdata_mem.start().unwrap(), &mut kdata_buf)
-        .map_err(|_| Errno::EINVAL)?;
+    let kinfo_buf = &kinfo_mem[..];
+    let kdata_buf = &kdata_mem[..];
+    let kinfo = HekiKernelInfo::from_bytes(kinfo_buf)?;
 
     vtl0_info.gpl_symbols.build_from_container(
         VirtAddr::from_ptr(kinfo.ksymtab_gpl_start),
         VirtAddr::from_ptr(kinfo.ksymtab_gpl_end),
         &kdata_mem,
-        &kdata_buf,
+        kdata_buf,
     )?;
 
     vtl0_info.symbols.build_from_container(
         VirtAddr::from_ptr(kinfo.ksymtab_start),
         VirtAddr::from_ptr(kinfo.ksymtab_end),
         &kdata_mem,
-        &kdata_buf,
+        kdata_buf,
     )?;
 
     Ok(0)
@@ -538,35 +504,58 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     // patch info for the kernel module
     let mut patch_info_for_module = MemoryContainer::new();
 
-    if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
-        prepare_data_for_module_validation(
-            &heki_pages,
-            &mut module_memory_metadata,
-            &mut module_in_memory,
-            &mut module_as_elf,
-            &mut patch_info_for_module,
-        )?;
-    } else {
+    let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) else {
         return Err(Errno::EINVAL);
+    };
+
+    for heki_page in &heki_pages {
+        for heki_range in heki_page {
+            let Some(mem) = (match heki_range.mod_mem_type() {
+                ModMemType::Unknown => {
+                    serial_println!("VSM: Invalid module memory type");
+                    return Err(Errno::EINVAL);
+                }
+                ModMemType::ElfBuffer => Some(&mut module_as_elf),
+                ModMemType::Patch => Some(&mut patch_info_for_module),
+                _ => {
+                    // if input memory range's type is neither `Unknown` nor `ElfBuffer`, its addresses must be page-aligned
+                    if !heki_range.is_aligned(Size4KiB::SIZE) {
+                        serial_println!("VSM: input address must be page-aligned");
+                        return Err(Errno::EINVAL);
+                    }
+                    module_memory_metadata.insert_heki_range(heki_range);
+                    module_in_memory.get_module_memory(heki_range.mod_mem_type())
+                }
+            }) else {
+                continue;
+            };
+            mem.extend_range(heki_range);
+        }
     }
 
-    let elf_size = module_as_elf.len();
+    module_as_elf
+        .write_bytes_from_heki_range()
+        .map_err(|_| Errno::EINVAL)?;
+    patch_info_for_module
+        .write_bytes_from_heki_range()
+        .map_err(|_| Errno::EINVAL)?;
+    module_in_memory
+        .write_bytes_from_heki_range()
+        .map_err(|_| Errno::EINVAL)?;
+
+    let elf_size = (module_as_elf[..]).len();
     assert!(
         elf_size <= MODULE_VALIDATION_MAX_SIZE,
         "Module ELF size exceeds the maximum allowed size"
     );
 
-    let mut original_elf_data = vec![0u8; elf_size];
-    module_as_elf
-        .read_bytes(module_as_elf.start().unwrap(), &mut original_elf_data)
-        .map_err(|_| Errno::EINVAL)?;
-    module_as_elf.clear();
+    let original_elf_data = &module_as_elf[..];
 
     #[cfg(debug_assertions)]
-    parse_modinfo(&original_elf_data).map_err(|_| Errno::EINVAL)?;
+    parse_modinfo(original_elf_data).map_err(|_| Errno::EINVAL)?;
 
     if let Err(result) = verify_kernel_module_signature(
-        &original_elf_data,
+        original_elf_data,
         crate::platform_low()
             .vtl0_kernel_info
             .get_system_certificates()
@@ -576,7 +565,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         return Err(result.into());
     }
 
-    if !validate_kernel_module_against_elf(&module_in_memory, &original_elf_data)
+    if !validate_kernel_module_against_elf(&module_in_memory, original_elf_data)
         .map_err(|_| Errno::EINVAL)?
     {
         serial_println!("VSM: Found unexpected relocations in the loaded module");
@@ -585,14 +574,11 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     // pre-computed patch data for a module
     if !patch_info_for_module.is_empty() {
-        let mut patch_info_buf = vec![0u8; patch_info_for_module.len()];
-        patch_info_for_module
-            .read_bytes(patch_info_for_module.start().unwrap(), &mut patch_info_buf)
-            .map_err(|_| Errno::EINVAL)?;
+        let patch_info_buf = &patch_info_for_module[..];
         crate::platform_low()
             .vtl0_kernel_info
             .precomputed_patches
-            .insert_patch_data_from_bytes(&patch_info_buf, Some(&mut module_memory_metadata))
+            .insert_patch_data_from_bytes(patch_info_buf, Some(&mut module_memory_metadata))
             .map_err(|_| Errno::EINVAL)?;
     }
 
@@ -610,51 +596,6 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         .module_memory_metadata
         .register_module_memory_metadata(module_memory_metadata);
     Ok(token)
-}
-
-/// This function copies data for module validation from VTL0 to VTL1. The physical address ranges of
-/// the VTL0 data are specified in `heki_pages`.
-// TODO: several VSM functions have similar VTL0 page walking and copying code. Combine them to avoid redundancy.
-fn prepare_data_for_module_validation(
-    heki_pages: &Vec<HekiPage>,
-    module_memory_metadata: &mut ModuleMemoryMetadata,
-    module_in_memory: &mut ModuleMemory,
-    module_as_elf: &mut MemoryContainer,
-    patch_info_for_module: &mut MemoryContainer,
-) -> Result<(), Errno> {
-    for heki_page in heki_pages {
-        for heki_range in heki_page {
-            match heki_range.mod_mem_type() {
-                ModMemType::Unknown => {
-                    serial_println!("VSM: Invalid module memory type");
-                    return Err(Errno::EINVAL);
-                }
-                ModMemType::ElfBuffer => {
-                    module_as_elf
-                        .write_bytes_from_heki_range(heki_range)
-                        .map_err(|_| Errno::EINVAL)?;
-                }
-                ModMemType::Patch => {
-                    patch_info_for_module
-                        .write_bytes_from_heki_range(heki_range)
-                        .map_err(|_| Errno::EINVAL)?;
-                }
-                _ => {
-                    // if input memory range's type is neither `Unknown` nor `ElfBuffer`, its addresses must be page-aligned
-                    if !heki_range.is_aligned(Size4KiB::SIZE) {
-                        serial_println!("VSM: input address must be page-aligned");
-                        return Err(Errno::EINVAL);
-                    }
-
-                    module_in_memory
-                        .write_bytes_from_heki_range(heki_range)
-                        .map_err(|_| Errno::EINVAL)?;
-                    module_memory_metadata.insert_heki_range(heki_range);
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// VSM function for supporting the initialization of a guest kernel module including
@@ -793,16 +734,37 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
     let mut kexec_image = MemoryContainer::new();
     let mut kexec_kernel_blob = MemoryContainer::new();
 
-    if let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) {
-        prepare_data_for_kexec_validation(
-            &heki_pages,
-            &mut kexec_memory_metadata,
-            &mut kexec_image,
-            &mut kexec_kernel_blob,
-        )?;
-    } else {
+    let Some(heki_pages) = copy_heki_pages_from_vtl0(pa, nranges) else {
         return Err(Errno::EINVAL);
+    };
+
+    for heki_page in &heki_pages {
+        for heki_range in heki_page {
+            let Some(mem) = (match heki_range.heki_kexec_type() {
+                HekiKexecType::KexecImage => {
+                    kexec_memory_metadata.insert_heki_range(heki_range);
+                    Some(&mut kexec_image)
+                }
+                HekiKexecType::KexecKernelBlob => {
+                    Some(&mut kexec_kernel_blob)
+                    // we do not protect kexec kernel blob memory
+                }
+                HekiKexecType::KexecPages => {
+                    kexec_memory_metadata.insert_heki_range(heki_range);
+                    None
+                }
+                HekiKexecType::Unknown => {
+                    serial_println!("VSM: Invalid kexec type");
+                    return Err(Errno::EINVAL);
+                }
+            }) else {
+                continue;
+            };
+            mem.extend_range(heki_range);
+        }
     }
+    kexec_image.write_bytes_from_heki_range().unwrap();
+    kexec_kernel_blob.write_bytes_from_heki_range().unwrap();
 
     // If this function is called for crash kexec, we protect its kimage segments as well.
     if is_crash {
@@ -813,9 +775,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
                 core::mem::size_of::<Kimage>(),
             )
         };
-        kexec_image
-            .read_bytes(kexec_image.start().unwrap(), kimage_slice)
-            .map_err(|_| Errno::EINVAL)?;
+        kimage_slice.copy_from_slice(&kexec_image[..core::mem::size_of::<Kimage>()]);
         let kimage = unsafe { kimage.assume_init() };
         if kimage.nr_segments > u64::try_from(KEXEC_SEGMENT_MAX).unwrap() {
             serial_println!("VSM: Invalid kexec image segments");
@@ -839,18 +799,10 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
     }
 
     // verify the signature of kexec blob
-    let kexec_kernel_blob_size = kexec_kernel_blob.len();
-    let mut kexec_kernel_blob_data = vec![0u8; kexec_kernel_blob_size];
-    kexec_kernel_blob
-        .read_bytes(
-            kexec_kernel_blob.start().unwrap(),
-            &mut kexec_kernel_blob_data,
-        )
-        .map_err(|_| Errno::EINVAL)?;
-    kexec_kernel_blob.clear();
+    let kexec_kernel_blob_data = &kexec_kernel_blob[..];
 
     if let Err(result) = verify_kernel_pe_signature(
-        &kexec_kernel_blob_data,
+        kexec_kernel_blob_data,
         crate::platform_low()
             .vtl0_kernel_info
             .get_system_certificates()
@@ -870,42 +822,6 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
     kexec_metadata_ref.register_memory(kexec_memory_metadata);
 
     Ok(0)
-}
-
-/// This function copies data for kexec validation from VTL0 to VTL1. The physical address ranges of
-/// the VTL0 data are specified in `heki_pages`.
-fn prepare_data_for_kexec_validation(
-    heki_pages: &Vec<HekiPage>,
-    kexec_memory_metadata: &mut KexecMemoryMetadata,
-    kexec_image: &mut MemoryContainer,
-    kexec_kernel_blob: &mut MemoryContainer,
-) -> Result<(), Errno> {
-    for heki_page in heki_pages {
-        for heki_range in heki_page {
-            match heki_range.heki_kexec_type() {
-                HekiKexecType::KexecImage => {
-                    kexec_image
-                        .write_bytes_from_heki_range(heki_range)
-                        .map_err(|_| Errno::EINVAL)?;
-                    kexec_memory_metadata.insert_heki_range(heki_range);
-                }
-                HekiKexecType::KexecKernelBlob => {
-                    kexec_kernel_blob
-                        .write_bytes_from_heki_range(heki_range)
-                        .map_err(|_| Errno::EINVAL)?;
-                    // we do not protect kexec kernel blob memory
-                }
-                HekiKexecType::KexecPages => {
-                    kexec_memory_metadata.insert_heki_range(heki_range);
-                }
-                HekiKexecType::Unknown => {
-                    serial_println!("VSM: Invalid kexec type");
-                    return Err(Errno::EINVAL);
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// VSM function for patching kernel or module text. VTL0 kernel calls this function to patch certain kernel or module
@@ -1448,45 +1364,22 @@ impl ModuleMemory {
     /// Write physical memory bytes from VTL0 specified in `HekiRange` at the specified virtual address of
     /// a certain memory container based on the memory/section type.
     #[inline]
-    pub(crate) fn write_bytes_from_heki_range(
-        &mut self,
-        &heki_range: &HekiRange,
-    ) -> Result<(), MemoryContainerError> {
-        let va = heki_range.va;
-        let pa = heki_range.pa;
-        let epa = heki_range.epa;
-        self.write_vtl0_phys_bytes_by_type(
-            VirtAddr::new(va),
-            PhysAddr::new(pa),
-            PhysAddr::new(epa),
-            heki_range.mod_mem_type(),
-        )
+    pub(crate) fn write_bytes_from_heki_range(&mut self) -> Result<(), MemoryContainerError> {
+        self.text.write_bytes_from_heki_range()?;
+        self.init_text.write_bytes_from_heki_range()?;
+        self.init_rodata.write_bytes_from_heki_range()?;
+        Ok(())
     }
 
-    /// Write physical memory bytes from VTL0 at the specified virtual address of a certain memory container
-    /// based on the memory/section type.
-    pub(crate) fn write_vtl0_phys_bytes_by_type(
+    pub(crate) fn get_module_memory(
         &mut self,
-        addr: VirtAddr,
-        phys_start: PhysAddr,
-        phys_end: PhysAddr,
         mod_mem_type: ModMemType,
-    ) -> Result<(), MemoryContainerError> {
+    ) -> Option<&mut MemoryContainer> {
         match mod_mem_type {
-            ModMemType::Text => self.text.write_vtl0_phys_bytes(addr, phys_start, phys_end),
-            ModMemType::InitText => self
-                .init_text
-                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
-            ModMemType::InitRoData => self
-                .init_rodata
-                .write_vtl0_phys_bytes(addr, phys_start, phys_end),
-            ModMemType::ElfBuffer
-            | ModMemType::Patch
-            | ModMemType::Data
-            | ModMemType::RoData
-            | ModMemType::RoAfterInit
-            | ModMemType::InitData => Ok(()), // we don't validate other memory types for now
-            ModMemType::Unknown => Err(MemoryContainerError::InvalidType),
+            ModMemType::Text => Some(&mut self.text),
+            ModMemType::InitText => Some(&mut self.init_text),
+            ModMemType::InitRoData => Some(&mut self.init_rodata),
+            _ => None,
         }
     }
 }
@@ -1496,216 +1389,116 @@ impl ModuleMemory {
 /// This structure allows us to handle data copied from VTL0 (e.g., for virtual-address-based page sorting) without
 /// explicit page mappings at VTL1.
 /// This structure is expected to be used locally and temporarily, so we do not protect it with a lock.
+#[derive(Clone, Copy)]
+struct MemoryRange {
+    addr: VirtAddr,
+    phys_addr: PhysAddr,
+    len: u64,
+}
+
 pub struct MemoryContainer {
-    pages: BTreeMap<VirtAddr, Box<AlignedPage>>,
-    range: Range<VirtAddr>,
+    range: Vec<MemoryRange>,
+    buf: Vec<u8>,
 }
 
 impl MemoryContainer {
     pub fn new() -> Self {
         Self {
-            pages: BTreeMap::new(),
-            range: Range {
-                start: VirtAddr::new(0),
-                end: VirtAddr::new(0),
-            },
-        }
-    }
-
-    /// Return the start address if the memory container is not empty, otherwise return `None`.
-    pub fn start(&self) -> Option<VirtAddr> {
-        if self.range.is_empty() {
-            None
-        } else {
-            Some(self.range.start)
+            range: Vec::new(),
+            buf: Vec::new(),
         }
     }
 
     /// Return the byte length of the memory container including all gaps (never-written virtual pages) it contains
     pub fn len(&self) -> usize {
-        if self.range.is_empty() {
-            0
-        } else {
-            usize::try_from(self.range.end - self.range.start).unwrap()
-        }
+        self.buf.len()
     }
 
     /// Check if the memory container is empty
     pub fn is_empty(&self) -> bool {
-        self.range.is_empty()
+        self.len() == 0
     }
 
-    fn extend_range(&mut self, start: VirtAddr, end: VirtAddr) {
-        assert!(start <= end, "Invalid range: start > end");
-        if self.range.is_empty() {
-            self.range.start = start;
-            self.range.end = end;
-        } else {
-            self.range.start = core::cmp::min(self.range.start, start);
-            self.range.end = core::cmp::max(self.range.end, end);
-        }
+    pub fn get_range(&self) -> Option<Range<VirtAddr>> {
+        let start_range = self.range.first()?;
+        let end_range = self.range.last()?;
+        Some(Range {
+            start: start_range.addr,
+            end: end_range.addr + end_range.len,
+        })
     }
 
-    fn get_or_alloc_page(&mut self, addr: VirtAddr) -> &mut Box<AlignedPage> {
-        let page_base = addr.align_down(Size4KiB::SIZE);
-        self.pages
-            .entry(page_base)
-            .or_insert_with(|| Box::new(AlignedPage::new()))
+    pub(crate) fn extend_range(&mut self, heki_range: &HekiRange) {
+        let addr = VirtAddr::try_new(heki_range.va).unwrap();
+        let phys_addr = PhysAddr::try_new(heki_range.pa).unwrap();
+        self.range.push(MemoryRange {
+            addr,
+            phys_addr,
+            len: heki_range.epa - heki_range.pa,
+        });
     }
 
     /// Write physical memory bytes from VTL0 specified in `HekiRange` at the specified virtual address
     #[inline]
-    pub(crate) fn write_bytes_from_heki_range(
-        &mut self,
-        &heki_range: &HekiRange,
-    ) -> Result<(), MemoryContainerError> {
-        let va = heki_range.va;
-        let pa = heki_range.pa;
-        let epa = heki_range.epa;
-        self.write_vtl0_phys_bytes(VirtAddr::new(va), PhysAddr::new(pa), PhysAddr::new(epa))
-    }
-
-    /// Write physical memory bytes from VTL0 at the specified virtual address
-    pub(crate) fn write_vtl0_phys_bytes(
-        &mut self,
-        addr: VirtAddr,
-        phys_start: PhysAddr,
-        phys_end: PhysAddr,
-    ) -> Result<(), MemoryContainerError> {
-        let mut phys_cur = phys_start;
-        if !phys_cur.is_aligned(Size4KiB::SIZE) {
-            let Some(page) = (unsafe {
-                crate::platform_low()
-                    .copy_from_vtl0_phys::<AlignedPage>(phys_cur.align_down(Size4KiB::SIZE))
-            }) else {
-                return Err(MemoryContainerError::CopyFromVtl0Failed);
-            };
-            let page_offset =
-                usize::try_from(phys_cur - phys_cur.align_down(Size4KiB::SIZE)).unwrap();
-            self.write_bytes(addr, &page.0[page_offset..])?;
-            phys_cur += Size4KiB::SIZE - u64::try_from(page_offset).unwrap();
-        }
-        while phys_cur < phys_end {
-            let Some(page) =
-                (unsafe { crate::platform_low().copy_from_vtl0_phys::<AlignedPage>(phys_cur) })
-            else {
-                return Err(MemoryContainerError::CopyFromVtl0Failed);
-            };
-            let to_write = if phys_cur + Size4KiB::SIZE < phys_end {
-                PAGE_SIZE
-            } else {
-                usize::try_from(phys_end - phys_cur).unwrap()
-            };
-            self.write_bytes(addr + (phys_cur - phys_start), &page.0[..to_write])?;
-            phys_cur += u64::try_from(to_write).unwrap();
+    pub(crate) fn write_bytes_from_heki_range(&mut self) -> Result<(), MemoryContainerError> {
+        let mut len = 0;
+        if self.buf.is_empty() {
+            for range in &self.range {
+                len += usize::try_from(range.len).unwrap();
+            }
+            self.buf.reserve_exact(len);
         }
 
-        self.extend_range(addr, addr + (phys_end - phys_start));
+        let range = self.range.clone();
+        for range in range {
+            self.write_vtl0_phys_bytes(range.phys_addr, range.phys_addr + range.len)?;
+        }
         Ok(())
     }
 
-    fn preallocate_pages(&mut self, start: VirtAddr, end: VirtAddr) {
-        let start_page = start.align_down(Size4KiB::SIZE);
-        let end_page = end.align_up(Size4KiB::SIZE);
+    /// Write physical memory bytes from VTL0 at the specified physical address
+    pub(crate) fn write_vtl0_phys_bytes(
+        &mut self,
+        phys_start: PhysAddr,
+        phys_end: PhysAddr,
+    ) -> Result<(), MemoryContainerError> {
+        let mut bytes_to_copy = usize::try_from(phys_end - phys_start).unwrap();
+        let mut phys_cur = phys_start;
 
-        let mut page_addr = start_page;
-        while page_addr < end_page {
-            let _ = self.get_or_alloc_page(page_addr);
-            page_addr += Size4KiB::SIZE;
+        while phys_cur < phys_end {
+            let phys_aligned = phys_cur.align_down(Size4KiB::SIZE);
+            let Some(page) =
+                (unsafe { crate::platform_low().copy_from_vtl0_phys::<AlignedPage>(phys_aligned) })
+            else {
+                return Err(MemoryContainerError::CopyFromVtl0Failed);
+            };
+
+            let src_offset = usize::try_from(phys_cur - phys_aligned).unwrap();
+            let src_len = core::cmp::min(
+                bytes_to_copy,
+                usize::try_from(Size4KiB::SIZE).unwrap() - src_offset,
+            );
+            let src = &page.0[src_offset..src_offset + src_len];
+
+            self.buf.extend_from_slice(src);
+            phys_cur += src_len as u64;
+            bytes_to_copy -= src_len;
         }
+        Ok(())
     }
+}
 
-    /// Writes a slice of bytes to the specified virtual address
-    pub fn write_bytes(&mut self, addr: VirtAddr, data: &[u8]) -> Result<(), MemoryContainerError> {
-        self.preallocate_pages(addr, addr + u64::try_from(data.len()).unwrap());
+impl core::ops::Deref for MemoryContainer {
+    type Target = Vec<u8>;
 
-        let start = addr;
-        let end = addr + u64::try_from(data.len()).unwrap();
-        let mut num_bytes = 0;
-
-        for (&page_addr, page) in self
-            .pages
-            .range_mut(start.align_down(Size4KiB::SIZE)..end.align_up(Size4KiB::SIZE))
-        {
-            let page_start = page_addr;
-            let page_end = page_addr + Size4KiB::SIZE;
-
-            let copy_start = core::cmp::max(start, page_start);
-            let copy_end = core::cmp::min(end, page_end);
-
-            let len = usize::try_from(copy_end - copy_start).unwrap_or(0);
-            if len == 0 {
-                break;
-            }
-
-            let page_offset = copy_start.page_offset().into();
-            let data_offset = usize::try_from(copy_start - start).expect("data offset error");
-
-            page.0[page_offset..page_offset + len]
-                .copy_from_slice(&data[data_offset..data_offset + len]);
-            num_bytes += len;
-        }
-
-        if num_bytes == data.len() {
-            self.extend_range(start, end);
-            Ok(())
-        } else {
-            Err(MemoryContainerError::WriteFailed)
-        }
-    }
-
-    /// Reads a slice of bytes from the specified virtual address
-    pub fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), MemoryContainerError> {
-        let start = addr;
-        let end = addr + buf.len() as u64;
-        let mut num_bytes = 0;
-
-        for (&page_addr, page) in self
-            .pages
-            .range(start.align_down(Size4KiB::SIZE)..end.align_up(Size4KiB::SIZE))
-        {
-            let page_start = page_addr;
-            let page_end = page_addr + Size4KiB::SIZE;
-
-            let copy_start = core::cmp::max(start, page_start);
-            let copy_end = core::cmp::min(end, page_end);
-
-            let len = usize::try_from(copy_end - copy_start).unwrap_or(0);
-            if len == 0 {
-                break;
-            }
-
-            let page_offset = copy_start.page_offset().into();
-            let buf_offset = usize::try_from(copy_start - start).expect("buffer offset error");
-
-            buf[buf_offset..buf_offset + len]
-                .copy_from_slice(&page.0[page_offset..page_offset + len]);
-            num_bytes += len;
-        }
-
-        if num_bytes == buf.len() {
-            Ok(())
-        } else {
-            Err(MemoryContainerError::ReadFailed)
-        }
-    }
-
-    /// Free all pages and reset the range of the memory container
-    pub fn clear(&mut self) {
-        self.pages.clear();
-        self.range = Range {
-            start: VirtAddr::new(0),
-            end: VirtAddr::new(0),
-        };
+    fn deref(&self) -> &Self::Target {
+        &self.buf
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub enum MemoryContainerError {
     CopyFromVtl0Failed,
-    ReadFailed,
-    WriteFailed,
-    InvalidType,
 }
 
 pub struct KexecMemoryMetadataWrapper {
@@ -1998,7 +1791,14 @@ impl SymbolTable {
         mem: &MemoryContainer,
         buf: &[u8],
     ) -> Result<u64, Errno> {
-        if start < mem.range.start || end > mem.range.end {
+        if mem.is_empty() {
+            serial_println!("VSM: Symbol table data empty");
+            return Err(Errno::EINVAL);
+        }
+        let Some(range) = mem.get_range() else {
+            return Err(Errno::EINVAL);
+        };
+        if start < range.start || end > range.end {
             serial_println!("VSM: Symbol table data not found");
             return Err(Errno::EINVAL);
         }
@@ -2008,7 +1808,7 @@ impl SymbolTable {
             return Err(Errno::EINVAL);
         }
 
-        let mut kinfo_offset = usize::try_from(start - mem.range.start).unwrap();
+        let mut kinfo_offset = usize::try_from(start - range.start).unwrap();
         let mut kinfo_addr = start;
         let ksym_count = kinfo_len / HekiKernelSymbol::KSYM_LEN;
         let mut inner = self.inner.write();
