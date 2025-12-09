@@ -2239,11 +2239,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 )
             };
             (@[$id:ident] [ $f:ident : { =*> $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                // `{ =*> e }`: temporary syntax to support removing some hard-coded bits
                 sys_req!(
                     @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: { $e ( ctx.sys_req_ptr($n) ) }, ]
                 )
             };
             (@[$id:ident] [ $f:ident : { => $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                // `{ => e }`: temporary syntax to support removing some hard-coded bits
                 sys_req!(
                     @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: { $e ( ctx.sys_req_arg($n) ) }, ]
                 )
