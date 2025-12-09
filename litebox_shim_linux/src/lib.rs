@@ -38,6 +38,7 @@ macro_rules! log_unsupported {
     };
 }
 
+pub(crate) mod channel;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
@@ -191,6 +192,7 @@ impl LinuxShimBuilder {
             load_filter: self.load_filter,
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             litebox: self.litebox,
+            unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
         });
         LinuxShim(global)
     }
@@ -432,6 +434,10 @@ enum Descriptor {
     },
     Epoll {
         file: alloc::sync::Arc<syscalls::epoll::EpollFile>,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
+    Unix {
+        file: alloc::sync::Arc<syscalls::unix::UnixSocket>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
 }
@@ -1113,6 +1119,8 @@ struct GlobalState {
     /// Next thread ID to assign.
     // TODO: better management of thread IDs
     next_thread_id: core::sync::atomic::AtomicI32,
+    /// UNIX domain socket address table
+    unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable>,
 }
 
 struct Task {

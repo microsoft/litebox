@@ -626,7 +626,7 @@ pub enum SockType {
 }
 
 bitflags::bitflags! {
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     pub struct SockFlags: core::ffi::c_uint {
         const NONBLOCK = OFlags::NONBLOCK.bits();
         const CLOEXEC = OFlags::CLOEXEC.bits();
@@ -643,14 +643,23 @@ pub struct Linger {
     pub linger: u32, /* How long to linger for	*/
 }
 
+/// IP Protocols
 #[repr(u8)]
 #[non_exhaustive]
-#[derive(IntEnum, PartialEq, Debug)]
-pub enum Protocol {
+#[derive(IntEnum, Debug)]
+pub enum IPProtocol {
+    Default = 0,
     ICMP = 1,
     TCP = 6,
     UDP = 17,
     RAW = 255,
+}
+
+#[repr(u8)]
+#[derive(Debug, IntEnum)]
+pub enum UnixProtocol {
+    Default = 0,
+    UNIX = 1,
 }
 
 #[repr(u32)]

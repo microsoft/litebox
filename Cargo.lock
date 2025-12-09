@@ -980,6 +980,7 @@ dependencies = [
  "litebox_common_linux",
  "litebox_platform_multiplex",
  "once_cell",
+ "ringbuf",
  "seq-macro",
  "spin 0.9.8",
  "syscalls",

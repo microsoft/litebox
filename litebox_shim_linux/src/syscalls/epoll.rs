@@ -37,6 +37,7 @@ pub(crate) enum EpollDescriptor {
     File(Arc<crate::FileFd>),
     Socket(Arc<super::net::SocketFd>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
+    Unix(Arc<crate::syscalls::unix::UnixSocket>),
 }
 
 impl EpollDescriptor {
@@ -49,6 +50,7 @@ impl EpollDescriptor {
             },
             Descriptor::Eventfd { file, .. } => Ok(EpollDescriptor::Eventfd(file.clone())),
             Descriptor::Epoll { file, .. } => Ok(EpollDescriptor::Epoll(file.clone())),
+            Descriptor::Unix { file, .. } => Ok(EpollDescriptor::Unix(file.clone())),
         }
     }
 }
@@ -59,6 +61,7 @@ enum DescriptorRef {
     File(Weak<crate::FileFd>),
     Socket(Weak<super::net::SocketFd>),
     Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
+    Unix(Weak<crate::syscalls::unix::UnixSocket>),
 }
 
 impl DescriptorRef {
@@ -69,6 +72,7 @@ impl DescriptorRef {
             EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
             EpollDescriptor::Pipe(pipe) => Self::Pipe(Arc::downgrade(pipe)),
+            EpollDescriptor::Unix(unix) => Self::Unix(Arc::downgrade(unix)),
         }
     }
 
@@ -79,6 +83,7 @@ impl DescriptorRef {
             DescriptorRef::File(file) => file.upgrade().map(EpollDescriptor::File),
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
             DescriptorRef::Pipe(pipe) => pipe.upgrade().map(EpollDescriptor::Pipe),
+            DescriptorRef::Unix(unix) => unix.upgrade().map(EpollDescriptor::Unix),
         }
     }
 }
@@ -111,6 +116,7 @@ impl EpollDescriptor {
             EpollDescriptor::Pipe(fd) => {
                 return global.pipes.with_iopollable(fd, poll).ok();
             }
+            EpollDescriptor::Unix(file) => file,
         };
         Some(poll(io_pollable))
     }
@@ -283,6 +289,7 @@ impl EpollEntryKey {
             EpollDescriptor::File(file) => Arc::as_ptr(file).addr(),
             EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).addr(),
             EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).addr(),
+            EpollDescriptor::Unix(unix) => Arc::as_ptr(unix).addr(),
         };
         Self(fd, ptr)
     }
