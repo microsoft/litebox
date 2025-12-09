@@ -1639,7 +1639,7 @@ pub enum PrctlArg<Platform: litebox::platform::RawPointerProvider> {
     CapBSetRead(usize),
 }
 
-#[repr(u32)]
+#[repr(i32)]
 #[derive(Debug, IntEnum)]
 pub enum IntervalTimer {
     /// This timer counts down in real (i.e., wall clock) time.  At each expiration, a SIGALRM signal is generated.
@@ -2712,14 +2712,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
-            Sysno::setitimer => {
-                let which: u32 = ctx.sys_req_arg(0);
-                if let Ok(which) = IntervalTimer::try_from(which) {
-                    sys_req!(SetITimer { which: {which}, new_value:*, old_value:* })
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);
