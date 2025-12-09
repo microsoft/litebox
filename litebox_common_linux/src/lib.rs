@@ -2007,6 +2007,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sigsetsize: usize,
     },
     EpollCreate {
+        size: i32,
         flags: EpollCreateFlags,
     },
     Ppoll {
@@ -2116,7 +2117,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         rlim: Platform::RawConstPointer<Rlimit>,
     },
     Prlimit {
-        pid: Option<i32>,
+        pid: i32,
         /// The resource for which the limit is being queried.
         resource: RlimitResource,
         /// If the new_limit argument is not a None, then the rlimit structure to which it points
@@ -2496,52 +2497,25 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             #[cfg(target_arch = "x86")]
             Sysno::ugetrlimit => sys_req!(Getrlimit { resource:?, rlim:* }),
             Sysno::setrlimit => sys_req!(Setrlimit { resource:?, rlim:* }),
-            Sysno::prlimit64 => {
-                let pid: i32 = ctx.sys_req_arg(0);
-                let resource: i32 = ctx.sys_req_arg(1);
-                if let Ok(resource) = RlimitResource::try_from(resource) {
-                    SyscallRequest::Prlimit {
-                        pid: if pid == 0 { None } else { Some(pid) },
-                        resource,
-                        new_limit: ctx.sys_req_ptr(2),
-                        old_limit: ctx.sys_req_ptr(3),
-                    }
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
-            Sysno::epoll_ctl => {
-                let op: i32 = ctx.sys_req_arg(1);
-                if let Ok(op) = EpollOp::try_from(op) {
-                    sys_req!(EpollCtl { epfd, op: {op}, fd, event:*, })
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
             Sysno::epoll_wait => {
                 sys_req!(EpollPwait { epfd, events:*, maxevents, timeout, sigmask: { None }, sigsetsize: { 0 }, })
             }
             Sysno::epoll_pwait => {
                 sys_req!(EpollPwait { epfd, events:*, maxevents, timeout, sigmask:*, sigsetsize })
             }
-            Sysno::epoll_create => {
-                // the `size` argument is ignored, but must be greater than zero;
-                let size: i32 = ctx.sys_req_arg(0);
-                if size > 0 {
-                    SyscallRequest::EpollCreate {
-                        flags: EpollCreateFlags::empty(),
-                    }
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
-            Sysno::epoll_create1 => sys_req!(EpollCreate { flags }),
+            Sysno::epoll_create => sys_req!(EpollCreate {
+                size,
+                flags: { EpollCreateFlags::empty() }
+            }),
+            Sysno::epoll_create1 => sys_req!(EpollCreate { flags, size: { 1 } }),
             Sysno::ppoll => {
                 sys_req!(Ppoll { fds:*, nfds, timeout: { =*> TimeParam::timespec_old }, sigmask:*, sigsetsize })
             }

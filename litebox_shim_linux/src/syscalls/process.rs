@@ -905,12 +905,12 @@ impl Task {
     /// for the requested resource. Getting resources for a specific PID is also not supported yet.
     pub(crate) fn sys_prlimit(
         &self,
-        pid: Option<i32>,
+        pid: i32,
         resource: litebox_common_linux::RlimitResource,
         new_rlim: Option<crate::ConstPtr<litebox_common_linux::Rlimit64>>,
         old_rlim: Option<crate::MutPtr<litebox_common_linux::Rlimit64>>,
     ) -> Result<(), Errno> {
-        if pid.is_some() {
+        if pid != 0 {
             unimplemented!("prlimit for a specific PID is not supported yet");
         }
         let new_limit = match new_rlim {
