@@ -180,6 +180,7 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
         r13: 0,
         r14: 0,
         r15: 0,
+        _pad: 0,
     },
     vtl0_locked_regs: ControlRegMap {
         entries: [(0, 0); NUM_CONTROL_REGS],
@@ -454,8 +455,8 @@ pub fn init_ktls_stack_pointers() {
         let interrupt_sp = usize::try_from(per_cpu_variables.interrupt_stack_top()).unwrap()
             & !(STACK_ALIGNMENT - 1);
         with_kernel_tls_mut(|ktls| {
-            ktls.kernel_stack_ptr.set(kernel_sp);
-            ktls.interrupt_stack_ptr.set(interrupt_sp);
+            ktls.set_kernel_stack_ptr(kernel_sp);
+            ktls.set_interrupt_stack_ptr(interrupt_sp);
         });
     });
 }

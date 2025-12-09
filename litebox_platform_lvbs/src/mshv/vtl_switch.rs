@@ -38,6 +38,7 @@ macro_rules! VTL_RETURN_ASM {
 // we should save/restore VTL0 registers. For now, we conservatively save/restore all
 // VTL0/VTL1 registers (results in performance degradation) but we can optimize it later.
 /// Struct to save VTL state (general-purpose registers)
+#[allow(clippy::pub_underscore_fields)]
 #[derive(Default, Clone, Copy)]
 #[repr(C)]
 pub struct VtlState {
@@ -56,6 +57,9 @@ pub struct VtlState {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
+    // To ease the stack alignment, ensure this struct size is multiple of 16 bytes.
+    // (15 + 1) * 8 = 128. 128 % 16 == 0
+    pub _pad: u64,
     // CR2
     // DR[0-6]
     // We use a separeate buffer to save/register extended states
@@ -82,10 +86,6 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
     if let Some(platform) = platform {
         crate::set_platform_low(platform);
     }
-    vtl_switch_loop()
-}
-
-fn vtl_switch_loop() -> ! {
     unsafe {
         asm!(
             "jmp {vtl_switch_loop_asm}",
@@ -99,6 +99,7 @@ macro_rules! SAVE_VTL0_STATE_ASM {
     () => {
         "
         mov gs:[{scratch_off}], rsp
+        push r15 /* alignment */
         push r15
         push r14
         push r13
@@ -113,9 +114,8 @@ macro_rules! SAVE_VTL0_STATE_ASM {
         push rcx
         push rbx
         push rax
-        push rbp /*  15 * 8 = 120. 120 % 16 == 8 */
+        push rbp
         lea rdi, [rsp]
-        push rbp /* alignment */
         call {save_vtl0_state}
         mov rsp, gs:[{scratch_off}]
         "
@@ -126,9 +126,8 @@ macro_rules! LOAD_VTL0_STATE_ASM {
     () => {
         "
         mov gs:[{scratch_off}], rsp
-        sub rsp, {vtl_state_size} /* 15 * 8 = 120. 120 % 16 == 8 */
+        sub rsp, {vtl_state_size}
         lea rdi, [rsp]
-        push rbp /* alignment */
         call {load_vtl0_state}
         mov rsp, gs:[{scratch_off}] /* anchor */
         sub rsp, {vtl_state_size}
@@ -152,26 +151,44 @@ macro_rules! LOAD_VTL0_STATE_ASM {
     };
 }
 
+/// Saves VTL0 state from stack to per-CPU storage.
+///
+/// # Safety
+/// - `vtl_state` must be a valid pointer to a readable `VtlState` structure
+/// - Must be called from VTL1 context with valid per-CPU variables initialized
 unsafe extern "C" fn save_vtl0_state(vtl_state: *const VtlState) {
-    let addr = with_per_cpu_variables(|per_cpu_variables| &raw const per_cpu_variables.vtl0_state);
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            vtl_state.cast::<u8>(),
-            addr.cast::<u8>().cast_mut(),
-            size_of::<VtlState>(),
-        );
-    }
+    with_per_cpu_variables_mut(|pcv| {
+        let dst = &raw mut pcv.vtl0_state;
+        // SAFETY: vtl_state points to valid VtlState from caller's stack frame.
+        // dst points to per-CPU storage initialized during boot.
+        unsafe {
+            if vtl_state.is_aligned() {
+                core::ptr::copy_nonoverlapping(vtl_state, dst, 1);
+            } else {
+                core::ptr::write(dst, core::ptr::read_unaligned(vtl_state));
+            }
+        }
+    });
 }
 
+/// Loads VTL0 state from per-CPU storage to stack.
+///
+/// # Safety
+/// - `vtl_state` must be a valid pointer to a writable `VtlState` structure
+/// - Must be called from VTL1 context with valid per-CPU variables initialized
 unsafe extern "C" fn load_vtl0_state(vtl_state: *mut VtlState) {
-    let addr = with_per_cpu_variables(|pcv| &raw const pcv.vtl0_state);
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            addr.cast::<u8>(),
-            vtl_state.cast::<u8>(),
-            size_of::<VtlState>(),
-        );
-    }
+    with_per_cpu_variables(|pcv| {
+        let src = &raw const pcv.vtl0_state;
+        // SAFETY: src points to per-CPU storage with valid VtlState.
+        // vtl_state points to caller's stack frame with sufficient space.
+        unsafe {
+            if vtl_state.is_aligned() {
+                core::ptr::copy_nonoverlapping(src, vtl_state, 1);
+            } else {
+                core::ptr::write_unaligned(vtl_state, core::ptr::read(src));
+            }
+        }
+    });
 }
 
 #[unsafe(naked)]
