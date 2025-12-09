@@ -112,15 +112,7 @@ pub fn validate_kernel_module_against_elf(
         )?;
 
         // load relocated/patched section
-        let mut section_in_memory = vec![0u8; section_from_elf.len()];
-        section_memory_container
-            .read_bytes(
-                section_memory_container
-                    .start()
-                    .ok_or(KernelElfError::SectionReadFailed)?,
-                &mut section_in_memory,
-            )
-            .map_err(|_| KernelElfError::SectionReadFailed)?;
+        let section_in_memory = &section_memory_container[..];
 
         // check whether non-relocatable bytes are modified
         #[cfg(not(debug_assertions))]
@@ -682,7 +674,6 @@ pub fn validate_text_patch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch
 /// Error for Kernel ELF validation and relocation failures.
 #[derive(Debug, PartialEq)]
 pub enum KernelElfError {
-    SectionReadFailed,
     ElfParseFailed,
     SectionNotFound,
 }

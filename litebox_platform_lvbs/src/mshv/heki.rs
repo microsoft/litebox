@@ -170,6 +170,23 @@ impl HekiRange {
     }
 }
 
+impl core::fmt::Debug for HekiRange {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let va = self.va;
+        let pa = self.pa;
+        let epa = self.epa;
+        let attr = self.attributes;
+        f.debug_struct("HekiRange")
+            .field("va", &format_args!("{va:#x}"))
+            .field("pa", &format_args!("{pa:#x}"))
+            .field("epa", &format_args!("{epa:#x}"))
+            .field("attr", &format_args!("{attr:#x}"))
+            .field("type", &format_args!("{:?}", self.heki_kdata_type()))
+            .field("size", &format_args!("{:?}", self.epa - self.pa))
+            .finish()
+    }
+}
+
 #[expect(clippy::cast_possible_truncation)]
 pub const HEKI_MAX_RANGES: usize =
     ((PAGE_SIZE as u32 - u64::BITS * 3 / 8) / core::mem::size_of::<HekiRange>() as u32) as usize;
