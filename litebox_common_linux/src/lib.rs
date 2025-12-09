@@ -1925,6 +1925,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         call: i32,
         args: Platform::RawConstPointer<usize>,
     },
+    Socketpair {
+        domain: u32,
+        type_and_flags: u32,
+        protocol: u8,
+        sockvec: Platform::RawMutPointer<u32>,
+    },
     Connect {
         sockfd: i32,
         sockaddr: Platform::RawConstPointer<u8>,
@@ -2423,6 +2429,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }),
             #[cfg(target_arch = "x86")]
             Sysno::socketcall => sys_req!(Socketcall { call, args:* }),
+            Sysno::socketpair => sys_req!(Socketpair {
+                domain,
+                type_and_flags,
+                protocol,
+                sockvec: *,
+            }),
             Sysno::connect => sys_req!(Connect { sockfd, sockaddr:*, addrlen }),
             #[cfg(target_arch = "x86_64")]
             Sysno::accept => sys_req!(Accept {

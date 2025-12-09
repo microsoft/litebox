@@ -740,6 +740,12 @@ impl Task {
             } => syscall!(sys_socket(domain, type_and_flags, protocol)),
             #[cfg(target_arch = "x86")]
             SyscallRequest::Socketcall { call, args } => self.sys_socketcall(call, args),
+            SyscallRequest::Socketpair {
+                domain,
+                type_and_flags,
+                protocol,
+                sockvec,
+            } => syscall!(sys_socketpair(domain, type_and_flags, protocol, sockvec)),
             SyscallRequest::Connect {
                 sockfd,
                 sockaddr,
