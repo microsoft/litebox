@@ -19,16 +19,19 @@ use core::arch::{asm, naked_asm};
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 
-/// A function to return to VTL0 using the Hyper-V hypercall stub.
+/// Assembly macro to return to VTL0 using the Hyper-V hypercall stub.
 /// Although Hyper-V lets each core use the same VTL return address, this implementation
 /// uses per-TLS return address to avoid using a mutable global variable.
+/// `ret_off` is the offset of the kernel TLS which holds the VTL return address.
 macro_rules! VTL_RETURN_ASM {
-    () => {
-        "
-        xor ecx, ecx
-        mov rax, gs:[{vtl_ret_addr_off}]
-        call rax
-        "
+    ($ret_off:tt) => {
+        concat!(
+            "xor ecx, ecx\n",
+            "mov rax, gs:[",
+            stringify!($ret_off),
+            "]\n",
+            "call rax\n",
+        )
     };
 }
 
@@ -95,59 +98,86 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
     }
 }
 
-macro_rules! SAVE_VTL0_STATE_ASM {
-    () => {
-        "
-        mov gs:[{scratch_off}], rsp
-        push r15 /* alignment */
-        push r15
-        push r14
-        push r13
-        push r12
-        push r11
-        push r10
-        push r9
-        push r8
-        push rdi
-        push rsi
-        push rdx
-        push rcx
-        push rbx
-        push rax
-        push rbp
-        lea rdi, [rsp]
-        call {save_vtl0_state}
-        mov rsp, gs:[{scratch_off}]
-        "
+/// Assembly macro to save VTL state using the stack as temporary storage.
+/// `fn_save_state` is the function to save VTL state stored in the stack.
+/// `scratch_off` is the offset of the kernel TLS which holds the scratch space to
+/// save/restore the current stack pointer.
+macro_rules! SAVE_VTL_STATE_ASM {
+    ($fn_save_state:tt, $scratch_off:tt) => {
+        concat!(
+            "mov gs:[",
+            stringify!($scratch_off),
+            "], rsp\n",
+            "push r15\n", // alignment
+            "push r15\n",
+            "push r14\n",
+            "push r13\n",
+            "push r12\n",
+            "push r11\n",
+            "push r10\n",
+            "push r9\n",
+            "push r8\n",
+            "push rdi\n",
+            "push rsi\n",
+            "push rdx\n",
+            "push rcx\n",
+            "push rbx\n",
+            "push rax\n",
+            "push rbp\n",
+            "lea rdi, [rsp]\n",
+            "call ",
+            stringify!($fn_save_state),
+            "\n",
+            "mov rsp, gs:[",
+            stringify!($scratch_off),
+            "]\n",
+        )
     };
 }
 
-macro_rules! LOAD_VTL0_STATE_ASM {
-    () => {
-        "
-        mov gs:[{scratch_off}], rsp
-        sub rsp, {vtl_state_size}
-        lea rdi, [rsp]
-        call {load_vtl0_state}
-        mov rsp, gs:[{scratch_off}] /* anchor */
-        sub rsp, {vtl_state_size}
-        pop rbp
-        pop rax
-        pop rbx
-        pop rcx
-        pop rdx
-        pop rsi
-        pop rdi
-        pop r8
-        pop r9
-        pop r10
-        pop r11
-        pop r12
-        pop r13
-        pop r14
-        pop r15
-        mov rsp, gs:[{scratch_off}]
-        "
+/// Assembly macro to load VTL state. It uses the stack as temporary storage.
+/// `fn_load_state` is the function to load VTL state to the stack.
+/// `state_size` is the size of `VtlState` structure.
+/// `scratch_off` is the offset of the kernel TLS which holds the scratch space to
+/// save/restore the current stack pointer.
+macro_rules! LOAD_VTL_STATE_ASM {
+    ($fn_load_state:tt, $state_size:tt, $scratch_off:tt) => {
+        concat!(
+            "mov gs:[",
+            stringify!($scratch_off),
+            "], rsp\n",
+            "sub rsp, ",
+            stringify!($state_size),
+            "\n",
+            "lea rdi, [rsp]\n",
+            "call ",
+            stringify!($fn_load_state),
+            "\n",
+            "mov rsp, gs:[",
+            stringify!($scratch_off),
+            "]\n", // anchor
+            "sub rsp, ",
+            stringify!($state_size),
+            "\n",
+            "pop rbp\n",
+            "pop rax\n",
+            "pop rbx\n",
+            "pop rcx\n",
+            "pop rdx\n",
+            "pop rsi\n",
+            "pop rdi\n",
+            "pop r8\n",
+            "pop r9\n",
+            "pop r10\n",
+            "pop r11\n",
+            "pop r12\n",
+            "pop r13\n",
+            "pop r14\n",
+            "pop r15\n",
+            "mov rsp, gs:[",
+            stringify!($scratch_off),
+            "]\n",
+        )
     };
 }
 
@@ -196,12 +226,12 @@ unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
     naked_asm!(
         "1:",
         "mov rsp, gs:[{kernel_sp_off}]", // reset kernel stack pointer. Hyper-V saves/restores rsp and rip.
-        VTL_RETURN_ASM!(),
+        VTL_RETURN_ASM!({vtl_ret_addr_off}),
         // *** VTL1 resumes here regardless of the entry reason (VTL switch or intercept) ***
-        SAVE_VTL0_STATE_ASM!(),
+        SAVE_VTL_STATE_ASM!({save_vtl0_state}, {scratch_off}),
         "mov rbp, rsp", // rbp contains VTL0's stack frame, so update it.
         "call {loop_body}",
-        LOAD_VTL0_STATE_ASM!(),
+        LOAD_VTL_STATE_ASM!({load_vtl0_state}, {vtl_state_size}, {scratch_off}),
         "jmp 1b",
         kernel_sp_off = const { KernelTlsOffset::KernelStackPtr as usize },
         vtl_ret_addr_off = const { KernelTlsOffset::VtlReturnAddr as usize },
