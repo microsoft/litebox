@@ -2202,6 +2202,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
     /// Ideally, this function would not panic. However, since it is currently under development, it
     /// is allowed to panic upon receiving a syscall number (or arguments) that it does not know how
     /// to handle.
+    // NOTE: This function is intended to be mostly trivial (in the future, we intend to replace
+    // this entire function with a simple type-driven macro), thus any non-trivial parsing should
+    // happen outside of this. Roughly speaking, if it is a simple integer, pointer, or a flag
+    // field, it is fine; anything more complex should not attempt to do more, and must instead
+    // perform the actual "parsing" outside. It is ok to introduce new `impl`s for
+    // `ReinterpretTruncatedFromUsize` in order to support stronger types (especially if one desires
+    // a fail-free parse), but also quite helpful is to define a `TryFrom<i32>` and use the `:?`
+    // combinator (which will return `EINVAL` upon parse failure).
     pub fn try_from_raw(
         syscall_number: usize,
         ctx: &PtRegs,
@@ -2246,12 +2254,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             };
             (@[$id:ident] [ $f:ident : { =*> $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
                 // `{ =*> e }`: temporary syntax to support removing some hard-coded bits
+                // NOTE: Please do NOT use this for any new syscalls added
                 sys_req!(
                     @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: { $e ( ctx.sys_req_ptr($n) ) }, ]
                 )
             };
             (@[$id:ident] [ $f:ident : { => $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
                 // `{ => e }`: temporary syntax to support removing some hard-coded bits
+                // NOTE: Please do NOT use this for any new syscalls added
                 sys_req!(
                     @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: { $e ( ctx.sys_req_arg($n) ) }, ]
                 )
