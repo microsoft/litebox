@@ -2238,6 +2238,11 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: ctx.sys_req_ptr($n), ]
                 )
             };
+            (@[$id:ident] [ $f:ident : ? $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                sys_req!(
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: ctx.sys_req_arg::<i32>($n).try_into().or(Err(errno::Errno::EINVAL))?, ]
+                )
+            };
             (@[$id:ident] [ $f:ident : { =*> $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
                 // `{ =*> e }`: temporary syntax to support removing some hard-coded bits
                 sys_req!(
@@ -2295,32 +2300,18 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::munmap => sys_req!(Munmap { addr:*, length }),
             Sysno::brk => sys_req!(Brk { addr:* }),
             Sysno::mremap => sys_req!(Mremap { old_addr:*, old_size, new_size, flags, new_addr }),
-            Sysno::rt_sigprocmask => {
-                let how: i32 = ctx.sys_req_arg(0);
-                if let Ok(how) = signal::SigmaskHow::try_from(how) {
-                    sys_req!(RtSigprocmask {
-                        how: { how },
-                        set:*,
-                        oldset:*,
-                        sigsetsize,
-                    })
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
-            Sysno::rt_sigaction => {
-                let signum: i32 = ctx.sys_req_arg(0);
-                if let Ok(signum) = signal::Signal::try_from(signum) {
-                    sys_req!(RtSigaction {
-                        signum: { signum },
-                        act:*,
-                        oldact:*,
-                        sigsetsize,
-                    })
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::rt_sigprocmask => sys_req!(RtSigprocmask {
+                how:?,
+                set:*,
+                oldset:*,
+                sigsetsize,
+            }),
+            Sysno::rt_sigaction => sys_req!(RtSigaction {
+                signum:?,
+                act:*,
+                oldact:*,
+                sigsetsize,
+            }),
             Sysno::rt_sigreturn => SyscallRequest::RtSigreturn,
             #[cfg(target_arch = "x86")]
             Sysno::sigreturn => SyscallRequest::Sigreturn,
@@ -2379,14 +2370,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::access => sys_req!(Access { pathname:*, mode }),
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
-            Sysno::madvise => {
-                let behavior: i32 = ctx.sys_req_arg(2);
-                if let Ok(behavior) = MadviseBehavior::try_from(behavior) {
-                    sys_req!(Madvise { addr:*, length, behavior: { behavior } })
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),
                 newfd: None,
@@ -2508,40 +2492,10 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::readlink => sys_req!(Readlink { pathname:*, buf:* ,bufsiz }),
             Sysno::readlinkat => sys_req!(Readlinkat { dirfd, pathname:*, buf:*, bufsiz }),
             #[cfg(target_arch = "x86_64")]
-            Sysno::getrlimit => {
-                let resource: i32 = ctx.sys_req_arg(0);
-                if let Ok(resource) = RlimitResource::try_from(resource) {
-                    SyscallRequest::Getrlimit {
-                        resource,
-                        rlim: ctx.sys_req_ptr(1),
-                    }
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::getrlimit => sys_req!(Getrlimit { resource:?, rlim:* }),
             #[cfg(target_arch = "x86")]
-            Sysno::ugetrlimit => {
-                let resource: i32 = ctx.sys_req_arg(0);
-                if let Ok(resource) = RlimitResource::try_from(resource) {
-                    SyscallRequest::Getrlimit {
-                        resource,
-                        rlim: ctx.sys_req_ptr(1),
-                    }
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
-            Sysno::setrlimit => {
-                let resource: i32 = ctx.sys_req_arg(0);
-                if let Ok(resource) = RlimitResource::try_from(resource) {
-                    SyscallRequest::Setrlimit {
-                        resource,
-                        rlim: ctx.sys_req_ptr(1),
-                    }
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::ugetrlimit => sys_req!(Getrlimit { resource:?, rlim:* }),
+            Sysno::setrlimit => sys_req!(Setrlimit { resource:?, rlim:* }),
             Sysno::prlimit64 => {
                 let pid: i32 = ctx.sys_req_arg(0);
                 let resource: i32 = ctx.sys_req_arg(1);
