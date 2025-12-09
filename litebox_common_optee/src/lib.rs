@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{PtRegs, errno::Errno};
 use modular_bitfield::prelude::*;
-use modular_bitfield::specifiers::{B4, B48};
+use modular_bitfield::specifiers::{B4, B8, B48, B54};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
 
@@ -1096,7 +1096,7 @@ const OPTEE_MSG_CMD_DO_BOTTOM_HALF: u32 = 6;
 const OPTEE_MSG_CMD_STOP_ASYNC_NOTIF: u32 = 7;
 
 #[non_exhaustive]
-#[derive(Debug, PartialEq, TryFromPrimitive)]
+#[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive)]
 #[repr(u32)]
 pub enum OpteeMessageCommand {
     OpenSession = OPTEE_MSG_CMD_OPEN_SESSION,
@@ -1110,6 +1110,46 @@ pub enum OpteeMessageCommand {
     Unknown = 0xffff_ffff,
 }
 
+/// Temporary reference memory parameter
+/// `buf_ptr`: Address of the buffer
+/// `size`: Size of the buffer
+/// `shm_ref`: Temporary shared memory reference, pointer to a struct tee_shm
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct OpteeMsgParamTmem {
+    buf_ptr: u64,
+    size: u64,
+    shm_ref: u64,
+}
+
+/// Registered memory reference parameter
+/// `offs`: Offset into shared memory reference
+/// `size`: Size of the buffer
+/// `shm_ref`: Shared memory reference, pointer to a struct tee_shm
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgParamRmem {
+    offs: u64,
+    size: u64,
+    shm_ref: u64,
+}
+
+/// FF-A memory reference parameter
+/// `offs_low`: Lower bits of offset into shared memory reference
+/// `offs_high`: Higher bits of offset into shared memory reference
+/// `internal_offs`: Internal offset into the first page of shared memory reference
+/// `size`: Size of the buffer
+/// `global_id`: Global identifier of the shared memory
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgParamFmem {
+    offs_low: u32,
+    offs_high: u32,
+    internal_offs: u16,
+    size: u64,
+    global_id: u64,
+}
+
 /// Opaque value parameter
 /// Value parameters are passed unchecked between normal and secure world.
 #[derive(Debug, Clone, Copy)]
@@ -1120,6 +1160,18 @@ pub struct OpteeMsgParamValue {
     c: u64,
 }
 
+/// Parameter used totether with `OpteeMsgArg`
+/// Note: whether it is `rmem` or `fmem` depends on the conduit.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub union OpteeMsgParamUnion {
+    tmem: OpteeMsgParamTmem,
+    rmem: OpteeMsgParamRmem,
+    fmem: OpteeMsgParamFmem,
+    value: OpteeMsgParamValue,
+    octets: [u8; 24],
+}
+
 const OPTEE_MSG_ATTR_TYPE_NONE: u8 = 0x0;
 const OPTEE_MSG_ATTR_TYPE_VALUE_INPUT: u8 = 0x1;
 const OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT: u8 = 0x2;
@@ -1127,6 +1179,9 @@ const OPTEE_MSG_ATTR_TYPE_VALUE_INOUT: u8 = 0x3;
 const OPTEE_MSG_ATTR_TYPE_RMEM_INPUT: u8 = 0x5;
 const OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT: u8 = 0x6;
 const OPTEE_MSG_ATTR_TYPE_RMEM_INOUT: u8 = 0x7;
+// const OPTEE_MSG_ATTR_TYPE_FMEM_INPUT: u8 = OPTEE_MSG_ATTR_TYPE_RMEM_INPUT;
+// const OPTEE_MSG_ATTR_TYPE_FMEM_OUTPUT: u8 = OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT;
+// const OPTEE_MSG_ATTR_TYPE_FMEM_INOUT: u8 = OPTEE_MSG_ATTR_TYPE_RMEM_INOUT;
 const OPTEE_MSG_ATTR_TYPE_TMEM_INPUT: u8 = 0x9;
 const OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT: u8 = 0xa;
 const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xb;
@@ -1147,31 +1202,72 @@ pub enum OpteeMsgAttrType {
     TmemInout = OPTEE_MSG_ATTR_TYPE_TMEM_INOUT,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+#[bitfield]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
-pub struct OpteeMsgParam {
-    attr: u64,
-    value: OpteeMsgParamValue,
-}
-
-impl OpteeMsgParam {
-    pub fn attr_type(&self) -> OpteeMsgAttrType {
-        OpteeMsgAttrType::try_from(u8::try_from(self.attr & 0xff).unwrap())
-            .unwrap_or(OpteeMsgAttrType::None)
-    }
+pub struct OpteeMsgAttr {
+    pub typ: B8,
+    pub meta: bool,
+    pub noncontig: bool,
+    #[skip]
+    __: B54,
 }
 
 #[derive(Clone, Copy)]
 #[repr(C)]
+pub struct OpteeMsgParam {
+    attr: OpteeMsgAttr,
+    u: OpteeMsgParamUnion,
+}
+
+impl OpteeMsgParam {
+    pub fn attr_type(&self) -> OpteeMsgAttrType {
+        OpteeMsgAttrType::try_from(self.attr.typ()).unwrap_or(OpteeMsgAttrType::None)
+    }
+}
+
+/// OP-TEE message argument structure that the normal world (or VTL0) OP-TEE driver and OP-TEE OS use to
+/// exchange messages. Note that this message is not serialized and contains some physical addresses of
+/// the normal world memory (recursive memory copies are needed).
+#[derive(Clone, Copy)]
+#[repr(C)]
 pub struct OpteeMsgArg {
-    cmd: u32,
+    /// OP-TEE message command. This is a superset of `UteeEntryFunc`.
+    cmd: OpteeMessageCommand,
+    /// TA function ID which is used if `cmd == InvokeCommand`. Note that the meaning of `cmd` and `func`
+    /// is swapped compared to TAs.
     func: u32,
+    /// Session ID. This is "IN" parameter most of the time except for `cmd == OpenSession` where
+    /// the secure world generates a session ID and returns it as a value.
     session: u32,
+    /// Cancellation ID. This is a unique value to identify this request.
     cancel_id: u32,
     pad: u32,
+    /// Return value from the secure world
     ret: u32,
+    /// Origin of the return value (e.g., OP-TEE OS, TA, ...)
     ret_origin: u32,
+    /// Number of parameters contained in `params`
     num_params: u32,
-    // If cmd is `OpenSession`, the first two params contain a TA UUID and they are not delivered to the TA.
+    /// Parameters to be passed to the secure world. If `cmd == OpenSession`, the first two params contain
+    /// a TA UUID and they are not delivered to the TA.
+    /// Note that, originally, the length of this array is variable. We fix it to `TEE_NUM_PARAMS + 2` to
+    /// simply the implementation (our OP-TEE Shim supports up to four parameters as well).
     params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
+}
+
+/// OP-TEE SMC call arguments. OP-TEE assumes that the underlying architecture is Arm with TrustZone and
+/// thus it uses Secure Monitor Call (SMC) calling convention (SMCCC).
+/// Since we currently rely on the existing OP-TEE driver which assumes SMCCC, we translate it into
+/// our VTL switch convention.
+#[repr(align(4096))]
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpteeSmcArgs {
+    args: [usize; Self::NUM_OPTEE_SMC_ARGS],
+}
+
+impl OpteeSmcArgs {
+    const NUM_OPTEE_SMC_ARGS: usize = 9;
 }
