@@ -1085,3 +1085,93 @@ impl LdelfArg {
         Self::default()
     }
 }
+
+const OPTEE_MSG_CMD_OPEN_SESSION: u32 = 0;
+const OPTEE_MSG_CMD_INVOKE_COMMAND: u32 = 1;
+const OPTEE_MSG_CMD_CLOSE_SESSION: u32 = 2;
+const OPTEE_MSG_CMD_CANCEL: u32 = 3;
+const OPTEE_MSG_CMD_REGISTER_SHM: u32 = 4;
+const OPTEE_MSG_CMD_UNREGISTER_SHM: u32 = 5;
+const OPTEE_MSG_CMD_DO_BOTTOM_HALF: u32 = 6;
+const OPTEE_MSG_CMD_STOP_ASYNC_NOTIF: u32 = 7;
+
+#[non_exhaustive]
+#[derive(Debug, PartialEq, TryFromPrimitive)]
+#[repr(u32)]
+pub enum OpteeMessageCommand {
+    OpenSession = OPTEE_MSG_CMD_OPEN_SESSION,
+    InvokeCommand = OPTEE_MSG_CMD_INVOKE_COMMAND,
+    CloseSession = OPTEE_MSG_CMD_CLOSE_SESSION,
+    Cancel = OPTEE_MSG_CMD_CANCEL,
+    RegisterShm = OPTEE_MSG_CMD_REGISTER_SHM,
+    UnregisterShm = OPTEE_MSG_CMD_UNREGISTER_SHM,
+    DoBottomHalf = OPTEE_MSG_CMD_DO_BOTTOM_HALF,
+    StopAsyncNotif = OPTEE_MSG_CMD_STOP_ASYNC_NOTIF,
+    Unknown = 0xffff_ffff,
+}
+
+/// Opaque value parameter
+/// Value parameters are passed unchecked between normal and secure world.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgParamValue {
+    a: u64,
+    b: u64,
+    c: u64,
+}
+
+const OPTEE_MSG_ATTR_TYPE_NONE: u8 = 0x0;
+const OPTEE_MSG_ATTR_TYPE_VALUE_INPUT: u8 = 0x1;
+const OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT: u8 = 0x2;
+const OPTEE_MSG_ATTR_TYPE_VALUE_INOUT: u8 = 0x3;
+const OPTEE_MSG_ATTR_TYPE_RMEM_INPUT: u8 = 0x5;
+const OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT: u8 = 0x6;
+const OPTEE_MSG_ATTR_TYPE_RMEM_INOUT: u8 = 0x7;
+const OPTEE_MSG_ATTR_TYPE_TMEM_INPUT: u8 = 0x9;
+const OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT: u8 = 0xa;
+const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xb;
+
+#[non_exhaustive]
+#[derive(Debug, PartialEq, TryFromPrimitive)]
+#[repr(u8)]
+pub enum OpteeMsgAttrType {
+    None = OPTEE_MSG_ATTR_TYPE_NONE,
+    ValueInput = OPTEE_MSG_ATTR_TYPE_VALUE_INPUT,
+    ValueOutput = OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT,
+    ValueInout = OPTEE_MSG_ATTR_TYPE_VALUE_INOUT,
+    RmemInput = OPTEE_MSG_ATTR_TYPE_RMEM_INPUT,
+    RmemOutput = OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT,
+    RmemInout = OPTEE_MSG_ATTR_TYPE_RMEM_INOUT,
+    TmemInput = OPTEE_MSG_ATTR_TYPE_TMEM_INPUT,
+    TmemOutput = OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT,
+    TmemInout = OPTEE_MSG_ATTR_TYPE_TMEM_INOUT,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgParam {
+    attr: u64,
+    value: OpteeMsgParamValue,
+}
+
+impl OpteeMsgParam {
+    pub fn attr_type(&self) -> OpteeMsgAttrType {
+        OpteeMsgAttrType::try_from(u8::try_from(self.attr & 0xff).unwrap())
+            .unwrap_or(OpteeMsgAttrType::None)
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgArg {
+    cmd: u32,
+    func: u32,
+    session: u32,
+    cancel_id: u32,
+    pad: u32,
+    ret: u32,
+    ret_origin: u32,
+    num_params: u32,
+    // If cmd is `OpenSession`, the first two params contain a TA UUID and they are not delivered to the TA.
+    params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
+}
