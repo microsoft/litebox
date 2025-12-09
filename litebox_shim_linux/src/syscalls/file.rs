@@ -280,9 +280,12 @@ impl Task {
                 buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
                 Ok(size_of::<u64>())
             }
-            Descriptor::Unix { file, .. } => {
-                file.recvfrom(buf, litebox_common_linux::ReceiveFlags::empty(), None)
-            }
+            Descriptor::Unix { file, .. } => file.recvfrom(
+                &self.wait_cx(),
+                buf,
+                litebox_common_linux::ReceiveFlags::empty(),
+                None,
+            ),
         }
     }
 

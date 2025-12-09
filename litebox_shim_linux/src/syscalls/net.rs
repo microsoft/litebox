@@ -1395,6 +1395,7 @@ impl Task {
                 let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
                 let mut addr = None;
                 let size = file.recvfrom(
+                    &self.wait_cx(),
                     buffer,
                     flags,
                     if source_addr.is_some() {

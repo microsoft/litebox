@@ -35,15 +35,15 @@ macro_rules! common_functions_for_channel {
 
 struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     rb: Mutex<Platform, T>,
-    pollee: Pollee<Platform>,
+    pollee: Arc<Pollee<Platform>>,
     is_shutdown: AtomicBool,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform, T> {
-    fn new(rb: T) -> Self {
+    fn new(rb: T, pollee: Arc<Pollee<Platform>>) -> Self {
         Self {
             rb: Mutex::new(rb),
-            pollee: Pollee::new(),
+            pollee,
             is_shutdown: AtomicBool::new(false),
         }
     }
@@ -147,17 +147,21 @@ pub(crate) struct Channel<T> {
 }
 
 impl<T> Channel<T> {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(
+        capacity: usize,
+        writer_pollee: Arc<Pollee<crate::Platform>>,
+        reader_pollee: Arc<Pollee<crate::Platform>>,
+    ) -> Self {
         use ringbuf::traits::Split as _;
         let rb: ringbuf::HeapRb<T> = ringbuf::HeapRb::new(capacity);
         let (rb_prod, rb_cons) = rb.split();
 
         let mut writer = WriteEnd {
-            endpoint: Arc::new(EndPointer::new(rb_prod)),
+            endpoint: Arc::new(EndPointer::new(rb_prod, writer_pollee)),
             peer: alloc::sync::Weak::new(),
         };
         let mut reader = ReadEnd {
-            endpoint: Arc::new(EndPointer::new(rb_cons)),
+            endpoint: Arc::new(EndPointer::new(rb_cons, reader_pollee)),
             peer: alloc::sync::Weak::new(),
         };
 
