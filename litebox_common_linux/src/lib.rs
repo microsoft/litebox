@@ -2219,6 +2219,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
         // in order; if something needs to be a pointer and you forget (or accidentally mark
         // something as a pointer) the type checker will complain and remind you (due to the nice
         // attributes on the relevant traits), so you shouldn't need to worry about that.
+        //
+        // NOTE: This macro should seldom (if ever) be updated. Usually if you think you need to
+        // update this, you probably need to introduce an `impl` instead.
         macro_rules! sys_req {
             ($id:ident { $( $field:ident $(:$star:tt)?),* $(,)? }) => {
                 sys_req!(
@@ -2235,24 +2238,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: ctx.sys_req_ptr($n), ]
                 )
             };
-            (@[$id:ident] [ $f:ident : ts64 $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+            (@[$id:ident] [ $f:ident : { =*> $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
                 sys_req!(
-                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::timespec64(ctx.sys_req_ptr($n)), ]
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: { $e ( ctx.sys_req_ptr($n) ) }, ]
                 )
             };
-            (@[$id:ident] [ $f:ident : tv $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+            (@[$id:ident] [ $f:ident : { => $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
                 sys_req!(
-                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::timeval(ctx.sys_req_ptr($n)), ]
-                )
-            };
-            (@[$id:ident] [ $f:ident : ts $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
-                sys_req!(
-                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::timespec_old(ctx.sys_req_ptr($n)), ]
-                )
-            };
-            (@[$id:ident] [ $f:ident : millis $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
-                sys_req!(
-                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::Milliseconds(ctx.sys_req_arg($n)), ]
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: { $e ( ctx.sys_req_arg($n) ) }, ]
                 )
             };
             (@[$id:ident] [ $f:ident : { $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
@@ -2471,18 +2464,26 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
-            Sysno::clock_gettime => sys_req!(ClockGettime { clockid, tp: ts }),
+            Sysno::clock_gettime => {
+                sys_req!(ClockGettime { clockid, tp: { =*> TimeParam::timespec_old } })
+            }
             #[cfg(target_arch = "x86")]
-            Sysno::clock_gettime64 => sys_req!(ClockGettime { clockid, tp: ts64 }),
-            Sysno::clock_getres => sys_req!(ClockGetres { clockid, res: ts }),
+            Sysno::clock_gettime64 => {
+                sys_req!(ClockGettime { clockid, tp: { =*> TimeParam::timespec64 } })
+            }
+            Sysno::clock_getres => {
+                sys_req!(ClockGetres { clockid, res: { =*> TimeParam::timespec_old } })
+            }
             #[cfg(target_arch = "x86")]
-            Sysno::clock_getres_time64 => sys_req!(ClockGetres { clockid, res: ts64 }),
+            Sysno::clock_getres_time64 => {
+                sys_req!(ClockGetres { clockid, res: { =*> TimeParam::timespec64 } })
+            }
             Sysno::clock_nanosleep => {
                 sys_req!(ClockNanosleep {
                     clockid,
                     flags,
-                    request: ts,
-                    remain: ts,
+                    request: { =*> TimeParam::timespec_old },
+                    remain: { =*> TimeParam::timespec_old },
                 })
             }
             #[cfg(target_arch = "x86")]
@@ -2490,13 +2491,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 sys_req!(ClockNanosleep {
                     clockid,
                     flags,
-                    request: ts64,
-                    remain: ts64,
+                    request: { =*> TimeParam::timespec64 },
+                    remain: { =*> TimeParam::timespec64 },
                 })
             }
             Sysno::nanosleep => sys_req!(ClockNanosleep {
-                request: ts,
-                remain: ts,
+                request: { =*> TimeParam::timespec_old },
+                remain: { =*> TimeParam::timespec_old },
                 clockid: { ClockId::Monotonic.into() },
                 flags: { TimerFlags::empty() },
             }),
@@ -2586,14 +2587,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }
             Sysno::epoll_create1 => sys_req!(EpollCreate { flags }),
             Sysno::ppoll => {
-                sys_req!(Ppoll { fds:*, nfds, timeout:ts, sigmask:*, sigsetsize })
+                sys_req!(Ppoll { fds:*, nfds, timeout: { =*> TimeParam::timespec_old }, sigmask:*, sigsetsize })
             }
             #[cfg(target_arch = "x86")]
             Sysno::ppoll_time64 => {
-                sys_req!(Ppoll { fds:*, nfds, timeout:ts64, sigmask:*, sigsetsize })
+                sys_req!(Ppoll { fds:*, nfds, timeout: { =*> TimeParam::timespec64 }, sigmask:*, sigsetsize })
             }
             Sysno::poll => {
-                sys_req!(Ppoll { fds:*, nfds, timeout:millis, sigmask: { None }, sigsetsize: { 0 } })
+                sys_req!(Ppoll { fds:*, nfds, timeout: { => TimeParam::Milliseconds }, sigmask: { None }, sigsetsize: { 0 } })
             }
             #[cfg(target_arch = "x86_64")]
             Sysno::select => {
@@ -2602,7 +2603,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:tv,
+                    timeout: { =*> TimeParam::timeval },
                     sigsetpack: { None },
                 })
             }
@@ -2613,7 +2614,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:tv,
+                    timeout: { =*> TimeParam::timeval },
                     sigsetpack: { None },
                 })
             }
@@ -2624,7 +2625,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:ts,
+                    timeout: { =*> TimeParam::timespec_old },
                     sigsetpack:*,
                 })
             }
@@ -2635,7 +2636,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:ts64,
+                    timeout: { =*> TimeParam::timespec64 },
                     sigsetpack:*,
                 })
             }
