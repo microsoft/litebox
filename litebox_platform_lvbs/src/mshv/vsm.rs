@@ -375,24 +375,22 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
     for heki_page in &heki_pages {
         for heki_range in heki_page {
             debug_serial_println!("VSM: Load kernel data {heki_range:?}");
-            let Some(mem) = (match heki_range.heki_kdata_type() {
-                HekiKdataType::SystemCerts => Some(&mut system_certs_mem),
+            match heki_range.heki_kdata_type() {
+                HekiKdataType::SystemCerts => system_certs_mem.extend_range(heki_range)?,
                 HekiKdataType::KexecTrampoline => {
                     kexec_trampoline_metadata.insert_heki_range(heki_range);
-                    None
                 }
-                HekiKdataType::PatchInfo => Some(&mut patch_info_mem),
-                HekiKdataType::KernelInfo => Some(&mut kinfo_mem),
-                HekiKdataType::KernelData => Some(&mut kdata_mem),
+                HekiKdataType::PatchInfo => patch_info_mem.extend_range(heki_range)?,
+                HekiKdataType::KernelInfo => kinfo_mem.extend_range(heki_range)?,
+                HekiKdataType::KernelData => kdata_mem.extend_range(heki_range)?,
                 HekiKdataType::Unknown => {
                     serial_println!("VSM: Invalid kernel data type",);
                     return Err(Errno::EINVAL);
                 }
-                _ => None,
-            }) else {
-                continue;
-            };
-            mem.extend_range(heki_range);
+                _ => {
+                    debug_serial_println!("VSM: Unsupported kernel data not loaded {heki_range:?}");
+                }
+            }
         }
     }
 
@@ -510,13 +508,13 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     for heki_page in &heki_pages {
         for heki_range in heki_page {
-            let Some(mem) = (match heki_range.mod_mem_type() {
+            match heki_range.mod_mem_type() {
                 ModMemType::Unknown => {
                     serial_println!("VSM: Invalid module memory type");
                     return Err(Errno::EINVAL);
                 }
-                ModMemType::ElfBuffer => Some(&mut module_as_elf),
-                ModMemType::Patch => Some(&mut patch_info_for_module),
+                ModMemType::ElfBuffer => module_as_elf.extend_range(heki_range)?,
+                ModMemType::Patch => patch_info_for_module.extend_range(heki_range)?,
                 _ => {
                     // if input memory range's type is neither `Unknown` nor `ElfBuffer`, its addresses must be page-aligned
                     if !heki_range.is_aligned(Size4KiB::SIZE) {
@@ -524,12 +522,9 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
                         return Err(Errno::EINVAL);
                     }
                     module_memory_metadata.insert_heki_range(heki_range);
-                    module_in_memory.get_module_memory(heki_range.mod_mem_type())
+                    module_in_memory.extend_range(heki_range.mod_mem_type(), heki_range)?;
                 }
-            }) else {
-                continue;
-            };
-            mem.extend_range(heki_range);
+            }
         }
     }
 
@@ -740,31 +735,32 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
 
     for heki_page in &heki_pages {
         for heki_range in heki_page {
-            let Some(mem) = (match heki_range.heki_kexec_type() {
+            match heki_range.heki_kexec_type() {
                 HekiKexecType::KexecImage => {
                     kexec_memory_metadata.insert_heki_range(heki_range);
-                    Some(&mut kexec_image)
+                    kexec_image.extend_range(heki_range)?;
                 }
-                HekiKexecType::KexecKernelBlob => {
-                    Some(&mut kexec_kernel_blob)
-                    // we do not protect kexec kernel blob memory
+                HekiKexecType::KexecKernelBlob =>
+                // we do not protect kexec kernel blob memory
+                {
+                    kexec_kernel_blob.extend_range(heki_range)?;
                 }
-                HekiKexecType::KexecPages => {
-                    kexec_memory_metadata.insert_heki_range(heki_range);
-                    None
-                }
+
+                HekiKexecType::KexecPages => kexec_memory_metadata.insert_heki_range(heki_range),
                 HekiKexecType::Unknown => {
                     serial_println!("VSM: Invalid kexec type");
                     return Err(Errno::EINVAL);
                 }
-            }) else {
-                continue;
-            };
-            mem.extend_range(heki_range);
+            }
         }
     }
-    kexec_image.write_bytes_from_heki_range().unwrap();
-    kexec_kernel_blob.write_bytes_from_heki_range().unwrap();
+
+    kexec_image
+        .write_bytes_from_heki_range()
+        .map_err(|_| Errno::EINVAL)?;
+    kexec_kernel_blob
+        .write_bytes_from_heki_range()
+        .map_err(|_| Errno::EINVAL)?;
 
     // If this function is called for crash kexec, we protect its kimage segments as well.
     if is_crash {
@@ -1371,16 +1367,18 @@ impl ModuleMemory {
         Ok(())
     }
 
-    pub(crate) fn get_module_memory(
+    pub(crate) fn extend_range(
         &mut self,
         mod_mem_type: ModMemType,
-    ) -> Option<&mut MemoryContainer> {
+        heki_range: &HekiRange,
+    ) -> Result<(), Errno> {
         match mod_mem_type {
-            ModMemType::Text => Some(&mut self.text),
-            ModMemType::InitText => Some(&mut self.init_text),
-            ModMemType::InitRoData => Some(&mut self.init_rodata),
-            _ => None,
+            ModMemType::Text => self.text.extend_range(heki_range)?,
+            ModMemType::InitText => self.init_text.extend_range(heki_range)?,
+            ModMemType::InitRoData => self.init_rodata.extend_range(heki_range)?,
+            _ => {}
         }
+        Ok(())
     }
 }
 
@@ -1409,7 +1407,7 @@ impl MemoryContainer {
         }
     }
 
-    /// Return the byte length of the memory container including all gaps (never-written virtual pages) it contains
+    /// Return the byte length of the memory container
     pub fn len(&self) -> usize {
         self.buf.len()
     }
@@ -1428,14 +1426,22 @@ impl MemoryContainer {
         })
     }
 
-    pub(crate) fn extend_range(&mut self, heki_range: &HekiRange) {
-        let addr = VirtAddr::try_new(heki_range.va).unwrap();
-        let phys_addr = PhysAddr::try_new(heki_range.pa).unwrap();
+    pub(crate) fn extend_range(&mut self, heki_range: &HekiRange) -> Result<(), Errno> {
+        let addr = VirtAddr::try_new(heki_range.va).map_err(|_| Errno::EINVAL)?;
+        let phys_addr = PhysAddr::try_new(heki_range.pa).map_err(|_| Errno::EINVAL)?;
+        if let Some(last_range) = self.range.last()
+            && last_range.addr + last_range.len != addr
+        {
+            serial_println!("Discontiguous address found {heki_range:?}");
+            // TODO: This should be an error once patch_info is fixed from VTL0
+            // It will simplify patch_info and heki_range parsing as well
+        }
         self.range.push(MemoryRange {
             addr,
             phys_addr,
             len: heki_range.epa - heki_range.pa,
         });
+        Ok(())
     }
 
     /// Write physical memory bytes from VTL0 specified in `HekiRange` at the specified virtual address
