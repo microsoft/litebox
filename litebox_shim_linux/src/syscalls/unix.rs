@@ -250,7 +250,7 @@ impl UnixInitStream {
             UnixEntryInner::Stream(backlog) => {
                 let backlog = backlog.clone();
                 drop(guard);
-                backlog.connect(self, is_nonblocking)
+                backlog.connect(&task.wait_cx(), self, is_nonblocking)
             }
             UnixEntryInner::Datagram(_) => Err((self, Errno::EPROTOTYPE)),
         }
@@ -311,22 +311,34 @@ impl Backlog {
     /// Establishes a connection, blocking if necessary.
     fn connect(
         &self,
-        mut init: UnixInitStream,
+        cx: &WaitContext<'_, crate::Platform>,
+        init: UnixInitStream,
         is_nonblocking: bool,
     ) -> Result<UnixConnectedStream, (UnixInitStream, Errno)> {
-        if is_nonblocking {
-            self.try_connect(init)
-        } else {
-            // TODO: use polling instead of busy loop
-            loop {
-                init = match self.try_connect(init) {
-                    Ok(stream) => return Ok(stream),
-                    Err((init, Errno::EAGAIN)) => init,
-                    Err((init, err)) => return Err((init, err)),
-                };
-                core::hint::spin_loop();
-            }
-        }
+        let mut state = Some(init);
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::OUT,
+            |observer, mask| {
+                self.pollee.register_observer(observer, mask);
+                Ok(())
+            },
+            || match self.try_connect(state.take().unwrap()) {
+                Ok(stream) => Ok(stream),
+                Err((init, err)) => {
+                    let _ = state.replace(init);
+                    if matches!(err, Errno::EAGAIN) {
+                        Err(TryOpError::TryAgain)
+                    } else {
+                        Err(TryOpError::Other(err))
+                    }
+                }
+            },
+        )
+        .map_err(|err| {
+            let err = Errno::from(err);
+            (state.take().unwrap(), err)
+        })
     }
 
     /// Attempts to accept a pending connection without blocking.
@@ -529,22 +541,30 @@ impl UnixConnectedStream {
         self.writer.try_write_one(msg)
     }
 
-    fn sendto(&self, buf: &[u8], is_nonblocking: bool) -> Result<usize, Errno> {
-        let mut msg = Message { data: buf.to_vec() };
-        if is_nonblocking {
-            self.try_sendto(msg).map_err(|(_, err)| err)?;
-            Ok(buf.len())
-        } else {
-            // TODO: use polling instead of busy loop
-            loop {
-                msg = match self.try_sendto(msg) {
-                    Ok(()) => return Ok(buf.len()),
-                    Err((msg, Errno::EAGAIN)) => msg,
-                    Err((_, err)) => return Err(err),
-                };
-                core::hint::spin_loop();
-            }
-        }
+    fn sendto(
+        &self,
+        cx: &WaitContext<'_, crate::Platform>,
+        buf: &[u8],
+        is_nonblocking: bool,
+    ) -> Result<usize, Errno> {
+        let mut msg = Some(Message { data: buf.to_vec() });
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::OUT,
+            |observer, mask| {
+                self.pollee.register_observer(observer, mask);
+                Ok(())
+            },
+            || match self.try_sendto(msg.take().unwrap()) {
+                Ok(()) => Ok(buf.len()),
+                Err((m, Errno::EAGAIN)) => {
+                    let _ = msg.replace(m);
+                    Err(TryOpError::TryAgain)
+                }
+                Err((_, err)) => Err(TryOpError::Other(err)),
+            },
+        )
+        .map_err(Errno::from)
     }
 
     fn try_recvfrom(&self, mut buf: &mut [u8]) -> Result<usize, TryOpError<Errno>> {
@@ -703,22 +723,6 @@ impl Drop for UnixDatagram {
     }
 }
 
-impl Drop for UnixDatagram {
-    fn drop(&mut self) {
-        if let Some((addr, global)) = self.addr.take() {
-            let key = addr.to_key();
-            let mut table = global.unix_addr_table.write();
-            // Only remove the entry if it matches the current socket
-            if let Some(UnixEntry(UnixEntryInner::Datagram(writer))) = table.get(&key)
-                && let Some(reader) = &self.reader
-                && writer.is_pair(reader)
-            {
-                table.remove(&key);
-            }
-        }
-    }
-}
-
 impl UnixDatagram {
     fn new() -> Self {
         Self {
@@ -766,7 +770,8 @@ impl UnixDatagram {
         let key = bound_addr.to_key();
         // Registers the write end of the socket in the global address table so it
         // can receive messages sent to this address.
-        let (writer, reader) = Channel::new(UNIX_BUF_SIZE).split();
+        let (writer, reader) =
+            Channel::new(UNIX_BUF_SIZE, Arc::new(Pollee::new()), self.pollee.clone()).split();
         let _ = task
             .global
             .unix_addr_table
@@ -1054,7 +1059,7 @@ impl UnixSocket {
                 if addr.is_some() {
                     return Err(Errno::EISCONN);
                 }
-                connect.sendto(buf, is_nonblocking)
+                connect.sendto(&task.wait_cx(), buf, is_nonblocking)
             }
             UnixSocketState::Datagram(sock) => sock.sendto(task, buf, is_nonblocking, addr),
         });

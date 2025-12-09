@@ -2369,8 +2369,6 @@ mod tests {
 
 #[cfg(test)]
 mod unix_tests {
-    use core::time::Duration;
-
     use alloc::{string::ToString, vec::Vec};
     use litebox::{event::Events, platform::RawConstPointer};
     use litebox_common_linux::{
@@ -2393,7 +2391,7 @@ mod unix_tests {
             server_fd,
             SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
         )?;
-        task.do_listen(server_fd, 128)?;
+        task.do_listen(server_fd, 1)?;
         Ok(server_fd)
     }
 
@@ -2628,14 +2626,24 @@ mod unix_tests {
             } else {
                 SockFlags::empty()
             },
-        ).unwrap();
+        )
+        .unwrap();
 
-        task.spawn_clone_for_test(|task| {
-            std::thread::sleep(Duration::from_millis(500));
+        task.spawn_clone_for_test(move |task| {
             let mut client_fds = Vec::new();
             for _ in 0..10 {
-                std::thread::sleep(Duration::from_millis(100));
-                let client_fd = create_unix_socket(&task, SockFlags::empty());
+                let client_fd = create_unix_socket(
+                    &task,
+                    SockType::Stream,
+                    if is_nonblocking {
+                        SockFlags::NONBLOCK
+                    } else {
+                        SockFlags::empty()
+                    },
+                );
+                if is_nonblocking {
+                    ppoll(&task, server_fd, Events::OUT);
+                }
                 task.do_connect(
                     client_fd,
                     SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
@@ -2644,9 +2652,7 @@ mod unix_tests {
                 client_fds.push(client_fd);
             }
 
-            std::thread::sleep(Duration::from_millis(500));
             for (i, client_fd) in client_fds.iter().enumerate() {
-                std::thread::sleep(Duration::from_millis(100));
                 let msg = alloc::format!("message from connection {i}");
                 let n = task
                     .do_sendto(
