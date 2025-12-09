@@ -1095,7 +1095,7 @@ impl Task {
                 let file = file.clone();
                 drop(file_table); // Drop before possibly-blocking `accept`
                 let mut socket_addr = peer.is_some().then_some(UnixSocketAddr::Unnamed);
-                let accepted_file = file.accept(flags, socket_addr.as_mut())?;
+                let accepted_file = file.accept(&self.wait_cx(), flags, socket_addr.as_mut())?;
                 if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
                     *peer = SocketAddress::Unix(socket_addr);
                 }
@@ -2369,10 +2369,13 @@ mod tests {
 
 #[cfg(test)]
 mod unix_tests {
+    use core::time::Duration;
+
     use alloc::{string::ToString, vec::Vec};
-    use litebox::platform::RawConstPointer;
+    use litebox::{event::Events, platform::RawConstPointer};
     use litebox_common_linux::{
-        AddressFamily, AtFlags, ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno,
+        AddressFamily, AtFlags, ReceiveFlags, SendFlags, SockFlags, SockType, TimeParam,
+        errno::Errno,
     };
 
     use crate::{
@@ -2397,6 +2400,27 @@ mod unix_tests {
     fn close_socket(task: &crate::Task, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
             .expect("close socket failed");
+    }
+
+    fn ppoll(task: &Task, fd: u32, events: Events) {
+        let fd = i32::try_from(fd).unwrap();
+        let mut pollfd = [litebox_common_linux::Pollfd {
+            fd,
+            events: i16::try_from(events.bits()).unwrap(),
+            revents: 0,
+        }];
+
+        let n = task
+            .sys_ppoll(
+                MutPtr::from_usize(pollfd.as_mut_ptr() as usize),
+                1,
+                TimeParam::None,
+                None,
+                0,
+            )
+            .expect("ppoll");
+        assert!(n != 0);
+        assert!(pollfd[0].revents != 0);
     }
 
     #[test]
@@ -2593,46 +2617,82 @@ mod unix_tests {
         close_socket(&task, client_fd);
     }
 
-    #[test]
-    fn test_multiple_unix_stream_connections() {
+    fn test_multiple_unix_stream_connections(is_nonblocking: bool) {
         let task = init_platform(None);
         let addr = "/unix_multi_stream_socket.sock";
-        let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
+        let server_fd = create_unix_server_socket(
+            &task,
+            addr,
+            if is_nonblocking {
+                SockFlags::NONBLOCK
+            } else {
+                SockFlags::empty()
+            },
+        ).unwrap();
 
-        let mut client_fds = Vec::new();
+        task.spawn_clone_for_test(|task| {
+            std::thread::sleep(Duration::from_millis(500));
+            let mut client_fds = Vec::new();
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(100));
+                let client_fd = create_unix_socket(&task, SockFlags::empty());
+                task.do_connect(
+                    client_fd,
+                    SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+                )
+                .unwrap();
+                client_fds.push(client_fd);
+            }
+
+            std::thread::sleep(Duration::from_millis(500));
+            for (i, client_fd) in client_fds.iter().enumerate() {
+                std::thread::sleep(Duration::from_millis(100));
+                let msg = alloc::format!("message from connection {i}");
+                let n = task
+                    .do_sendto(
+                        *client_fd,
+                        ConstPtr::from_usize(msg.as_ptr() as usize),
+                        msg.len(),
+                        SendFlags::empty(),
+                        None,
+                    )
+                    .expect("sendto failed");
+                assert_eq!(n, msg.len());
+            }
+
+            for client_fd in client_fds {
+                close_socket(&task, client_fd);
+            }
+        });
+
         let mut server_conn_fds = Vec::new();
         for _ in 0..10 {
-            let client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
-            task.do_connect(
-                client_fd,
-                SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
-            )
-            .unwrap();
-            client_fds.push(client_fd);
-
-            let server_conn = task.do_accept(server_fd, None, SockFlags::empty()).unwrap();
+            if is_nonblocking {
+                ppoll(&task, server_fd, Events::IN);
+            }
+            let server_conn = task
+                .do_accept(
+                    server_fd,
+                    None,
+                    if is_nonblocking {
+                        SockFlags::NONBLOCK
+                    } else {
+                        SockFlags::empty()
+                    },
+                )
+                .unwrap();
             server_conn_fds.push(server_conn);
         }
 
-        for (i, (client_fd, server_conn_fd)) in
-            client_fds.iter().zip(server_conn_fds.iter()).enumerate()
-        {
+        for (i, server_conn_fd) in server_conn_fds.iter().enumerate() {
             let msg = alloc::format!("message from connection {i}");
-            let n = task
-                .do_sendto(
-                    *server_conn_fd,
-                    ConstPtr::from_usize(msg.as_ptr() as usize),
-                    msg.len(),
-                    SendFlags::empty(),
-                    None,
-                )
-                .expect("sendto failed");
-            assert_eq!(n, msg.len());
-
             let mut buf = [0u8; 64];
+            if is_nonblocking {
+                ppoll(&task, *server_conn_fd, Events::IN);
+            }
             let n = task
                 .do_recvfrom(
-                    *client_fd,
+                    *server_conn_fd,
                     MutPtr::from_usize(buf.as_mut_ptr() as usize),
                     buf.len(),
                     ReceiveFlags::empty(),
@@ -2643,13 +2703,20 @@ mod unix_tests {
             assert_eq!(&buf[..n], msg.as_bytes());
         }
 
-        for client_fd in client_fds {
-            close_socket(&task, client_fd);
-        }
         for server_conn_fd in server_conn_fds {
             close_socket(&task, server_conn_fd);
         }
         close_socket(&task, server_fd);
+    }
+
+    #[test]
+    fn test_multiple_blocking_unix_stream_connections() {
+        test_multiple_unix_stream_connections(false);
+    }
+
+    #[test]
+    fn test_multiple_non_blocking_unix_stream_connections() {
+        test_multiple_unix_stream_connections(true);
     }
 
     #[test]

@@ -303,6 +303,8 @@ impl Backlog {
 
         let (client, server) = init.into_connected(self.addr.clone());
         sockets.push_back(server);
+
+        self.pollee.notify_observers(Events::IN);
         Ok(client)
     }
 
@@ -328,34 +330,36 @@ impl Backlog {
     }
 
     /// Attempts to accept a pending connection without blocking.
-    fn try_accept(&self) -> Result<UnixConnectedStream, Errno> {
+    fn try_accept(&self) -> Result<UnixConnectedStream, TryOpError<Errno>> {
         let mut sockets = self.sockets.lock();
         let Some(sockets) = &mut *sockets else {
             // the server socket is shutdown
-            return Err(Errno::ECONNREFUSED);
+            return Err(TryOpError::Other(Errno::ECONNREFUSED));
         };
 
         match sockets.pop_front() {
-            Some(stream) => Ok(stream),
-            None => Err(Errno::EAGAIN),
+            Some(stream) => {
+                self.pollee.notify_observers(Events::OUT);
+                Ok(stream)
+            }
+            None => Err(TryOpError::TryAgain),
         }
     }
 
-    /// Accepts a pending connection, blocking if necessary.
-    fn accept(&self, is_nonblocking: bool) -> Result<UnixConnectedStream, Errno> {
-        if is_nonblocking {
-            self.try_accept()
-        } else {
-            // TODO: use polling instead of busy loop
-            loop {
-                match self.try_accept() {
-                    Ok(stream) => return Ok(stream),
-                    Err(Errno::EAGAIN) => {}
-                    Err(err) => return Err(err),
-                }
-                core::hint::spin_loop();
-            }
+    fn check_io_events(&self) -> Events {
+        let limit = self.limit.load(Ordering::Relaxed);
+        let sockets = self.sockets.lock();
+        let Some(sockets) = &*sockets else {
+            return Events::HUP;
+        };
+        let mut events = Events::empty();
+        if !sockets.is_empty() {
+            events |= Events::IN;
         }
+        if sockets.len() < limit as usize {
+            events |= Events::OUT;
+        }
+        events
     }
 
     /// Shuts down this backlog, preventing new connections.
@@ -377,9 +381,30 @@ impl UnixListenStream {
         self.backlog.set_backlog(backlog);
     }
 
+    fn register_observer(
+        &self,
+        observer: Weak<dyn litebox::event::observer::Observer<litebox::event::Events>>,
+        mask: litebox::event::Events,
+    ) {
+        self.backlog.pollee.register_observer(observer, mask);
+    }
+
     /// Accepts a pending connection.
-    fn accept(&self, is_nonblocking: bool) -> Result<UnixConnectedStream, Errno> {
-        self.backlog.accept(is_nonblocking)
+    fn accept(
+        &self,
+        cx: &WaitContext<'_, crate::Platform>,
+        is_nonblocking: bool,
+    ) -> Result<UnixConnectedStream, Errno> {
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::IN,
+            |observer, mask| {
+                self.register_observer(observer, mask);
+                Ok(())
+            },
+            || self.backlog.try_accept(),
+        )
+        .map_err(Errno::from)
     }
 
     /// Returns the local address this socket is bound to.
@@ -552,33 +577,24 @@ impl UnixConnectedStream {
         Ok(total_read)
     }
 
-    // fn recvfrom(
-    //     &self,
-    //     buf: &mut [u8],
-    //     is_nonblocking: bool,
-    //     source_addr: Option<&mut Option<UnixSocketAddr>>,
-    // ) -> Result<usize, Errno> {
-    //     if let Some(source_addr) = source_addr {
-    //         *source_addr = None;
-    //     }
-    //     let ret = if is_nonblocking {
-    //         self.try_recvfrom(buf)
-    //     } else {
-    //         // TODO: use polling instead of busy loop
-    //         loop {
-    //             match self.try_recvfrom(buf) {
-    //                 Ok(size) => break Ok(size),
-    //                 Err(Errno::EAGAIN) => {}
-    //                 Err(err) => break Err(err),
-    //             }
-    //             core::hint::spin_loop();
-    //         }
-    //     };
-    //     match ret {
-    //         Err(Errno::ESHUTDOWN) => Ok(0),
-    //         other => other,
-    //     }
-    // }
+    fn check_io_events(&self) -> Events {
+        let mut events = Events::empty();
+        let is_read_shutdown = self.reader.is_shutdown();
+        let is_write_shutdown = self.writer.is_shutdown();
+        if is_read_shutdown {
+            events |= Events::RDHUP | Events::IN;
+            if is_write_shutdown {
+                events |= Events::HUP;
+            }
+        }
+        if !self.reader.is_empty() {
+            events |= Events::IN;
+        }
+        if !self.writer.is_full() {
+            events |= Events::OUT;
+        }
+        events
+    }
 }
 
 /// A datagram message with source address information
@@ -989,12 +1005,17 @@ impl UnixSocket {
 
     pub(super) fn accept(
         &self,
+        cx: &WaitContext<'_, crate::Platform>,
         flags: SockFlags,
         peer: Option<&mut UnixSocketAddr>,
     ) -> Result<UnixSocket, Errno> {
         self.with_state_ref(|state| match state {
             UnixSocketState::ListenStream(listen) => {
-                let accepted = listen.accept(self.get_status().contains(OFlags::NONBLOCK))?;
+                let accepted = listen.accept(
+                    cx,
+                    self.get_status().contains(OFlags::NONBLOCK)
+                        | flags.contains(SockFlags::NONBLOCK),
+                )?;
                 if let Some(peer) = peer {
                     *peer = accepted.get_peer_addr();
                 }
@@ -1064,7 +1085,6 @@ impl UnixSocket {
         let ret = self.with_state_ref(|state| match state {
             UnixSocketState::InitStream(_) | UnixSocketState::ListenStream(_) => Err(Errno::EINVAL),
             UnixSocketState::ConnectedStream(connect) => {
-                // connect.recvfrom(buf, is_nonblocking, source_addr);
                 if let Some(source_addr) = source_addr {
                     *source_addr = None;
                 }
@@ -1128,23 +1148,26 @@ impl UnixSocket {
 impl IOPollable for UnixSocket {
     fn register_observer(
         &self,
-        observer: Weak<dyn litebox::event::observer::Observer<litebox::event::Events>>,
-        mask: litebox::event::Events,
+        observer: Weak<dyn litebox::event::observer::Observer<Events>>,
+        mask: Events,
     ) {
         self.with_state_ref(|state| match state {
             UnixSocketState::InitStream(init) => init.pollee.register_observer(observer, mask),
-            UnixSocketState::ListenStream(listen) => {
-                listen.backlog.pollee.register_observer(observer, mask)
-            }
+            UnixSocketState::ListenStream(listen) => listen.register_observer(observer, mask),
             UnixSocketState::ConnectedStream(connect) => {
-                connect.pollee.register_observer(observer, mask)
+                connect.pollee.register_observer(observer, mask);
             }
             UnixSocketState::Datagram(sock) => sock.pollee.register_observer(observer, mask),
-        })
+        });
     }
 
-    fn check_io_events(&self) -> litebox::event::Events {
-        todo!()
+    fn check_io_events(&self) -> Events {
+        self.with_state_ref(|state| match state {
+            UnixSocketState::InitStream(_) => Events::OUT | Events::HUP,
+            UnixSocketState::ListenStream(listen) => listen.backlog.check_io_events(),
+            UnixSocketState::ConnectedStream(conn) => conn.check_io_events(),
+            UnixSocketState::Datagram(_) => todo!(),
+        })
     }
 }
 

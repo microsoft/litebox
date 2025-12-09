@@ -7,12 +7,12 @@ use litebox::{
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
 use litebox_common_linux::errno::Errno;
-use ringbuf::traits::{Consumer as _, Producer as _};
+use ringbuf::traits::{Consumer as _, Observer as _, Producer as _};
 
 macro_rules! common_functions_for_channel {
     () => {
         /// Has this been shut down?
-        fn is_shutdown(&self) -> bool {
+        pub(crate) fn is_shutdown(&self) -> bool {
             self.endpoint.is_shutdown()
         }
 
@@ -67,6 +67,10 @@ impl<T> ReadEnd<T> {
         if let Some(peer) = self.peer.upgrade() {
             peer.pollee.notify_observers(litebox::event::Events::OUT);
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.endpoint.rb.lock().is_empty()
     }
 
     /// Peeks at the first item in the channel and conditionally consumes it.
@@ -128,6 +132,10 @@ impl<T> WriteEnd<T> {
             }
             Err(e) => Err((e, Errno::EAGAIN)),
         }
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.endpoint.rb.lock().is_full()
     }
 
     pub(crate) fn is_pair(&self, reader: &ReadEnd<T>) -> bool {
