@@ -746,6 +746,17 @@ impl GlobalState {
     }
 }
 
+fn parse_type_and_flags(type_and_flags: u32) -> Result<(SockType, SockFlags), Errno> {
+    let ty = type_and_flags & 0x0f;
+    let flags = type_and_flags & !0x0f;
+    let ty = SockType::try_from(ty).map_err(|_| {
+        log_unsupported!("socket(type = {ty})");
+        Errno::EINVAL
+    })?;
+    let flags = SockFlags::from_bits_truncate(flags);
+    Ok((ty, flags))
+}
+
 impl Task {
     /// Handle syscall `socket`
     pub(crate) fn sys_socket(
@@ -754,17 +765,11 @@ impl Task {
         type_and_flags: u32,
         protocol: u8,
     ) -> Result<u32, Errno> {
-        let ty = type_and_flags & 0x0f;
-        let flags = type_and_flags & !0x0f;
+        let (ty, flags) = parse_type_and_flags(type_and_flags)?;
         let domain = AddressFamily::try_from(domain).map_err(|_| {
             log_unsupported!("socket(domain = {domain})");
             Errno::EINVAL
         })?;
-        let ty = SockType::try_from(ty).map_err(|_| {
-            log_unsupported!("socket(type = {ty})");
-            Errno::EINVAL
-        })?;
-        let flags = SockFlags::from_bits_truncate(flags);
         self.do_socket(domain, ty, flags, protocol)
     }
     fn do_socket(
@@ -826,6 +831,83 @@ impl Task {
                     .expect("closing descriptor should succeed");
                 Errno::EMFILE
             })
+    }
+
+    pub(crate) fn sys_socketpair(
+        &self,
+        domain: u32,
+        type_and_flags: u32,
+        protocol: u8,
+        sockvec: MutPtr<u32>,
+    ) -> Result<(), Errno> {
+        let (ty, flags) = parse_type_and_flags(type_and_flags)?;
+        let domain = AddressFamily::try_from(domain).map_err(|_| {
+            log_unsupported!("socket(domain = {domain})");
+            Errno::EINVAL
+        })?;
+        let (sock1, sock2) = self.do_socketpair(domain, ty, flags, protocol)?;
+        unsafe { sockvec.write_at_offset(0, sock1) }.ok_or(Errno::EFAULT)?;
+        unsafe { sockvec.write_at_offset(1, sock2) }.ok_or(Errno::EFAULT)?;
+        Ok(())
+    }
+    fn do_socketpair(
+        &self,
+        domain: AddressFamily,
+        ty: SockType,
+        flags: SockFlags,
+        protocol: u8,
+    ) -> Result<(u32, u32), Errno> {
+        let (desc1, desc2) = match domain {
+            AddressFamily::UNIX => {
+                let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
+                let (sock1, sock2) =
+                    UnixSocket::new_connected_pair(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
+                let file1 = Descriptor::Unix {
+                    file: Arc::new(sock1),
+                    close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
+                };
+                let file2 = Descriptor::Unix {
+                    file: Arc::new(sock2),
+                    close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
+                };
+                (file1, file2)
+            }
+            AddressFamily::INET | AddressFamily::INET6 | AddressFamily::NETLINK => {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            _ => {
+                log_unsupported!("socketpair(domain = {domain:?})");
+                return Err(Errno::EAFNOSUPPORT);
+            }
+        };
+        let files = self.files.borrow();
+        let fd1 = files
+            .file_descriptors
+            .write()
+            .insert(self, desc1)
+            .map_err(|desc| {
+                self.do_close(desc)
+                    .expect("closing descriptor should succeed");
+            });
+        let Ok(fd1) = fd1 else {
+            self.do_close(desc2)
+                .expect("closing descriptor should succeed");
+            return Err(Errno::EMFILE);
+        };
+        let fd2 = files
+            .file_descriptors
+            .write()
+            .insert(self, desc2)
+            .map_err(|desc| {
+                self.do_close(desc)
+                    .expect("closing descriptor should succeed");
+            });
+        let Ok(fd2) = fd2 else {
+            self.sys_close(i32::try_from(fd1).unwrap())
+                .expect("close should succeed");
+            return Err(Errno::EMFILE);
+        };
+        Ok((fd1, fd2))
     }
 }
 pub(crate) fn read_sockaddr_from_user(
@@ -1515,6 +1597,14 @@ impl Task {
                     domain: 0,
                     type_and_flags: 1,
                     protocol: 2,
+                })
+            }
+            SocketcallType::Socketpair => {
+                parse_socketcall_args!(4 => sys_socketpair {
+                    domain: 0,
+                    type_and_flags: 1,
+                    protocol: 2,
+                    sv: [ 3 ],
                 })
             }
             SocketcallType::Bind => {
@@ -2517,5 +2607,73 @@ mod unix_tests {
         .unwrap();
         close_socket(&task, client2_fd);
         close_socket(&task, server2_fd);
+    }
+
+    #[test]
+    fn test_unix_socketpair_bidirectional() {
+        let task = init_platform(None);
+        let mut sv_ptr = alloc::vec![0u32; 2];
+        let sv_mut_ptr = MutPtr::from_usize(sv_ptr.as_mut_ptr() as usize);
+
+        task.sys_socketpair(
+            AddressFamily::UNIX as u32,
+            SockType::Stream as u32,
+            0,
+            sv_mut_ptr,
+        )
+        .unwrap();
+
+        let sock1 = sv_ptr[0];
+        let sock2 = sv_ptr[1];
+
+        // Send from sock1 to sock2
+        let msg1 = "Message from sock1";
+        task.do_sendto(
+            sock1,
+            ConstPtr::from_usize(msg1.as_ptr().expose_provenance()),
+            msg1.len(),
+            SendFlags::empty(),
+            None,
+        )
+        .expect("sendto failed");
+
+        // Send from sock2 to sock1
+        let msg2 = "Message from sock2";
+        task.do_sendto(
+            sock2,
+            ConstPtr::from_usize(msg2.as_ptr().expose_provenance()),
+            msg2.len(),
+            SendFlags::empty(),
+            None,
+        )
+        .expect("sendto failed");
+
+        // Receive on sock2 (from sock1)
+        let mut buf = [0u8; 64];
+        let n = task
+            .do_recvfrom(
+                sock2,
+                MutPtr::from_usize(buf.as_mut_ptr() as usize),
+                buf.len(),
+                ReceiveFlags::empty(),
+                None,
+            )
+            .expect("recvfrom failed");
+        assert_eq!(&buf[..n], msg1.as_bytes());
+
+        // Receive on sock1 (from sock2)
+        let n = task
+            .do_recvfrom(
+                sock1,
+                MutPtr::from_usize(buf.as_mut_ptr() as usize),
+                buf.len(),
+                ReceiveFlags::empty(),
+                None,
+            )
+            .expect("recvfrom failed");
+        assert_eq!(&buf[..n], msg2.as_bytes());
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
     }
 }

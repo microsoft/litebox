@@ -755,6 +755,21 @@ impl UnixSocket {
         })
     }
 
+    pub(super) fn new_connected_pair(
+        ty: SockType,
+        flags: SockFlags,
+    ) -> Option<(UnixSocket, UnixSocket)> {
+        let (conn1, conn2) = UnixConnectedStream::new_pair(None, None);
+        match ty {
+            SockType::Stream => Some((
+                UnixSocket::new_with_state(UnixSocketState::ConnectedStream(conn1), flags),
+                UnixSocket::new_with_state(UnixSocketState::ConnectedStream(conn2), flags),
+            )),
+            SockType::Datagram => unimplemented!("datagram unix socket"),
+            _ => None,
+        }
+    }
+
     super::common_functions_for_file_status!();
 }
 
