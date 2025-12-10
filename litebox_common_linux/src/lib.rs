@@ -1648,7 +1648,7 @@ pub enum PrctlArg<Platform: litebox::platform::RawPointerProvider> {
     CapBSetRead(usize),
 }
 
-#[repr(u32)]
+#[repr(i32)]
 #[derive(Debug, IntEnum)]
 pub enum IntervalTimer {
     /// This timer counts down in real (i.e., wall clock) time.  At each expiration, a SIGALRM signal is generated.
@@ -2022,6 +2022,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sigsetsize: usize,
     },
     EpollCreate {
+        size: i32,
         flags: EpollCreateFlags,
     },
     Ppoll {
@@ -2131,7 +2132,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         rlim: Platform::RawConstPointer<Rlimit>,
     },
     Prlimit {
-        pid: Option<i32>,
+        pid: i32,
         /// The resource for which the limit is being queried.
         resource: RlimitResource,
         /// If the new_limit argument is not a None, then the rlimit structure to which it points
@@ -2216,6 +2217,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
     /// Ideally, this function would not panic. However, since it is currently under development, it
     /// is allowed to panic upon receiving a syscall number (or arguments) that it does not know how
     /// to handle.
+    // NOTE: This function is intended to be mostly trivial (in the future, we intend to replace
+    // this entire function with a simple type-driven macro), thus any non-trivial parsing should
+    // happen outside of this. Roughly speaking, if it is a simple integer, pointer, or a flag
+    // field, it is fine; anything more complex should not attempt to do more, and must instead
+    // perform the actual "parsing" outside. It is ok to introduce new `impl`s for
+    // `ReinterpretTruncatedFromUsize` in order to support stronger types (especially if one desires
+    // a fail-free parse), but also quite helpful is to define a `TryFrom<i32>` and use the `:?`
+    // combinator (which will return `EINVAL` upon parse failure).
     pub fn try_from_raw(
         syscall_number: usize,
         ctx: &PtRegs,
@@ -2234,6 +2243,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
         // in order; if something needs to be a pointer and you forget (or accidentally mark
         // something as a pointer) the type checker will complain and remind you (due to the nice
         // attributes on the relevant traits), so you shouldn't need to worry about that.
+        //
+        // NOTE: This macro should seldom (if ever) be updated. Usually if you think you need to
+        // update this, you probably need to introduce an `impl` instead.
         macro_rules! sys_req {
             ($id:ident { $( $field:ident $(:$star:tt)?),* $(,)? }) => {
                 sys_req!(
@@ -2250,24 +2262,23 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: ctx.sys_req_ptr($n), ]
                 )
             };
-            (@[$id:ident] [ $f:ident : ts64 $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+            (@[$id:ident] [ $f:ident : ? $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
                 sys_req!(
-                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::timespec64(ctx.sys_req_ptr($n)), ]
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: ctx.sys_req_arg::<i32>($n).try_into().or(Err(errno::Errno::EINVAL))?, ]
                 )
             };
-            (@[$id:ident] [ $f:ident : tv $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+            (@[$id:ident] [ $f:ident : { =*> $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                // `{ =*> e }`: temporary syntax to support removing some hard-coded bits
+                // NOTE: Please do NOT use this for any new syscalls added
                 sys_req!(
-                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::timeval(ctx.sys_req_ptr($n)), ]
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: { $e ( ctx.sys_req_ptr($n) ) }, ]
                 )
             };
-            (@[$id:ident] [ $f:ident : ts $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+            (@[$id:ident] [ $f:ident : { => $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                // `{ => e }`: temporary syntax to support removing some hard-coded bits
+                // NOTE: Please do NOT use this for any new syscalls added
                 sys_req!(
-                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::timespec_old(ctx.sys_req_ptr($n)), ]
-                )
-            };
-            (@[$id:ident] [ $f:ident : millis $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
-                sys_req!(
-                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: TimeParam::Milliseconds(ctx.sys_req_arg($n)), ]
+                    @[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: { $e ( ctx.sys_req_arg($n) ) }, ]
                 )
             };
             (@[$id:ident] [ $f:ident : { $e:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
@@ -2315,32 +2326,18 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::munmap => sys_req!(Munmap { addr:*, length }),
             Sysno::brk => sys_req!(Brk { addr:* }),
             Sysno::mremap => sys_req!(Mremap { old_addr:*, old_size, new_size, flags, new_addr }),
-            Sysno::rt_sigprocmask => {
-                let how: i32 = ctx.sys_req_arg(0);
-                if let Ok(how) = signal::SigmaskHow::try_from(how) {
-                    sys_req!(RtSigprocmask {
-                        how: { how },
-                        set:*,
-                        oldset:*,
-                        sigsetsize,
-                    })
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
-            Sysno::rt_sigaction => {
-                let signum: i32 = ctx.sys_req_arg(0);
-                if let Ok(signum) = signal::Signal::try_from(signum) {
-                    sys_req!(RtSigaction {
-                        signum: { signum },
-                        act:*,
-                        oldact:*,
-                        sigsetsize,
-                    })
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::rt_sigprocmask => sys_req!(RtSigprocmask {
+                how:?,
+                set:*,
+                oldset:*,
+                sigsetsize,
+            }),
+            Sysno::rt_sigaction => sys_req!(RtSigaction {
+                signum:?,
+                act:*,
+                oldact:*,
+                sigsetsize,
+            }),
             Sysno::rt_sigreturn => SyscallRequest::RtSigreturn,
             #[cfg(target_arch = "x86")]
             Sysno::sigreturn => SyscallRequest::Sigreturn,
@@ -2399,14 +2396,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::access => sys_req!(Access { pathname:*, mode }),
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
-            Sysno::madvise => {
-                let behavior: i32 = ctx.sys_req_arg(2);
-                if let Ok(behavior) = MadviseBehavior::try_from(behavior) {
-                    sys_req!(Madvise { addr:*, length, behavior: { behavior } })
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),
                 newfd: None,
@@ -2492,18 +2482,26 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
-            Sysno::clock_gettime => sys_req!(ClockGettime { clockid, tp: ts }),
+            Sysno::clock_gettime => {
+                sys_req!(ClockGettime { clockid, tp: { =*> TimeParam::timespec_old } })
+            }
             #[cfg(target_arch = "x86")]
-            Sysno::clock_gettime64 => sys_req!(ClockGettime { clockid, tp: ts64 }),
-            Sysno::clock_getres => sys_req!(ClockGetres { clockid, res: ts }),
+            Sysno::clock_gettime64 => {
+                sys_req!(ClockGettime { clockid, tp: { =*> TimeParam::timespec64 } })
+            }
+            Sysno::clock_getres => {
+                sys_req!(ClockGetres { clockid, res: { =*> TimeParam::timespec_old } })
+            }
             #[cfg(target_arch = "x86")]
-            Sysno::clock_getres_time64 => sys_req!(ClockGetres { clockid, res: ts64 }),
+            Sysno::clock_getres_time64 => {
+                sys_req!(ClockGetres { clockid, res: { =*> TimeParam::timespec64 } })
+            }
             Sysno::clock_nanosleep => {
                 sys_req!(ClockNanosleep {
                     clockid,
                     flags,
-                    request: ts,
-                    remain: ts,
+                    request: { =*> TimeParam::timespec_old },
+                    remain: { =*> TimeParam::timespec_old },
                 })
             }
             #[cfg(target_arch = "x86")]
@@ -2511,13 +2509,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 sys_req!(ClockNanosleep {
                     clockid,
                     flags,
-                    request: ts64,
-                    remain: ts64,
+                    request: { =*> TimeParam::timespec64 },
+                    remain: { =*> TimeParam::timespec64 },
                 })
             }
             Sysno::nanosleep => sys_req!(ClockNanosleep {
-                request: ts,
-                remain: ts,
+                request: { =*> TimeParam::timespec_old },
+                remain: { =*> TimeParam::timespec_old },
                 clockid: { ClockId::Monotonic.into() },
                 flags: { TimerFlags::empty() },
             }),
@@ -2526,95 +2524,38 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::readlink => sys_req!(Readlink { pathname:*, buf:* ,bufsiz }),
             Sysno::readlinkat => sys_req!(Readlinkat { dirfd, pathname:*, buf:*, bufsiz }),
             #[cfg(target_arch = "x86_64")]
-            Sysno::getrlimit => {
-                let resource: i32 = ctx.sys_req_arg(0);
-                if let Ok(resource) = RlimitResource::try_from(resource) {
-                    SyscallRequest::Getrlimit {
-                        resource,
-                        rlim: ctx.sys_req_ptr(1),
-                    }
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::getrlimit => sys_req!(Getrlimit { resource:?, rlim:* }),
             #[cfg(target_arch = "x86")]
-            Sysno::ugetrlimit => {
-                let resource: i32 = ctx.sys_req_arg(0);
-                if let Ok(resource) = RlimitResource::try_from(resource) {
-                    SyscallRequest::Getrlimit {
-                        resource,
-                        rlim: ctx.sys_req_ptr(1),
-                    }
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
-            Sysno::setrlimit => {
-                let resource: i32 = ctx.sys_req_arg(0);
-                if let Ok(resource) = RlimitResource::try_from(resource) {
-                    SyscallRequest::Setrlimit {
-                        resource,
-                        rlim: ctx.sys_req_ptr(1),
-                    }
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
-            Sysno::prlimit64 => {
-                let pid: i32 = ctx.sys_req_arg(0);
-                let resource: i32 = ctx.sys_req_arg(1);
-                if let Ok(resource) = RlimitResource::try_from(resource) {
-                    SyscallRequest::Prlimit {
-                        pid: if pid == 0 { None } else { Some(pid) },
-                        resource,
-                        new_limit: ctx.sys_req_ptr(2),
-                        old_limit: ctx.sys_req_ptr(3),
-                    }
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::ugetrlimit => sys_req!(Getrlimit { resource:?, rlim:* }),
+            Sysno::setrlimit => sys_req!(Setrlimit { resource:?, rlim:* }),
+            Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
-            Sysno::epoll_ctl => {
-                let op: i32 = ctx.sys_req_arg(1);
-                if let Ok(op) = EpollOp::try_from(op) {
-                    sys_req!(EpollCtl { epfd, op: {op}, fd, event:*, })
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
             Sysno::epoll_wait => {
                 sys_req!(EpollPwait { epfd, events:*, maxevents, timeout, sigmask: { None }, sigsetsize: { 0 }, })
             }
             Sysno::epoll_pwait => {
                 sys_req!(EpollPwait { epfd, events:*, maxevents, timeout, sigmask:*, sigsetsize })
             }
-            Sysno::epoll_create => {
-                // the `size` argument is ignored, but must be greater than zero;
-                let size: i32 = ctx.sys_req_arg(0);
-                if size > 0 {
-                    SyscallRequest::EpollCreate {
-                        flags: EpollCreateFlags::empty(),
-                    }
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
-            Sysno::epoll_create1 => sys_req!(EpollCreate { flags }),
+            Sysno::epoll_create => sys_req!(EpollCreate {
+                size,
+                flags: { EpollCreateFlags::empty() }
+            }),
+            Sysno::epoll_create1 => sys_req!(EpollCreate { flags, size: { 1 } }),
             Sysno::ppoll => {
-                sys_req!(Ppoll { fds:*, nfds, timeout:ts, sigmask:*, sigsetsize })
+                sys_req!(Ppoll { fds:*, nfds, timeout: { =*> TimeParam::timespec_old }, sigmask:*, sigsetsize })
             }
             #[cfg(target_arch = "x86")]
             Sysno::ppoll_time64 => {
-                sys_req!(Ppoll { fds:*, nfds, timeout:ts64, sigmask:*, sigsetsize })
+                sys_req!(Ppoll { fds:*, nfds, timeout: { =*> TimeParam::timespec64 }, sigmask:*, sigsetsize })
             }
             Sysno::poll => {
-                sys_req!(Ppoll { fds:*, nfds, timeout:millis, sigmask: { None }, sigsetsize: { 0 } })
+                sys_req!(Ppoll { fds:*, nfds, timeout: { => TimeParam::Milliseconds }, sigmask: { None }, sigsetsize: { 0 } })
             }
             #[cfg(target_arch = "x86_64")]
             Sysno::select => {
@@ -2623,7 +2564,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:tv,
+                    timeout: { =*> TimeParam::timeval },
                     sigsetpack: { None },
                 })
             }
@@ -2634,7 +2575,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:tv,
+                    timeout: { =*> TimeParam::timeval },
                     sigsetpack: { None },
                 })
             }
@@ -2645,7 +2586,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:ts,
+                    timeout: { =*> TimeParam::timespec_old },
                     sigsetpack:*,
                 })
             }
@@ -2656,7 +2597,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     readfds:*,
                     writefds:*,
                     exceptfds:*,
-                    timeout:ts64,
+                    timeout: { =*> TimeParam::timespec64 },
                     sigsetpack:*,
                 })
             }
@@ -2802,14 +2743,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
-            Sysno::setitimer => {
-                let which: u32 = ctx.sys_req_arg(0);
-                if let Ok(which) = IntervalTimer::try_from(which) {
-                    sys_req!(SetITimer { which: {which}, new_value:*, old_value:* })
-                } else {
-                    return Err(errno::Errno::EINVAL);
-                }
-            }
+            Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

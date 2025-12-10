@@ -822,8 +822,13 @@ impl Task {
                 fd,
                 event,
             } => syscall!(sys_epoll_ctl(epfd, op, fd, event)),
-            SyscallRequest::EpollCreate { flags } => {
-                syscall!(sys_epoll_create(flags))
+            SyscallRequest::EpollCreate { size, flags } => {
+                // the `size` argument is ignored, but must be greater than zero;
+                if size > 0 {
+                    syscall!(sys_epoll_create(flags))
+                } else {
+                    Err(Errno::EINVAL)
+                }
             }
             SyscallRequest::EpollPwait {
                 epfd,
