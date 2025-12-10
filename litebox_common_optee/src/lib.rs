@@ -1334,7 +1334,7 @@ impl OpteeSmcFunction {
 /// OP-TEE SMC call uses CPU registers to pass input and output values.
 /// Thus, this structure is technically equivalent to `OpteeSmcArgs`, but we separate them for clarity.
 #[repr(align(4096))]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct OpteeSmcResult {
     args: [usize; Self::NUM_OPTEE_SMC_ARGS],
@@ -1343,53 +1343,63 @@ pub struct OpteeSmcResult {
 impl OpteeSmcResult {
     const NUM_OPTEE_SMC_ARGS: usize = 9;
 
-    pub fn return_status(&mut self, status: OpteeSmcReturn) {
-        self.args[0] = status as usize;
+    pub fn new(status: OpteeSmcReturn) -> Self {
+        let mut res = Self::default();
+        res.args[0] = status as usize;
+        res
     }
 
-    pub fn exchange_capabilities(
-        &mut self,
+    pub fn new_exchange_capabilities(
         status: OpteeSmcReturn,
         capabilities: OpteeSecureWorldCapabilities,
         max_notif_value: usize,
         data: usize,
-    ) {
-        self.return_status(status);
-        self.args[1] = capabilities.bits();
-        self.args[2] = max_notif_value;
-        self.args[3] = data;
+    ) -> Self {
+        let mut res = Self::default();
+        res.args[0] = status as usize;
+        res.args[1] = capabilities.bits();
+        res.args[2] = max_notif_value;
+        res.args[3] = data;
+        res
     }
 
     /// # Panics
     /// panics if any element of `data` cannot be converted to `usize`.
-    pub fn uuid(&mut self, data: [u32; 4]) {
+    pub fn new_uuid(data: &[u32; 4]) -> Self {
+        let mut res = Self::default();
         // OP-TEE doesn't use the high 32 bit of each argument to avoid sign extension and overflow issues.
-        self.args[0] = usize::try_from(data[0]).unwrap();
-        self.args[1] = usize::try_from(data[1]).unwrap();
-        self.args[2] = usize::try_from(data[2]).unwrap();
-        self.args[3] = usize::try_from(data[3]).unwrap();
+        res.args[0] = usize::try_from(data[0]).unwrap();
+        res.args[1] = usize::try_from(data[1]).unwrap();
+        res.args[2] = usize::try_from(data[2]).unwrap();
+        res.args[3] = usize::try_from(data[3]).unwrap();
+        res
     }
 
-    pub fn revision(&mut self, major: usize, minor: usize) {
-        self.args[0] = major;
-        self.args[1] = minor;
+    pub fn new_revision(major: usize, minor: usize) -> Self {
+        let mut res = Self::default();
+        res.args[0] = major;
+        res.args[1] = minor;
+        res
     }
 
-    pub fn os_revision(&mut self, major: usize, minor: usize, build_id: usize) {
-        self.args[0] = major;
-        self.args[1] = minor;
-        self.args[2] = build_id;
+    pub fn new_os_revision(major: usize, minor: usize, build_id: usize) -> Self {
+        let mut res = Self::default();
+        res.args[0] = major;
+        res.args[1] = minor;
+        res.args[2] = build_id;
+        res
     }
 
-    pub fn disable_shm_cache(
-        &mut self,
+    pub fn new_disable_shm_cache(
         status: OpteeSmcReturn,
         shm_upper32: usize,
         shm_lower32: usize,
-    ) {
-        self.args[0] = status as usize;
-        self.args[1] = shm_upper32;
-        self.args[2] = shm_lower32;
+    ) -> Self {
+        let mut res = Self::default();
+        res.args[0] = status as usize;
+        res.args[1] = shm_upper32;
+        res.args[2] = shm_lower32;
+        res
     }
 }
 
