@@ -33,6 +33,8 @@ use litebox_platform_multiplex::Platform;
 pub mod loader;
 pub(crate) mod syscalls;
 
+pub mod msg_proto;
+
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
 pub struct OpteeShimEntrypoints {
