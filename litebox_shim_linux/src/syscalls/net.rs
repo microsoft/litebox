@@ -2381,6 +2381,8 @@ mod unix_tests {
         syscalls::{net::SocketAddress, tests::init_platform, unix::UnixSocketAddr},
     };
 
+    extern crate std;
+
     fn create_unix_socket(task: &Task, ty: SockType, flags: SockFlags) -> u32 {
         task.do_socket(AddressFamily::UNIX, ty, flags, 0).unwrap()
     }
@@ -2811,17 +2813,41 @@ mod unix_tests {
         }
     }
 
-    fn unix_socketpair_bidirectional(ty: SockType) {
+    fn unix_socketpair_bidirectional(ty: SockType, is_nonblocking: bool) {
         let task = init_platform(None);
         let mut sv_ptr = alloc::vec![0u32; 2];
         let sv_mut_ptr = MutPtr::from_usize(sv_ptr.as_mut_ptr() as usize);
 
-        task.sys_socketpair(AddressFamily::UNIX as u32, ty as u32, 0, sv_mut_ptr)
+        let ty_and_flags = if is_nonblocking {
+            SockFlags::NONBLOCK.bits()
+        } else {
+            0
+        } | ty as u32;
+        task.sys_socketpair(AddressFamily::UNIX as u32, ty_and_flags, 0, sv_mut_ptr)
             .unwrap();
 
         let sock1 = sv_ptr[0];
         let sock2 = sv_ptr[1];
 
+        // Receive on sock2 (from sock1)
+        task.spawn_clone_for_test(move |task| {
+            let mut buf = [0u8; 64];
+            if is_nonblocking {
+                ppoll(&task, sock2, Events::IN);
+            }
+            let n = task
+                .do_recvfrom(
+                    sock2,
+                    MutPtr::from_usize(buf.as_mut_ptr() as usize),
+                    buf.len(),
+                    ReceiveFlags::empty(),
+                    None,
+                )
+                .expect("recvfrom failed");
+            assert_eq!(&buf[..n], b"Message from sock1");
+        });
+
+        std::thread::sleep(core::time::Duration::from_millis(100));
         // Send from sock1 to sock2
         let msg1 = "Message from sock1";
         task.do_sendto(
@@ -2833,6 +2859,25 @@ mod unix_tests {
         )
         .expect("sendto failed");
 
+        task.spawn_clone_for_test(move |task| {
+            // Receive on sock1 (from sock2)
+            let mut buf = [0u8; 64];
+            if is_nonblocking {
+                ppoll(&task, sock1, Events::IN);
+            }
+            let n = task
+                .do_recvfrom(
+                    sock1,
+                    MutPtr::from_usize(buf.as_mut_ptr() as usize),
+                    buf.len(),
+                    ReceiveFlags::empty(),
+                    None,
+                )
+                .expect("recvfrom failed");
+            assert_eq!(&buf[..n], b"Message from sock2");
+        });
+
+        std::thread::sleep(core::time::Duration::from_millis(100));
         // Send from sock2 to sock1
         let msg2 = "Message from sock2";
         task.do_sendto(
@@ -2844,38 +2889,17 @@ mod unix_tests {
         )
         .expect("sendto failed");
 
-        // Receive on sock2 (from sock1)
-        let mut buf = [0u8; 64];
-        let n = task
-            .do_recvfrom(
-                sock2,
-                MutPtr::from_usize(buf.as_mut_ptr() as usize),
-                buf.len(),
-                ReceiveFlags::empty(),
-                None,
-            )
-            .expect("recvfrom failed");
-        assert_eq!(&buf[..n], msg1.as_bytes());
-
-        // Receive on sock1 (from sock2)
-        let n = task
-            .do_recvfrom(
-                sock1,
-                MutPtr::from_usize(buf.as_mut_ptr() as usize),
-                buf.len(),
-                ReceiveFlags::empty(),
-                None,
-            )
-            .expect("recvfrom failed");
-        assert_eq!(&buf[..n], msg2.as_bytes());
-
+        std::thread::sleep(core::time::Duration::from_millis(500));
         close_socket(&task, sock1);
         close_socket(&task, sock2);
     }
 
     #[test]
     fn test_unix_socketpair_bidirectional() {
-        unix_socketpair_bidirectional(SockType::Stream);
-        unix_socketpair_bidirectional(SockType::Datagram);
+        unix_socketpair_bidirectional(SockType::Stream, false);
+        unix_socketpair_bidirectional(SockType::Datagram, false);
+
+        unix_socketpair_bidirectional(SockType::Stream, true);
+        unix_socketpair_bidirectional(SockType::Datagram, true);
     }
 }
