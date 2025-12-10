@@ -1245,8 +1245,8 @@ pub struct OpteeMsgArg {
     pad: u32,
     /// Return value from the secure world
     ret: u32,
-    /// Origin of the return value (e.g., OP-TEE OS, TA, ...)
-    ret_origin: u32,
+    /// Origin of the return value
+    ret_origin: TeeOrigin,
     /// Number of parameters contained in `params`
     num_params: u32,
     /// Parameters to be passed to the secure world. If `cmd == OpenSession`, the first two params contain
