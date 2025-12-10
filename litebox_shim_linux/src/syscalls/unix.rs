@@ -908,7 +908,7 @@ impl UnixDatagram {
                 events |= Events::OUT;
             }
         } else {
-            // TODO: no specific destination?
+            // If not connected, allow to sendto any address?
             events |= Events::OUT;
         }
         events
