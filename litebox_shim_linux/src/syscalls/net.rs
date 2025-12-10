@@ -2383,15 +2383,14 @@ mod unix_tests {
         task.do_socket(AddressFamily::UNIX, ty, flags, 0).unwrap()
     }
 
-    fn create_unix_server_socket(task: &Task, addr: &str, flags: SockFlags) -> u32 {
+    fn create_unix_server_socket(task: &Task, addr: &str, flags: SockFlags) -> Result<u32, Errno> {
         let server_fd = create_unix_socket(task, SockType::Stream, flags);
         task.do_bind(
             server_fd,
             SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
-        )
-        .unwrap();
-        task.do_listen(server_fd, 128).unwrap();
-        server_fd
+        )?;
+        task.do_listen(server_fd, 128)?;
+        Ok(server_fd)
     }
 
     fn close_socket(task: &crate::Task, fd: u32) {
@@ -2473,6 +2472,10 @@ mod unix_tests {
 
             close_socket(&task, server_fd);
             close_socket(&task, client_fd);
+            task.sys_unlinkat(-1, server_path, AtFlags::empty())
+                .unwrap();
+            task.sys_unlinkat(-1, client_path, AtFlags::empty())
+                .unwrap();
         }
     }
 
@@ -2482,8 +2485,7 @@ mod unix_tests {
 
         for _ in 0..10 {
             let addr = "/unix_stream_socket.sock";
-            let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty());
-
+            let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
             let client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
             task.do_connect(
                 client_fd,
@@ -2537,6 +2539,7 @@ mod unix_tests {
 
             close_socket(&task, server_fd);
             close_socket(&task, client_fd);
+            task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
         }
     }
 
@@ -2552,8 +2555,7 @@ mod unix_tests {
         assert_eq!(result.unwrap_err(), Errno::ECONNREFUSED);
         close_socket(&task, client_fd);
 
-        let addr = "/unix_stream_socket_refused.sock";
-        let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty());
+        let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
         let client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
         let result = task.do_connect(
             client_fd,
@@ -2574,8 +2576,8 @@ mod unix_tests {
         close_socket(&task, another_client);
         close_socket(&task, client_fd);
 
-        let addr = "/unix_stream_socket_refused.sock";
-        let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty());
+        let addr = "/unix_stream_socket_refused2.sock";
+        let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
         let client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
 
         // remove the sock file
@@ -2594,7 +2596,7 @@ mod unix_tests {
     fn test_multiple_unix_stream_connections() {
         let task = init_platform(None);
         let addr = "/unix_multi_stream_socket.sock";
-        let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty());
+        let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
 
         let mut client_fds = Vec::new();
         let mut server_conn_fds = Vec::new();
@@ -2652,40 +2654,87 @@ mod unix_tests {
     #[test]
     fn test_unix_stream_socket_on_same_addr() {
         let task = init_platform(None);
-        let addr = "/unix_stream_socket_server.sock";
-        let server1_fd = create_unix_server_socket(&task, addr, SockFlags::NONBLOCK);
-        // the second one will replace the first one
-        let server2_fd = create_unix_server_socket(&task, addr, SockFlags::empty());
+        for _ in 0..10 {
+            let addr = "/unix_stream_socket_server.sock";
+            let server1_fd = create_unix_server_socket(&task, addr, SockFlags::NONBLOCK).unwrap();
+            let err = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap_err();
+            assert_eq!(err, Errno::EADDRINUSE);
 
-        let client1_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
-        task.do_connect(
-            client1_fd,
-            SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
-        )
-        .unwrap();
+            // remove the socket file to allow another server to bind to the same address
+            task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
+            let server2_fd = create_unix_server_socket(&task, addr, SockFlags::NONBLOCK).unwrap();
 
-        // server one is still alive but cannot accept connections
-        let err = task
-            .do_accept(server1_fd, None, SockFlags::empty())
-            .unwrap_err();
-        assert_eq!(err, Errno::EAGAIN);
-
-        let server2_conn_fd = task
-            .do_accept(server2_fd, None, SockFlags::empty())
+            let client1_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+            task.do_connect(
+                client1_fd,
+                SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+            )
             .unwrap();
-        close_socket(&task, server2_conn_fd);
-        close_socket(&task, client1_fd);
 
-        // close server one and connect again
-        close_socket(&task, server1_fd);
-        let client2_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
-        task.do_connect(
-            client2_fd,
-            SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
-        )
-        .unwrap();
-        close_socket(&task, client2_fd);
-        close_socket(&task, server2_fd);
+            // server one is still alive but cannot accept connections
+            let err = task
+                .do_accept(server1_fd, None, SockFlags::empty())
+                .unwrap_err();
+            assert_eq!(err, Errno::EAGAIN);
+
+            let conn_fd = task
+                .do_accept(server2_fd, None, SockFlags::empty())
+                .unwrap();
+            close_socket(&task, conn_fd);
+            close_socket(&task, client1_fd);
+
+            // close server one and connect again
+            close_socket(&task, server1_fd);
+            let client2_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+            task.do_connect(
+                client2_fd,
+                SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+            )
+            .unwrap();
+            close_socket(&task, client2_fd);
+            close_socket(&task, server2_fd);
+
+            // still fail after we close the server
+            let err = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap_err();
+            assert_eq!(err, Errno::EADDRINUSE);
+
+            task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_unix_datagram_socket_on_same_addr() {
+        let task = init_platform(None);
+        for _ in 0..10 {
+            let addr = "/unix_datagram_socket_server.sock";
+            let server_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+            task.do_bind(
+                server_fd,
+                SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+            )
+            .unwrap();
+
+            let server_fd2 = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+            let err = task
+                .do_bind(
+                    server_fd2,
+                    SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+                )
+                .unwrap_err();
+            assert_eq!(err, Errno::EADDRINUSE);
+
+            task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
+            let server_fd2 = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+            task.do_bind(
+                server_fd2,
+                SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+            )
+            .unwrap();
+
+            close_socket(&task, server_fd);
+            close_socket(&task, server_fd2);
+            task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
+        }
     }
 
     fn unix_socketpair_bidirectional(ty: SockType) {

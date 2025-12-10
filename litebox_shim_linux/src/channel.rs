@@ -130,6 +130,14 @@ impl<T> WriteEnd<T> {
         }
     }
 
+    pub(crate) fn is_pair(&self, reader: &ReadEnd<T>) -> bool {
+        if let Some(peer) = self.peer.upgrade() {
+            Arc::ptr_eq(&peer, &reader.endpoint)
+        } else {
+            false
+        }
+    }
+
     common_functions_for_channel!();
 }
 

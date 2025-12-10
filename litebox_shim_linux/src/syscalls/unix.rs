@@ -10,7 +10,7 @@ use alloc::{
 };
 use litebox::{
     event::IOPollable,
-    fs::{FileSystem, Mode, OFlags},
+    fs::{FileSystem, Mode, OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
 };
 use litebox_common_linux::{ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno};
@@ -83,17 +83,25 @@ impl UnixSocketAddr {
         match self {
             UnixSocketAddr::Path(path) => {
                 let flags = if is_server {
-                    // create the socket file if not exists
-                    OFlags::CREAT | OFlags::RDWR
+                    // create the socket file if not exists;
+                    // use O_EXCL to ensure exclusive creation
+                    OFlags::CREAT | OFlags::EXCL | OFlags::RDWR
                 } else {
                     OFlags::RDWR
                 };
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
-                let file = task.global.fs.open(
-                    path.as_str(),
-                    flags,
-                    Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-                )?;
+                let file = task
+                    .global
+                    .fs
+                    .open(
+                        path.as_str(),
+                        flags,
+                        Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                    )
+                    .map_err(|err| match err {
+                        OpenError::AlreadyExists => Errno::EADDRINUSE,
+                        other => Errno::from(other),
+                    })?;
                 Ok(UnixBoundSocketAddr::Path((path, file, task.global.clone())))
             }
             UnixSocketAddr::Abstract(data) => {
@@ -644,8 +652,15 @@ struct UnixDatagram {
 impl Drop for UnixDatagram {
     fn drop(&mut self) {
         if let Some((addr, global)) = self.addr.take() {
-            let old = global.unix_addr_table.write().remove(&addr.to_key());
-            debug_assert!(old.is_some());
+            let key = addr.to_key();
+            let mut table = global.unix_addr_table.write();
+            // Only remove the entry if it matches the current socket
+            if let Some(UnixEntry(UnixEntryInner::Datagram(writer))) = table.get(&key)
+                && let Some(reader) = &self.reader
+                && writer.is_pair(reader)
+            {
+                table.remove(&key);
+            }
         }
     }
 }
@@ -688,15 +703,14 @@ impl UnixDatagram {
 
         let bound_addr = addr.bind(task, true)?;
         let key = bound_addr.to_key();
-        let unix_addr_table = &task.global.unix_addr_table;
-        let mut guard = unix_addr_table.write();
-        if guard.contains_key(&key) {
-            return Err(Errno::EADDRINUSE);
-        }
         // Registers the write end of the socket in the global address table so it
         // can receive messages sent to this address.
         let (writer, reader) = Channel::new(UNIX_BUF_SIZE).split();
-        guard.insert(key, UnixEntry(UnixEntryInner::Datagram(writer)));
+        let _ = task
+            .global
+            .unix_addr_table
+            .write()
+            .insert(key, UnixEntry(UnixEntryInner::Datagram(writer)));
         self.addr = Some((bound_addr, task.global.clone()));
         self.reader = Some(reader);
         Ok(())
