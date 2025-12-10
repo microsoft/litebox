@@ -1252,7 +1252,7 @@ pub struct OpteeMsgArg {
     /// Parameters to be passed to the secure world. If `cmd == OpenSession`, the first two params contain
     /// a TA UUID and they are not delivered to the TA.
     /// Note that, originally, the length of this array is variable. We fix it to `TEE_NUM_PARAMS + 2` to
-    /// simply the implementation (our OP-TEE Shim supports up to four parameters as well).
+    /// simplify the implementation (our OP-TEE Shim supports up to four parameters as well).
     params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
 }
 
@@ -1289,13 +1289,12 @@ impl OpteeSmcArgs {
 
     /// Get the physical address of `OpteeMsgArg`. The secure world is expected to map and copy
     /// this structure.
-    /// # Panics
-    /// Panics if the computed address cannot be converted to `u64`.
-    pub fn optee_msg_arg_phys_addr(&self) -> Result<u64, Errno> {
-        // To avoid potential overflow issues, OP-TEE often only uses the low half of 64-bit variables.
+    pub fn optee_msg_arg_phys_addr(&self) -> Result<usize, Errno> {
+        // To avoid potential sign extension and overflow issues, OP-TEE stores the low and
+        // high 32 bits of a 64-bit address in `args[2]` and `args[1]`, respectively.
         if self.args[1] & 0xffff_ffff_0000_0000 == 0 && self.args[2] & 0xffff_ffff_0000_0000 == 0 {
             let addr = (self.args[1] << 32) | self.args[2];
-            Ok(u64::try_from(addr).unwrap())
+            Ok(addr)
         } else {
             Err(Errno::EINVAL)
         }
@@ -1364,6 +1363,7 @@ impl OpteeSmcResult {
     /// # Panics
     /// panics if any element of `data` cannot be converted to `usize`.
     pub fn uuid(&mut self, data: [u32; 4]) {
+        // OP-TEE doesn't use the high 32 bit of each argument to avoid sign extension and overflow issues.
         self.args[0] = usize::try_from(data[0]).unwrap();
         self.args[1] = usize::try_from(data[1]).unwrap();
         self.args[2] = usize::try_from(data[2]).unwrap();
