@@ -751,7 +751,7 @@ mod test {
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
 
-        task.spawn_clone_for_test(move |task| {
+        let handle = task.spawn_clone_for_test(move |task| {
             std::thread::sleep(core::time::Duration::from_millis(100));
             // write a byte
             let buf = [0x41u8];
@@ -778,6 +778,7 @@ mod test {
 
         let _ = task.sys_close(rfd);
         let _ = task.sys_close(wfd);
+        handle.join().unwrap();
     }
 
     #[test]
@@ -790,7 +791,7 @@ mod test {
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
 
-        task.spawn_clone_for_test(move |task| {
+        let handle = task.spawn_clone_for_test(move |task| {
             std::thread::sleep(core::time::Duration::from_millis(100));
             task.sys_close(wfd).expect("close writer failed");
         });
@@ -819,6 +820,7 @@ mod test {
         assert_eq!(n, 0, "read should return 0 on EOF");
 
         let _ = task.sys_close(rfd);
+        handle.join().unwrap();
     }
 
     #[test]
