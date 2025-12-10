@@ -4,21 +4,8 @@ use crate::{
     debug_serial_println, host::per_cpu_variables::with_per_cpu_variables_mut, mshv::HV_VTL_SECURE,
 };
 use litebox_common_linux::errno::Errno;
+use litebox_common_optee::OpteeSmcArgs;
 use x86_64::PhysAddr;
-
-/// OP-TEE SMC call arguments. OP-TEE assumes that the underlying architecture is Arm with TrustZone.
-/// This is why it uses Secure Monitor Call (SMC) calling convention (SMCCC).
-/// We translate SMCCC into VTL switch convention.
-#[repr(align(4096))]
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct OpteeSmcArgs {
-    args: [usize; Self::NUM_OPTEE_SMC_ARGS],
-}
-
-impl OpteeSmcArgs {
-    const NUM_OPTEE_SMC_ARGS: usize = 9;
-}
 
 pub(crate) fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
     if let Ok(optee_smc_args_page_addr) = PhysAddr::try_new(optee_smc_args_pfn << 12)

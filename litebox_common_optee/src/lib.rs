@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{PtRegs, errno::Errno};
 use modular_bitfield::prelude::*;
-use modular_bitfield::specifiers::{B4, B48};
+use modular_bitfield::specifiers::{B4, B8, B48, B54};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
 
@@ -1084,4 +1084,349 @@ impl LdelfArg {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+const OPTEE_MSG_CMD_OPEN_SESSION: u32 = 0;
+const OPTEE_MSG_CMD_INVOKE_COMMAND: u32 = 1;
+const OPTEE_MSG_CMD_CLOSE_SESSION: u32 = 2;
+const OPTEE_MSG_CMD_CANCEL: u32 = 3;
+const OPTEE_MSG_CMD_REGISTER_SHM: u32 = 4;
+const OPTEE_MSG_CMD_UNREGISTER_SHM: u32 = 5;
+const OPTEE_MSG_CMD_DO_BOTTOM_HALF: u32 = 6;
+const OPTEE_MSG_CMD_STOP_ASYNC_NOTIF: u32 = 7;
+
+/// `OPTEE_MSG_CMD_*` from `optee_os/core/include/optee_msg.h`
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive)]
+#[repr(u32)]
+pub enum OpteeMessageCommand {
+    OpenSession = OPTEE_MSG_CMD_OPEN_SESSION,
+    InvokeCommand = OPTEE_MSG_CMD_INVOKE_COMMAND,
+    CloseSession = OPTEE_MSG_CMD_CLOSE_SESSION,
+    Cancel = OPTEE_MSG_CMD_CANCEL,
+    RegisterShm = OPTEE_MSG_CMD_REGISTER_SHM,
+    UnregisterShm = OPTEE_MSG_CMD_UNREGISTER_SHM,
+    DoBottomHalf = OPTEE_MSG_CMD_DO_BOTTOM_HALF,
+    StopAsyncNotif = OPTEE_MSG_CMD_STOP_ASYNC_NOTIF,
+    Unknown = 0xffff_ffff,
+}
+
+/// Temporary reference memory parameter
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct OpteeMsgParamTmem {
+    /// Physical address of the buffer
+    buf_ptr: u64,
+    /// Size of the buffer
+    size: u64,
+    /// Temporary shared memory reference or identifier
+    shm_ref: u64,
+}
+
+/// Registered memory reference parameter
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgParamRmem {
+    /// Offset into shared memory reference
+    offs: u64,
+    /// Size of the buffer
+    size: u64,
+    /// Shared memory reference or identifier
+    shm_ref: u64,
+}
+
+/// FF-A memory reference parameter
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgParamFmem {
+    /// Lower bits of offset into shared memory reference
+    offs_low: u32,
+    /// Higher bits of offset into shared memory reference
+    offs_high: u32,
+    /// Internal offset into the first page of shared memory reference
+    internal_offs: u16,
+    /// Size of the buffer
+    size: u64,
+    /// Global identifier of the shared memory
+    global_id: u64,
+}
+
+/// Opaque value parameter
+/// Value parameters are passed unchecked between normal and secure world.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgParamValue {
+    a: u64,
+    b: u64,
+    c: u64,
+}
+
+/// Parameter used together with `OpteeMsgArg`
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub union OpteeMsgParamUnion {
+    tmem: OpteeMsgParamTmem,
+    rmem: OpteeMsgParamRmem,
+    fmem: OpteeMsgParamFmem,
+    value: OpteeMsgParamValue,
+    octets: [u8; 24],
+}
+
+const OPTEE_MSG_ATTR_TYPE_NONE: u8 = 0x0;
+const OPTEE_MSG_ATTR_TYPE_VALUE_INPUT: u8 = 0x1;
+const OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT: u8 = 0x2;
+const OPTEE_MSG_ATTR_TYPE_VALUE_INOUT: u8 = 0x3;
+const OPTEE_MSG_ATTR_TYPE_RMEM_INPUT: u8 = 0x5;
+const OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT: u8 = 0x6;
+const OPTEE_MSG_ATTR_TYPE_RMEM_INOUT: u8 = 0x7;
+const OPTEE_MSG_ATTR_TYPE_TMEM_INPUT: u8 = 0x9;
+const OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT: u8 = 0xa;
+const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xb;
+// Note: `OPTEE_MSG_ATTR_TYPE_FMEM_*` are aliases of `OPTEE_MSG_ATTR_TYPE_RMEM_*`.
+// Whether it is RMEM of FMEM depends on the conduit.
+
+#[non_exhaustive]
+#[derive(Debug, PartialEq, TryFromPrimitive)]
+#[repr(u8)]
+pub enum OpteeMsgAttrType {
+    None = OPTEE_MSG_ATTR_TYPE_NONE,
+    ValueInput = OPTEE_MSG_ATTR_TYPE_VALUE_INPUT,
+    ValueOutput = OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT,
+    ValueInout = OPTEE_MSG_ATTR_TYPE_VALUE_INOUT,
+    RmemInput = OPTEE_MSG_ATTR_TYPE_RMEM_INPUT,
+    RmemOutput = OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT,
+    RmemInout = OPTEE_MSG_ATTR_TYPE_RMEM_INOUT,
+    TmemInput = OPTEE_MSG_ATTR_TYPE_TMEM_INPUT,
+    TmemOutput = OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT,
+    TmemInout = OPTEE_MSG_ATTR_TYPE_TMEM_INOUT,
+}
+
+#[non_exhaustive]
+#[bitfield]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct OpteeMsgAttr {
+    pub typ: B8,
+    pub meta: bool,
+    pub noncontig: bool,
+    #[skip]
+    __: B54,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgParam {
+    attr: OpteeMsgAttr,
+    u: OpteeMsgParamUnion,
+}
+
+impl OpteeMsgParam {
+    pub fn attr_type(&self) -> OpteeMsgAttrType {
+        OpteeMsgAttrType::try_from(self.attr.typ()).unwrap_or(OpteeMsgAttrType::None)
+    }
+}
+
+/// `optee_msg_arg` from `optee_os/core/include/optee_msg.h`
+/// OP-TEE message argument structure that the normal world (or VTL0) OP-TEE driver and OP-TEE OS use to
+/// exchange messages.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpteeMsgArg {
+    /// OP-TEE message command. This is a superset of `UteeEntryFunc`.
+    cmd: OpteeMessageCommand,
+    /// TA function ID which is used if `cmd == InvokeCommand`. Note that the meaning of `cmd` and `func`
+    /// is swapped compared to TAs.
+    func: u32,
+    /// Session ID. This is "IN" parameter most of the time except for `cmd == OpenSession` where
+    /// the secure world generates and returns a session ID.
+    session: u32,
+    /// Cancellation ID. This is a unique value to identify this request.
+    cancel_id: u32,
+    pad: u32,
+    /// Return value from the secure world
+    ret: u32,
+    /// Origin of the return value
+    ret_origin: TeeOrigin,
+    /// Number of parameters contained in `params`
+    num_params: u32,
+    /// Parameters to be passed to the secure world. If `cmd == OpenSession`, the first two params contain
+    /// a TA UUID and they are not delivered to the TA.
+    /// Note that, originally, the length of this array is variable. We fix it to `TEE_NUM_PARAMS + 2` to
+    /// simplify the implementation (our OP-TEE Shim supports up to four parameters as well).
+    params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
+}
+
+/// OP-TEE SMC call arguments.
+/// OP-TEE assumes that the underlying architecture is Arm with TrustZone and
+/// thus it uses Secure Monitor Call (SMC) calling convention (SMCCC).
+/// Since we currently rely on the existing OP-TEE driver which assumes SMCCC, we translate it into
+/// our VTL switch convention.
+/// Specifically, OP-TEE SMC call uses up to nine CPU registers to pass arguments.
+/// However, since VTL call only supports up to four parameters, we allocate a VTL0 memory page and
+/// exchange all arguments through that memory page.
+#[repr(align(4096))]
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpteeSmcArgs {
+    args: [usize; Self::NUM_OPTEE_SMC_ARGS],
+}
+
+impl OpteeSmcArgs {
+    const NUM_OPTEE_SMC_ARGS: usize = 9;
+
+    pub fn arg_index(&self, index: usize) -> Option<usize> {
+        if index < Self::NUM_OPTEE_SMC_ARGS {
+            Some(self.args[index])
+        } else {
+            None
+        }
+    }
+
+    /// Get the function ID of an OP-TEE SMC call
+    pub fn func_id(&self) -> Result<OpteeSmcFunction, Errno> {
+        OpteeSmcFunction::try_from(self.args[0] & OpteeSmcFunction::MASK).map_err(|_| Errno::EINVAL)
+    }
+
+    /// Get the physical address of `OpteeMsgArg`. The secure world is expected to map and copy
+    /// this structure.
+    pub fn optee_msg_arg_phys_addr(&self) -> Result<usize, Errno> {
+        // To avoid potential sign extension and overflow issues, OP-TEE stores the low and
+        // high 32 bits of a 64-bit address in `args[2]` and `args[1]`, respectively.
+        if self.args[1] & 0xffff_ffff_0000_0000 == 0 && self.args[2] & 0xffff_ffff_0000_0000 == 0 {
+            let addr = (self.args[1] << 32) | self.args[2];
+            Ok(addr)
+        } else {
+            Err(Errno::EINVAL)
+        }
+    }
+}
+
+/// `OPTEE_SMC_FUNCID_*` from `core/arch/arm/include/sm/optee_smc.h`
+/// TODO: Add stuffs based on the OP-TEE driver that LVBS is using.
+const OPTEE_SMC_FUNCID_GET_OS_REVISION: usize = 0x1;
+const OPTEE_SMC_FUNCID_CALL_WITH_ARG: usize = 0x4;
+const OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES: usize = 0x9;
+const OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE: usize = 0xa;
+const OPTEE_SMC_FUNCID_CALL_WITH_RPC_ARG: usize = 0x12;
+const OPTEE_SMC_FUNCID_CALL_WITH_REGD_ARG: usize = 0x13;
+const OPTEE_SMC_FUNCID_CALLS_UID: usize = 0xff01;
+const OPTEE_SMC_FUNCID_CALLS_REVISION: usize = 0xff03;
+
+#[non_exhaustive]
+#[derive(PartialEq, TryFromPrimitive)]
+#[repr(usize)]
+pub enum OpteeSmcFunction {
+    GetOsRevision = OPTEE_SMC_FUNCID_GET_OS_REVISION,
+    CallWithArg = OPTEE_SMC_FUNCID_CALL_WITH_ARG,
+    ExchangeCapabilities = OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES,
+    DisableShmCache = OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE,
+    CallWithRpcArg = OPTEE_SMC_FUNCID_CALL_WITH_RPC_ARG,
+    CallWithRegdArg = OPTEE_SMC_FUNCID_CALL_WITH_REGD_ARG,
+    CallsUid = OPTEE_SMC_FUNCID_CALLS_UID,
+    CallsRevision = OPTEE_SMC_FUNCID_CALLS_REVISION,
+}
+
+impl OpteeSmcFunction {
+    const MASK: usize = 0xffff;
+}
+
+/// OP-TEE SMC call result.
+/// OP-TEE SMC call uses CPU registers to pass input and output values.
+/// Thus, this structure is technically equivalent to `OpteeSmcArgs`, but we separate them for clarity.
+#[repr(align(4096))]
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpteeSmcResult {
+    args: [usize; Self::NUM_OPTEE_SMC_ARGS],
+}
+
+impl OpteeSmcResult {
+    const NUM_OPTEE_SMC_ARGS: usize = 9;
+
+    pub fn return_status(&mut self, status: OpteeSmcReturn) {
+        self.args[0] = status as usize;
+    }
+
+    pub fn exchange_capabilities(
+        &mut self,
+        status: OpteeSmcReturn,
+        capabilities: OpteeSecureWorldCapabilities,
+        max_notif_value: usize,
+        data: usize,
+    ) {
+        self.return_status(status);
+        self.args[1] = capabilities.bits();
+        self.args[2] = max_notif_value;
+        self.args[3] = data;
+    }
+
+    /// # Panics
+    /// panics if any element of `data` cannot be converted to `usize`.
+    pub fn uuid(&mut self, data: [u32; 4]) {
+        // OP-TEE doesn't use the high 32 bit of each argument to avoid sign extension and overflow issues.
+        self.args[0] = usize::try_from(data[0]).unwrap();
+        self.args[1] = usize::try_from(data[1]).unwrap();
+        self.args[2] = usize::try_from(data[2]).unwrap();
+        self.args[3] = usize::try_from(data[3]).unwrap();
+    }
+
+    pub fn revision(&mut self, major: usize, minor: usize) {
+        self.args[0] = major;
+        self.args[1] = minor;
+    }
+
+    pub fn os_revision(&mut self, major: usize, minor: usize, build_id: usize) {
+        self.args[0] = major;
+        self.args[1] = minor;
+        self.args[2] = build_id;
+    }
+
+    pub fn disable_shm_cache(
+        &mut self,
+        status: OpteeSmcReturn,
+        shm_upper32: usize,
+        shm_lower32: usize,
+    ) {
+        self.args[0] = status as usize;
+        self.args[1] = shm_upper32;
+        self.args[2] = shm_lower32;
+    }
+}
+
+bitflags::bitflags! {
+    #[non_exhaustive]
+    #[derive(PartialEq, Clone, Copy)]
+    pub struct OpteeSecureWorldCapabilities: usize {
+        const HAVE_RESERVED_SHM = 1 << 0;
+        const UNREGISTERED_SHM = 1 << 1;
+        const DYNAMIC_SHM = 1 << 2;
+        const MEMREF_NULL = 1 << 4;
+        const RPC_ARG = 1 << 6;
+        const _ = !0;
+    }
+}
+
+const OPTEE_SMC_RETURN_OK: usize = 0x0;
+const OPTEE_SMC_RETURN_ETHREAD_LIMIT: usize = 0x1;
+const OPTEE_SMC_RETURN_EBUSY: usize = 0x2;
+const OPTEE_SMC_RETURN_ERESUME: usize = 0x3;
+const OPTEE_SMC_RETURN_EBADADDR: usize = 0x4;
+const OPTEE_SMC_RETURN_EBADCMD: usize = 0x5;
+const OPTEE_SMC_RETURN_ENOMEM: usize = 0x6;
+const OPTEE_SMC_RETURN_ENOTAVAIL: usize = 0x7;
+const OPTEE_SMC_RETURN_UNKNOWN_FUNCTION: usize = 0xffff_ffff;
+
+#[non_exhaustive]
+#[derive(Copy, Clone, PartialEq, TryFromPrimitive)]
+#[repr(usize)]
+pub enum OpteeSmcReturn {
+    Ok = OPTEE_SMC_RETURN_OK,
+    EThreadLimit = OPTEE_SMC_RETURN_ETHREAD_LIMIT,
+    EBusy = OPTEE_SMC_RETURN_EBUSY,
+    EResume = OPTEE_SMC_RETURN_ERESUME,
+    EBadAddr = OPTEE_SMC_RETURN_EBADADDR,
+    EBadCmd = OPTEE_SMC_RETURN_EBADCMD,
+    ENomem = OPTEE_SMC_RETURN_ENOMEM,
+    ENotAvail = OPTEE_SMC_RETURN_ENOTAVAIL,
+    UnknownFunction = OPTEE_SMC_RETURN_UNKNOWN_FUNCTION,
 }
