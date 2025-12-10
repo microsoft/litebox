@@ -1161,7 +1161,7 @@ pub struct OpteeMsgParamValue {
     c: u64,
 }
 
-/// Parameter used totether with `OpteeMsgArg`
+/// Parameter used together with `OpteeMsgArg`
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub union OpteeMsgParamUnion {
@@ -1332,7 +1332,7 @@ impl OpteeSmcFunction {
 
 /// OP-TEE SMC call result.
 /// OP-TEE SMC call uses CPU registers to pass input and output values.
-/// Thus, this structure is technically equivalent to `OpteeSmcArgs`, but we separete them for clarity.
+/// Thus, this structure is technically equivalent to `OpteeSmcArgs`, but we separate them for clarity.
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
 #[repr(C)]
