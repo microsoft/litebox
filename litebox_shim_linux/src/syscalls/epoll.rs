@@ -620,7 +620,7 @@ mod test {
 
         // spawn a thread to write to the eventfd
         let copied_eventfd = eventfd.clone();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             copied_eventfd
                 .write(&WaitState::new(platform()).context(), 1)
                 .unwrap();
@@ -628,6 +628,7 @@ mod test {
         epoll
             .wait(&task.global, &WaitState::new(platform()).context(), 1024)
             .unwrap();
+        handle.join().unwrap();
     }
 
     #[test]
@@ -653,7 +654,7 @@ mod test {
 
         // spawn a thread to write to the pipe
         let global = task.global.clone();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(100));
             assert_eq!(
                 global
@@ -666,6 +667,7 @@ mod test {
         epoll
             .wait(&task.global, &WaitState::new(platform()).context(), 1024)
             .unwrap();
+        handle.join().unwrap();
         let mut buf = [0; 2];
         task.global
             .pipes
@@ -727,7 +729,7 @@ mod test {
 
         // spawn a thread to write to the eventfd
         let copied_eventfd = eventfd.clone();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             copied_eventfd
                 .write(&WaitState::new(platform()).context(), 1)
                 .unwrap();
@@ -736,6 +738,7 @@ mod test {
         set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
+        handle.join().unwrap();
     }
 
     #[test]
