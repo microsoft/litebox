@@ -2690,9 +2690,14 @@ mod unix_tests {
 
     fn unix_socketpair_bidirectional(ty: SockType) {
         let task = init_platform(None);
-        let (sock1, sock2) = task
-            .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
+        let mut sv_ptr = alloc::vec![0u32; 2];
+        let sv_mut_ptr = MutPtr::from_usize(sv_ptr.as_mut_ptr() as usize);
+
+        task.sys_socketpair(AddressFamily::UNIX as u32, ty as u32, 0, sv_mut_ptr)
             .unwrap();
+
+        let sock1 = sv_ptr[0];
+        let sock2 = sv_ptr[1];
 
         // Send from sock1 to sock2
         let msg1 = "Message from sock1";

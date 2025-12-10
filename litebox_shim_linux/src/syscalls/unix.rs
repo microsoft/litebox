@@ -552,6 +552,7 @@ impl UnixConnectedStream {
     }
 }
 
+/// A datagram message with source address information
 #[derive(Clone)]
 struct DatagramMessage {
     data: Vec<u8>,
@@ -581,6 +582,10 @@ impl WriteEnd<DatagramMessage> {
     }
 }
 impl ReadEnd<DatagramMessage> {
+    /// Attempts to read datagram messages without blocking.
+    ///
+    /// Reads multiple messages from the same source address until the buffer
+    /// is full or a message from a different source is encountered.
     fn try_read(
         &self,
         mut buf: &mut [u8],
@@ -626,9 +631,13 @@ impl ReadEnd<DatagramMessage> {
     }
 }
 
+/// Represents a Unix datagram socket.
 struct UnixDatagram {
+    /// The local address this socket is bound to, if any.
     addr: Option<(UnixBoundSocketAddr, Arc<GlobalState>)>,
+    /// The read end of the local socket's channel.
     reader: Option<ReadEnd<DatagramMessage>>,
+    /// The write end of the remote socket it is connected to, if any.
     peer_writer: Option<WriteEnd<DatagramMessage>>,
 }
 
@@ -684,6 +693,8 @@ impl UnixDatagram {
         if guard.contains_key(&key) {
             return Err(Errno::EADDRINUSE);
         }
+        // Registers the write end of the socket in the global address table so it
+        // can receive messages sent to this address.
         let (writer, reader) = Channel::new(UNIX_BUF_SIZE).split();
         guard.insert(key, UnixEntry(UnixEntryInner::Datagram(writer)));
         self.addr = Some((bound_addr, task.global.clone()));
@@ -691,6 +702,7 @@ impl UnixDatagram {
         Ok(())
     }
 
+    /// Looks up a socket address and returns its write endpoint.
     fn lookup(
         &self,
         task: &Task,
@@ -711,11 +723,18 @@ impl UnixDatagram {
         }
     }
 
+    /// Connects this socket to a default peer address.
+    ///
+    /// Subsequent sends without an address will use this peer.
     fn connect(&mut self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
         self.peer_writer = Some(self.lookup(task, addr)?);
         Ok(())
     }
 
+    // Sends data to the specified or connected peer.
+    ///
+    /// If `addr` is provided, sends to that address. Otherwise, uses the
+    /// connected peer (set via `connect()`).
     fn sendto(
         &self,
         task: &Task,
@@ -747,6 +766,9 @@ impl UnixDatagram {
         Ok(buf.len())
     }
 
+    /// Receives data from any sender.
+    ///
+    /// If `source_addr` is provided, it will be populated with the sender's address.
     fn recvfrom(
         &self,
         buf: &mut [u8],
