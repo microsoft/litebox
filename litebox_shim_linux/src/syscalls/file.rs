@@ -335,7 +335,7 @@ impl Task {
                 file.write(&self.wait_cx(), value)
             }
             Descriptor::Unix { file, .. } => {
-                file.sendto(buf, litebox_common_linux::SendFlags::empty(), None)
+                file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
             }
         };
         if let Err(Errno::EPIPE) = res {
