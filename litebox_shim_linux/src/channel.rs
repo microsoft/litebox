@@ -1,8 +1,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use litebox::{
-    event::polling::Pollee,
+    event::{Events, observer::Observer, polling::Pollee},
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
@@ -144,6 +144,10 @@ impl<T> WriteEnd<T> {
         } else {
             false
         }
+    }
+
+    pub(crate) fn register_observer(&self, observer: Weak<dyn Observer<Events>>, filter: Events) {
+        self.endpoint.pollee.register_observer(observer, filter);
     }
 
     common_functions_for_channel!();

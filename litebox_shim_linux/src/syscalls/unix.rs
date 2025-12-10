@@ -630,20 +630,30 @@ impl WriteEnd<DatagramMessage> {
     fn try_write(&self, msg: DatagramMessage) -> Result<(), (DatagramMessage, Errno)> {
         self.try_write_one(msg)
     }
-    fn write(&self, mut msg: DatagramMessage, is_nonblocking: bool) -> Result<(), Errno> {
-        if is_nonblocking {
-            self.try_write(msg).map_err(|(_, err)| err)?;
-            Ok(())
-        } else {
-            // TODO: use polling instead of busy loop
-            loop {
-                msg = match self.try_write(msg) {
-                    Ok(()) => return Ok(()),
-                    Err((msg, Errno::EAGAIN)) => msg,
-                    Err((_, err)) => return Err(err),
+    fn write(
+        &self,
+        cx: &WaitContext<'_, crate::Platform>,
+        msg: DatagramMessage,
+        is_nonblocking: bool,
+    ) -> Result<(), Errno> {
+        let mut msg = Some(msg);
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::OUT,
+            |observer, mask| {
+                self.register_observer(observer, mask);
+                Ok(())
+            },
+            || match self.try_write(msg.take().unwrap()) {
+                Ok(()) => Ok(()),
+                Err((m, Errno::EAGAIN)) => {
+                    let _ = msg.replace(m);
+                    Err(TryOpError::TryAgain)
                 }
-            }
-        }
+                Err((_, err)) => Err(TryOpError::Other(err)),
+            },
+        )
+        .map_err(Errno::from)
     }
 }
 impl ReadEnd<DatagramMessage> {
@@ -655,7 +665,7 @@ impl ReadEnd<DatagramMessage> {
         &self,
         mut buf: &mut [u8],
         source_addr: Option<&mut Option<UnixSocketAddr>>,
-    ) -> Result<usize, Errno> {
+    ) -> Result<usize, TryOpError<Errno>> {
         let mut src = None;
         let mut total_read = 0;
         let mut stop = false;
@@ -683,7 +693,10 @@ impl ReadEnd<DatagramMessage> {
                     if total_read > 0 {
                         break;
                     }
-                    return Err(e);
+                    return match e {
+                        Errno::EAGAIN => Err(TryOpError::TryAgain),
+                        other => Err(TryOpError::Other(other)),
+                    };
                 }
             };
             total_read += n;
@@ -826,6 +839,7 @@ impl UnixDatagram {
         if let Some(addr) = addr {
             let peer_writer = self.lookup(task, addr)?;
             peer_writer.write(
+                &task.wait_cx(),
                 DatagramMessage {
                     data: buf.to_vec(),
                     source,
@@ -834,6 +848,7 @@ impl UnixDatagram {
             )?;
         } else if let Some(peer_writer) = &self.peer_writer {
             peer_writer.write(
+                &task.wait_cx(),
                 DatagramMessage {
                     data: buf.to_vec(),
                     source,
@@ -851,6 +866,7 @@ impl UnixDatagram {
     /// If `source_addr` is provided, it will be populated with the sender's address.
     fn recvfrom(
         &self,
+        cx: &WaitContext<'_, crate::Platform>,
         buf: &mut [u8],
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
@@ -858,23 +874,16 @@ impl UnixDatagram {
         let Some(reader) = &self.reader else {
             return Err(Errno::ENOTCONN);
         };
-        let ret = if is_nonblocking {
-            reader.try_read(buf, source_addr.as_deref_mut())
-        } else {
-            // TODO: use polling instead of busy wait
-            loop {
-                match reader.try_read(buf, source_addr.as_deref_mut()) {
-                    Ok(size) => break Ok(size),
-                    Err(Errno::EAGAIN) => {}
-                    Err(err) => break Err(err),
-                }
-                core::hint::spin_loop();
-            }
-        };
-        match ret {
-            Err(Errno::ESHUTDOWN) => Ok(0),
-            other => other,
-        }
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::IN,
+            |observer, mask| {
+                self.pollee.register_observer(observer, mask);
+                Ok(())
+            },
+            || reader.try_read(buf, source_addr.as_deref_mut()),
+        )
+        .map_err(Errno::from)
     }
 
     fn get_local_addr(&self) -> UnixSocketAddr {
@@ -883,6 +892,26 @@ impl UnixDatagram {
         } else {
             UnixSocketAddr::Unnamed
         }
+    }
+
+    fn check_io_events(&self) -> Events {
+        let mut events = Events::empty();
+        if let Some(reader) = &self.reader {
+            if reader.is_shutdown() {
+                events |= Events::IN | Events::RDHUP;
+            } else if !reader.is_empty() {
+                events |= Events::IN;
+            }
+        }
+        if let Some(peer_writer) = &self.peer_writer {
+            if !peer_writer.is_full() {
+                events |= Events::OUT;
+            }
+        } else {
+            // TODO: no specific destination?
+            events |= Events::OUT;
+        }
+        events
     }
 }
 
@@ -1104,7 +1133,7 @@ impl UnixSocket {
                 )
                 .map_err(Errno::from)
             }
-            UnixSocketState::Datagram(sock) => sock.recvfrom(buf, is_nonblocking, source_addr),
+            UnixSocketState::Datagram(sock) => sock.recvfrom(cx, buf, is_nonblocking, source_addr),
         });
         match ret {
             Err(Errno::ESHUTDOWN) => Ok(0),
@@ -1171,7 +1200,7 @@ impl IOPollable for UnixSocket {
             UnixSocketState::InitStream(_) => Events::OUT | Events::HUP,
             UnixSocketState::ListenStream(listen) => listen.backlog.check_io_events(),
             UnixSocketState::ConnectedStream(conn) => conn.check_io_events(),
-            UnixSocketState::Datagram(_) => todo!(),
+            UnixSocketState::Datagram(sock) => sock.check_io_events(),
         })
     }
 }
