@@ -746,6 +746,14 @@ impl SocketOptionName {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct Ucred {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
 // Following libc's definition of time_t and suseconds_t.
 // They are not same as isize on all architectures, e.g.,
 // `suseconds_t` is i64 on riscv32:
