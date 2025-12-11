@@ -22,6 +22,15 @@ macro_rules! cmd {
     }}
 }
 
+macro_rules! output {
+    ($($tt:tt)*) => {{
+        let mut cmd = cmd!($($tt)*);
+        cmd.set_ignore_stdout(false);
+        cmd.set_ignore_stderr(false);
+        cmd.output()
+    }}
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct CliArgs {
@@ -439,7 +448,7 @@ fn run_rewritten_hello_static(ctx: BenchCtx<'_>) -> Result<()> {
 // XXX: This is not ideal, because it means that we have differing tests/benchmarks depending on
 // different machines. Ideally we'd switch this out to a more deterministic approach.
 fn locate_command(sh: &xshell::Shell, command: &str) -> Result<PathBuf> {
-    let r = cmd!(sh, "which {command}").output()?.stdout;
+    let r = output!(sh, "which {command}")?.stdout;
     let r = PathBuf::from(String::from_utf8_lossy(&r).trim());
     Ok(r)
 }
@@ -447,7 +456,7 @@ fn locate_command(sh: &xshell::Shell, command: &str) -> Result<PathBuf> {
 /// Find all dependencies for `command` via `ldd`
 fn find_dependencies(sh: &xshell::Shell, command: &str) -> Result<Vec<PathBuf>> {
     let executable = locate_command(sh, command)?;
-    let output = cmd!(sh, "ldd {executable}").output()?;
+    let output = output!(sh, "ldd {executable}")?;
     let dependencies = String::from_utf8_lossy(&output.stdout);
     trace!("Dependencies:\n{dependencies}");
     let mut paths = Vec::new();
