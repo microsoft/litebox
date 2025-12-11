@@ -128,6 +128,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileSystem<Platform> {}
 
+/// Strip the `./` prefix from tar filenames if present.
+///
+/// This is helpful for tar files that have been created via `tar cvf foo.tar .`
+fn normalize_tar_filename(filename: &str) -> &str {
+    filename.strip_prefix("./").unwrap_or(filename)
+}
+
 fn contains_dir(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -177,7 +184,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             // direct hashmap lookup of relevant information and data.
             self.tar_data.entries().enumerate().find(|(_, entry)| {
                 match entry.filename().as_str() {
-                    Ok(p) => p == path || contains_dir(p, path),
+                    Ok(p) => {
+                        let p = normalize_tar_filename(p);
+                        p == path || contains_dir(p, path)
+                    }
                     Err(_) => false,
                 }
             })
@@ -188,7 +198,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(OpenError::ReadOnlyFileSystem);
         }
         assert!(flags.contains(OFlags::RDONLY));
-        let fd = if entry.filename().as_str().unwrap() == path {
+        let fd = if normalize_tar_filename(entry.filename().as_str().unwrap()) == path {
             // it is a file
             if flags.contains(OFlags::DIRECTORY) {
                 return Err(OpenError::PathError(PathError::ComponentNotADirectory));
@@ -319,7 +329,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .tar_data
             .entries()
             .any(|entry| match entry.filename().as_str() {
-                Ok(p) => p == path || contains_dir(p, path),
+                Ok(p) => {
+                    let p = normalize_tar_filename(p);
+                    p == path || contains_dir(p, path)
+                }
                 Err(_) => false,
             })
         {
@@ -342,7 +355,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .tar_data
             .entries()
             .any(|entry| match entry.filename().as_str() {
-                Ok(p) => p == path || contains_dir(p, path),
+                Ok(p) => {
+                    let p = normalize_tar_filename(p);
+                    p == path || contains_dir(p, path)
+                }
                 Err(_) => false,
             })
         {
@@ -360,12 +376,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .tar_data
             .entries()
             .find(|entry| match entry.filename().as_str() {
-                Ok(p) => p == path || contains_dir(p, path),
+                Ok(p) => {
+                    let p = normalize_tar_filename(p);
+                    p == path || contains_dir(p, path)
+                }
                 Err(_) => false,
             });
         match entry {
             None => Err(PathError::NoSuchFileOrDirectory)?,
-            Some(p) if p.filename().as_str().unwrap() != path => Err(UnlinkError::IsADirectory),
+            Some(p) if normalize_tar_filename(p.filename().as_str().unwrap()) != path => {
+                Err(UnlinkError::IsADirectory)
+            }
             Some(_) => Err(UnlinkError::ReadOnlyFileSystem),
         }
     }
@@ -400,6 +421,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .map(|(idx, entry)| (idx, entry.filename()))
             .filter_map(|(idx, p)| {
                 let p = p.as_str().ok()?;
+                let p = normalize_tar_filename(p);
                 contains_dir(p, path).then(|| {
                     // Drop the directory path from `p`
                     let suffix = p.trim_start_matches(path).trim_start_matches('/');
@@ -470,24 +492,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         };
         let entry = self.tar_data.entries().enumerate().find(|(_, entry)| {
             match entry.filename().as_str() {
-                Ok(p) => p == path || contains_dir(p, path),
+                Ok(p) => {
+                    let p = normalize_tar_filename(p);
+                    p == path || contains_dir(p, path)
+                }
                 Err(_) => false,
             }
         });
         match entry {
             None => Err(PathError::NoSuchFileOrDirectory)?,
-            Some((_, p)) if p.filename().as_str().unwrap() != path => Ok(super::FileStatus {
-                file_type: super::FileType::Directory,
-                mode: DEFAULT_DIR_MODE,
-                size: super::DEFAULT_DIRECTORY_SIZE,
-                owner: owner_from_posix_header(p.posix_header()),
-                node_info: NodeInfo {
-                    dev: DEVICE_ID,
-                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
-                    rdev: None,
-                },
-                blksize: BLOCK_SIZE,
-            }),
+            Some((_, p)) if normalize_tar_filename(p.filename().as_str().unwrap()) != path => {
+                Ok(super::FileStatus {
+                    file_type: super::FileType::Directory,
+                    mode: DEFAULT_DIR_MODE,
+                    size: super::DEFAULT_DIRECTORY_SIZE,
+                    owner: owner_from_posix_header(p.posix_header()),
+                    node_info: NodeInfo {
+                        dev: DEVICE_ID,
+                        ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                        rdev: None,
+                    },
+                    blksize: BLOCK_SIZE,
+                })
+            }
             Some((idx, p)) => Ok(super::FileStatus {
                 file_type: super::FileType::RegularFile,
                 mode: mode_of_modeflags(p.posix_header().mode.to_flags().unwrap()),
