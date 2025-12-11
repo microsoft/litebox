@@ -1291,7 +1291,7 @@ impl OpteeMsgArg {
     }
 }
 
-/// OP-TEE SMC call arguments.
+/// A memory page to exchange OP-TEE SMC call arguments.
 /// OP-TEE assumes that the underlying architecture is Arm with TrustZone and
 /// thus it uses Secure Monitor Call (SMC) calling convention (SMCCC).
 /// Since we currently rely on the existing OP-TEE driver which assumes SMCCC, we translate it into
@@ -1299,23 +1299,34 @@ impl OpteeMsgArg {
 /// Specifically, OP-TEE SMC call uses up to nine CPU registers to pass arguments.
 /// However, since VTL call only supports up to four parameters, we allocate a VTL0 memory page and
 /// exchange all arguments through that memory page.
+/// TODO: Since this is LVBS-specific structure to facilitate the translation between VTL call convention,
+/// we might want to move it to the `litebox_platform_lvbs` crate later.
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
 #[repr(C)]
+pub struct OpteeSmcArgsPage {
+    pub args: [usize; Self::NUM_OPTEE_SMC_ARGS],
+}
+impl OpteeSmcArgsPage {
+    const NUM_OPTEE_SMC_ARGS: usize = 9;
+}
+
+impl From<&OpteeSmcArgsPage> for OpteeSmcArgs {
+    fn from(page: &OpteeSmcArgsPage) -> Self {
+        let mut smc = OpteeSmcArgs::default();
+        smc.args.copy_from_slice(&page.args);
+        smc
+    }
+}
+
+/// OP-TEE SMC call arguments.
+#[derive(Clone, Copy, Default)]
 pub struct OpteeSmcArgs {
     args: [usize; Self::NUM_OPTEE_SMC_ARGS],
 }
 
 impl OpteeSmcArgs {
     const NUM_OPTEE_SMC_ARGS: usize = 9;
-
-    pub fn arg_index(&self, index: usize) -> Option<usize> {
-        if index < Self::NUM_OPTEE_SMC_ARGS {
-            Some(self.args[index])
-        } else {
-            None
-        }
-    }
 
     /// Get the function ID of an OP-TEE SMC call
     pub fn func_id(&self) -> Result<OpteeSmcFunction, Errno> {
@@ -1368,75 +1379,94 @@ impl OpteeSmcFunction {
 
 /// OP-TEE SMC call result.
 /// OP-TEE SMC call uses CPU registers to pass input and output values.
-/// Thus, this structure is technically equivalent to `OpteeSmcArgs`, but we separate them for clarity.
-#[repr(align(4096))]
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct OpteeSmcResult {
-    args: [usize; Self::NUM_OPTEE_SMC_ARGS],
-}
-
-impl OpteeSmcResult {
-    const NUM_OPTEE_SMC_ARGS: usize = 9;
-
-    pub fn new(status: OpteeSmcReturn) -> Self {
-        let mut res = Self::default();
-        res.args[0] = status as usize;
-        res
-    }
-
-    pub fn new_exchange_capabilities(
+/// Thus, we convert this into `OpteeSmcArgs` later.
+#[non_exhaustive]
+pub enum OpteeSmcResult<'a> {
+    Generic {
+        status: OpteeSmcReturn,
+    },
+    ExchangeCapabilities {
         status: OpteeSmcReturn,
         capabilities: OpteeSecureWorldCapabilities,
         max_notif_value: usize,
         data: usize,
-    ) -> Self {
-        let mut res = Self::default();
-        res.args[0] = status as usize;
-        res.args[1] = capabilities.bits();
-        res.args[2] = max_notif_value;
-        res.args[3] = data;
-        res
-    }
-
-    /// # Panics
-    /// panics if any element of `data` cannot be converted to `usize`.
-    #[cfg(target_pointer_width = "64")]
-    pub fn new_uuid(data: &[u32; 4]) -> Self {
-        let mut res = Self::default();
-        // OP-TEE doesn't use the high 32 bit of each argument to avoid sign extension and overflow issues.
-        res.args[0] = data[0] as usize;
-        res.args[1] = data[1] as usize;
-        res.args[2] = data[2] as usize;
-        res.args[3] = data[3] as usize;
-        res
-    }
-
-    pub fn new_revision(major: usize, minor: usize) -> Self {
-        let mut res = Self::default();
-        res.args[0] = major;
-        res.args[1] = minor;
-        res
-    }
-
-    pub fn new_os_revision(major: usize, minor: usize, build_id: usize) -> Self {
-        let mut res = Self::default();
-        res.args[0] = major;
-        res.args[1] = minor;
-        res.args[2] = build_id;
-        res
-    }
-
-    pub fn new_disable_shm_cache(
+    },
+    Uuid {
+        data: &'a [u32; 4],
+    },
+    Revision {
+        major: usize,
+        minor: usize,
+    },
+    OsRevision {
+        major: usize,
+        minor: usize,
+        build_id: usize,
+    },
+    DisableShmCache {
         status: OpteeSmcReturn,
         shm_upper32: usize,
         shm_lower32: usize,
-    ) -> Self {
-        let mut res = Self::default();
-        res.args[0] = status as usize;
-        res.args[1] = shm_upper32;
-        res.args[2] = shm_lower32;
-        res
+    },
+}
+
+impl From<OpteeSmcResult<'_>> for OpteeSmcArgs {
+    fn from(value: OpteeSmcResult) -> Self {
+        match value {
+            OpteeSmcResult::Generic { status } => {
+                let mut smc = OpteeSmcArgs::default();
+                smc.args[0] = status as usize;
+                smc
+            }
+            OpteeSmcResult::ExchangeCapabilities {
+                status,
+                capabilities,
+                max_notif_value,
+                data,
+            } => {
+                let mut smc = OpteeSmcArgs::default();
+                smc.args[0] = status as usize;
+                smc.args[1] = capabilities.bits();
+                smc.args[2] = max_notif_value;
+                smc.args[3] = data;
+                smc
+            }
+            OpteeSmcResult::Uuid { data } => {
+                let mut smc = OpteeSmcArgs::default();
+                for (i, arg) in smc.args.iter_mut().enumerate().take(4) {
+                    *arg = data[i] as usize;
+                }
+                smc
+            }
+            OpteeSmcResult::Revision { major, minor } => {
+                let mut smc = OpteeSmcArgs::default();
+                smc.args[0] = major;
+                smc.args[1] = minor;
+                smc
+            }
+            OpteeSmcResult::OsRevision {
+                major,
+                minor,
+                build_id,
+            } => {
+                let mut smc = OpteeSmcArgs::default();
+                smc.args[0] = major;
+                smc.args[1] = minor;
+                smc.args[2] = build_id;
+                smc
+            }
+            OpteeSmcResult::DisableShmCache {
+                status,
+                shm_upper32,
+                shm_lower32,
+            } => {
+                let mut smc = OpteeSmcArgs::default();
+                smc.args[0] = status as usize;
+                smc.args[1] = shm_upper32;
+                smc.args[2] = shm_lower32;
+                smc
+            }
+        }
     }
 }
 
