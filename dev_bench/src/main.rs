@@ -46,6 +46,39 @@ struct CliArgs {
     /// If specified, compares the two runs instead of performing a new run.
     #[arg(long, value_names = &["RUN1", "RUN2"], num_args = 2)]
     compare: Option<Vec<String>>,
+    /// Number of iterations to run the benchmark.
+    ///
+    /// Runs the initialization stage only once per benchmark, but the main run is what is repeated
+    /// this number of times.
+    #[arg(short = 'n', long, default_value = "1")]
+    iterations: std::num::NonZeroU32,
+    /// Technique to summarize across multiple iterations.
+    #[arg(long, default_value = "min", requires = "iterations")]
+    summarization: Summarization,
+}
+
+// JB: We are not actually storing `n` or the type of summarization into the csv files, so
+// comparisons across two CSVs that use different values for these might not be valid.
+//
+// FUTURE: Store more relevant info in the CSVs.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+enum Summarization {
+    /// Minimum run time across executions
+    Min,
+    /// Mean run time across executions
+    Mean,
+}
+
+impl Summarization {
+    fn summarize(&self, durations: &[Duration]) -> Duration {
+        assert!(!durations.is_empty());
+        match self {
+            Summarization::Min => *durations.iter().min().unwrap(),
+            Summarization::Mean => {
+                durations.iter().sum::<Duration>() / u32::try_from(durations.len()).unwrap()
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -172,10 +205,16 @@ fn run_benchmark(name: &str, func: BenchFn, cli_args: &CliArgs) -> Result<()> {
         is_init: true,
     };
     func(ctx.with_init(true))?;
-    info!(benchmark = %name, "Running benchmark");
-    let start = std::time::Instant::now();
-    func(ctx.with_init(false))?;
-    let duration = start.elapsed();
+    info!(benchmark = %name, iterations=cli_args.iterations, "Running benchmark");
+    let duration = {
+        let mut durations: Vec<Duration> = vec![];
+        for _ in 0..cli_args.iterations.get() {
+            let start = std::time::Instant::now();
+            func(ctx.with_init(false))?;
+            durations.push(start.elapsed());
+        }
+        cli_args.summarization.summarize(&durations)
+    };
     info!(benchmark = %name, ?duration, "Completed benchmark");
 
     let run_csv = format!("runs/{}.csv", cli_args.record.as_ref().unwrap());
