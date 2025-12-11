@@ -1075,7 +1075,7 @@ impl litebox::platform::SystemTime for SystemTime {
     fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration> {
         self.inner
             .checked_sub(earlier.inner)
-            .ok_or_else(|| earlier.inner - self.inner)
+            .ok_or_else(|| earlier.inner.checked_sub(self.inner).unwrap())
     }
 }
 
