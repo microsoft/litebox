@@ -1,4 +1,4 @@
-use crate::remote_pointers::{RemoteConstPtr, RemotePtrKind, ValidateAccess};
+use crate::ptr::{RemoteConstPtr, RemotePtrKind, ValidateAccess};
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 use litebox::mm::linux::PAGE_SIZE;
