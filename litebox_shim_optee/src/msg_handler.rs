@@ -60,7 +60,8 @@ where
     Ok(())
 }
 
-pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult, Errno> {
+/// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
+pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_>, Errno> {
     let func_id = smc.func_id()?;
 
     match func_id {
@@ -69,43 +70,47 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult, E
         | OpteeSmcFunction::CallWithRegdArg => {
             let msg_arg_addr = smc.optee_msg_arg_phys_addr()?;
             let msg_arg = copy_from_remote_memory::<OpteeMsgArg>(msg_arg_addr)?;
-            handle_optee_msg_arg(&msg_arg).map(|()| OpteeSmcResult::new(OpteeSmcReturn::Ok))
+            handle_optee_msg_arg(&msg_arg).map(|()| OpteeSmcResult::Generic {
+                status: OpteeSmcReturn::Ok,
+            })
         }
         OpteeSmcFunction::ExchangeCapabilities => {
             // TODO: update the below when we support more features
             let default_cap = OpteeSecureWorldCapabilities::DYNAMIC_SHM
                 | OpteeSecureWorldCapabilities::MEMREF_NULL
                 | OpteeSecureWorldCapabilities::RPC_ARG;
-            Ok(OpteeSmcResult::new_exchange_capabilities(
-                OpteeSmcReturn::Ok,
-                default_cap,
-                MAX_NOTIF_VALUE,
-                NUM_RPC_PARMS,
-            ))
+            Ok(OpteeSmcResult::ExchangeCapabilities {
+                status: OpteeSmcReturn::Ok,
+                capabilities: default_cap,
+                max_notif_value: MAX_NOTIF_VALUE,
+                data: NUM_RPC_PARMS,
+            })
         }
         OpteeSmcFunction::DisableShmCache => {
             // We do not support this feature
-            Ok(OpteeSmcResult::new_disable_shm_cache(
-                OpteeSmcReturn::ENotAvail,
-                0,
-                0,
-            ))
+            Ok(OpteeSmcResult::DisableShmCache {
+                status: OpteeSmcReturn::ENotAvail,
+                shm_upper32: 0,
+                shm_lower32: 0,
+            })
         }
-        OpteeSmcFunction::CallsUid => Ok(OpteeSmcResult::new_uuid(&[
-            OPTEE_MSG_UID_0,
-            OPTEE_MSG_UID_1,
-            OPTEE_MSG_UID_2,
-            OPTEE_MSG_UID_3,
-        ])),
-        OpteeSmcFunction::GetOsRevision => Ok(OpteeSmcResult::new_os_revision(
-            OPTEE_MSG_REVISION_MAJOR,
-            OPTEE_MSG_REVISION_MINOR,
-            OPTEE_MSG_BUILD_ID,
-        )),
-        OpteeSmcFunction::CallsRevision => Ok(OpteeSmcResult::new_revision(
-            OPTEE_MSG_REVISION_MAJOR,
-            OPTEE_MSG_REVISION_MINOR,
-        )),
+        OpteeSmcFunction::CallsUid => Ok(OpteeSmcResult::Uuid {
+            data: &[
+                OPTEE_MSG_UID_0,
+                OPTEE_MSG_UID_1,
+                OPTEE_MSG_UID_2,
+                OPTEE_MSG_UID_3,
+            ],
+        }),
+        OpteeSmcFunction::GetOsRevision => Ok(OpteeSmcResult::OsRevision {
+            major: OPTEE_MSG_REVISION_MAJOR,
+            minor: OPTEE_MSG_REVISION_MINOR,
+            build_id: OPTEE_MSG_BUILD_ID,
+        }),
+        OpteeSmcFunction::CallsRevision => Ok(OpteeSmcResult::Revision {
+            major: OPTEE_MSG_REVISION_MAJOR,
+            minor: OPTEE_MSG_REVISION_MINOR,
+        }),
         _ => Err(Errno::EINVAL),
     }
 }
