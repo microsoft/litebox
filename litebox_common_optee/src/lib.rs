@@ -1122,11 +1122,11 @@ pub enum OpteeMessageCommand {
 #[repr(C)]
 pub struct OpteeMsgParamTmem {
     /// Physical address of the buffer
-    buf_ptr: u64,
+    pub buf_ptr: u64,
     /// Size of the buffer
-    size: u64,
+    pub size: u64,
     /// Temporary shared memory reference or identifier
-    shm_ref: u64,
+    pub shm_ref: u64,
 }
 
 /// Registered memory reference parameter
@@ -1134,11 +1134,11 @@ pub struct OpteeMsgParamTmem {
 #[repr(C)]
 pub struct OpteeMsgParamRmem {
     /// Offset into shared memory reference
-    offs: u64,
+    pub offs: u64,
     /// Size of the buffer
-    size: u64,
+    pub size: u64,
     /// Shared memory reference or identifier
-    shm_ref: u64,
+    pub shm_ref: u64,
 }
 
 /// FF-A memory reference parameter
@@ -1146,15 +1146,15 @@ pub struct OpteeMsgParamRmem {
 #[repr(C)]
 pub struct OpteeMsgParamFmem {
     /// Lower bits of offset into shared memory reference
-    offs_low: u32,
+    pub offs_low: u32,
     /// Higher bits of offset into shared memory reference
-    offs_high: u32,
+    pub offs_high: u32,
     /// Internal offset into the first page of shared memory reference
-    internal_offs: u16,
+    pub internal_offs: u16,
     /// Size of the buffer
-    size: u64,
+    pub size: u64,
     /// Global identifier of the shared memory
-    global_id: u64,
+    pub global_id: u64,
 }
 
 /// Opaque value parameter
@@ -1162,9 +1162,9 @@ pub struct OpteeMsgParamFmem {
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct OpteeMsgParamValue {
-    a: u64,
-    b: u64,
-    c: u64,
+    pub a: u64,
+    pub b: u64,
+    pub c: u64,
 }
 
 /// Parameter used together with `OpteeMsgArg`
@@ -1239,7 +1239,7 @@ impl OpteeMsgParam {
 #[repr(C)]
 pub struct OpteeMsgArg {
     /// OP-TEE message command. This is a superset of `UteeEntryFunc`.
-    cmd: OpteeMessageCommand,
+    pub cmd: OpteeMessageCommand,
     /// TA function ID which is used if `cmd == InvokeCommand`. Note that the meaning of `cmd` and `func`
     /// is swapped compared to TAs.
     func: u32,
@@ -1260,6 +1260,41 @@ pub struct OpteeMsgArg {
     /// Note that, originally, the length of this array is variable. We fix it to `TEE_NUM_PARAMS + 2` to
     /// simplify the implementation (our OP-TEE Shim supports up to four parameters as well).
     params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
+}
+
+impl OpteeMsgArg {
+    #[cfg(target_pointer_width = "64")]
+    pub fn get_param_tmem(&self, index: usize) -> Result<OpteeMsgParamTmem, Errno> {
+        if index >= self.params.len() || index >= self.num_params as usize {
+            Err(Errno::EINVAL)
+        } else {
+            Ok(unsafe { self.params[index].u.tmem })
+        }
+    }
+    #[cfg(target_pointer_width = "64")]
+    pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, Errno> {
+        if index >= self.params.len() || index >= self.num_params as usize {
+            Err(Errno::EINVAL)
+        } else {
+            Ok(unsafe { self.params[index].u.rmem })
+        }
+    }
+    #[cfg(target_pointer_width = "64")]
+    pub fn get_param_fmem(&self, index: usize) -> Result<OpteeMsgParamFmem, Errno> {
+        if index >= self.params.len() || index >= self.num_params as usize {
+            Err(Errno::EINVAL)
+        } else {
+            Ok(unsafe { self.params[index].u.fmem })
+        }
+    }
+    #[cfg(target_pointer_width = "64")]
+    pub fn get_param_value(&self, index: usize) -> Result<OpteeMsgParamValue, Errno> {
+        if index >= self.params.len() || index >= self.num_params as usize {
+            Err(Errno::EINVAL)
+        } else {
+            Ok(unsafe { self.params[index].u.value })
+        }
+    }
 }
 
 /// OP-TEE SMC call arguments.
@@ -1295,12 +1330,13 @@ impl OpteeSmcArgs {
 
     /// Get the physical address of `OpteeMsgArg`. The secure world is expected to map and copy
     /// this structure.
-    pub fn optee_msg_arg_phys_addr(&self) -> Result<usize, Errno> {
+    #[cfg(target_pointer_width = "64")]
+    pub fn optee_msg_arg_phys_addr(&self) -> Result<u64, Errno> {
         // To avoid potential sign extension and overflow issues, OP-TEE stores the low and
         // high 32 bits of a 64-bit address in `args[2]` and `args[1]`, respectively.
         if self.args[1] & 0xffff_ffff_0000_0000 == 0 && self.args[2] & 0xffff_ffff_0000_0000 == 0 {
             let addr = (self.args[1] << 32) | self.args[2];
-            Ok(addr)
+            Ok(addr as u64)
         } else {
             Err(Errno::EINVAL)
         }
@@ -1371,13 +1407,14 @@ impl OpteeSmcResult {
 
     /// # Panics
     /// panics if any element of `data` cannot be converted to `usize`.
+    #[cfg(target_pointer_width = "64")]
     pub fn new_uuid(data: &[u32; 4]) -> Self {
         let mut res = Self::default();
         // OP-TEE doesn't use the high 32 bit of each argument to avoid sign extension and overflow issues.
-        res.args[0] = usize::try_from(data[0]).unwrap();
-        res.args[1] = usize::try_from(data[1]).unwrap();
-        res.args[2] = usize::try_from(data[2]).unwrap();
-        res.args[3] = usize::try_from(data[3]).unwrap();
+        res.args[0] = data[0] as usize;
+        res.args[1] = data[1] as usize;
+        res.args[2] = data[2] as usize;
+        res.args[3] = data[3] as usize;
         res
     }
 

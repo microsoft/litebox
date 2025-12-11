@@ -33,7 +33,7 @@ use litebox_platform_multiplex::Platform;
 pub mod loader;
 pub(crate) mod syscalls;
 
-pub mod msg_proto;
+pub mod msg_handler;
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
