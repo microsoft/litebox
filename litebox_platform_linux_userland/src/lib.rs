@@ -1221,7 +1221,16 @@ fn futex_timeout(
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
         syscalls::syscall6(
-            syscalls::Sysno::futex,
+            {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    syscalls::Sysno::futex
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    syscalls::Sysno::futex_time64
+                }
+            },
             uaddr as usize,
             usize::try_from(futex_op).unwrap(),
             val as usize,
@@ -1251,7 +1260,16 @@ fn futex_val2(
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
         syscalls::syscall6(
-            syscalls::Sysno::futex,
+            {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    syscalls::Sysno::futex
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    syscalls::Sysno::futex_time64
+                }
+            },
             uaddr as usize,
             usize::try_from(futex_op).unwrap(),
             val as usize,
