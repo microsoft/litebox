@@ -181,7 +181,7 @@ macro_rules! LOAD_VTL_STATE_ASM {
     };
 }
 
-/// Saves VTL0 state from stack to per-CPU storage.
+/// Saves VTL0 state to per-CPU storage.
 ///
 /// # Safety
 /// - `vtl_state` must be a valid pointer to a readable `VtlState` structure
@@ -189,7 +189,7 @@ macro_rules! LOAD_VTL_STATE_ASM {
 unsafe extern "C" fn save_vtl0_state(vtl_state: *const VtlState) {
     with_per_cpu_variables_mut(|pcv| {
         let dst = &raw mut pcv.vtl0_state;
-        // SAFETY: vtl_state points to valid VtlState from caller's stack frame.
+        // SAFETY: vtl_state points to valid VtlState.
         // dst points to per-CPU storage initialized during boot.
         unsafe {
             if vtl_state.is_aligned() {
@@ -201,7 +201,7 @@ unsafe extern "C" fn save_vtl0_state(vtl_state: *const VtlState) {
     });
 }
 
-/// Loads VTL0 state from per-CPU storage to stack.
+/// Loads VTL0 state from per-CPU storage.
 ///
 /// # Safety
 /// - `vtl_state` must be a valid pointer to a writable `VtlState` structure
@@ -210,7 +210,7 @@ unsafe extern "C" fn load_vtl0_state(vtl_state: *mut VtlState) {
     with_per_cpu_variables(|pcv| {
         let src = &raw const pcv.vtl0_state;
         // SAFETY: src points to per-CPU storage with valid VtlState.
-        // vtl_state points to caller's stack frame with sufficient space.
+        // vtl_state points to valid VtlState space.
         unsafe {
             if vtl_state.is_aligned() {
                 core::ptr::copy_nonoverlapping(src, vtl_state, 1);

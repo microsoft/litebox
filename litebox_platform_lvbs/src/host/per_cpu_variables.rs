@@ -193,6 +193,7 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 
 /// Specify the layout of Kernel TLS area.
 #[non_exhaustive]
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone)]
 pub struct KernelTls {
