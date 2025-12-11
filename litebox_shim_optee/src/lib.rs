@@ -32,6 +32,7 @@ pub mod loader;
 pub(crate) mod syscalls;
 
 pub mod msg_handler;
+pub mod remote_pointers;
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 

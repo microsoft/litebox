@@ -1,6 +1,8 @@
+use crate::remote_pointers::{RemoteConstPtr, RemotePtrKind, ValidateAccess};
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 use litebox::mm::linux::PAGE_SIZE;
+use litebox::platform::RawConstPointer;
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArg, OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction,
@@ -35,32 +37,17 @@ fn page_align_up(len: u64) -> u64 {
     len.next_multiple_of(PAGE_SIZE as u64)
 }
 
-// Placeholder for copying data from remote memory (e.g., VTL0 physical memory)
-// TODO: Specify it in the litebox crate?
-// TODO: Define a type for remote address
-#[allow(clippy::unnecessary_wraps)]
-fn copy_from_remote_memory<T>(_remote_addr: u64) -> Result<T, Errno>
-where
-    T: Copy,
-{
-    // TODO: implement the actual remote copy
-    Ok(unsafe { core::mem::zeroed() })
-}
+// TODO: implement a validation mechanism for VTL0 physical addresses (e.g., ensure this physical
+// address does not belong to VTL1)
+pub struct Novalidation;
+impl ValidateAccess for Novalidation {}
 
-// Placeholder for copying data to remote memory (e.g., VTL0 physical memory)
-// TODO: Specify it in the litebox crate?
-// TODO: Define a type for remote address
-#[expect(unused)]
-#[allow(clippy::unnecessary_wraps)]
-fn copy_to_remote_memory<T>(_remote_addr: u64, _data: &T) -> Result<(), Errno>
-where
-    T: Copy,
-{
-    // TODO: implement the actual remote copy
-    Ok(())
-}
+pub struct Vtl0PhysAddr;
+impl RemotePtrKind for Vtl0PhysAddr {}
 
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
+/// # Panics
+/// Panics if the physical address in `smc` cannot be converted to `usize`.
 pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_>, Errno> {
     let func_id = smc.func_id()?;
 
@@ -69,7 +56,13 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_
         | OpteeSmcFunction::CallWithRpcArg
         | OpteeSmcFunction::CallWithRegdArg => {
             let msg_arg_addr = smc.optee_msg_arg_phys_addr()?;
-            let msg_arg = copy_from_remote_memory::<OpteeMsgArg>(msg_arg_addr)?;
+            let msg_arg_addr = usize::try_from(msg_arg_addr).unwrap();
+            let remote_ptr =
+                RemoteConstPtr::<Novalidation, Vtl0PhysAddr, OpteeMsgArg>::from_usize(msg_arg_addr);
+            let msg_arg = unsafe { remote_ptr.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
+            // let msg_arg = copy_from_remote_memory::<OpteeMsgArg>(msg_arg_addr)?;
             handle_optee_msg_arg(&msg_arg).map(|()| OpteeSmcResult::Generic {
                 status: OpteeSmcReturn::Ok,
             })
@@ -195,11 +188,13 @@ impl ShmRefMap {
         let num_pages = usize::try_from(aligned_size).unwrap() / PAGE_SIZE;
         let mut pages = Vec::with_capacity(num_pages);
 
-        let mut cur_addr = aligned_phys_addr;
+        let mut cur_addr = usize::try_from(aligned_phys_addr).unwrap();
         loop {
-            let Ok(pages_data) = copy_from_remote_memory::<ShmRefPagesData>(cur_addr) else {
-                return Err(Errno::EFAULT);
-            };
+            let cur_ptr =
+                RemoteConstPtr::<Novalidation, Vtl0PhysAddr, ShmRefPagesData>::from_usize(cur_addr);
+            let pages_data = unsafe { cur_ptr.read_at_offset(0) }
+                .ok_or(Errno::EFAULT)?
+                .into_owned();
             for page in &pages_data.pages_list {
                 if *page == 0 || pages.len() == num_pages {
                     break;
@@ -212,7 +207,7 @@ impl ShmRefMap {
             if pages_data.next_page_data == 0 || pages.len() == num_pages {
                 break;
             } else {
-                cur_addr = pages_data.next_page_data;
+                cur_addr = usize::try_from(pages_data.next_page_data).unwrap();
             }
         }
 
