@@ -19,6 +19,7 @@ use litebox::{
     },
     fs::{FileSystem, Mode, OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
+    utils::TruncateExt as _,
 };
 use litebox_common_linux::{
     IpOption, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption, SocketOptionName,
@@ -1311,13 +1312,16 @@ impl UnixSocket {
                     let val = super::net::read_from_user::<u32>(optval, optlen)?;
                     self.options.lock().keep_alive = val != 0;
                 }
+                SocketOption::BROADCAST => {
+                    let val = super::net::read_from_user::<u32>(optval, optlen)?;
+                    self.options.lock().broadcast = val != 0;
+                }
                 // Don't allow changing socket type and credentials
                 SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
                 // We use fixed buffer size for now
                 SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
-                SocketOption::BROADCAST => todo!("setsockopt BROADCAST"),
             },
-            SocketOptionName::TCP(_) => return Err(Errno::EINVAL),
+            SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
         }
         Ok(())
     }
@@ -1350,11 +1354,26 @@ impl UnixSocket {
                     UnixSocketInner::Datagram(_) => SockType::Datagram as u32,
                 },
                 SocketOption::KEEPALIVE => u32::from(self.options.lock().keep_alive),
-                _ => todo!("getsockopt for {:?}", so),
+                SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.truncate(),
+                SocketOption::BROADCAST => u32::from(self.options.lock().broadcast),
+                SocketOption::PEERCRED => {
+                    let ucred = self.with_state_ref(|state| match state {
+                        UnixSocketState::ConnectedStream(_) | UnixSocketState::Datagram(_) => {
+                            log_unsupported!("get PEERCRED for unix socket");
+                            Err(Errno::EOPNOTSUPP)
+                        }
+                        _ => Ok(litebox_common_linux::Ucred {
+                            pid: 0,
+                            uid: u32::MAX,
+                            gid: u32::MAX,
+                        }),
+                    })?;
+                    return super::net::write_to_user(ucred, optval, len);
+                }
             },
-            SocketOptionName::TCP(_) => return Err(Errno::EINVAL),
+            SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
         };
-        super::net::write_u32_option(val, optval, len)
+        super::net::write_to_user(val, optval, len)
     }
 
     super::common_functions_for_file_status!();
