@@ -106,6 +106,7 @@ impl<T> ReadEnd<T> {
     common_functions_for_channel!();
 }
 
+#[derive(Clone)]
 pub(crate) struct WriteEnd<T> {
     endpoint: alloc::sync::Arc<EndPointer<crate::Platform, ringbuf::HeapProd<T>>>,
     peer: alloc::sync::Weak<EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
@@ -126,6 +127,14 @@ impl<T> WriteEnd<T> {
                 Ok(())
             }
             Err(e) => Err((e, Errno::EAGAIN)),
+        }
+    }
+
+    pub(crate) fn is_pair(&self, reader: &ReadEnd<T>) -> bool {
+        if let Some(peer) = self.peer.upgrade() {
+            Arc::ptr_eq(&peer, &reader.endpoint)
+        } else {
+            false
         }
     }
 

@@ -10,12 +10,15 @@ use alloc::{
 };
 use litebox::{
     event::IOPollable,
-    fs::{FileSystem, Mode, OFlags},
+    fs::{FileSystem, Mode, OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
 };
 use litebox_common_linux::{ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno};
 
-use crate::{FileFd, GlobalState, Task};
+use crate::{
+    FileFd, GlobalState, Task,
+    channel::{Channel, ReadEnd, WriteEnd},
+};
 
 /// C-compatible structure for Unix socket addresses.
 const UNIX_PATH_MAX: usize = 108;
@@ -80,17 +83,25 @@ impl UnixSocketAddr {
         match self {
             UnixSocketAddr::Path(path) => {
                 let flags = if is_server {
-                    // create the socket file if not exists
-                    OFlags::CREAT | OFlags::RDWR
+                    // create the socket file if not exists;
+                    // use O_EXCL to ensure exclusive creation
+                    OFlags::CREAT | OFlags::EXCL | OFlags::RDWR
                 } else {
                     OFlags::RDWR
                 };
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
-                let file = task.global.fs.open(
-                    path.as_str(),
-                    flags,
-                    Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-                )?;
+                let file = task
+                    .global
+                    .fs
+                    .open(
+                        path.as_str(),
+                        flags,
+                        Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                    )
+                    .map_err(|err| match err {
+                        OpenError::AlreadyExists => Errno::EADDRINUSE,
+                        other => Errno::from(other),
+                    })?;
                 Ok(UnixBoundSocketAddr::Path((path, file, task.global.clone())))
             }
             UnixSocketAddr::Abstract(data) => {
@@ -232,6 +243,7 @@ impl UnixInitStream {
                 drop(guard);
                 backlog.connect(self, is_nonblocking)
             }
+            UnixEntryInner::Datagram(_) => Err((self, Errno::EPROTOTYPE)),
         }
     }
 }
@@ -548,11 +560,272 @@ impl UnixConnectedStream {
     }
 }
 
-#[expect(clippy::enum_variant_names, reason = "will add datagram soon")]
+/// A datagram message with source address information
+#[derive(Clone)]
+struct DatagramMessage {
+    data: Vec<u8>,
+    // TODO: add control messages
+    // cmsgs: Option<Vec<Cmsg>>,
+    source: UnixSocketAddr,
+}
+
+impl WriteEnd<DatagramMessage> {
+    fn try_write(&self, msg: DatagramMessage) -> Result<(), (DatagramMessage, Errno)> {
+        self.try_write_one(msg)
+    }
+    fn write(&self, mut msg: DatagramMessage, is_nonblocking: bool) -> Result<(), Errno> {
+        if is_nonblocking {
+            self.try_write(msg).map_err(|(_, err)| err)?;
+            Ok(())
+        } else {
+            // TODO: use polling instead of busy loop
+            loop {
+                msg = match self.try_write(msg) {
+                    Ok(()) => return Ok(()),
+                    Err((msg, Errno::EAGAIN)) => msg,
+                    Err((_, err)) => return Err(err),
+                }
+            }
+        }
+    }
+}
+impl ReadEnd<DatagramMessage> {
+    /// Attempts to read datagram messages without blocking.
+    ///
+    /// Reads multiple messages from the same source address until the buffer
+    /// is full or a message from a different source is encountered.
+    fn try_read(
+        &self,
+        mut buf: &mut [u8],
+        source_addr: Option<&mut Option<UnixSocketAddr>>,
+    ) -> Result<usize, Errno> {
+        let mut src = None;
+        let mut total_read = 0;
+        let mut stop = false;
+        while !buf.is_empty() {
+            let n = match self.peek_and_consume_one(|msg| {
+                if src.as_ref().is_some_and(|addr| *addr != msg.source) {
+                    stop = true;
+                    return Ok((false, 0));
+                }
+                if src.is_none() {
+                    src.replace(msg.source.clone());
+                }
+                if buf.len() >= msg.data.len() {
+                    buf[..msg.data.len()].copy_from_slice(&msg.data);
+                    Ok((true, msg.data.len()))
+                } else {
+                    buf.copy_from_slice(&msg.data[..buf.len()]);
+                    msg.data = msg.data.split_off(buf.len());
+                    Ok((false, buf.len()))
+                }
+            }) {
+                Ok(0) if stop => break,
+                Ok(n) => n,
+                Err(e) => {
+                    if total_read > 0 {
+                        break;
+                    }
+                    return Err(e);
+                }
+            };
+            total_read += n;
+            buf = &mut buf[n..];
+        }
+        if let (Some(src), Some(source_addr)) = (src, source_addr) {
+            *source_addr = Some(src);
+        }
+        Ok(total_read)
+    }
+}
+
+/// Represents a Unix datagram socket.
+struct UnixDatagram {
+    /// The local address this socket is bound to, if any.
+    addr: Option<(UnixBoundSocketAddr, Arc<GlobalState>)>,
+    /// The read end of the local socket's channel.
+    reader: Option<ReadEnd<DatagramMessage>>,
+    /// The write end of the remote socket it is connected to, if any.
+    peer_writer: Option<WriteEnd<DatagramMessage>>,
+}
+
+impl Drop for UnixDatagram {
+    fn drop(&mut self) {
+        if let Some((addr, global)) = self.addr.take() {
+            let key = addr.to_key();
+            let mut table = global.unix_addr_table.write();
+            // Only remove the entry if it matches the current socket
+            if let Some(UnixEntry(UnixEntryInner::Datagram(writer))) = table.get(&key)
+                && let Some(reader) = &self.reader
+                && writer.is_pair(reader)
+            {
+                table.remove(&key);
+            }
+        }
+    }
+}
+
+impl UnixDatagram {
+    fn new() -> Self {
+        Self {
+            addr: None,
+            reader: None,
+            peer_writer: None,
+        }
+    }
+
+    fn new_pair() -> (UnixDatagram, UnixDatagram) {
+        let (writer, reader) = crate::channel::Channel::new(UNIX_BUF_SIZE).split();
+        let (writer_peer, reader_peer) = crate::channel::Channel::new(UNIX_BUF_SIZE).split();
+        (
+            UnixDatagram {
+                addr: None,
+                reader: Some(reader),
+                peer_writer: Some(writer_peer),
+            },
+            UnixDatagram {
+                addr: None,
+                reader: Some(reader_peer),
+                peer_writer: Some(writer),
+            },
+        )
+    }
+
+    /// Binds this socket to the given address.
+    fn bind(&mut self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
+        if self.addr.is_some() {
+            return if addr.is_unnamed() {
+                Ok(())
+            } else {
+                Err(Errno::EINVAL)
+            };
+        }
+
+        let bound_addr = addr.bind(task, true)?;
+        let key = bound_addr.to_key();
+        // Registers the write end of the socket in the global address table so it
+        // can receive messages sent to this address.
+        let (writer, reader) = Channel::new(UNIX_BUF_SIZE).split();
+        let _ = task
+            .global
+            .unix_addr_table
+            .write()
+            .insert(key, UnixEntry(UnixEntryInner::Datagram(writer)));
+        self.addr = Some((bound_addr, task.global.clone()));
+        self.reader = Some(reader);
+        Ok(())
+    }
+
+    /// Looks up a socket address and returns its write endpoint.
+    fn lookup(
+        &self,
+        task: &Task,
+        addr: UnixSocketAddr,
+    ) -> Result<WriteEnd<DatagramMessage>, Errno> {
+        let guard = task.global.unix_addr_table.read();
+        let Some(key) = addr.to_key() else {
+            return Err(Errno::EINVAL);
+        };
+        let Some(entry) = guard.get(&key) else {
+            return Err(Errno::ECONNREFUSED);
+        };
+        // check if we can bind to the address
+        let _ = addr.bind(task, false)?;
+        match &entry.0 {
+            UnixEntryInner::Stream(_) => Err(Errno::EPROTOTYPE),
+            UnixEntryInner::Datagram(writer) => Ok(writer.clone()),
+        }
+    }
+
+    /// Connects this socket to a default peer address.
+    ///
+    /// Subsequent sends without an address will use this peer.
+    fn connect(&mut self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
+        self.peer_writer = Some(self.lookup(task, addr)?);
+        Ok(())
+    }
+
+    // Sends data to the specified or connected peer.
+    ///
+    /// If `addr` is provided, sends to that address. Otherwise, uses the
+    /// connected peer (set via `connect()`).
+    fn sendto(
+        &self,
+        task: &Task,
+        buf: &[u8],
+        is_nonblocking: bool,
+        addr: Option<UnixSocketAddr>,
+    ) -> Result<usize, Errno> {
+        let source = self.get_local_addr();
+        if let Some(addr) = addr {
+            let peer_writer = self.lookup(task, addr)?;
+            peer_writer.write(
+                DatagramMessage {
+                    data: buf.to_vec(),
+                    source,
+                },
+                is_nonblocking,
+            )?;
+        } else if let Some(peer_writer) = &self.peer_writer {
+            peer_writer.write(
+                DatagramMessage {
+                    data: buf.to_vec(),
+                    source,
+                },
+                is_nonblocking,
+            )?;
+        } else {
+            return Err(Errno::ENOTCONN);
+        }
+        Ok(buf.len())
+    }
+
+    /// Receives data from any sender.
+    ///
+    /// If `source_addr` is provided, it will be populated with the sender's address.
+    fn recvfrom(
+        &self,
+        buf: &mut [u8],
+        is_nonblocking: bool,
+        mut source_addr: Option<&mut Option<UnixSocketAddr>>,
+    ) -> Result<usize, Errno> {
+        let Some(reader) = &self.reader else {
+            return Err(Errno::ENOTCONN);
+        };
+        let ret = if is_nonblocking {
+            reader.try_read(buf, source_addr.as_deref_mut())
+        } else {
+            // TODO: use polling instead of busy wait
+            loop {
+                match reader.try_read(buf, source_addr.as_deref_mut()) {
+                    Ok(size) => break Ok(size),
+                    Err(Errno::EAGAIN) => {}
+                    Err(err) => break Err(err),
+                }
+                core::hint::spin_loop();
+            }
+        };
+        match ret {
+            Err(Errno::ESHUTDOWN) => Ok(0),
+            other => other,
+        }
+    }
+
+    fn get_local_addr(&self) -> UnixSocketAddr {
+        if let Some((addr, _)) = &self.addr {
+            UnixSocketAddr::from(addr)
+        } else {
+            UnixSocketAddr::Unnamed
+        }
+    }
+}
+
 enum UnixSocketState {
     InitStream(UnixInitStream),
     ListenStream(UnixListenStream),
     ConnectedStream(UnixConnectedStream),
+
+    Datagram(UnixDatagram),
 }
 
 pub struct UnixSocket {
@@ -575,7 +848,7 @@ impl UnixSocket {
     pub(super) fn new(sock_type: SockType, flags: SockFlags) -> Option<Self> {
         let state = match sock_type {
             SockType::Stream => UnixSocketState::InitStream(UnixInitStream::new()),
-            SockType::Datagram => unimplemented!("Datagram sockets are not yet implemented"),
+            SockType::Datagram => UnixSocketState::Datagram(UnixDatagram::new()),
             e => {
                 log_unsupported!("Unsupported unix socket type: {:?}", e);
                 return None;
@@ -620,6 +893,7 @@ impl UnixSocket {
                     Err(Errno::EINVAL)
                 }
                 UnixSocketState::ConnectedStream(_) => Err(Errno::EISCONN),
+                UnixSocketState::Datagram(unix) => unix.bind(task, addr),
             }
         })
     }
@@ -638,6 +912,7 @@ impl UnixSocket {
                     Ok(())
                 }
                 UnixSocketState::ConnectedStream(_) => Err(Errno::EISCONN),
+                UnixSocketState::Datagram(_) => Err(Errno::EOPNOTSUPP),
             };
             (state, ret)
         })
@@ -658,6 +933,10 @@ impl UnixSocket {
                 }
                 UnixSocketState::ListenStream(_) => Err(Errno::EINVAL),
                 UnixSocketState::ConnectedStream(_) => Err(Errno::EISCONN),
+                UnixSocketState::Datagram(mut unix) => {
+                    let ret = unix.connect(task, addr);
+                    return (UnixSocketState::Datagram(unix), ret);
+                }
             };
             (state, ret)
         })
@@ -682,11 +961,13 @@ impl UnixSocket {
             UnixSocketState::InitStream(_) | UnixSocketState::ConnectedStream(_) => {
                 Err(Errno::EINVAL)
             }
+            UnixSocketState::Datagram(_) => Err(Errno::EOPNOTSUPP),
         })
     }
 
     pub(super) fn sendto(
         &self,
+        task: &Task,
         buf: &[u8],
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
@@ -696,6 +977,8 @@ impl UnixSocket {
             log_unsupported!("Unsupported sendto flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
+        let is_nonblocking =
+            flags.contains(SendFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
 
         let ret = self.with_state_ref(|state| match state {
             UnixSocketState::InitStream(_) | UnixSocketState::ListenStream(_) => {
@@ -705,12 +988,9 @@ impl UnixSocket {
                 if addr.is_some() {
                     return Err(Errno::EISCONN);
                 }
-                connect.sendto(
-                    buf,
-                    flags.contains(SendFlags::DONTWAIT)
-                        || self.get_status().contains(OFlags::NONBLOCK),
-                )
+                connect.sendto(buf, is_nonblocking)
             }
+            UnixSocketState::Datagram(sock) => sock.sendto(task, buf, is_nonblocking, addr),
         });
         if let Err(Errno::EPIPE) = ret
             && !flags.contains(SendFlags::NOSIGNAL)
@@ -732,15 +1012,15 @@ impl UnixSocket {
             log_unsupported!("Unsupported recvfrom flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
+        let is_nonblocking =
+            flags.contains(ReceiveFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
 
         self.with_state_ref(|state| match state {
             UnixSocketState::InitStream(_) | UnixSocketState::ListenStream(_) => Err(Errno::EINVAL),
-            UnixSocketState::ConnectedStream(connect) => connect.recvfrom(
-                buf,
-                flags.contains(ReceiveFlags::DONTWAIT)
-                    || self.get_status().contains(OFlags::NONBLOCK),
-                source_addr,
-            ),
+            UnixSocketState::ConnectedStream(connect) => {
+                connect.recvfrom(buf, is_nonblocking, source_addr)
+            }
+            UnixSocketState::Datagram(sock) => sock.recvfrom(buf, is_nonblocking, source_addr),
         })
     }
 
@@ -752,6 +1032,7 @@ impl UnixSocket {
             },
             UnixSocketState::ListenStream(listen) => UnixSocketAddr::from(listen.get_local_addr()),
             UnixSocketState::ConnectedStream(connect) => connect.get_local_addr(),
+            UnixSocketState::Datagram(sock) => sock.get_local_addr(),
         })
     }
 
@@ -759,13 +1040,21 @@ impl UnixSocket {
         ty: SockType,
         flags: SockFlags,
     ) -> Option<(UnixSocket, UnixSocket)> {
-        let (conn1, conn2) = UnixConnectedStream::new_pair(None, None);
         match ty {
-            SockType::Stream => Some((
-                UnixSocket::new_with_state(UnixSocketState::ConnectedStream(conn1), flags),
-                UnixSocket::new_with_state(UnixSocketState::ConnectedStream(conn2), flags),
-            )),
-            SockType::Datagram => unimplemented!("datagram unix socket"),
+            SockType::Stream => {
+                let (conn1, conn2) = UnixConnectedStream::new_pair(None, None);
+                Some((
+                    UnixSocket::new_with_state(UnixSocketState::ConnectedStream(conn1), flags),
+                    UnixSocket::new_with_state(UnixSocketState::ConnectedStream(conn2), flags),
+                ))
+            }
+            SockType::Datagram => {
+                let (datagram1, datagram2) = UnixDatagram::new_pair();
+                Some((
+                    UnixSocket::new_with_state(UnixSocketState::Datagram(datagram1), flags),
+                    UnixSocket::new_with_state(UnixSocketState::Datagram(datagram2), flags),
+                ))
+            }
             _ => None,
         }
     }
@@ -788,9 +1077,9 @@ impl IOPollable for UnixSocket {
 }
 
 pub(crate) struct UnixEntry(UnixEntryInner);
-// TODO: add datagram entry
 enum UnixEntryInner {
     Stream(Arc<Backlog>),
+    Datagram(WriteEnd<DatagramMessage>),
 }
 
 /// Type alias for the global Unix socket address table.
