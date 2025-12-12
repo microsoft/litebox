@@ -1111,6 +1111,18 @@ pub enum OpteeMessageCommand {
     Unknown = 0xffff_ffff,
 }
 
+impl TryFrom<OpteeMessageCommand> for UteeEntryFunc {
+    type Error = OpteeSmcReturn;
+    fn try_from(cmd: OpteeMessageCommand) -> Result<Self, Self::Error> {
+        match cmd {
+            OpteeMessageCommand::OpenSession => Ok(UteeEntryFunc::OpenSession),
+            OpteeMessageCommand::CloseSession => Ok(UteeEntryFunc::CloseSession),
+            OpteeMessageCommand::InvokeCommand => Ok(UteeEntryFunc::InvokeCommand),
+            _ => Err(OpteeSmcReturn::EBadCmd),
+        }
+    }
+}
+
 /// Temporary reference memory parameter
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -1236,24 +1248,24 @@ pub struct OpteeMsgArg {
     pub cmd: OpteeMessageCommand,
     /// TA function ID which is used if `cmd == InvokeCommand`. Note that the meaning of `cmd` and `func`
     /// is swapped compared to TAs.
-    func: u32,
+    pub func: u32,
     /// Session ID. This is "IN" parameter most of the time except for `cmd == OpenSession` where
     /// the secure world generates and returns a session ID.
-    session: u32,
+    pub session: u32,
     /// Cancellation ID. This is a unique value to identify this request.
-    cancel_id: u32,
+    pub cancel_id: u32,
     pad: u32,
     /// Return value from the secure world
-    ret: u32,
+    pub ret: u32,
     /// Origin of the return value
-    ret_origin: TeeOrigin,
+    pub ret_origin: TeeOrigin,
     /// Number of parameters contained in `params`
-    num_params: u32,
+    pub num_params: u32,
     /// Parameters to be passed to the secure world. If `cmd == OpenSession`, the first two params contain
     /// a TA UUID and they are not delivered to the TA.
     /// Note that, originally, the length of this array is variable. We fix it to `TEE_NUM_PARAMS + 2` to
     /// simplify the implementation (our OP-TEE Shim supports up to four parameters as well).
-    params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
+    pub params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
 }
 
 impl OpteeMsgArg {
@@ -1329,21 +1341,22 @@ impl OpteeSmcArgs {
     const NUM_OPTEE_SMC_ARGS: usize = 9;
 
     /// Get the function ID of an OP-TEE SMC call
-    pub fn func_id(&self) -> Result<OpteeSmcFunction, Errno> {
-        OpteeSmcFunction::try_from(self.args[0] & OpteeSmcFunction::MASK).map_err(|_| Errno::EINVAL)
+    pub fn func_id(&self) -> Result<OpteeSmcFunction, OpteeSmcReturn> {
+        OpteeSmcFunction::try_from(self.args[0] & OpteeSmcFunction::MASK)
+            .map_err(|_| OpteeSmcReturn::EBadCmd)
     }
 
     /// Get the physical address of `OpteeMsgArg`. The secure world is expected to map and copy
     /// this structure.
     #[cfg(target_pointer_width = "64")]
-    pub fn optee_msg_arg_phys_addr(&self) -> Result<u64, Errno> {
+    pub fn optee_msg_arg_phys_addr(&self) -> Result<u64, OpteeSmcReturn> {
         // To avoid potential sign extension and overflow issues, OP-TEE stores the low and
         // high 32 bits of a 64-bit address in `args[2]` and `args[1]`, respectively.
         if self.args[1] & 0xffff_ffff_0000_0000 == 0 && self.args[2] & 0xffff_ffff_0000_0000 == 0 {
             let addr = (self.args[1] << 32) | self.args[2];
             Ok(addr as u64)
         } else {
-            Err(Errno::EINVAL)
+            Err(OpteeSmcReturn::EBadAddr)
         }
     }
 }
