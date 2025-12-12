@@ -1,4 +1,5 @@
-//! Placeholders for implementing remote pointer access (e.g., reading from VTL0 physical memory)
+//! Placeholders for specifying remote pointer access (e.g., reading data from
+//! VTL0 physical memory)
 //! TODO: Improve these and move these to the litebox crate later
 
 use litebox::platform::{RawConstPointer, RawMutPointer};
@@ -146,3 +147,19 @@ impl<V: ValidateAccess, K: RemotePtrKind, T: Clone> RawMutPointer<T> for RemoteM
         Some(())
     }
 }
+
+// TODO: implement a validation mechanism for VTL0 physical addresses (e.g., ensure this physical
+// address does not belong to VTL1)
+pub struct Novalidation;
+impl ValidateAccess for Novalidation {}
+
+pub struct Vtl0PhysAddr;
+impl RemotePtrKind for Vtl0PhysAddr {}
+
+/// Normal world const pointer type. For now, normal world implies VTL0 but it can be something else
+/// including TrustZone normal world, other VMPL or TD partition, or other processes.
+pub type NormalWorldConstPtr<T> = RemoteConstPtr<Novalidation, Vtl0PhysAddr, T>;
+
+/// Normal world mutable pointer type. For now, normal world implies VTL0 but it can be something else
+/// including TrustZone normal world, other VMPL or TD partition, or other processes.
+pub type NormalWorldMutPtr<T> = RemoteMutPtr<Novalidation, Vtl0PhysAddr, T>;
