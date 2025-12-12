@@ -1,3 +1,16 @@
+//! OP-TEE's message passing is a bit complex because it involves with multiple actors
+//! (normal world: client app and driver; secure world: OP-TEE OS and TAs),
+//! consists multiple layers, and relies on shared memory references (i.e., no serialization).
+//!
+//! Since the normal world is out of LiteBox's scope, the OP-TEE shim starts with handling
+//! an OP-TEE SMC call from the normal-world OP-TEE driver which consists of
+//! up to nine register values. By checking the SMC function ID, the shim determines whether
+//! it is for passing an OP-TEE message or a pure SMC function call (e.g., get OP-TEE OS
+//! version). If it is for passing an OP-TEE message/command, the shim accesses a normal world
+//! physical address containing `OpteeMsgArg` structure (the address is contained in
+//! the SMC call arguments). This `OpteeMsgArg` structure may contain references to normal
+//! world physical addresses to exchange a large amount of data. Also, a certain OP-TEE
+//! message/command does not involve with any TA (e.g., register shared memory).
 use crate::ptr::NormalWorldConstPtr;
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
@@ -10,7 +23,7 @@ use litebox_common_optee::{
 use once_cell::race::OnceBox;
 
 // OP-TEE version and build info (2.0)
-// TODO: Consider repacing it with our own version info
+// TODO: Consider replacing it with our own version info
 const OPTEE_MSG_REVISION_MAJOR: usize = 2;
 const OPTEE_MSG_REVISION_MINOR: usize = 0;
 const OPTEE_MSG_BUILD_ID: usize = 0;
