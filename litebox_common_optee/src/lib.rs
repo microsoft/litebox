@@ -1242,6 +1242,54 @@ impl OpteeMsgParam {
     pub fn attr_type(&self) -> OpteeMsgAttrType {
         OpteeMsgAttrType::try_from(self.attr.typ()).unwrap_or(OpteeMsgAttrType::None)
     }
+    pub fn get_param_tmem(&self) -> Option<OpteeMsgParamTmem> {
+        if matches!(
+            self.attr.typ(),
+            OPTEE_MSG_ATTR_TYPE_TMEM_INPUT
+                | OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT
+                | OPTEE_MSG_ATTR_TYPE_TMEM_INOUT
+        ) {
+            Some(unsafe { self.u.tmem })
+        } else {
+            None
+        }
+    }
+    pub fn get_param_rmem(&self) -> Option<OpteeMsgParamRmem> {
+        if matches!(
+            self.attr.typ(),
+            OPTEE_MSG_ATTR_TYPE_RMEM_INPUT
+                | OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT
+                | OPTEE_MSG_ATTR_TYPE_RMEM_INOUT
+        ) {
+            Some(unsafe { self.u.rmem })
+        } else {
+            None
+        }
+    }
+    pub fn get_param_fmem(&self) -> Option<OpteeMsgParamFmem> {
+        if matches!(
+            self.attr.typ(),
+            OPTEE_MSG_ATTR_TYPE_RMEM_INPUT
+                | OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT
+                | OPTEE_MSG_ATTR_TYPE_RMEM_INOUT
+        ) {
+            Some(unsafe { self.u.fmem })
+        } else {
+            None
+        }
+    }
+    pub fn get_param_value(&self) -> Option<OpteeMsgParamValue> {
+        if matches!(
+            self.attr.typ(),
+            OPTEE_MSG_ATTR_TYPE_VALUE_INPUT
+                | OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT
+                | OPTEE_MSG_ATTR_TYPE_VALUE_INOUT
+        ) {
+            Some(unsafe { self.u.value })
+        } else {
+            None
+        }
+    }
 }
 
 /// `optee_msg_arg` from `optee_os/core/include/optee_msg.h`
@@ -1275,36 +1323,32 @@ pub struct OpteeMsgArg {
 }
 
 impl OpteeMsgArg {
-    #[cfg(target_pointer_width = "64")]
     pub fn get_param_tmem(&self, index: usize) -> Result<OpteeMsgParamTmem, Errno> {
         if index >= self.params.len() || index >= self.num_params as usize {
             Err(Errno::EINVAL)
         } else {
-            Ok(unsafe { self.params[index].u.tmem })
+            Ok(self.params[index].get_param_tmem().ok_or(Errno::EINVAL)?)
         }
     }
-    #[cfg(target_pointer_width = "64")]
     pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, Errno> {
         if index >= self.params.len() || index >= self.num_params as usize {
             Err(Errno::EINVAL)
         } else {
-            Ok(unsafe { self.params[index].u.rmem })
+            Ok(self.params[index].get_param_rmem().ok_or(Errno::EINVAL)?)
         }
     }
-    #[cfg(target_pointer_width = "64")]
     pub fn get_param_fmem(&self, index: usize) -> Result<OpteeMsgParamFmem, Errno> {
         if index >= self.params.len() || index >= self.num_params as usize {
             Err(Errno::EINVAL)
         } else {
-            Ok(unsafe { self.params[index].u.fmem })
+            Ok(self.params[index].get_param_fmem().ok_or(Errno::EINVAL)?)
         }
     }
-    #[cfg(target_pointer_width = "64")]
     pub fn get_param_value(&self, index: usize) -> Result<OpteeMsgParamValue, Errno> {
         if index >= self.params.len() || index >= self.num_params as usize {
             Err(Errno::EINVAL)
         } else {
-            Ok(unsafe { self.params[index].u.value })
+            Ok(self.params[index].get_param_value().ok_or(Errno::EINVAL)?)
         }
     }
 }
