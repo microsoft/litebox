@@ -79,7 +79,7 @@ enum Summarization {
 }
 
 impl Summarization {
-    fn summarize(&self, durations: &[Duration]) -> Duration {
+    fn summarize(self, durations: &[Duration]) -> Duration {
         assert!(!durations.is_empty());
         match self {
             Summarization::Min => *durations.iter().min().unwrap(),
@@ -138,16 +138,16 @@ fn main() -> Result<()> {
             .iter()
             .filter(|(name, _func)| name.contains(filter));
         let (name, func) = match (matches.next(), matches.next()) {
-            (Some(matched), None) => matched,
+            (Some(m), None) => m,
             (Some(_), Some(_)) => {
                 error!(filter, "Multiple benchmarks match filter");
                 list_benchmarks();
-                return Err(anyhow!("Multiple benchmarks match filter '{}'", filter));
+                return Err(anyhow!("Multiple benchmarks match filter '{filter}'"));
             }
             (None, None) => {
                 error!(filter, "No benchmarks match filter");
                 list_benchmarks();
-                return Err(anyhow!("No benchmarks match filter '{}'", filter));
+                return Err(anyhow!("No benchmarks match filter '{filter}'"));
             }
             (None, Some(_)) => unreachable!(),
         };
@@ -166,7 +166,7 @@ fn main() -> Result<()> {
     // the user that no automatic comparison was done.
     if run_name == "main" {
         info!("Current run is 'main'; not performing automatic comparison against itself");
-    } else if let Ok(_) = compare_runs(false, "main", &run_name, &cli_args) {
+    } else if let Ok(()) = compare_runs(false, "main", &run_name, &cli_args) {
         // Awesome!
     } else {
         warn!("No comparison was printed; to compare runs, use the --compare option");
@@ -179,7 +179,7 @@ fn main() -> Result<()> {
 fn list_benchmarks() {
     println!("Available benchmarks:");
     for (name, _func) in BENCHMARKS {
-        println!(" - {}", name);
+        println!(" - {name}");
     }
 }
 
@@ -234,9 +234,6 @@ fn run_benchmark(name: &str, func: BenchFn, cli_args: &CliArgs) -> Result<()> {
 }
 
 fn compare_runs(print_on_missing: bool, run1: &str, run2: &str, cli_args: &CliArgs) -> Result<()> {
-    let sh = xshell::Shell::new()?;
-    sh.change_dir(BENCH_DIR_BASE);
-
     fn available_runs(sh: &xshell::Shell) -> Result<Vec<String>> {
         let mut files = sh.read_dir("runs")?.into_iter().collect::<Vec<PathBuf>>();
         files.sort_by_key(|file| {
@@ -251,6 +248,7 @@ fn compare_runs(print_on_missing: bool, run1: &str, run2: &str, cli_args: &CliAr
             .filter_map(|entry| {
                 let file_name = entry.file_name()?;
                 let file_name = file_name.to_str()?;
+                #[allow(clippy::case_sensitive_file_extension_comparisons)]
                 if file_name.ends_with(".csv") {
                     Some(file_name.trim_end_matches(".csv").to_string())
                 } else {
@@ -261,29 +259,33 @@ fn compare_runs(print_on_missing: bool, run1: &str, run2: &str, cli_args: &CliAr
         Ok(runs)
     }
 
-    let Ok(run1_csv) = sh.read_file(format!("runs/{}.csv", run1)) else {
+    let sh = xshell::Shell::new()?;
+    sh.change_dir(BENCH_DIR_BASE);
+
+    let Ok(run1_csv) = sh.read_file(format!("runs/{run1}.csv")) else {
         warn!(run1, "Could not find run");
         let available = available_runs(&sh)?;
         if print_on_missing {
             eprintln!("Available runs (oldest to newest):");
             for run in available {
-                eprintln!(" - {}", run);
+                eprintln!(" - {run}");
             }
         }
-        return Err(anyhow!("Run '{}' not found", run1));
+        return Err(anyhow!("Run '{run1}' not found"));
     };
-    let Ok(run2_csv) = sh.read_file(format!("runs/{}.csv", run2)) else {
+    let Ok(run2_csv) = sh.read_file(format!("runs/{run2}.csv")) else {
         warn!(run2, "Could not find run");
         let available = available_runs(&sh)?;
         if print_on_missing {
             eprintln!("Available runs (oldest to newest):");
             for run in available {
-                eprintln!(" - {}", run);
+                eprintln!(" - {run}");
             }
         }
-        return Err(anyhow!("Run '{}' not found", run2));
+        return Err(anyhow!("Run '{run2}' not found"));
     };
 
+    #[allow(clippy::items_after_statements, clippy::ref_option)]
     fn f<'a>(csv: &'a str, filter: &Option<String>) -> BTreeMap<&'a str, Duration> {
         csv.lines()
             .filter(|line| filter.as_ref().is_none_or(|f| line.contains(f)))
@@ -304,8 +306,8 @@ fn compare_runs(print_on_missing: bool, run1: &str, run2: &str, cli_args: &CliAr
         .max()
         .unwrap_or(9)
         .max(9);
-    let run1_header = format!("{} (ms)", run1);
-    let run2_header = format!("{} (ms)", run2);
+    let run1_header = format!("{run1} (ms)");
+    let run2_header = format!("{run2} (ms)");
     let max_time1_width = r1
         .values()
         .map(|d| d.as_millis().to_string().len())
@@ -334,7 +336,7 @@ fn compare_runs(print_on_missing: bool, run1: &str, run2: &str, cli_args: &CliAr
     for bench in all_benches {
         match (r1.get(bench), r2.get(bench)) {
             (Some(t1), Some(t2)) => {
-                let abs_diff = t2.abs_diff(*t1).as_millis() as i128;
+                let abs_diff = i128::try_from(t2.abs_diff(*t1).as_millis()).unwrap();
                 let diff = if t1 > t2 { -abs_diff } else { abs_diff };
                 println!(
                     "| {:<bench_width$} | {:>run1_width$} | {:>run2_width$} | {:>diff_width$} |",
@@ -356,13 +358,12 @@ fn compare_runs(print_on_missing: bool, run1: &str, run2: &str, cli_args: &CliAr
         }
     }
 
+    #[allow(clippy::cast_precision_loss)]
     let avg_diff = diff_total as f64 / total_counted as f64;
-    let reaction = if diff_total < 0 {
-        "🚀 run 2 is faster than run 1"
-    } else if diff_total > 0 {
-        "🐌 run 2 is slower than run 1"
-    } else {
-        "⚖️ perfectly balanced"
+    let reaction = match diff_total.cmp(&0) {
+        std::cmp::Ordering::Less => "🚀 run 2 is faster than run 1",
+        std::cmp::Ordering::Equal => "⚖️ perfectly balanced",
+        std::cmp::Ordering::Greater => "🐌 run 2 is slower than run 1",
     };
 
     info!(total_counted, avg_diff, %reaction, "Summarized change");
@@ -381,7 +382,7 @@ struct BenchCtx<'a> {
     is_init: bool,
 }
 
-impl<'a> BenchCtx<'a> {
+impl BenchCtx<'_> {
     fn with_init(&self, is_init: bool) -> Self {
         Self {
             is_init,
@@ -487,11 +488,11 @@ fn find_dependencies(sh: &xshell::Shell, command: &str) -> Result<Vec<PathBuf>> 
         }
     }
     let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    paths.iter().for_each(|p| {
+    for p in &paths {
         if !p.exists() {
             warn!(path = %p.display(), "Resolved dependency path does not exist");
         }
-    });
+    }
     trace!("Resolved dependency paths: {paths:?}");
     Ok(paths)
 }
@@ -562,7 +563,7 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
         )
         .run()?;
     } else {
-        let mode = release_mode.then_some("release").unwrap_or("debug");
+        let mode = if release_mode { "release" } else { "debug" };
         cmd!(
             sh,
             "{project_root}/target/{mode}/litebox_runner_linux_userland --unstable --interception-backend rewriter --env HOME=/ --initial-files {tar_file} node_rewritten hello_world.js"
