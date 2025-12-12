@@ -29,7 +29,7 @@ use litebox_common_linux::{
 use crate::{
     ConstPtr, FileFd, GlobalState, MutPtr, Task,
     channel::{Channel, ReadEnd, WriteEnd},
-    syscalls::net::SocketOptions,
+    syscalls::net::{SocketOptionValue, SocketOptions},
 };
 
 /// C-compatible structure for Unix socket addresses.
@@ -1285,77 +1285,106 @@ impl UnixSocket {
 
     pub(super) fn setsockopt(
         &self,
+        global: &GlobalState,
         optname: SocketOptionName,
         optval: ConstPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
-        match optname {
-            SocketOptionName::IP(ip) => match ip {
-                IpOption::TOS => return Err(Errno::EOPNOTSUPP),
-            },
-            SocketOptionName::Socket(so) => match so {
-                SocketOption::RCVTIMEO | SocketOption::SNDTIMEO => {
-                    let duration = super::net::read_timeval_as_duration(optval, optlen)?;
-                    let mut options = self.options.lock();
-                    match so {
-                        SocketOption::RCVTIMEO => options.recv_timeout = duration,
-                        SocketOption::SNDTIMEO => options.send_timeout = duration,
-                        _ => unreachable!(),
-                    }
+        match global.setsockopt_common(optname, optval, optlen, |so, value| {
+            match (so, value) {
+                (SocketOption::RCVTIMEO, SocketOptionValue::Timeout(timeout)) => {
+                    self.options.lock().recv_timeout = timeout;
                 }
-                SocketOption::LINGER => todo!("setsockopt LINGER"),
-                SocketOption::REUSEADDR => {
-                    let val = super::net::read_from_user::<u32>(optval, optlen)?;
+                (SocketOption::SNDTIMEO, SocketOptionValue::Timeout(timeout)) => {
+                    self.options.lock().send_timeout = timeout;
+                }
+                (SocketOption::LINGER, SocketOptionValue::Timeout(timeout)) => {
+                    self.options.lock().linger_timeout = timeout;
+                }
+                (SocketOption::REUSEADDR, SocketOptionValue::U32(val)) => {
                     self.options.lock().reuse_address = val != 0;
                 }
-                SocketOption::KEEPALIVE => {
-                    let val = super::net::read_from_user::<u32>(optval, optlen)?;
+                (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                     self.options.lock().keep_alive = val != 0;
                 }
-                SocketOption::BROADCAST => {
-                    let val = super::net::read_from_user::<u32>(optval, optlen)?;
+                (SocketOption::BROADCAST, SocketOptionValue::U32(val)) => {
                     self.options.lock().broadcast = val != 0;
                 }
-                // Don't allow changing socket type and credentials
-                SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
-                // We use fixed buffer size for now
-                SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
-            },
-            SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
+                _ => unreachable!(),
+            }
+            Ok(())
+        }) {
+            Err(Errno::ENOPROTOOPT) => {} // continue to handle unix
+            other => return other,
         }
-        Ok(())
+
+        match optname {
+            SocketOptionName::IP(ip) => match ip {
+                IpOption::TOS => Err(Errno::EOPNOTSUPP),
+            },
+            SocketOptionName::Socket(so) => match so {
+                // handled by `setsockopt_common`
+                SocketOption::RCVTIMEO
+                | SocketOption::SNDTIMEO
+                | SocketOption::LINGER
+                | SocketOption::REUSEADDR
+                | SocketOption::KEEPALIVE
+                | SocketOption::BROADCAST => {
+                    unreachable!()
+                }
+                // Don't allow changing socket type and credentials
+                SocketOption::TYPE | SocketOption::PEERCRED => Err(Errno::ENOPROTOOPT),
+                // We use fixed buffer size for now
+                SocketOption::RCVBUF | SocketOption::SNDBUF => Err(Errno::EOPNOTSUPP),
+            },
+            SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
+        }
     }
     pub(super) fn getsockopt(
         &self,
+        global: &GlobalState,
         optname: SocketOptionName,
         optval: MutPtr<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
+        match global.getsockopt_common(optname, optval, len, |sopt| match sopt {
+            SocketOption::RCVTIMEO => SocketOptionValue::Timeout(self.options.lock().recv_timeout),
+            SocketOption::SNDTIMEO => SocketOptionValue::Timeout(self.options.lock().send_timeout),
+            SocketOption::LINGER => SocketOptionValue::Timeout(self.options.lock().linger_timeout),
+            SocketOption::REUSEADDR => {
+                SocketOptionValue::U32(u32::from(self.options.lock().reuse_address))
+            }
+            SocketOption::KEEPALIVE => {
+                SocketOptionValue::U32(u32::from(self.options.lock().keep_alive))
+            }
+            SocketOption::BROADCAST => {
+                SocketOptionValue::U32(u32::from(self.options.lock().broadcast))
+            }
+            _ => unreachable!(),
+        }) {
+            Err(Errno::ENOPROTOOPT) => {} // continue to handle unix
+            other => return other,
+        }
+
         let val: u32 = match optname {
             SocketOptionName::IP(ip) => match ip {
                 IpOption::TOS => return Err(Errno::EOPNOTSUPP),
             },
             SocketOptionName::Socket(so) => match so {
-                SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {
-                    return super::net::handle_timeval_sockopt(
-                        || match so {
-                            SocketOption::RCVTIMEO => self.options.lock().recv_timeout,
-                            SocketOption::SNDTIMEO => self.options.lock().send_timeout,
-                            SocketOption::LINGER => self.options.lock().linger_timeout,
-                            _ => unreachable!(),
-                        },
-                        optval,
-                        len,
-                    );
+                // handled by `getsockopt_common`
+                SocketOption::RCVTIMEO
+                | SocketOption::SNDTIMEO
+                | SocketOption::LINGER
+                | SocketOption::REUSEADDR
+                | SocketOption::KEEPALIVE
+                | SocketOption::BROADCAST => {
+                    unreachable!()
                 }
-                SocketOption::REUSEADDR => u32::from(self.options.lock().reuse_address),
                 SocketOption::TYPE => match self.inner {
                     UnixSocketInner::Stream(_) => SockType::Stream as u32,
                     UnixSocketInner::Datagram(_) => SockType::Datagram as u32,
                 },
-                SocketOption::KEEPALIVE => u32::from(self.options.lock().keep_alive),
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.truncate(),
-                SocketOption::BROADCAST => u32::from(self.options.lock().broadcast),
                 SocketOption::PEERCRED => {
                     let ucred = self.with_state_ref(|state| match state {
                         UnixSocketState::ConnectedStream(_) | UnixSocketState::Datagram(_) => {
