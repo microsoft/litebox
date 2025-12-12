@@ -144,6 +144,10 @@ pub(super) struct SocketOptions {
 
 pub(crate) struct SocketOFlags(pub OFlags);
 
+pub(super) enum SocketOptionValue {
+    Timeout(Option<core::time::Duration>),
+    U32(u32),
+}
 /// Helper function to write an option of type T to user memory.
 pub(super) fn write_to_user<T>(val: T, optval: MutPtr<u8>, len: u32) -> Result<usize, Errno> {
     // If the provided buffer is too small, we just write as much as we can.
@@ -151,28 +155,6 @@ pub(super) fn write_to_user<T>(val: T, optval: MutPtr<u8>, len: u32) -> Result<u
     let data = unsafe { core::slice::from_raw_parts((&raw const val).cast::<u8>(), length) };
     unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
     Ok(length)
-}
-/// Helper function to handle common socket options (RCVTIMEO, SNDTIMEO, LINGER):
-/// writes a `TimeVal` representation of the provided timeout duration to user memory.
-pub(super) fn handle_timeval_sockopt<F>(
-    get_timeout: F,
-    optval: MutPtr<u8>,
-    len: u32,
-) -> Result<usize, Errno>
-where
-    F: FnOnce() -> Option<core::time::Duration>,
-{
-    let timeout = get_timeout();
-    let tv = timeout.map_or_else(
-        litebox_common_linux::TimeVal::default,
-        litebox_common_linux::TimeVal::from,
-    );
-    // If the provided buffer is too small, we just write as much as we can.
-    // let length = size_of::<litebox_common_linux::TimeVal>().min(len as usize);
-    // let data = unsafe { core::slice::from_raw_parts((&raw const tv).cast::<u8>(), length) };
-    // unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
-    // Ok(length)
-    write_to_user(tv, optval, len)
 }
 /// Helper function to read an option of type T from user memory.
 pub(super) fn read_from_user<T: Clone>(optval: ConstPtr<u8>, optlen: usize) -> Result<T, Errno> {
@@ -183,17 +165,6 @@ pub(super) fn read_from_user<T: Clone>(optval: ConstPtr<u8>, optlen: usize) -> R
     unsafe { optval.read_at_offset(0) }
         .ok_or(Errno::EFAULT)
         .map(alloc::borrow::Cow::into_owned)
-}
-/// Helper function to read a `TimeVal` from user memory and convert to Duration.
-///
-/// Returns `None` if the duration is zero (meaning no timeout).
-pub(super) fn read_timeval_as_duration(
-    optval: ConstPtr<u8>,
-    optlen: usize,
-) -> Result<Option<core::time::Duration>, Errno> {
-    let timeval = read_from_user::<litebox_common_linux::TimeVal>(optval, optlen)?;
-    let d = core::time::Duration::try_from(timeval)?;
-    if d.is_zero() { Ok(None) } else { Ok(Some(d)) }
 }
 
 /// Socket-related implementation. Currently these methods are on `GlobalState`
@@ -235,29 +206,34 @@ impl GlobalState {
             .unwrap()
     }
 
-    fn setsockopt(
+    /// Common implementation for setsockopt for options that are stored in [`SocketOptions`]:
+    /// - RCVTIMEO
+    /// - SNDTIMEO
+    /// - LINGER
+    /// - REUSEADDR
+    /// - KEEPALIVE
+    /// - BROADCAST
+    pub(super) fn setsockopt_common<F>(
         &self,
-        fd: &SocketFd,
         optname: SocketOptionName,
         optval: ConstPtr<u8>,
         optlen: usize,
-    ) -> Result<(), Errno> {
+        set_option: F,
+    ) -> Result<(), Errno>
+    where
+        F: FnOnce(SocketOption, SocketOptionValue) -> Result<(), Errno>,
+    {
         match optname {
-            SocketOptionName::IP(ip) => match ip {
-                litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
-            },
-            SocketOptionName::Socket(so) => match so {
+            SocketOptionName::Socket(sopt) => match sopt {
                 SocketOption::RCVTIMEO | SocketOption::SNDTIMEO => {
-                    let duration = read_timeval_as_duration(optval, optlen)?;
-                    self.with_socket_options_mut(fd, |opt| match so {
-                        SocketOption::RCVTIMEO => {
-                            opt.recv_timeout = duration;
-                        }
-                        SocketOption::SNDTIMEO => {
-                            opt.send_timeout = duration;
-                        }
-                        _ => unreachable!(),
-                    });
+                    let timeval = read_from_user::<litebox_common_linux::TimeVal>(optval, optlen)?;
+                    let duration = core::time::Duration::try_from(timeval)?;
+                    let duration = if duration.is_zero() {
+                        None
+                    } else {
+                        Some(duration)
+                    };
+                    set_option(sopt, SocketOptionValue::Timeout(duration))
                 }
                 SocketOption::LINGER => {
                     let linger: litebox_common_linux::Linger = read_from_user(optval, optlen)?;
@@ -266,44 +242,93 @@ impl GlobalState {
                     } else {
                         None
                     };
-                    self.with_socket_options_mut(fd, |opt| {
-                        opt.linger_timeout = timeout;
-                    });
+                    set_option(sopt, SocketOptionValue::Timeout(timeout))
                 }
-                SocketOption::REUSEADDR => {
+                SocketOption::REUSEADDR | SocketOption::BROADCAST | SocketOption::KEEPALIVE => {
                     let val: u32 = read_from_user(optval, optlen)?;
-                    self.with_socket_options_mut(fd, |opt| {
-                        opt.reuse_address = val != 0;
-                    });
+                    set_option(sopt, SocketOptionValue::U32(val))
                 }
-                SocketOption::BROADCAST => {
-                    if read_from_user::<u32>(optval, optlen)? == 0 {
-                        todo!("disable SO_BROADCAST");
+                _ => Err(Errno::ENOPROTOOPT),
+            },
+            _ => Err(Errno::ENOPROTOOPT),
+        }
+    }
+    fn setsockopt(
+        &self,
+        fd: &SocketFd,
+        optname: SocketOptionName,
+        optval: ConstPtr<u8>,
+        optlen: usize,
+    ) -> Result<(), Errno> {
+        match self.setsockopt_common(optname, optval, optlen, |so, value| {
+            self.with_socket_options_mut(fd, |opt| {
+                match (so, value) {
+                    (SocketOption::RCVTIMEO, SocketOptionValue::Timeout(timeout)) => {
+                        opt.recv_timeout = timeout;
                     }
-                }
-                SocketOption::KEEPALIVE => {
-                    let keep_alive = read_from_user::<u32>(optval, optlen)? != 0;
-                    if let Err(err) = self.net.lock().set_tcp_option(
-                        fd,
-                        // default time interval is 2 hours
-                        litebox::net::TcpOptionData::KEEPALIVE(Some(
-                            core::time::Duration::from_secs(2 * 60 * 60),
-                        )),
-                    ) {
-                        match err {
-                            litebox::net::errors::SetTcpOptionError::InvalidFd => {
-                                return Err(Errno::EBADF);
-                            }
-                            litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                                unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
-                            }
-                            _ => unimplemented!(),
+                    (SocketOption::SNDTIMEO, SocketOptionValue::Timeout(timeout)) => {
+                        opt.send_timeout = timeout;
+                    }
+                    (SocketOption::LINGER, SocketOptionValue::Timeout(timeout)) => {
+                        opt.linger_timeout = timeout;
+                    }
+                    (SocketOption::REUSEADDR, SocketOptionValue::U32(val)) => {
+                        opt.reuse_address = val != 0;
+                    }
+                    (SocketOption::BROADCAST, SocketOptionValue::U32(val)) => {
+                        opt.broadcast = val != 0;
+                        if val == 0 {
+                            todo!("disable SO_BROADCAST");
                         }
                     }
-                    self.with_socket_options_mut(fd, |opt| {
+                    (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
+                        let keep_alive = val != 0;
+                        if let Err(err) = self.net.lock().set_tcp_option(
+                            fd,
+                            if keep_alive {
+                                // default time interval is 2 hours
+                                litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                    core::time::Duration::from_secs(2 * 60 * 60),
+                                ))
+                            } else {
+                                litebox::net::TcpOptionData::KEEPALIVE(None)
+                            },
+                        ) {
+                            match err {
+                                litebox::net::errors::SetTcpOptionError::InvalidFd => {
+                                    return Err(Errno::EBADF);
+                                }
+                                litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
+                                    unimplemented!(
+                                        "SO_KEEPALIVE is not supported for non-TCP sockets"
+                                    )
+                                }
+                                _ => unimplemented!(),
+                            }
+                        }
                         opt.keep_alive = keep_alive;
-                    });
+                    }
+                    _ => unreachable!(),
                 }
+                Ok(())
+            })
+        }) {
+            Err(Errno::ENOPROTOOPT) => {} // fallthrough to handle other options
+            other => return other,
+        }
+
+        match optname {
+            SocketOptionName::IP(ip) => match ip {
+                litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+            },
+            SocketOptionName::Socket(so) => match so {
+                // handled by `setsockopt_common`
+                SocketOption::RCVTIMEO
+                | SocketOption::SNDTIMEO
+                | SocketOption::LINGER
+                | SocketOption::REUSEADDR
+                | SocketOption::BROADCAST
+                | SocketOption::KEEPALIVE => unreachable!(),
                 // We use fixed buffer size for now
                 SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
                 // Socket does not support these options
@@ -369,6 +394,46 @@ impl GlobalState {
         Ok(())
     }
 
+    /// Common implementation for getsockopt for options that are stored in [`SocketOptions`]:
+    /// - RCVTIMEO
+    /// - SNDTIMEO
+    /// - LINGER
+    /// - REUSEADDR
+    /// - KEEPALIVE
+    /// - BROADCAST
+    pub(super) fn getsockopt_common<F>(
+        &self,
+        optname: SocketOptionName,
+        optval: MutPtr<u8>,
+        len: u32,
+        get_option: F,
+    ) -> Result<usize, Errno>
+    where
+        F: FnOnce(SocketOption) -> SocketOptionValue,
+    {
+        match optname {
+            SocketOptionName::Socket(sopt) => match sopt {
+                SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {
+                    let SocketOptionValue::Timeout(timeout) = get_option(sopt) else {
+                        unreachable!()
+                    };
+                    let tv = timeout.map_or_else(
+                        litebox_common_linux::TimeVal::default,
+                        litebox_common_linux::TimeVal::from,
+                    );
+                    write_to_user(tv, optval, len)
+                }
+                SocketOption::REUSEADDR | SocketOption::KEEPALIVE | SocketOption::BROADCAST => {
+                    let SocketOptionValue::U32(val) = get_option(sopt) else {
+                        unreachable!()
+                    };
+                    write_to_user(val, optval, len)
+                }
+                _ => Err(Errno::ENOPROTOOPT),
+            },
+            _ => Err(Errno::ENOPROTOOPT),
+        }
+    }
     fn getsockopt(
         &self,
         fd: &SocketFd,
@@ -376,33 +441,36 @@ impl GlobalState {
         optval: MutPtr<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
+        match self.getsockopt_common(optname, optval, len, |sopt| {
+            self.with_socket_options(fd, |options| match sopt {
+                SocketOption::RCVTIMEO => SocketOptionValue::Timeout(options.recv_timeout),
+                SocketOption::SNDTIMEO => SocketOptionValue::Timeout(options.send_timeout),
+                SocketOption::LINGER => SocketOptionValue::Timeout(options.linger_timeout),
+                SocketOption::REUSEADDR => SocketOptionValue::U32(u32::from(options.reuse_address)),
+                SocketOption::KEEPALIVE => SocketOptionValue::U32(u32::from(options.keep_alive)),
+                SocketOption::BROADCAST => SocketOptionValue::U32(u32::from(options.broadcast)),
+                _ => unreachable!(),
+            })
+        }) {
+            Err(Errno::ENOPROTOOPT) => {} // fallthrough to handle other options
+            other => return other,
+        }
+
         let val: u32 = match optname {
             SocketOptionName::IP(ipopt) => match ipopt {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
             },
             SocketOptionName::Socket(sopt) => match sopt {
-                SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {
-                    return handle_timeval_sockopt(
-                        || {
-                            self.with_socket_options(fd, |options| match sopt {
-                                SocketOption::RCVTIMEO => options.recv_timeout,
-                                SocketOption::SNDTIMEO => options.send_timeout,
-                                SocketOption::LINGER => options.linger_timeout,
-                                _ => unreachable!(),
-                            })
-                        },
-                        optval,
-                        len,
-                    );
+                // handled by `getsockopt_common`
+                SocketOption::RCVTIMEO
+                | SocketOption::SNDTIMEO
+                | SocketOption::LINGER
+                | SocketOption::REUSEADDR
+                | SocketOption::KEEPALIVE
+                | SocketOption::BROADCAST => {
+                    unreachable!()
                 }
                 SocketOption::TYPE => self.get_socket_type(fd)? as u32,
-                SocketOption::REUSEADDR => {
-                    u32::from(self.with_socket_options(fd, |o| o.reuse_address))
-                }
-                SocketOption::BROADCAST => u32::from(self.with_socket_options(fd, |o| o.broadcast)),
-                SocketOption::KEEPALIVE => {
-                    u32::from(self.with_socket_options(fd, |o| o.keep_alive))
-                }
                 SocketOption::RCVBUF | SocketOption::SNDBUF => {
                     litebox::net::SOCKET_BUFFER_SIZE.truncate()
                 }
@@ -1411,7 +1479,7 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 self.global.setsockopt(fd, optname, optval, optlen)
             }),
-            Descriptor::Unix { file, .. } => file.setsockopt(optname, optval, optlen),
+            Descriptor::Unix { file, .. } => file.setsockopt(&self.global, optname, optval, optlen),
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1460,7 +1528,7 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 self.global.getsockopt(fd, optname, optval, len)
             }),
-            Descriptor::Unix { file, .. } => file.getsockopt(optname, optval, len),
+            Descriptor::Unix { file, .. } => file.getsockopt(&self.global, optname, optval, len),
             _ => Err(Errno::ENOTSOCK),
         }
     }
