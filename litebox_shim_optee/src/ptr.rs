@@ -4,44 +4,58 @@
 
 use litebox::platform::{RawConstPointer, RawMutPointer};
 
+// TODO: use the one from the litebox crate
 pub trait ValidateAccess {}
-pub trait RemotePtrKind {}
+
+/// Trait to access a pointer to remote memory
+/// For now, we only consider copying the entire value before acccessing it.
+/// We do not consider byte-level access or unaligned access.
+pub trait RemoteMemoryAccess {
+    fn read_at_offset<T>(ptr: *mut T, count: isize) -> Option<T>;
+
+    fn write_at_offset<T>(ptr: *mut T, count: isize, value: T) -> Option<()>;
+
+    fn slice_from<T>(ptr: *mut T, len: usize) -> Option<alloc::boxed::Box<[T]>>;
+
+    fn copy_from_slice<T>(start_offset: usize, buf: &[T]) -> Option<()>;
+}
 
 #[repr(C)]
-pub struct RemoteConstPtr<V, K, T> {
+pub struct RemoteConstPtr<V, A, T> {
     inner: *const T,
-    _kind: core::marker::PhantomData<K>,
+    _access: core::marker::PhantomData<A>,
     _validator: core::marker::PhantomData<V>,
 }
 
-impl<V: ValidateAccess, K: RemotePtrKind, T: Clone> RemoteConstPtr<V, K, T> {
+impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RemoteConstPtr<V, A, T> {
     pub fn from_ptr(ptr: *const T) -> Self {
         Self {
             inner: ptr,
-            _kind: core::marker::PhantomData,
+            _access: core::marker::PhantomData,
             _validator: core::marker::PhantomData,
         }
     }
 }
 
-impl<V, K, T> Clone for RemoteConstPtr<V, K, T> {
+impl<V, A, T> Clone for RemoteConstPtr<V, A, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<V, K, T> Copy for RemoteConstPtr<V, K, T> {}
+impl<V, A, T> Copy for RemoteConstPtr<V, A, T> {}
 
-impl<V, K, T: Clone> core::fmt::Debug for RemoteConstPtr<V, K, T> {
+impl<V, A, T: Clone> core::fmt::Debug for RemoteConstPtr<V, A, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("RemoteConstPtr").field(&self.inner).finish()
     }
 }
 
-impl<V: ValidateAccess, K: RemotePtrKind, T: Clone> RawConstPointer<T> for RemoteConstPtr<V, K, T> {
-    unsafe fn read_at_offset<'a>(self, _count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
-        // TODO: read data from the remote side
-        let val: T = unsafe { core::mem::zeroed() };
+impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RawConstPointer<T>
+    for RemoteConstPtr<V, A, T>
+{
+    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
+        let val = A::read_at_offset(self.inner.cast_mut(), count)?;
         Some(alloc::borrow::Cow::Owned(val))
     }
 
@@ -63,47 +77,48 @@ impl<V: ValidateAccess, K: RemotePtrKind, T: Clone> RawConstPointer<T> for Remot
     fn from_usize(addr: usize) -> Self {
         Self {
             inner: core::ptr::with_exposed_provenance(addr),
-            _kind: core::marker::PhantomData,
+            _access: core::marker::PhantomData,
             _validator: core::marker::PhantomData,
         }
     }
 }
 
 #[repr(C)]
-pub struct RemoteMutPtr<V, K, T> {
+pub struct RemoteMutPtr<V, A, T> {
     inner: *mut T,
-    _kind: core::marker::PhantomData<K>,
+    _access: core::marker::PhantomData<A>,
     _validator: core::marker::PhantomData<V>,
 }
 
-impl<V: ValidateAccess, K: RemotePtrKind, T: Clone> RemoteMutPtr<V, K, T> {
+impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RemoteMutPtr<V, A, T> {
     pub fn from_ptr(ptr: *mut T) -> Self {
         Self {
             inner: ptr,
-            _kind: core::marker::PhantomData,
+            _access: core::marker::PhantomData,
             _validator: core::marker::PhantomData,
         }
     }
 }
 
-impl<V, K, T> Clone for RemoteMutPtr<V, K, T> {
+impl<V, A, T> Clone for RemoteMutPtr<V, A, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<V, K, T> Copy for RemoteMutPtr<V, K, T> {}
+impl<V, A, T> Copy for RemoteMutPtr<V, A, T> {}
 
-impl<V, K, T: Clone> core::fmt::Debug for RemoteMutPtr<V, K, T> {
+impl<V, A, T: Clone> core::fmt::Debug for RemoteMutPtr<V, A, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("RemoteMutPtr").field(&self.inner).finish()
     }
 }
 
-impl<V: ValidateAccess, K: RemotePtrKind, T: Clone> RawConstPointer<T> for RemoteMutPtr<V, K, T> {
-    unsafe fn read_at_offset<'a>(self, _count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
-        // TODO: read data from the remote side
-        let val: T = unsafe { core::mem::zeroed() };
+impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RawConstPointer<T>
+    for RemoteMutPtr<V, A, T>
+{
+    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
+        let val = A::read_at_offset(self.inner, count)?;
         Some(alloc::borrow::Cow::Owned(val))
     }
 
@@ -112,10 +127,8 @@ impl<V: ValidateAccess, K: RemotePtrKind, T: Clone> RawConstPointer<T> for Remot
         if len == 0 {
             return Some(alloc::borrow::Cow::Owned(alloc::vec::Vec::new()));
         }
-        let mut data = alloc::vec::Vec::new();
-        data.reserve_exact(len);
-        unsafe { data.set_len(len) };
-        Some(alloc::borrow::Cow::Owned(data))
+        let data = A::slice_from(self.inner, len)?;
+        Some(alloc::borrow::Cow::Owned(data.into()))
     }
 
     fn as_usize(&self) -> usize {
@@ -127,9 +140,11 @@ impl<V: ValidateAccess, K: RemotePtrKind, T: Clone> RawConstPointer<T> for Remot
     }
 }
 
-impl<V: ValidateAccess, K: RemotePtrKind, T: Clone> RawMutPointer<T> for RemoteMutPtr<V, K, T> {
-    unsafe fn write_at_offset<'a>(self, _count: isize, _value: T) -> Option<()> {
-        Some(())
+impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RawMutPointer<T>
+    for RemoteMutPtr<V, A, T>
+{
+    unsafe fn write_at_offset<'a>(self, count: isize, value: T) -> Option<()> {
+        A::write_at_offset(self.inner, count, value)
     }
 
     fn mutate_subslice_with<R>(
@@ -140,11 +155,11 @@ impl<V: ValidateAccess, K: RemotePtrKind, T: Clone> RawMutPointer<T> for RemoteM
         unimplemented!("use write_slice_at_offset instead")
     }
 
-    fn copy_from_slice(self, _start_offset: usize, _buf: &[T]) -> Option<()>
+    fn copy_from_slice(self, start_offset: usize, buf: &[T]) -> Option<()>
     where
         T: Copy,
     {
-        Some(())
+        A::copy_from_slice(start_offset, buf)
     }
 }
 
@@ -153,13 +168,37 @@ impl<V: ValidateAccess, K: RemotePtrKind, T: Clone> RawMutPointer<T> for RemoteM
 pub struct Novalidation;
 impl ValidateAccess for Novalidation {}
 
-pub struct Vtl0PhysAddr;
-impl RemotePtrKind for Vtl0PhysAddr {}
+pub struct Vtl0PhysMemoryAccess;
+impl RemoteMemoryAccess for Vtl0PhysMemoryAccess {
+    fn read_at_offset<T>(_ptr: *mut T, _count: isize) -> Option<T> {
+        // TODO: read a value from VTL0 physical memory
+        let val: T = unsafe { core::mem::zeroed() };
+        Some(val)
+    }
 
-/// Normal world const pointer type. For now, normal world implies VTL0 but it can be something else
-/// including TrustZone normal world, other VMPL or TD partition, or other processes.
-pub type NormalWorldConstPtr<T> = RemoteConstPtr<Novalidation, Vtl0PhysAddr, T>;
+    fn write_at_offset<T>(_ptr: *mut T, _count: isize, _value: T) -> Option<()> {
+        // TODO: write a value to VTL0 physical memory
+        Some(())
+    }
 
-/// Normal world mutable pointer type. For now, normal world implies VTL0 but it can be something else
-/// including TrustZone normal world, other VMPL or TD partition, or other processes.
-pub type NormalWorldMutPtr<T> = RemoteMutPtr<Novalidation, Vtl0PhysAddr, T>;
+    fn slice_from<T>(_ptr: *mut T, len: usize) -> Option<alloc::boxed::Box<[T]>> {
+        // TODO: read a slice from VTL0 physical memory
+        let mut data: alloc::vec::Vec<T> = alloc::vec::Vec::new();
+        data.reserve_exact(len);
+        unsafe { data.set_len(len) };
+        Some(data.into_boxed_slice())
+    }
+
+    fn copy_from_slice<T>(_start_offset: usize, _buf: &[T]) -> Option<()> {
+        // TODO: write a slice to VTL0 physical memory
+        Some(())
+    }
+}
+
+/// Normal world const pointer type. For now, we only consider VTL0 physical memory but it can be
+/// something else like TrustZone normal world, other VMPL or TD partition, or other processes.
+pub type NormalWorldConstPtr<T> = RemoteConstPtr<Novalidation, Vtl0PhysMemoryAccess, T>;
+
+/// Normal world mutable pointer type. For now, we only consider VTL0 physical memory but it can be
+/// something else like TrustZone normal world, other VMPL or TD partition, or other processes.
+pub type NormalWorldMutPtr<T> = RemoteMutPtr<Novalidation, Vtl0PhysMemoryAccess, T>;
