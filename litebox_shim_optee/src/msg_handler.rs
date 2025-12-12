@@ -9,16 +9,25 @@ use litebox_common_optee::{
 };
 use once_cell::race::OnceBox;
 
-// TODO: Replace these with version and build info
+// OP-TEE version and build info (2.0)
+// TODO: Consider repacing it with our own version info
 const OPTEE_MSG_REVISION_MAJOR: usize = 2;
 const OPTEE_MSG_REVISION_MINOR: usize = 0;
 const OPTEE_MSG_BUILD_ID: usize = 0;
 
-// TODO: Replace this with an actual UID
+// This UID is from OP-TEE OS
+// TODO: Consider replacing it with our own UID
 const OPTEE_MSG_UID_0: u32 = 0x384f_b3e0;
 const OPTEE_MSG_UID_1: u32 = 0xe7f8_11e3;
 const OPTEE_MSG_UID_2: u32 = 0xaf63_0002;
 const OPTEE_MSG_UID_3: u32 = 0xa5d5_c51b;
+
+// This is the UUID of OP-TEE Trusted OS
+// TODO: Consider replacing it with our own UUID
+const OPTEE_MSG_OS_OPTEE_UUID_0: u32 = 0x486178e0;
+const OPTEE_MSG_OS_OPTEE_UUID_1: u32 = 0xe7f811e3;
+const OPTEE_MSG_OS_OPTEE_UUID_2: u32 = 0xbc5e0002;
+const OPTEE_MSG_OS_OPTEE_UUID_3: u32 = 0xa5d5c51b;
 
 // We do not support notification for now
 const MAX_NOTIF_VALUE: usize = 0;
@@ -39,7 +48,6 @@ fn page_align_up(len: u64) -> u64 {
 /// Panics if the normal world physical address in `smc` cannot be converted to `usize`.
 pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_>, OpteeSmcReturn> {
     let func_id = smc.func_id()?;
-
     match func_id {
         OpteeSmcFunction::CallWithArg
         | OpteeSmcFunction::CallWithRpcArg
@@ -50,7 +58,6 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_
             let msg_arg = unsafe { ptr.read_at_offset(0) }
                 .ok_or(OpteeSmcReturn::EBadAddr)?
                 .into_owned();
-            // let msg_arg = copy_from_remote_memory::<OpteeMsgArg>(msg_arg_addr)?;
             handle_optee_msg_arg(&msg_arg).map(|_| OpteeSmcResult::Generic {
                 status: OpteeSmcReturn::Ok,
             })
@@ -75,6 +82,14 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_
                 shm_lower32: 0,
             })
         }
+        OpteeSmcFunction::GetOsUuid => Ok(OpteeSmcResult::Uuid {
+            data: &[
+                OPTEE_MSG_OS_OPTEE_UUID_0,
+                OPTEE_MSG_OS_OPTEE_UUID_1,
+                OPTEE_MSG_OS_OPTEE_UUID_2,
+                OPTEE_MSG_OS_OPTEE_UUID_3,
+            ],
+        }),
         OpteeSmcFunction::CallsUid => Ok(OpteeSmcResult::Uuid {
             data: &[
                 OPTEE_MSG_UID_0,

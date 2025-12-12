@@ -1407,6 +1407,7 @@ impl OpteeSmcArgs {
 
 /// `OPTEE_SMC_FUNCID_*` from `core/arch/arm/include/sm/optee_smc.h`
 /// TODO: Add stuffs based on the OP-TEE driver that LVBS is using.
+const OPTEE_SMC_FUNCID_GET_OS_UUID: usize = 0x0;
 const OPTEE_SMC_FUNCID_GET_OS_REVISION: usize = 0x1;
 const OPTEE_SMC_FUNCID_CALL_WITH_ARG: usize = 0x4;
 const OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES: usize = 0x9;
@@ -1420,6 +1421,7 @@ const OPTEE_SMC_FUNCID_CALLS_REVISION: usize = 0xff03;
 #[derive(PartialEq, TryFromPrimitive)]
 #[repr(usize)]
 pub enum OpteeSmcFunction {
+    GetOsUuid = OPTEE_SMC_FUNCID_GET_OS_UUID,
     GetOsRevision = OPTEE_SMC_FUNCID_GET_OS_REVISION,
     CallWithArg = OPTEE_SMC_FUNCID_CALL_WITH_ARG,
     ExchangeCapabilities = OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES,
