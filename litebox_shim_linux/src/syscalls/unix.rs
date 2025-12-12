@@ -596,6 +596,27 @@ impl UnixConnectedStream {
         }
         Ok(total_read)
     }
+    fn recvfrom(
+        &self,
+        cx: &WaitContext<'_, crate::Platform>,
+        buf: &mut [u8],
+        is_nonblocking: bool,
+        source_addr: Option<&mut Option<UnixSocketAddr>>,
+    ) -> Result<usize, Errno> {
+        if let Some(source_addr) = source_addr {
+            *source_addr = None;
+        }
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::IN,
+            |observer, filter| {
+                self.pollee.register_observer(observer, filter);
+                Ok(())
+            },
+            || self.try_recvfrom(buf),
+        )
+        .map_err(Errno::from)
+    }
 
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
@@ -750,21 +771,21 @@ impl UnixDatagram {
         let pollee1 = Arc::new(Pollee::new());
         let pollee2 = Arc::new(Pollee::new());
         let (writer_peer, reader) =
-            crate::channel::Channel::new(UNIX_BUF_SIZE, pollee1.clone(), pollee2.clone()).split();
-        let (writer, reader_peer) =
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee2.clone(), pollee1.clone()).split();
+        let (writer, reader_peer) =
+            crate::channel::Channel::new(UNIX_BUF_SIZE, pollee1.clone(), pollee2.clone()).split();
         (
             UnixDatagram {
                 addr: None,
                 reader: Some(reader),
                 peer_writer: Some(writer),
-                pollee: pollee2,
+                pollee: pollee1,
             },
             UnixDatagram {
                 addr: None,
                 reader: Some(reader_peer),
                 peer_writer: Some(writer_peer),
-                pollee: pollee1,
+                pollee: pollee2,
             },
         )
     }
@@ -1118,20 +1139,8 @@ impl UnixSocket {
 
         let ret = self.with_state_ref(|state| match state {
             UnixSocketState::InitStream(_) | UnixSocketState::ListenStream(_) => Err(Errno::EINVAL),
-            UnixSocketState::ConnectedStream(connect) => {
-                if let Some(source_addr) = source_addr {
-                    *source_addr = None;
-                }
-                cx.wait_on_events(
-                    is_nonblocking,
-                    Events::IN,
-                    |observer, filter| {
-                        self.register_observer(observer, filter);
-                        Ok(())
-                    },
-                    || connect.try_recvfrom(buf),
-                )
-                .map_err(Errno::from)
+            UnixSocketState::ConnectedStream(conn) => {
+                conn.recvfrom(cx, buf, is_nonblocking, source_addr)
             }
             UnixSocketState::Datagram(sock) => sock.recvfrom(cx, buf, is_nonblocking, source_addr),
         });
