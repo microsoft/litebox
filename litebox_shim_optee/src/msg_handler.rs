@@ -166,43 +166,89 @@ pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcR
                     out_address: None,
                 }
             }
-            OpteeMsgAttrType::TmemInput => {
-                let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                if let Some(phys_addr) = get_shm_phys_addr_from_optee_msg_param_tmem(tmem) {
-                    let ptr = NormalWorldConstPtr::<u8>::from_usize(phys_addr);
-                    let data_size: usize = tmem.size.try_into().unwrap();
-                    let slice = unsafe { ptr.to_cow_slice(data_size) }
-                        .ok_or(OpteeSmcReturn::EBadAddr)?
-                        .into_owned();
+            OpteeMsgAttrType::TmemInput | OpteeMsgAttrType::RmemInput => {
+                if let (Ok(phys_addrs), data_size) = {
+                    match param.attr_type() {
+                        OpteeMsgAttrType::TmemInput => {
+                            let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                            (
+                                get_shm_phys_addrs_from_optee_msg_param_tmem(tmem),
+                                usize::try_from(tmem.size).unwrap(),
+                            )
+                        }
+                        OpteeMsgAttrType::RmemInput => {
+                            let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                            (
+                                get_shm_phys_addrs_from_optee_msg_param_rmem(rmem),
+                                usize::try_from(rmem.size).unwrap(),
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                } {
+                    // TODO: loop to handle scatter-gather list
+                    // let ptr = NormalWorldConstPtr::<u8>::from_usize(phys_addr);
+                    let slice = alloc::vec![0u8; data_size];
                     UteeParamOwned::MemrefInput { data: slice.into() }
                 } else {
                     UteeParamOwned::None
                 }
             }
-            OpteeMsgAttrType::TmemOutput => {
-                let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                if let Some(phys_addr) = get_shm_phys_addr_from_optee_msg_param_tmem(tmem) {
-                    let buffer_size: usize = tmem.size.try_into().unwrap();
+            OpteeMsgAttrType::TmemOutput | OpteeMsgAttrType::RmemOutput => {
+                if let (Ok(phys_addrs), buffer_size) = {
+                    match param.attr_type() {
+                        OpteeMsgAttrType::TmemInput => {
+                            let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                            (
+                                get_shm_phys_addrs_from_optee_msg_param_tmem(tmem),
+                                usize::try_from(tmem.size).unwrap(),
+                            )
+                        }
+                        OpteeMsgAttrType::RmemInput => {
+                            let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                            (
+                                get_shm_phys_addrs_from_optee_msg_param_rmem(rmem),
+                                usize::try_from(rmem.size).unwrap(),
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                } {
                     UteeParamOwned::MemrefOutput {
                         buffer_size,
-                        out_addresses: Some(Box::new([phys_addr])),
+                        out_addresses: Some(phys_addrs),
                     }
                 } else {
                     UteeParamOwned::None
                 }
             }
-            OpteeMsgAttrType::TmemInout => {
-                let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                if let Some(phys_addr) = get_shm_phys_addr_from_optee_msg_param_tmem(tmem) {
-                    let ptr = NormalWorldConstPtr::<u8>::from_usize(phys_addr);
-                    let buffer_size: usize = tmem.size.try_into().unwrap();
-                    let slice = unsafe { ptr.to_cow_slice(buffer_size) }
-                        .ok_or(OpteeSmcReturn::EBadAddr)?
-                        .into_owned();
+            OpteeMsgAttrType::TmemInout | OpteeMsgAttrType::RmemInout => {
+                if let (Ok(phys_addrs), buffer_size) = {
+                    match param.attr_type() {
+                        OpteeMsgAttrType::TmemInput => {
+                            let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                            (
+                                get_shm_phys_addrs_from_optee_msg_param_tmem(tmem),
+                                usize::try_from(tmem.size).unwrap(),
+                            )
+                        }
+                        OpteeMsgAttrType::RmemInput => {
+                            let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                            (
+                                get_shm_phys_addrs_from_optee_msg_param_rmem(rmem),
+                                usize::try_from(rmem.size).unwrap(),
+                            )
+                        }
+                        _ => unreachable!(),
+                    }
+                } {
+                    // TODO: loop to handle scatter-gather list
+                    // let ptr = NormalWorldConstPtr::<u8>::from_usize(phys_addr);
+                    let slice = alloc::vec![0u8; buffer_size];
                     UteeParamOwned::MemrefInout {
                         data: slice.into(),
                         buffer_size,
-                        out_addresses: Some(Box::new([phys_addr])),
+                        out_addresses: Some(phys_addrs),
                     }
                 } else {
                     UteeParamOwned::None
@@ -222,6 +268,7 @@ struct ShmRefInfo {
     pub page_offset: u64,
 }
 
+/// Scatter-gather list of OP-TEE shared physical pages in VTL0.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct ShmRefPagesData {
@@ -261,7 +308,6 @@ impl ShmRefMap {
         guard.remove(&shm_ref)
     }
 
-    #[expect(unused)]
     pub fn get(&self, shm_ref: u64) -> Option<ShmRefInfo> {
         let guard = self.inner.lock();
         guard.get(&shm_ref).cloned()
@@ -317,20 +363,29 @@ fn shm_ref_map() -> &'static ShmRefMap {
 }
 
 /// Get a normal world physical address of OP-TEE shared memory from `OpteeMsgParamTmem`.
-fn get_shm_phys_addr_from_optee_msg_param_tmem(tmem: OpteeMsgParamTmem) -> Option<usize> {
-    if tmem.buf_ptr == 0 || tmem.size == 0 {
-        None
-    } else {
-        // TODO: validate this address
-        Some(tmem.buf_ptr.try_into().unwrap())
-    }
+/// Note that we use this function for handing TA requests and in that context there is no
+/// difference between `OpteeMsgParamTmem` and `OpteeMsgParamRmem`.
+/// `OpteeMsgParamTmem` is matter for the registration of shared memory regions.
+fn get_shm_phys_addrs_from_optee_msg_param_tmem(
+    tmem: OpteeMsgParamTmem,
+) -> Result<Box<[usize]>, OpteeSmcReturn> {
+    let rmem = OpteeMsgParamRmem {
+        offs: tmem.buf_ptr,
+        size: tmem.size,
+        shm_ref: tmem.shm_ref,
+    };
+    get_shm_phys_addrs_from_optee_msg_param_rmem(rmem)
 }
 
 /// Get a list of the normal world physical addresses of OP-TEE shared memory from `OpteeMsgParamRmem`.
 /// All addresses must be page-aligned except possibly the first one.
 /// These addresses are virtually contiguous within the normal world, but not necessarily
 /// physically contiguous.
-#[expect(unused)]
-fn get_shm_phys_addrs_from_optee_msg_param_rmem(_rmem: OpteeMsgParamTmem) -> Option<Box<[usize]>> {
-    None
+fn get_shm_phys_addrs_from_optee_msg_param_rmem(
+    rmem: OpteeMsgParamRmem,
+) -> Result<Box<[usize]>, OpteeSmcReturn> {
+    let Some(shm_ref_info) = shm_ref_map().get(rmem.shm_ref) else {
+        return Err(OpteeSmcReturn::EBadAddr);
+    };
+    Ok(Box::new([]))
 }
