@@ -1317,32 +1317,40 @@ pub struct OpteeMsgArg {
 }
 
 impl OpteeMsgArg {
-    pub fn get_param_tmem(&self, index: usize) -> Result<OpteeMsgParamTmem, Errno> {
+    pub fn get_param_tmem(&self, index: usize) -> Result<OpteeMsgParamTmem, OpteeSmcReturn> {
         if index >= self.params.len() || index >= self.num_params as usize {
-            Err(Errno::EINVAL)
+            Err(OpteeSmcReturn::ENotAvail)
         } else {
-            Ok(self.params[index].get_param_tmem().ok_or(Errno::EINVAL)?)
+            Ok(self.params[index]
+                .get_param_tmem()
+                .ok_or(OpteeSmcReturn::EBadCmd)?)
         }
     }
-    pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, Errno> {
+    pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, OpteeSmcReturn> {
         if index >= self.params.len() || index >= self.num_params as usize {
-            Err(Errno::EINVAL)
+            Err(OpteeSmcReturn::ENotAvail)
         } else {
-            Ok(self.params[index].get_param_rmem().ok_or(Errno::EINVAL)?)
+            Ok(self.params[index]
+                .get_param_rmem()
+                .ok_or(OpteeSmcReturn::EBadCmd)?)
         }
     }
-    pub fn get_param_fmem(&self, index: usize) -> Result<OpteeMsgParamFmem, Errno> {
+    pub fn get_param_fmem(&self, index: usize) -> Result<OpteeMsgParamFmem, OpteeSmcReturn> {
         if index >= self.params.len() || index >= self.num_params as usize {
-            Err(Errno::EINVAL)
+            Err(OpteeSmcReturn::ENotAvail)
         } else {
-            Ok(self.params[index].get_param_fmem().ok_or(Errno::EINVAL)?)
+            Ok(self.params[index]
+                .get_param_fmem()
+                .ok_or(OpteeSmcReturn::EBadCmd)?)
         }
     }
-    pub fn get_param_value(&self, index: usize) -> Result<OpteeMsgParamValue, Errno> {
+    pub fn get_param_value(&self, index: usize) -> Result<OpteeMsgParamValue, OpteeSmcReturn> {
         if index >= self.params.len() || index >= self.num_params as usize {
-            Err(Errno::EINVAL)
+            Err(OpteeSmcReturn::ENotAvail)
         } else {
-            Ok(self.params[index].get_param_value().ok_or(Errno::EINVAL)?)
+            Ok(self.params[index]
+                .get_param_value()
+                .ok_or(OpteeSmcReturn::EBadCmd)?)
         }
     }
 }

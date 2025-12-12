@@ -9,8 +9,9 @@
 //! version). If it is for passing an OP-TEE message/command, the shim accesses a normal world
 //! physical address containing `OpteeMsgArg` structure (the address is contained in
 //! the SMC call arguments). This `OpteeMsgArg` structure may contain references to normal
-//! world physical addresses to exchange a large amount of data. Also, a certain OP-TEE
-//! message/command does not involve with any TA (e.g., register shared memory).
+//! world physical addresses to exchange a large amount of data. Also, like the OP-TEE
+//! SMC call, a certain OP-TEE message/command does not involve with any TA (e.g., register
+//! shared memory).
 use crate::ptr::NormalWorldConstPtr;
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
@@ -88,7 +89,7 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_
             })
         }
         OpteeSmcFunction::DisableShmCache => {
-            // We do not support this feature
+            // Currently, we do not support this feature.
             Ok(OpteeSmcResult::DisableShmCache {
                 status: OpteeSmcReturn::ENotAvail,
                 shm_upper32: 0,
@@ -128,20 +129,14 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_
 pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcReturn> {
     match msg_arg.cmd {
         OpteeMessageCommand::RegisterShm => {
-            if let Ok(tmem) = msg_arg.get_param_tmem(0) {
-                shm_ref_map().register_shm(tmem.buf_ptr, tmem.size, tmem.shm_ref)?;
-            } else {
-                return Err(OpteeSmcReturn::EBadAddr);
-            }
+            let tmem = msg_arg.get_param_tmem(0)?;
+            shm_ref_map().register_shm(tmem.buf_ptr, tmem.size, tmem.shm_ref)?;
         }
         OpteeMessageCommand::UnregisterShm => {
-            if let Ok(tmem) = msg_arg.get_param_tmem(0) {
-                shm_ref_map()
-                    .remove(tmem.shm_ref)
-                    .ok_or(OpteeSmcReturn::EBadAddr)?;
-            } else {
-                return Err(OpteeSmcReturn::EBadCmd);
-            }
+            let tmem = msg_arg.get_param_tmem(0)?;
+            shm_ref_map()
+                .remove(tmem.shm_ref)
+                .ok_or(OpteeSmcReturn::EBadAddr)?;
         }
         OpteeMessageCommand::OpenSession
         | OpteeMessageCommand::InvokeCommand
@@ -166,15 +161,17 @@ struct ShmRefInfo {
     pub page_offset: u64,
 }
 
-/// Scatter-gather list of OP-TEE shared physical pages in VTL0.
+/// A scatter-gather list of OP-TEE shared physical pages in VTL0.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct ShmRefPagesData {
-    pub pages_list: [u64; PAGELIST_ENTRIES_PER_PAGE],
+    pub pages_list: [u64; Self::PAGELIST_ENTRIES_PER_PAGE],
     pub next_page_data: u64,
 }
-const PAGELIST_ENTRIES_PER_PAGE: usize =
-    PAGE_SIZE / core::mem::size_of::<u64>() - core::mem::size_of::<u64>();
+impl ShmRefPagesData {
+    const PAGELIST_ENTRIES_PER_PAGE: usize =
+        PAGE_SIZE / core::mem::size_of::<u64>() - core::mem::size_of::<u64>();
+}
 
 /// Maintain the information of OP-TEE shared memory in VTL0 referenced by `shm_ref`.
 /// This data structure is for registering shared memory regions before they are
