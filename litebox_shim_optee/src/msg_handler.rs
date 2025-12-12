@@ -50,9 +50,7 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_
             let msg_arg_addr = smc.optee_msg_arg_phys_addr()?;
             let msg_arg_addr = usize::try_from(msg_arg_addr).unwrap();
             let ptr = NormalWorldConstPtr::<OpteeMsgArg>::from_usize(msg_arg_addr);
-            let msg_arg = unsafe { ptr.read_at_offset(0) }
-                .ok_or(Errno::EFAULT)?
-                .into_owned();
+            let msg_arg = unsafe { ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
             // let msg_arg = copy_from_remote_memory::<OpteeMsgArg>(msg_arg_addr)?;
             handle_optee_msg_arg(&msg_arg).map(|()| OpteeSmcResult::Generic {
                 status: OpteeSmcReturn::Ok,
@@ -121,6 +119,7 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), Errno> {
     Ok(())
 }
 
+#[expect(dead_code)]
 #[derive(Clone)]
 struct ShmRefInfo {
     pub pages: Box<[u64]>,
@@ -182,9 +181,7 @@ impl ShmRefMap {
         let mut cur_addr = usize::try_from(aligned_phys_addr).unwrap();
         loop {
             let cur_ptr = NormalWorldConstPtr::<ShmRefPagesData>::from_usize(cur_addr);
-            let pages_data = unsafe { cur_ptr.read_at_offset(0) }
-                .ok_or(Errno::EFAULT)?
-                .into_owned();
+            let pages_data = unsafe { cur_ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
             for page in &pages_data.pages_list {
                 if *page == 0 || pages.len() == num_pages {
                     break;

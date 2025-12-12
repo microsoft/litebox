@@ -54,20 +54,20 @@ impl<V, A, T: Clone> core::fmt::Debug for RemoteConstPtr<V, A, T> {
 impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RawConstPointer<T>
     for RemoteConstPtr<V, A, T>
 {
-    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
+    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
         let val = A::read_at_offset(self.inner.cast_mut(), count)?;
-        Some(alloc::borrow::Cow::Owned(val))
+        Some(val)
     }
 
-    unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
+    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
         // TODO: read data from the remote side
         if len == 0 {
-            return Some(alloc::borrow::Cow::Owned(alloc::vec::Vec::new()));
+            return Some(alloc::boxed::Box::new([]));
         }
         let mut data = alloc::vec::Vec::new();
         data.reserve_exact(len);
         unsafe { data.set_len(len) };
-        Some(alloc::borrow::Cow::Owned(data))
+        Some(data.into_boxed_slice())
     }
 
     fn as_usize(&self) -> usize {
@@ -117,18 +117,18 @@ impl<V, A, T: Clone> core::fmt::Debug for RemoteMutPtr<V, A, T> {
 impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RawConstPointer<T>
     for RemoteMutPtr<V, A, T>
 {
-    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
+    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
         let val = A::read_at_offset(self.inner, count)?;
-        Some(alloc::borrow::Cow::Owned(val))
+        Some(val)
     }
 
-    unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
+    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
         // TODO: read data from the remote side
         if len == 0 {
-            return Some(alloc::borrow::Cow::Owned(alloc::vec::Vec::new()));
+            return Some(alloc::boxed::Box::new([]));
         }
         let data = A::slice_from(self.inner, len)?;
-        Some(alloc::borrow::Cow::Owned(data.into()))
+        Some(data)
     }
 
     fn as_usize(&self) -> usize {
