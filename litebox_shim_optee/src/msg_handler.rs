@@ -5,8 +5,8 @@ use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::RawConstPointer;
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArg, OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction,
-    OpteeSmcResult, OpteeSmcReturn,
+    OpteeMessageCommand, OpteeMsgArg, OpteeMsgAttrType, OpteeSecureWorldCapabilities, OpteeSmcArgs,
+    OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturn, UteeEntryFunc, UteeParamOwned,
 };
 use once_cell::race::OnceBox;
 
@@ -40,7 +40,7 @@ fn page_align_up(len: u64) -> u64 {
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
 /// # Panics
 /// Panics if the physical address in `smc` cannot be converted to `usize`.
-pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_>, Errno> {
+pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_>, OpteeSmcReturn> {
     let func_id = smc.func_id()?;
 
     match func_id {
@@ -51,8 +51,7 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_
             let msg_arg_addr = usize::try_from(msg_arg_addr).unwrap();
             let ptr = NormalWorldConstPtr::<OpteeMsgArg>::from_usize(msg_arg_addr);
             let msg_arg = unsafe { ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
-            // let msg_arg = copy_from_remote_memory::<OpteeMsgArg>(msg_arg_addr)?;
-            handle_optee_msg_arg(&msg_arg).map(|()| OpteeSmcResult::Generic {
+            handle_optee_msg_arg(&msg_arg).map(|_| OpteeSmcResult::Generic {
                 status: OpteeSmcReturn::Ok,
             })
         }
@@ -93,30 +92,82 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_
             major: OPTEE_MSG_REVISION_MAJOR,
             minor: OPTEE_MSG_REVISION_MINOR,
         }),
-        _ => Err(Errno::EINVAL),
+        _ => Err(OpteeSmcReturn::UnknownFunction),
     }
 }
 
-pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), Errno> {
+pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcReturn> {
     match msg_arg.cmd {
         OpteeMessageCommand::RegisterShm => {
             if let Ok(tmem) = msg_arg.get_param_tmem(0) {
                 shm_ref_map().register_shm(tmem.buf_ptr, tmem.size, tmem.shm_ref)?;
             } else {
-                return Err(Errno::EINVAL);
+                return Err(OpteeSmcReturn::EBadAddr);
             }
         }
         OpteeMessageCommand::UnregisterShm => {
             if let Ok(tmem) = msg_arg.get_param_tmem(0) {
-                shm_ref_map().remove(tmem.shm_ref).ok_or(Errno::ENOENT)?;
+                shm_ref_map()
+                    .remove(tmem.shm_ref)
+                    .ok_or(OpteeSmcReturn::EBadAddr)?;
             } else {
-                return Err(Errno::EINVAL);
+                return Err(OpteeSmcReturn::EBadCmd);
             }
         }
-        _ => {}
+        OpteeMessageCommand::OpenSession
+        | OpteeMessageCommand::InvokeCommand
+        | OpteeMessageCommand::CloseSession => return handle_ta_request(msg_arg),
+        _ => {
+            todo!("Unimplemented OpteeMessageCommand: {:?}", msg_arg.cmd);
+        }
     }
 
-    Ok(())
+    Ok(*msg_arg)
+}
+
+pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcReturn> {
+    let ta_entry_func: UteeEntryFunc = msg_arg.cmd.try_into()?;
+
+    let shift: usize = if ta_entry_func == UteeEntryFunc::OpenSession {
+        // TODO: load a TA using its UUID (if not yet loaded)
+
+        2 // first two params are for TA UUID
+    } else {
+        0
+    };
+    let num_params = usize::try_from(msg_arg.num_params).unwrap();
+
+    let ta_cmd_id = msg_arg.func;
+    let mut ta_params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
+
+    for (i, param) in msg_arg.params[shift..shift + num_params].iter().enumerate() {
+        ta_params[i] = match param.attr_type() {
+            OpteeMsgAttrType::None => UteeParamOwned::None,
+            OpteeMsgAttrType::ValueInput => {
+                let value = msg_arg
+                    .get_param_value(shift + i)
+                    .map_err(|_| OpteeSmcReturn::EBadCmd)?;
+                UteeParamOwned::ValueInput {
+                    value_a: value.a,
+                    value_b: value.b,
+                }
+            }
+            OpteeMsgAttrType::ValueOutput => UteeParamOwned::ValueOutput { out_address: None },
+            OpteeMsgAttrType::ValueInout => {
+                let value = msg_arg
+                    .get_param_value(shift + i)
+                    .map_err(|_| OpteeSmcReturn::EBadCmd)?;
+                UteeParamOwned::ValueInout {
+                    value_a: value.a,
+                    value_b: value.b,
+                    out_address: None,
+                }
+            }
+            _ => todo!(),
+        }
+    }
+
+    Ok(*msg_arg)
 }
 
 #[expect(dead_code)]
@@ -150,10 +201,10 @@ impl ShmRefMap {
         }
     }
 
-    pub fn insert(&self, shm_ref: u64, info: ShmRefInfo) -> Result<(), Errno> {
+    pub fn insert(&self, shm_ref: u64, info: ShmRefInfo) -> Result<(), OpteeSmcReturn> {
         let mut guard = self.inner.lock();
         if guard.contains_key(&shm_ref) {
-            Err(Errno::EEXIST)
+            Err(OpteeSmcReturn::ENotAvail)
         } else {
             let _ = guard.insert(shm_ref, info);
             Ok(())
@@ -171,7 +222,12 @@ impl ShmRefMap {
         guard.get(&shm_ref).cloned()
     }
 
-    pub fn register_shm(&self, phys_addr: u64, size: u64, shm_ref: u64) -> Result<(), Errno> {
+    pub fn register_shm(
+        &self,
+        phys_addr: u64,
+        size: u64,
+        shm_ref: u64,
+    ) -> Result<(), OpteeSmcReturn> {
         let aligned_phys_addr = page_align_down(phys_addr);
         let page_offset = phys_addr - aligned_phys_addr;
         let aligned_size = page_align_up(page_offset + size);
@@ -186,7 +242,7 @@ impl ShmRefMap {
                 if *page == 0 || pages.len() == num_pages {
                     break;
                 } else if !page.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap()) {
-                    return Err(Errno::EINVAL);
+                    return Err(OpteeSmcReturn::EBadAddr);
                 } else {
                     pages.push(*page);
                 }
