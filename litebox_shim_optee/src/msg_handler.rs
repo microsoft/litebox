@@ -4,8 +4,9 @@ use hashbrown::HashMap;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::RawConstPointer;
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArg, OpteeMsgAttrType, OpteeSecureWorldCapabilities, OpteeSmcArgs,
-    OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturn, UteeEntryFunc, UteeParamOwned,
+    OpteeMessageCommand, OpteeMsgArg, OpteeMsgAttrType, OpteeMsgParamRmem, OpteeMsgParamTmem,
+    OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturn,
+    UteeEntryFunc, UteeParamOwned,
 };
 use once_cell::race::OnceBox;
 
@@ -38,7 +39,7 @@ fn page_align_up(len: u64) -> u64 {
 
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
 /// # Panics
-/// Panics if the physical address in `smc` cannot be converted to `usize`.
+/// Panics if the normal world physical address in `smc` cannot be converted to `usize`.
 pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_>, OpteeSmcReturn> {
     let func_id = smc.func_id()?;
 
@@ -98,6 +99,7 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_
     }
 }
 
+/// This function handles an OP-TEE message contained in `OpteeMsgArg`
 pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcReturn> {
     match msg_arg.cmd {
         OpteeMessageCommand::RegisterShm => {
@@ -127,28 +129,31 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeS
     Ok(*msg_arg)
 }
 
+/// This function handles a TA request contained in `OpteeMsgArg`
+///
+/// # Panics
+/// Panics if `num_params` cannot be converted to usize.
 pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcReturn> {
     let ta_entry_func: UteeEntryFunc = msg_arg.cmd.try_into()?;
 
-    let shift: usize = if ta_entry_func == UteeEntryFunc::OpenSession {
+    let skip: usize = if ta_entry_func == UteeEntryFunc::OpenSession {
         // TODO: load a TA using its UUID (if not yet loaded)
 
         2 // first two params are for TA UUID
     } else {
         0
     };
-    let num_params = usize::try_from(msg_arg.num_params).unwrap();
+    let num_params: usize = msg_arg.num_params.try_into().unwrap();
 
     let ta_cmd_id = msg_arg.func;
     let mut ta_params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
-    for (i, param) in msg_arg.params[shift..shift + num_params].iter().enumerate() {
+    // TODO: handle `out_address`
+    for (i, param) in msg_arg.params[skip..skip + num_params].iter().enumerate() {
         ta_params[i] = match param.attr_type() {
             OpteeMsgAttrType::None => UteeParamOwned::None,
             OpteeMsgAttrType::ValueInput => {
-                let value = msg_arg
-                    .get_param_value(shift + i)
-                    .map_err(|_| OpteeSmcReturn::EBadCmd)?;
+                let value = param.get_param_value().ok_or(OpteeSmcReturn::EBadCmd)?;
                 UteeParamOwned::ValueInput {
                     value_a: value.a,
                     value_b: value.b,
@@ -156,16 +161,56 @@ pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcR
             }
             OpteeMsgAttrType::ValueOutput => UteeParamOwned::ValueOutput { out_address: None },
             OpteeMsgAttrType::ValueInout => {
-                let value = msg_arg
-                    .get_param_value(shift + i)
-                    .map_err(|_| OpteeSmcReturn::EBadCmd)?;
+                let value = param.get_param_value().ok_or(OpteeSmcReturn::EBadCmd)?;
                 UteeParamOwned::ValueInout {
                     value_a: value.a,
                     value_b: value.b,
                     out_address: None,
                 }
             }
-            _ => todo!(),
+            OpteeMsgAttrType::TmemInput => {
+                let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                if let Some(phys_addr) = get_shm_phys_addr_from_optee_msg_param_tmem(tmem) {
+                    let ptr = NormalWorldConstPtr::<u8>::from_usize(phys_addr);
+                    let data_size: usize = tmem.size.try_into().unwrap();
+                    let slice = unsafe { ptr.to_cow_slice(data_size) }
+                        .ok_or(OpteeSmcReturn::EBadAddr)?
+                        .into_owned();
+                    UteeParamOwned::MemrefInput { data: slice.into() }
+                } else {
+                    UteeParamOwned::None
+                }
+            }
+            OpteeMsgAttrType::TmemOutput => {
+                let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                if let Some(phys_addr) = get_shm_phys_addr_from_optee_msg_param_tmem(tmem) {
+                    let buffer_size: usize = tmem.size.try_into().unwrap();
+                    UteeParamOwned::MemrefOutput {
+                        buffer_size,
+                        out_addresses: Some(Box::new([phys_addr])),
+                    }
+                } else {
+                    UteeParamOwned::None
+                }
+            }
+            OpteeMsgAttrType::TmemInout => {
+                let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                if let Some(phys_addr) = get_shm_phys_addr_from_optee_msg_param_tmem(tmem) {
+                    let ptr = NormalWorldConstPtr::<u8>::from_usize(phys_addr);
+                    let buffer_size: usize = tmem.size.try_into().unwrap();
+                    let slice = unsafe { ptr.to_cow_slice(buffer_size) }
+                        .ok_or(OpteeSmcReturn::EBadAddr)?
+                        .into_owned();
+                    UteeParamOwned::MemrefInout {
+                        data: slice.into(),
+                        buffer_size,
+                        out_addresses: Some(Box::new([phys_addr])),
+                    }
+                } else {
+                    UteeParamOwned::None
+                }
+            }
+            _ => todo!("handle OpteeMsgParamRmem"),
         }
     }
 
@@ -272,4 +317,23 @@ impl ShmRefMap {
 fn shm_ref_map() -> &'static ShmRefMap {
     static SHM_REF_MAP: OnceBox<ShmRefMap> = OnceBox::new();
     SHM_REF_MAP.get_or_init(|| Box::new(ShmRefMap::new()))
+}
+
+/// Get a normal world physical address of OP-TEE shared memory from `OpteeMsgParamTmem`.
+fn get_shm_phys_addr_from_optee_msg_param_tmem(tmem: OpteeMsgParamTmem) -> Option<usize> {
+    if tmem.buf_ptr == 0 || tmem.size == 0 {
+        None
+    } else {
+        // TODO: validate this address
+        Some(tmem.buf_ptr.try_into().unwrap())
+    }
+}
+
+/// Get a list of the normal world physical addresses of OP-TEE shared memory from `OpteeMsgParamRmem`.
+/// All addresses must be page-aligned except possibly the first one.
+/// These addresses are virtually contiguous within the normal world, but not necessarily
+/// physically contiguous.
+#[expect(unused)]
+fn get_shm_phys_addrs_from_optee_msg_param_rmem(_rmem: OpteeMsgParamTmem) -> Option<Box<[usize]>> {
+    None
 }
