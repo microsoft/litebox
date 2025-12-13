@@ -402,21 +402,8 @@ impl UnixListenStream {
     }
 
     /// Accepts a pending connection.
-    fn accept(
-        &self,
-        cx: &WaitContext<'_, crate::Platform>,
-        is_nonblocking: bool,
-    ) -> Result<UnixConnectedStream, Errno> {
-        cx.wait_on_events(
-            is_nonblocking,
-            Events::IN,
-            |observer, mask| {
-                self.register_observer(observer, mask);
-                Ok(())
-            },
-            || self.backlog.try_accept(),
-        )
-        .map_err(Errno::from)
+    fn try_accept(&self) -> Result<UnixConnectedStream, TryOpError<Errno>> {
+        self.backlog.try_accept()
     }
 
     /// Returns the local address this socket is bound to.
@@ -541,32 +528,6 @@ impl UnixConnectedStream {
         self.writer.try_write_one(msg)
     }
 
-    fn sendto(
-        &self,
-        cx: &WaitContext<'_, crate::Platform>,
-        buf: &[u8],
-        is_nonblocking: bool,
-    ) -> Result<usize, Errno> {
-        let mut msg = Some(Message { data: buf.to_vec() });
-        cx.wait_on_events(
-            is_nonblocking,
-            Events::OUT,
-            |observer, mask| {
-                self.pollee.register_observer(observer, mask);
-                Ok(())
-            },
-            || match self.try_sendto(msg.take().unwrap()) {
-                Ok(()) => Ok(buf.len()),
-                Err((m, Errno::EAGAIN)) => {
-                    let _ = msg.replace(m);
-                    Err(TryOpError::TryAgain)
-                }
-                Err((_, err)) => Err(TryOpError::Other(err)),
-            },
-        )
-        .map_err(Errno::from)
-    }
-
     fn try_recvfrom(&self, mut buf: &mut [u8]) -> Result<usize, TryOpError<Errno>> {
         let mut total_read = 0;
         while !buf.is_empty() {
@@ -596,27 +557,6 @@ impl UnixConnectedStream {
         }
         Ok(total_read)
     }
-    fn recvfrom(
-        &self,
-        cx: &WaitContext<'_, crate::Platform>,
-        buf: &mut [u8],
-        is_nonblocking: bool,
-        source_addr: Option<&mut Option<UnixSocketAddr>>,
-    ) -> Result<usize, Errno> {
-        if let Some(source_addr) = source_addr {
-            *source_addr = None;
-        }
-        cx.wait_on_events(
-            is_nonblocking,
-            Events::IN,
-            |observer, filter| {
-                self.pollee.register_observer(observer, filter);
-                Ok(())
-            },
-            || self.try_recvfrom(buf),
-        )
-        .map_err(Errno::from)
-    }
 
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
@@ -642,6 +582,21 @@ enum UnixStreamState {
     Init(UnixInitStream),
     Listen(UnixListenStream),
     Connected(UnixConnectedStream),
+}
+
+impl UnixStreamState {
+    fn connected(&self) -> Option<&UnixConnectedStream> {
+        match self {
+            UnixStreamState::Connected(conn) => Some(conn),
+            _ => None,
+        }
+    }
+    fn listen(&self) -> Option<&UnixListenStream> {
+        match self {
+            UnixStreamState::Listen(listen) => Some(listen),
+            _ => None,
+        }
+    }
 }
 
 struct UnixStream {
@@ -738,21 +693,33 @@ impl UnixStream {
     fn accept(
         &self,
         cx: &WaitContext<'_, crate::Platform>,
-        peer: Option<&mut UnixSocketAddr>,
+        mut peer: Option<&mut UnixSocketAddr>,
         is_nonblocking: bool,
     ) -> Result<UnixSocketInner, Errno> {
-        self.with_state_ref(|state| match state {
-            UnixStreamState::Listen(listen) => {
-                let accepted = listen.accept(cx, is_nonblocking)?;
-                if let Some(peer) = peer {
-                    *peer = accepted.get_peer_addr();
-                }
-                Ok(UnixSocketInner::Stream(UnixStream::new(
-                    UnixStreamState::Connected(accepted),
-                )))
-            }
-            UnixStreamState::Init(_) | UnixStreamState::Connected(_) => Err(Errno::EINVAL),
-        })
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::IN,
+            |observer, mask| {
+                self.with_state_ref(|state| {
+                    let listen = state.listen().ok_or(Errno::EINVAL)?;
+                    listen.register_observer(observer, mask);
+                    Ok(())
+                })
+            },
+            || {
+                self.with_state_ref(|state| {
+                    let listen = state.listen().ok_or(TryOpError::Other(Errno::EINVAL))?;
+                    let accepted = listen.try_accept()?;
+                    if let Some(peer) = peer.as_deref_mut() {
+                        *peer = accepted.get_peer_addr();
+                    }
+                    Ok(UnixSocketInner::Stream(UnixStream::new(
+                        UnixStreamState::Connected(accepted),
+                    )))
+                })
+            },
+        )
+        .map_err(Errno::from)
     }
 
     fn sendto(
@@ -762,15 +729,37 @@ impl UnixStream {
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
-        self.with_state_ref(|state| match state {
-            UnixStreamState::Init(_) | UnixStreamState::Listen(_) => Err(Errno::ENOTCONN),
-            UnixStreamState::Connected(connect) => {
-                if addr.is_some() {
-                    return Err(Errno::EISCONN);
-                }
-                connect.sendto(cx, buf, is_nonblocking)
-            }
-        })
+        let mut msg = Some(Message { data: buf.to_vec() });
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::OUT,
+            |observer, mask| {
+                self.with_state_ref(|state| {
+                    let conn = state.connected().ok_or(Errno::ENOTCONN)?;
+                    conn.pollee.register_observer(observer, mask);
+                    Ok(())
+                })
+            },
+            || {
+                self.with_state_ref(|state| {
+                    let conn = state
+                        .connected()
+                        .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
+                    if addr.is_some() {
+                        return Err(TryOpError::Other(Errno::EISCONN));
+                    }
+                    match conn.try_sendto(msg.take().unwrap()) {
+                        Ok(()) => Ok(buf.len()),
+                        Err((m, Errno::EAGAIN)) => {
+                            let _ = msg.replace(m);
+                            Err(TryOpError::TryAgain)
+                        }
+                        Err((_, err)) => Err(TryOpError::Other(err)),
+                    }
+                })
+            },
+        )
+        .map_err(Errno::from)
     }
 
     fn recvfrom(
@@ -778,12 +767,33 @@ impl UnixStream {
         cx: &WaitContext<'_, crate::Platform>,
         buf: &mut [u8],
         is_nonblocking: bool,
-        source_addr: Option<&mut Option<UnixSocketAddr>>,
+        mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        self.with_state_ref(|state| match state {
-            UnixStreamState::Init(_) | UnixStreamState::Listen(_) => Err(Errno::EINVAL),
-            UnixStreamState::Connected(conn) => conn.recvfrom(cx, buf, is_nonblocking, source_addr),
-        })
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::IN,
+            |observer, mask| {
+                self.with_state_ref(|state| {
+                    let conn = state.connected().ok_or(Errno::ENOTCONN)?;
+                    conn.pollee.register_observer(observer, mask);
+                    Ok(())
+                })
+            },
+            || {
+                self.with_state_ref(|state| {
+                    let conn = state
+                        .connected()
+                        .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
+                    let n = conn.try_recvfrom(buf)?;
+                    // For connected stream sockets, no need to return the source address
+                    if let Some(source_addr) = source_addr.as_deref_mut() {
+                        *source_addr = None;
+                    }
+                    Ok(n)
+                })
+            },
+        )
+        .map_err(Errno::from)
     }
 
     fn get_local_addr(&self) -> UnixSocketAddr {
@@ -1227,7 +1237,6 @@ impl UnixSocket {
             flags.contains(SendFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
 
         let ret = match &self.inner {
-            // TODO: addr?
             UnixSocketInner::Stream(stream) => {
                 stream.sendto(&task.wait_cx(), buf, is_nonblocking, addr)
             }
