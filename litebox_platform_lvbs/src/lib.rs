@@ -389,6 +389,17 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ) {
         syscall_entry::init(shim);
     }
+
+    /// Register the upcall.
+    pub fn register_upcall(
+        upcall: &'static (
+                     dyn litebox::upcall::Upcall<Context = litebox_common_linux::PtRegs>
+                         + Send
+                         + Sync
+                 ),
+    ) {
+        UPCALL.call_once(|| upcall);
+    }
 }
 
 impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
@@ -754,6 +765,11 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
         unimplemented!()
     }
 }
+
+// Use static for upcall (we can use kernel TLS if needed) and `PtRegs` for now.
+static UPCALL: spin::Once<
+    &'static (dyn litebox::upcall::Upcall<Context = litebox_common_linux::PtRegs> + Send + Sync),
+> = spin::Once::new();
 
 // NOTE: The below code is a naive workaround to let LVBS code to access the platform.
 // Rather than doing this, we should implement LVBS interface/provider for the platform.

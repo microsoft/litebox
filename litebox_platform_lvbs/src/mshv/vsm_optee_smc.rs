@@ -18,7 +18,12 @@ pub(crate) fn optee_smc_dispatch(optee_smc_args_pfn: u64) -> i64 {
         with_per_cpu_variables_mut(|per_cpu_variables| {
             per_cpu_variables.save_extended_states(HV_VTL_SECURE);
         });
-        // TODO: Implement OP-TEE SMC for TA command invocation here.
+
+        // Placeholder for now
+        let upcall = crate::UPCALL.get().expect("OP-TEE upcall not registered");
+        let mut ctx = litebox_common_linux::PtRegs::default();
+        let _ = upcall.execute(&mut ctx);
+
         debug_serial_println!("VSM function call for OP-TEE message");
         with_per_cpu_variables_mut(|per_cpu_variables| {
             per_cpu_variables.restore_extended_states(HV_VTL_SECURE);

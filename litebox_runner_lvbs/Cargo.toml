@@ -5,10 +5,10 @@ edition = "2024"
 
 [dependencies]
 litebox = { version = "0.1.0", path = "../litebox" }
+litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", default-features = false, features = ["interrupt"] }
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_lvbs"] }
 litebox_shim_optee = { path = "../litebox_shim_optee/", version = "0.1.0" }
-
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }

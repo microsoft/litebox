@@ -1,5 +1,7 @@
 #![no_std]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
@@ -91,12 +93,32 @@ pub fn init() -> Option<&'static Platform> {
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
     Platform::register_shim(&litebox_shim_optee::OpteeShim);
+    Platform::register_upcall(&crate::OpteeMsgHandler);
 
     ret
 }
 
 pub fn run(platform: Option<&'static Platform>) -> ! {
     vtl_switch_loop_entry(platform)
+}
+
+pub struct OpteeMsgHandler;
+impl litebox::upcall::Upcall for OpteeMsgHandler {
+    type Context = litebox_common_linux::PtRegs;
+
+    fn init(
+        &self,
+    ) -> alloc::boxed::Box<dyn litebox::upcall::Upcall<Context = litebox_common_linux::PtRegs>>
+    {
+        alloc::boxed::Box::new(OpteeMsgHandler {})
+    }
+
+    fn execute(
+        &self,
+        _ctx: &mut Self::Context,
+    ) -> Result<Self::Context, litebox::upcall::UpcallError> {
+        todo!("invoke OP-TEE message handlers")
+    }
 }
 
 #[panic_handler]

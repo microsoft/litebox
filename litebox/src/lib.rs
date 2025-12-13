@@ -24,6 +24,7 @@ pub mod platform;
 pub mod shim;
 pub mod sync;
 pub mod tls;
+pub mod upcall;
 
 // The core [`LiteBox`] object itself, re-exported here publicly, just to keep management of the
 // code cleaner.
