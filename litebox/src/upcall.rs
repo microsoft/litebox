@@ -9,17 +9,25 @@
 use thiserror::Error;
 
 pub trait Upcall {
-    /// The upcall context type
-    type Context;
+    /// The upcall parameter type
+    type Parameter;
+
+    /// The upcall return type
+    type Return;
 
     /// Initialize the upcall handler
-    fn init(&self) -> alloc::boxed::Box<dyn crate::upcall::Upcall<Context = Self::Context>>;
+    fn init(
+        &self,
+    ) -> alloc::boxed::Box<
+        dyn crate::upcall::Upcall<Parameter = Self::Parameter, Return = Self::Return>,
+    >;
 
-    /// Execute the upcall with the given context
-    fn execute(&self, ctx: &mut Self::Context) -> Result<Self::Context, UpcallError>;
+    /// Execute the upcall with the given parameter
+    fn execute(&self, ctx: &mut Self::Parameter) -> Result<Self::Return, UpcallError>;
 }
 
-/// The operation to perform after returning from a shim handler
+/// The error type for upcalls
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum UpcallError {
     #[error("Upcall failed")]

@@ -393,8 +393,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// Register the upcall.
     pub fn register_upcall(
         upcall: &'static (
-                     dyn litebox::upcall::Upcall<Context = litebox_common_linux::PtRegs>
-                         + Send
+                     dyn litebox::upcall::Upcall<
+            Parameter = litebox_common_linux::PtRegs,
+            Return = litebox_common_linux::PtRegs,
+        > + Send
                          + Sync
                  ),
     ) {
@@ -768,7 +770,13 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
 
 // Use static for upcall (we can use kernel TLS if needed) and `PtRegs` for now.
 static UPCALL: spin::Once<
-    &'static (dyn litebox::upcall::Upcall<Context = litebox_common_linux::PtRegs> + Send + Sync),
+    &'static (
+                 dyn litebox::upcall::Upcall<
+        Parameter = litebox_common_linux::PtRegs,
+        Return = litebox_common_linux::PtRegs,
+    > + Send
+                     + Sync
+             ),
 > = spin::Once::new();
 
 // NOTE: The below code is a naive workaround to let LVBS code to access the platform.

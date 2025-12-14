@@ -104,19 +104,24 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
 
 pub struct OpteeMsgHandler;
 impl litebox::upcall::Upcall for OpteeMsgHandler {
-    type Context = litebox_common_linux::PtRegs;
+    type Parameter = litebox_common_linux::PtRegs;
+    type Return = litebox_common_linux::PtRegs;
 
     fn init(
         &self,
-    ) -> alloc::boxed::Box<dyn litebox::upcall::Upcall<Context = litebox_common_linux::PtRegs>>
-    {
+    ) -> alloc::boxed::Box<
+        dyn litebox::upcall::Upcall<
+                Parameter = litebox_common_linux::PtRegs,
+                Return = litebox_common_linux::PtRegs,
+            >,
+    > {
         alloc::boxed::Box::new(OpteeMsgHandler {})
     }
 
     fn execute(
         &self,
-        _ctx: &mut Self::Context,
-    ) -> Result<Self::Context, litebox::upcall::UpcallError> {
+        _ctx: &mut Self::Parameter,
+    ) -> Result<Self::Return, litebox::upcall::UpcallError> {
         todo!("invoke OP-TEE message handlers")
     }
 }
