@@ -1318,6 +1318,9 @@ pub struct OpteeMsgArg {
 
 impl OpteeMsgArg {
     pub fn get_param_tmem(&self, index: usize) -> Result<OpteeMsgParamTmem, OpteeSmcReturn> {
+        // `self.params.len()` indicates the maximum number of parameters possible whereas `self.num_params`
+        // indicates the number of parameters that the message sender specifies (which must be less than or
+        // equal to the maximum).
         if index >= self.params.len() || index >= self.num_params as usize {
             Err(OpteeSmcReturn::ENotAvail)
         } else {

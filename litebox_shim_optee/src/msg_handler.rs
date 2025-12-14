@@ -161,7 +161,12 @@ struct ShmRefInfo {
     pub page_offset: u64,
 }
 
-/// A scatter-gather list of OP-TEE shared physical pages in VTL0.
+/// A scatter-gather list of OP-TEE physical page addresses in the normal world (VTL0) to
+/// share with the secure world (VTL1). Each [`ShmRefPagesData`] occupies one memory page
+/// where `pages_list` contains a list of physical page addresses and `next_page_data`
+/// contains the physical address of the next [`ShmRefPagesData`] if any. Entries of `pages_list`
+/// and `next_page_data` contain zero if the list ends. These physical page addresses are
+/// virtually contiguous in the normal world. All these address values must be page aligned.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct ShmRefPagesData {
@@ -209,6 +214,13 @@ impl ShmRefMap {
         guard.get(&shm_ref).cloned()
     }
 
+    /// This function registers shared memory information that the normal world (VTL0) provides.
+    /// Specifically, it walks through [`ShmRefPagesData`] structures referenced by `phys_addr`
+    /// to create a slice of the shared physical page addresses and registers the slice with
+    /// `shm_ref` as its identifier. `size` indicates the total size of this registered shared
+    /// memory region. Note that `phys_addr` may not be page aligned. In that case, its page-aligned
+    /// address points to the first [`ShmRefPagesData`] structure while its page offset indicates
+    /// the page offset of the first page (i.e., `pages_list[0]` of the first [`ShmRefPagesData`]).
     pub fn register_shm(
         &self,
         phys_addr: u64,
