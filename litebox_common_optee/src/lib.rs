@@ -1108,7 +1108,6 @@ pub enum OpteeMessageCommand {
     UnregisterShm = OPTEE_MSG_CMD_UNREGISTER_SHM,
     DoBottomHalf = OPTEE_MSG_CMD_DO_BOTTOM_HALF,
     StopAsyncNotif = OPTEE_MSG_CMD_STOP_ASYNC_NOTIF,
-    Unknown = 0xffff_ffff,
 }
 
 impl TryFrom<OpteeMessageCommand> for UteeEntryFunc {
@@ -1317,11 +1316,21 @@ pub struct OpteeMsgArg {
 }
 
 impl OpteeMsgArg {
+    /// Validate the message argument structure.
+    pub fn validate(&self) -> Result<(), OpteeSmcReturn> {
+        let _ =
+            OpteeMessageCommand::try_from(self.cmd as u32).map_err(|_| OpteeSmcReturn::EBadCmd)?;
+        if self.cmd == OpteeMessageCommand::OpenSession && self.num_params < 2 {
+            return Err(OpteeSmcReturn::EBadCmd);
+        }
+        if self.num_params as usize > self.params.len() {
+            Err(OpteeSmcReturn::EBadCmd)
+        } else {
+            Ok(())
+        }
+    }
     pub fn get_param_tmem(&self, index: usize) -> Result<OpteeMsgParamTmem, OpteeSmcReturn> {
-        // `self.params.len()` indicates the maximum number of parameters possible whereas `self.num_params`
-        // indicates the number of parameters that the message sender specifies (which must be less than or
-        // equal to the maximum).
-        if index >= self.params.len() || index >= self.num_params as usize {
+        if index >= self.num_params as usize {
             Err(OpteeSmcReturn::ENotAvail)
         } else {
             Ok(self.params[index]
@@ -1330,7 +1339,7 @@ impl OpteeMsgArg {
         }
     }
     pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, OpteeSmcReturn> {
-        if index >= self.params.len() || index >= self.num_params as usize {
+        if index >= self.num_params as usize {
             Err(OpteeSmcReturn::ENotAvail)
         } else {
             Ok(self.params[index]
@@ -1339,7 +1348,7 @@ impl OpteeMsgArg {
         }
     }
     pub fn get_param_fmem(&self, index: usize) -> Result<OpteeMsgParamFmem, OpteeSmcReturn> {
-        if index >= self.params.len() || index >= self.num_params as usize {
+        if index >= self.num_params as usize {
             Err(OpteeSmcReturn::ENotAvail)
         } else {
             Ok(self.params[index]
@@ -1348,7 +1357,7 @@ impl OpteeMsgArg {
         }
     }
     pub fn get_param_value(&self, index: usize) -> Result<OpteeMsgParamValue, OpteeSmcReturn> {
-        if index >= self.params.len() || index >= self.num_params as usize {
+        if index >= self.num_params as usize {
             Err(OpteeSmcReturn::ENotAvail)
         } else {
             Ok(self.params[index]

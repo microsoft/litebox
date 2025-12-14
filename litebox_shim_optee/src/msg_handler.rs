@@ -38,10 +38,10 @@ const OPTEE_MSG_UID_3: u32 = 0xa5d5_c51b;
 
 // This is the UUID of OP-TEE Trusted OS
 // TODO: Consider replacing it with our own UUID
-const OPTEE_MSG_OS_OPTEE_UUID_0: u32 = 0x486178e0;
-const OPTEE_MSG_OS_OPTEE_UUID_1: u32 = 0xe7f811e3;
-const OPTEE_MSG_OS_OPTEE_UUID_2: u32 = 0xbc5e0002;
-const OPTEE_MSG_OS_OPTEE_UUID_3: u32 = 0xa5d5c51b;
+const OPTEE_MSG_OS_OPTEE_UUID_0: u32 = 0x4861_78e0;
+const OPTEE_MSG_OS_OPTEE_UUID_1: u32 = 0xe7f8_11e3;
+const OPTEE_MSG_OS_OPTEE_UUID_2: u32 = 0xbc5e_0002;
+const OPTEE_MSG_OS_OPTEE_UUID_3: u32 = 0xa5d5_c51b;
 
 // We do not support notification for now
 const MAX_NOTIF_VALUE: usize = 0;
@@ -127,6 +127,7 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_
 
 /// This function handles an OP-TEE message contained in `OpteeMsgArg`
 pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcReturn> {
+    msg_arg.validate()?;
     match msg_arg.cmd {
         OpteeMessageCommand::RegisterShm => {
             let tmem = msg_arg.get_param_tmem(0)?;
