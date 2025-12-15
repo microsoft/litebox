@@ -148,24 +148,6 @@ pub(super) enum SocketOptionValue {
     Timeout(Option<core::time::Duration>),
     U32(u32),
 }
-/// Helper function to write an option of type T to user memory.
-pub(super) fn write_to_user<T>(val: T, optval: MutPtr<u8>, len: u32) -> Result<usize, Errno> {
-    // If the provided buffer is too small, we just write as much as we can.
-    let length = core::mem::size_of::<T>().min(len as usize);
-    let data = unsafe { core::slice::from_raw_parts((&raw const val).cast::<u8>(), length) };
-    unsafe { optval.write_slice_at_offset(0, data) }.ok_or(Errno::EFAULT)?;
-    Ok(length)
-}
-/// Helper function to read an option of type T from user memory.
-pub(super) fn read_from_user<T: Clone>(optval: ConstPtr<u8>, optlen: usize) -> Result<T, Errno> {
-    if optlen < size_of::<T>() {
-        return Err(Errno::EINVAL);
-    }
-    let optval: ConstPtr<T> = ConstPtr::from_usize(optval.as_usize());
-    unsafe { optval.read_at_offset(0) }
-        .ok_or(Errno::EFAULT)
-        .map(alloc::borrow::Cow::into_owned)
-}
 
 /// Socket-related implementation. Currently these methods are on `GlobalState`
 /// so that they can access `net` and the litebox descriptor table. This might
@@ -236,7 +218,8 @@ impl GlobalState {
         match optname {
             SocketOptionName::Socket(sopt) => match sopt {
                 SocketOption::RCVTIMEO | SocketOption::SNDTIMEO => {
-                    let timeval = read_from_user::<litebox_common_linux::TimeVal>(optval, optlen)?;
+                    let timeval =
+                        super::read_from_user::<litebox_common_linux::TimeVal>(optval, optlen)?;
                     let duration = core::time::Duration::try_from(timeval)?;
                     let duration = if duration.is_zero() {
                         None
@@ -246,7 +229,8 @@ impl GlobalState {
                     set_option(sopt, SocketOptionValue::Timeout(duration))
                 }
                 SocketOption::LINGER => {
-                    let linger: litebox_common_linux::Linger = read_from_user(optval, optlen)?;
+                    let linger: litebox_common_linux::Linger =
+                        super::read_from_user(optval, optlen)?;
                     let timeout = if linger.onoff != 0 {
                         Some(core::time::Duration::from_secs(u64::from(linger.linger)))
                     } else {
@@ -255,7 +239,7 @@ impl GlobalState {
                     set_option(sopt, SocketOptionValue::Timeout(timeout))
                 }
                 SocketOption::REUSEADDR | SocketOption::BROADCAST | SocketOption::KEEPALIVE => {
-                    let val: u32 = read_from_user(optval, optlen)?;
+                    let val: u32 = super::read_from_user(optval, optlen)?;
                     set_option(sopt, SocketOptionValue::U32(val))
                 }
                 _ => Err(Errno::ENOPROTOOPT),
@@ -368,7 +352,7 @@ impl GlobalState {
                     return Err(Errno::EOPNOTSUPP);
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {
-                    let val: u32 = read_from_user(optval, size_of::<u32>())?;
+                    let val: u32 = super::read_from_user(optval, size_of::<u32>())?;
                     // Some applications use Nagle's Algorithm (via the TCP_NODELAY option) for a similar effect.
                     // However, TCP_CORK offers more fine-grained control, as it's designed for applications that
                     // send variable-length chunks of data that don't necessarily fit nicely into a full TCP segment.
@@ -385,7 +369,7 @@ impl GlobalState {
                 }
                 TcpOption::KEEPINTVL => {
                     const MAX_TCP_KEEPINTVL: u32 = 32767;
-                    let val: u32 = read_from_user(optval, size_of::<u32>())?;
+                    let val: u32 = super::read_from_user(optval, size_of::<u32>())?;
                     if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
                         return Err(Errno::EINVAL);
                     }
@@ -442,13 +426,13 @@ impl GlobalState {
                         litebox_common_linux::TimeVal::default,
                         litebox_common_linux::TimeVal::from,
                     );
-                    write_to_user(tv, optval, len)
+                    super::write_to_user(tv, optval, len)
                 }
                 SocketOption::REUSEADDR | SocketOption::KEEPALIVE | SocketOption::BROADCAST => {
                     let SocketOptionValue::U32(val) = get_option(sopt) else {
                         unreachable!()
                     };
-                    write_to_user(val, optval, len)
+                    super::write_to_user(val, optval, len)
                 }
                 _ => Err(Errno::ENOPROTOOPT),
             },
@@ -549,7 +533,7 @@ impl GlobalState {
                 }
             }
         };
-        write_to_user(val, optval, len)
+        super::write_to_user(val, optval, len)
     }
 
     fn register_observer(

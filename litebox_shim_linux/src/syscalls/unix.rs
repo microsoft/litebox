@@ -1406,7 +1406,7 @@ impl UnixSocket {
                                 gid: u32::MAX,
                             }),
                         })?;
-                        return super::net::write_to_user(ucred, optval, len);
+                        return super::write_to_user(ucred, optval, len);
                     }
                     UnixSocketInner::Datagram(_) => {
                         log_unsupported!("get PEERCRED for unix datagram socket");
@@ -1416,7 +1416,7 @@ impl UnixSocket {
             },
             SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
         };
-        super::net::write_to_user(val, optval, len)
+        super::write_to_user(val, optval, len)
     }
 
     super::common_functions_for_file_status!();
