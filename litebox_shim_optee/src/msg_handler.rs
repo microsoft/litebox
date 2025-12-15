@@ -130,10 +130,27 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeS
     match msg_arg.cmd {
         OpteeMessageCommand::RegisterShm => {
             let tmem = msg_arg.get_param_tmem(0)?;
-            shm_ref_map().register_shm(tmem.buf_ptr, tmem.size, tmem.shm_ref)?;
+            if tmem.buf_ptr == 0 || tmem.size == 0 || tmem.shm_ref == 0 {
+                return Err(OpteeSmcReturn::EBadAddr);
+            }
+            // `tmem.buf_ptr` embeds two different information:
+            // - The physical page address of the first `ShmRefPagesData`
+            // - The page offset of the first shared memory page (`pages_list[0]`)
+            let shm_ref_pages_data_phys_addr = page_align_down(tmem.buf_ptr);
+            let page_offset = tmem.buf_ptr - shm_ref_pages_data_phys_addr;
+            let aligned_size = page_align_up(page_offset + tmem.size);
+            shm_ref_map().register_shm(
+                shm_ref_pages_data_phys_addr,
+                page_offset,
+                aligned_size,
+                tmem.shm_ref,
+            )?;
         }
         OpteeMessageCommand::UnregisterShm => {
             let tmem = msg_arg.get_param_tmem(0)?;
+            if tmem.shm_ref == 0 {
+                return Err(OpteeSmcReturn::EBadAddr);
+            }
             shm_ref_map()
                 .remove(tmem.shm_ref)
                 .ok_or(OpteeSmcReturn::EBadAddr)?;
@@ -215,25 +232,21 @@ impl ShmRefMap {
     }
 
     /// This function registers shared memory information that the normal world (VTL0) provides.
-    /// Specifically, it walks through [`ShmRefPagesData`] structures referenced by `phys_addr`
-    /// to create a slice of the shared physical page addresses and registers the slice with
-    /// `shm_ref` as its identifier. `size` indicates the total size of this registered shared
-    /// memory region. Note that `phys_addr` may not be page aligned. In that case, its page-aligned
-    /// address points to the first [`ShmRefPagesData`] structure while its page offset indicates
+    /// Specifically, it walks through a linked list of [`ShmRefPagesData`] structures referenced by
+    /// `shm_ref_pages_data_phys_addr` to create a slice of the shared physical page addresses
+    /// and registers the slice with `shm_ref` as its identifier. `page_offset` indicates
     /// the page offset of the first page (i.e., `pages_list[0]` of the first [`ShmRefPagesData`]).
+    /// `aligned_size` indicates the page-aligned size of the shared memory region to register.
     pub fn register_shm(
         &self,
-        phys_addr: u64,
-        size: u64,
+        shm_ref_pages_data_phys_addr: u64,
+        page_offset: u64,
+        aligned_size: u64,
         shm_ref: u64,
     ) -> Result<(), OpteeSmcReturn> {
-        let aligned_phys_addr = page_align_down(phys_addr);
-        let page_offset = phys_addr - aligned_phys_addr;
-        let aligned_size = page_align_up(page_offset + size);
         let num_pages = usize::try_from(aligned_size).unwrap() / PAGE_SIZE;
         let mut pages = Vec::with_capacity(num_pages);
-
-        let mut cur_addr = usize::try_from(aligned_phys_addr).unwrap();
+        let mut cur_addr = usize::try_from(shm_ref_pages_data_phys_addr).unwrap();
         loop {
             let cur_ptr = NormalWorldConstPtr::<ShmRefPagesData>::from_usize(cur_addr);
             let pages_data = unsafe { cur_ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
@@ -260,7 +273,6 @@ impl ShmRefMap {
                 page_offset,
             },
         )?;
-
         Ok(())
     }
 }
