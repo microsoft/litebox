@@ -769,12 +769,18 @@ impl UnixStream {
 
     fn get_local_addr(&self) -> UnixSocketAddr {
         self.with_state_ref(|state| match state {
-            UnixStreamState::Init(init) => match &init.addr {
-                Some(addr) => UnixSocketAddr::from(addr),
-                None => UnixSocketAddr::Unnamed,
-            },
+            UnixStreamState::Init(init) => init
+                .addr
+                .as_ref()
+                .map_or(UnixSocketAddr::Unnamed, UnixSocketAddr::from),
             UnixStreamState::Listen(listen) => UnixSocketAddr::from(listen.get_local_addr()),
             UnixStreamState::Connected(connect) => connect.get_local_addr(),
+        })
+    }
+    fn get_peer_addr(&self) -> Option<UnixSocketAddr> {
+        self.with_state_ref(|state| match state {
+            UnixStreamState::Init(_) | UnixStreamState::Listen(_) => None,
+            UnixStreamState::Connected(connect) => Some(connect.get_peer_addr()),
         })
     }
 
@@ -902,7 +908,7 @@ struct UnixDatagramInner {
     recv_channel: Option<ReadEnd<DatagramMessage>>,
     /// The write end of the connected peer socket for sending messages.
     /// Set when the socket is connected via `connect` or `new_pair`.
-    connected_send_channel: Option<WriteEnd<DatagramMessage>>,
+    connected_send_channel: Option<(WriteEnd<DatagramMessage>, UnixSocketAddr)>,
     pollee: Arc<Pollee<crate::Platform>>,
 }
 /// Represents a Unix datagram socket.
@@ -979,7 +985,7 @@ impl UnixDatagram {
                 inner: RwLock::new(UnixDatagramInner {
                     addr: None,
                     recv_channel: Some(recv_channel),
-                    connected_send_channel: Some(send_channel_peer),
+                    connected_send_channel: Some((send_channel_peer, UnixSocketAddr::Unnamed)),
                     pollee: pollee1,
                 }),
             },
@@ -987,7 +993,7 @@ impl UnixDatagram {
                 inner: RwLock::new(UnixDatagramInner {
                     addr: None,
                     recv_channel: Some(recv_channel_peer),
-                    connected_send_channel: Some(send_channel),
+                    connected_send_channel: Some((send_channel, UnixSocketAddr::Unnamed)),
                     pollee: pollee2,
                 }),
             },
@@ -1024,7 +1030,7 @@ impl UnixDatagram {
     ///
     /// Subsequent sends without an address will use this peer.
     fn connect(&self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
-        self.inner.write().connected_send_channel = Some(self.lookup(task, addr)?);
+        self.inner.write().connected_send_channel = Some((self.lookup(task, addr.clone())?, addr));
         Ok(())
     }
 
@@ -1070,7 +1076,8 @@ impl UnixDatagram {
         let source = self.get_local_addr();
         let send_channel = if let Some(addr) = addr {
             self.lookup(task, addr)?
-        } else if let Some(connected_send_channel) = &self.inner.read().connected_send_channel {
+        } else if let Some((connected_send_channel, _)) = &self.inner.read().connected_send_channel
+        {
             connected_send_channel.clone()
         } else {
             return Err(Errno::ENOTCONN);
@@ -1088,11 +1095,20 @@ impl UnixDatagram {
     }
 
     fn get_local_addr(&self) -> UnixSocketAddr {
-        if let Some((addr, _)) = &self.inner.read().addr {
-            UnixSocketAddr::from(addr)
-        } else {
-            UnixSocketAddr::Unnamed
-        }
+        self.inner
+            .read()
+            .addr
+            .as_ref()
+            .map_or(UnixSocketAddr::Unnamed, |(addr, _)| {
+                UnixSocketAddr::from(addr)
+            })
+    }
+    fn get_peer_addr(&self) -> Option<UnixSocketAddr> {
+        self.inner
+            .read()
+            .connected_send_channel
+            .as_ref()
+            .map(|(_, addr)| addr.clone())
     }
 
     fn check_io_events(&self) -> Events {
@@ -1104,7 +1120,7 @@ impl UnixDatagram {
                 events |= Events::IN;
             }
         }
-        if let Some(connected_send_channel) = &self.inner.read().connected_send_channel {
+        if let Some((connected_send_channel, _)) = &self.inner.read().connected_send_channel {
             if !connected_send_channel.is_full() {
                 events |= Events::OUT;
             }
@@ -1259,6 +1275,12 @@ impl UnixSocket {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.get_local_addr(),
             UnixSocketInner::Datagram(datagram) => datagram.get_local_addr(),
+        }
+    }
+    pub(super) fn get_peer_addr(&self) -> Option<UnixSocketAddr> {
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.get_peer_addr(),
+            UnixSocketInner::Datagram(datagram) => datagram.get_peer_addr(),
         }
     }
 
