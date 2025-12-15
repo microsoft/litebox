@@ -1385,20 +1385,26 @@ impl UnixSocket {
                     UnixSocketInner::Datagram(_) => SockType::Datagram as u32,
                 },
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.truncate(),
-                SocketOption::PEERCRED => {
-                    let ucred = self.with_state_ref(|state| match state {
-                        UnixSocketState::ConnectedStream(_) | UnixSocketState::Datagram(_) => {
-                            log_unsupported!("get PEERCRED for unix socket");
-                            Err(Errno::EOPNOTSUPP)
-                        }
-                        _ => Ok(litebox_common_linux::Ucred {
-                            pid: 0,
-                            uid: u32::MAX,
-                            gid: u32::MAX,
-                        }),
-                    })?;
-                    return super::net::write_to_user(ucred, optval, len);
-                }
+                SocketOption::PEERCRED => match &self.inner {
+                    UnixSocketInner::Stream(stream) => {
+                        let ucred = stream.with_state_ref(|state| match state {
+                            UnixStreamState::Connected(_) => {
+                                log_unsupported!("get PEERCRED for unix socket");
+                                Err(Errno::EOPNOTSUPP)
+                            }
+                            _ => Ok(litebox_common_linux::Ucred {
+                                pid: 0,
+                                uid: u32::MAX,
+                                gid: u32::MAX,
+                            }),
+                        })?;
+                        return super::net::write_to_user(ucred, optval, len);
+                    }
+                    UnixSocketInner::Datagram(_) => {
+                        log_unsupported!("get PEERCRED for unix datagram socket");
+                        return Err(Errno::EOPNOTSUPP);
+                    }
+                },
             },
             SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
         };
