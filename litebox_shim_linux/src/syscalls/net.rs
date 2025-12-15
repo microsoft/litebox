@@ -207,12 +207,22 @@ impl GlobalState {
     }
 
     /// Common implementation for setsockopt for options that are stored in [`SocketOptions`]:
+    ///
+    /// This method handles the common logic of reading option values from user memory and
+    /// converting them to appropriate types, then delegates the actual storage to a callback.
+    /// It supports the following socket options:
     /// - RCVTIMEO
     /// - SNDTIMEO
     /// - LINGER
     /// - REUSEADDR
     /// - KEEPALIVE
     /// - BROADCAST
+    ///
+    /// # Parameters
+    /// - `optname`: The name of the socket option to set.
+    /// - `optval`: A pointer to the option value in user memory.
+    /// - `optlen`: The length of the option value.
+    /// - `set_option` - Callback invoked with the parsed option and value for storage.
     pub(super) fn setsockopt_common<F>(
         &self,
         optname: SocketOptionName,
@@ -395,12 +405,23 @@ impl GlobalState {
     }
 
     /// Common implementation for getsockopt for options that are stored in [`SocketOptions`]:
+    ///
+    /// This method handles the common logic of retrieving option values via a callback and
+    /// writing them to user memory in the appropriate format. It supports the following socket
+    /// options:
     /// - RCVTIMEO
     /// - SNDTIMEO
     /// - LINGER
     /// - REUSEADDR
     /// - KEEPALIVE
     /// - BROADCAST
+    ///
+    /// # Parameters
+    ///
+    /// * `optname` - The socket option name to retrieve
+    /// * `optval` - Pointer to user memory where the option value will be written
+    /// * `len` - Maximum length to write in bytes
+    /// * `get_option` - Callback invoked to retrieve the current option value
     pub(super) fn getsockopt_common<F>(
         &self,
         optname: SocketOptionName,
