@@ -18,6 +18,7 @@ ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
 buddy_system_allocator = { version = "0.11.0", default-features = false, features = ["use_spin"] }
 # Depend on (currently unreleased) slabmalloc `main`, which contains some fixes on top of `0.11.0`
 slabmalloc = { git = "https://github.com/gz/rust-slabmalloc.git", rev = "19480b2e82704210abafe575fb9699184c1be110" }
+tracing = { version = "0.1.43", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60.2", features = [

@@ -61,10 +61,14 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         #[cfg(feature = "lock_tracing")]
         crate::sync::lock_tracing::LockTracker::init(platform);
 
+        let descriptors = RwLock::new(Descriptors::new_from_litebox_creation());
+
+        tracing::debug!("LiteBox instance initialized");
+
         Self {
             x: Arc::new(LiteBoxX {
                 platform,
-                descriptors: RwLock::new(Descriptors::new_from_litebox_creation()),
+                descriptors,
             }),
         }
     }
