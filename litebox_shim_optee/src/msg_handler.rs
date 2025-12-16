@@ -23,7 +23,7 @@ use litebox::platform::vmap::PhysPageAddr;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArg, OpteeMsgAttrType, OpteeMsgParamRmem, OpteeMsgParamTmem,
     OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturn,
-    UteeEntryFunc, UteeParamOwned,
+    TeeUuid, UteeEntryFunc, UteeParamOwned,
 };
 use once_cell::race::OnceBox;
 
@@ -214,17 +214,25 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), OpteeSmcReturn>
 
 /// This function handles a TA request contained in `OpteeMsgArg`
 /// # Panics
-/// Panics if any conversion from `u32` to `usize` fails.
+/// Panics if any conversion from `u64` to `usize` fails. OP-TEE shim doesn't support a 32-bit environment.
 pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcReturn> {
     let ta_entry_func: UteeEntryFunc = msg_arg.cmd.try_into()?;
-    let skip: usize = if ta_entry_func == UteeEntryFunc::OpenSession {
-        // TODO: load a TA using its UUID
-        2
+    let (ta_uuid, skip): (Option<TeeUuid>, usize) = if ta_entry_func == UteeEntryFunc::OpenSession {
+        // If it is an OpenSession request, extract the TA UUID from the first two parameters
+        let mut data = [0u32; 4];
+        data[0] = (msg_arg.get_param_value(0)?.a).truncate();
+        data[1] = (msg_arg.get_param_value(0)?.b).truncate();
+        data[2] = (msg_arg.get_param_value(1)?.a).truncate();
+        data[3] = (msg_arg.get_param_value(1)?.b).truncate();
+        (Some(TeeUuid::new_from_u32s(data)), 2)
     } else {
-        0
+        (None, 0)
     };
+
+    let ta_cmd_id = msg_arg.func;
+
     let mut ta_params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
-    let num_params: usize = msg_arg.num_params.try_into().unwrap();
+    let num_params = msg_arg.num_params as usize;
     for (i, param) in msg_arg
         .params
         .iter()
@@ -234,6 +242,7 @@ pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcR
     {
         ta_params[i] = match param.attr_type() {
             OpteeMsgAttrType::None => UteeParamOwned::None,
+            // TODO: drop `out_address`. We'll revise the call-by-value handling.
             OpteeMsgAttrType::ValueInput => {
                 let value = param.get_param_value().ok_or(OpteeSmcReturn::EBadCmd)?;
                 UteeParamOwned::ValueInput {
@@ -336,11 +345,10 @@ pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcR
                     UteeParamOwned::None
                 }
             }
-            _ => todo!(),
+            _ => return Err(OpteeSmcReturn::EBadCmd),
         };
     }
 
-    // let ta_cmd_id = msg_arg.func;
     Ok(*msg_arg)
 }
 

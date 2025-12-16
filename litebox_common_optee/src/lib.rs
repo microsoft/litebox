@@ -522,6 +522,22 @@ pub struct TeeUuid {
     pub time_hi_and_version: u16,
     pub clock_seq_and_node: [u8; 8],
 }
+impl TeeUuid {
+    pub fn new_from_u32s(data: [u32; 4]) -> Self {
+        let time_low = data[0];
+        let time_mid = (data[1] >> 16) as u16;
+        let time_hi_and_version = (data[1] & 0xffff) as u16;
+        let mut clock_seq_and_node = [0u8; 8];
+        clock_seq_and_node[0..4].copy_from_slice(&data[2].to_be_bytes());
+        clock_seq_and_node[4..8].copy_from_slice(&data[3].to_be_bytes());
+        TeeUuid {
+            time_low,
+            time_mid,
+            time_hi_and_version,
+            clock_seq_and_node,
+        }
+    }
+}
 
 /// `TEE_Identity` from `optee_os/lib/libutee/include/tee_api_types.h`.
 #[derive(Clone, Copy, PartialEq)]
