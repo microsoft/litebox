@@ -74,6 +74,20 @@ pub enum InterceptionBackend {
 static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+fn mmapped_file_data(path: impl AsRef<Path>) -> Result<&'static [u8]> {
+    let path = path.as_ref();
+    let file = std::fs::File::open(path)?;
+    // SAFETY: We assume that the file given to us is not going to change _externally_ while in
+    // the middle of execution. Since we are mapping it as read-only and mapping it only once,
+    // we are not planning to change it either. With both these in mind, this call is safe.
+    //
+    // We need to leak the `Mmap` object, so that it stays alive until the end of the program,
+    // rather than being unmapped at function finish (i.e., to get the `'static` lifetime).
+    Ok(Box::leak(Box::new(unsafe { Mmap::map(&file) }.map_err(
+        |e| anyhow!("Could not read tar file at {}: {}", path.display(), e),
+    )?)))
+}
+
 /// Run Linux programs with LiteBox on unmodified Linux
 ///
 /// # Panics
@@ -88,7 +102,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     }
 
-    let (ancestor_modes_and_users, prog_data): (Vec<(litebox::fs::Mode, u32)>, Vec<u8>) = {
+    let (ancestor_modes_and_users, prog_data): (
+        Vec<(litebox::fs::Mode, u32)>,
+        alloc::borrow::Cow<'static, [u8]>,
+    ) = {
         let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
         let ancestors: Vec<_> = prog.ancestors().collect();
         let modes: Vec<_> = ancestors
@@ -103,11 +120,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 )
             })
             .collect();
-        let data = std::fs::read(prog).unwrap();
+        let data = mmapped_file_data(prog)?;
         let data = if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
+            litebox_syscall_rewriter::hook_syscalls_in_elf(data, None)
+                .unwrap()
+                .into()
         } else {
-            data
+            data.into()
         };
         (modes, data)
     };
@@ -115,18 +134,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
             anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
         }
-        let file = std::fs::File::open(tar_file)?;
-        // SAFETY: We assume that the tar file given to us is not going to change _externally_
-        // while in the middle of execution. Since we are mapping it as read-only and mapping it
-        // only once, we are not going to change it either. With both these in mind, this call
-        // is safe.
-        //
-        // We need to leak the `Mmap` object, so that it stays alive until the end of the
-        // program, rather than being unmapped at function finish (i.e., to get the `'static`
-        // lifetime).
-        Box::leak(Box::new(unsafe { Mmap::map(&file) }.map_err(|e| {
-            anyhow!("Could not read tar file at {}: {}", tar_file.display(), e)
-        })?))
+        mmapped_file_data(tar_file)?
     } else {
         litebox::fs::tar_ro::EMPTY_TAR_FILE
     };
