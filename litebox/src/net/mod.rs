@@ -521,10 +521,14 @@ pub enum PlatformInteraction {
     Manual,
 }
 
+/// Direction of polling for platform interaction
 #[derive(Clone, Copy)]
-enum PollDirection {
+pub enum PollDirection {
+    /// Ingress (receiving) direction
     Ingress,
+    /// Egress (sending) direction
     Egress,
+    /// Both directions
     Both,
 }
 impl PollDirection {
@@ -589,12 +593,15 @@ where
     ///
     /// This function panics if run without first using [`Self::set_platform_interaction`] to set
     /// interactions to manual.
-    pub fn perform_platform_interaction(&mut self) -> PlatformInteractionReinvocationAdvice {
+    pub fn perform_platform_interaction(
+        &mut self,
+        direction: PollDirection,
+    ) -> PlatformInteractionReinvocationAdvice {
         assert!(
             matches!(self.platform_interaction, PlatformInteraction::Manual),
             "Requires manual-mode interactions"
         );
-        self.internal_perform_platform_interaction(PollDirection::Both)
+        self.internal_perform_platform_interaction(direction)
     }
 
     /// Return a _soft timeout_ (duration to wait) before calling [`Self::perform_platform_interaction`] again.

@@ -1769,7 +1769,7 @@ mod tests {
                 while global
                     .net
                     .lock()
-                    .perform_platform_interaction()
+                    .perform_platform_interaction(litebox::net::PollDirection::Both)
                     .call_again_immediately()
                 {}
                 core::hint::spin_loop();

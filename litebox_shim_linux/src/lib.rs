@@ -278,18 +278,18 @@ impl LinuxShim {
     /// This function should be invoked in a loop, based on the returned advice.
     pub fn perform_network_interaction(&self) -> NetworkInteractionAdvice {
         let mut net = self.0.net.lock();
-        match net.perform_platform_interaction() {
-            litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {
-                NetworkInteractionAdvice::CallAgainImmediately
-            }
-            litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction => {
-                match net.poll_at() {
-                    Some(timeout) if timeout.is_zero() => NetworkInteractionAdvice::CallAgainImmediately,
-                    t => {
-                        NetworkInteractionAdvice::WaitUntil(t)
-                    }
-                }
-            }
+        // consuming all ingress packets first to avoid unnecessary egress processing
+        while net
+            .perform_platform_interaction(litebox::net::PollDirection::Ingress)
+            .call_again_immediately()
+        {}
+        while net
+            .perform_platform_interaction(litebox::net::PollDirection::Egress)
+            .call_again_immediately()
+        {}
+        match net.poll_at() {
+            Some(timeout) if timeout.is_zero() => NetworkInteractionAdvice::CallAgainImmediately,
+            t => NetworkInteractionAdvice::WaitUntil(t),
         }
     }
 }

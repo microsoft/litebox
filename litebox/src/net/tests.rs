@@ -92,7 +92,10 @@ fn test_bidirectional_tcp_communication_manual() {
     let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Manual);
     bidi_tcp_comms(network, |nw| {
-        while nw.perform_platform_interaction().call_again_immediately() {}
+        while nw
+            .perform_platform_interaction(crate::net::PollDirection::Both)
+            .call_again_immediately()
+        {}
     });
 }
 
