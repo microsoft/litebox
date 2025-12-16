@@ -22,8 +22,9 @@ use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::vmap::PhysPageAddr;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArg, OpteeMsgAttrType, OpteeMsgParamRmem, OpteeMsgParamTmem,
-    OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturn,
-    TeeUuid, UteeEntryFunc, UteeParamOwned,
+    OpteeMsgParamValue, OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction,
+    OpteeSmcResult, OpteeSmcReturn, TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned,
+    UteeParams,
 };
 use once_cell::race::OnceBox;
 
@@ -75,7 +76,7 @@ pub struct OpteeSmcHandled<'a> {
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
 /// It returns an `OpteeSmcResult` representing the result of the SMC call and
 /// an optional `OpteeMsgArg` if the SMC call involves with an OP-TEE messagewhich should be handled by
-/// `handle_optee_msg_arg` or `handle_ta_request`.
+/// `handle_optee_msg_arg` or `decode_ta_request`.
 ///
 /// # Panics
 ///
@@ -171,7 +172,7 @@ pub fn handle_optee_smc_args(
 /// Currently, it only handles shared memory registration and unregistration.
 /// If an OP-TEE message involves with a TA request, it simply returns
 /// `Err(OpteeSmcReturn::Ok)` while expecting that the caller will handle
-/// the message with `handle_ta_request`.
+/// the message with `decode_ta_request`.
 pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), OpteeSmcReturn> {
     msg_arg.validate()?;
     match msg_arg.cmd {
@@ -212,10 +213,27 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), OpteeSmcReturn>
     Ok(())
 }
 
-/// This function handles a TA request contained in `OpteeMsgArg`
+/// TA request information extracted from an OP-TEE message.
+/// In addition to standard TA information (i.e., TA UUID, session ID, command ID,
+/// and parameters), it contains shared memory addresses (`out_phys_addrs`) to
+/// write back output data to the normal world once the TA execution is done.
+pub struct TaRequestInfo {
+    pub uuid: Option<TeeUuid>,
+    pub session: u32,
+    pub entry_func: UteeEntryFunc,
+    pub cmd_id: u32,
+    pub params: [UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
+    pub out_phys_addrs: [Option<Box<[usize]>>; UteeParamOwned::TEE_NUM_PARAMS],
+}
+
+/// This function decodes a TA request contained in `OpteeMsgArg`.
+/// Currently, this function copies the entire parameter data from the normal world
+/// shared memory into LiteBox's memory to create `UteeParamOwned` structures.
+/// Clearly, this approach is infficient and we need to revise it to avoid unnecessary
+/// data copies (while maintaining the security).
 /// # Panics
 /// Panics if any conversion from `u64` to `usize` fails. OP-TEE shim doesn't support a 32-bit environment.
-pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcReturn> {
+pub fn decode_ta_request(msg_arg: &OpteeMsgArg) -> Result<TaRequestInfo, OpteeSmcReturn> {
     let ta_entry_func: UteeEntryFunc = msg_arg.cmd.try_into()?;
     let (ta_uuid, skip): (Option<TeeUuid>, usize) = if ta_entry_func == UteeEntryFunc::OpenSession {
         // If it is an OpenSession request, extract the TA UUID from the first two parameters
@@ -229,9 +247,15 @@ pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcR
         (None, 0)
     };
 
-    let ta_cmd_id = msg_arg.func;
+    let mut ta_req_info = TaRequestInfo {
+        uuid: ta_uuid,
+        session: msg_arg.session,
+        entry_func: ta_entry_func,
+        cmd_id: msg_arg.func,
+        params: [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS],
+        out_phys_addrs: [const { None }; UteeParamOwned::TEE_NUM_PARAMS],
+    };
 
-    let mut ta_params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
     let num_params = msg_arg.num_params as usize;
     for (i, param) in msg_arg
         .params
@@ -240,9 +264,9 @@ pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcR
         .skip(skip)
         .enumerate()
     {
-        ta_params[i] = match param.attr_type() {
+        ta_req_info.params[i] = match param.attr_type() {
             OpteeMsgAttrType::None => UteeParamOwned::None,
-            // TODO: drop `out_address`. We'll revise the call-by-value handling.
+            // TODO: drop `out_address(es)`. We have revised the way to return back output data.
             OpteeMsgAttrType::ValueInput => {
                 let value = param.get_param_value().ok_or(OpteeSmcReturn::EBadCmd)?;
                 UteeParamOwned::ValueInput {
@@ -306,9 +330,10 @@ pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcR
                         _ => unreachable!(),
                     }
                 } {
+                    ta_req_info.out_phys_addrs[i] = Some(phys_addrs);
                     UteeParamOwned::MemrefOutput {
                         buffer_size,
-                        out_addresses: Some(phys_addrs),
+                        out_addresses: None,
                     }
                 } else {
                     UteeParamOwned::None
@@ -336,10 +361,11 @@ pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcR
                 } {
                     let mut buffer = alloc::vec![0u8; buffer_size];
                     read_data_from_shm_phys_addrs(&phys_addrs, &mut buffer)?;
+                    ta_req_info.out_phys_addrs[i] = Some(phys_addrs);
                     UteeParamOwned::MemrefInout {
                         data: buffer.into(),
                         buffer_size,
-                        out_addresses: Some(phys_addrs),
+                        out_addresses: None,
                     }
                 } else {
                     UteeParamOwned::None
@@ -349,7 +375,60 @@ pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcR
         };
     }
 
-    Ok(*msg_arg)
+    Ok(ta_req_info)
+}
+
+/// Thus function prepares for returning from OP-TEE secure world to the normal world.
+/// In particular, it writes back TA execution outputs associated with shared memory references and
+/// updates the `OpteeMsgArg` structure to return value-based outputs.
+/// `ta_params` is a reference to `UteeParams` structure that stores TA's output within its memory.
+/// `ta_req_info` refers to the decoded TA request information including the normal world
+/// shared memory addresses to write back output data.
+pub fn prepare_for_return_to_normal_world(
+    ta_params: &UteeParams,
+    ta_req_info: &TaRequestInfo,
+    msg_arg: &mut OpteeMsgArg,
+) -> Result<(), OpteeSmcReturn> {
+    for index in 0..UteeParams::TEE_NUM_PARAMS {
+        let param_type = ta_params
+            .get_type(index)
+            .map_err(|_| OpteeSmcReturn::EBadAddr)?;
+        match param_type {
+            TeeParamType::ValueOutput | TeeParamType::ValueInout => {
+                if let Ok(Some((value_a, value_b))) = ta_params.get_values(index) {
+                    msg_arg.set_param_value(
+                        index,
+                        OpteeMsgParamValue {
+                            a: value_a,
+                            b: value_b,
+                            c: 0,
+                        },
+                    )?;
+                }
+            }
+            TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
+                if let Ok(Some((addr, len))) = ta_params.get_values(index) {
+                    // SAFETY
+                    // `addr` is expected to be a valid address of a TA and `addr + len` does not
+                    // exceed the TA's memory region.
+                    let slice = unsafe {
+                        &*core::ptr::slice_from_raw_parts(
+                            addr as *const u8,
+                            usize::try_from(len).unwrap_or(0),
+                        )
+                    };
+                    if slice.is_empty() {
+                        continue;
+                    }
+                    if let Some(out_addrs) = &ta_req_info.out_phys_addrs[index] {
+                        write_data_to_shm_phys_addrs(out_addrs, slice)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// A scatter-gather list of OP-TEE physical page addresses in the normal world (VTL0) to
@@ -553,6 +632,41 @@ fn read_data_from_shm_phys_addrs(
         let to_copy = core::cmp::min(PAGE_SIZE, buffer.len() - copied);
         buffer[copied..copied + to_copy].copy_from_slice(&page[..to_copy]);
         copied += to_copy;
+    }
+    Ok(())
+}
+
+/// Write data in `buffer` to the normal world shared memory pages whose physical addresses
+/// are given in `phys_addrs`. The size of `buffer` indicates how many bytes to write.
+/// Currently, this function writes data page by page (i.e., it does not map multiple physical
+/// pages at once). All physical addresses in `phys_addrs` are page-aligned except the first one.
+fn write_data_to_shm_phys_addrs(phys_addrs: &[usize], buffer: &[u8]) -> Result<(), OpteeSmcReturn> {
+    let ptr = NormalWorldMutPtr::<[u8; PAGE_SIZE]>::from_usize(page_align_down(phys_addrs[0]));
+    let mut page = unsafe { ptr.read_at_offset(0) }
+        .ok_or(OpteeSmcReturn::EBadAddr)?
+        .into_owned();
+    let page_offset = phys_addrs[0] - page_align_down(phys_addrs[0]);
+    let to_copy = core::cmp::min(PAGE_SIZE - page_offset, buffer.len());
+    page[page_offset..page_offset + to_copy].copy_from_slice(&buffer[..to_copy]);
+    unsafe {
+        ptr.write_at_offset(0, page)
+            .ok_or(OpteeSmcReturn::EBadAddr)?;
+    }
+    let mut written = to_copy;
+
+    for phys_addr in phys_addrs.iter().skip(1) {
+        if written >= buffer.len() {
+            break;
+        }
+        let ptr = NormalWorldMutPtr::<[u8; PAGE_SIZE]>::from_usize(*phys_addr);
+        let mut page = [0u8; PAGE_SIZE];
+        let to_copy = core::cmp::min(PAGE_SIZE, buffer.len() - written);
+        page[..to_copy].copy_from_slice(&buffer[written..written + to_copy]);
+        unsafe {
+            ptr.write_at_offset(0, page)
+                .ok_or(OpteeSmcReturn::EBadAddr)?;
+        }
+        written += to_copy;
     }
     Ok(())
 }

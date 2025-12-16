@@ -1381,6 +1381,18 @@ impl OpteeMsgArg {
                 .ok_or(OpteeSmcReturn::EBadCmd)?)
         }
     }
+    pub fn set_param_value(
+        &mut self,
+        index: usize,
+        value: OpteeMsgParamValue,
+    ) -> Result<(), OpteeSmcReturn> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturn::ENotAvail)
+        } else {
+            self.params[index].u.value = value;
+            Ok(())
+        }
+    }
 }
 
 /// A memory page to exchange OP-TEE SMC call arguments.
