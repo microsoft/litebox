@@ -441,35 +441,15 @@ impl UteeParams {
 /// Each parameter for TA invocation with copied content/buffer for safer operations.
 /// This is our representation of `utee_params` and not for directly
 /// interacting with OP-TEE TAs and clients (which expect pointers/references).
-/// `out_address(es)`: VTL0 physical address(es) to write output data to. They are virtually
-/// contiguous but may not be physically contiguous.
 #[derive(Clone)]
 pub enum UteeParamOwned {
     None,
-    ValueInput {
-        value_a: u64,
-        value_b: u64,
-    },
-    ValueOutput {
-        out_address: Option<usize>,
-    },
-    ValueInout {
-        value_a: u64,
-        value_b: u64,
-        out_address: Option<usize>,
-    },
-    MemrefInput {
-        data: Box<[u8]>,
-    },
-    MemrefOutput {
-        buffer_size: usize,
-        out_addresses: Option<Box<[usize]>>,
-    },
-    MemrefInout {
-        data: Box<[u8]>,
-        buffer_size: usize,
-        out_addresses: Option<Box<[usize]>>,
-    },
+    ValueInput { value_a: u64, value_b: u64 },
+    ValueOutput {},
+    ValueInout { value_a: u64, value_b: u64 },
+    MemrefInput { data: Box<[u8]> },
+    MemrefOutput { buffer_size: usize },
+    MemrefInout { data: Box<[u8]>, buffer_size: usize },
 }
 
 impl UteeParamOwned {

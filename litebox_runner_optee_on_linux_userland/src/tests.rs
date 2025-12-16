@@ -259,20 +259,16 @@ impl TaCommandParamsBase64 {
                 value_a: *value_a,
                 value_b: *value_b,
             },
-            TaCommandParamsBase64::ValueOutput {} => {
-                UteeParamOwned::ValueOutput { out_address: None }
-            }
+            TaCommandParamsBase64::ValueOutput {} => UteeParamOwned::ValueOutput {},
             TaCommandParamsBase64::ValueInout { value_a, value_b } => UteeParamOwned::ValueInout {
                 value_a: *value_a,
                 value_b: *value_b,
-                out_address: None,
             },
             TaCommandParamsBase64::MemrefInput { data_base64 } => UteeParamOwned::MemrefInput {
                 data: Self::decode_base64(data_base64).into_boxed_slice(),
             },
             TaCommandParamsBase64::MemrefOutput { buffer_size } => UteeParamOwned::MemrefOutput {
                 buffer_size: usize::try_from(*buffer_size).unwrap(),
-                out_addresses: None,
             },
             TaCommandParamsBase64::MemrefInout {
                 data_base64,
@@ -287,7 +283,6 @@ impl TaCommandParamsBase64 {
                 UteeParamOwned::MemrefInout {
                     data: decoded_data.into_boxed_slice(),
                     buffer_size,
-                    out_addresses: None,
                 }
             }
         }

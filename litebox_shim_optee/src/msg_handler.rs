@@ -75,7 +75,7 @@ pub struct OpteeSmcHandled<'a> {
 
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
 /// It returns an `OpteeSmcResult` representing the result of the SMC call and
-/// an optional `OpteeMsgArg` if the SMC call involves with an OP-TEE messagewhich should be handled by
+/// an optional `OpteeMsgArg` if the SMC call involves with an OP-TEE message which should be handled by
 /// `handle_optee_msg_arg` or `decode_ta_request`.
 ///
 /// # Panics
@@ -229,7 +229,7 @@ pub struct TaRequestInfo {
 /// This function decodes a TA request contained in `OpteeMsgArg`.
 /// Currently, this function copies the entire parameter data from the normal world
 /// shared memory into LiteBox's memory to create `UteeParamOwned` structures.
-/// Clearly, this approach is infficient and we need to revise it to avoid unnecessary
+/// Clearly, this approach is inefficient and we need to revise it to avoid unnecessary
 /// data copies (while maintaining the security).
 /// # Panics
 /// Panics if any conversion from `u64` to `usize` fails. OP-TEE shim doesn't support a 32-bit environment.
@@ -266,7 +266,6 @@ pub fn decode_ta_request(msg_arg: &OpteeMsgArg) -> Result<TaRequestInfo, OpteeSm
     {
         ta_req_info.params[i] = match param.attr_type() {
             OpteeMsgAttrType::None => UteeParamOwned::None,
-            // TODO: drop `out_address(es)`. We have revised the way to return back output data.
             OpteeMsgAttrType::ValueInput => {
                 let value = param.get_param_value().ok_or(OpteeSmcReturn::EBadCmd)?;
                 UteeParamOwned::ValueInput {
@@ -274,13 +273,12 @@ pub fn decode_ta_request(msg_arg: &OpteeMsgArg) -> Result<TaRequestInfo, OpteeSm
                     value_b: value.b,
                 }
             }
-            OpteeMsgAttrType::ValueOutput => UteeParamOwned::ValueOutput { out_address: None },
+            OpteeMsgAttrType::ValueOutput => UteeParamOwned::ValueOutput {},
             OpteeMsgAttrType::ValueInout => {
                 let value = param.get_param_value().ok_or(OpteeSmcReturn::EBadCmd)?;
                 UteeParamOwned::ValueInout {
                     value_a: value.a,
                     value_b: value.b,
-                    out_address: None,
                 }
             }
             OpteeMsgAttrType::TmemInput | OpteeMsgAttrType::RmemInput => {
@@ -331,10 +329,7 @@ pub fn decode_ta_request(msg_arg: &OpteeMsgArg) -> Result<TaRequestInfo, OpteeSm
                     }
                 } {
                     ta_req_info.out_phys_addrs[i] = Some(phys_addrs);
-                    UteeParamOwned::MemrefOutput {
-                        buffer_size,
-                        out_addresses: None,
-                    }
+                    UteeParamOwned::MemrefOutput { buffer_size }
                 } else {
                     UteeParamOwned::None
                 }
@@ -365,7 +360,6 @@ pub fn decode_ta_request(msg_arg: &OpteeMsgArg) -> Result<TaRequestInfo, OpteeSm
                     UteeParamOwned::MemrefInout {
                         data: buffer.into(),
                         buffer_size,
-                        out_addresses: None,
                     }
                 } else {
                     UteeParamOwned::None
@@ -378,7 +372,7 @@ pub fn decode_ta_request(msg_arg: &OpteeMsgArg) -> Result<TaRequestInfo, OpteeSm
     Ok(ta_req_info)
 }
 
-/// Thus function prepares for returning from OP-TEE secure world to the normal world.
+/// This function prepares for returning from OP-TEE secure world to the normal world.
 /// In particular, it writes back TA execution outputs associated with shared memory references and
 /// updates the `OpteeMsgArg` structure to return value-based outputs.
 /// `ta_params` is a reference to `UteeParams` structure that stores TA's output within its memory.
