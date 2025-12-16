@@ -181,11 +181,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         mode,
                     )
                     .unwrap();
-                let mut data = prog_data.as_slice();
-                while !data.is_empty() {
-                    let len = fs.write(&fd, data, None).unwrap();
-                    data = &data[len..];
-                }
+                fs.initialize_primarily_read_heavy_file(&fd, prog_data.into());
                 fs.close(&fd).unwrap();
             };
         let last = ancestor_modes_and_users.last().unwrap();
@@ -230,15 +226,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                             rwxr_xr_x,
                         )
                         .expect("Failed to create /lib/litebox_rtld_audit.so");
-                    let mut data =
-                        include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so"))
-                            .as_slice();
-                    while !data.is_empty() {
-                        let len = fs
-                            .write(&fd, data, None)
-                            .expect("Failed to write to /lib/litebox_rtld_audit.so");
-                        data = &data[len..];
-                    }
+                    fs.initialize_primarily_read_heavy_file(
+                        &fd,
+                        include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).into(),
+                    );
                     fs.close(&fd)
                         .expect("Failed to close /lib/litebox_rtld_audit.so");
                 });
