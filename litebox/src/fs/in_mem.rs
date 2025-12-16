@@ -184,7 +184,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         mode,
                         userinfo: self.current_user,
                     },
-                    data: Vec::new(),
+                    data: Vec::new().into(),
                     unique_id: self.fresh_id(),
                 })));
                 let old = root.entries.insert(path, entry.clone());
@@ -317,16 +317,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             let end = end_position.min(file.data.len());
             debug_assert!(start <= end);
             let first_half_len = end - start;
-            file.data[start..end].copy_from_slice(&buf[..first_half_len]);
+            file.data.to_mut()[start..end].copy_from_slice(&buf[..first_half_len]);
             first_half_len
         } else {
             if *position > file.data.len() {
                 // Need to pad with 0s because position was past the end of the file
-                file.data.resize(*position, 0);
+                file.data.to_mut().resize(*position, 0);
             }
             0
         };
-        file.data.extend(&buf[start..]);
+        file.data.to_mut().extend(&buf[start..]);
         *position = end_position;
         Ok(buf.len())
     }
@@ -391,9 +391,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
         let mut file_data = file.write();
         match length.cmp(&file_data.data.len()) {
-            core::cmp::Ordering::Less => file_data.data.truncate(length),
-            core::cmp::Ordering::Equal => file_data.data.resize(length, 0),
-            core::cmp::Ordering::Greater => (),
+            core::cmp::Ordering::Less => match &mut file_data.data {
+                alloc::borrow::Cow::Borrowed(d) => {
+                    *d = &d[..length];
+                }
+                alloc::borrow::Cow::Owned(d) => d.truncate(length),
+            },
+            core::cmp::Ordering::Equal => (),
+            core::cmp::Ordering::Greater => file_data.data.to_mut().resize(length, 0),
         }
         if reset_offset {
             *position = 0;
@@ -830,7 +835,7 @@ type File<Platform> = Arc<sync::RwLock<Platform, FileX>>;
 
 pub(crate) struct FileX {
     perms: Permissions,
-    data: Vec<u8>,
+    data: alloc::borrow::Cow<'static, [u8]>,
     unique_id: usize,
 }
 
