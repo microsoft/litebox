@@ -79,6 +79,45 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         }
     }
 
+    /// Initialize a primarily read-heavy file with static data.
+    ///
+    /// While this function could technically work with write-heavy files, it has performance
+    /// benefits _particularly_ for files that are read-only, compared to doing open+write
+    /// operations.
+    ///
+    /// The file is initialized with clone-on-write semantics for the data, meaning that the first
+    /// time a write occurs on the file, it suffers the penalty of the entire data being cloned into
+    /// memory, which is why this is intended primarily for read-only files (such as executables).
+    ///
+    /// # Panics
+    ///
+    /// Panics if used on
+    /// - a closed FD
+    /// - a non-file FD
+    /// - a file that already contains data
+    pub fn initialize_primarily_read_heavy_file(
+        &mut self,
+        fd: &FileFd<Platform>,
+        data: alloc::borrow::Cow<'static, [u8]>,
+    ) {
+        let descriptor_table = self.litebox.descriptor_table();
+        let Descriptor::File {
+            file,
+            read_allowed: _,
+            write_allowed: _,
+            position: _,
+        } = &mut descriptor_table.get_entry_mut(fd).unwrap().entry
+        else {
+            panic!("must only be used on files, not directories")
+        };
+        let mut file = file.write();
+        assert!(
+            file.data.is_empty(),
+            "must only be used on empty files during initialization"
+        );
+        file.data = data;
+    }
+
     /// Execute `f` as a specific user (for testing purposes).
     #[cfg(test)]
     pub fn with_user<F>(&mut self, user: u16, group: u16, f: F)
