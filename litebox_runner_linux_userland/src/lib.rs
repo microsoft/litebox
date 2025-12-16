@@ -189,7 +189,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         mode,
                     )
                     .unwrap();
-                fs.initialize_primarily_read_heavy_file(&fd, prog_data.into());
+                fs.initialize_primarily_read_heavy_file(&fd, prog_data);
                 fs.close(&fd).unwrap();
             };
         let last = ancestor_modes_and_users.last().unwrap();
