@@ -52,12 +52,17 @@ const MAX_NOTIF_VALUE: usize = 0;
 const NUM_RPC_PARMS: usize = 4;
 
 #[inline]
-fn page_align_down(address: u64) -> u64 {
+fn page_align_down_u64(address: u64) -> u64 {
     address & !(PAGE_SIZE as u64 - 1)
 }
 
 #[inline]
-fn page_align_up(len: u64) -> u64 {
+fn page_align_down(address: usize) -> usize {
+    address & !(PAGE_SIZE - 1)
+}
+
+#[inline]
+fn page_align_up_u64(len: u64) -> u64 {
     len.next_multiple_of(PAGE_SIZE as u64)
 }
 
@@ -178,9 +183,9 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), OpteeSmcReturn>
             // `tmem.buf_ptr` encodes two different information:
             // - The physical page address of the first `ShmRefPagesData`
             // - The page offset of the first shared memory page (`pages_list[0]`)
-            let shm_ref_pages_data_phys_addr = page_align_down(tmem.buf_ptr);
+            let shm_ref_pages_data_phys_addr = page_align_down_u64(tmem.buf_ptr);
             let page_offset = tmem.buf_ptr - shm_ref_pages_data_phys_addr;
-            let aligned_size = page_align_up(page_offset + tmem.size);
+            let aligned_size = page_align_up_u64(page_offset + tmem.size);
             shm_ref_map().register_shm(
                 shm_ref_pages_data_phys_addr,
                 page_offset,
@@ -208,6 +213,8 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), OpteeSmcReturn>
 }
 
 /// This function handles a TA request contained in `OpteeMsgArg`
+/// # Panics
+/// Panics if any conversion from `u32` to `usize` fails.
 pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcReturn> {
     let ta_entry_func: UteeEntryFunc = msg_arg.cmd.try_into()?;
     let skip: usize = if ta_entry_func == UteeEntryFunc::OpenSession {
@@ -263,9 +270,9 @@ pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcR
                         _ => unreachable!(),
                     }
                 } {
-                    let slice = alloc::vec![0u8; data_size];
-                    // TODO: walk the scatter-gather list to populate `slice`
-                    UteeParamOwned::MemrefInput { data: slice.into() }
+                    let mut data = alloc::vec![0u8; data_size];
+                    read_data_from_shm_phys_addrs(&phys_addrs, &mut data)?;
+                    UteeParamOwned::MemrefInput { data: data.into() }
                 } else {
                     UteeParamOwned::None
                 }
@@ -318,10 +325,10 @@ pub fn handle_ta_request(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcR
                         _ => unreachable!(),
                     }
                 } {
-                    let slice = alloc::vec![0u8; buffer_size];
-                    // TODO: walk the scatter-gather list to populate `slice`
+                    let mut buffer = alloc::vec![0u8; buffer_size];
+                    read_data_from_shm_phys_addrs(&phys_addrs, &mut buffer)?;
                     UteeParamOwned::MemrefInout {
-                        data: slice.into(),
+                        data: buffer.into(),
                         buffer_size,
                         out_addresses: Some(phys_addrs),
                     }
@@ -477,42 +484,67 @@ fn get_shm_phys_addrs_from_optee_msg_param_tmem(
 }
 
 /// Get a list of the normal world physical addresses of OP-TEE shared memory from `OpteeMsgParamRmem`.
-/// Specifically, `rmem.offs` must be an offset within the shared memory region registered with
-/// `rmem.shm_ref` before and `rmem.offs + rmem.size` must not exceed the size of the registered
-/// shared memory region.
-/// All addresses this function returns are page-aligned except the first one whose page offset is
-/// in `ShmRefInfo`. These addresses are virtually contiguous within the normal world, but not
-/// necessarily physically contiguous.
+/// `rmem.offs` must be an offset within the shared memory region registered with `rmem.shm_ref` before
+/// and `rmem.offs + rmem.size` must not exceed the size of the registered shared memory region.
+/// All addresses this function returns are page-aligned except the first one. These addresses are
+/// virtually contiguous within the normal world, but not necessarily physically contiguous.
 fn get_shm_phys_addrs_from_optee_msg_param_rmem(
     rmem: OpteeMsgParamRmem,
 ) -> Result<Box<[usize]>, OpteeSmcReturn> {
     let Some(shm_ref_info) = shm_ref_map().get(rmem.shm_ref) else {
         return Err(OpteeSmcReturn::ENotAvail);
     };
-    let offset = shm_ref_info
+    let start = shm_ref_info
         .page_offset
         .checked_add(rmem.offs)
         .ok_or(OpteeSmcReturn::EBadAddr)?;
-    let end = offset
+    let end = start
         .checked_add(rmem.size)
         .ok_or(OpteeSmcReturn::EBadAddr)?;
-    let start_index = usize::try_from(page_align_down(offset)).unwrap() / PAGE_SIZE;
-    let end_index = usize::try_from(page_align_up(end)).unwrap() / PAGE_SIZE;
-    if start_index >= shm_ref_info.pages.len() || end_index > shm_ref_info.pages.len() {
+    let start_page_index = usize::try_from(page_align_down_u64(start)).unwrap() / PAGE_SIZE;
+    let end_page_index = usize::try_from(page_align_up_u64(end)).unwrap() / PAGE_SIZE;
+    if start_page_index >= shm_ref_info.pages.len() || end_page_index > shm_ref_info.pages.len() {
         return Err(OpteeSmcReturn::EBadAddr);
     }
-
-    let mut pages = Vec::with_capacity(end_index - start_index);
-    let page_offset = offset - page_align_down(offset);
-    pages[0] = usize::try_from(shm_ref_info.pages[start_index] + page_offset).unwrap();
+    let mut pages = Vec::with_capacity(end_page_index - start_page_index);
+    let page_offset = start - page_align_down_u64(start);
+    pages[0] = usize::try_from(shm_ref_info.pages[start_page_index] + page_offset).unwrap();
     for (i, page) in shm_ref_info
         .pages
         .iter()
-        .take(end_index)
-        .skip(start_index)
+        .take(end_page_index)
+        .skip(start_page_index)
         .enumerate()
     {
         pages[i] = usize::try_from(*page).unwrap();
     }
     Ok(pages.into_boxed_slice())
+}
+
+/// Read data from the normal world shared memory pages whose physical addresses are given in
+/// `phys_addrs` into `buffer`. The size of `buffer` indicates how many bytes to read.
+/// Currently, this function reads data page by page (i.e., it does not map multiple physical
+/// pages at once). All physical addresses in `phys_addrs` are page-aligned except the first one.
+fn read_data_from_shm_phys_addrs(
+    phys_addrs: &[usize],
+    buffer: &mut [u8],
+) -> Result<(), OpteeSmcReturn> {
+    let ptr = NormalWorldConstPtr::<[u8; PAGE_SIZE]>::from_usize(page_align_down(phys_addrs[0]));
+    let page = unsafe { ptr.read_at_offset(0) }.ok_or(OpteeSmcReturn::EBadAddr)?;
+    let page_offset = phys_addrs[0] - page_align_down(phys_addrs[0]);
+    let to_copy = core::cmp::min(PAGE_SIZE - page_offset, buffer.len());
+    buffer.copy_from_slice(&page[page_offset..page_offset + to_copy]);
+    let mut copied = to_copy;
+
+    for phys_addr in phys_addrs.iter().skip(1) {
+        if copied >= buffer.len() {
+            break;
+        }
+        let ptr = NormalWorldConstPtr::<[u8; PAGE_SIZE]>::from_usize(*phys_addr);
+        let page = unsafe { ptr.read_at_offset(0) }.ok_or(OpteeSmcReturn::EBadAddr)?;
+        let to_copy = core::cmp::min(PAGE_SIZE, buffer.len() - copied);
+        buffer[copied..copied + to_copy].copy_from_slice(&page[..to_copy]);
+        copied += to_copy;
+    }
+    Ok(())
 }
