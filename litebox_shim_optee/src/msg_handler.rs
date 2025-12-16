@@ -59,9 +59,14 @@ fn page_align_up(len: u64) -> u64 {
 }
 
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
+/// It returns an `OpteeSmcResult` representing the result of the SMC call and
+/// an optional `OpteeMsgArg` if the SMC call involves with an OP-TEE messagewhich should be handled by
+/// `handle_optee_msg_arg` or `handle_ta_request`.
 /// # Panics
 /// Panics if the normal world physical address in `smc` cannot be converted to `usize`.
-pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_>, OpteeSmcReturn> {
+pub fn handle_optee_smc_args(
+    smc: &mut OpteeSmcArgs,
+) -> Result<(OpteeSmcResult<'_>, Option<OpteeMsgArg>), OpteeSmcReturn> {
     let func_id = smc.func_id()?;
     match func_id {
         OpteeSmcFunction::CallWithArg
@@ -70,62 +75,87 @@ pub fn handle_optee_smc_args(smc: &mut OpteeSmcArgs) -> Result<OpteeSmcResult<'_
             let msg_arg_addr = smc.optee_msg_arg_phys_addr()?;
             let msg_arg_addr = usize::try_from(msg_arg_addr).unwrap();
             let ptr = NormalWorldConstPtr::<OpteeMsgArg>::from_usize(msg_arg_addr);
-            let msg_arg = unsafe { ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
-            handle_optee_msg_arg(&msg_arg).map(|_| OpteeSmcResult::Generic {
-                status: OpteeSmcReturn::Ok,
-            })
+            let msg_arg = unsafe { ptr.read_at_offset(0) }.ok_or(OpteeSmcReturn::EBadAddr)?;
+            Ok((
+                OpteeSmcResult::Generic {
+                    status: OpteeSmcReturn::Ok,
+                },
+                Some(msg_arg),
+            ))
         }
         OpteeSmcFunction::ExchangeCapabilities => {
             // TODO: update the below when we support more features
             let default_cap = OpteeSecureWorldCapabilities::DYNAMIC_SHM
                 | OpteeSecureWorldCapabilities::MEMREF_NULL
                 | OpteeSecureWorldCapabilities::RPC_ARG;
-            Ok(OpteeSmcResult::ExchangeCapabilities {
-                status: OpteeSmcReturn::Ok,
-                capabilities: default_cap,
-                max_notif_value: MAX_NOTIF_VALUE,
-                data: NUM_RPC_PARMS,
-            })
+            Ok((
+                OpteeSmcResult::ExchangeCapabilities {
+                    status: OpteeSmcReturn::Ok,
+                    capabilities: default_cap,
+                    max_notif_value: MAX_NOTIF_VALUE,
+                    data: NUM_RPC_PARMS,
+                },
+                None,
+            ))
         }
         OpteeSmcFunction::DisableShmCache => {
             // Currently, we do not support this feature.
-            Ok(OpteeSmcResult::DisableShmCache {
-                status: OpteeSmcReturn::ENotAvail,
-                shm_upper32: 0,
-                shm_lower32: 0,
-            })
+            Ok((
+                OpteeSmcResult::DisableShmCache {
+                    status: OpteeSmcReturn::ENotAvail,
+                    shm_upper32: 0,
+                    shm_lower32: 0,
+                },
+                None,
+            ))
         }
-        OpteeSmcFunction::GetOsUuid => Ok(OpteeSmcResult::Uuid {
-            data: &[
-                OPTEE_MSG_OS_OPTEE_UUID_0,
-                OPTEE_MSG_OS_OPTEE_UUID_1,
-                OPTEE_MSG_OS_OPTEE_UUID_2,
-                OPTEE_MSG_OS_OPTEE_UUID_3,
-            ],
-        }),
-        OpteeSmcFunction::CallsUid => Ok(OpteeSmcResult::Uuid {
-            data: &[
-                OPTEE_MSG_UID_0,
-                OPTEE_MSG_UID_1,
-                OPTEE_MSG_UID_2,
-                OPTEE_MSG_UID_3,
-            ],
-        }),
-        OpteeSmcFunction::GetOsRevision => Ok(OpteeSmcResult::OsRevision {
-            major: OPTEE_MSG_REVISION_MAJOR,
-            minor: OPTEE_MSG_REVISION_MINOR,
-            build_id: OPTEE_MSG_BUILD_ID,
-        }),
-        OpteeSmcFunction::CallsRevision => Ok(OpteeSmcResult::Revision {
-            major: OPTEE_MSG_REVISION_MAJOR,
-            minor: OPTEE_MSG_REVISION_MINOR,
-        }),
+        OpteeSmcFunction::GetOsUuid => Ok((
+            OpteeSmcResult::Uuid {
+                data: &[
+                    OPTEE_MSG_OS_OPTEE_UUID_0,
+                    OPTEE_MSG_OS_OPTEE_UUID_1,
+                    OPTEE_MSG_OS_OPTEE_UUID_2,
+                    OPTEE_MSG_OS_OPTEE_UUID_3,
+                ],
+            },
+            None,
+        )),
+        OpteeSmcFunction::CallsUid => Ok((
+            OpteeSmcResult::Uuid {
+                data: &[
+                    OPTEE_MSG_UID_0,
+                    OPTEE_MSG_UID_1,
+                    OPTEE_MSG_UID_2,
+                    OPTEE_MSG_UID_3,
+                ],
+            },
+            None,
+        )),
+        OpteeSmcFunction::GetOsRevision => Ok((
+            OpteeSmcResult::OsRevision {
+                major: OPTEE_MSG_REVISION_MAJOR,
+                minor: OPTEE_MSG_REVISION_MINOR,
+                build_id: OPTEE_MSG_BUILD_ID,
+            },
+            None,
+        )),
+        OpteeSmcFunction::CallsRevision => Ok((
+            OpteeSmcResult::Revision {
+                major: OPTEE_MSG_REVISION_MAJOR,
+                minor: OPTEE_MSG_REVISION_MINOR,
+            },
+            None,
+        )),
         _ => Err(OpteeSmcReturn::UnknownFunction),
     }
 }
 
-/// This function handles an OP-TEE message contained in `OpteeMsgArg`
-pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcReturn> {
+/// This function handles an OP-TEE message contained in `OpteeMsgArg`.
+/// Currently, it only handles share memory registration and unregistration.
+/// If an OP-TEE message involves with a TA request, it simply returns
+/// `Err(OpteeSmcReturn::Ok)` while expecting that the caller will handle
+/// the message with `handle_ta_request`.
+pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), OpteeSmcReturn> {
     msg_arg.validate()?;
     match msg_arg.cmd {
         OpteeMessageCommand::RegisterShm => {
@@ -157,13 +187,12 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeS
         }
         OpteeMessageCommand::OpenSession
         | OpteeMessageCommand::InvokeCommand
-        | OpteeMessageCommand::CloseSession => return handle_ta_request(msg_arg),
+        | OpteeMessageCommand::CloseSession => return Err(OpteeSmcReturn::Ok),
         _ => {
             todo!("Unimplemented OpteeMessageCommand: {:?}", msg_arg.cmd);
         }
     }
-
-    Ok(*msg_arg)
+    Ok(())
 }
 
 /// This function handles a TA request contained in `OpteeMsgArg`
