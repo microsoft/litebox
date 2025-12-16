@@ -5,7 +5,6 @@ use litebox_platform_multiplex::Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 extern crate alloc;
 
@@ -272,12 +271,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let shutdown_clone = shutdown.clone();
         let child = std::thread::spawn(move || {
             while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
-                while shim.perform_network_interaction().call_again_immediately() {}
-                litebox_platform_multiplex::platform().wait_on_tun(Some(Duration::from_millis(50)));
+                let timeout = loop {
+                    match shim.perform_network_interaction() {
+                        litebox_shim_linux::NetworkInteractionAdvice::CallAgainImmediately => {}
+                        litebox_shim_linux::NetworkInteractionAdvice::WaitUntil(timeout) => {
+                            break timeout;
+                        }
+                    }
+                };
+                if let Some(timeout) = timeout {
+                    litebox_platform_multiplex::platform().wait_on_tun(Some(timeout));
+                }
             }
             // Final flush
             // TODO: keep running until all sockets are closed?
-            while shim.perform_network_interaction().call_again_immediately() {}
+            while let litebox_shim_linux::NetworkInteractionAdvice::CallAgainImmediately =
+                shim.perform_network_interaction()
+            {}
         });
         Some(child)
     } else {

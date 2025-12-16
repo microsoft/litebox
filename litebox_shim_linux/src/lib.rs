@@ -198,6 +198,17 @@ impl LinuxShimBuilder {
     }
 }
 
+/// Advice returned by [`LinuxShim::perform_network_interaction`] on when to invoke it again.
+pub enum NetworkInteractionAdvice {
+    /// The caller should invoke [`LinuxShim::perform_network_interaction`] again immediately.
+    CallAgainImmediately,
+    /// The caller should wait for the specified timeout duration before invoking
+    /// [`LinuxShim::perform_network_interaction`] again, or until network activity occurs.
+    ///
+    /// If `None`, there is no pending timeout (i.e., no scheduled work requiring network operations).
+    WaitUntil(Option<core::time::Duration>),
+}
+
 #[derive(Clone)]
 pub struct LinuxShim(Arc<GlobalState>);
 
@@ -265,10 +276,21 @@ impl LinuxShim {
     /// Perform queued network interactions with the outside world.
     ///
     /// This function should be invoked in a loop, based on the returned advice.
-    pub fn perform_network_interaction(
-        &self,
-    ) -> litebox::net::PlatformInteractionReinvocationAdvice {
-        self.0.net.lock().perform_platform_interaction()
+    pub fn perform_network_interaction(&self) -> NetworkInteractionAdvice {
+        let mut net = self.0.net.lock();
+        match net.perform_platform_interaction() {
+            litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {
+                NetworkInteractionAdvice::CallAgainImmediately
+            }
+            litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction => {
+                match net.poll_at() {
+                    Some(timeout) if timeout.is_zero() => NetworkInteractionAdvice::CallAgainImmediately,
+                    t => {
+                        NetworkInteractionAdvice::WaitUntil(t)
+                    }
+                }
+            }
+        }
     }
 }
 

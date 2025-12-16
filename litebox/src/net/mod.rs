@@ -597,6 +597,23 @@ where
         self.internal_perform_platform_interaction(PollDirection::Both)
     }
 
+    /// Return a _soft timeout_ (duration to wait) before calling [`Self::perform_platform_interaction`] again.
+    ///
+    /// Returns `None` if there is no pending timeout (i.e., no scheduled work requiring network operations).
+    pub fn poll_at(&mut self) -> Option<core::time::Duration> {
+        let timestamp = self.now();
+        self.interface
+            .poll_at(timestamp, &self.socket_set)
+            .map(|instant| {
+                if timestamp < instant {
+                    let diff = instant - timestamp;
+                    diff.into()
+                } else {
+                    core::time::Duration::ZERO
+                }
+            })
+    }
+
     /// (Internal-only API) Actually perform the queued interactions with the outside world.
     fn internal_perform_platform_interaction(
         &mut self,
