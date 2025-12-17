@@ -671,19 +671,14 @@ where
         }
     }
 
-    /// (Internal-only API) Perform the queued interactions only in automatic mode.
+    /// (Internal-only API) Perform the queued interactions.
     fn automated_platform_interaction(&mut self, direction: PollDirection) {
-        match self.platform_interaction {
-            PlatformInteraction::Automatic => {
-                while self
-                    .internal_perform_platform_interaction(direction)
-                    .call_again_immediately()
-                {
-                    // We just loop until all platform interaction is completed, _roughly_ analogous
-                    // to smoltcp's `poll`.
-                }
-            }
-            PlatformInteraction::Manual => {}
+        while self
+            .internal_perform_platform_interaction(direction)
+            .call_again_immediately()
+        {
+            // We just loop until all platform interaction is completed, _roughly_ analogous
+            // to smoltcp's `poll`.
         }
     }
 
