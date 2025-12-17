@@ -145,27 +145,15 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
     match shim.syscall(&mut ctx) {
         ContinueOperation::ResumeGuest => ctx.rax,
         ContinueOperation::ExitThread => {
-            let host_bp = crate::get_host_bp();
-            debug_serial_println!(
-                "Exiting from run_thread: rbp={:#x}, ret={:#x}",
-                host_bp,
-                ctx.rax,
-            );
+            debug_serial_println!("Exiting from run_thread:  ret={:#x}", ctx.rax,);
 
+            // return into the middle of the `run_thread` function
             unsafe {
                 core::arch::asm!(
                     "mov rax, {ret}",
-                    "mov rbp, {host_bp}",
-                    "lea rsp, [rbp - 5*8]",
-                    "pop r15",
-                    "pop r14",
-                    "pop r13",
-                    "pop r12",
-                    "pop rbx",
-                    "pop rbp",
-                    "ret",
+                    "mov r11, gs:run_thread_done@tpoff",
+                    "jmp r11",
                     ret = in(reg) ctx.rax,
-                    host_bp = in(reg) host_bp,
                     options(nostack, noreturn, preserves_flags),
                 );
             }
@@ -177,7 +165,11 @@ fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
 unsafe extern "C" fn syscall_entry_wrapper() {
     naked_asm!(
         "swapgs",
-        "push rsp",
+        "mov gs:guest_sp@tpoff, rsp",
+        "mov gs:guest_ret@tpoff, rcx",
+        "mov gs:guest_rflags@tpoff, r11",
+        "mov rsp, gs:host_sp@tpoff",
+        "push rbp",
         "push r11",
         "push rcx",
         "push r13",
@@ -190,21 +182,23 @@ unsafe extern "C" fn syscall_entry_wrapper() {
         "push rdi",
         "mov rdi, rax",
         "mov rsi, rsp",
-        "and rsp, {stack_alignment}",
         "call {syscall_entry}",
-        "add rsp, {register_space}",
-        "pop rcx",
-        "pop r11",
-        "pop rbp",
+        "mov r11, cr3",
+        "mov cr3, r11",
+        "mov r11, {user_ds}",
+        "push r11",
+        "push gs:guest_sp@tpoff",
+        "push gs:guest_rflags@tpoff",
+        "mov r11, {user_cs}",
+        "push r11",
+        "push gs:guest_ret@tpoff",
         "swapgs",
-        "sysretq",
-        stack_alignment = const STACK_ALIGNMENT,
+        "iretq",
         syscall_entry = sym syscall_entry,
-        register_space = const core::mem::size_of::<SyscallContextRaw>() - core::mem::size_of::<u64>() * NUM_REGISTERS_TO_POP,
+        user_cs = const 0x2b,
+        user_ds = const 0x33,
     );
 }
-const NUM_REGISTERS_TO_POP: usize = 3;
-const STACK_ALIGNMENT: isize = -16;
 
 /// This function enables 64-bit syscall extensions and sets up the necessary MSRs.
 /// It must be called for each core.

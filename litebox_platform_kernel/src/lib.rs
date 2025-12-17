@@ -434,6 +434,33 @@ unsafe extern "C" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
         // Save host rsp and rbp and guest context top in TLS.
         "mov gs:host_sp@tpoff, rsp",
         "mov gs:host_bp@tpoff, rbp",
+        "call {init_handler}",
+        "jmp done",
+        "done:",
+        "mov rbp, gs:host_bp@tpoff",
+        "mov rsp, gs:host_sp@tpoff",
+        "lea rsp, [rbp - 5 * 8]",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        init_handler = sym init_handler
+    );
+}
+
+/// TODO: call shim init.
+/// # Safety
+/// This function assumes that the caller uses `call` not `jmp` as it
+/// gets the return address from the stack top and store it to TLS.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn init_handler(_ctx: &litebox_common_linux::PtRegs) -> ! {
+    core::arch::naked_asm!(
+        "mov r11, [rsp]",
+        "mov gs:run_thread_done@tpoff, r11",
         "call {switch_to_guest}",
         switch_to_guest = sym switch_to_guest
     );
@@ -448,20 +475,24 @@ scratch:
     .quad 0
 scratch2:
     .quad 0
+.globl host_sp
 host_sp:
     .quad 0
+.globl host_bp
 host_bp:
     .quad 0
-guest_context_top:
+.globl guest_sp
+guest_sp:
     .quad 0
-.globl guest_fsbase
-guest_fsbase:
+.globl guest_ret
+guest_ret:
     .quad 0
-in_guest:
-    .byte 0
-.globl interrupt
-interrupt:
-    .byte 0
+.globl guest_rflags
+guest_rflags:
+    .quad 0
+.globl run_thread_done
+run_thread_done:
+    .quad 0
     "
 );
 
@@ -501,19 +532,6 @@ unsafe extern "C" fn switch_to_guest_kernel_mode(ctx: &litebox_common_linux::PtR
         "pop rsp",
         "jmp gs:scratch@tpoff", // jump to the guest
     );
-}
-
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn get_host_bp() -> usize {
-    let value: usize;
-    unsafe {
-        core::arch::asm!(
-            "mov {}, gs:host_bp@tpoff",
-            out(reg) value,
-            options(nostack, preserves_flags)
-        );
-    }
-    value
 }
 
 /// Switches to the provided guest context with the user mode.
