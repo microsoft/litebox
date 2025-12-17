@@ -292,7 +292,6 @@ impl Backlog {
     }
 
     fn check_io_events(&self) -> Events {
-        let limit = self.limit.load(Ordering::Relaxed);
         let sockets = self.sockets.lock();
         let Some(sockets) = &*sockets else {
             return Events::HUP;
@@ -301,7 +300,7 @@ impl Backlog {
         if !sockets.is_empty() {
             events |= Events::IN;
         }
-        if sockets.len() < limit as usize {
+        if sockets.len() < self.limit.load(Ordering::Relaxed) as usize {
             events |= Events::OUT;
         }
         events
@@ -401,8 +400,10 @@ struct Message {
 /// Represents a connected Unix stream socket.
 struct UnixConnectedStream {
     addr: AddrView,
-    reader: crate::channel::ReadEnd<Message>,
-    writer: crate::channel::WriteEnd<Message>,
+    /// The read end of the local socket's channel for receiving messages.
+    recv_channel: crate::channel::ReadEnd<Message>,
+    /// The write end of the connected peer socket for sending messages.
+    connected_send_channel: crate::channel::WriteEnd<Message>,
     pollee: Arc<Pollee<crate::Platform>>,
 }
 
@@ -417,21 +418,22 @@ impl UnixConnectedStream {
         let (addr1, addr2) = AddrView::new_pair(addr, peer);
         let pollee1 = pollee.unwrap_or(Arc::new(Pollee::new()));
         let pollee2 = Arc::new(Pollee::new());
-        let (writer_peer, reader) =
+        let (send_channel, recv_channel) =
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee2.clone(), pollee1.clone()).split();
-        let (writer, reader_peer) =
+        let (send_channel_peer, recv_channel_peer) =
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee1.clone(), pollee2.clone()).split();
         (
+            // Cross-wire: each socket keeps the other side's send channel.
             UnixConnectedStream {
                 addr: addr1,
-                reader,
-                writer,
+                recv_channel,
+                connected_send_channel: send_channel_peer,
                 pollee: pollee1,
             },
             UnixConnectedStream {
                 addr: addr2,
-                reader: reader_peer,
-                writer: writer_peer,
+                recv_channel: recv_channel_peer,
+                connected_send_channel: send_channel,
                 pollee: pollee2,
             },
         )
@@ -453,13 +455,13 @@ impl UnixConnectedStream {
 
     fn try_sendto(&self, msg: Message) -> Result<(), (Message, Errno)> {
         // TODO: write partial data?
-        self.writer.try_write_one(msg)
+        self.connected_send_channel.try_write_one(msg)
     }
 
     fn try_recvfrom(&self, mut buf: &mut [u8]) -> Result<usize, TryOpError<Errno>> {
         let mut total_read = 0;
         while !buf.is_empty() {
-            let n = match self.reader.peek_and_consume_one(|msg| {
+            let n = match self.recv_channel.peek_and_consume_one(|msg| {
                 if buf.len() >= msg.data.len() {
                     buf[..msg.data.len()].copy_from_slice(&msg.data);
                     Ok((true, msg.data.len()))
@@ -488,18 +490,18 @@ impl UnixConnectedStream {
 
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
-        let is_read_shutdown = self.reader.is_shutdown();
-        let is_write_shutdown = self.writer.is_shutdown();
+        let is_read_shutdown = self.recv_channel.is_shutdown();
+        let is_write_shutdown = self.connected_send_channel.is_shutdown();
         if is_read_shutdown {
             events |= Events::RDHUP | Events::IN;
             if is_write_shutdown {
                 events |= Events::HUP;
             }
         }
-        if !self.reader.is_empty() {
+        if !self.recv_channel.is_empty() {
             events |= Events::IN;
         }
-        if !self.writer.is_full() {
+        if !self.connected_send_channel.is_full() {
             events |= Events::OUT;
         }
         events
@@ -878,10 +880,12 @@ impl ReadEnd<DatagramMessage> {
 struct UnixDatagramInner {
     /// The local address this socket is bound to, if any.
     addr: Option<(UnixBoundSocketAddr, Arc<GlobalState>)>,
-    /// The read end of the local socket's channel.
-    reader: Option<ReadEnd<DatagramMessage>>,
-    /// The write end of the remote socket it is connected to, if any.
-    peer_writer: Option<WriteEnd<DatagramMessage>>,
+    /// The read end of the local socket's channel for receiving messages.
+    /// Set when the socket is bound via `bind` or `new_pair`.
+    recv_channel: Option<ReadEnd<DatagramMessage>>,
+    /// The write end of the connected peer socket for sending messages.
+    /// Set when the socket is connected via `connect` or `new_pair`.
+    connected_send_channel: Option<WriteEnd<DatagramMessage>>,
     pollee: Arc<Pollee<crate::Platform>>,
 }
 /// Represents a Unix datagram socket.
@@ -895,9 +899,9 @@ impl Drop for UnixDatagramInner {
             let key = addr.to_key();
             let mut table = global.unix_addr_table.write();
             // Only remove the entry if it matches the current socket
-            if let Some(UnixEntry(UnixEntryInner::Datagram(writer))) = table.get(&key)
-                && let Some(reader) = &self.reader
-                && writer.is_pair(reader)
+            if let Some(UnixEntry(UnixEntryInner::Datagram(send_channel))) = table.get(&key)
+                && let Some(recv_channel) = &self.recv_channel
+                && send_channel.is_pair(recv_channel)
             {
                 table.remove(&key);
             }
@@ -920,15 +924,15 @@ impl UnixDatagramInner {
         let key = bound_addr.to_key();
         // Registers the write end of the socket in the global address table so it
         // can receive messages sent to this address.
-        let (writer, reader) =
+        let (send_channel, recv_channel) =
             Channel::new(UNIX_BUF_SIZE, Arc::new(Pollee::new()), self.pollee.clone()).split();
         let _ = task
             .global
             .unix_addr_table
             .write()
-            .insert(key, UnixEntry(UnixEntryInner::Datagram(writer)));
+            .insert(key, UnixEntry(UnixEntryInner::Datagram(send_channel)));
         self.addr = Some((bound_addr, task.global.clone()));
-        self.reader = Some(reader);
+        self.recv_channel = Some(recv_channel);
         Ok(())
     }
 }
@@ -938,8 +942,8 @@ impl UnixDatagram {
         Self {
             inner: RwLock::new(UnixDatagramInner {
                 addr: None,
-                reader: None,
-                peer_writer: None,
+                recv_channel: None,
+                connected_send_channel: None,
                 pollee: Arc::new(Pollee::new()),
             }),
         }
@@ -948,24 +952,25 @@ impl UnixDatagram {
     fn new_pair() -> (UnixDatagram, UnixDatagram) {
         let pollee1 = Arc::new(Pollee::new());
         let pollee2 = Arc::new(Pollee::new());
-        let (writer_peer, reader) =
+        let (send_channel, recv_channel) =
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee2.clone(), pollee1.clone()).split();
-        let (writer, reader_peer) =
+        let (send_channel_peer, recv_channel_peer) =
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee1.clone(), pollee2.clone()).split();
         (
+            // Cross-wire: each socket keeps the other side's send channel.
             UnixDatagram {
                 inner: RwLock::new(UnixDatagramInner {
                     addr: None,
-                    reader: Some(reader),
-                    peer_writer: Some(writer),
+                    recv_channel: Some(recv_channel),
+                    connected_send_channel: Some(send_channel_peer),
                     pollee: pollee1,
                 }),
             },
             UnixDatagram {
                 inner: RwLock::new(UnixDatagramInner {
                     addr: None,
-                    reader: Some(reader_peer),
-                    peer_writer: Some(writer_peer),
+                    recv_channel: Some(recv_channel_peer),
+                    connected_send_channel: Some(send_channel),
                     pollee: pollee2,
                 }),
             },
@@ -994,7 +999,7 @@ impl UnixDatagram {
         let _ = addr.bind(task, false)?;
         match &entry.0 {
             UnixEntryInner::Stream(_) => Err(Errno::EPROTOTYPE),
-            UnixEntryInner::Datagram(writer) => Ok(writer.clone()),
+            UnixEntryInner::Datagram(send_channel) => Ok(send_channel.clone()),
         }
     }
 
@@ -1002,7 +1007,7 @@ impl UnixDatagram {
     ///
     /// Subsequent sends without an address will use this peer.
     fn connect(&self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
-        self.inner.write().peer_writer = Some(self.lookup(task, addr)?);
+        self.inner.write().connected_send_channel = Some(self.lookup(task, addr)?);
         Ok(())
     }
 
@@ -1022,10 +1027,10 @@ impl UnixDatagram {
             },
             || {
                 let guard = self.inner.read();
-                let Some(reader) = &guard.reader else {
+                let Some(recv_channel) = &guard.recv_channel else {
                     return Err(TryOpError::Other(Errno::ENOTCONN));
                 };
-                reader.try_read(buf, source_addr.as_deref_mut())
+                recv_channel.try_read(buf, source_addr.as_deref_mut())
             },
         )
         .map_err(Errno::from)
@@ -1043,14 +1048,14 @@ impl UnixDatagram {
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
         let source = self.get_local_addr();
-        let peer_writer = if let Some(addr) = addr {
+        let send_channel = if let Some(addr) = addr {
             self.lookup(task, addr)?
-        } else if let Some(peer_writer) = &self.inner.read().peer_writer {
-            peer_writer.clone()
+        } else if let Some(connected_send_channel) = &self.inner.read().connected_send_channel {
+            connected_send_channel.clone()
         } else {
             return Err(Errno::ENOTCONN);
         };
-        peer_writer.write(
+        send_channel.write(
             &task.wait_cx(),
             DatagramMessage {
                 data: buf.to_vec(),
@@ -1071,15 +1076,15 @@ impl UnixDatagram {
 
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
-        if let Some(reader) = &self.inner.read().reader {
-            if reader.is_shutdown() {
+        if let Some(recv_channel) = &self.inner.read().recv_channel {
+            if recv_channel.is_shutdown() {
                 events |= Events::IN | Events::RDHUP;
-            } else if !reader.is_empty() {
+            } else if !recv_channel.is_empty() {
                 events |= Events::IN;
             }
         }
-        if let Some(peer_writer) = &self.inner.read().peer_writer {
-            if !peer_writer.is_full() {
+        if let Some(connected_send_channel) = &self.inner.read().connected_send_channel {
+            if !connected_send_channel.is_full() {
                 events |= Events::OUT;
             }
         } else {
