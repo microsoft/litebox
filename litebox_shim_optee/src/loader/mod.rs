@@ -52,10 +52,10 @@ pub fn prepare_registers(
         rdi: usize::try_from(func_id).unwrap(),
         orig_rax: 0,
         rip: ta_info.entry_point,
-        cs: 0x33, // __USER_CS
+        cs: 0x2b, // __USER_CS
         eflags: 0,
         rsp: stack.get_cur_stack_top(),
-        ss: 0x2b, // __USER_DS
+        ss: 0x33, // __USER_DS
     }
 }
 

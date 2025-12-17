@@ -562,30 +562,17 @@ unsafe extern "C" fn switch_to_guest(_ctx: &litebox_common_linux::PtRegs) -> ! {
             "pop rdx",
             "pop rsi",
             "pop rdi",
-            "add rsp, 8",           // skip orig_rax
-            "pop gs:scratch@tpoff", // read rip into scratch
-            "add rsp, 8",           // skip cs
-            "popfq",
-            "pop gs:scratch2@tpoff", // read user rsp into scratch2
+            "add rsp, 8", // skip orig_rax
             // Flush TLB by reloading CR3
             "mov rax, cr3",
             "mov cr3, rax",
-            // Switch to user mode
-            "mov rax, {user_ds}",
-            "push rax",
-            "push gs:scratch2@tpoff", // user rsp
-            "mov rax, {rflags}",
-            "push rax",
-            "mov rax, {user_cs}",
-            "push rax",
-            "push gs:scratch@tpoff", // jump to the guest
+            "xor eax, eax",
+            // Stack already has all the values needed for iretq (rip, cs, flags, rsp, ds)
+            // from the PtRegs structure.
             // clear the GS base register (as the `KernelGsBase` MSR contains 0)
             // while writing the current GS base value to `KernelGsBase`.
             "swapgs",
             "iretq",
-            user_cs = const 0x2b,
-            rflags = const 0,
-            user_ds = const 0x33,
             options(noreturn)
         );
     }
