@@ -139,7 +139,12 @@ fn run_ta_with_default_commands(session_id: usize, ta_info: &ElfLoadInfo) {
                     func_id as u32,
                     None,
                 );
-                unsafe { litebox_platform_kernel::run_thread(&mut pt_regs) };
+                unsafe {
+                    litebox_platform_kernel::run_thread(
+                        litebox_shim_optee::OpteeShim,
+                        &mut pt_regs,
+                    );
+                };
             }
             UteeEntryFunc::InvokeCommand => {
                 let mut params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
@@ -161,7 +166,12 @@ fn run_ta_with_default_commands(session_id: usize, ta_info: &ElfLoadInfo) {
                     func_id as u32,
                     Some(1),
                 );
-                unsafe { litebox_platform_kernel::run_thread(&mut pt_regs) };
+                unsafe {
+                    litebox_platform_kernel::run_thread(
+                        litebox_shim_optee::OpteeShim,
+                        &mut pt_regs,
+                    );
+                };
             }
             UteeEntryFunc::CloseSession => {
                 litebox_shim_optee::deinit_session();

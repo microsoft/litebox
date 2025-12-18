@@ -17,6 +17,7 @@ use litebox::platform::{
 use litebox::platform::{
     PunchthroughProvider, PunchthroughToken, RawMutPointer, RawPointerProvider,
 };
+use litebox::shim::ContinueOperation;
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use ptr::UserMutPtr;
@@ -407,20 +408,38 @@ impl StdioProvider for LiteBoxKernel {
 /// The context must be valid guest context.
 /// # Panics
 /// Panics if `gsbase` is larger than `u64::MAX`.
-pub unsafe fn run_thread(ctx: &mut litebox_common_linux::PtRegs) {
+pub unsafe fn run_thread(
+    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
     // Currently, `litebox_platform_kernel` uses `swapgs` to efficiently switch between
     // kernel and user GS base values during kernel-user mode transitions.
     // This `swapgs` usage can pontetially leak a kernel address to the user, so
     // we clear the `KernelGsBase` MSR before running the user thread.
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
-    unsafe {
-        run_thread_inner(ctx);
-    }
+    run_thread_inner(&shim, ctx);
+}
+
+struct ThreadContext<'a> {
+    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &'a mut litebox_common_linux::PtRegs,
+}
+
+fn run_thread_inner(
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    let ctx_ptr = core::ptr::from_mut(ctx);
+    let mut thread_ctx = ThreadContext { shim, ctx };
+    unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr) };
 }
 
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-unsafe extern "C" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
+unsafe extern "C" fn run_thread_arch(
+    thread_ctx: &mut ThreadContext,
+    ctx: *mut litebox_common_linux::PtRegs,
+) {
     core::arch::naked_asm!(
         "push rbp",
         "mov rbp, rsp",
@@ -429,12 +448,44 @@ unsafe extern "C" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
         "push r13",
         "push r14",
         "push r15",
-        "push r15", // align
-        "mov rax, rsp",
+        "push rdi", // save thread context
         // Save host rsp and rbp and guest context top in TLS.
         "mov gs:host_sp@tpoff, rsp",
         "mov gs:host_bp@tpoff, rbp",
+        "lea r8, [rsi + {GUEST_CONTEXT_SIZE}]",
+        "mov gs:guest_context_top@tpoff, r8",
         "call {init_handler}",
+        "jmp done",
+        ".globl syscall_callback",
+        "syscall_callback:",
+        "swapgs",
+        "mov r11, rsp",
+        "mov rsp, gs:guest_context_top@tpoff",
+        "push 0x33", // USER_DS
+        "push r11",
+        "pushfq",
+        "push 0x2b", // USER_CS
+        "push rcx",
+        "push rax",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push -38",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push [rsp + 88]",
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rsp, gs:host_sp@tpoff",
+        "mov rbp, gs:host_bp@tpoff",
+        "mov rdi, [rsp]", // pass thread_ctx
+        "call {syscall_handler}",
         "jmp done",
         "done:",
         "mov rbp, gs:host_bp@tpoff",
@@ -447,23 +498,45 @@ unsafe extern "C" fn run_thread_inner(ctx: &mut litebox_common_linux::PtRegs) {
         "pop rbx",
         "pop rbp",
         "ret",
-        init_handler = sym init_handler
+        GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+        init_handler = sym init_handler,
+        syscall_handler = sym syscall_handler,
     );
 }
 
+#[allow(dead_code)]
+unsafe extern "C" {
+    // Defined in asm blocks above
+    fn syscall_callback() -> isize;
+}
+
+#[allow(clippy::cast_sign_loss)]
+unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
+}
+
+/// Calls `f` in order to call into a shim entrypoint.
+impl ThreadContext<'_> {
+    fn call_shim(
+        &mut self,
+        f: impl FnOnce(
+            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+            &mut litebox_common_linux::PtRegs,
+        ) -> ContinueOperation,
+    ) {
+        // TODO: clear the interrupt flag before calling the shim
+        let op = f(self.shim, self.ctx);
+        match op {
+            ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::ExitThread => {}
+        }
+    }
+}
+
 /// TODO: call shim init.
-/// # Safety
-/// This function assumes that the caller uses `call` not `jmp` as it
-/// gets the return address from the stack top and store it to TLS.
 #[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-unsafe extern "C" fn init_handler(_ctx: &litebox_common_linux::PtRegs) -> ! {
-    core::arch::naked_asm!(
-        "mov r11, [rsp]",
-        "mov gs:run_thread_done@tpoff, r11",
-        "call {switch_to_guest}",
-        switch_to_guest = sym switch_to_guest
-    );
+fn init_handler(thread_ctx: &mut ThreadContext) {
+    thread_ctx.call_shim(|shim, ctx| shim.init(ctx))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -475,23 +548,11 @@ scratch:
     .quad 0
 scratch2:
     .quad 0
-.globl host_sp
 host_sp:
     .quad 0
-.globl host_bp
 host_bp:
     .quad 0
-.globl guest_sp
-guest_sp:
-    .quad 0
-.globl guest_ret
-guest_ret:
-    .quad 0
-.globl guest_rflags
-guest_rflags:
-    .quad 0
-.globl run_thread_done
-run_thread_done:
+guest_context_top:
     .quad 0
     "
 );
@@ -545,6 +606,10 @@ unsafe extern "C" fn switch_to_guest_kernel_mode(ctx: &litebox_common_linux::PtR
 unsafe extern "C" fn switch_to_guest(_ctx: &litebox_common_linux::PtRegs) -> ! {
     unsafe {
         core::arch::asm!(
+            // Flush TLB by reloading CR3
+            "mov rax, cr3",
+            "mov cr3, rax",
+            "xor eax, eax",
             // Restore guest context from ctx.
             "mov rsp, rdi",
             "pop r15",
@@ -563,10 +628,6 @@ unsafe extern "C" fn switch_to_guest(_ctx: &litebox_common_linux::PtRegs) -> ! {
             "pop rsi",
             "pop rdi",
             "add rsp, 8", // skip orig_rax
-            // Flush TLB by reloading CR3
-            "mov rax, cr3",
-            "mov cr3, rax",
-            "xor eax, eax",
             // Stack already has all the values needed for iretq (rip, cs, flags, rsp, ds)
             // from the PtRegs structure.
             // clear the GS base register (as the `KernelGsBase` MSR contains 0)

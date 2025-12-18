@@ -1,7 +1,5 @@
-use crate::debug_serial_println;
 use crate::per_cpu_variables::with_per_cpu_variables;
 use core::arch::naked_asm;
-use litebox::shim::ContinueOperation;
 use litebox_common_linux::PtRegs;
 use litebox_common_optee::SyscallContext;
 use x86_64::{
@@ -35,8 +33,9 @@ use x86_64::{
 // r11: userspace rflags
 // Note. rsp should point to the userspace stack before calling `sysretq`
 
-static SHIM: spin::Once<&'static dyn litebox::shim::EnterShim<ExecutionContext = PtRegs>> =
-    spin::Once::new();
+pub(crate) static SHIM: spin::Once<
+    &'static dyn litebox::shim::EnterShim<ExecutionContext = PtRegs>,
+> = spin::Once::new();
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug)]
@@ -126,78 +125,9 @@ impl SyscallContextRaw {
     }
 }
 
-#[allow(clippy::similar_names)]
-#[allow(unreachable_code)]
-fn syscall_entry(sysnr: u64, ctx_raw: *const SyscallContextRaw) -> usize {
-    let &shim = SHIM.get().expect("Shim should be initialized");
-
-    debug_serial_println!("sysnr = {:#x}, ctx_raw = {:#x}", sysnr, ctx_raw as usize);
-    let ctx_raw = unsafe { &*ctx_raw };
-
-    assert!(
-        ctx_raw.user_rip().is_some() && ctx_raw.user_rsp().is_some(),
-        "BUG: userspace RIP or RSP is invalid"
-    );
-
-    let mut ctx = ctx_raw.to_pt_regs(sysnr);
-
-    // call the syscall handler passed down from the shim
-    match shim.syscall(&mut ctx) {
-        ContinueOperation::ResumeGuest => ctx.rax,
-        ContinueOperation::ExitThread => {
-            debug_serial_println!("Exiting from run_thread:  ret={:#x}", ctx.rax,);
-
-            // return into the middle of the `run_thread` function
-            unsafe {
-                core::arch::asm!(
-                    "mov rax, {ret}",
-                    "mov r11, gs:run_thread_done@tpoff",
-                    "jmp r11",
-                    ret = in(reg) ctx.rax,
-                    options(nostack, noreturn, preserves_flags),
-                );
-            }
-        }
-    }
-}
-
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry_wrapper() {
-    naked_asm!(
-        "swapgs",
-        "mov gs:guest_sp@tpoff, rsp",
-        "mov gs:guest_ret@tpoff, rcx",
-        "mov gs:guest_rflags@tpoff, r11",
-        "mov rsp, gs:host_sp@tpoff",
-        "push rbp",
-        "push r11",
-        "push rcx",
-        "push r13",
-        "push r12",
-        "push r9",
-        "push r8",
-        "push r10",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "mov rdi, rax",
-        "mov rsi, rsp",
-        "call {syscall_entry}",
-        "mov r11, cr3",
-        "mov cr3, r11",
-        "mov r11, {user_ds}",
-        "push r11",
-        "push gs:guest_sp@tpoff",
-        "push gs:guest_rflags@tpoff",
-        "mov r11, {user_cs}",
-        "push r11",
-        "push gs:guest_ret@tpoff",
-        "swapgs",
-        "iretq",
-        syscall_entry = sym syscall_entry,
-        user_cs = const 0x2b,
-        user_ds = const 0x33,
-    );
+    naked_asm!("jmp syscall_callback");
 }
 
 /// This function enables 64-bit syscall extensions and sets up the necessary MSRs.
