@@ -764,8 +764,6 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
 ///
 /// # Safety
 /// The context must be valid user context.
-/// # Panics
-/// Panics if `gsbase` is larger than `u64::MAX`.
 pub unsafe fn run_thread(
     shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
@@ -792,6 +790,99 @@ fn run_thread_inner(
     unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr) };
 }
 
+/// Save callee-saved registers onto the stack.
+#[cfg(target_arch = "x86_64")]
+macro_rules! SAVE_CALLEE_SAVED_REGISTERS_ASM {
+    () => {
+        "
+        push rbp
+        mov rbp, rsp
+        push rbx
+        push r12
+        push r13
+        push r14
+        push r15
+        "
+    };
+}
+
+/// Restore callee-saved registers from the stack.
+#[cfg(target_arch = "x86_64")]
+macro_rules! RESTORE_CALLEE_SAVED_REGISTERS_ASM {
+    () => {
+        "
+        lea rsp, [rbp - 5 * 8]
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop rbx
+        pop rbp
+        "
+    };
+}
+
+/// Save user context onto the stack.
+///
+/// Prerequisite: The stack is reserved for `PtRegs` and `r11` contains user `rsp`.
+#[cfg(target_arch = "x86_64")]
+macro_rules! SAVE_USER_CONTEXT_ASM {
+    () => {
+        "
+        push 0x33 // USER_DS
+        push r11 // r11 has user rsp
+        pushfq
+        push 0x2b // USER_CS
+        push rcx // rip
+        push rax // orig_rax
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push -38
+        push r8
+        push r9
+        push r10
+        push [rsp + 88]
+        push rbx
+        push rbp
+        push r12
+        push r13
+        push r14
+        push r15
+        "
+    };
+}
+
+/// Restore user context from the stack.
+///
+/// Prerequisite: The stack has `PtRegs` structure saved by `SAVE_USER_CONTEXT_ASM`.
+#[cfg(target_arch = "x86_64")]
+macro_rules! RESTORE_USER_CONTEXT_ASM {
+    () => {
+        "
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop rbp
+        pop rbx
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rax
+        pop rcx
+        pop rdx
+        pop rsi
+        pop rdi
+        add rsp, 8 // skip orig_rax
+        // Stack already has all the values needed for iretq (rip, cs, flags, rsp, ds)
+        // from the `PtRegs` structure.
+        "
+    };
+}
+
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 unsafe extern "C" fn run_thread_arch(
@@ -799,13 +890,7 @@ unsafe extern "C" fn run_thread_arch(
     ctx: *mut litebox_common_linux::PtRegs,
 ) {
     core::arch::naked_asm!(
-        "push rbp",
-        "mov rbp, rsp",
-        "push rbx",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
+        SAVE_CALLEE_SAVED_REGISTERS_ASM!(),
         "push rdi", // save thread context
         // Save kernel rsp and rbp and user context top in TLS.
         "mov gs:[{cur_kernel_sp_off}], rsp",
@@ -819,30 +904,10 @@ unsafe extern "C" fn run_thread_arch(
         "swapgs",
         "mov r11, rsp",
         "mov rsp, gs:[{user_context_top_off}]",
-        "push 0x33", // USER_DS
-        "push r11",
-        "pushfq",
-        "push 0x2b", // USER_CS
-        "push rcx",
-        "push rax",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push -38",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push [rsp + 88]",
-        "push rbx",
-        "push rbp",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "mov rsp, gs:[{cur_kernel_sp_off}]",
+        SAVE_USER_CONTEXT_ASM!(),
         "mov rbp, gs:[{cur_kernel_bp_off}]",
-        "mov rdi, [rsp]", // pass thread_ctx
+        "mov rsp, gs:[{cur_kernel_sp_off}]",
+        "mov rdi, [rsp]", // pass thread context
         "call {syscall_handler}",
         "jmp done",
         // Exception and interrupt callback placeholders
@@ -857,13 +922,7 @@ unsafe extern "C" fn run_thread_arch(
         "done:",
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
-        "lea rsp, [rbp - 5 * 8]",
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbx",
-        "pop rbp",
+        RESTORE_CALLEE_SAVED_REGISTERS_ASM!(),
         "ret",
         cur_kernel_sp_off = const { PerCpuVariablesAsm::cur_kernel_stack_ptr_offset() },
         cur_kernel_bp_off = const { PerCpuVariablesAsm::cur_kernel_base_ptr_offset() },
@@ -916,24 +975,7 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         "xor eax, eax",
         // Restore user context from ctx.
         "mov rsp, rdi",
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbp",
-        "pop rbx",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rax",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "add rsp, 8", // skip orig_rax
-        // Stack already has all the values needed for iretq (rip, cs, flags, rsp, ds)
-        // from the `PtRegs` structure.
+        RESTORE_USER_CONTEXT_ASM!(),
         // clear the GS base register (as the `KernelGsBase` MSR contains 0)
         // while writing the current GS base value to `KernelGsBase`.
         "swapgs",
