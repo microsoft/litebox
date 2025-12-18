@@ -663,7 +663,6 @@ where
             }
         }
         if socket_state_changed {
-            self.check_and_update_events();
             PlatformInteractionReinvocationAdvice::CallAgainImmediately
         } else {
             ingress_advice
@@ -680,6 +679,7 @@ where
             // We just loop until all platform interaction is completed, _roughly_ analogous
             // to smoltcp's `poll`.
         }
+        self.check_and_update_events();
     }
 
     /// (Internal-only API) Socket states could have changed, update events
@@ -687,7 +687,7 @@ where
         unused_variables,
         reason = "this implementation is undergoing change due to change in underlying interfaces for events"
     )]
-    fn check_and_update_events(&mut self) {
+    pub fn check_and_update_events(&mut self) {
         self.remove_dead_sockets();
         self.close_pending_sockets();
 

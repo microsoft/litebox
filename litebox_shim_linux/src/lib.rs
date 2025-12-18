@@ -280,13 +280,15 @@ impl LinuxShim {
         // set a maximum number of iterations (randomly picked number for now) to avoid starvation
         const MAX_ITERATIONS: usize = 128;
         let process = |direction| {
-            (0..MAX_ITERATIONS).all(|_| {
+            let contd = (0..MAX_ITERATIONS).all(|_| {
                 self.0
                     .net
                     .lock()
                     .perform_platform_interaction(direction)
                     .call_again_immediately()
-            })
+            });
+            self.0.net.lock().check_and_update_events();
+            contd
         };
 
         // consuming multiple ingress packets first to avoid unnecessary egress processing
