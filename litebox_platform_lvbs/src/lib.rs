@@ -5,7 +5,7 @@
 #![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
 
 use crate::{
-    host::per_cpu_variables::PerCpuVariablesAsmOffset, mshv::vsm::Vtl0KernelInfo,
+    host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo,
     user_context::UserContextMap,
 };
 use core::{
@@ -865,9 +865,9 @@ unsafe extern "C" fn run_thread_arch(
         "pop rbx",
         "pop rbp",
         "ret",
-        cur_kernel_sp_off = const { PerCpuVariablesAsmOffset::CurKernelStackPtr as usize },
-        cur_kernel_bp_off = const { PerCpuVariablesAsmOffset::CurKernelBasePtr as usize },
-        user_context_top_off = const { PerCpuVariablesAsmOffset::UserContextTopAddr as usize },
+        cur_kernel_sp_off = const { PerCpuVariablesAsm::cur_kernel_stack_ptr_offset() },
+        cur_kernel_bp_off = const { PerCpuVariablesAsm::cur_kernel_base_ptr_offset() },
+        user_context_top_off = const { PerCpuVariablesAsm::user_context_top_addr_offset() },
         USER_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
         init_handler = sym init_handler,
         syscall_handler = sym syscall_handler,

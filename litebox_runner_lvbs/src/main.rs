@@ -7,7 +7,7 @@ use litebox_platform_lvbs::{
     arch::{enable_extended_states, enable_fsgsbase, get_core_id, instrs::hlt_loop},
     host::{
         bootparam::parse_boot_info,
-        per_cpu_variables::{PerCpuVariablesAsmOffset, init_per_cpu_variables},
+        per_cpu_variables::{PerCpuVariablesAsm, init_per_cpu_variables},
     },
     mm::MemoryProvider,
     serial_println,
@@ -125,7 +125,7 @@ pub unsafe extern "C" fn _start() -> ! {
         asm!(
             "mov rsp, gs:[{kernel_sp_off}]",
             "call {kernel_main}",
-            kernel_sp_off = const { PerCpuVariablesAsmOffset::KernelStackPtr as usize },
+            kernel_sp_off = const { PerCpuVariablesAsm::kernel_stack_ptr_offset() },
             kernel_main = sym kernel_main
         );
     }
