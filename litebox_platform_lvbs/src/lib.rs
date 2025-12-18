@@ -5,27 +5,31 @@
 #![cfg_attr(feature = "interrupt", feature(abi_x86_interrupt))]
 
 use crate::{
-    mshv::{vsm::Vtl0KernelInfo, vtl1_mem_layout::PAGE_SIZE},
+    host::per_cpu_variables::PerCpuVariablesAsmOffset, mshv::vsm::Vtl0KernelInfo,
     user_context::UserContextMap,
 };
-
 use core::{
     arch::asm,
     sync::atomic::{AtomicU32, AtomicU64},
 };
-use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
-    Punchthrough, RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
+    Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutex as _, RawMutexProvider,
+    RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
+    page_mgmt::DeallocationError,
 };
-use litebox::platform::{
-    PunchthroughProvider, PunchthroughToken, RawMutex as _, RawPointerProvider,
+use litebox::{
+    mm::linux::{PAGE_SIZE, PageRange},
+    platform::page_mgmt::FixedAddressBehavior,
+    shim::ContinueOperation,
 };
-use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
-use x86_64::structures::paging::{
-    PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
-    mapper::MapToError,
+use x86_64::{
+    VirtAddr,
+    structures::paging::{
+        PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
+        mapper::MapToError,
+    },
 };
 
 extern crate alloc;
@@ -47,6 +51,7 @@ pub struct LinuxKernel<Host: HostInterface> {
     page_table: mm::PageTable<PAGE_SIZE>,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
     vtl0_kernel_info: Vtl0KernelInfo,
+    #[expect(dead_code)]
     user_contexts: UserContextMap,
 }
 
@@ -754,6 +759,195 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
         unimplemented!()
     }
 }
+
+/// Runs a user thread with the given initial context.
+///
+/// # Safety
+/// The context must be valid user context.
+/// # Panics
+/// Panics if `gsbase` is larger than `u64::MAX`.
+pub unsafe fn run_thread(
+    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    // Currently, `litebox_platform_lvbs` uses `swapgs` to efficiently switch between
+    // kernel and user GS base values during kernel-user mode transitions.
+    // This `swapgs` usage can pontetially leak a kernel address to the user, so
+    // we clear the `KernelGsBase` MSR before running the user thread.
+    crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
+    run_thread_inner(&shim, ctx);
+}
+
+struct ThreadContext<'a> {
+    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &'a mut litebox_common_linux::PtRegs,
+}
+
+fn run_thread_inner(
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    let ctx_ptr = core::ptr::from_mut(ctx);
+    let mut thread_ctx = ThreadContext { shim, ctx };
+    unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn run_thread_arch(
+    thread_ctx: &mut ThreadContext,
+    ctx: *mut litebox_common_linux::PtRegs,
+) {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "push rdi", // save thread context
+        // Save kernel rsp and rbp and user context top in TLS.
+        "mov gs:[{cur_kernel_sp_off}], rsp",
+        "mov gs:[{cur_kernel_bp_off}], rbp",
+        "lea r8, [rsi + {USER_CONTEXT_SIZE}]",
+        "mov gs:[{user_context_top_off}], r8",
+        "call {init_handler}",
+        "jmp done",
+        ".globl syscall_callback",
+        "syscall_callback:",
+        "swapgs",
+        "mov r11, rsp",
+        "mov rsp, gs:[{user_context_top_off}]",
+        "push 0x33", // USER_DS
+        "push r11",
+        "pushfq",
+        "push 0x2b", // USER_CS
+        "push rcx",
+        "push rax",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push -38",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push [rsp + 88]",
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rsp, gs:[{cur_kernel_sp_off}]",
+        "mov rbp, gs:[{cur_kernel_bp_off}]",
+        "mov rdi, [rsp]", // pass thread_ctx
+        "call {syscall_handler}",
+        "jmp done",
+        // Exception and interrupt callback placeholders
+        // IDT handler functions will jump to these labels to
+        // handle user-mode exceptions/interrupts.
+        ".globl exception_callback",
+        "exception_callback:",
+        "jmp done",
+        ".globl interrupt_callback",
+        "interrupt_callback:",
+        "jmp done",
+        "done:",
+        "mov rbp, gs:[{cur_kernel_bp_off}]",
+        "mov rsp, gs:[{cur_kernel_sp_off}]",
+        "lea rsp, [rbp - 5 * 8]",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        cur_kernel_sp_off = const { PerCpuVariablesAsmOffset::CurKernelStackPtr as usize },
+        cur_kernel_bp_off = const { PerCpuVariablesAsmOffset::CurKernelBasePtr as usize },
+        user_context_top_off = const { PerCpuVariablesAsmOffset::UserContextTopAddr as usize },
+        USER_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+        init_handler = sym init_handler,
+        syscall_handler = sym syscall_handler,
+    );
+}
+
+#[allow(clippy::cast_sign_loss)]
+unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
+}
+
+/// Calls `f` in order to call into a shim entrypoint.
+impl ThreadContext<'_> {
+    fn call_shim(
+        &mut self,
+        f: impl FnOnce(
+            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+            &mut litebox_common_linux::PtRegs,
+        ) -> ContinueOperation,
+    ) {
+        // TODO: clear the interrupt flag before calling the shim
+        let op = f(self.shim, self.ctx);
+        match op {
+            ContinueOperation::ResumeGuest => unsafe { switch_to_user(self.ctx) },
+            ContinueOperation::ExitThread => {}
+        }
+    }
+}
+
+fn init_handler(thread_ctx: &mut ThreadContext) {
+    thread_ctx.call_shim(|shim, ctx| shim.init(ctx));
+}
+
+// Switches to the provided user context with the user mode.
+///
+/// # Safety
+/// The context must be valid user context.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
+    core::arch::naked_asm!(
+        "switch_to_user_start:",
+        // Flush TLB by reloading CR3
+        "mov rax, cr3",
+        "mov cr3, rax",
+        "xor eax, eax",
+        // Restore user context from ctx.
+        "mov rsp, rdi",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rax",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "add rsp, 8", // skip orig_rax
+        // Stack already has all the values needed for iretq (rip, cs, flags, rsp, ds)
+        // from the `PtRegs` structure.
+        // clear the GS base register (as the `KernelGsBase` MSR contains 0)
+        // while writing the current GS base value to `KernelGsBase`.
+        "swapgs",
+        "iretq",
+        "switch_to_user_end:",
+    );
+}
+
+// Note on user page table management:
+// The legacy platform code creates a new page table to load a program in a separate
+// address space and destroys it when the program terminates. This is why the old syscall
+// handler invokes `change_address_space()`. Previously, the platform does all these because
+// it is the one running the event loop. Once we have an `upcall` mechanism, the runner
+// should be the one manage all these.
 
 // NOTE: The below code is a naive workaround to let LVBS code to access the platform.
 // Rather than doing this, we should implement LVBS interface/provider for the platform.

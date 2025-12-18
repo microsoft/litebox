@@ -335,6 +335,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// # Panics
     /// Panics if the page table is invalid
     #[allow(clippy::similar_names)]
+    #[expect(dead_code)]
     pub(crate) fn change_address_space(&self) -> PhysFrame {
         let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
         let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
@@ -354,6 +355,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// To this end, we use this function to match the physical frame of the page table contained in each user
     /// context structure with the CR3 value in a system call context (before changing the page table).
     #[allow(clippy::similar_names)]
+    #[expect(dead_code)]
     pub(crate) fn get_physical_frame(&self) -> PhysFrame {
         let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
         let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
