@@ -1,14 +1,69 @@
-//! Placeholders for specifying remote pointer access (e.g., reading data from
-//! VTL0 physical memory)
+//! Physical Pointer Abstraction with On-demand Mapping
+//!
+//! This module implements types and traits to support accessing physical addresses
+//! (e.g., VTL0 or normal-world physical memory) from LiteBox with on-demand mapping.
+//! In the context of LVBS and OP-TEE, accessing physical memory is necessary
+//! because VTL0 and VTL1 as well as normal world and secure world do not share
+//! the same virtual address space, but they still have to share data through memory.
+//! VTL1 and secure world receive physical addresses from VTL0 and normal world,
+//! respectively, and they need to read from or write to those addresses.
+//!
+//! To simplify all these, we could persistently map the entire VTL0/normal-world
+//! physical memory into VTL1/secure-world address space at once and just access them
+//! through corresponding virtual addresses. Also, we could define some APIs to let
+//! LiteBox (shim) map/unmap arbitrary physical addresses. However, we do not take
+//! these approaches due to security concerns (e.g., data corruption or information
+//! leakage due to concurrent and persistent access).
+//!
+//! Instead, the approach this module takes is to map the required physical memory
+//! region on-demand when accessing them while using a buffer to copy data to/from
+//! those regions. This way, we can ensure that data must be copied into
+//! LiteBox-managed memory before being used while avoiding any unknown side effects
+//! due to persistent memory mapping.
+//!
+//! Considerations:
+//!
+//! Ideally, we should be able to validate whether a given physical address is okay
+//! to access or even exists in the first place. For example, accessing LiteBox's
+//! own memory with this physical pointer abstraction should be prohibited. Also,
+//! some device memory is mapped to certain physical address ranges and LiteBox
+//! should not touch them without in-depth knowledge. However, this is a bit tricky
+//! because, in many cases, LiteBox does not directly interact with the underlying
+//! hardware or BIOS/UEFI. In the case of LVBS, LiteBox obtains the physical memory
+//! information from VTL0 including the total physical memory size and the memory
+//! range assigned to VTL1/LiteBox. Thus, this module can confirm whether a given
+//! physical address belongs to VTL0's physical memory.
+//!
+//! This module should allow byte-level access while transparently handling page
+//! mapping and data access across page boundaries. This could become complicated
+//! when we consider multiple page sizes (e.g., 4KiB, 2MiB, 1GiB). Also, unaligned
+//! access is matter to be considered.
+//!
+//! In addition, often times, this physical pointer abstraction is involved with
+//! a list of physical page addresses (i.e., scatter-gather list). For example, in
+//! the worse case, a two-byte data structure can span across two physical pages.
+//! Thus, to enhance the performance, we may need to consider mapping multiple pages
+//! at once, copy data from/to them, and unmap them later. Currently, our
+//! implementation (in `litebox_platform_lvbs`) does not implement this functionality
+//! yet and it just maps/unmaps one page at a time. We could define separate
+//! interfaces for this functionality later (e.g., its parameter would be a slice of
+//! `usize` instead of single `usize`).
+//!
+//! When this module needs to access data across physical page boundaries, it assumes
+//! that those physical pages are virtually contiguous in VTL0 or normal-world address
+//! space. Otherwise, this module could end up with accessing incorrect data. This is
+//! best-effort assumption and it is the VTL0 or normal-world side's responsibility
+//! (e.g., even if we always require a list of physical addresses, they can provide
+//! a wrong list by mistake or intentionally).
+
 //! TODO: Improve these and move these to the litebox crate later
 
 use litebox::platform::{RawConstPointer, RawMutPointer};
 
-// TODO: use the one from the litebox crate
 pub trait ValidateAccess {}
 
-/// Trait to access a pointer to remote memory
-/// For now, we only consider copying the entire value before acccessing it.
+/// Trait to access a pointer to physical memory
+/// For now, we only consider copying the entire value before accessing it.
 /// We do not consider byte-level access or unaligned access.
 pub trait RemoteMemoryAccess {
     fn read_at_offset<T>(ptr: *mut T, count: isize) -> Option<T>;
