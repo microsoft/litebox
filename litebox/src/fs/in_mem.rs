@@ -79,6 +79,45 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         }
     }
 
+    /// Initialize a primarily read-heavy file with static data.
+    ///
+    /// While this function could technically work with write-heavy files, it has performance
+    /// benefits _particularly_ for files that are read-only, compared to doing open+write
+    /// operations.
+    ///
+    /// The file is initialized with clone-on-write semantics for the data, meaning that the first
+    /// time a write occurs on the file, it suffers the penalty of the entire data being cloned into
+    /// memory, which is why this is intended primarily for read-only files (such as executables).
+    ///
+    /// # Panics
+    ///
+    /// Panics if used on
+    /// - a closed FD
+    /// - a non-file FD
+    /// - a file that already contains data
+    pub fn initialize_primarily_read_heavy_file(
+        &mut self,
+        fd: &FileFd<Platform>,
+        data: alloc::borrow::Cow<'static, [u8]>,
+    ) {
+        let descriptor_table = self.litebox.descriptor_table();
+        let Descriptor::File {
+            file,
+            read_allowed: _,
+            write_allowed: _,
+            position: _,
+        } = &mut descriptor_table.get_entry_mut(fd).unwrap().entry
+        else {
+            panic!("must only be used on files, not directories")
+        };
+        let mut file = file.write();
+        assert!(
+            file.data.is_empty(),
+            "must only be used on empty files during initialization"
+        );
+        file.data = data;
+    }
+
     /// Execute `f` as a specific user (for testing purposes).
     #[cfg(test)]
     pub fn with_user<F>(&mut self, user: u16, group: u16, f: F)
@@ -184,7 +223,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         mode,
                         userinfo: self.current_user,
                     },
-                    data: Vec::new(),
+                    data: Vec::new().into(),
                     unique_id: self.fresh_id(),
                 })));
                 let old = root.entries.insert(path, entry.clone());
@@ -317,16 +356,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             let end = end_position.min(file.data.len());
             debug_assert!(start <= end);
             let first_half_len = end - start;
-            file.data[start..end].copy_from_slice(&buf[..first_half_len]);
+            file.data.to_mut()[start..end].copy_from_slice(&buf[..first_half_len]);
             first_half_len
         } else {
             if *position > file.data.len() {
                 // Need to pad with 0s because position was past the end of the file
-                file.data.resize(*position, 0);
+                file.data.to_mut().resize(*position, 0);
             }
             0
         };
-        file.data.extend(&buf[start..]);
+        file.data.to_mut().extend(&buf[start..]);
         *position = end_position;
         Ok(buf.len())
     }
@@ -391,9 +430,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
         let mut file_data = file.write();
         match length.cmp(&file_data.data.len()) {
-            core::cmp::Ordering::Less => file_data.data.truncate(length),
-            core::cmp::Ordering::Equal => file_data.data.resize(length, 0),
-            core::cmp::Ordering::Greater => (),
+            core::cmp::Ordering::Less => match &mut file_data.data {
+                alloc::borrow::Cow::Borrowed(d) => {
+                    *d = &d[..length];
+                }
+                alloc::borrow::Cow::Owned(d) => d.truncate(length),
+            },
+            core::cmp::Ordering::Equal => (),
+            core::cmp::Ordering::Greater => file_data.data.to_mut().resize(length, 0),
         }
         if reset_offset {
             *position = 0;
@@ -830,7 +874,7 @@ type File<Platform> = Arc<sync::RwLock<Platform, FileX>>;
 
 pub(crate) struct FileX {
     perms: Permissions,
-    data: Vec<u8>,
+    data: alloc::borrow::Cow<'static, [u8]>,
     unique_id: usize,
 }
 
