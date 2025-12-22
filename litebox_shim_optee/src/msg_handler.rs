@@ -12,7 +12,7 @@
 //! world physical addresses to exchange a large amount of data. Also, like the OP-TEE
 //! SMC call, a certain OP-TEE message/command does not involve with any TA (e.g., register
 //! shared memory).
-use crate::ptr::NormalWorldPtr;
+use crate::ptr::NormalWorldConstPtr;
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 use litebox::mm::linux::PAGE_SIZE;
@@ -72,8 +72,9 @@ pub fn handle_optee_smc_args(
         | OpteeSmcFunction::CallWithRegdArg => {
             let msg_arg_addr = smc.optee_msg_arg_phys_addr()?;
             let msg_arg_addr = usize::try_from(msg_arg_addr).unwrap();
-            let mut ptr = NormalWorldPtr::<OpteeMsgArg, PAGE_SIZE>::try_from_usize(msg_arg_addr)
-                .map_err(|_| OpteeSmcReturn::EBadAddr)?;
+            let mut ptr =
+                NormalWorldConstPtr::<OpteeMsgArg, PAGE_SIZE>::try_from_usize(msg_arg_addr)
+                    .map_err(|_| OpteeSmcReturn::EBadAddr)?;
             let msg_arg = unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturn::EBadAddr)?;
             Ok((
                 OpteeSmcResult::Generic {
@@ -277,7 +278,7 @@ impl ShmRefMap {
         let mut cur_addr = usize::try_from(shm_ref_pages_data_phys_addr).unwrap();
         loop {
             let mut cur_ptr =
-                NormalWorldPtr::<ShmRefPagesData, PAGE_SIZE>::try_from_usize(cur_addr)
+                NormalWorldConstPtr::<ShmRefPagesData, PAGE_SIZE>::try_from_usize(cur_addr)
                     .map_err(|_| OpteeSmcReturn::EBadAddr)?;
             let pages_data =
                 unsafe { cur_ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturn::EBadAddr)?;
