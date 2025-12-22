@@ -12,11 +12,10 @@
 //! world physical addresses to exchange a large amount of data. Also, like the OP-TEE
 //! SMC call, a certain OP-TEE message/command does not involve with any TA (e.g., register
 //! shared memory).
-use crate::ptr::NormalWorldConstPtr;
+use crate::ptr::NormalWorldPtr;
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 use litebox::mm::linux::PAGE_SIZE;
-use litebox::platform::RawConstPointer;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArg, OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction,
     OpteeSmcResult, OpteeSmcReturn,
@@ -73,15 +72,14 @@ pub fn handle_optee_smc_args(
         | OpteeSmcFunction::CallWithRegdArg => {
             let msg_arg_addr = smc.optee_msg_arg_phys_addr()?;
             let msg_arg_addr = usize::try_from(msg_arg_addr).unwrap();
-            let ptr = NormalWorldConstPtr::<OpteeMsgArg>::from_usize(msg_arg_addr);
-            let msg_arg = unsafe { ptr.read_at_offset(0) }
-                .ok_or(OpteeSmcReturn::EBadAddr)?
-                .into_owned();
+            let mut ptr = NormalWorldPtr::<OpteeMsgArg, PAGE_SIZE>::try_from_usize(msg_arg_addr)
+                .map_err(|_| OpteeSmcReturn::EBadAddr)?;
+            let msg_arg = unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturn::EBadAddr)?;
             Ok((
                 OpteeSmcResult::Generic {
                     status: OpteeSmcReturn::Ok,
                 },
-                Some(msg_arg),
+                Some(*msg_arg),
             ))
         }
         OpteeSmcFunction::ExchangeCapabilities => {
@@ -278,10 +276,11 @@ impl ShmRefMap {
         let mut pages = Vec::with_capacity(num_pages);
         let mut cur_addr = usize::try_from(shm_ref_pages_data_phys_addr).unwrap();
         loop {
-            let cur_ptr = NormalWorldConstPtr::<ShmRefPagesData>::from_usize(cur_addr);
-            let pages_data = unsafe { cur_ptr.read_at_offset(0) }
-                .ok_or(OpteeSmcReturn::EBadAddr)?
-                .into_owned();
+            let mut cur_ptr =
+                NormalWorldPtr::<ShmRefPagesData, PAGE_SIZE>::try_from_usize(cur_addr)
+                    .map_err(|_| OpteeSmcReturn::EBadAddr)?;
+            let pages_data =
+                unsafe { cur_ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturn::EBadAddr)?;
             for page in &pages_data.pages_list {
                 if *page == 0 || pages.len() == num_pages {
                     break;
