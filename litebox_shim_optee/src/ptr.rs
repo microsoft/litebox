@@ -174,7 +174,7 @@ pub trait PhysPageMapper {
 /// - `V`: The validator type implementing [`ValidateAccess`] trait to validate the physical addresses
 #[derive(Clone)]
 #[repr(C)]
-pub struct PhysMappedPtr<V, M, T, const ALIGN: usize> {
+pub struct PhysMutPtr<V, M, T, const ALIGN: usize> {
     pages: PhysPageArray<ALIGN>,
     offset: usize,
     count: usize,
@@ -185,9 +185,9 @@ pub struct PhysMappedPtr<V, M, T, const ALIGN: usize> {
 }
 
 impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
-    PhysMappedPtr<V, M, T, ALIGN>
+    PhysMutPtr<V, M, T, ALIGN>
 {
-    /// Create a new `PhysMappedPtr` from the given physical page array and offset.
+    /// Create a new `PhysMutPtr` from the given physical page array and offset.
     pub fn try_from_page_array(
         pages: PhysPageArray<ALIGN>,
         offset: usize,
@@ -219,7 +219,7 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
             _validator: core::marker::PhantomData,
         })
     }
-    /// Create a new `PhysMappedPtr` from the given contiguous physical address and length.
+    /// Create a new `PhysMutPtr` from the given contiguous physical address and length.
     /// The caller must ensure that `pa`, ..., `pa+bytes` are both physically and virtually contiguous.
     pub fn try_from_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
         if bytes < core::mem::size_of::<T>() {
@@ -244,7 +244,7 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
         }
         Self::try_from_page_array(PhysPageArray(pages.into()), pa - start_page)
     }
-    /// Create a new `PhysMappedPtr` from the given physical address for a single object.
+    /// Create a new `PhysMutPtr` from the given physical address for a single object.
     /// This is a shortcut for `try_from_contiguous_pages(pa, size_of::<T>())`.
     pub fn try_from_usize(pa: usize) -> Result<Self, PhysPointerError> {
         Self::try_from_contiguous_pages(pa, core::mem::size_of::<T>())
@@ -345,11 +345,68 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
     }
 }
 
-impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMappedPtr<V, M, T, ALIGN> {
+impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMutPtr<V, M, T, ALIGN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PhysMappedPtr")
-            .field("pages", &self.pages.0)
+        f.debug_struct("PhysMutPtr")
+            .field("pages[0]", &self.pages.0[0])
             .field("offset", &self.offset)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Represent a physical pointer to a read-only object. This wraps around [`PhysMutPtr`] and
+/// exposes only read access.
+#[derive(Clone)]
+#[repr(C)]
+pub struct PhysConstPtr<V, M, T, const ALIGN: usize> {
+    inner: PhysMutPtr<V, M, T, ALIGN>,
+}
+impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
+    PhysConstPtr<V, M, T, ALIGN>
+{
+    /// Create a new `PhysConstPtr` from the given physical page array and offset.
+    pub fn try_from_page_array(
+        pages: PhysPageArray<ALIGN>,
+        offset: usize,
+    ) -> Result<Self, PhysPointerError> {
+        Ok(Self {
+            inner: PhysMutPtr::try_from_page_array(pages, offset)?,
+        })
+    }
+    /// Create a new `PhysConstPtr` from the given contiguous physical address and length.
+    /// The caller must ensure that `pa`, ..., `pa+bytes` are both physically and virtually contiguous.
+    pub fn try_from_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
+        Ok(Self {
+            inner: PhysMutPtr::try_from_contiguous_pages(pa, bytes)?,
+        })
+    }
+    /// Create a new `PhysConstPtr` from the given physical address for a single object.
+    /// This is a shortcut for `try_from_contiguous_pages(pa, size_of::<T>())`.
+    pub fn try_from_usize(pa: usize) -> Result<Self, PhysPointerError> {
+        Ok(Self {
+            inner: PhysMutPtr::try_from_usize(pa)?,
+        })
+    }
+    /// Read the value at the given type-aware offset from the physical pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
+    /// in place (e.g., by the hypervisor or hardware).
+    pub unsafe fn read_at_offset(
+        &mut self,
+        count: usize,
+    ) -> Result<alloc::boxed::Box<T>, PhysPointerError> {
+        unsafe { self.inner.read_at_offset(count) }
+    }
+}
+
+impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysConstPtr<V, M, T, ALIGN> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PhysConstPtr")
+            .field("pages[0]", &self.inner.pages.0[0])
+            .field("offset", &self.inner.offset)
             .finish_non_exhaustive()
     }
 }
@@ -407,6 +464,10 @@ pub enum PhysPointerError {
     NoMappingInfo,
 }
 
-/// Normal world pointer type using MockPhysMemoryMapper for testing purposes.
-pub type NormalWorldPtr<T, const ALIGN: usize> =
-    PhysMappedPtr<NoValidation, MockPhysMemoryMapper, T, ALIGN>;
+/// Normal world constant pointer type using MockPhysMemoryMapper for testing purposes.
+pub type NormalWorldConstPtr<T, const ALIGN: usize> =
+    PhysConstPtr<NoValidation, MockPhysMemoryMapper, T, ALIGN>;
+
+/// Normal world mutable pointer type using MockPhysMemoryMapper for testing purposes.
+pub type NormalWorldMutPtr<T, const ALIGN: usize> =
+    PhysMutPtr<NoValidation, MockPhysMemoryMapper, T, ALIGN>;
