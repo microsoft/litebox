@@ -61,6 +61,16 @@
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use thiserror::Error;
 
+#[inline]
+fn align_down(address: usize, align: usize) -> usize {
+    address & !(align - 1)
+}
+
+#[inline]
+fn align_up(len: usize, align: usize) -> usize {
+    len.next_multiple_of(align)
+}
+
 /// Trait to validate that a physical pointer does not belong to LiteBox-managed memory
 /// (including both kernel and userspace memory).
 ///
@@ -85,17 +95,29 @@ pub trait ValidateAccess {
 /// Data structure for an array of physical pages. These physical pages should be
 /// virtually contiguous in the source address space.
 #[derive(Clone)]
-pub struct PhysPageArray<const ALIGN: usize>(alloc::boxed::Box<[usize]>);
-
-impl PhysPageArray<4096> {
+pub struct PhysPageArray<const ALIGN: usize> {
+    inner: alloc::boxed::Box<[usize]>,
+}
+impl<const ALIGN: usize> PhysPageArray<ALIGN> {
     /// Create a new `PhysPageArray` from the given slice of physical addresses.
     pub fn try_from_slice(addrs: &[usize]) -> Result<Self, PhysPointerError> {
         for addr in addrs {
-            if !addr.is_multiple_of(4096) {
-                return Err(PhysPointerError::UnalignedPhysicalAddress(*addr, 4096));
+            if !addr.is_multiple_of(ALIGN) {
+                return Err(PhysPointerError::UnalignedPhysicalAddress(*addr, ALIGN));
             }
         }
-        Ok(Self(addrs.into()))
+        Ok(Self {
+            inner: alloc::boxed::Box::from(addrs),
+        })
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &usize> {
+        self.inner.iter()
     }
 }
 
@@ -132,6 +154,18 @@ impl From<MemoryRegionPermissions> for PhysPageMapPermissions {
             phys_perms |= PhysPageMapPermissions::WRITE;
         }
         phys_perms
+    }
+}
+impl From<PhysPageMapPermissions> for MemoryRegionPermissions {
+    fn from(perms: PhysPageMapPermissions) -> Self {
+        let mut mem_perms = MemoryRegionPermissions::empty();
+        if perms.contains(PhysPageMapPermissions::READ) {
+            mem_perms |= MemoryRegionPermissions::READ;
+        }
+        if perms.contains(PhysPageMapPermissions::WRITE) {
+            mem_perms |= MemoryRegionPermissions::WRITE;
+        }
+        mem_perms
     }
 }
 
@@ -195,10 +229,14 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
         if offset >= ALIGN {
             return Err(PhysPointerError::InvalidBaseOffset(offset, ALIGN));
         }
-        let size = if pages.0.is_empty() {
+        let size = if pages.is_empty() {
             0
         } else {
-            ALIGN - offset + (pages.0.len() - 1) * ALIGN
+            pages
+                .len()
+                .checked_mul(ALIGN)
+                .ok_or(PhysPointerError::Overflow)?
+                - offset
         };
         if size < core::mem::size_of::<T>() {
             return Err(PhysPointerError::InsufficientPhysicalPages(
@@ -206,7 +244,7 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
                 core::mem::size_of::<T>(),
             ));
         }
-        for pa in &pages.0 {
+        for pa in pages.iter() {
             V::validate::<T>(*pa)?;
         }
         Ok(Self {
@@ -228,28 +266,26 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
                 core::mem::size_of::<T>(),
             ));
         }
-        let start_page = pa - (pa % ALIGN);
-        let end_page = pa + bytes;
-        let end_page_aligned = if end_page.is_multiple_of(ALIGN) {
-            end_page
-        } else {
-            end_page + (ALIGN - (end_page % ALIGN))
-        };
-        let mut pages = alloc::vec::Vec::new();
+        let start_page = align_down(pa, ALIGN);
+        let end_page = align_up(
+            pa.checked_add(bytes).ok_or(PhysPointerError::Overflow)?,
+            ALIGN,
+        );
+        let mut pages = alloc::vec::Vec::with_capacity((end_page - start_page) / ALIGN);
         let mut current_page = start_page;
-        while current_page < end_page_aligned {
+        while current_page < end_page {
             V::validate::<T>(current_page)?;
             pages.push(current_page);
             current_page += ALIGN;
         }
-        Self::try_from_page_array(PhysPageArray(pages.into()), pa - start_page)
+        Self::try_from_page_array(PhysPageArray::try_from_slice(&pages)?, pa - start_page)
     }
     /// Create a new `PhysMutPtr` from the given physical address for a single object.
     /// This is a shortcut for `try_from_contiguous_pages(pa, size_of::<T>())`.
     pub fn try_from_usize(pa: usize) -> Result<Self, PhysPointerError> {
         Self::try_from_contiguous_pages(pa, core::mem::size_of::<T>())
     }
-    /// Read the value at the given type-aware offset from the physical pointer.
+    /// Read the value at the given offset from the physical pointer.
     ///
     /// # Safety
     ///
@@ -287,10 +323,51 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
             }
             unsafe { buffer.assume_init() }
         };
-        self.unmap_all()?;
+        self.unmap()?;
         Ok(alloc::boxed::Box::new(val))
     }
-    /// Write the value at the given type-aware offset to the physical pointer.
+    /// Read a slice of values at the given offset from the physical pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
+    /// in place (e.g., by the hypervisor or hardware).
+    pub unsafe fn read_slice_at_offset(
+        &mut self,
+        count: usize,
+        values: &mut [T],
+    ) -> Result<(), PhysPointerError> {
+        if count
+            .checked_add(values.len())
+            .is_none_or(|end| end > self.count)
+        {
+            return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
+        }
+        self.map_all(PhysPageMapPermissions::READ)?;
+        let Some(map_info) = &self.map_info else {
+            return Err(PhysPointerError::NoMappingInfo);
+        };
+        let addr = unsafe { map_info.base.add(self.offset) }
+            .cast::<T>()
+            .wrapping_add(count);
+        if (addr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            unsafe {
+                core::ptr::copy_nonoverlapping(addr, values.as_mut_ptr(), values.len());
+            }
+        } else {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    addr.cast::<u8>(),
+                    values.as_mut_ptr().cast::<u8>(),
+                    core::mem::size_of_val(values),
+                );
+            }
+        }
+        self.unmap()?;
+        Ok(())
+    }
+    /// Write the value at the given offset to the physical pointer.
     ///
     /// # Safety
     ///
@@ -317,7 +394,48 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
         } else {
             unsafe { core::ptr::write_unaligned(addr, value) };
         }
-        self.unmap_all()?;
+        self.unmap()?;
+        Ok(())
+    }
+    /// Write a slice of values at the given offset to the physical pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
+    /// in place (e.g., by the hypervisor or hardware).
+    pub unsafe fn write_slice_at_offset(
+        &mut self,
+        count: usize,
+        values: &[T],
+    ) -> Result<(), PhysPointerError> {
+        if count
+            .checked_add(values.len())
+            .is_none_or(|end| end > self.count)
+        {
+            return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
+        }
+        self.map_all(PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE)?;
+        let Some(map_info) = &self.map_info else {
+            return Err(PhysPointerError::NoMappingInfo);
+        };
+        let addr = unsafe { map_info.base.add(self.offset) }
+            .cast::<T>()
+            .wrapping_add(count);
+        if (addr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            unsafe {
+                core::ptr::copy_nonoverlapping(values.as_ptr(), addr, values.len());
+            }
+        } else {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    values.as_ptr().cast::<u8>(),
+                    addr.cast::<u8>(),
+                    core::mem::size_of_val(values),
+                );
+            }
+        }
+        self.unmap()?;
         Ok(())
     }
     /// Map the physical pages if not already mapped.
@@ -328,11 +446,13 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
             }
             Ok(())
         } else {
-            Err(PhysPointerError::AlreadyMapped(self.pages.0[0]))
+            Err(PhysPointerError::AlreadyMapped(
+                self.pages.iter().next().copied().unwrap_or(0),
+            ))
         }
     }
     /// Unmap the physical pages if mapped.
-    fn unmap_all(&mut self) -> Result<(), PhysPointerError> {
+    fn unmap(&mut self) -> Result<(), PhysPointerError> {
         if let Some(map_info) = self.map_info.take() {
             unsafe {
                 M::vunmap(map_info)?;
@@ -340,7 +460,9 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
             self.map_info = None;
             Ok(())
         } else {
-            Err(PhysPointerError::Unmapped(self.pages.0[0]))
+            Err(PhysPointerError::Unmapped(
+                self.pages.iter().next().copied().unwrap_or(0),
+            ))
         }
     }
 }
@@ -348,7 +470,7 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
 impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMutPtr<V, M, T, ALIGN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysMutPtr")
-            .field("pages[0]", &self.pages.0[0])
+            .field("pages[0]", &self.pages.iter().next().copied().unwrap_or(0))
             .field("offset", &self.offset)
             .finish_non_exhaustive()
     }
@@ -387,7 +509,7 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
             inner: PhysMutPtr::try_from_usize(pa)?,
         })
     }
-    /// Read the value at the given type-aware offset from the physical pointer.
+    /// Read the value at the given offset from the physical pointer.
     ///
     /// # Safety
     ///
@@ -400,12 +522,29 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
     ) -> Result<alloc::boxed::Box<T>, PhysPointerError> {
         unsafe { self.inner.read_at_offset(count) }
     }
+    /// Read a slice of values at the given offset from the physical pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
+    /// in place (e.g., by the hypervisor or hardware).
+    pub unsafe fn read_slice_at_offset(
+        &mut self,
+        count: usize,
+        values: &mut [T],
+    ) -> Result<(), PhysPointerError> {
+        unsafe { self.inner.read_slice_at_offset(count, values) }
+    }
 }
 
 impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysConstPtr<V, M, T, ALIGN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysConstPtr")
-            .field("pages[0]", &self.inner.pages.0[0])
+            .field(
+                "pages[0]",
+                &self.inner.pages.iter().next().copied().unwrap_or(0),
+            )
             .field("offset", &self.inner.offset)
             .finish_non_exhaustive()
     }
@@ -428,7 +567,7 @@ impl PhysPageMapper for MockPhysMemoryMapper {
     ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
         Ok(PhysPageMapInfo {
             base: core::ptr::null_mut(),
-            size: pages.0.len() * ALIGN,
+            size: pages.iter().count() * ALIGN,
         })
     }
     unsafe fn vunmap<const ALIGN: usize>(
@@ -462,6 +601,8 @@ pub enum PhysPointerError {
     Unmapped(usize),
     #[error("No mapping information available")]
     NoMappingInfo,
+    #[error("Overflow occurred during calculation")]
+    Overflow,
 }
 
 /// Normal world constant pointer type using MockPhysMemoryMapper for testing purposes.
