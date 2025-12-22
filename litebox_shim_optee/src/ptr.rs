@@ -58,7 +58,7 @@
 //! if this module always requires a list of physical addresses, the caller can provide
 //! a wrong list by mistake or intentionally).
 
-use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use thiserror::Error;
 
 /// Trait to validate that a physical pointer does not belong to LiteBox-managed memory
@@ -80,19 +80,6 @@ pub trait ValidateAccess {
     ///
     /// Returns `Some(pa)` if valid. If the pointer is not valid, returns `None`.
     fn validate<T>(pa: usize) -> Result<usize, PhysPointerError>;
-}
-
-/// Trait to access a pointer to physical memory
-/// For now, we only consider copying the entire value before accessing it.
-/// We do not consider byte-level access or unaligned access.
-pub trait RemoteMemoryAccess {
-    fn read_at_offset<T>(ptr: *mut T, count: isize) -> Option<T>;
-
-    fn write_at_offset<T>(ptr: *mut T, count: isize, value: T) -> Option<()>;
-
-    fn slice_from<T>(ptr: *mut T, len: usize) -> Option<alloc::boxed::Box<[T]>>;
-
-    fn copy_from_slice<T>(start_offset: usize, buf: &[T]) -> Option<()>;
 }
 
 /// Data structure for an array of physical pages. These physical pages should be
@@ -135,6 +122,18 @@ bitflags::bitflags! {
         const WRITE = 1 << 1;
     }
 }
+impl From<MemoryRegionPermissions> for PhysPageMapPermissions {
+    fn from(perms: MemoryRegionPermissions) -> Self {
+        let mut phys_perms = PhysPageMapPermissions::empty();
+        if perms.contains(MemoryRegionPermissions::READ) {
+            phys_perms |= PhysPageMapPermissions::READ;
+        }
+        if perms.contains(MemoryRegionPermissions::WRITE) {
+            phys_perms |= PhysPageMapPermissions::WRITE;
+        }
+        phys_perms
+    }
+}
 
 /// Trait to map and unmap physical pages into virtually contiguous address space.
 ///
@@ -165,18 +164,20 @@ pub trait PhysPageMapper {
     ) -> Result<(), PhysPointerError>;
 }
 
-/// Represent a physical pointer to a read-only object.
+/// Represent a physical pointer to an object with on-demand mapping.
 /// - `pages`: An array of page-aligned physical addresses ([`PhysPageArray`]). Physical addresses in
 ///   this array should be virtually contiguous.
 /// - `offset`: The offset within `pages[0]` where the object starts. It should be smaller than `ALIGN`.
+/// - `count`: The number of objects of type `T` that can be accessed from this pointer.
 /// - `T`: The type of the object being pointed to. `pages` with respect to `offset` should cover enough
 ///   memory for an object of type `T`.
 /// - `V`: The validator type implementing [`ValidateAccess`] trait to validate the physical addresses
 #[derive(Clone)]
 #[repr(C)]
-pub struct PhysConstPtr<V, M, T, const ALIGN: usize> {
+pub struct PhysMappedPtr<V, M, T, const ALIGN: usize> {
     pages: PhysPageArray<ALIGN>,
     offset: usize,
+    count: usize,
     map_info: Option<PhysPageMapInfo<ALIGN>>,
     _type: core::marker::PhantomData<T>,
     _mapper: core::marker::PhantomData<M>,
@@ -184,9 +185,9 @@ pub struct PhysConstPtr<V, M, T, const ALIGN: usize> {
 }
 
 impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
-    PhysConstPtr<V, M, T, ALIGN>
+    PhysMappedPtr<V, M, T, ALIGN>
 {
-    /// Create a new `PhysConstPtr` from the given physical page array and offset.
+    /// Create a new `PhysMappedPtr` from the given physical page array and offset.
     pub fn try_from_page_array(
         pages: PhysPageArray<ALIGN>,
         offset: usize,
@@ -211,23 +212,24 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
         Ok(Self {
             pages,
             offset,
+            count: size / core::mem::size_of::<T>(),
             map_info: None,
             _type: core::marker::PhantomData,
             _mapper: core::marker::PhantomData,
             _validator: core::marker::PhantomData,
         })
     }
-    /// Create a new `PhysConstPtr` from the given contiguous physical address and length.
-    /// The caller must ensure that `pa`, ..., `pa+len` are both physically and virtually contiguous.
-    pub fn try_from_contiguous_pages(pa: usize, len: usize) -> Result<Self, PhysPointerError> {
-        if len < core::mem::size_of::<T>() {
+    /// Create a new `PhysMappedPtr` from the given contiguous physical address and length.
+    /// The caller must ensure that `pa`, ..., `pa+bytes` are both physically and virtually contiguous.
+    pub fn try_from_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
+        if bytes < core::mem::size_of::<T>() {
             return Err(PhysPointerError::InsufficientPhysicalPages(
-                len,
+                bytes,
                 core::mem::size_of::<T>(),
             ));
         }
         let start_page = pa - (pa % ALIGN);
-        let end_page = pa + len;
+        let end_page = pa + bytes;
         let end_page_aligned = if end_page.is_multiple_of(ALIGN) {
             end_page
         } else {
@@ -242,218 +244,140 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
         }
         Self::try_from_page_array(PhysPageArray(pages.into()), pa - start_page)
     }
-    /// Map the physical pages if not already mapped.
-    fn map(&mut self) -> Result<(), PhysPointerError> {
-        if self.map_info.is_none() {
-            unsafe {
-                self.map_info = Some(M::vmap(self.pages.clone(), PhysPageMapPermissions::READ)?);
-            }
+    /// Create a new `PhysMappedPtr` from the given physical address for a single object.
+    /// This is a shortcut for `try_from_contiguous_pages(pa, size_of::<T>())`.
+    pub fn try_from_usize(pa: usize) -> Result<Self, PhysPointerError> {
+        Self::try_from_contiguous_pages(pa, core::mem::size_of::<T>())
+    }
+    /// Read the value at the given type-aware offset from the physical pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
+    /// in place (e.g., by the hypervisor or hardware).
+    pub unsafe fn read_at_offset(
+        &mut self,
+        count: usize,
+    ) -> Result<alloc::boxed::Box<T>, PhysPointerError> {
+        if count >= self.count {
+            return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
+        self.map_all(PhysPageMapPermissions::READ)?;
+        let Some(map_info) = &self.map_info else {
+            return Err(PhysPointerError::NoMappingInfo);
+        };
+        let addr = unsafe { map_info.base.add(self.offset) }
+            .cast::<T>()
+            .wrapping_add(count);
+        let val = {
+            let mut buffer = core::mem::MaybeUninit::<T>::uninit();
+            if (addr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(addr, buffer.as_mut_ptr(), 1);
+                }
+            } else {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        addr.cast::<u8>(),
+                        buffer.as_mut_ptr().cast::<u8>(),
+                        core::mem::size_of::<T>(),
+                    );
+                }
+            }
+            unsafe { buffer.assume_init() }
+        };
+        self.unmap_all()?;
+        Ok(alloc::boxed::Box::new(val))
+    }
+    /// Write the value at the given type-aware offset to the physical pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
+    /// in place (e.g., by the hypervisor or hardware).
+    pub unsafe fn write_at_offset(
+        &mut self,
+        count: usize,
+        value: T,
+    ) -> Result<(), PhysPointerError> {
+        if count >= self.count {
+            return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
+        }
+        self.map_all(PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE)?;
+        let Some(map_info) = &self.map_info else {
+            return Err(PhysPointerError::NoMappingInfo);
+        };
+        let addr = unsafe { map_info.base.add(self.offset) }
+            .cast::<T>()
+            .wrapping_add(count);
+        if (addr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            unsafe { core::ptr::write(addr, value) };
+        } else {
+            unsafe { core::ptr::write_unaligned(addr, value) };
+        }
+        self.unmap_all()?;
         Ok(())
     }
+    /// Map the physical pages if not already mapped.
+    fn map_all(&mut self, perms: PhysPageMapPermissions) -> Result<(), PhysPointerError> {
+        if self.map_info.is_none() {
+            unsafe {
+                self.map_info = Some(M::vmap(self.pages.clone(), perms)?);
+            }
+            Ok(())
+        } else {
+            Err(PhysPointerError::AlreadyMapped(self.pages.0[0]))
+        }
+    }
     /// Unmap the physical pages if mapped.
-    fn unmap(&mut self) -> Result<(), PhysPointerError> {
+    fn unmap_all(&mut self) -> Result<(), PhysPointerError> {
         if let Some(map_info) = self.map_info.take() {
             unsafe {
                 M::vunmap(map_info)?;
             }
             self.map_info = None;
+            Ok(())
+        } else {
+            Err(PhysPointerError::Unmapped(self.pages.0[0]))
         }
-        Ok(())
-    }
-    pub fn as_usize(&mut self) -> Result<usize, PhysPointerError> {
-        todo!()
-    }
-    pub fn from_usize(&mut self, addr: usize) -> Result<(), PhysPointerError> {
-        todo!()
     }
 }
 
-impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysConstPtr<V, M, T, ALIGN> {
+impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMappedPtr<V, M, T, ALIGN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PhysConstPtr")
+        f.debug_struct("PhysMappedPtr")
             .field("pages", &self.pages.0)
             .field("offset", &self.offset)
             .finish_non_exhaustive()
     }
 }
 
-#[repr(C)]
-pub struct RemoteConstPtr<V, A, T> {
-    inner: *const T,
-    _access: core::marker::PhantomData<A>,
-    _validator: core::marker::PhantomData<V>,
-}
-
-impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RemoteConstPtr<V, A, T> {
-    pub fn from_ptr(ptr: *const T) -> Self {
-        Self {
-            inner: ptr,
-            _access: core::marker::PhantomData,
-            _validator: core::marker::PhantomData,
-        }
-    }
-}
-
-impl<V, A, T> Clone for RemoteConstPtr<V, A, T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<V, A, T> Copy for RemoteConstPtr<V, A, T> {}
-
-impl<V, A, T: Clone> core::fmt::Debug for RemoteConstPtr<V, A, T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_tuple("RemoteConstPtr").field(&self.inner).finish()
-    }
-}
-
-impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RawConstPointer<T>
-    for RemoteConstPtr<V, A, T>
-{
-    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
-        let val = A::read_at_offset(self.inner.cast_mut(), count)?;
-        Some(val)
-    }
-
-    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        // TODO: read data from the remote side
-        if len == 0 {
-            return Some(alloc::boxed::Box::new([]));
-        }
-        let mut data = alloc::vec::Vec::new();
-        data.reserve_exact(len);
-        unsafe { data.set_len(len) };
-        Some(data.into_boxed_slice())
-    }
-
-    fn as_usize(&self) -> usize {
-        self.inner.expose_provenance()
-    }
-
-    fn from_usize(addr: usize) -> Self {
-        Self {
-            inner: core::ptr::with_exposed_provenance(addr),
-            _access: core::marker::PhantomData,
-            _validator: core::marker::PhantomData,
-        }
-    }
-}
-
-#[repr(C)]
-pub struct RemoteMutPtr<V, A, T> {
-    inner: *mut T,
-    _access: core::marker::PhantomData<A>,
-    _validator: core::marker::PhantomData<V>,
-}
-
-impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RemoteMutPtr<V, A, T> {
-    pub fn from_ptr(ptr: *mut T) -> Self {
-        Self {
-            inner: ptr,
-            _access: core::marker::PhantomData,
-            _validator: core::marker::PhantomData,
-        }
-    }
-}
-
-impl<V, A, T> Clone for RemoteMutPtr<V, A, T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<V, A, T> Copy for RemoteMutPtr<V, A, T> {}
-
-impl<V, A, T: Clone> core::fmt::Debug for RemoteMutPtr<V, A, T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_tuple("RemoteMutPtr").field(&self.inner).finish()
-    }
-}
-
-impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RawConstPointer<T>
-    for RemoteMutPtr<V, A, T>
-{
-    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
-        let val = A::read_at_offset(self.inner, count)?;
-        Some(val)
-    }
-
-    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        // TODO: read data from the remote side
-        if len == 0 {
-            return Some(alloc::boxed::Box::new([]));
-        }
-        let data = A::slice_from(self.inner, len)?;
-        Some(data)
-    }
-
-    fn as_usize(&self) -> usize {
-        self.inner.expose_provenance()
-    }
-
-    fn from_usize(addr: usize) -> Self {
-        Self::from_ptr(core::ptr::with_exposed_provenance_mut(addr))
-    }
-}
-
-impl<V: ValidateAccess, A: RemoteMemoryAccess, T: Clone> RawMutPointer<T>
-    for RemoteMutPtr<V, A, T>
-{
-    unsafe fn write_at_offset<'a>(self, count: isize, value: T) -> Option<()> {
-        A::write_at_offset(self.inner, count, value)
-    }
-
-    fn mutate_subslice_with<R>(
-        self,
-        _range: impl core::ops::RangeBounds<isize>,
-        _f: impl FnOnce(&mut [T]) -> R,
-    ) -> Option<R> {
-        unimplemented!("use write_slice_at_offset instead")
-    }
-
-    fn copy_from_slice(self, start_offset: usize, buf: &[T]) -> Option<()>
-    where
-        T: Copy,
-    {
-        A::copy_from_slice(start_offset, buf)
-    }
-}
-
 // TODO: Sample no-op implementations to be removed. Implement a validation mechanism for
 // VTL0 physical addresses (e.g., ensure this physical address does not belong to VTL1)
-pub struct Novalidation;
-impl ValidateAccess for Novalidation {
+pub struct NoValidation;
+impl ValidateAccess for NoValidation {
     fn validate<T>(pa: usize) -> Result<usize, PhysPointerError> {
         Ok(pa)
     }
 }
 
-pub struct Vtl0PhysMemoryAccess;
-impl RemoteMemoryAccess for Vtl0PhysMemoryAccess {
-    fn read_at_offset<T>(_ptr: *mut T, _count: isize) -> Option<T> {
-        // TODO: read a value from VTL0 physical memory
-        let val: T = unsafe { core::mem::zeroed() };
-        Some(val)
+pub struct MockPhysMemoryMapper;
+impl PhysPageMapper for MockPhysMemoryMapper {
+    unsafe fn vmap<const ALIGN: usize>(
+        pages: PhysPageArray<ALIGN>,
+        _perms: PhysPageMapPermissions,
+    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
+        Ok(PhysPageMapInfo {
+            base: core::ptr::null_mut(),
+            size: pages.0.len() * ALIGN,
+        })
     }
-
-    fn write_at_offset<T>(_ptr: *mut T, _count: isize, _value: T) -> Option<()> {
-        // TODO: write a value to VTL0 physical memory
-        Some(())
-    }
-
-    fn slice_from<T>(_ptr: *mut T, len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        // TODO: read a slice from VTL0 physical memory
-        let mut data: alloc::vec::Vec<T> = alloc::vec::Vec::new();
-        data.reserve_exact(len);
-        unsafe { data.set_len(len) };
-        Some(data.into_boxed_slice())
-    }
-
-    fn copy_from_slice<T>(_start_offset: usize, _buf: &[T]) -> Option<()> {
-        // TODO: write a slice to VTL0 physical memory
-        Some(())
+    unsafe fn vunmap<const ALIGN: usize>(
+        _vmap_info: PhysPageMapInfo<ALIGN>,
+    ) -> Result<(), PhysPointerError> {
+        Ok(())
     }
 }
 
@@ -473,12 +397,16 @@ pub enum PhysPointerError {
         "The total size of the given pages ({0} bytes) is insufficient for the requested type ({1} bytes)"
     )]
     InsufficientPhysicalPages(usize, usize),
+    #[error("Index {0} is out of bounds (count: {1})")]
+    IndexOutOfBounds(usize, usize),
+    #[error("Physical address {0:#x} is already mapped")]
+    AlreadyMapped(usize),
+    #[error("Physical address {0:#x} is unmapped")]
+    Unmapped(usize),
+    #[error("No mapping information available")]
+    NoMappingInfo,
 }
 
-/// Normal world const pointer type. For now, we only consider VTL0 physical memory but it can be
-/// something else like TrustZone normal world, other VMPL or TD partition, or other processes.
-pub type NormalWorldConstPtr<T> = RemoteConstPtr<Novalidation, Vtl0PhysMemoryAccess, T>;
-
-/// Normal world mutable pointer type. For now, we only consider VTL0 physical memory but it can be
-/// something else like TrustZone normal world, other VMPL or TD partition, or other processes.
-pub type NormalWorldMutPtr<T> = RemoteMutPtr<Novalidation, Vtl0PhysMemoryAccess, T>;
+/// Normal world pointer type using MockPhysMemoryMapper for testing purposes.
+pub type NormalWorldPtr<T, const ALIGN: usize> =
+    PhysMappedPtr<NoValidation, MockPhysMemoryMapper, T, ALIGN>;
