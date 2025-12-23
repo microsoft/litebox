@@ -1,6 +1,7 @@
 #![no_std]
 
 use core::panic::PanicInfo;
+use litebox::mm::linux::PAGE_SIZE;
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
     debug_serial_println,
@@ -10,7 +11,7 @@ use litebox_platform_lvbs::{
         hvcall,
         vtl_switch::vtl_switch_loop_entry,
         vtl1_mem_layout::{
-            PAGE_SIZE, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
+            VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
             VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
         },
     },
@@ -103,7 +104,6 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
 // This will be revised once the upcall interface is finalized.
 // NOTE: This function doesn't work because `run_thread` is not ready.
 // It is okay to remove this function in this PR and add it in a follow-up PR.
-use litebox::platform::{RawConstPointer, RawMutPointer};
 use litebox_common_optee::{
     LdelfArg, OpteeMessageCommand, OpteeMsgArg, OpteeSmcArgs, OpteeSmcReturn, TeeIdentity,
     TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
@@ -116,10 +116,9 @@ use litebox_shim_optee::msg_handler::{
 use litebox_shim_optee::ptr::{NormalWorldConstPtr, NormalWorldMutPtr};
 #[expect(dead_code)]
 fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeSmcReturn> {
-    let smc_args_ptr = NormalWorldConstPtr::<OpteeSmcArgs>::from_usize(smc_args_addr);
-    let mut smc_args = unsafe { smc_args_ptr.read_at_offset(0) }
-        .unwrap()
-        .into_owned();
+    let mut smc_args_ptr =
+        NormalWorldConstPtr::<OpteeSmcArgs, PAGE_SIZE>::try_from_usize(smc_args_addr)?;
+    let mut smc_args = unsafe { smc_args_ptr.read_at_offset(0) }?;
     let msg_arg_phys_addr = smc_args.optee_msg_arg_phys_addr()?;
     let (res, msg_arg) = handle_optee_smc_args(&mut smc_args)?;
     if let Some(mut msg_arg) = msg_arg {
@@ -201,10 +200,10 @@ fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeS
 
                     prepare_for_return_to_normal_world(&ta_params, &ta_req_info, &mut msg_arg)?;
 
-                    let ptr = NormalWorldMutPtr::<OpteeMsgArg>::from_usize(
+                    let mut ptr = NormalWorldMutPtr::<OpteeMsgArg, PAGE_SIZE>::try_from_usize(
                         usize::try_from(msg_arg_phys_addr).unwrap(),
-                    );
-                    let _ = unsafe { ptr.write_at_offset(0, msg_arg) };
+                    )?;
+                    unsafe { ptr.write_at_offset(0, msg_arg) }?;
                 } else {
                     // retrieve `ta_info` from global data structure
                     todo!()
