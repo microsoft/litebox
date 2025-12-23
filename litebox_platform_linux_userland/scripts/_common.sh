@@ -1,4 +1,7 @@
-#!/bin/bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
 
 # Script intended to be sourced as a common helper for other scripts.
 

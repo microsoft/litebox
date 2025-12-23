@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Common implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
 use litebox::{

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A shim that provides an OP-TEE-compatible ABI via LiteBox
 
 #![cfg(target_arch = "x86_64")]

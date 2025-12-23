@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A reader-writer lock
 //!
 //! This type of lock allows a number of readers or at most one writer at any point in time. The

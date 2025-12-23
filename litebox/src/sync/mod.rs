@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Higher-level synchronization primitives
 //!
 //! The implementation for some of the components in this module (specifically, [`Mutex`] and

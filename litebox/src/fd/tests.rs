@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use alloc::string::String;
 use alloc::string::ToString as _;
 use alloc::vec;

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Per-CPU VTL1 kernel variables
 
 use crate::{

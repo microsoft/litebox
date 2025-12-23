@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use core::{convert::Infallible, sync::atomic::AtomicBool};
 
 use alloc::{

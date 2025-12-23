@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Unix domain socket implementation for the Linux shim layer.
 
 use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use crate::MutPtr;
 use crate::syscalls::signal::{DeliverFault, SignalState};
 use core::mem::offset_of;

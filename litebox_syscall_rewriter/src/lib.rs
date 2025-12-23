@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Rewrite ELF files to hook syscalls
 //!
 //! This crate sets up a trampoline point for every `syscall` instruction in its input binary,

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Event file for notification
 
 use core::sync::atomic::AtomicU32;

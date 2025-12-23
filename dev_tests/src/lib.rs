@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! This crate only makes sense in testing mode
 #![cfg(test)]
 

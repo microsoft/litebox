@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Common elements to enable OP-TEE-like functionalities
 
 #![cfg(target_arch = "x86_64")]

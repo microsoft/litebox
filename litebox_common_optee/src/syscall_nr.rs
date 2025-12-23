@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use num_enum::TryFromPrimitive;
 
 const SYSCALL_SYS_RETURN: u32 = 0;

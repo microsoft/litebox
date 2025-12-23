@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Different host implementations of [`super::HostInterface`]
 pub mod bootparam;
 pub mod linux;

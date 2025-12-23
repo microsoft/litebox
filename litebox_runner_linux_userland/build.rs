@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use std::path::PathBuf;
 
 const RTLD_AUDIT_DIR: &str = "../litebox_rtld_audit";

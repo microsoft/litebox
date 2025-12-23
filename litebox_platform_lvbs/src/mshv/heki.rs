@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use crate::{
     host::linux::ListHead,
     mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE},

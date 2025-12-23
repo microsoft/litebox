@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>

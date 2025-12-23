@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Miscellaneous Linux syscalls for LiteBox shim.
 //!
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Utilities for use _within_ LiteBox, but not exposed to users of LiteBox
 
 pub(crate) mod anymap;

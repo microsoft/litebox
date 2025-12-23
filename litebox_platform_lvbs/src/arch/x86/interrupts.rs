@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Interrupt Descriptor Table (IDT)
 
 use crate::mshv::HYPERVISOR_CALLBACK_VECTOR;

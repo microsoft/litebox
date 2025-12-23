@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Implementations of trivial providers.
 //!
 //! Most users of LiteBox may possibly need more featureful providers, provided by other crates;

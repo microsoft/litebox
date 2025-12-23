@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #include <unistd.h>
 #include <errno.h>
 #include <stdio.h>

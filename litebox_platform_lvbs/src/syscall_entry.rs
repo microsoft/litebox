@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use crate::debug_serial_println;
 use crate::{
     host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},

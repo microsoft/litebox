@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Implementation of cryptography related syscalls
 
 use crate::with_current_task;

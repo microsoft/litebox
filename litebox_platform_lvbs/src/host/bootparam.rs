@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! VTL1 kernel boot parameters (compatible with Linux kernel's boot_params structure and command line)
 
 use crate::{

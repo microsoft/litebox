@@ -1,3 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 SRC = rtld_audit.c
 OUT_DIR ?= .
 OUTPUT = $(OUT_DIR)/litebox_rtld_audit.so

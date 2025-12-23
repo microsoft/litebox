@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A multiplexer for [LiteBox platforms](../litebox/platform/index.html), to simplify access to a
 //! global platform for shims "above" LiteBox.
 //!

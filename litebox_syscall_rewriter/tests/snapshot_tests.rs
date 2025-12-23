@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 fn objdump(binary: &[u8]) -> String {
     use std::io::Write;
     use std::process::Command;

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use anyhow::{Result, bail};
 use fs::File;
 use fs_err as fs;

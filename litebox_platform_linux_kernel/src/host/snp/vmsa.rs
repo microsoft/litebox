@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #[repr(C, packed)]
 pub struct VmsaSegmentRegister {
     pub selector: u16,

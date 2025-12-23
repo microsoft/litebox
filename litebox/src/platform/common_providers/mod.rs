@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Common Platform Provider Implementations
 //!
 //! This module contains reusable implementations of platform provider traits that

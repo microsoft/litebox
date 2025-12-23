@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Allocator that uses buddy allocator for pages and slab allocator for small objects.
 
 use core::{

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! ELF loader for LiteBox
 
 use alloc::{ffi::CString, string::ToString};

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Miscellaneous "kitchen sink" for use in various LiteBox crates.
 //!
 //! Note: while we do not anticipate significant API changes in these utilities, these utilities do

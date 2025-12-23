@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! This module contains the loader for the LiteBox shim.
 
 pub(crate) mod elf;

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use super::{cryp::sys_cryp_random_number_generate, tee::sys_log};
 use litebox_platform_multiplex::{Platform, set_platform};
 

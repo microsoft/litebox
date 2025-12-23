@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! OP-TEE TA on Linux userland tests
 //! OP-TEE TAs need clients to work with that this Linux userland runner lacks.
 //! Instead, these tests use pre-defined JSON-formatted command sequences to test TAs.

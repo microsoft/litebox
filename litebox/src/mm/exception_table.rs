@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Exception Table Infrastructure
 //!
 //! This module provides the core exception table mechanism used by fallible

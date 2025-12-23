@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Observer pattern utilities for event handling.
 
 use alloc::collections::btree_map::BTreeMap;

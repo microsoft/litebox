@@ -1,3 +1,6 @@
+/* Copyright (c) Microsoft Corporation.
+   Licensed under the MIT license. */
+
 .global sandbox_process_ret_from_fork;
 
     .code64

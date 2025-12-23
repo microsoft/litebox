@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Memory management module
 
 use crate::arch::{PhysAddr, VirtAddr};

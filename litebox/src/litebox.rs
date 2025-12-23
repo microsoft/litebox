@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A module to house all the code for the top-level [`LiteBox`] object.
 
 use alloc::sync::Arc;

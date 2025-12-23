@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 fn build_binding_from_sandbox_driver() {
     let bindings = bindgen::Builder::default()
         .clang_arg("--target=x86_64-unknown-none")
