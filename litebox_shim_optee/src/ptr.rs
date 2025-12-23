@@ -109,6 +109,9 @@ impl<const ALIGN: usize> PhysPageArray<ALIGN> {
                 return Err(PhysPointerError::UnalignedPhysicalAddress(*addr, ALIGN));
             }
         }
+        // TODO: Remove this check once our platform implementations support virtually
+        // contiguous non-contiguous physical page mapping.
+        Self::check_contiguity(addrs)?;
         Ok(Self {
             inner: alloc::boxed::Box::from(addrs),
         })
@@ -124,6 +127,21 @@ impl<const ALIGN: usize> PhysPageArray<ALIGN> {
     /// Return the first physical address in the array if exists.
     pub fn first(&self) -> Option<usize> {
         self.inner.first().copied()
+    }
+    /// Checks whether the given physical addresses are contiguous with respect to ALIGN.
+    ///
+    /// Note: This is a temporary check to let this module work with our platform implementations
+    /// which map physical pages with a fixed offset (`MemoryProvider::GVA_OFFSET`) such that
+    /// do not support non-contiguous physical page mapping with contiguous virtual addresses.
+    fn check_contiguity(addrs: &[usize]) -> Result<(), PhysPointerError> {
+        for window in addrs.windows(2) {
+            let first = window[0];
+            let second = window[1];
+            if second != first.checked_add(ALIGN).ok_or(PhysPointerError::Overflow)? {
+                return Err(PhysPointerError::NonContiguousPages);
+            }
+        }
+        Ok(())
     }
 }
 impl<const ALIGN: usize> core::iter::Iterator for PhysPageArray<ALIGN> {
@@ -690,35 +708,6 @@ impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysConstPtr<V, M,
     }
 }
 
-/// This is a mock implementation that does no validation. Each platform which supports
-/// `PhysMutPtr` and `PhysConstPtr` should provide its `ValidateAccess` implementation.
-pub struct NoValidation;
-impl ValidateAccess for NoValidation {
-    fn validate<T>(pa: usize) -> Result<usize, PhysPointerError> {
-        Ok(pa)
-    }
-}
-
-/// This is a mock implementation that does no actual mapping. Each platform which supports
-/// `PhysMutPtr` and `PhysConstPtr` should provide its `PhysPageMapper` implementation.
-pub struct MockPhysMemoryMapper;
-impl PhysPageMapper for MockPhysMemoryMapper {
-    unsafe fn vmap<const ALIGN: usize>(
-        pages: PhysPageArray<ALIGN>,
-        _perms: PhysPageMapPermissions,
-    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
-        Ok(PhysPageMapInfo {
-            base: core::ptr::null_mut(),
-            size: pages.iter().count() * ALIGN,
-        })
-    }
-    unsafe fn vunmap<const ALIGN: usize>(
-        _vmap_info: PhysPageMapInfo<ALIGN>,
-    ) -> Result<(), PhysPointerError> {
-        Ok(())
-    }
-}
-
 /// Possible errors for physical page access
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -745,6 +734,37 @@ pub enum PhysPointerError {
     NoMappingInfo,
     #[error("Overflow occurred during calculation")]
     Overflow,
+    #[error("Non-contiguous physical pages in the array")]
+    NonContiguousPages,
+}
+
+/// This is a mock implementation that does no validation. Each platform which supports
+/// `PhysMutPtr` and `PhysConstPtr` should provide its `ValidateAccess` implementation.
+pub struct NoValidation;
+impl ValidateAccess for NoValidation {
+    fn validate<T>(pa: usize) -> Result<usize, PhysPointerError> {
+        Ok(pa)
+    }
+}
+
+/// This is a mock implementation that does no actual mapping. Each platform which supports
+/// `PhysMutPtr` and `PhysConstPtr` should provide its `PhysPageMapper` implementation.
+pub struct MockPhysMemoryMapper;
+impl PhysPageMapper for MockPhysMemoryMapper {
+    unsafe fn vmap<const ALIGN: usize>(
+        _pages: PhysPageArray<ALIGN>,
+        _perms: PhysPageMapPermissions,
+    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
+        Ok(PhysPageMapInfo {
+            base: core::ptr::null_mut(),
+            size: 0,
+        })
+    }
+    unsafe fn vunmap<const ALIGN: usize>(
+        _vmap_info: PhysPageMapInfo<ALIGN>,
+    ) -> Result<(), PhysPointerError> {
+        Ok(())
+    }
 }
 
 /// Normal world constant pointer type using MockPhysMemoryMapper for testing purposes.
