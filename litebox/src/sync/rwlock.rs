@@ -1,5 +1,6 @@
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) The Rust Project Contributors & Microsoft Corporation.
 // Licensed under the MIT license.
+// See ./mod.rs for more details for modifications from the original Rust source for this file.
 
 //! A reader-writer lock
 //!
