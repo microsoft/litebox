@@ -15,6 +15,9 @@ use std::time::Duration;
 use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
+use litebox::platform::vmap::{
+    PhysPageArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
+};
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
@@ -2184,6 +2187,29 @@ unsafe fn interrupt_signal_handler(
 impl litebox::platform::CrngProvider for LinuxUserland {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
         getrandom::fill(buf).expect("getrandom failed");
+    }
+}
+
+/// Dummy `VmapProvider`.
+///
+/// In general, userland platforms do not support `vmap` and `vunmap` (which are kernel functions).
+/// We might need to emulate these functions' behaviors using virtual addresses for development or
+/// testing, or use a kernel module to provide this functionality (if needed).
+impl<const ALIGN: usize> VmapProvider<ALIGN> for LinuxUserland {
+    type PhysPageArray = PhysPageArray<ALIGN>;
+    type PhysPageMapInfo = PhysPageMapInfo<ALIGN>;
+    unsafe fn vmap(
+        &self,
+        _pages: Self::PhysPageArray,
+        _perms: PhysPageMapPermissions,
+    ) -> Result<Self::PhysPageMapInfo, PhysPointerError> {
+        Err(PhysPointerError::UnsupportedOperation)
+    }
+    unsafe fn vunmap(&self, _vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError> {
+        Err(PhysPointerError::UnsupportedOperation)
+    }
+    fn validate<T>(&self, _pa: usize) -> Result<usize, PhysPointerError> {
+        Err(PhysPointerError::UnsupportedOperation)
     }
 }
 

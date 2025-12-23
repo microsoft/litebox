@@ -1240,3 +1240,6 @@ mod test_utils {
         }
     }
 }
+
+pub type NormalWorldConstPtr<T, const ALIGN: usize> = crate::ptr::PhysConstPtr<T, ALIGN>;
+pub type NormalWorldMutPtr<T, const ALIGN: usize> = crate::ptr::PhysMutPtr<T, ALIGN>;

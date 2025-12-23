@@ -1,7 +1,10 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Physical Pointer Abstraction with On-demand Mapping
 //!
-//! This module implements types and traits to support accessing physical addresses
-//! (e.g., VTL0 or normal-world physical memory) from LiteBox with on-demand mapping.
+//! This module adds supports for accessing physical addresses (e.g., VTL0 or
+//! normal-world physical memory) from LiteBox with on-demand mapping.
 //! In the context of LVBS and OP-TEE, accessing physical memory is necessary
 //! because VTL0 and VTL1 as well as normal world and secure world do not share
 //! the same virtual address space, but they still have to share data through memory.
@@ -10,12 +13,10 @@
 //!
 //! To simplify all these, we could persistently map the entire VTL0/normal-world
 //! physical memory into VTL1/secure-world address space at once and just access them
-//! through corresponding virtual addresses. Also, we could define some APIs to let
-//! LiteBox (shim) map/unmap arbitrary physical addresses (i.e., implementing and
-//! exposing APIs like Linux kernel's `vmap()` and `vunmap()`). However, this module
-//! does not take these approaches due to scalability (e.g., how to deal with a system
-//! with terabytes of physical memory?) and security concerns (e.g., data corruption or
-//! information leakage due to concurrent or persistent access).
+//! through corresponding virtual addresses. However, this module does not take these
+//! approaches due to scalability (e.g., how to deal with a system with terabytes of
+//! physical memory?) and security concerns (e.g., data corruption or information
+//! leakage due to concurrent or persistent access).
 //!
 //! Instead, the approach this module takes is to map the required physical memory
 //! region on-demand when accessing them while using a LiteBox-managed buffer to copy
@@ -57,9 +58,14 @@
 //! if this module always requires a list of physical addresses, the caller might
 //! provide a wrong list by mistake or intentionally).
 
+// TODO: Since the below `PhysMutPtr` and `PhysConstPtr` are not OP-TEE specific,
+// we can move them to a different crate (e.g., `litebox`) if needed.
+
 use core::ops::Deref;
-use litebox::platform::page_mgmt::MemoryRegionPermissions;
-use thiserror::Error;
+use litebox::platform::vmap::{
+    PhysPageArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
+};
+use litebox_platform_multiplex::{Platform, platform};
 
 #[inline]
 fn align_down(address: usize, align: usize) -> usize {
@@ -71,204 +77,25 @@ fn align_up(len: usize, align: usize) -> usize {
     len.next_multiple_of(align)
 }
 
-/// Trait to validate that a physical pointer does not belong to LiteBox-managed memory
-/// (including both kernel and userspace memory).
-///
-/// This validation is mainly to deal with the Boomerang attack where a normal-world client
-/// tricks the secure-world kernel (i.e., LiteBox) to access the secure-world memory.
-/// However, even if there is no such threat (e.g., no normal/secure world separation),
-/// this validation is still beneficial to ensure the memory safety by doing not access
-/// LiteBox-managed memory without going through its memory allocator.
-///
-/// Succeeding these operations does not guarantee that the physical pointer is valid to
-/// access, just that it is outside of LiteBox-managed memory and won't be used to access
-/// it as an unmanaged channel.
-pub trait ValidateAccess {
-    /// Validate that the given physical pointer does not belong to LiteBox-managed memory.
-    ///
-    /// Here, we do not use `*const T` or `*mut T` because this is a physical pointer which
-    /// must not be dereferenced directly.
-    ///
-    /// Returns `Ok(pa)` if valid. If the pointer is not valid, returns `Err(PhysPointerError)`.
-    fn validate<T>(pa: usize) -> Result<usize, PhysPointerError>;
-}
-
-/// Data structure for an array of physical pages. These physical pages should be
-/// virtually contiguous in the source address space.
-#[derive(Clone)]
-pub struct PhysPageArray<const ALIGN: usize> {
-    inner: alloc::boxed::Box<[usize]>,
-}
-impl<const ALIGN: usize> PhysPageArray<ALIGN> {
-    /// Create a new `PhysPageArray` from the given slice of physical addresses.
-    ///
-    /// All page addresses must be aligned to `ALIGN`.
-    pub fn try_from_slice(addrs: &[usize]) -> Result<Self, PhysPointerError> {
-        for addr in addrs {
-            if !addr.is_multiple_of(ALIGN) {
-                return Err(PhysPointerError::UnalignedPhysicalAddress(*addr, ALIGN));
-            }
-        }
-        // TODO: Remove this check once our platform implementations support virtually
-        // contiguous non-contiguous physical page mapping.
-        Self::check_contiguity(addrs)?;
-        Ok(Self {
-            inner: alloc::boxed::Box::from(addrs),
-        })
-    }
-    /// Check if the array is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-    /// Return the number of physical pages in the array.
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-    /// Return the first physical address in the array if exists.
-    pub fn first(&self) -> Option<usize> {
-        self.inner.first().copied()
-    }
-    /// Checks whether the given physical addresses are contiguous with respect to ALIGN.
-    ///
-    /// Note: This is a temporary check to let this module work with our platform implementations
-    /// which map physical pages with a fixed offset (`MemoryProvider::GVA_OFFSET`) such that
-    /// do not support non-contiguous physical page mapping with contiguous virtual addresses.
-    fn check_contiguity(addrs: &[usize]) -> Result<(), PhysPointerError> {
-        for window in addrs.windows(2) {
-            let first = window[0];
-            let second = window[1];
-            if second != first.checked_add(ALIGN).ok_or(PhysPointerError::Overflow)? {
-                return Err(PhysPointerError::NonContiguousPages);
-            }
-        }
-        Ok(())
-    }
-}
-impl<const ALIGN: usize> core::iter::Iterator for PhysPageArray<ALIGN> {
-    type Item = usize;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.inner.is_empty() {
-            None
-        } else {
-            Some(self.inner[0])
-        }
-    }
-}
-impl<const ALIGN: usize> core::ops::Deref for PhysPageArray<ALIGN> {
-    type Target = [usize];
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-/// Data structure to maintain the mapping information returned by `vmap()`.
-/// `base` is the virtual address of the mapped region which is page aligned.
-/// `size` is the size of the mapped region in bytes.
-#[derive(Clone)]
-pub struct PhysPageMapInfo<const ALIGN: usize> {
-    pub base: *mut u8,
-    pub size: usize,
-}
-
-bitflags::bitflags! {
-    /// Physical page map permissions which is a restricted version of
-    /// [`litebox::platform::page_mgmt::MemoryRegionPermissions`].
-    ///
-    /// This module only supports READ and WRITE permissions. Both EXECUTE and SHARED
-    /// permissions are explicitly prohibited.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct PhysPageMapPermissions: u8 {
-        /// Readable
-        const READ = 1 << 0;
-        /// Writable
-        const WRITE = 1 << 1;
-    }
-}
-impl From<MemoryRegionPermissions> for PhysPageMapPermissions {
-    fn from(perms: MemoryRegionPermissions) -> Self {
-        let mut phys_perms = PhysPageMapPermissions::empty();
-        if perms.contains(MemoryRegionPermissions::READ) {
-            phys_perms |= PhysPageMapPermissions::READ;
-        }
-        if perms.contains(MemoryRegionPermissions::WRITE) {
-            phys_perms |= PhysPageMapPermissions::WRITE;
-        }
-        phys_perms
-    }
-}
-impl From<PhysPageMapPermissions> for MemoryRegionPermissions {
-    fn from(perms: PhysPageMapPermissions) -> Self {
-        let mut mem_perms = MemoryRegionPermissions::empty();
-        if perms.contains(PhysPageMapPermissions::READ) {
-            mem_perms |= MemoryRegionPermissions::READ;
-        }
-        if perms.contains(PhysPageMapPermissions::WRITE) {
-            mem_perms |= MemoryRegionPermissions::WRITE;
-        }
-        mem_perms
-    }
-}
-
-/// Trait to map and unmap physical pages into virtually contiguous address space.
-///
-/// The implementation of this trait is platform-specific because it depends on how
-/// the underlying platform manages page tables and memory regions.
-pub trait PhysPageMapper {
-    /// Map the given [`PhysPageArray`] into virtually contiguous address space with the given
-    /// [`PhysPageMapPermissions`] while returning [`PhysPageMapInfo`].
-    ///
-    /// This function is analogous to Linux kernel's `vmap()`.
-    ///
-    /// # Safety
-    ///
-    /// The caller should ensure that `pages` are not in active use by other entities. LiteBox
-    /// itself cannot fully guarantee this and it needs some helps from the caller, hypervisor,
-    /// or hardware.
-    /// Multiple LiteBox threads might concurrently call this function with overlapping physical
-    /// pages, so the implementation should safely handle such cases.
-    unsafe fn vmap<const ALIGN: usize>(
-        pages: PhysPageArray<ALIGN>,
-        perms: PhysPageMapPermissions,
-    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError>;
-    /// Unmap the previously mapped virtually contiguous address space ([`PhysPageMapInfo`]).
-    ///
-    /// This function is analogous to Linux kernel's `vunmap()`.
-    ///
-    /// # Safety
-    ///
-    /// The caller should ensure that the virtual addresses belonging to `vmap_info` are not in
-    /// active use by other entities. Like `vmap()`, LiteBox itself cannot fully guarantee this
-    /// and it needs some helps from other parties.
-    /// Multiple LiteBox threads might concurrently call this function with overlapping physical
-    /// pages, so the implementation should safely handle such cases.
-    unsafe fn vunmap<const ALIGN: usize>(
-        vmap_info: PhysPageMapInfo<ALIGN>,
-    ) -> Result<(), PhysPointerError>;
-}
-
 /// Represent a physical pointer to an object with on-demand mapping.
 /// - `pages`: An array of page-aligned physical addresses ([`PhysPageArray`]). Physical addresses in
 ///   this array should be virtually contiguous.
 /// - `offset`: The offset within `pages[0]` where the object starts. It should be smaller than `ALIGN`.
 /// - `count`: The number of objects of type `T` that can be accessed from this pointer.
+/// - `map_info`: The mapping information of the currently mapped physical pages, if any.
 /// - `T`: The type of the object being pointed to. `pages` with respect to `offset` should cover enough
 ///   memory for an object of type `T`.
-/// - `V`: The validator type implementing [`ValidateAccess`] trait to validate the physical addresses
 #[derive(Clone)]
 #[repr(C)]
-pub struct PhysMutPtr<V, M, T, const ALIGN: usize> {
+pub struct PhysMutPtr<T, const ALIGN: usize> {
     pages: PhysPageArray<ALIGN>,
     offset: usize,
     count: usize,
     map_info: Option<PhysPageMapInfo<ALIGN>>,
     _type: core::marker::PhantomData<T>,
-    _mapper: core::marker::PhantomData<M>,
-    _validator: core::marker::PhantomData<V>,
 }
 
-impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
-    PhysMutPtr<V, M, T, ALIGN>
-{
+impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     /// Create a new `PhysMutPtr` from the given physical page array and offset.
     ///
     /// All addresses in `pages` must be valid and aligned to `ALIGN`, and `offset` must be smaller than `ALIGN`.
@@ -296,7 +123,7 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
             ));
         }
         for pa in pages.iter() {
-            V::validate::<T>(*pa)?;
+            <Platform as VmapProvider<ALIGN>>::validate::<T>(platform(), *pa)?;
         }
         Ok(Self {
             pages,
@@ -304,8 +131,6 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
             count: size / core::mem::size_of::<T>(),
             map_info: None,
             _type: core::marker::PhantomData,
-            _mapper: core::marker::PhantomData,
-            _validator: core::marker::PhantomData,
         })
     }
     /// Create a new `PhysMutPtr` from the given contiguous physical address and length.
@@ -327,7 +152,7 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
         let mut pages = alloc::vec::Vec::with_capacity((end_page - start_page) / ALIGN);
         let mut current_page = start_page;
         while current_page < end_page {
-            V::validate::<T>(current_page)?;
+            <Platform as VmapProvider<ALIGN>>::validate::<T>(platform(), current_page)?;
             pages.push(current_page);
             current_page += ALIGN;
         }
@@ -592,7 +417,7 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
         if self.map_info.is_none() {
             let sub_pages = PhysPageArray::try_from_slice(&self.pages.deref()[start..end])?;
             unsafe {
-                self.map_info = Some(M::vmap(sub_pages, perms)?);
+                self.map_info = Some(platform().vmap(sub_pages, perms)?);
             }
             Ok(())
         } else {
@@ -610,7 +435,7 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
     unsafe fn unmap(&mut self) -> Result<(), PhysPointerError> {
         if let Some(map_info) = self.map_info.take() {
             unsafe {
-                M::vunmap(map_info)?;
+                platform().vunmap(map_info)?;
             }
             self.map_info = None;
             Ok(())
@@ -620,7 +445,7 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
     }
 }
 
-impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMutPtr<V, M, T, ALIGN> {
+impl<T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMutPtr<T, ALIGN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysMutPtr")
             .field("pages[0]", &self.pages.first().unwrap_or(0))
@@ -633,12 +458,10 @@ impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMutPtr<V, M, T
 /// exposes only read access.
 #[derive(Clone)]
 #[repr(C)]
-pub struct PhysConstPtr<V, M, T, const ALIGN: usize> {
-    inner: PhysMutPtr<V, M, T, ALIGN>,
+pub struct PhysConstPtr<T, const ALIGN: usize> {
+    inner: PhysMutPtr<T, ALIGN>,
 }
-impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
-    PhysConstPtr<V, M, T, ALIGN>
-{
+impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     /// Create a new `PhysMutPtr` from the given physical page array and offset.
     ///
     /// All addresses in `pages` must be valid and aligned to `ALIGN`, and `offset` must be smaller than `ALIGN`.
@@ -699,7 +522,7 @@ impl<V: ValidateAccess, M: PhysPageMapper, T: Clone, const ALIGN: usize>
     }
 }
 
-impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysConstPtr<V, M, T, ALIGN> {
+impl<T: Clone, const ALIGN: usize> core::fmt::Debug for PhysConstPtr<T, ALIGN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysConstPtr")
             .field("pages[0]", &self.inner.pages.first().unwrap_or(0))
@@ -707,70 +530,3 @@ impl<V, M, T: Clone, const ALIGN: usize> core::fmt::Debug for PhysConstPtr<V, M,
             .finish_non_exhaustive()
     }
 }
-
-/// Possible errors for physical page access
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum PhysPointerError {
-    #[error("Physical address {0:#x} is invalid to access")]
-    InvalidPhysicalAddress(usize),
-    #[error("Physical address {0:#x} is not aligned to {1} bytes")]
-    UnalignedPhysicalAddress(usize, usize),
-    #[error("Offset {0:#x} is not aligned to {1} bytes")]
-    UnalignedOffset(usize, usize),
-    #[error("Base offset {0:#x} is greater than or equal to alignment ({1} bytes)")]
-    InvalidBaseOffset(usize, usize),
-    #[error(
-        "The total size of the given pages ({0} bytes) is insufficient for the requested type ({1} bytes)"
-    )]
-    InsufficientPhysicalPages(usize, usize),
-    #[error("Index {0} is out of bounds (count: {1})")]
-    IndexOutOfBounds(usize, usize),
-    #[error("Physical address {0:#x} is already mapped")]
-    AlreadyMapped(usize),
-    #[error("Physical address {0:#x} is unmapped")]
-    Unmapped(usize),
-    #[error("No mapping information available")]
-    NoMappingInfo,
-    #[error("Overflow occurred during calculation")]
-    Overflow,
-    #[error("Non-contiguous physical pages in the array")]
-    NonContiguousPages,
-}
-
-/// This is a mock implementation that does no validation. Each platform which supports
-/// `PhysMutPtr` and `PhysConstPtr` should provide its `ValidateAccess` implementation.
-pub struct NoValidation;
-impl ValidateAccess for NoValidation {
-    fn validate<T>(pa: usize) -> Result<usize, PhysPointerError> {
-        Ok(pa)
-    }
-}
-
-/// This is a mock implementation that does no actual mapping. Each platform which supports
-/// `PhysMutPtr` and `PhysConstPtr` should provide its `PhysPageMapper` implementation.
-pub struct MockPhysMemoryMapper;
-impl PhysPageMapper for MockPhysMemoryMapper {
-    unsafe fn vmap<const ALIGN: usize>(
-        _pages: PhysPageArray<ALIGN>,
-        _perms: PhysPageMapPermissions,
-    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
-        Ok(PhysPageMapInfo {
-            base: core::ptr::null_mut(),
-            size: 0,
-        })
-    }
-    unsafe fn vunmap<const ALIGN: usize>(
-        _vmap_info: PhysPageMapInfo<ALIGN>,
-    ) -> Result<(), PhysPointerError> {
-        Ok(())
-    }
-}
-
-/// Normal world constant pointer type using MockPhysMemoryMapper for testing purposes.
-pub type NormalWorldConstPtr<T, const ALIGN: usize> =
-    PhysConstPtr<NoValidation, MockPhysMemoryMapper, T, ALIGN>;
-
-/// Normal world mutable pointer type using MockPhysMemoryMapper for testing purposes.
-pub type NormalWorldMutPtr<T, const ALIGN: usize> =
-    PhysMutPtr<NoValidation, MockPhysMemoryMapper, T, ALIGN>;

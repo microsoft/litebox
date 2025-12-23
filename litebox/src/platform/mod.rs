@@ -10,6 +10,7 @@
 pub mod common_providers;
 pub mod page_mgmt;
 pub mod trivial_providers;
+pub mod vmap;
 
 #[cfg(test)]
 pub(crate) mod mock;

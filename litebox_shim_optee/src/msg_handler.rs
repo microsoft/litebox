@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! OP-TEE's message passing is a bit complex because it involves with multiple actors
 //! (normal world: client app and driver; secure world: OP-TEE OS and TAs),
 //! consists multiple layers, and relies on shared memory references (i.e., no serialization).
@@ -12,7 +15,7 @@
 //! world physical addresses to exchange a large amount of data. Also, like the OP-TEE
 //! SMC call, a certain OP-TEE message/command does not involve with any TA (e.g., register
 //! shared memory).
-use crate::ptr::NormalWorldConstPtr;
+use crate::NormalWorldConstPtr;
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 use litebox::mm::linux::PAGE_SIZE;
