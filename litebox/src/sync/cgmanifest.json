@@ -1,0 +1,24 @@
+{
+    "$schema": "https://json.schemastore.org/component-detection-manifest.json",
+    "version": 1,
+    "registrations": [
+        {
+            "component": {
+                "type": "git",
+                "git": {
+                    "repositoryUrl": "https://github.com/rust-lang/rust",
+                    "commitHash": "6fd7e9010db6be7605241c39eab7c5078ee2d5bd"
+                }
+            }
+        },
+        {
+            "component": {
+                "type": "git",
+                "git": {
+                    "repositoryUrl": "https://github.com/rust-lang/rust",
+                    "commitHash": "98815742cf2e914ee0d7142a02322cf939c47834"
+                }
+            }
+        }
+    ]
+}
