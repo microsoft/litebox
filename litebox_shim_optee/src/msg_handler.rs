@@ -610,8 +610,11 @@ fn read_data_from_shm_phys_addrs(
     phys_addrs: &[usize],
     buffer: &mut [u8],
 ) -> Result<(), OpteeSmcReturn> {
-    let ptr = NormalWorldConstPtr::<[u8; PAGE_SIZE]>::from_usize(page_align_down(phys_addrs[0]));
-    let page = unsafe { ptr.read_at_offset(0) }.ok_or(OpteeSmcReturn::EBadAddr)?;
+    let mut ptr = NormalWorldConstPtr::<[u8; PAGE_SIZE], PAGE_SIZE>::try_from_usize(
+        page_align_down(phys_addrs[0]),
+    )
+    .map_err(|_| OpteeSmcReturn::EBadAddr)?;
+    let page = unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturn::EBadAddr)?;
     let page_offset = phys_addrs[0] - page_align_down(phys_addrs[0]);
     let to_copy = core::cmp::min(PAGE_SIZE - page_offset, buffer.len());
     buffer.copy_from_slice(&page[page_offset..page_offset + to_copy]);
@@ -621,8 +624,9 @@ fn read_data_from_shm_phys_addrs(
         if copied >= buffer.len() {
             break;
         }
-        let ptr = NormalWorldConstPtr::<[u8; PAGE_SIZE]>::from_usize(*phys_addr);
-        let page = unsafe { ptr.read_at_offset(0) }.ok_or(OpteeSmcReturn::EBadAddr)?;
+        let mut ptr = NormalWorldConstPtr::<[u8; PAGE_SIZE], PAGE_SIZE>::try_from_usize(*phys_addr)
+            .map_err(|_| OpteeSmcReturn::EBadAddr)?;
+        let page = unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturn::EBadAddr)?;
         let to_copy = core::cmp::min(PAGE_SIZE, buffer.len() - copied);
         buffer[copied..copied + to_copy].copy_from_slice(&page[..to_copy]);
         copied += to_copy;
@@ -635,16 +639,17 @@ fn read_data_from_shm_phys_addrs(
 /// Currently, this function writes data page by page (i.e., it does not map multiple physical
 /// pages at once). All physical addresses in `phys_addrs` are page-aligned except the first one.
 fn write_data_to_shm_phys_addrs(phys_addrs: &[usize], buffer: &[u8]) -> Result<(), OpteeSmcReturn> {
-    let ptr = NormalWorldMutPtr::<[u8; PAGE_SIZE]>::from_usize(page_align_down(phys_addrs[0]));
-    let mut page = unsafe { ptr.read_at_offset(0) }
-        .ok_or(OpteeSmcReturn::EBadAddr)?
-        .into_owned();
+    let mut ptr = NormalWorldMutPtr::<[u8; PAGE_SIZE], PAGE_SIZE>::try_from_usize(page_align_down(
+        phys_addrs[0],
+    ))
+    .map_err(|_| OpteeSmcReturn::EBadAddr)?;
+    let mut page = unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturn::EBadAddr)?;
     let page_offset = phys_addrs[0] - page_align_down(phys_addrs[0]);
     let to_copy = core::cmp::min(PAGE_SIZE - page_offset, buffer.len());
     page[page_offset..page_offset + to_copy].copy_from_slice(&buffer[..to_copy]);
     unsafe {
-        ptr.write_at_offset(0, page)
-            .ok_or(OpteeSmcReturn::EBadAddr)?;
+        ptr.write_at_offset(0, *page)
+            .map_err(|_| OpteeSmcReturn::EBadAddr)?;
     }
     let mut written = to_copy;
 
@@ -652,13 +657,14 @@ fn write_data_to_shm_phys_addrs(phys_addrs: &[usize], buffer: &[u8]) -> Result<(
         if written >= buffer.len() {
             break;
         }
-        let ptr = NormalWorldMutPtr::<[u8; PAGE_SIZE]>::from_usize(*phys_addr);
+        let mut ptr = NormalWorldMutPtr::<[u8; PAGE_SIZE], PAGE_SIZE>::try_from_usize(*phys_addr)
+            .map_err(|_| OpteeSmcReturn::EBadAddr)?;
         let mut page = [0u8; PAGE_SIZE];
         let to_copy = core::cmp::min(PAGE_SIZE, buffer.len() - written);
         page[..to_copy].copy_from_slice(&buffer[written..written + to_copy]);
         unsafe {
             ptr.write_at_offset(0, page)
-                .ok_or(OpteeSmcReturn::EBadAddr)?;
+                .map_err(|_| OpteeSmcReturn::EBadAddr)?;
         }
         written += to_copy;
     }
