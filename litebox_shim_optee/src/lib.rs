@@ -844,3 +844,6 @@ pub fn session_id_pool<'a>() -> &'a SessionIdPool {
     static SESSION_ID_POOL: OnceBox<SessionIdPool> = OnceBox::new();
     SESSION_ID_POOL.get_or_init(|| alloc::boxed::Box::new(SessionIdPool::new()))
 }
+
+pub type NormalWorldConstPtr<T, const ALIGN: usize> = crate::ptr::PhysConstPtr<T, ALIGN>;
+pub type NormalWorldMutPtr<T, const ALIGN: usize> = crate::ptr::PhysMutPtr<T, ALIGN>;
