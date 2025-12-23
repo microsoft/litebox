@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Process/thread related syscalls.
 
 use crate::{ConstPtr, MutPtr, Task};

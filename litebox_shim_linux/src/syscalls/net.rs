@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 
 use core::{

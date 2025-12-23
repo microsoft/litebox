@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use super::{DeliverFault, SignalState};
 use crate::{ConstPtr, Errno, MutPtr, Task};
 use core::mem::offset_of;

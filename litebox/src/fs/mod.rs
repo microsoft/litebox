@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! File-system related functionality
 
 use crate::fd::{FdEnabledSubsystem, TypedFd};

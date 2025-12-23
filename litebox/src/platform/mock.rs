@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Crate-local test-only mock platform for easily running tests in the various modules.
 
 #![expect(

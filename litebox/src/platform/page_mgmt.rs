@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Page-management related types and traits
 
 use crate::platform::{RawConstPointer as _, RawMutPointer as _};

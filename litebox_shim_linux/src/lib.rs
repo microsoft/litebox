@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A shim that provides a Linux-compatible ABI via LiteBox.
 //!
 //! This shim is parametric in the choice of [LiteBox platform](../litebox/platform/index.html),

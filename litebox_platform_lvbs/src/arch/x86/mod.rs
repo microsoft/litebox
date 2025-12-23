@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 pub mod gdt;
 pub mod instrs;
 pub mod ioport;

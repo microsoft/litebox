@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! VSM functions
 
 #[cfg(debug_assertions)]

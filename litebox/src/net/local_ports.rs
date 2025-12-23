@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Handling the allocation of local ports
 
 use core::num::{NonZeroU16, NonZeroU64};

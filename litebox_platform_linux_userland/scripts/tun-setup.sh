@@ -1,5 +1,8 @@
 #! /bin/bash
 
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 source "$(dirname "$0")/_common.sh"
 
 # If not root, exit

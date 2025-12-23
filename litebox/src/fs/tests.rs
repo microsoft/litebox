@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 mod in_mem {
     use crate::LiteBox;
     use crate::fs::in_mem;

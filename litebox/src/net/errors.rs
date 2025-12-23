@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Possible errors from [`Network`]
 
 use core::net::SocketAddr;

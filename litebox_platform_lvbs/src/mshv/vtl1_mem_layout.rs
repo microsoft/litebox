@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! VTL1 physical memory layout (LVBS-specific)
 
 pub const PAGE_SIZE: usize = 4096;

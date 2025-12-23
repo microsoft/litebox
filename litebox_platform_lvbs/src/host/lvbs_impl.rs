@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! An implementation of [`HostInterface`] for LVBS
 
 use crate::{

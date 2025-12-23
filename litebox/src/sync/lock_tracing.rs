@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Lock-tracing functionality for debugging lock ordering and contention
 //! issues.
 //!

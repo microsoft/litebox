@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A convenient storage of exactly one value of any given type.
 //!
 //! This is heavily inspired by the ideas of [the anymap crate](https://docs.rs/anymap), but is

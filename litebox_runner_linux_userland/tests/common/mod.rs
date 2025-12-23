@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use glob::glob;
 use std::path::{Path, PathBuf};
 

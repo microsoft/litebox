@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
 use crate::{

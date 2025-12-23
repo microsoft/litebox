@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Windows.
 
 // Restrict this crate to only work on Windows. For now, we are restricting this to only x86-64

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! The underlying platform upon which LiteBox resides.
 //!
 //! The top-level trait that denotes something is a valid LiteBox platform is [`Provider`]. This

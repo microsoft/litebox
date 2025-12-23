@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A network file system, using the 9p protocol
 
 use crate::{LiteBox, platform};

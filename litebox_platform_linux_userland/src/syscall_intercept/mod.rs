@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Implementation of syscall interception for Linux userland.
 
 #[cfg(all(target_arch = "x86_64", feature = "systrap_backend"))]

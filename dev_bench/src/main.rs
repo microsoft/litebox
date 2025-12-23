@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use std::sync::atomic::Ordering::Relaxed;

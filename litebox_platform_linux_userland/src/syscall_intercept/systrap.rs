@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! The systrap platform relies on seccomp’s `SECCOMP_RET_TRAP` feature to intercept system calls.
 
 use core::ffi::{c_int, c_uint};

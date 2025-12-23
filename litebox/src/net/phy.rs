@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Connection to the physical (i.e., "lower") side for networking.
 
 // TODO(jayb): Do we need to wrap/unwrap the IPv4 header here, or is a better place within the

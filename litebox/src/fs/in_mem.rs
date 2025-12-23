@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! An in-memory file system, not backed by any physical device.
 
 use alloc::string::String;

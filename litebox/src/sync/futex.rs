@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A Linux-y `futex`-like abstraction. Fast user-space mutexes.
 
 // Implementation note: other submodules of `crate::sync` should NOT depend on

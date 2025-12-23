@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Implementation of generic TEE related syscalls
 
 use litebox::mm::linux::{NonZeroAddress, NonZeroPageSize, PAGE_SIZE};

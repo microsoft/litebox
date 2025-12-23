@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Linux Structs
 
 use crate::arch::MAX_CORES;

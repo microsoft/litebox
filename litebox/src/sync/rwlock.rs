@@ -1,3 +1,7 @@
+// Copyright (c) The Rust Project Contributors & Microsoft Corporation.
+// Licensed under the MIT license.
+// See ./mod.rs for more details for modifications from the original Rust source for this file.
+
 //! A reader-writer lock
 //!
 //! This type of lock allows a number of readers or at most one writer at any point in time. The

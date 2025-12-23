@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! A thread-safe intrusive linked list with loan semantics.
 //!
 //! This module provides [`LoanList`], a specialized linked list data structure

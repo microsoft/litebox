@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Signal handling syscalls and support.
 
 #[cfg(target_arch = "x86")]

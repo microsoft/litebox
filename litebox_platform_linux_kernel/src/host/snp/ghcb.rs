@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use litebox::utils::TruncateExt as _;
 
 use crate::arch::{

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 pub mod mm;
 
 pub(crate) use x86_64::structures::{

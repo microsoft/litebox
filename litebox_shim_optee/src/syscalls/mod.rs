@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Syscalls Handlers
 
 pub(crate) mod cryp;

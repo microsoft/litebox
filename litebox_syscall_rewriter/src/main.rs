@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Runner for [`litebox_syscall_rewriter`]
 
 use clap::Parser;

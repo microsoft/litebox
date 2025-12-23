@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Polling-related functionality
 
 use core::sync::atomic::AtomicBool;

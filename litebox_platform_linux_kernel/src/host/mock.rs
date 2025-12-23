@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use core::sync::atomic::AtomicU32;
 
 use litebox::utils::ReinterpretUnsignedExt as _;

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Definitions for x86 signal context structures.
 
 #[repr(C)]

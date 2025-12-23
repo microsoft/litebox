@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! # LiteBox
 //!
 //! > A security-focused library OS.

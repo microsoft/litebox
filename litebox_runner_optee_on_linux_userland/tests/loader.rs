@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use litebox_platform_multiplex::{Platform, set_platform};
 
 fn init_platform() {

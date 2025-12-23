@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Condition variables
 
 #![expect(unused, reason = "currently unimplemented")]

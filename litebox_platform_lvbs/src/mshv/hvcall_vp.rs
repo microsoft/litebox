@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Hyper-V Hypercall functions for virtual processor (VP)
 
 use crate::{

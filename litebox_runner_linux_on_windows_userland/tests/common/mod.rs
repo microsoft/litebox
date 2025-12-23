@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
 use std::ffi::CString;

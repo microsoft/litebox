@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! This module manages the stack layout for TA (stack and `UteeParams`).
 
 use litebox::{

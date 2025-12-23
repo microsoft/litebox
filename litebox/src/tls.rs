@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Thread-local storage support for shims.
 //!
 //! Shims can use [`shim_thread_local!`](crate::shim_thread_local) to define

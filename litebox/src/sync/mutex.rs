@@ -1,3 +1,7 @@
+// Copyright (c) The Rust Project Contributors & Microsoft Corporation.
+// Licensed under the MIT license.
+// See ./mod.rs for more details for modifications from the original Rust source for this file.
+
 //! Mutual exclusion
 
 use core::cell::UnsafeCell;

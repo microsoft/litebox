@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Support infrastructure for interruptible waits.
 //!
 //! Ordinary waits in litebox, via the [`RawMutex`] trait, are not easily

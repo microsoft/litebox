@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Random number generation
 
 /// A non-cryptographically-secure random number generator.

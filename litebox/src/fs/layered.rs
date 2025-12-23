@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! An layered file system, layering on [`FileSystem`](super::FileSystem) on top of another.
 
 use alloc::string::String;

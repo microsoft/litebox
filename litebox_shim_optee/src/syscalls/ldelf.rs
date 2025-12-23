@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 use crate::UserMutPtr;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::{RawConstPointer, RawMutPointer};

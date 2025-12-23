@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>

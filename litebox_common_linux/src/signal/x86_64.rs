@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Definitions for x86_64 signal context structures.
 
 use crate::signal::x86::FpxSwBytes;

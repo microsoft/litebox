@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! VTL1 user context
 //! A user context is created for process, TA session, task, or something like that.
 

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! I/O Port-based serial communication
 
 use core::{arch::asm, fmt};

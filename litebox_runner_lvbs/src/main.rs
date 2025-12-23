@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 #![no_main]

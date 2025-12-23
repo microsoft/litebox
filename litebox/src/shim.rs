@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Types and traits implemented by shims, for calling from platforms.
 
 /// An object to initialize a newly spawned platform thread for use with the

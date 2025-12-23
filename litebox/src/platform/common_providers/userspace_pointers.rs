@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Userspace Pointer Abstraction with Fallible Memory Access
 //!
 //! This module implements fallible userspace pointers that can safely handle invalid

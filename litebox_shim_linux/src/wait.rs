@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Wait state management.
 //!
 //! Use a dedicated module to prevent code from accidentally accessing

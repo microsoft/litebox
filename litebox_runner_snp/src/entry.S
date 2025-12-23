@@ -1,3 +1,6 @@
+/* Copyright (c) Microsoft Corporation.
+   Licensed under the MIT license. */
+
 .global sandbox_kernel_start;
 .global sandbox_kernel_end;
 .global sandbox_process_start;
