@@ -6,7 +6,6 @@ edition = "2024"
 # All dependencies here are dev dependencies, because this is just purely tests.
 [dev-dependencies]
 anyhow = "1.0.99"
-glob = "0.3.3"
 fs-err = "3.1.2"
 
 [lints]
