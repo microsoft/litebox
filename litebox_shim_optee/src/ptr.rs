@@ -87,7 +87,7 @@ fn align_up(len: usize, align: usize) -> usize {
 ///   memory for an object of type `T`.
 #[derive(Clone)]
 #[repr(C)]
-pub struct PhysMutPtr<T, const ALIGN: usize> {
+pub struct PhysMutPtr<T: Clone, const ALIGN: usize> {
     pages: PhysPageArray<ALIGN>,
     offset: usize,
     count: usize,
@@ -456,6 +456,12 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     }
 }
 
+impl<T: Clone, const ALIGN: usize> Drop for PhysMutPtr<T, ALIGN> {
+    fn drop(&mut self) {
+        let _ = unsafe { self.unmap() };
+    }
+}
+
 impl<T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMutPtr<T, ALIGN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysMutPtr")
@@ -469,9 +475,10 @@ impl<T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMutPtr<T, ALIGN> {
 /// exposes only read access.
 #[derive(Clone)]
 #[repr(C)]
-pub struct PhysConstPtr<T, const ALIGN: usize> {
+pub struct PhysConstPtr<T: Clone, const ALIGN: usize> {
     inner: PhysMutPtr<T, ALIGN>,
 }
+
 impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     /// Create a new `PhysConstPtr` from the given physical page array and offset.
     ///
@@ -537,6 +544,12 @@ impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
         values: &mut [T],
     ) -> Result<(), PhysPointerError> {
         unsafe { self.inner.read_slice_at_offset(count, values) }
+    }
+}
+
+impl<T: Clone, const ALIGN: usize> Drop for PhysConstPtr<T, ALIGN> {
+    fn drop(&mut self) {
+        let _ = unsafe { self.inner.unmap() };
     }
 }
 
