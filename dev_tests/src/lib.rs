@@ -49,12 +49,8 @@ pub(crate) fn all_source_files() -> Result<Vec<PathBuf>> {
 /// Get all `.rs` source files
 ///
 /// Skips files in `target/` directory since we might have build artifacts there.
-// TODO(jayb): Clear away `glob` and switch entirely to `ignore` instead.
 pub(crate) fn all_rs_files() -> Result<impl Iterator<Item = PathBuf>> {
-    let _ = project_root()?;
-    glob::glob("**/*.rs").map_err(|e| anyhow!(e)).map(|paths| {
-        paths
-            .filter_map(Result::ok)
-            .filter(|p| !p.components().any(|c| c.as_os_str() == "target"))
-    })
+    Ok(all_source_files()?
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|ext| ext == "rs")))
 }
