@@ -765,7 +765,9 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
 
 impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKernel<Host> {
     type PhysPageArray = PhysPageArray<ALIGN>;
+
     type PhysPageMapInfo = PhysPageMapInfo<ALIGN>;
+
     unsafe fn vmap(
         &self,
         _pages: Self::PhysPageArray,
@@ -773,9 +775,11 @@ impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKerne
     ) -> Result<Self::PhysPageMapInfo, PhysPointerError> {
         todo!("use map_vtl0_phys_range()")
     }
+
     unsafe fn vunmap(&self, _vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError> {
         todo!("use unmap_vtl0_pages()")
     }
+
     fn validate<T>(&self, _pa: usize) -> Result<usize, PhysPointerError> {
         todo!("use vtl1_phys_frame_range to validate")
     }

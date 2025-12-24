@@ -98,8 +98,10 @@ pub struct PhysMutPtr<T, const ALIGN: usize> {
 impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     /// Create a new `PhysMutPtr` from the given physical page array and offset.
     ///
-    /// All addresses in `pages` must be valid and aligned to `ALIGN`, and `offset` must be smaller than `ALIGN`.
-    /// Also, `pages` must contain enough pages to cover at least one object of type `T` starting from `offset`.
+    /// All addresses in `pages` should be valid and aligned to `ALIGN`, and `offset` should be smaller
+    /// than `ALIGN`. Also, `pages` should contain enough pages to cover at least one object of
+    /// type `T` starting from `offset`. If these conditions are not met, this function returns
+    /// `Err(PhysPointerError)`.
     pub fn try_from_page_array(
         pages: PhysPageArray<ALIGN>,
         offset: usize,
@@ -133,10 +135,12 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             _type: core::marker::PhantomData,
         })
     }
+
     /// Create a new `PhysMutPtr` from the given contiguous physical address and length.
     ///
     /// This is a shortcut for `try_from_page_array([align_down(pa), ..., align_up(align_down(pa) + bytes)], pa % ALIGN)`.
-    /// The caller must ensure that `pa`, ..., `pa+bytes` are both physically and virtually contiguous.
+    /// This function assumes that `pa`, ..., `pa+bytes` are both physically and virtually contiguous. If not,
+    /// later accesses through `PhysMutPtr` may read/write incorrect data.
     pub fn try_from_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
         if bytes < core::mem::size_of::<T>() {
             return Err(PhysPointerError::InsufficientPhysicalPages(
@@ -158,6 +162,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         }
         Self::try_from_page_array(PhysPageArray::try_from_slice(&pages)?, pa - start_page)
     }
+
     /// Create a new `PhysMutPtr` from the given physical address for a single object.
     ///
     /// This is a shortcut for `try_from_contiguous_pages(pa, size_of::<T>())`.
@@ -166,13 +171,14 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     pub fn try_from_usize(pa: usize) -> Result<Self, PhysPointerError> {
         Self::try_from_contiguous_pages(pa, core::mem::size_of::<T>())
     }
+
     /// Read the value at the given offset from the physical pointer.
     ///
     /// # Safety
     ///
-    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// The caller should be aware that the given physical address might be concurrently written by
     /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That it, it might read corrupt data.
+    /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
     pub unsafe fn read_at_offset(
         &mut self,
         count: usize,
@@ -225,11 +231,12 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         }
         Ok(alloc::boxed::Box::new(val))
     }
+
     /// Read a slice of values at the given offset from the physical pointer.
     ///
     /// # Safety
     ///
-    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// The caller should be aware that the given physical address might be concurrently written by
     /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
     /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
     pub unsafe fn read_slice_at_offset(
@@ -284,11 +291,12 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         }
         Ok(())
     }
+
     /// Write the value at the given offset to the physical pointer.
     ///
     /// # Safety
     ///
-    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// The caller should be aware that the given physical address might be concurrently writtenby
     /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
     /// in place (e.g., by the hypervisor or hardware). That is, data it writes might be overwritten.
     pub unsafe fn write_at_offset(
@@ -336,11 +344,12 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         }
         Ok(())
     }
+
     /// Write a slice of values at the given offset to the physical pointer.
     ///
     /// # Safety
     ///
-    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// The caller should be aware that the given physical address might be concurrently written by
     /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
     /// in place (e.g., by the hypervisor or hardware). That is, data it writes might be overwritten.
     pub unsafe fn write_slice_at_offset(
@@ -399,6 +408,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         }
         Ok(())
     }
+
     /// Map the physical pages from `start` to `end` indexes.
     ///
     /// # Safety
@@ -426,6 +436,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             ))
         }
     }
+
     /// Unmap the physical pages if mapped.
     ///
     /// # Safety
@@ -462,10 +473,12 @@ pub struct PhysConstPtr<T, const ALIGN: usize> {
     inner: PhysMutPtr<T, ALIGN>,
 }
 impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
-    /// Create a new `PhysMutPtr` from the given physical page array and offset.
+    /// Create a new `PhysConstPtr` from the given physical page array and offset.
     ///
-    /// All addresses in `pages` must be valid and aligned to `ALIGN`, and `offset` must be smaller than `ALIGN`.
-    /// Also, `pages` must contain enough pages to cover at least one object of type `T` starting from `offset`.
+    /// All addresses in `pages` should be valid and aligned to `ALIGN`, and `offset` should be smaller
+    /// than `ALIGN`. Also, `pages` should contain enough pages to cover at least one object of
+    /// type `T` starting from `offset`. If these conditions are not met, this function returns
+    /// `Err(PhysPointerError)`.
     pub fn try_from_page_array(
         pages: PhysPageArray<ALIGN>,
         offset: usize,
@@ -474,16 +487,19 @@ impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
             inner: PhysMutPtr::try_from_page_array(pages, offset)?,
         })
     }
-    /// Create a new `PhysMutPtr` from the given contiguous physical address and length.
+
+    /// Create a new `PhysConstPtr` from the given contiguous physical address and length.
     ///
     /// This is a shortcut for `try_from_page_array([align_down(pa), ..., align_up(align_down(pa) + bytes)], pa % ALIGN)`.
-    /// The caller must ensure that `pa`, ..., `pa+bytes` are both physically and virtually contiguous.
+    /// This function assumes that `pa`, ..., `pa+bytes` are both physically and virtually contiguous. If not,
+    /// later accesses through `PhysConstPtr` may read incorrect data.
     pub fn try_from_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
         Ok(Self {
             inner: PhysMutPtr::try_from_contiguous_pages(pa, bytes)?,
         })
     }
-    /// Create a new `PhysMutPtr` from the given physical address for a single object.
+
+    /// Create a new `PhysConstPtr` from the given physical address for a single object.
     ///
     /// This is a shortcut for `try_from_contiguous_pages(pa, size_of::<T>())`.
     ///
@@ -493,11 +509,12 @@ impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
             inner: PhysMutPtr::try_from_usize(pa)?,
         })
     }
+
     /// Read the value at the given offset from the physical pointer.
     ///
     /// # Safety
     ///
-    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// The caller should be aware that the given physical address might be concurrently written by
     /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
     /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
     pub unsafe fn read_at_offset(
@@ -506,11 +523,12 @@ impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     ) -> Result<alloc::boxed::Box<T>, PhysPointerError> {
         unsafe { self.inner.read_at_offset(count) }
     }
+
     /// Read a slice of values at the given offset from the physical pointer.
     ///
     /// # Safety
     ///
-    /// The caller should be aware that the given physical address might be concurrently accessed by
+    /// The caller should be aware that the given physical address might be concurrently written by
     /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
     /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
     pub unsafe fn read_slice_at_offset(
