@@ -2212,7 +2212,15 @@ impl<const ALIGN: usize> VmapProvider<ALIGN> for LinuxUserland {
         Err(PhysPointerError::UnsupportedOperation)
     }
 
-    fn validate<T>(&self, _pa: usize) -> Result<usize, PhysPointerError> {
+    fn validate(&self, _pages: Self::PhysPageArray) -> Result<(), PhysPointerError> {
+        Err(PhysPointerError::UnsupportedOperation)
+    }
+
+    unsafe fn protect(
+        &self,
+        _pages: Self::PhysPageArray,
+        _perms: PhysPageMapPermissions,
+    ) -> Result<(), PhysPointerError> {
         Err(PhysPointerError::UnsupportedOperation)
     }
 }

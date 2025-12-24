@@ -780,8 +780,16 @@ impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKerne
         todo!("use unmap_vtl0_pages()")
     }
 
-    fn validate<T>(&self, _pa: usize) -> Result<usize, PhysPointerError> {
+    fn validate(&self, _pages: Self::PhysPageArray) -> Result<(), PhysPointerError> {
         todo!("use vtl1_phys_frame_range to validate")
+    }
+
+    unsafe fn protect(
+        &self,
+        _pages: Self::PhysPageArray,
+        _perms: PhysPageMapPermissions,
+    ) -> Result<(), PhysPointerError> {
+        todo!("use hypercall to protect/unprotect physical pages")
     }
 }
 

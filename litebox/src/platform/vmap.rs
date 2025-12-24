@@ -52,15 +52,34 @@ pub trait VmapProvider<const ALIGN: usize> {
     /// overlapping physical pages, so the implementation should safely handle such cases.
     unsafe fn vunmap(&self, vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError>;
 
-    /// Validate that the given physical address (with type) does not belong to LiteBox-managed
-    /// memory. Use `&self` to get the memory layout of the platform (i.e., the physical memory
+    /// Validate that the given physical pages do not belong to LiteBox-managed memory.
+    /// Use `&self` to get the memory layout of the platform (i.e., the physical memory
     /// range assigned to LiteBox).
     ///
-    /// This function does not use `*const T` or `*mut T` because it deals with a physical address
-    /// which should not be dereferenced directly.
+    /// This function is a no-op if there is no other world or VM sharing the physical memory.
     ///
-    /// Returns `Ok(pa)` if valid. If the address is not valid, returns `Err(PhysPointerError)`.
-    fn validate<T>(&self, pa: usize) -> Result<usize, PhysPointerError>;
+    /// Returns `Ok(())` if valid. If the pages are not valid, returns `Err(PhysPointerError)`.
+    fn validate(&self, pages: Self::PhysPageArray) -> Result<(), PhysPointerError>;
+
+    /// Protect the given physical pages to ensure concurrent read or exclusive write access.
+    /// Read protection prevents others from modifying the pages. Read/write protection prevents
+    /// others from accessing the pages.
+    /// This can be implemented using EPT/NPT, TZASC, PMP, or some other hardware mechanisms.
+    ///
+    /// This function is a no-op if there is no other world or VM sharing the physical memory.
+    ///
+    /// Returns `Ok(())` if it successfully protects the pages. If it fails, returns
+    /// `Err(PhysPointerError)`.
+    ///
+    /// # Safety
+    ///
+    /// Since this function is expected to use hypercalls or other privileged hardware features,
+    /// the caller must ensure that it is safe to perform such operations at the time of the call.
+    unsafe fn protect(
+        &self,
+        pages: Self::PhysPageArray,
+        perms: PhysPageMapPermissions,
+    ) -> Result<(), PhysPointerError>;
 }
 
 /// Data structure for an array of physical pages. These physical pages should be virtually contiguous.

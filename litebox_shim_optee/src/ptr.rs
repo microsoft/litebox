@@ -124,9 +124,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 core::mem::size_of::<T>(),
             ));
         }
-        for pa in pages.iter() {
-            <Platform as VmapProvider<ALIGN>>::validate::<T>(platform(), *pa)?;
-        }
+        <Platform as VmapProvider<ALIGN>>::validate(platform(), pages.clone())?;
         Ok(Self {
             pages,
             offset,
@@ -156,7 +154,6 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         let mut pages = alloc::vec::Vec::with_capacity((end_page - start_page) / ALIGN);
         let mut current_page = start_page;
         while current_page < end_page {
-            <Platform as VmapProvider<ALIGN>>::validate::<T>(platform(), current_page)?;
             pages.push(current_page);
             current_page += ALIGN;
         }
