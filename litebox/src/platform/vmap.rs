@@ -14,8 +14,10 @@ use thiserror::Error;
 pub trait VmapProvider<const ALIGN: usize> {
     /// Data structure for an array of physical pages which are virtually contiguous.
     type PhysPageArray;
+
     /// Data structure to maintain the mapping information returned by `vmap()`.
     type PhysPageMapInfo;
+
     /// Map the given [`PhysPageArray`] into virtually contiguous addresses with the given
     /// [`PhysPageMapPermissions`] while returning [`PhysPageMapInfo`]. This function
     /// expects that it can access and update the page table using `&self`.
@@ -24,7 +26,8 @@ pub trait VmapProvider<const ALIGN: usize> {
     ///
     /// # Safety
     ///
-    /// The caller should ensure that `pages` are not in active use by other entities.
+    /// The caller should ensure that `pages` are not in active use by other entities
+    /// (especially, there should be no read/write or write/write conflicts).
     /// Unfortunately, LiteBox itself cannot fully guarantee this and it needs some helps
     /// from the caller, hypervisor, or hardware.
     /// Multiple LiteBox threads might concurrently call this function (and `vunmap()`) with
@@ -34,6 +37,7 @@ pub trait VmapProvider<const ALIGN: usize> {
         pages: Self::PhysPageArray,
         perms: PhysPageMapPermissions,
     ) -> Result<Self::PhysPageMapInfo, PhysPointerError>;
+
     /// Unmap the previously mapped virtually contiguous addresses ([`PhysPageMapInfo`]).
     /// Use `&self` to access and update the page table.
     ///
@@ -47,12 +51,13 @@ pub trait VmapProvider<const ALIGN: usize> {
     /// Multiple LiteBox threads might concurrently call this function (and `vmap()`) with
     /// overlapping physical pages, so the implementation should safely handle such cases.
     unsafe fn vunmap(&self, vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError>;
+
     /// Validate that the given physical address (with type) does not belong to LiteBox-managed
     /// memory. Use `&self` to get the memory layout of the platform (i.e., the physical memory
     /// range assigned to LiteBox).
     ///
     /// This function does not use `*const T` or `*mut T` because it deals with a physical address
-    /// which must not be dereferenced directly.
+    /// which should not be dereferenced directly.
     ///
     /// Returns `Ok(pa)` if valid. If the address is not valid, returns `Err(PhysPointerError)`.
     fn validate<T>(&self, pa: usize) -> Result<usize, PhysPointerError>;
@@ -63,10 +68,11 @@ pub trait VmapProvider<const ALIGN: usize> {
 pub struct PhysPageArray<const ALIGN: usize> {
     inner: alloc::boxed::Box<[usize]>,
 }
+
 impl<const ALIGN: usize> PhysPageArray<ALIGN> {
     /// Create a new `PhysPageArray` from the given slice of physical addresses.
     ///
-    /// All page addresses must be aligned to `ALIGN`.
+    /// All page addresses should be aligned to `ALIGN`.
     pub fn try_from_slice(addrs: &[usize]) -> Result<Self, PhysPointerError> {
         for addr in addrs {
             if !addr.is_multiple_of(ALIGN) {
@@ -80,18 +86,22 @@ impl<const ALIGN: usize> PhysPageArray<ALIGN> {
             inner: alloc::boxed::Box::from(addrs),
         })
     }
+
     /// Check if the array is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
     /// Return the number of physical pages in the array.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+
     /// Return the first physical address in the array if exists.
     pub fn first(&self) -> Option<usize> {
         self.inner.first().copied()
     }
+
     /// Checks whether the given physical addresses are contiguous with respect to ALIGN.
     ///
     /// Note: This is a temporary check to let this module work with our platform implementations
@@ -108,6 +118,7 @@ impl<const ALIGN: usize> PhysPageArray<ALIGN> {
         Ok(())
     }
 }
+
 impl<const ALIGN: usize> core::iter::Iterator for PhysPageArray<ALIGN> {
     type Item = usize;
     fn next(&mut self) -> Option<Self::Item> {
@@ -118,6 +129,7 @@ impl<const ALIGN: usize> core::iter::Iterator for PhysPageArray<ALIGN> {
         }
     }
 }
+
 impl<const ALIGN: usize> core::ops::Deref for PhysPageArray<ALIGN> {
     type Target = [usize];
     fn deref(&self) -> &Self::Target {
@@ -149,6 +161,7 @@ bitflags::bitflags! {
         const WRITE = 1 << 1;
     }
 }
+
 impl From<MemoryRegionPermissions> for PhysPageMapPermissions {
     fn from(perms: MemoryRegionPermissions) -> Self {
         let mut phys_perms = PhysPageMapPermissions::empty();
@@ -161,6 +174,7 @@ impl From<MemoryRegionPermissions> for PhysPageMapPermissions {
         phys_perms
     }
 }
+
 impl From<PhysPageMapPermissions> for MemoryRegionPermissions {
     fn from(perms: PhysPageMapPermissions) -> Self {
         let mut mem_perms = MemoryRegionPermissions::empty();

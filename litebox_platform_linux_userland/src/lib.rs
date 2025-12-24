@@ -2153,7 +2153,9 @@ impl litebox::platform::CrngProvider for LinuxUserland {
 /// testing, or use a kernel module to provide this functionality (if needed).
 impl<const ALIGN: usize> VmapProvider<ALIGN> for LinuxUserland {
     type PhysPageArray = PhysPageArray<ALIGN>;
+
     type PhysPageMapInfo = PhysPageMapInfo<ALIGN>;
+
     unsafe fn vmap(
         &self,
         _pages: Self::PhysPageArray,
@@ -2161,9 +2163,11 @@ impl<const ALIGN: usize> VmapProvider<ALIGN> for LinuxUserland {
     ) -> Result<Self::PhysPageMapInfo, PhysPointerError> {
         Err(PhysPointerError::UnsupportedOperation)
     }
+
     unsafe fn vunmap(&self, _vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError> {
         Err(PhysPointerError::UnsupportedOperation)
     }
+
     fn validate<T>(&self, _pa: usize) -> Result<usize, PhysPointerError> {
         Err(PhysPointerError::UnsupportedOperation)
     }
