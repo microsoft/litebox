@@ -15,7 +15,7 @@ use core::{
 };
 use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::vmap::{
-    PhysPageArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
+    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
 };
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
@@ -758,16 +758,37 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
     }
 }
 
+/// Checks whether the given physical addresses are contiguous with respect to ALIGN.
+///
+/// Note: This is a temporary check to let `VmapProvider` work with this platform
+/// which maps physical pages with a fixed offset (`MemoryProvider::GVA_OFFSET`) such that
+/// does not support non-contiguous physical page mapping with contiguous virtual addresses.
+fn check_contiguity<const ALIGN: usize>(
+    addrs: &[PhysPageAddr<ALIGN>],
+) -> Result<(), PhysPointerError> {
+    for window in addrs.windows(2) {
+        let first = window[0].as_usize();
+        let second = window[1].as_usize();
+        if second != first.checked_add(ALIGN).ok_or(PhysPointerError::Overflow)? {
+            return Err(PhysPointerError::NonContiguousPages);
+        }
+    }
+    Ok(())
+}
+
 impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKernel<Host> {
-    type PhysPageArray = PhysPageArray<ALIGN>;
+    type PhysPageAddrArray = alloc::boxed::Box<[PhysPageAddr<ALIGN>]>;
 
     type PhysPageMapInfo = PhysPageMapInfo<ALIGN>;
 
     unsafe fn vmap(
         &self,
-        _pages: Self::PhysPageArray,
+        pages: Self::PhysPageAddrArray,
         _perms: PhysPageMapPermissions,
     ) -> Result<Self::PhysPageMapInfo, PhysPointerError> {
+        // TODO: Remove this check once this platform supports virtually contiguous
+        // non-contiguous physical page mapping.
+        check_contiguity(&pages)?;
         todo!("use map_vtl0_phys_range()")
     }
 
@@ -775,13 +796,13 @@ impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKerne
         todo!("use unmap_vtl0_pages()")
     }
 
-    fn validate(&self, _pages: Self::PhysPageArray) -> Result<(), PhysPointerError> {
+    fn validate(&self, _pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError> {
         todo!("use vtl1_phys_frame_range to validate")
     }
 
     unsafe fn protect(
         &self,
-        _pages: Self::PhysPageArray,
+        _pages: Self::PhysPageAddrArray,
         _perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError> {
         todo!("use hypercall to protect/unprotect physical pages")

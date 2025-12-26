@@ -12,13 +12,13 @@ use thiserror::Error;
 /// `litebox_shim_optee::ptr::PhysConstPtr`. It can benefit other modules which need
 /// Linux kernel's `vmap()` and `vunmap()` functionalities (e.g., HVCI/HEKI, drivers).
 pub trait VmapProvider<const ALIGN: usize> {
-    /// Data structure for an array of physical pages which are virtually contiguous.
-    type PhysPageArray;
+    /// Data structure for an array of physical page addresses which are virtually contiguous.
+    type PhysPageAddrArray;
 
     /// Data structure to maintain the mapping information returned by `vmap()`.
     type PhysPageMapInfo;
 
-    /// Map the given [`PhysPageArray`] into virtually contiguous addresses with the given
+    /// Map the given `PhysPageAddrArray` into virtually contiguous addresses with the given
     /// [`PhysPageMapPermissions`] while returning [`PhysPageMapInfo`]. This function
     /// expects that it can access and update the page table using `&self`.
     ///
@@ -34,7 +34,7 @@ pub trait VmapProvider<const ALIGN: usize> {
     /// overlapping physical pages, so the implementation should safely handle such cases.
     unsafe fn vmap(
         &self,
-        pages: Self::PhysPageArray,
+        pages: Self::PhysPageAddrArray,
         perms: PhysPageMapPermissions,
     ) -> Result<Self::PhysPageMapInfo, PhysPointerError>;
 
@@ -59,7 +59,7 @@ pub trait VmapProvider<const ALIGN: usize> {
     /// This function is a no-op if there is no other world or VM sharing the physical memory.
     ///
     /// Returns `Ok(())` if valid. If the pages are not valid, returns `Err(PhysPointerError)`.
-    fn validate(&self, pages: Self::PhysPageArray) -> Result<(), PhysPointerError>;
+    fn validate(&self, pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError>;
 
     /// Protect the given physical pages to ensure concurrent read or exclusive write access.
     /// Read protection prevents others from modifying the pages. Read/write protection prevents
@@ -77,84 +77,18 @@ pub trait VmapProvider<const ALIGN: usize> {
     /// the caller must ensure that it is safe to perform such operations at the time of the call.
     unsafe fn protect(
         &self,
-        pages: Self::PhysPageArray,
+        pages: Self::PhysPageAddrArray,
         perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError>;
 }
 
-/// Data structure for an array of physical pages. These physical pages should be virtually contiguous.
-#[derive(Clone)]
-pub struct PhysPageArray<const ALIGN: usize> {
-    inner: alloc::boxed::Box<[usize]>,
-}
-
-impl<const ALIGN: usize> PhysPageArray<ALIGN> {
-    /// Create a new `PhysPageArray` from the given slice of physical addresses.
-    ///
-    /// All page addresses should be aligned to `ALIGN`.
-    pub fn try_from_slice(addrs: &[usize]) -> Result<Self, PhysPointerError> {
-        for addr in addrs {
-            if !addr.is_multiple_of(ALIGN) {
-                return Err(PhysPointerError::UnalignedPhysicalAddress(*addr, ALIGN));
-            }
-        }
-        // TODO: Remove this check once our platform implementations support virtually
-        // contiguous non-contiguous physical page mapping.
-        Self::check_contiguity(addrs)?;
-        Ok(Self {
-            inner: alloc::boxed::Box::from(addrs),
-        })
-    }
-
-    /// Check if the array is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// Return the number of physical pages in the array.
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Return the first physical address in the array if exists.
-    pub fn first(&self) -> Option<usize> {
-        self.inner.first().copied()
-    }
-
-    /// Checks whether the given physical addresses are contiguous with respect to ALIGN.
-    ///
-    /// Note: This is a temporary check to let this module work with our platform implementations
-    /// which map physical pages with a fixed offset (`MemoryProvider::GVA_OFFSET`) such that
-    /// do not support non-contiguous physical page mapping with contiguous virtual addresses.
-    fn check_contiguity(addrs: &[usize]) -> Result<(), PhysPointerError> {
-        for window in addrs.windows(2) {
-            let first = window[0];
-            let second = window[1];
-            if second != first.checked_add(ALIGN).ok_or(PhysPointerError::Overflow)? {
-                return Err(PhysPointerError::NonContiguousPages);
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<const ALIGN: usize> core::iter::Iterator for PhysPageArray<ALIGN> {
-    type Item = usize;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.inner.is_empty() {
-            None
-        } else {
-            Some(self.inner[0])
-        }
-    }
-}
-
-impl<const ALIGN: usize> core::ops::Deref for PhysPageArray<ALIGN> {
-    type Target = [usize];
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
+/// Data structure representing a physical address with page alignment.
+///
+/// Currently, this is an alias to `crate::mm::linux::NonZeroAddress`. This might change if
+/// we selectively conduct sanity checks based on whether an address is virtual or physical
+/// (e.g., whether a virtual address is canonical, whether a physical address is tagged with
+/// a valid key ID, etc.).
+pub type PhysPageAddr<const ALIGN: usize> = crate::mm::linux::NonZeroAddress<ALIGN>;
 
 /// Data structure to maintain the mapping information returned by `vmap()`.
 ///
@@ -172,12 +106,14 @@ bitflags::bitflags! {
     ///
     /// This module only supports READ and WRITE permissions. Both EXECUTE and SHARED
     /// permissions are explicitly prohibited.
+    #[non_exhaustive]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct PhysPageMapPermissions: u8 {
         /// Readable
         const READ = 1 << 0;
         /// Writable
         const WRITE = 1 << 1;
+        const _ = !0;
     }
 }
 
@@ -237,4 +173,6 @@ pub enum PhysPointerError {
     NonContiguousPages,
     #[error("The operation is unsupported on this platform")]
     UnsupportedOperation,
+    #[error("Unsupported permissions: {0:#x}")]
+    UnsupportedPermissions(u8),
 }
