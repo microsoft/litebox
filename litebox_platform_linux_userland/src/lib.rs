@@ -16,7 +16,7 @@ use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
 use litebox::platform::vmap::{
-    PhysPageArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
+    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
 };
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
@@ -2196,13 +2196,13 @@ impl litebox::platform::CrngProvider for LinuxUserland {
 /// We might need to emulate these functions' behaviors using virtual addresses for development or
 /// testing, or use a kernel module to provide this functionality (if needed).
 impl<const ALIGN: usize> VmapProvider<ALIGN> for LinuxUserland {
-    type PhysPageArray = PhysPageArray<ALIGN>;
+    type PhysPageAddrArray = alloc::boxed::Box<[PhysPageAddr<ALIGN>]>;
 
     type PhysPageMapInfo = PhysPageMapInfo<ALIGN>;
 
     unsafe fn vmap(
         &self,
-        _pages: Self::PhysPageArray,
+        _pages: Self::PhysPageAddrArray,
         _perms: PhysPageMapPermissions,
     ) -> Result<Self::PhysPageMapInfo, PhysPointerError> {
         Err(PhysPointerError::UnsupportedOperation)
@@ -2212,13 +2212,13 @@ impl<const ALIGN: usize> VmapProvider<ALIGN> for LinuxUserland {
         Err(PhysPointerError::UnsupportedOperation)
     }
 
-    fn validate(&self, _pages: Self::PhysPageArray) -> Result<(), PhysPointerError> {
+    fn validate(&self, _pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError> {
         Err(PhysPointerError::UnsupportedOperation)
     }
 
     unsafe fn protect(
         &self,
-        _pages: Self::PhysPageArray,
+        _pages: Self::PhysPageAddrArray,
         _perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError> {
         Err(PhysPointerError::UnsupportedOperation)

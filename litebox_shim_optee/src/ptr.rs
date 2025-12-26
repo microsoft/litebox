@@ -61,9 +61,8 @@
 // TODO: Since the below `PhysMutPtr` and `PhysConstPtr` are not OP-TEE specific,
 // we can move them to a different crate (e.g., `litebox`) if needed.
 
-use core::ops::Deref;
 use litebox::platform::vmap::{
-    PhysPageArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
+    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
 };
 use litebox_platform_multiplex::{Platform, platform};
 
@@ -78,8 +77,8 @@ fn align_up(len: usize, align: usize) -> usize {
 }
 
 /// Represent a physical pointer to an object with on-demand mapping.
-/// - `pages`: An array of page-aligned physical addresses ([`PhysPageArray`]). Physical addresses in
-///   this array should be virtually contiguous.
+/// - `pages`: An array of page-aligned physical addresses. Physical addresses in this array should be
+///   virtually contiguous.
 /// - `offset`: The offset within `pages[0]` where the object starts. It should be smaller than `ALIGN`.
 /// - `count`: The number of objects of type `T` that can be accessed from this pointer.
 /// - `map_info`: The mapping information of the currently mapped physical pages, if any.
@@ -88,7 +87,7 @@ fn align_up(len: usize, align: usize) -> usize {
 #[derive(Clone)]
 #[repr(C)]
 pub struct PhysMutPtr<T: Clone, const ALIGN: usize> {
-    pages: PhysPageArray<ALIGN>,
+    pages: alloc::boxed::Box<[PhysPageAddr<ALIGN>]>,
     offset: usize,
     count: usize,
     map_info: Option<PhysPageMapInfo<ALIGN>>,
@@ -103,7 +102,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     /// type `T` starting from `offset`. If these conditions are not met, this function returns
     /// `Err(PhysPointerError)`.
     pub fn try_from_page_array(
-        pages: PhysPageArray<ALIGN>,
+        pages: &[PhysPageAddr<ALIGN>],
         offset: usize,
     ) -> Result<Self, PhysPointerError> {
         if offset >= ALIGN {
@@ -124,9 +123,9 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 core::mem::size_of::<T>(),
             ));
         }
-        <Platform as VmapProvider<ALIGN>>::validate(platform(), pages.clone())?;
+        <Platform as VmapProvider<ALIGN>>::validate(platform(), pages.into())?;
         Ok(Self {
-            pages,
+            pages: pages.into(),
             offset,
             count: size / core::mem::size_of::<T>(),
             map_info: None,
@@ -154,10 +153,13 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         let mut pages = alloc::vec::Vec::with_capacity((end_page - start_page) / ALIGN);
         let mut current_page = start_page;
         while current_page < end_page {
-            pages.push(current_page);
+            pages.push(
+                PhysPageAddr::<ALIGN>::new(current_page)
+                    .ok_or(PhysPointerError::InvalidPhysicalAddress(current_page))?,
+            );
             current_page += ALIGN;
         }
-        Self::try_from_page_array(PhysPageArray::try_from_slice(&pages)?, pa - start_page)
+        Self::try_from_page_array(&pages, pa - start_page)
     }
 
     /// Create a new `PhysMutPtr` from the given physical address for a single object.
@@ -421,15 +423,23 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         if start >= end || end > self.pages.len() {
             return Err(PhysPointerError::IndexOutOfBounds(end, self.pages.len()));
         }
+        let accept_perms = PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE;
+        if perms.bits() & !accept_perms.bits() != 0 {
+            return Err(PhysPointerError::UnsupportedPermissions(perms.bits()));
+        }
         if self.map_info.is_none() {
-            let sub_pages = PhysPageArray::try_from_slice(&self.pages.deref()[start..end])?;
+            let sub_pages = &self.pages[start..end];
             unsafe {
-                self.map_info = Some(platform().vmap(sub_pages, perms)?);
+                self.map_info = Some(<Platform as VmapProvider<ALIGN>>::vmap(
+                    platform(),
+                    sub_pages.into(),
+                    perms,
+                )?);
             }
             Ok(())
         } else {
             Err(PhysPointerError::AlreadyMapped(
-                self.pages.first().unwrap_or(0),
+                self.pages.first().map_or(0, |p| p.as_usize()),
             ))
         }
     }
@@ -448,7 +458,9 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             self.map_info = None;
             Ok(())
         } else {
-            Err(PhysPointerError::Unmapped(self.pages.first().unwrap_or(0)))
+            Err(PhysPointerError::Unmapped(
+                self.pages.first().map_or(0, |p| p.as_usize()),
+            ))
         }
     }
 }
@@ -462,7 +474,7 @@ impl<T: Clone, const ALIGN: usize> Drop for PhysMutPtr<T, ALIGN> {
 impl<T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMutPtr<T, ALIGN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysMutPtr")
-            .field("pages[0]", &self.pages.first().unwrap_or(0))
+            .field("pages[0]", &self.pages.first().map_or(0, |p| p.as_usize()))
             .field("offset", &self.offset)
             .finish_non_exhaustive()
     }
@@ -484,7 +496,7 @@ impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     /// type `T` starting from `offset`. If these conditions are not met, this function returns
     /// `Err(PhysPointerError)`.
     pub fn try_from_page_array(
-        pages: PhysPageArray<ALIGN>,
+        pages: &[PhysPageAddr<ALIGN>],
         offset: usize,
     ) -> Result<Self, PhysPointerError> {
         Ok(Self {
@@ -553,7 +565,10 @@ impl<T: Clone, const ALIGN: usize> Drop for PhysConstPtr<T, ALIGN> {
 impl<T: Clone, const ALIGN: usize> core::fmt::Debug for PhysConstPtr<T, ALIGN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysConstPtr")
-            .field("pages[0]", &self.inner.pages.first().unwrap_or(0))
+            .field(
+                "pages[0]",
+                &self.inner.pages.first().map_or(0, |p| p.as_usize()),
+            )
             .field("offset", &self.inner.offset)
             .finish_non_exhaustive()
     }
