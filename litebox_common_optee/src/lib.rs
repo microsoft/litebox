@@ -6,7 +6,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use litebox::platform::RawConstPointer as _;
+use litebox::platform::{RawConstPointer as _, vmap::PhysPointerError};
 use litebox_common_linux::{PtRegs, errno::Errno};
 use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B4, B8, B48, B54};
@@ -1592,4 +1592,14 @@ pub enum OpteeSmcReturn {
     ENomem = OPTEE_SMC_RETURN_ENOMEM,
     ENotAvail = OPTEE_SMC_RETURN_ENOTAVAIL,
     UnknownFunction = OPTEE_SMC_RETURN_UNKNOWN_FUNCTION,
+}
+
+impl From<PhysPointerError> for OpteeSmcReturn {
+    fn from(err: PhysPointerError) -> Self {
+        match err {
+            PhysPointerError::AlreadyMapped(_) => OpteeSmcReturn::EBusy,
+            PhysPointerError::NoMappingInfo => OpteeSmcReturn::ENomem,
+            _ => OpteeSmcReturn::EBadAddr,
+        }
+    }
 }

@@ -15,7 +15,7 @@
 //! world physical addresses to exchange a large amount of data. Also, like the OP-TEE
 //! SMC call, a certain OP-TEE message/command does not involve with any TA (e.g., register
 //! shared memory).
-use crate::NormalWorldConstPtr;
+use crate::{NormalWorldConstPtr, NormalWorldMutPtr};
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 use litebox::mm::linux::PAGE_SIZE;
@@ -604,18 +604,15 @@ fn get_shm_phys_addrs_from_optee_msg_param_rmem(
 
 /// Read data from the normal world shared memory pages whose physical addresses are given in
 /// `phys_addrs` into `buffer`. The size of `buffer` indicates how many bytes to read.
-/// All physical addresses in `phys_addrs` are page-aligned except the first one.
+/// All physical addresses in `phys_addrs` are page aligned except the first one.
 fn read_data_from_shm_phys_addrs(
     phys_addrs: &[usize],
     buffer: &mut [u8],
 ) -> Result<(), OpteeSmcReturn> {
-    let mut array: Vec<usize> = Vec::with_capacity(phys_addrs.len());
-    array.push(page_align_down(phys_addrs[0]));
-    array.extend_from_slice(&phys_addrs[1..]);
-    let page_array = PhysPageArray::<PAGE_SIZE>::try_from_slice(array.as_slice())?;
+    let phys_page_addrs = phys_addrs_to_page_addrs::<PAGE_SIZE>(phys_addrs)?;
     let mut ptr = NormalWorldConstPtr::<u8, PAGE_SIZE>::try_from_page_array(
-        page_array,
-        phys_addrs[0] - array[0],
+        &phys_page_addrs,
+        phys_addrs[0] - phys_page_addrs[0].as_usize(),
     )?;
     unsafe {
         ptr.read_slice_at_offset(0, buffer)?;
@@ -625,15 +622,12 @@ fn read_data_from_shm_phys_addrs(
 
 /// Write data in `buffer` to the normal world shared memory pages whose physical addresses
 /// are given in `phys_addrs`. The size of `buffer` indicates how many bytes to write.
-/// All physical addresses in `phys_addrs` are page-aligned except the first one.
+/// All physical addresses in `phys_addrs` are page aligned except the first one.
 fn write_data_to_shm_phys_addrs(phys_addrs: &[usize], buffer: &[u8]) -> Result<(), OpteeSmcReturn> {
-    let mut array: Vec<usize> = Vec::with_capacity(phys_addrs.len());
-    array.push(page_align_down(phys_addrs[0]));
-    array.extend_from_slice(&phys_addrs[1..]);
-    let page_array = PhysPageArray::<PAGE_SIZE>::try_from_slice(array.as_slice())?;
+    let phys_page_addrs = phys_addrs_to_page_addrs::<PAGE_SIZE>(phys_addrs)?;
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::try_from_page_array(
-        page_array,
-        phys_addrs[0] - array[0],
+        &phys_page_addrs,
+        phys_addrs[0] - phys_page_addrs[0].as_usize(),
     )
     .map_err(|_| OpteeSmcReturn::EBadAddr)?;
     unsafe {
@@ -642,12 +636,17 @@ fn write_data_to_shm_phys_addrs(phys_addrs: &[usize], buffer: &[u8]) -> Result<(
     Ok(())
 }
 
-impl From<PhysPointerError> for OpteeSmcReturn {
-    fn from(err: PhysPointerError) -> Self {
-        match err {
-            PhysPointerError::AlreadyMapped(_) => OpteeSmcReturn::EBusy,
-            PhysPointerError::NoMappingInfo => OpteeSmcReturn::ENomem,
-            _ => OpteeSmcReturn::EBadAddr,
-        }
+#[inline]
+fn phys_addrs_to_page_addrs<const ALIGN: usize>(
+    phys_addrs: &[usize],
+) -> Result<Vec<PhysPageAddr<ALIGN>>, OpteeSmcReturn> {
+    let mut page_addrs: Vec<PhysPageAddr<ALIGN>> = Vec::with_capacity(phys_addrs.len());
+    page_addrs.push(
+        PhysPageAddr::<ALIGN>::new(page_align_down(phys_addrs[0]))
+            .ok_or(OpteeSmcReturn::EBadAddr)?,
+    );
+    for addr in &phys_addrs[1..] {
+        page_addrs.push(PhysPageAddr::<ALIGN>::new(*addr).ok_or(OpteeSmcReturn::EBadAddr)?);
     }
+    Ok(page_addrs)
 }

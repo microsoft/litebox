@@ -113,7 +113,7 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_arg, handle_optee_smc_args,
     prepare_for_return_to_normal_world,
 };
-use litebox_shim_optee::ptr::{NormalWorldConstPtr, NormalWorldMutPtr};
+use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
 #[expect(dead_code)]
 fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeSmcReturn> {
     let mut smc_args_ptr =
