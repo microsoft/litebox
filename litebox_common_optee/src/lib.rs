@@ -518,7 +518,7 @@ impl TeeUuid {
         }
     }
 
-    pub fn with_u32_array(data: [u32; 4]) -> Self {
+    pub fn from_u32_array(data: [u32; 4]) -> Self {
         let mut buffer = [0u8; 16];
         buffer[0..4].copy_from_slice(&data[0].to_le_bytes());
         buffer[4..8].copy_from_slice(&data[1].to_le_bytes());
