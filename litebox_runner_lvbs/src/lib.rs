@@ -117,7 +117,7 @@ use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
 #[expect(dead_code)]
 fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeSmcReturn> {
     let mut smc_args_ptr =
-        NormalWorldConstPtr::<OpteeSmcArgs, PAGE_SIZE>::try_from_usize(smc_args_addr)?;
+        NormalWorldConstPtr::<OpteeSmcArgs, PAGE_SIZE>::with_usize(smc_args_addr)?;
     let mut smc_args = unsafe { smc_args_ptr.read_at_offset(0) }?;
     let msg_arg_phys_addr = smc_args.optee_msg_arg_phys_addr()?;
     let (res, msg_arg) = handle_optee_smc_args(&mut smc_args)?;
@@ -200,7 +200,7 @@ fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeS
 
                     prepare_for_return_to_normal_world(&ta_params, &ta_req_info, &mut msg_arg)?;
 
-                    let mut ptr = NormalWorldMutPtr::<OpteeMsgArg, PAGE_SIZE>::try_from_usize(
+                    let mut ptr = NormalWorldMutPtr::<OpteeMsgArg, PAGE_SIZE>::with_usize(
                         usize::try_from(msg_arg_phys_addr).unwrap(),
                     )?;
                     unsafe { ptr.write_at_offset(0, msg_arg) }?;

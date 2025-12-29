@@ -610,7 +610,7 @@ fn read_data_from_shm_phys_addrs(
     buffer: &mut [u8],
 ) -> Result<(), OpteeSmcReturn> {
     let phys_page_addrs = phys_addrs_to_page_addrs::<PAGE_SIZE>(phys_addrs)?;
-    let mut ptr = NormalWorldConstPtr::<u8, PAGE_SIZE>::try_from_page_array(
+    let mut ptr = NormalWorldConstPtr::<u8, PAGE_SIZE>::new(
         &phys_page_addrs,
         phys_addrs[0] - phys_page_addrs[0].as_usize(),
     )?;
@@ -625,7 +625,7 @@ fn read_data_from_shm_phys_addrs(
 /// All physical addresses in `phys_addrs` are page aligned except the first one.
 fn write_data_to_shm_phys_addrs(phys_addrs: &[usize], buffer: &[u8]) -> Result<(), OpteeSmcReturn> {
     let phys_page_addrs = phys_addrs_to_page_addrs::<PAGE_SIZE>(phys_addrs)?;
-    let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::try_from_page_array(
+    let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::new(
         &phys_page_addrs,
         phys_addrs[0] - phys_page_addrs[0].as_usize(),
     )
