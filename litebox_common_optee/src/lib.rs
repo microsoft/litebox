@@ -503,19 +503,28 @@ pub struct TeeUuid {
     pub clock_seq_and_node: [u8; 8],
 }
 impl TeeUuid {
-    pub fn new_from_u32s(data: [u32; 4]) -> Self {
-        let time_low = data[0];
-        let time_mid = (data[1] >> 16) as u16;
-        let time_hi_and_version = (data[1] & 0xffff) as u16;
+    #[allow(clippy::missing_panics_doc)]
+    pub fn from_bytes(data: [u8; 16]) -> Self {
+        let time_low = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let time_mid = u16::from_le_bytes(data[4..6].try_into().unwrap());
+        let time_hi_and_version = u16::from_le_bytes(data[6..8].try_into().unwrap());
         let mut clock_seq_and_node = [0u8; 8];
-        clock_seq_and_node[0..4].copy_from_slice(&data[2].to_be_bytes());
-        clock_seq_and_node[4..8].copy_from_slice(&data[3].to_be_bytes());
-        TeeUuid {
+        clock_seq_and_node.copy_from_slice(&data[8..16]);
+        Self {
             time_low,
             time_mid,
             time_hi_and_version,
             clock_seq_and_node,
         }
+    }
+
+    pub fn with_u32_array(data: [u32; 4]) -> Self {
+        let mut buffer = [0u8; 16];
+        buffer[0..4].copy_from_slice(&data[0].to_le_bytes());
+        buffer[4..8].copy_from_slice(&data[1].to_le_bytes());
+        buffer[8..12].copy_from_slice(&data[2].to_le_bytes());
+        buffer[12..16].copy_from_slice(&data[3].to_le_bytes());
+        Self::from_bytes(buffer)
     }
 }
 

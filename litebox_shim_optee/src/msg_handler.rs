@@ -242,7 +242,7 @@ pub fn decode_ta_request(msg_arg: &OpteeMsgArg) -> Result<TaRequestInfo, OpteeSm
         data[1] = (msg_arg.get_param_value(0)?.b).truncate();
         data[2] = (msg_arg.get_param_value(1)?.a).truncate();
         data[3] = (msg_arg.get_param_value(1)?.b).truncate();
-        (Some(TeeUuid::new_from_u32s(data)), 2)
+        (Some(TeeUuid::with_u32_array(data)), 2)
     } else {
         (None, 0)
     };
