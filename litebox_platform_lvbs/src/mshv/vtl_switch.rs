@@ -9,7 +9,7 @@ use crate::{
         HV_REGISTER_VSM_CODEPAGE_OFFSETS, HV_VTL_NORMAL, HV_VTL_SECURE,
         HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
         VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction, hvcall_vp::hvcall_get_vp_registers,
-        vsm::vsm_dispatch, vsm_intercept::vsm_handle_intercept, vsm_optee_smc,
+        vsm::vsm_dispatch, vsm_intercept::vsm_handle_intercept,
     },
 };
 use core::arch::{asm, naked_asm};
@@ -313,7 +313,20 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         .unwrap_or(VsmFunction::Unknown);
     match func_id {
         VsmFunction::Unknown => Errno::EINVAL.as_neg().into(),
-        VsmFunction::OpteeMessage => vsm_optee_smc::optee_smc_dispatch(params[1]),
+        VsmFunction::OpteeMessage => {
+            // Since we do not know whether an upcall handler uses extended states, we conservatively
+            // save and restore extended states before and after invoking the upcall handler.
+            with_per_cpu_variables_mut(|per_cpu_variables| {
+                per_cpu_variables.save_extended_states(HV_VTL_SECURE);
+            });
+
+            // TODO: invoke the OP-TEE upcall once it is merged.
+
+            with_per_cpu_variables_mut(|per_cpu_variables| {
+                per_cpu_variables.restore_extended_states(HV_VTL_SECURE);
+            });
+            0
+        }
         _ => vsm_dispatch(func_id, &params[1..]),
     }
 }
