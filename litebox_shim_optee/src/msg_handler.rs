@@ -19,6 +19,7 @@ use crate::NormalWorldConstPtr;
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 use litebox::mm::linux::PAGE_SIZE;
+use litebox::platform::vmap::PhysPageAddr;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArg, OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction,
     OpteeSmcResult, OpteeSmcReturn,
@@ -202,19 +203,14 @@ pub fn handle_ta_request(_msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmc
     todo!()
 }
 
-#[expect(unused)]
-#[derive(Clone)]
-struct ShmRefInfo {
-    pub pages: Box<[u64]>,
-    pub page_offset: u64,
-}
-
 /// A scatter-gather list of OP-TEE physical page addresses in the normal world (VTL0) to
 /// share with the secure world (VTL1). Each [`ShmRefPagesData`] occupies one memory page
 /// where `pages_list` contains a list of physical page addresses and `next_page_data`
 /// contains the physical address of the next [`ShmRefPagesData`] if any. Entries of `pages_list`
 /// and `next_page_data` contain zero if the list ends. These physical page addresses are
 /// virtually contiguous in the normal world. All these address values must be page aligned.
+///
+/// `pages_data` from [Linux](https://elixir.bootlin.com/linux/v6.18.2/source/drivers/tee/optee/smc_abi.c#L409)
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct ShmRefPagesData {
@@ -226,22 +222,33 @@ impl ShmRefPagesData {
         PAGE_SIZE / core::mem::size_of::<u64>() - core::mem::size_of::<u64>();
 }
 
+/// Data structure to maintain the information of OP-TEE shared memory in VTL0 referenced by `shm_ref`.
+/// `pages` contains an array of physical page addresses.
+/// `page_offset` indicates the page offset of the first page (i.e., `pages[0]`) which should be
+/// smaller than `ALIGN`.
+#[expect(unused)]
+#[derive(Clone)]
+struct ShmRefInfo<const ALIGN: usize> {
+    pub pages: Box<[PhysPageAddr<ALIGN>]>,
+    pub page_offset: usize,
+}
+
 /// Maintain the information of OP-TEE shared memory in VTL0 referenced by `shm_ref`.
 /// This data structure is for registering shared memory regions before they are
 /// used during OP-TEE calls with parameters referencing shared memory.
 /// Any normal memory references without this registration will be rejected.
-struct ShmRefMap {
-    inner: spin::mutex::SpinMutex<HashMap<u64, ShmRefInfo>>,
+struct ShmRefMap<const ALIGN: usize> {
+    inner: spin::mutex::SpinMutex<HashMap<u64, ShmRefInfo<ALIGN>>>,
 }
 
-impl ShmRefMap {
+impl<const ALIGN: usize> ShmRefMap<ALIGN> {
     pub fn new() -> Self {
         Self {
             inner: spin::mutex::SpinMutex::new(HashMap::new()),
         }
     }
 
-    pub fn insert(&self, shm_ref: u64, info: ShmRefInfo) -> Result<(), OpteeSmcReturn> {
+    pub fn insert(&self, shm_ref: u64, info: ShmRefInfo<ALIGN>) -> Result<(), OpteeSmcReturn> {
         let mut guard = self.inner.lock();
         if guard.contains_key(&shm_ref) {
             Err(OpteeSmcReturn::ENotAvail)
@@ -251,13 +258,13 @@ impl ShmRefMap {
         }
     }
 
-    pub fn remove(&self, shm_ref: u64) -> Option<ShmRefInfo> {
+    pub fn remove(&self, shm_ref: u64) -> Option<ShmRefInfo<ALIGN>> {
         let mut guard = self.inner.lock();
         guard.remove(&shm_ref)
     }
 
     #[expect(unused)]
-    pub fn get(&self, shm_ref: u64) -> Option<ShmRefInfo> {
+    pub fn get(&self, shm_ref: u64) -> Option<ShmRefInfo<ALIGN>> {
         let guard = self.inner.lock();
         guard.get(&shm_ref).cloned()
     }
@@ -275,22 +282,25 @@ impl ShmRefMap {
         aligned_size: u64,
         shm_ref: u64,
     ) -> Result<(), OpteeSmcReturn> {
-        let num_pages = usize::try_from(aligned_size).unwrap() / PAGE_SIZE;
+        if page_offset >= ALIGN as u64 || aligned_size == 0 {
+            return Err(OpteeSmcReturn::EBadAddr);
+        }
+        let num_pages = usize::try_from(aligned_size).unwrap() / ALIGN;
         let mut pages = Vec::with_capacity(num_pages);
         let mut cur_addr = usize::try_from(shm_ref_pages_data_phys_addr).unwrap();
         loop {
-            let mut cur_ptr =
-                NormalWorldConstPtr::<ShmRefPagesData, PAGE_SIZE>::with_usize(cur_addr)
-                    .map_err(|_| OpteeSmcReturn::EBadAddr)?;
+            let mut cur_ptr = NormalWorldConstPtr::<ShmRefPagesData, ALIGN>::with_usize(cur_addr)
+                .map_err(|_| OpteeSmcReturn::EBadAddr)?;
             let pages_data =
                 unsafe { cur_ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturn::EBadAddr)?;
             for page in &pages_data.pages_list {
                 if *page == 0 || pages.len() == num_pages {
                     break;
-                } else if !page.is_multiple_of(u64::try_from(PAGE_SIZE).unwrap()) {
-                    return Err(OpteeSmcReturn::EBadAddr);
                 } else {
-                    pages.push(*page);
+                    pages.push(
+                        PhysPageAddr::new(usize::try_from(*page).unwrap())
+                            .ok_or(OpteeSmcReturn::EBadAddr)?,
+                    );
                 }
             }
             if pages_data.next_page_data == 0 || pages.len() == num_pages {
@@ -304,14 +314,14 @@ impl ShmRefMap {
             shm_ref,
             ShmRefInfo {
                 pages: pages.into_boxed_slice(),
-                page_offset,
+                page_offset: usize::try_from(page_offset).unwrap(),
             },
         )?;
         Ok(())
     }
 }
 
-fn shm_ref_map() -> &'static ShmRefMap {
-    static SHM_REF_MAP: OnceBox<ShmRefMap> = OnceBox::new();
+fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {
+    static SHM_REF_MAP: OnceBox<ShmRefMap<PAGE_SIZE>> = OnceBox::new();
     SHM_REF_MAP.get_or_init(|| Box::new(ShmRefMap::new()))
 }
