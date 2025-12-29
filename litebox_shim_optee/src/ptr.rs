@@ -64,7 +64,7 @@
 use litebox::platform::vmap::{
     PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
 };
-use litebox_platform_multiplex::{Platform, platform};
+use litebox_platform_multiplex::platform;
 
 #[inline]
 fn align_down(address: usize, align: usize) -> usize {
@@ -101,10 +101,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     /// than `ALIGN`. Also, `pages` should contain enough pages to cover at least one object of
     /// type `T` starting from `offset`. If these conditions are not met, this function returns
     /// `Err(PhysPointerError)`.
-    pub fn try_from_page_array(
-        pages: &[PhysPageAddr<ALIGN>],
-        offset: usize,
-    ) -> Result<Self, PhysPointerError> {
+    pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError> {
         if offset >= ALIGN {
             return Err(PhysPointerError::InvalidBaseOffset(offset, ALIGN));
         }
@@ -123,7 +120,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 core::mem::size_of::<T>(),
             ));
         }
-        <Platform as VmapProvider<ALIGN>>::validate(platform(), pages.into())?;
+        platform().validate(pages.into())?;
         Ok(Self {
             pages: pages.into(),
             offset,
@@ -135,10 +132,11 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
 
     /// Create a new `PhysMutPtr` from the given contiguous physical address and length.
     ///
-    /// This is a shortcut for `try_from_page_array([align_down(pa), ..., align_up(align_down(pa) + bytes)], pa % ALIGN)`.
+    /// This is a shortcut for
+    /// `PhysMutPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(align_down(pa) + bytes)], pa % ALIGN)`.
     /// This function assumes that `pa`, ..., `pa+bytes` are both physically and virtually contiguous. If not,
     /// later accesses through `PhysMutPtr` may read/write incorrect data.
-    pub fn try_from_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
+    pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
         if bytes < core::mem::size_of::<T>() {
             return Err(PhysPointerError::InsufficientPhysicalPages(
                 bytes,
@@ -159,16 +157,16 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             );
             current_page += ALIGN;
         }
-        Self::try_from_page_array(&pages, pa - start_page)
+        Self::new(&pages, pa - start_page)
     }
 
     /// Create a new `PhysMutPtr` from the given physical address for a single object.
     ///
-    /// This is a shortcut for `try_from_contiguous_pages(pa, size_of::<T>())`.
+    /// This is a shortcut for `PhysMutPtr::with_contiguous_pages(pa, size_of::<T>())`.
     ///
     /// Note: This module doesn't provide `as_usize` because LiteBox should not dereference physical addresses directly.
-    pub fn try_from_usize(pa: usize) -> Result<Self, PhysPointerError> {
-        Self::try_from_contiguous_pages(pa, core::mem::size_of::<T>())
+    pub fn with_usize(pa: usize) -> Result<Self, PhysPointerError> {
+        Self::with_contiguous_pages(pa, core::mem::size_of::<T>())
     }
 
     /// Read the value at the given offset from the physical pointer.
@@ -199,25 +197,23 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             self.map_range(start, end, PhysPageMapPermissions::READ)?;
         }
         // Don't forget to call unmap() before returning to the caller
-        let Some(map_info) = &self.map_info else {
+        let Some(src) = (unsafe { self.base_ptr() }) else {
             unsafe {
                 self.unmap()?;
             }
             return Err(PhysPointerError::NoMappingInfo);
         };
-        let addr = unsafe { map_info.base.add(self.offset) }
-            .cast::<T>()
-            .wrapping_add(count);
+        let src = src.wrapping_add(count);
         let val = {
             let mut buffer = core::mem::MaybeUninit::<T>::uninit();
-            if (addr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            if (src as usize).is_multiple_of(core::mem::align_of::<T>()) {
                 unsafe {
-                    core::ptr::copy_nonoverlapping(addr, buffer.as_mut_ptr(), 1);
+                    core::ptr::copy_nonoverlapping(src, buffer.as_mut_ptr(), 1);
                 }
             } else {
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        addr.cast::<u8>(),
+                        src.cast::<u8>(),
                         buffer.as_mut_ptr().cast::<u8>(),
                         core::mem::size_of::<T>(),
                     );
@@ -263,23 +259,21 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             self.map_range(start, end, PhysPageMapPermissions::READ)?;
         }
         // Don't forget to call unmap() before returning to the caller
-        let Some(map_info) = &self.map_info else {
+        let Some(src) = (unsafe { self.base_ptr() }) else {
             unsafe {
                 self.unmap()?;
             }
             return Err(PhysPointerError::NoMappingInfo);
         };
-        let addr = unsafe { map_info.base.add(self.offset) }
-            .cast::<T>()
-            .wrapping_add(count);
-        if (addr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+        let src = src.wrapping_add(count);
+        if (src as usize).is_multiple_of(core::mem::align_of::<T>()) {
             unsafe {
-                core::ptr::copy_nonoverlapping(addr, values.as_mut_ptr(), values.len());
+                core::ptr::copy_nonoverlapping(src, values.as_mut_ptr(), values.len());
             }
         } else {
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    addr.cast::<u8>(),
+                    src.cast::<u8>(),
                     values.as_mut_ptr().cast::<u8>(),
                     core::mem::size_of_val(values),
                 );
@@ -324,19 +318,17 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             )?;
         }
         // Don't forget to call unmap() before returning to the caller
-        let Some(map_info) = &self.map_info else {
+        let Some(dst) = (unsafe { self.base_ptr() }) else {
             unsafe {
                 self.unmap()?;
             }
             return Err(PhysPointerError::NoMappingInfo);
         };
-        let addr = unsafe { map_info.base.add(self.offset) }
-            .cast::<T>()
-            .wrapping_add(count);
-        if (addr as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            unsafe { core::ptr::write(addr, value) };
+        let dst = dst.wrapping_add(count);
+        if (dst as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            unsafe { core::ptr::write(dst, value) };
         } else {
-            unsafe { core::ptr::write_unaligned(addr, value) };
+            unsafe { core::ptr::write_unaligned(dst, value) };
         }
         unsafe {
             self.unmap()?;
@@ -380,24 +372,22 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             )?;
         }
         // Don't forget to call unmap() before returning to the caller
-        let Some(map_info) = &self.map_info else {
+        let Some(dst) = (unsafe { self.base_ptr() }) else {
             unsafe {
                 self.unmap()?;
             }
             return Err(PhysPointerError::NoMappingInfo);
         };
-        let addr = unsafe { map_info.base.add(self.offset) }
-            .cast::<T>()
-            .wrapping_add(count);
-        if (addr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+        let dst = dst.wrapping_add(count);
+        if (dst as usize).is_multiple_of(core::mem::align_of::<T>()) {
             unsafe {
-                core::ptr::copy_nonoverlapping(values.as_ptr(), addr, values.len());
+                core::ptr::copy_nonoverlapping(values.as_ptr(), dst, values.len());
             }
         } else {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     values.as_ptr().cast::<u8>(),
-                    addr.cast::<u8>(),
+                    dst.cast::<u8>(),
                     core::mem::size_of_val(values),
                 );
             }
@@ -430,11 +420,9 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         if self.map_info.is_none() {
             let sub_pages = &self.pages[start..end];
             unsafe {
-                self.map_info = Some(<Platform as VmapProvider<ALIGN>>::vmap(
-                    platform(),
-                    sub_pages.into(),
-                    perms,
-                )?);
+                platform().vmap(sub_pages.into(), perms).map(|info| {
+                    self.map_info = Some(info);
+                })?;
             }
             Ok(())
         } else {
@@ -462,6 +450,19 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 self.pages.first().map_or(0, |p| p.as_usize()),
             ))
         }
+    }
+
+    /// Get the base virtual pointer if mapped.
+    ///
+    /// # Safety
+    ///
+    /// This function performs pointer arithmetic on the mapped base pointer.
+    #[inline]
+    unsafe fn base_ptr(&self) -> Option<*mut T> {
+        let Some(map_info) = &self.map_info else {
+            return None;
+        };
+        Some(unsafe { map_info.base.add(self.offset) }.cast::<T>())
     }
 }
 
@@ -495,34 +496,32 @@ impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     /// than `ALIGN`. Also, `pages` should contain enough pages to cover at least one object of
     /// type `T` starting from `offset`. If these conditions are not met, this function returns
     /// `Err(PhysPointerError)`.
-    pub fn try_from_page_array(
-        pages: &[PhysPageAddr<ALIGN>],
-        offset: usize,
-    ) -> Result<Self, PhysPointerError> {
+    pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError> {
         Ok(Self {
-            inner: PhysMutPtr::try_from_page_array(pages, offset)?,
+            inner: PhysMutPtr::new(pages, offset)?,
         })
     }
 
     /// Create a new `PhysConstPtr` from the given contiguous physical address and length.
     ///
-    /// This is a shortcut for `try_from_page_array([align_down(pa), ..., align_up(align_down(pa) + bytes)], pa % ALIGN)`.
+    /// This is a shortcut for
+    /// `PhysConstPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(align_down(pa) + bytes)], pa % ALIGN)`.
     /// This function assumes that `pa`, ..., `pa+bytes` are both physically and virtually contiguous. If not,
     /// later accesses through `PhysConstPtr` may read incorrect data.
-    pub fn try_from_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
+    pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
         Ok(Self {
-            inner: PhysMutPtr::try_from_contiguous_pages(pa, bytes)?,
+            inner: PhysMutPtr::with_contiguous_pages(pa, bytes)?,
         })
     }
 
     /// Create a new `PhysConstPtr` from the given physical address for a single object.
     ///
-    /// This is a shortcut for `try_from_contiguous_pages(pa, size_of::<T>())`.
+    /// This is a shortcut for `PhysConstPtr::with_contiguous_pages(pa, size_of::<T>())`.
     ///
     /// Note: This module doesn't provide `as_usize` because LiteBox should not dereference physical addresses directly.
-    pub fn try_from_usize(pa: usize) -> Result<Self, PhysPointerError> {
+    pub fn with_usize(pa: usize) -> Result<Self, PhysPointerError> {
         Ok(Self {
-            inner: PhysMutPtr::try_from_usize(pa)?,
+            inner: PhysMutPtr::with_usize(pa)?,
         })
     }
 
