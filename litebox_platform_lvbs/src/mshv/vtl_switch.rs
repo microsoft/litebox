@@ -314,17 +314,7 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
     match func_id {
         VsmFunction::Unknown => Errno::EINVAL.as_neg().into(),
         VsmFunction::OpteeMessage => {
-            // Since we do not know whether an upcall handler uses extended states, we conservatively
-            // save and restore extended states before and after invoking the upcall handler.
-            with_per_cpu_variables_mut(|per_cpu_variables| {
-                per_cpu_variables.save_extended_states(HV_VTL_SECURE);
-            });
-
             // TODO: invoke the OP-TEE upcall once it is merged.
-
-            with_per_cpu_variables_mut(|per_cpu_variables| {
-                per_cpu_variables.restore_extended_states(HV_VTL_SECURE);
-            });
             0
         }
         _ => vsm_dispatch(func_id, &params[1..]),

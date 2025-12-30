@@ -5,10 +5,13 @@ use litebox::mm::linux::PAGE_SIZE;
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
     debug_serial_println,
-    host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
+    host::{
+        bootparam::get_vtl1_memory_info,
+        per_cpu_variables::{allocate_per_cpu_variables, with_per_cpu_variables_mut},
+    },
     mm::MemoryProvider,
     mshv::{
-        hvcall,
+        HV_VTL_SECURE, hvcall,
         vtl_switch::vtl_switch_loop_entry,
         vtl1_mem_layout::{
             VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
@@ -192,7 +195,17 @@ fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeS
                         None,
                     );
 
+                    // Since we do not know whether an OP-TEE TA uses extended states, we conservatively
+                    // save and restore extended states before and after invoking the upcall handler.
+                    with_per_cpu_variables_mut(|per_cpu_variables| {
+                        per_cpu_variables.save_extended_states(HV_VTL_SECURE);
+                    });
+
                     // TODO: run_thread
+
+                    with_per_cpu_variables_mut(|per_cpu_variables| {
+                        per_cpu_variables.restore_extended_states(HV_VTL_SECURE);
+                    });
 
                     // SAFETY
                     // We assume that `ta_info.params_address` is a valid pointer to `UteeParams`.
@@ -200,6 +213,7 @@ fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeS
 
                     prepare_for_return_to_normal_world(&ta_params, &ta_req_info, &mut msg_arg)?;
 
+                    // Overwrite `msg_arg` back to normal world memory to return value outputs (`ValueOutput` or `VapueInout`).
                     let mut ptr = NormalWorldMutPtr::<OpteeMsgArg, PAGE_SIZE>::with_usize(
                         usize::try_from(msg_arg_phys_addr).unwrap(),
                     )?;
