@@ -21,7 +21,7 @@ use once_cell::race::OnceBox;
 use thiserror::Error;
 
 use super::ElfLoadInfo;
-use crate::UserMutPtr;
+use crate::{Task, UserMutPtr};
 
 #[cfg(feature = "platform_linux_userland")]
 use crate::litebox_page_manager;
@@ -143,7 +143,7 @@ impl ElfLoaderMmap {
         prot: ProtFlags,
         flags: MapFlags,
     ) -> elf_loader::Result<usize> {
-        match crate::syscalls::mm::sys_mmap(
+        match Task::sys_mmap(
             addr.unwrap_or(0),
             len,
             litebox_common_linux::ProtFlags::from_bits(prot.bits()).ok_or(
@@ -206,16 +206,13 @@ impl elf_loader::mmap::Mmap for ElfLoaderMmap {
                 .read(mapped_slice, offset, fd)
                 .expect("fd_elf_map.read failed");
 
-            crate::syscalls::mm::sys_mprotect(
-                UserMutPtr::from_usize(mapped_addr),
-                len,
-                litebox_common_linux::ProtFlags::from_bits(prot.bits()).ok_or(
-                    elf_loader::Error::MmapError {
-                        msg: "unsupported prot flags".to_string(),
-                    },
-                )?,
-            )
-            .expect("sys_mprotect failed");
+            let prot = litebox_common_linux::ProtFlags::from_bits(prot.bits()).ok_or(
+                elf_loader::Error::MmapError {
+                    msg: "unsupported prot flags".to_string(),
+                },
+            )?;
+            Task::sys_mprotect(UserMutPtr::from_usize(mapped_addr), len, prot)
+                .expect("sys_mprotect failed");
 
             *need_copy = false;
             mapped_addr
@@ -360,8 +357,7 @@ fn load_trampoline(trampoline: TrampolineHdr, relo_off: usize, fd: i32) -> usize
     // TODO: For now, we unmap `ldelf`'s memory area to load the trampoline.
     // TAs might interact with `ldelf` to use its critical syscalls, so we might need to
     // figure out how to deal with this potential memory area overlap.
-    let _ =
-        crate::syscalls::mm::sys_munmap(UserMutPtr::from_usize(start_addr), end_addr - start_addr);
+    let _ = Task::sys_munmap(UserMutPtr::from_usize(start_addr), end_addr - start_addr);
     let ret = unsafe {
         ElfLoaderMmap::mmap(
             Some(start_addr),
@@ -413,7 +409,7 @@ pub(super) fn allocate_guest_tls(
     tls_size: Option<usize>,
 ) -> Result<(), litebox_common_linux::errno::Errno> {
     let tls_size = tls_size.unwrap_or(PAGE_SIZE).next_multiple_of(PAGE_SIZE);
-    let addr = crate::syscalls::mm::sys_mmap(
+    let addr = Task::sys_mmap(
         0,
         tls_size,
         litebox_common_linux::ProtFlags::PROT_READ | litebox_common_linux::ProtFlags::PROT_WRITE,

@@ -4,6 +4,7 @@
 //! Implementation of pseudo TAs (PTAs) which export system services as
 //! the functions of built-in TAs.
 
+use crate::Task;
 use litebox_common_optee::{TeeParamType, TeeResult, TeeUuid, UteeParams};
 use num_enum::TryFromPrimitive;
 
@@ -67,52 +68,56 @@ pub fn is_pta_session(ta_sess_id: u32) -> bool {
     ta_sess_id == crate::SessionIdPool::get_pta_session_id()
 }
 
-/// Handle a command of the system PTA.
-pub fn handle_system_pta_command(cmd_id: u32, params: &UteeParams) -> Result<(), TeeResult> {
-    #[allow(clippy::single_match_else)]
-    match PtaSystemCommandId::try_from(cmd_id).map_err(|_| TeeResult::BadParameters)? {
-        PtaSystemCommandId::DeriveTaUniqueKey => {
-            if params
-                .get_type(0)
-                .is_ok_and(|t| t == TeeParamType::MemrefInput)
-                && params
-                    .get_type(1)
-                    .is_ok_and(|t| t == TeeParamType::MemrefOutput)
-                && params.get_type(2).is_ok_and(|t| t == TeeParamType::None)
-                && params.get_type(3).is_ok_and(|t| t == TeeParamType::None)
-                && let Ok(Some(input)) = params.get_values(0).map_err(|_| TeeResult::BadParameters)
-                && let Ok(Some(output)) = params.get_values(1).map_err(|_| TeeResult::BadParameters)
-            {
-                let _extra_data = unsafe {
-                    &*core::ptr::slice_from_raw_parts(
-                        input.0 as *const u8,
-                        usize::try_from(input.1).map_err(|_| TeeResult::BadParameters)?,
-                    )
-                };
-                let key_slice = unsafe {
-                    &mut *core::ptr::slice_from_raw_parts_mut(
-                        output.0 as *mut u8,
-                        usize::try_from(output.1).map_err(|_| TeeResult::BadParameters)?,
-                    )
-                };
+impl Task {
+    /// Handle a command of the system PTA.
+    pub fn handle_system_pta_command(cmd_id: u32, params: &UteeParams) -> Result<(), TeeResult> {
+        #[allow(clippy::single_match_else)]
+        match PtaSystemCommandId::try_from(cmd_id).map_err(|_| TeeResult::BadParameters)? {
+            PtaSystemCommandId::DeriveTaUniqueKey => {
+                if params
+                    .get_type(0)
+                    .is_ok_and(|t| t == TeeParamType::MemrefInput)
+                    && params
+                        .get_type(1)
+                        .is_ok_and(|t| t == TeeParamType::MemrefOutput)
+                    && params.get_type(2).is_ok_and(|t| t == TeeParamType::None)
+                    && params.get_type(3).is_ok_and(|t| t == TeeParamType::None)
+                    && let Ok(Some(input)) =
+                        params.get_values(0).map_err(|_| TeeResult::BadParameters)
+                    && let Ok(Some(output)) =
+                        params.get_values(1).map_err(|_| TeeResult::BadParameters)
+                {
+                    let _extra_data = unsafe {
+                        &*core::ptr::slice_from_raw_parts(
+                            input.0 as *const u8,
+                            usize::try_from(input.1).map_err(|_| TeeResult::BadParameters)?,
+                        )
+                    };
+                    let key_slice = unsafe {
+                        &mut *core::ptr::slice_from_raw_parts_mut(
+                            output.0 as *mut u8,
+                            usize::try_from(output.1).map_err(|_| TeeResult::BadParameters)?,
+                        )
+                    };
 
-                // TODO: checks whether `key_slice` is within the secure memory
+                    // TODO: checks whether `key_slice` is within the secure memory
 
-                // TODO: derive a TA unique key using the hardware unique key (HUK), TA's UUID, and `extra_data`
-                litebox::log_println!(
-                    litebox_platform_multiplex::platform(),
-                    "derive a key and store it in the secure memory (ptr: {:#x}, size: {})",
-                    key_slice.as_ptr() as usize,
-                    key_slice.len()
-                );
-                // TODO: replace below with a secure key derivation function
-                crate::syscalls::cryp::sys_cryp_random_number_generate(key_slice)?;
+                    // TODO: derive a TA unique key using the hardware unique key (HUK), TA's UUID, and `extra_data`
+                    litebox::log_println!(
+                        litebox_platform_multiplex::platform(),
+                        "derive a key and store it in the secure memory (ptr: {:#x}, size: {})",
+                        key_slice.as_ptr() as usize,
+                        key_slice.len()
+                    );
+                    // TODO: replace below with a secure key derivation function
+                    Task::sys_cryp_random_number_generate(key_slice)?;
 
-                Ok(())
-            } else {
-                Err(TeeResult::BadParameters)
+                    Ok(())
+                } else {
+                    Err(TeeResult::BadParameters)
+                }
             }
+            _ => todo!("support other system PTA commands {cmd_id}"),
         }
-        _ => todo!("support other system PTA commands {cmd_id}"),
     }
 }

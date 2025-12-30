@@ -101,26 +101,6 @@ pub fn get_ta_base_addr() -> Option<usize> {
     })
 }
 
-/// Read `count` bytes of the TA binary of the current task from `offset` into
-/// userspace `dst`.
-///
-/// # Safety
-/// Ensure that `dst` is valid for `count` bytes.
-unsafe fn read_ta_bin(dst: UserMutPtr<u8>, offset: usize, count: usize) -> Option<()> {
-    with_current_task(|task| {
-        if let Some(ta_bin) = task.ta_bin.as_ref() {
-            let end_offset = offset.checked_add(count)?;
-            if end_offset <= ta_bin.len() {
-                dst.copy_from_slice(0, &ta_bin[offset..end_offset])
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    })
-}
-
 /// Get the global litebox object
 pub fn litebox<'a>() -> &'a LiteBox<Platform> {
     static LITEBOX: OnceBox<LiteBox<Platform>> = OnceBox::new();
@@ -154,9 +134,9 @@ impl litebox::shim::EnterShim for OpteeShim {
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         if is_ta_loaded() {
-            handle_syscall_request(ctx)
+            with_current_task(|task| task.handle_syscall_request(ctx))
         } else {
-            handle_ldelf_syscall_request(ctx)
+            with_current_task(|task| task.handle_ldelf_syscall_request(ctx))
         }
     }
 
@@ -173,291 +153,295 @@ impl litebox::shim::EnterShim for OpteeShim {
     }
 }
 
-/// Handle OP-TEE syscalls
-///
-/// # Panics
-///
-/// Unsupported syscalls or arguments would trigger a panic for development purposes.
-fn handle_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
-    let request = match SyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
-        Ok(request) => request,
-        Err(err) => {
-            // TODO: this seems like the wrong kind of error for OPTEE.
-            ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
-            return ContinueOperation::ResumeGuest;
-        }
-    };
+impl Task {
+    /// Handle OP-TEE syscalls
+    ///
+    /// # Panics
+    ///
+    /// Unsupported syscalls or arguments would trigger a panic for development purposes.
+    fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+        let request = match SyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
+            Ok(request) => request,
+            Err(err) => {
+                // TODO: this seems like the wrong kind of error for OPTEE.
+                ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
+                return ContinueOperation::ResumeGuest;
+            }
+        };
 
-    if let SyscallRequest::Return { ret } = request {
-        ctx.rax = syscalls::tee::sys_return(ret);
-        return ContinueOperation::ExitThread;
-    } else if let SyscallRequest::Panic { code } = request {
-        ctx.rax = syscalls::tee::sys_panic(code);
-        return ContinueOperation::ExitThread;
-    }
-    let res: Result<(), TeeResult> = match request {
-        SyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
-            Some(buf) => syscalls::tee::sys_log(&buf),
-            None => Err(TeeResult::BadParameters),
-        },
-        SyscallRequest::GetProperty {
-            prop_set,
-            index,
-            name,
-            name_len,
-            buf,
-            blen,
-            prop_type,
-        } => {
-            if let Some(buf_length) = unsafe { blen.read_at_offset(0) }
-                && usize::try_from(*buf_length).unwrap() <= MAX_KERNEL_BUF_SIZE
-            {
-                let mut prop_buf = vec![0u8; usize::try_from(*buf_length).unwrap()];
-                if name.as_usize() != 0 || name_len.as_usize() != 0 {
-                    todo!("return the name of a given property index")
-                }
-                syscalls::tee::sys_get_property(
-                    prop_set,
-                    index,
-                    None,
-                    None,
-                    &mut prop_buf,
-                    blen,
-                    prop_type,
-                )
-                .and_then(|()| {
-                    buf.copy_from_slice(0, &prop_buf)
-                        .ok_or(TeeResult::ShortBuffer)?;
-                    Ok(())
-                })
-            } else {
-                Err(TeeResult::BadParameters)
-            }
+        if let SyscallRequest::Return { ret } = request {
+            ctx.rax = Task::sys_return(ret);
+            return ContinueOperation::ExitThread;
+        } else if let SyscallRequest::Panic { code } = request {
+            ctx.rax = Task::sys_panic(code);
+            return ContinueOperation::ExitThread;
         }
-        SyscallRequest::GetPropertyNameToIndex {
-            prop_set,
-            name,
-            name_len,
-            index,
-        } => match unsafe { name.to_cow_slice(name_len) } {
-            Some(name) => syscalls::tee::sys_get_property_name_to_index(prop_set, &name, index),
-            None => Err(TeeResult::BadParameters),
-        },
-        SyscallRequest::OpenTaSession {
-            ta_uuid,
-            cancel_req_to,
-            usr_params,
-            ta_sess_id,
-            ret_orig,
-        } => {
-            if let Some(ta_uuid) = unsafe { ta_uuid.read_at_offset(0) }
-                && let Some(usr_params) = unsafe { usr_params.read_at_offset(0) }
-            {
-                syscalls::tee::sys_open_ta_session(
-                    *ta_uuid,
-                    cancel_req_to,
-                    *usr_params,
-                    ta_sess_id,
-                    ret_orig,
-                )
-            } else {
-                Err(TeeResult::BadParameters)
-            }
-        }
-        SyscallRequest::CloseTaSession { ta_sess_id } => {
-            syscalls::tee::sys_close_ta_session(ta_sess_id)
-        }
-        SyscallRequest::InvokeTaCommand {
-            ta_sess_id,
-            cancel_req_to,
-            cmd_id,
-            params,
-            ret_orig,
-        } => {
-            if let Some(params) = unsafe { params.read_at_offset(0) } {
-                syscalls::tee::sys_invoke_ta_command(
-                    ta_sess_id,
-                    cancel_req_to,
-                    cmd_id,
-                    *params,
-                    ret_orig,
-                )
-            } else {
-                Err(TeeResult::BadParameters)
-            }
-        }
-        SyscallRequest::CheckAccessRights { flags, buf, len } => {
-            syscalls::tee::sys_check_access_rights(flags, buf, len)
-        }
-        SyscallRequest::CrypStateAlloc {
-            algo,
-            op_mode,
-            key1,
-            key2,
-            state,
-        } => syscalls::cryp::sys_cryp_state_alloc(algo, op_mode, key1, key2, state),
-        SyscallRequest::CrypStateFree { state } => syscalls::cryp::sys_cryp_state_free(state),
-        SyscallRequest::CipherInit { state, iv, iv_len } => {
-            match unsafe { iv.to_cow_slice(iv_len) } {
-                Some(iv) => syscalls::cryp::sys_cipher_init(state, &iv),
+        let res: Result<(), TeeResult> = match request {
+            SyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
+                Some(buf) => Task::sys_log(&buf),
                 None => Err(TeeResult::BadParameters),
+            },
+            SyscallRequest::GetProperty {
+                prop_set,
+                index,
+                name,
+                name_len,
+                buf,
+                blen,
+                prop_type,
+            } => {
+                if let Some(buf_length) = unsafe { blen.read_at_offset(0) }
+                    && usize::try_from(*buf_length).unwrap() <= MAX_KERNEL_BUF_SIZE
+                {
+                    let mut prop_buf = vec![0u8; usize::try_from(*buf_length).unwrap()];
+                    if name.as_usize() != 0 || name_len.as_usize() != 0 {
+                        todo!("return the name of a given property index")
+                    }
+                    Task::sys_get_property(
+                        prop_set,
+                        index,
+                        None,
+                        None,
+                        &mut prop_buf,
+                        blen,
+                        prop_type,
+                    )
+                    .and_then(|()| {
+                        buf.copy_from_slice(0, &prop_buf)
+                            .ok_or(TeeResult::ShortBuffer)?;
+                        Ok(())
+                    })
+                } else {
+                    Err(TeeResult::BadParameters)
+                }
             }
-        }
-        SyscallRequest::CipherUpdate {
-            state,
-            src,
-            src_len,
-            dst,
-            dst_len,
-        } => handle_cipher_update_or_final(
-            state,
-            src,
-            src_len,
-            dst,
-            dst_len,
-            syscalls::cryp::sys_cipher_update,
-        ),
-        SyscallRequest::CipherFinal {
-            state,
-            src,
-            src_len,
-            dst,
-            dst_len,
-        } => handle_cipher_update_or_final(
-            state,
-            src,
-            src_len,
-            dst,
-            dst_len,
-            syscalls::cryp::sys_cipher_final,
-        ),
-        SyscallRequest::CrypObjGetInfo { obj, info } => {
-            syscalls::cryp::sys_cryp_obj_get_info(obj, info)
-        }
-        SyscallRequest::CrypObjAlloc { typ, max_size, obj } => {
-            syscalls::cryp::sys_cryp_obj_alloc(typ, max_size, obj)
-        }
-        SyscallRequest::CrypObjClose { obj } => syscalls::cryp::sys_cryp_obj_close(obj),
-        SyscallRequest::CrypObjReset { obj } => syscalls::cryp::sys_cryp_obj_reset(obj),
-        SyscallRequest::CrypObjPopulate {
-            obj,
-            attrs,
-            attr_count,
-        } => match unsafe { attrs.to_cow_slice(attr_count) } {
-            Some(attrs) => syscalls::cryp::sys_cryp_obj_populate(obj, &attrs),
-            None => Err(TeeResult::BadParameters),
-        },
-        SyscallRequest::CrypObjCopy { dst_obj, src_obj } => {
-            syscalls::cryp::sys_cryp_obj_copy(dst_obj, src_obj)
-        }
-        SyscallRequest::CrypRandomNumberGenerate { buf, blen } => {
-            // This could take a long time for large sizes. But OP-TEE OS limits
-            // the maximum size of random data generation to 4096 bytes, so
-            // let's do the same rather than something more complicated.
-            if blen > 4096 {
-                Err(TeeResult::OutOfMemory)
-            } else {
-                let mut kernel_buf = vec![0u8; blen];
-                syscalls::cryp::sys_cryp_random_number_generate(&mut kernel_buf).and_then(|()| {
-                    buf.copy_from_slice(0, &kernel_buf)
-                        .ok_or(TeeResult::AccessDenied)
-                })
+            SyscallRequest::GetPropertyNameToIndex {
+                prop_set,
+                name,
+                name_len,
+                index,
+            } => match unsafe { name.to_cow_slice(name_len) } {
+                Some(name) => Task::sys_get_property_name_to_index(prop_set, &name, index),
+                None => Err(TeeResult::BadParameters),
+            },
+            SyscallRequest::OpenTaSession {
+                ta_uuid,
+                cancel_req_to,
+                usr_params,
+                ta_sess_id,
+                ret_orig,
+            } => {
+                if let Some(ta_uuid) = unsafe { ta_uuid.read_at_offset(0) }
+                    && let Some(usr_params) = unsafe { usr_params.read_at_offset(0) }
+                {
+                    Task::sys_open_ta_session(
+                        *ta_uuid,
+                        cancel_req_to,
+                        *usr_params,
+                        ta_sess_id,
+                        ret_orig,
+                    )
+                } else {
+                    Err(TeeResult::BadParameters)
+                }
             }
-        }
-        _ => todo!(),
-    };
+            SyscallRequest::CloseTaSession { ta_sess_id } => Task::sys_close_ta_session(ta_sess_id),
+            SyscallRequest::InvokeTaCommand {
+                ta_sess_id,
+                cancel_req_to,
+                cmd_id,
+                params,
+                ret_orig,
+            } => {
+                if let Some(params) = unsafe { params.read_at_offset(0) } {
+                    Task::sys_invoke_ta_command(
+                        ta_sess_id,
+                        cancel_req_to,
+                        cmd_id,
+                        *params,
+                        ret_orig,
+                    )
+                } else {
+                    Err(TeeResult::BadParameters)
+                }
+            }
+            SyscallRequest::CheckAccessRights { flags, buf, len } => {
+                Task::sys_check_access_rights(flags, buf, len)
+            }
+            SyscallRequest::CrypStateAlloc {
+                algo,
+                op_mode,
+                key1,
+                key2,
+                state,
+            } => self.sys_cryp_state_alloc(algo, op_mode, key1, key2, state),
+            SyscallRequest::CrypStateFree { state } => self.sys_cryp_state_free(state),
+            SyscallRequest::CipherInit { state, iv, iv_len } => {
+                match unsafe { iv.to_cow_slice(iv_len) } {
+                    Some(iv) => self.sys_cipher_init(state, &iv),
+                    None => Err(TeeResult::BadParameters),
+                }
+            }
+            SyscallRequest::CipherUpdate {
+                state,
+                src,
+                src_len,
+                dst,
+                dst_len,
+            } => handle_cipher_update_or_final(
+                self,
+                state,
+                src,
+                src_len,
+                dst,
+                dst_len,
+                Task::sys_cipher_update,
+            ),
+            SyscallRequest::CipherFinal {
+                state,
+                src,
+                src_len,
+                dst,
+                dst_len,
+            } => handle_cipher_update_or_final(
+                self,
+                state,
+                src,
+                src_len,
+                dst,
+                dst_len,
+                Task::sys_cipher_final,
+            ),
+            SyscallRequest::CrypObjGetInfo { obj, info } => self.sys_cryp_obj_get_info(obj, info),
+            SyscallRequest::CrypObjAlloc { typ, max_size, obj } => {
+                self.sys_cryp_obj_alloc(typ, max_size, obj)
+            }
+            SyscallRequest::CrypObjClose { obj } => self.sys_cryp_obj_close(obj),
+            SyscallRequest::CrypObjReset { obj } => self.sys_cryp_obj_reset(obj),
+            SyscallRequest::CrypObjPopulate {
+                obj,
+                attrs,
+                attr_count,
+            } => match unsafe { attrs.to_cow_slice(attr_count) } {
+                Some(attrs) => self.sys_cryp_obj_populate(obj, &attrs),
+                None => Err(TeeResult::BadParameters),
+            },
+            SyscallRequest::CrypObjCopy { dst_obj, src_obj } => {
+                self.sys_cryp_obj_copy(dst_obj, src_obj)
+            }
+            SyscallRequest::CrypRandomNumberGenerate { buf, blen } => {
+                // This could take a long time for large sizes. But OP-TEE OS limits
+                // the maximum size of random data generation to 4096 bytes, so
+                // let's do the same rather than something more complicated.
+                if blen > 4096 {
+                    Err(TeeResult::OutOfMemory)
+                } else {
+                    let mut kernel_buf = vec![0u8; blen];
+                    Task::sys_cryp_random_number_generate(&mut kernel_buf).and_then(|()| {
+                        buf.copy_from_slice(0, &kernel_buf)
+                            .ok_or(TeeResult::AccessDenied)
+                    })
+                }
+            }
+            _ => todo!(),
+        };
 
-    ctx.rax = match res {
-        Ok(()) => u32::from(TeeResult::Success),
-        Err(e) => e.into(),
-    } as usize;
-    ContinueOperation::ResumeGuest
-}
-
-fn handle_ldelf_syscall_request(ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
-    let request = match LdelfSyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
-        Ok(request) => request,
-        Err(err) => {
-            // TODO: this seems like the wrong kind of error for OPTEE.
-            ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
-            return ContinueOperation::ResumeGuest;
-        }
-    };
-
-    if let LdelfSyscallRequest::Return { ret } = request {
-        ctx.rax = syscalls::tee::sys_return(ret);
-        return ContinueOperation::ExitThread;
-    } else if let LdelfSyscallRequest::Panic { code } = request {
-        ctx.rax = syscalls::tee::sys_panic(code);
-        return ContinueOperation::ExitThread;
+        ctx.rax = match res {
+            Ok(()) => u32::from(TeeResult::Success),
+            Err(e) => e.into(),
+        } as usize;
+        ContinueOperation::ResumeGuest
     }
-    let res: Result<(), TeeResult> = match request {
-        LdelfSyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
-            Some(buf) => syscalls::tee::sys_log(&buf),
-            None => Err(TeeResult::BadParameters),
-        },
-        LdelfSyscallRequest::MapZi {
-            va,
-            num_bytes,
-            pad_begin,
-            pad_end,
-            flags,
-        } => syscalls::ldelf::sys_map_zi(va, num_bytes, pad_begin, pad_end, flags),
-        LdelfSyscallRequest::OpenBin {
-            uuid,
-            uuid_size,
-            handle,
-        } => {
-            if uuid_size == core::mem::size_of::<TeeUuid>()
-                && let Some(ta_uuid) = unsafe { uuid.read_at_offset(0) }
-            {
-                syscalls::ldelf::sys_open_bin(*ta_uuid, handle)
-            } else {
-                Err(TeeResult::BadParameters)
-            }
-        }
-        LdelfSyscallRequest::CloseBin { handle } => syscalls::ldelf::sys_close_bin(handle),
-        LdelfSyscallRequest::MapBin {
-            va,
-            num_bytes,
-            handle,
-            offs,
-            pad_begin,
-            pad_end,
-            flags,
-        } => syscalls::ldelf::sys_map_bin(va, num_bytes, handle, offs, pad_begin, pad_end, flags),
-        LdelfSyscallRequest::CpFromBin {
-            dst,
-            offs,
-            num_bytes,
-            handle,
-        } => syscalls::ldelf::sys_cp_from_bin(dst, offs, num_bytes, handle),
-        LdelfSyscallRequest::GenRndNum { buf, num_bytes } => {
-            // This could take a long time for large sizes. But OP-TEE OS limits
-            // the maximum size of random data generation to 4096 bytes, so
-            // let's do the same rather than something more complicated.
-            if num_bytes > 4096 {
-                Err(TeeResult::OutOfMemory)
-            } else {
-                let mut kernel_buf = vec![0u8; num_bytes];
-                syscalls::cryp::sys_cryp_random_number_generate(&mut kernel_buf).and_then(|()| {
-                    buf.copy_from_slice(0, &kernel_buf)
-                        .ok_or(TeeResult::AccessDenied)
-                })
-            }
-        }
-        _ => todo!(),
-    };
 
-    ctx.rax = match res {
-        Ok(()) => u32::from(TeeResult::Success),
-        Err(e) => e.into(),
-    } as usize;
-    ContinueOperation::ResumeGuest
+    fn handle_ldelf_syscall_request(
+        &self,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) -> ContinueOperation {
+        let request = match LdelfSyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
+            Ok(request) => request,
+            Err(err) => {
+                // TODO: this seems like the wrong kind of error for OPTEE.
+                ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
+                return ContinueOperation::ResumeGuest;
+            }
+        };
+
+        if let LdelfSyscallRequest::Return { ret } = request {
+            ctx.rax = Task::sys_return(ret);
+            return ContinueOperation::ExitThread;
+        } else if let LdelfSyscallRequest::Panic { code } = request {
+            ctx.rax = Task::sys_panic(code);
+            return ContinueOperation::ExitThread;
+        }
+        let res: Result<(), TeeResult> = match request {
+            LdelfSyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
+                Some(buf) => Task::sys_log(&buf),
+                None => Err(TeeResult::BadParameters),
+            },
+            LdelfSyscallRequest::MapZi {
+                va,
+                num_bytes,
+                pad_begin,
+                pad_end,
+                flags,
+            } => Task::sys_map_zi(va, num_bytes, pad_begin, pad_end, flags),
+            LdelfSyscallRequest::OpenBin {
+                uuid,
+                uuid_size,
+                handle,
+            } => {
+                if uuid_size == core::mem::size_of::<TeeUuid>()
+                    && let Some(ta_uuid) = unsafe { uuid.read_at_offset(0) }
+                {
+                    Task::sys_open_bin(*ta_uuid, handle)
+                } else {
+                    Err(TeeResult::BadParameters)
+                }
+            }
+            LdelfSyscallRequest::CloseBin { handle } => Task::sys_close_bin(handle),
+            LdelfSyscallRequest::MapBin {
+                va,
+                num_bytes,
+                handle,
+                offs,
+                pad_begin,
+                pad_end,
+                flags,
+            } => self.sys_map_bin(va, num_bytes, handle, offs, pad_begin, pad_end, flags),
+            LdelfSyscallRequest::CpFromBin {
+                dst,
+                offs,
+                num_bytes,
+                handle,
+            } => self.sys_cp_from_bin(dst, offs, num_bytes, handle),
+            LdelfSyscallRequest::GenRndNum { buf, num_bytes } => {
+                // This could take a long time for large sizes. But OP-TEE OS limits
+                // the maximum size of random data generation to 4096 bytes, so
+                // let's do the same rather than something more complicated.
+                if num_bytes > 4096 {
+                    Err(TeeResult::OutOfMemory)
+                } else {
+                    let mut kernel_buf = vec![0u8; num_bytes];
+                    Task::sys_cryp_random_number_generate(&mut kernel_buf).and_then(|()| {
+                        buf.copy_from_slice(0, &kernel_buf)
+                            .ok_or(TeeResult::AccessDenied)
+                    })
+                }
+            }
+            _ => todo!(),
+        };
+
+        ctx.rax = match res {
+            Ok(()) => u32::from(TeeResult::Success),
+            Err(e) => e.into(),
+        } as usize;
+        ContinueOperation::ResumeGuest
+    }
 }
 
 #[inline]
 fn handle_cipher_update_or_final<F>(
+    task: &Task,
     state: TeeCrypStateHandle,
     src: UserConstPtr<u8>,
     src_len: usize,
@@ -466,7 +450,7 @@ fn handle_cipher_update_or_final<F>(
     syscall_fn: F,
 ) -> Result<(), TeeResult>
 where
-    F: Fn(TeeCrypStateHandle, &[u8], &mut [u8], &mut usize) -> Result<(), TeeResult>,
+    F: Fn(&Task, TeeCrypStateHandle, &[u8], &mut [u8], &mut usize) -> Result<(), TeeResult>,
 {
     if let Some(src_slice) = unsafe { src.to_cow_slice(src_len) }
         && let Some(length) = unsafe { dst_len.read_at_offset(0) }
@@ -474,7 +458,7 @@ where
     {
         let mut length = usize::try_from(*length).unwrap();
         let mut kernel_buf = vec![0u8; length];
-        syscall_fn(state, &src_slice, &mut kernel_buf, &mut length).and_then(|()| {
+        syscall_fn(task, state, &src_slice, &mut kernel_buf, &mut length).and_then(|()| {
             unsafe {
                 let _ = dst_len.write_at_offset(0, u64::try_from(length).unwrap());
             }

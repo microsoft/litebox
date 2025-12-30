@@ -3,7 +3,7 @@
 
 //! Implementation of cryptography related syscalls
 
-use crate::with_current_task;
+use crate::Task;
 use aes::{
     Aes128, Aes192, Aes256,
     cipher::{NewCipher, StreamCipher, generic_array::GenericArray},
@@ -17,16 +17,17 @@ use litebox_common_optee::{
 
 use crate::{Cipher, TeeCrypState, TeeObj, UserMutPtr};
 
-pub(crate) fn sys_cryp_state_alloc(
-    algo: TeeAlgorithm,
-    mode: TeeOperationMode,
-    key1: TeeObjHandle,
-    key2: TeeObjHandle,
-    state: UserMutPtr<TeeCrypStateHandle>,
-) -> Result<(), TeeResult> {
-    with_current_task(|task| {
-        let tee_cryp_state_map = &task.tee_cryp_state_map;
-        let tee_obj_map = &task.tee_obj_map;
+impl Task {
+    pub(crate) fn sys_cryp_state_alloc(
+        &self,
+        algo: TeeAlgorithm,
+        mode: TeeOperationMode,
+        key1: TeeObjHandle,
+        key2: TeeObjHandle,
+        state: UserMutPtr<TeeCrypStateHandle>,
+    ) -> Result<(), TeeResult> {
+        let tee_cryp_state_map = &self.tee_cryp_state_map;
+        let tee_obj_map = &self.tee_obj_map;
         if key1 != TeeObjHandle::NULL {
             if !tee_obj_map.exists(key1) {
                 return Err(TeeResult::BadState);
@@ -77,14 +78,12 @@ pub(crate) fn sys_cryp_state_alloc(
             tee_obj_map.set_busy(key2, true);
         }
         Ok(())
-    })
-}
+    }
 
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn sys_cryp_state_free(state: TeeCrypStateHandle) -> Result<(), TeeResult> {
-    with_current_task(|task| {
-        let tee_cryp_state_map = &task.tee_cryp_state_map;
-        let tee_obj_map = &task.tee_obj_map;
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn sys_cryp_state_free(&self, state: TeeCrypStateHandle) -> Result<(), TeeResult> {
+        let tee_cryp_state_map = &self.tee_cryp_state_map;
+        let tee_obj_map = &self.tee_obj_map;
         if let Some(cryp_state) = tee_cryp_state_map.get_copy(state) {
             if let Some(handle) = cryp_state.get_object_handle(true) {
                 tee_obj_map.remove(handle);
@@ -95,34 +94,15 @@ pub(crate) fn sys_cryp_state_free(state: TeeCrypStateHandle) -> Result<(), TeeRe
             tee_cryp_state_map.remove(state);
         }
         Ok(())
-    })
-}
-
-fn create_cipher(algo: TeeAlgorithm, key: &[u8], iv: &[u8]) -> Option<Cipher> {
-    match algo {
-        TeeAlgorithm::AesCtr => match key.len() {
-            16 => Some(Cipher::Aes128Ctr(Ctr128BE::<Aes128>::new(
-                GenericArray::from_slice(key),
-                GenericArray::from_slice(iv),
-            ))),
-            24 => Some(Cipher::Aes192Ctr(Ctr128BE::<Aes192>::new(
-                GenericArray::from_slice(key),
-                GenericArray::from_slice(iv),
-            ))),
-            32 => Some(Cipher::Aes256Ctr(Ctr128BE::<Aes256>::new(
-                GenericArray::from_slice(key),
-                GenericArray::from_slice(iv),
-            ))),
-            _ => None,
-        },
-        _ => None,
     }
-}
 
-pub(crate) fn sys_cipher_init(state: TeeCrypStateHandle, iv: &[u8]) -> Result<(), TeeResult> {
-    with_current_task(|task| {
-        let tee_cryp_state_map = &task.tee_cryp_state_map;
-        let tee_obj_map = &task.tee_obj_map;
+    pub(crate) fn sys_cipher_init(
+        &self,
+        state: TeeCrypStateHandle,
+        iv: &[u8],
+    ) -> Result<(), TeeResult> {
+        let tee_cryp_state_map = &self.tee_cryp_state_map;
+        let tee_obj_map = &self.tee_obj_map;
         if let Some(cryp_state) = tee_cryp_state_map.get_copy(state)
             && let Some(handle) = cryp_state.get_object_handle(true)
             && tee_obj_map.exists(handle)
@@ -152,36 +132,37 @@ pub(crate) fn sys_cipher_init(state: TeeCrypStateHandle, iv: &[u8]) -> Result<()
         } else {
             Err(TeeResult::BadParameters)
         }
-    })
-}
+    }
 
-pub(crate) fn sys_cipher_update(
-    state: TeeCrypStateHandle,
-    src_slice: &[u8],
-    dst_slice: &mut [u8],
-    dst_len: &mut usize,
-) -> Result<(), TeeResult> {
-    do_cipher_update(state, src_slice, dst_slice, dst_len, false)
-}
+    pub(crate) fn sys_cipher_update(
+        &self,
+        state: TeeCrypStateHandle,
+        src_slice: &[u8],
+        dst_slice: &mut [u8],
+        dst_len: &mut usize,
+    ) -> Result<(), TeeResult> {
+        self.do_cipher_update(state, src_slice, dst_slice, dst_len, false)
+    }
 
-pub(crate) fn sys_cipher_final(
-    state: TeeCrypStateHandle,
-    src_slice: &[u8],
-    dst_slice: &mut [u8],
-    dst_len: &mut usize,
-) -> Result<(), TeeResult> {
-    do_cipher_update(state, src_slice, dst_slice, dst_len, true)
-}
+    pub(crate) fn sys_cipher_final(
+        &self,
+        state: TeeCrypStateHandle,
+        src_slice: &[u8],
+        dst_slice: &mut [u8],
+        dst_len: &mut usize,
+    ) -> Result<(), TeeResult> {
+        self.do_cipher_update(state, src_slice, dst_slice, dst_len, true)
+    }
 
-fn do_cipher_update(
-    state: TeeCrypStateHandle,
-    src_slice: &[u8],
-    dst_slice: &mut [u8],
-    dst_len: &mut usize,
-    last_block: bool,
-) -> Result<(), TeeResult> {
-    with_current_task(|task| {
-        let tee_cryp_state_map = &task.tee_cryp_state_map;
+    fn do_cipher_update(
+        &self,
+        state: TeeCrypStateHandle,
+        src_slice: &[u8],
+        dst_slice: &mut [u8],
+        dst_len: &mut usize,
+        last_block: bool,
+    ) -> Result<(), TeeResult> {
+        let tee_cryp_state_map = &self.tee_cryp_state_map;
         if dst_slice.len() < src_slice.len() {
             return Err(TeeResult::ShortBuffer);
         }
@@ -208,15 +189,14 @@ fn do_cipher_update(
         } else {
             Err(TeeResult::BadParameters)
         }
-    })
-}
+    }
 
-pub(crate) fn sys_cryp_obj_get_info(
-    obj: TeeObjHandle,
-    info: UserMutPtr<TeeObjectInfo>,
-) -> Result<(), TeeResult> {
-    with_current_task(|task| {
-        let tee_obj_map = &task.tee_obj_map;
+    pub(crate) fn sys_cryp_obj_get_info(
+        &self,
+        obj: TeeObjHandle,
+        info: UserMutPtr<TeeObjectInfo>,
+    ) -> Result<(), TeeResult> {
+        let tee_obj_map = &self.tee_obj_map;
         if tee_obj_map.exists(obj) {
             let tee_obj = tee_obj_map.get_copy(obj).ok_or(TeeResult::ItemNotFound)?;
             unsafe {
@@ -226,16 +206,15 @@ pub(crate) fn sys_cryp_obj_get_info(
         } else {
             Err(TeeResult::BadState)
         }
-    })
-}
+    }
 
-pub(crate) fn sys_cryp_obj_alloc(
-    typ: TeeObjectType,
-    max_size: u32,
-    obj: UserMutPtr<TeeObjHandle>,
-) -> Result<(), TeeResult> {
-    with_current_task(|task| {
-        let tee_obj_map = &task.tee_obj_map;
+    pub(crate) fn sys_cryp_obj_alloc(
+        &self,
+        typ: TeeObjectType,
+        max_size: u32,
+        obj: UserMutPtr<TeeObjHandle>,
+    ) -> Result<(), TeeResult> {
+        let tee_obj_map = &self.tee_obj_map;
         let tee_obj = TeeObj::new(typ, max_size);
         let handle = tee_obj_map.allocate(&tee_obj);
         if let Some(()) = unsafe { obj.write_at_offset(0, handle) } {
@@ -244,38 +223,33 @@ pub(crate) fn sys_cryp_obj_alloc(
             tee_obj_map.remove(handle);
             Err(TeeResult::AccessDenied)
         }
-    })
-}
+    }
 
-pub(crate) fn sys_cryp_obj_close(obj: TeeObjHandle) -> Result<(), TeeResult> {
-    with_current_task(|task| {
-        let tee_obj_map = &task.tee_obj_map;
+    pub(crate) fn sys_cryp_obj_close(&self, obj: TeeObjHandle) -> Result<(), TeeResult> {
+        let tee_obj_map = &self.tee_obj_map;
         if tee_obj_map.exists(obj) {
             tee_obj_map.remove(obj);
             Ok(())
         } else {
             Err(TeeResult::BadState)
         }
-    })
-}
+    }
 
-pub(crate) fn sys_cryp_obj_reset(obj: TeeObjHandle) -> Result<(), TeeResult> {
-    with_current_task(|task| {
-        let tee_obj_map = &task.tee_obj_map;
+    pub(crate) fn sys_cryp_obj_reset(&self, obj: TeeObjHandle) -> Result<(), TeeResult> {
+        let tee_obj_map = &self.tee_obj_map;
         if tee_obj_map.exists(obj) {
             tee_obj_map.reset(obj)
         } else {
             Err(TeeResult::BadState)
         }
-    })
-}
+    }
 
-pub(crate) fn sys_cryp_obj_populate(
-    obj: TeeObjHandle,
-    attrs: &[UteeAttribute],
-) -> Result<(), TeeResult> {
-    with_current_task(|task| {
-        let tee_obj_map = &task.tee_obj_map;
+    pub(crate) fn sys_cryp_obj_populate(
+        &self,
+        obj: TeeObjHandle,
+        attrs: &[UteeAttribute],
+    ) -> Result<(), TeeResult> {
+        let tee_obj_map = &self.tee_obj_map;
         if attrs.len() > 1 {
             todo!("handle multiple attributes");
         }
@@ -285,12 +259,14 @@ pub(crate) fn sys_cryp_obj_populate(
         tee_obj_map
             .populate(obj, attrs)
             .map_err(|_| TeeResult::BadParameters)
-    })
-}
+    }
 
-pub(crate) fn sys_cryp_obj_copy(dst: TeeObjHandle, src: TeeObjHandle) -> Result<(), TeeResult> {
-    with_current_task(|task| {
-        let tee_obj_map = &task.tee_obj_map;
+    pub(crate) fn sys_cryp_obj_copy(
+        &self,
+        dst: TeeObjHandle,
+        src: TeeObjHandle,
+    ) -> Result<(), TeeResult> {
+        let tee_obj_map = &self.tee_obj_map;
         let src_obj = tee_obj_map.get_copy(src).ok_or(TeeResult::BadState)?;
         if !src_obj
             .info
@@ -311,16 +287,37 @@ pub(crate) fn sys_cryp_obj_copy(dst: TeeObjHandle, src: TeeObjHandle) -> Result<
 
         tee_obj_map.replace(dst, &src_obj);
         Ok(())
-    })
+    }
+
+    pub(crate) fn sys_cryp_random_number_generate(buf: &mut [u8]) -> Result<(), TeeResult> {
+        if buf.is_empty() {
+            return Err(TeeResult::BadParameters);
+        }
+        <crate::Platform as litebox::platform::CrngProvider>::fill_bytes_crng(
+            litebox_platform_multiplex::platform(),
+            buf,
+        );
+        Ok(())
+    }
 }
 
-pub(crate) fn sys_cryp_random_number_generate(buf: &mut [u8]) -> Result<(), TeeResult> {
-    if buf.is_empty() {
-        return Err(TeeResult::BadParameters);
+fn create_cipher(algo: TeeAlgorithm, key: &[u8], iv: &[u8]) -> Option<Cipher> {
+    match algo {
+        TeeAlgorithm::AesCtr => match key.len() {
+            16 => Some(Cipher::Aes128Ctr(Ctr128BE::<Aes128>::new(
+                GenericArray::from_slice(key),
+                GenericArray::from_slice(iv),
+            ))),
+            24 => Some(Cipher::Aes192Ctr(Ctr128BE::<Aes192>::new(
+                GenericArray::from_slice(key),
+                GenericArray::from_slice(iv),
+            ))),
+            32 => Some(Cipher::Aes256Ctr(Ctr128BE::<Aes256>::new(
+                GenericArray::from_slice(key),
+                GenericArray::from_slice(iv),
+            ))),
+            _ => None,
+        },
+        _ => None,
     }
-    <crate::Platform as litebox::platform::CrngProvider>::fill_bytes_crng(
-        litebox_platform_multiplex::platform(),
-        buf,
-    );
-    Ok(())
 }

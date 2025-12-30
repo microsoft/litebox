@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use super::{cryp::sys_cryp_random_number_generate, tee::sys_log};
+use crate::Task;
 use litebox_platform_multiplex::{Platform, set_platform};
 
 // Ensure we only init the platform once
@@ -17,7 +17,7 @@ pub(crate) fn init_platform() {
 #[test]
 fn test_sys_log() {
     init_platform();
-    let result = sys_log(b"Hello! This is litebox_shim_optee.");
+    let result = Task::sys_log(b"Hello! This is litebox_shim_optee.");
     assert!(result.is_ok());
 }
 
@@ -25,6 +25,6 @@ fn test_sys_log() {
 fn test_cryp_random_number_generate() {
     init_platform();
     let mut buf = [0u8; 16];
-    let result = sys_cryp_random_number_generate(&mut buf);
+    let result = Task::sys_cryp_random_number_generate(&mut buf);
     assert!(result.is_ok() && buf != [0u8; 16]);
 }
