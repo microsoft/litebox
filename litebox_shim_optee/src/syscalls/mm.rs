@@ -6,7 +6,7 @@
 use litebox::mm::linux::{MappingError, PAGE_SIZE};
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
-use crate::{Task, UserMutPtr, litebox_page_manager};
+use crate::{Task, UserMutPtr};
 
 // `litebox_shim_optee` memory management
 // OP-TEE OS does have `ldelf_*` syscalls for memory management, but they are for LDELF (an ELF loader) not TAs.
@@ -24,6 +24,7 @@ fn align_up(addr: usize, align: usize) -> usize {
 impl Task {
     #[inline]
     fn do_mmap_anonymous(
+        &self,
         suggested_addr: Option<usize>,
         len: usize,
         prot: ProtFlags,
@@ -31,7 +32,7 @@ impl Task {
     ) -> Result<UserMutPtr<u8>, MappingError> {
         let op = |_| Ok(0);
         litebox_common_linux::mm::do_mmap(
-            litebox_page_manager(),
+            &self.global.pm,
             suggested_addr,
             len,
             prot,
@@ -43,6 +44,7 @@ impl Task {
 
     /// Handle syscall `mmap`
     pub(crate) fn sys_mmap(
+        &self,
         addr: usize,
         len: usize,
         prot: ProtFlags,
@@ -79,7 +81,7 @@ impl Task {
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
         if flags.contains(MapFlags::MAP_ANONYMOUS) {
-            Task::do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
+            self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
         } else {
             panic!("we don't support file-backed mmap");
         }
@@ -88,19 +90,20 @@ impl Task {
 
     /// Handle syscall `munmap`
     #[allow(dead_code)]
-    pub(crate) fn sys_munmap(addr: UserMutPtr<u8>, len: usize) -> Result<(), Errno> {
-        let pm = litebox_page_manager();
+    pub(crate) fn sys_munmap(&self, addr: UserMutPtr<u8>, len: usize) -> Result<(), Errno> {
+        let pm = &self.global.pm;
         litebox_common_linux::mm::sys_munmap(pm, addr, len)
     }
 
     /// Handle syscall `mprotect`
     #[inline]
     pub(crate) fn sys_mprotect(
+        &self,
         addr: UserMutPtr<u8>,
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        let pm = litebox_page_manager();
+        let pm = &self.global.pm;
         litebox_common_linux::mm::sys_mprotect(pm, addr, len, prot)
     }
 }

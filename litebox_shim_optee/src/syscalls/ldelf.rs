@@ -13,8 +13,6 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
-const DUMMY_HANDLE: u32 = 1;
-
 impl Task {
     /// OP-TEE's syscall to map zero-initialized memory with padding.
     /// This function pads `pad_begin` bytes before and `pad_end` bytes after the
@@ -24,6 +22,7 @@ impl Task {
     /// Memory regions between `start - pad_begin` and `start` and between
     /// `start + num_bytes` and `start + num_bytes + pad_end` are reserved and must not be used.
     pub fn sys_map_zi(
+        &self,
         va: UserMutPtr<usize>,
         num_bytes: usize,
         pad_begin: usize,
@@ -36,7 +35,7 @@ impl Task {
 
         #[cfg(debug_assertions)]
         litebox::log_println!(
-            litebox_platform_multiplex::platform(),
+            self.global.platform,
             "sys_map_zi: va {:#x} (addr {:#x}), num_bytes {}, flags {:#x}",
             va.as_usize(),
             *addr,
@@ -65,18 +64,20 @@ impl Task {
         // OP-TEE maintains data structures to ensure padded regions are not used. It does not use page tables because
         // it targets systems with inefficient CPU and MMU. Instead of reproducing OP-TEE's behavior, we create
         // mappings with `PROT_NONE` for padded regions to prevent others from using them.
-        let addr = Task::sys_mmap(*addr, total_size, ProtFlags::PROT_NONE, flags, -1, 0)
+        let addr = self
+            .sys_mmap(*addr, total_size, ProtFlags::PROT_NONE, flags, -1, 0)
             .map_err(|_| TeeResult::OutOfMemory)?;
         let padded_start = addr.as_usize() + pad_begin;
-        if Task::sys_mprotect(
-            UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
-            (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
-                .next_multiple_of(PAGE_SIZE),
-            prot,
-        )
-        .is_err()
+        if self
+            .sys_mprotect(
+                UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
+                (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
+                    .next_multiple_of(PAGE_SIZE),
+                prot,
+            )
+            .is_err()
         {
-            let _ = Task::sys_munmap(addr, total_size).ok();
+            let _ = self.sys_munmap(addr, total_size).ok();
             return Err(TeeResult::OutOfMemory);
         }
         unsafe {
@@ -87,20 +88,24 @@ impl Task {
 
     /// OP-TEE's syscall to open a TA binary.
     #[expect(clippy::unnecessary_wraps)]
-    pub fn sys_open_bin(ta_uuid: TeeUuid, handle: UserMutPtr<u32>) -> Result<(), TeeResult> {
+    pub fn sys_open_bin(&self, ta_uuid: TeeUuid, handle: UserMutPtr<u32>) -> Result<(), TeeResult> {
         // TODO: This function requires an RPC from the secure world to the normal world to
         // open the TA binary identified by `ta_uuid` and return a handle to it in `handle`.
         // Since we don't have RPC implementation yet, we just return a dummy handle value.
         #[cfg(debug_assertions)]
         litebox::log_println!(
-            litebox_platform_multiplex::platform(),
+            self.global.platform,
             "sys_open_bin: ta_uuid {:?}, handle {:#x}",
             ta_uuid,
             handle.as_usize()
         );
 
+        if self.global.ta_uuid_map.get(&ta_uuid).is_none() {
+            return Err(TeeResult::ItemNotFound);
+        }
+        let new_handle = self.ta_handle_map.insert(ta_uuid);
         unsafe {
-            let _ = handle.write_at_offset(0, DUMMY_HANDLE); // TODO: use real handle
+            let _ = handle.write_at_offset(0, new_handle);
         }
 
         Ok(())
@@ -108,23 +113,19 @@ impl Task {
 
     /// OP-TEE's syscall to close a TA binary.
     #[expect(clippy::unnecessary_wraps)]
-    pub fn sys_close_bin(handle: u32) -> Result<(), TeeResult> {
+    pub fn sys_close_bin(&self, handle: u32) -> Result<(), TeeResult> {
         // TODO: This function requires an RPC from the secure world to the normal world to
         // close the TA binary identified by `handle`.
         // Since we don't have RPC implementation yet, we just do nothing.
         #[cfg(debug_assertions)]
-        litebox::log_println!(
-            litebox_platform_multiplex::platform(),
-            "sys_close_bin: handle {}",
-            handle
-        );
+        litebox::log_println!(self.global.platform, "sys_close_bin: handle {}", handle);
 
-        assert!(handle == DUMMY_HANDLE, "invalid handle");
-        // TODO: check whether `handle` is valid
-
-        // TODO: unmap all mappings related to `handle` which are no longer used.
-
-        Ok(())
+        if self.ta_handle_map.get(handle).is_none() {
+            Err(TeeResult::BadParameters)
+        } else {
+            self.ta_handle_map.remove(handle);
+            Ok(())
+        }
     }
 
     /// OP-TEE's syscall to map a portion of a TA binary into memory.
@@ -149,7 +150,7 @@ impl Task {
         // TA binary to do this.
         #[cfg(debug_assertions)]
         litebox::log_println!(
-            litebox_platform_multiplex::platform(),
+            self.global.platform,
             "sys_map_bin: va {:#x} (addr {:#x}), num_bytes {}, handle {}, offs {}, pad_begin {}, pad_end {}, flags {:#x}",
             va.as_usize(),
             *addr,
@@ -168,8 +169,9 @@ impl Task {
             return Err(TeeResult::BadParameters);
         }
 
-        assert!(handle == DUMMY_HANDLE, "invalid handle");
-        // TODO: check whether `handle` is valid
+        if self.ta_handle_map.get(handle).is_none() {
+            return Err(TeeResult::BadParameters);
+        }
 
         if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_SHAREABLE)
             && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_WRITEABLE)
@@ -195,31 +197,38 @@ impl Task {
 
         // Currently, we do not support TA binary mapping. So, we create an anonymous mapping and copy
         // the content of the TA binary into it.
-        let addr = Task::sys_mmap(
-            *addr,
-            total_size,
-            ProtFlags::PROT_NONE,
-            flags_internal,
-            -1,
-            0,
-        )
-        .map_err(|_| TeeResult::OutOfMemory)?;
+        let addr = self
+            .sys_mmap(
+                *addr,
+                total_size,
+                ProtFlags::PROT_NONE,
+                flags_internal,
+                -1,
+                0,
+            )
+            .map_err(|_| TeeResult::OutOfMemory)?;
         let padded_start = addr.as_usize() + pad_begin;
-        if Task::sys_mprotect(
-            UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
-            (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
-                .next_multiple_of(PAGE_SIZE),
-            ProtFlags::PROT_READ_WRITE,
-        )
-        .is_err()
+        if self
+            .sys_mprotect(
+                UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
+                (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
+                    .next_multiple_of(PAGE_SIZE),
+                ProtFlags::PROT_READ_WRITE,
+            )
+            .is_err()
         {
-            let _ = Task::sys_munmap(addr, total_size).ok();
+            let _ = self.sys_munmap(addr, total_size).ok();
             return Err(TeeResult::OutOfMemory);
         }
 
         unsafe {
             if self
-                .read_ta_bin(UserMutPtr::from_usize(padded_start), offs, num_bytes)
+                .read_ta_bin(
+                    handle,
+                    UserMutPtr::from_usize(padded_start),
+                    offs,
+                    num_bytes,
+                )
                 .is_none()
             {
                 return Err(TeeResult::ShortBuffer);
@@ -232,23 +241,24 @@ impl Task {
         } else if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE) {
             prot |= ProtFlags::PROT_EXEC;
         }
-        if Task::sys_mprotect(
-            UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
-            (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
-                .next_multiple_of(PAGE_SIZE),
-            prot,
-        )
-        .is_err()
+        if self
+            .sys_mprotect(
+                UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
+                (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
+                    .next_multiple_of(PAGE_SIZE),
+                prot,
+            )
+            .is_err()
         {
-            let _ = Task::sys_munmap(addr, total_size).ok();
+            let _ = self.sys_munmap(addr, total_size).ok();
             return Err(TeeResult::OutOfMemory);
         }
 
         if offs == PAGE_SIZE
             && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
-            && crate::get_ta_base_addr().is_none()
+            && self.get_ta_base_addr().is_none()
         {
-            crate::set_ta_base_addr(padded_start);
+            self.set_ta_base_addr(padded_start);
         }
 
         unsafe {
@@ -268,7 +278,7 @@ impl Task {
     ) -> Result<(), TeeResult> {
         #[cfg(debug_assertions)]
         litebox::log_println!(
-            litebox_platform_multiplex::platform(),
+            self.global.platform,
             "sys_cp_from_bin: dst {:#x}, offs {}, num_bytes {}, handle {}",
             dst,
             offs,
@@ -277,7 +287,7 @@ impl Task {
         );
 
         unsafe {
-            self.read_ta_bin(UserMutPtr::from_usize(dst), offs, num_bytes)
+            self.read_ta_bin(handle, UserMutPtr::from_usize(dst), offs, num_bytes)
                 .ok_or(TeeResult::ShortBuffer)?;
         }
 
@@ -289,8 +299,16 @@ impl Task {
     ///
     /// # Safety
     /// Ensure that `dst` is valid for `count` bytes.
-    unsafe fn read_ta_bin(&self, dst: UserMutPtr<u8>, offset: usize, count: usize) -> Option<()> {
-        if let Some(ta_bin) = self.ta_bin.as_ref() {
+    unsafe fn read_ta_bin(
+        &self,
+        handle: u32,
+        dst: UserMutPtr<u8>,
+        offset: usize,
+        count: usize,
+    ) -> Option<()> {
+        if let Some(ta_uuid) = self.ta_handle_map.get(handle)
+            && let Some(ta_bin) = self.global.ta_uuid_map.get(&ta_uuid)
+        {
             let end_offset = offset.checked_add(count)?;
             if end_offset <= ta_bin.len() {
                 dst.copy_from_slice(0, &ta_bin[offset..end_offset])

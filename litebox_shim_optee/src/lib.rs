@@ -13,7 +13,7 @@ extern crate alloc;
 use once_cell::race::OnceBox;
 
 use aes::{Aes128, Aes192, Aes256};
-use alloc::{boxed::Box, collections::vec_deque::VecDeque, vec};
+use alloc::{collections::vec_deque::VecDeque, sync::Arc, vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::SeqCst};
 use ctr::Ctr128BE;
 use hashbrown::HashMap;
@@ -26,8 +26,8 @@ use litebox::{
 };
 use litebox_common_optee::{
     LdelfSyscallRequest, SyscallRequest, TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType,
-    TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeObjHandle, TeeObjectInfo, TeeObjectType,
-    TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
+    TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle, TeeObjectInfo,
+    TeeObjectType, TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -36,6 +36,100 @@ pub(crate) mod syscalls;
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
+pub struct OpteeShimEntrypoints {
+    task: Task,
+    // The task should not be moved once it's bound to a platform thread so that
+    // we preserve the ability to use TLS in the future.
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+impl litebox::shim::EnterShim for OpteeShimEntrypoints {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+
+    fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        ContinueOperation::ResumeGuest
+    }
+
+    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        if self.task.ta_loaded.load(SeqCst) {
+            self.task.handle_syscall_request(ctx)
+        } else {
+            self.task.handle_ldelf_syscall_request(ctx)
+        }
+    }
+
+    fn exception(
+        &self,
+        _ctx: &mut Self::ExecutionContext,
+        _info: &litebox::shim::ExceptionInfo,
+    ) -> ContinueOperation {
+        todo!("terminate the optee process on exception")
+    }
+
+    fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        ContinueOperation::ResumeGuest
+    }
+}
+
+/// The shim entry point structure.
+pub struct OpteeShimBuilder {
+    platform: &'static Platform,
+    litebox: LiteBox<Platform>,
+}
+
+impl Default for OpteeShimBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpteeShimBuilder {
+    /// Returns a new shim builder.
+    pub fn new() -> Self {
+        let platform = litebox_platform_multiplex::platform();
+        Self {
+            platform,
+            litebox: LiteBox::new(platform),
+        }
+    }
+
+    /// Returns the litebox object for the shim.
+    pub fn litebox(&self) -> &LiteBox<Platform> {
+        &self.litebox
+    }
+
+    /// Build the shim.
+    ///
+    /// # Panics
+    /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
+    /// before calling this method.
+    pub fn build(self) -> OpteeShim {
+        let global = Arc::new(GlobalState {
+            platform: self.platform,
+            pm: PageManager::new(&self.litebox),
+            _litebox: self.litebox,
+            _session_id_pool: SessionIdPool::new(),
+            ta_uuid_map: TaUuidMap::new(),
+        });
+        OpteeShim(global)
+    }
+}
+
+/// Global shim state, shared across all tasks.
+struct GlobalState {
+    /// The platform instance used throughout the shim.
+    platform: &'static Platform,
+    /// The page manager for managing virtual memory.
+    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    /// The LiteBox instance used throughout the shim.
+    _litebox: litebox::LiteBox<Platform>,
+    /// Session ID pool.
+    _session_id_pool: SessionIdPool,
+    /// The TA UUID to binary map for TA loading.
+    ta_uuid_map: TaUuidMap,
+}
+
+/*
 /// Initialize the shim to run a task with the given parameters.
 /// This function optionally accepts the TA binary data for TA loading without RPC.
 ///
@@ -47,6 +141,7 @@ pub fn init_session<'a>(
 ) -> &'a LiteBox<Platform> {
     SHIM_TLS.init(OpteeShimTls {
         current_task: Task {
+            global: Arc<GlobalState>,
             session_id: session_id_pool().allocate(),
             ta_app_id: *ta_app_id,
             client_identity: *client_identity,
@@ -100,19 +195,7 @@ pub fn get_ta_base_addr() -> Option<usize> {
         if addr == 0 { None } else { Some(addr) }
     })
 }
-
-/// Get the global litebox object
-pub fn litebox<'a>() -> &'a LiteBox<Platform> {
-    static LITEBOX: OnceBox<LiteBox<Platform>> = OnceBox::new();
-    LITEBOX.get_or_init(|| {
-        alloc::boxed::Box::new(LiteBox::new(litebox_platform_multiplex::platform()))
-    })
-}
-
-pub(crate) fn litebox_page_manager<'a>() -> &'a PageManager<Platform, PAGE_SIZE> {
-    static VMEM: OnceBox<PageManager<Platform, PAGE_SIZE>> = OnceBox::new();
-    VMEM.get_or_init(|| alloc::boxed::Box::new(PageManager::new(litebox())))
-}
+*/
 
 type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,
@@ -123,34 +206,48 @@ type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::
     T,
 >;
 
-pub struct OpteeShim;
+type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
-impl litebox::shim::EnterShim for OpteeShim {
-    type ExecutionContext = litebox_common_linux::PtRegs;
+#[derive(Clone)]
+pub struct OpteeShim(Arc<GlobalState>);
 
-    fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        ContinueOperation::ResumeGuest
-    }
-
-    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        if is_ta_loaded() {
-            with_current_task(|task| task.handle_syscall_request(ctx))
-        } else {
-            with_current_task(|task| task.handle_ldelf_syscall_request(ctx))
-        }
-    }
-
-    fn exception(
+impl OpteeShim {
+    pub fn load_ta(
         &self,
-        _ctx: &mut Self::ExecutionContext,
-        _info: &litebox::shim::ExceptionInfo,
-    ) -> ContinueOperation {
-        todo!("terminate the optee process on exception")
+        _ldelf_bin: &[u8],
+        ta_bin: &[u8],
+        _params: &[litebox_common_optee::UteeParamOwned;
+             litebox_common_optee::UteeParamOwned::TEE_NUM_PARAMS],
+    ) -> Result<LoadedTa, loader::elf::ElfLoaderError> {
+        let entrypoints = crate::OpteeShimEntrypoints {
+            _not_send: core::marker::PhantomData,
+            task: Task {
+                global: self.0.clone(),
+                _session_id: 0,
+                ta_app_id: TeeUuid::default(),
+                client_identity: TeeIdentity {
+                    login: TeeLogin::User,
+                    uuid: TeeUuid::default(),
+                },
+                tee_cryp_state_map: TeeCrypStateMap::new(),
+                tee_obj_map: TeeObjMap::new(),
+                ta_loaded: AtomicBool::new(false),
+                ta_base_addr: AtomicUsize::new(0),
+                ta_handle_map: TaHandleMap::new(),
+                ta_stack_base_addr: AtomicUsize::new(0),
+            },
+        };
+        Ok(LoadedTa { entrypoints })
     }
 
-    fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        ContinueOperation::ResumeGuest
+    /// Get the global page manager
+    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
+        &self.0.pm
     }
+}
+
+pub struct LoadedTa {
+    pub entrypoints: OpteeShimEntrypoints,
 }
 
 impl Task {
@@ -170,15 +267,15 @@ impl Task {
         };
 
         if let SyscallRequest::Return { ret } = request {
-            ctx.rax = Task::sys_return(ret);
+            ctx.rax = self.sys_return(ret);
             return ContinueOperation::ExitThread;
         } else if let SyscallRequest::Panic { code } = request {
-            ctx.rax = Task::sys_panic(code);
+            ctx.rax = self.sys_panic(code);
             return ContinueOperation::ExitThread;
         }
         let res: Result<(), TeeResult> = match request {
             SyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
-                Some(buf) => Task::sys_log(&buf),
+                Some(buf) => self.sys_log(&buf),
                 None => Err(TeeResult::BadParameters),
             },
             SyscallRequest::GetProperty {
@@ -197,7 +294,7 @@ impl Task {
                     if name.as_usize() != 0 || name_len.as_usize() != 0 {
                         todo!("return the name of a given property index")
                     }
-                    Task::sys_get_property(
+                    self.sys_get_property(
                         prop_set,
                         index,
                         None,
@@ -254,19 +351,13 @@ impl Task {
                 ret_orig,
             } => {
                 if let Some(params) = unsafe { params.read_at_offset(0) } {
-                    Task::sys_invoke_ta_command(
-                        ta_sess_id,
-                        cancel_req_to,
-                        cmd_id,
-                        *params,
-                        ret_orig,
-                    )
+                    self.sys_invoke_ta_command(ta_sess_id, cancel_req_to, cmd_id, *params, ret_orig)
                 } else {
                     Err(TeeResult::BadParameters)
                 }
             }
             SyscallRequest::CheckAccessRights { flags, buf, len } => {
-                Task::sys_check_access_rights(flags, buf, len)
+                self.sys_check_access_rights(flags, buf, len)
             }
             SyscallRequest::CrypStateAlloc {
                 algo,
@@ -337,10 +428,11 @@ impl Task {
                     Err(TeeResult::OutOfMemory)
                 } else {
                     let mut kernel_buf = vec![0u8; blen];
-                    Task::sys_cryp_random_number_generate(&mut kernel_buf).and_then(|()| {
-                        buf.copy_from_slice(0, &kernel_buf)
-                            .ok_or(TeeResult::AccessDenied)
-                    })
+                    self.sys_cryp_random_number_generate(&mut kernel_buf)
+                        .and_then(|()| {
+                            buf.copy_from_slice(0, &kernel_buf)
+                                .ok_or(TeeResult::AccessDenied)
+                        })
                 }
             }
             _ => todo!(),
@@ -367,15 +459,15 @@ impl Task {
         };
 
         if let LdelfSyscallRequest::Return { ret } = request {
-            ctx.rax = Task::sys_return(ret);
+            ctx.rax = self.sys_return(ret);
             return ContinueOperation::ExitThread;
         } else if let LdelfSyscallRequest::Panic { code } = request {
-            ctx.rax = Task::sys_panic(code);
+            ctx.rax = self.sys_panic(code);
             return ContinueOperation::ExitThread;
         }
         let res: Result<(), TeeResult> = match request {
             LdelfSyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
-                Some(buf) => Task::sys_log(&buf),
+                Some(buf) => self.sys_log(&buf),
                 None => Err(TeeResult::BadParameters),
             },
             LdelfSyscallRequest::MapZi {
@@ -384,7 +476,7 @@ impl Task {
                 pad_begin,
                 pad_end,
                 flags,
-            } => Task::sys_map_zi(va, num_bytes, pad_begin, pad_end, flags),
+            } => self.sys_map_zi(va, num_bytes, pad_begin, pad_end, flags),
             LdelfSyscallRequest::OpenBin {
                 uuid,
                 uuid_size,
@@ -393,12 +485,12 @@ impl Task {
                 if uuid_size == core::mem::size_of::<TeeUuid>()
                     && let Some(ta_uuid) = unsafe { uuid.read_at_offset(0) }
                 {
-                    Task::sys_open_bin(*ta_uuid, handle)
+                    self.sys_open_bin(*ta_uuid, handle)
                 } else {
                     Err(TeeResult::BadParameters)
                 }
             }
-            LdelfSyscallRequest::CloseBin { handle } => Task::sys_close_bin(handle),
+            LdelfSyscallRequest::CloseBin { handle } => self.sys_close_bin(handle),
             LdelfSyscallRequest::MapBin {
                 va,
                 num_bytes,
@@ -422,10 +514,11 @@ impl Task {
                     Err(TeeResult::OutOfMemory)
                 } else {
                     let mut kernel_buf = vec![0u8; num_bytes];
-                    Task::sys_cryp_random_number_generate(&mut kernel_buf).and_then(|()| {
-                        buf.copy_from_slice(0, &kernel_buf)
-                            .ok_or(TeeResult::AccessDenied)
-                    })
+                    self.sys_cryp_random_number_generate(&mut kernel_buf)
+                        .and_then(|()| {
+                            buf.copy_from_slice(0, &kernel_buf)
+                                .ok_or(TeeResult::AccessDenied)
+                        })
                 }
             }
             _ => todo!(),
@@ -436,6 +529,19 @@ impl Task {
             Err(e) => e.into(),
         } as usize;
         ContinueOperation::ResumeGuest
+    }
+
+    // Set the base address of the loaded TA for the current task.
+    // This address is used for loading the TA's trampoline.
+    pub(crate) fn set_ta_base_addr(&self, addr: usize) {
+        self.ta_base_addr.store(addr, SeqCst);
+    }
+
+    // Get the base address of the loaded TA for the current task.
+    // This address is used for loading the TA's trampoline.
+    pub(crate) fn get_ta_base_addr(&self) -> Option<usize> {
+        let addr = self.ta_base_addr.load(SeqCst);
+        if addr == 0 { None } else { Some(addr) }
     }
 }
 
@@ -742,18 +848,71 @@ impl TeeCrypStateMap {
     }
 }
 
-// Note. OP-TEE does not specify that this information shall be stored in TLS.
-// We use TLS for better modularity.
-struct OpteeShimTls {
-    /// TA/session-related information for the current task
-    current_task: Task,
+/// Data structure to maintain a mapping from handles to their TA UUIDs.
+pub(crate) struct TaHandleMap {
+    inner: spin::mutex::SpinMutex<HashMap<u32, TeeUuid>>,
+    next_handle: core::sync::atomic::AtomicU32,
 }
+
+impl TaHandleMap {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: spin::mutex::SpinMutex::new(HashMap::new()),
+            next_handle: 1.into(),
+        }
+    }
+
+    pub(crate) fn insert(&self, uuid: TeeUuid) -> u32 {
+        let handle = self
+            .next_handle
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        let mut inner = self.inner.lock();
+        inner.insert(handle, uuid);
+        handle
+    }
+
+    pub(crate) fn get(&self, handle: u32) -> Option<TeeUuid> {
+        self.inner.lock().get(&handle).copied()
+    }
+
+    pub(crate) fn remove(&self, handle: u32) -> Option<TeeUuid> {
+        self.inner.lock().remove(&handle)
+    }
+}
+
+/// Data structure to maintain a mapping from TA UUIDs to their binary data.
+pub(crate) struct TaUuidMap {
+    inner: spin::mutex::SpinMutex<HashMap<TeeUuid, alloc::boxed::Box<[u8]>>>,
+}
+
+impl TaUuidMap {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: spin::mutex::SpinMutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: alloc::boxed::Box<[u8]>) {
+        let mut inner = self.inner.lock();
+        inner.insert(uuid, ta_bin);
+    }
+
+    pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+        self.inner.lock().get(uuid).cloned()
+    }
+
+    pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+        self.inner.lock().remove(uuid)
+    }
+}
+
 // TODO: OP-TEE supports global, persistent objects across sessions. Implement this map if needed.
 
 /// TA/session-related information for the current task
 struct Task {
+    global: Arc<GlobalState>,
     /// Session ID
-    session_id: u32,
+    _session_id: u32,
     /// TA UUID
     ta_app_id: TeeUuid,
     /// Client identity (VTL0 process or another TA)
@@ -766,18 +925,11 @@ struct Task {
     ta_loaded: AtomicBool,
     /// Base address where the TA is loaded
     ta_base_addr: AtomicUsize,
-    /// Optional TA binary data (for loading TA without RPC),
-    ta_bin: Option<Box<[u8]>>,
+    /// TA handle to UUID map
+    ta_handle_map: TaHandleMap,
+    /// TA stack base addr
+    ta_stack_base_addr: AtomicUsize,
     // TODO: add more fields as needed
-}
-
-litebox::shim_thread_local! {
-    #[platform = Platform]
-    static SHIM_TLS: OpteeShimTls;
-}
-
-fn with_current_task<R>(f: impl FnOnce(&Task) -> R) -> R {
-    SHIM_TLS.with(|tls| f(&tls.current_task))
 }
 
 pub struct SessionIdPool {
@@ -791,7 +943,7 @@ impl SessionIdPool {
     pub fn new() -> Self {
         SessionIdPool {
             inner: spin::mutex::SpinMutex::new(VecDeque::new()),
-            next_session_id: AtomicU32::new(1),
+            next_session_id: 1.into(),
         }
     }
 
@@ -824,7 +976,27 @@ impl Default for SessionIdPool {
     }
 }
 
-pub fn session_id_pool<'a>() -> &'a SessionIdPool {
-    static SESSION_ID_POOL: OnceBox<SessionIdPool> = OnceBox::new();
-    SESSION_ID_POOL.get_or_init(|| alloc::boxed::Box::new(SessionIdPool::new()))
+mod test_utils {
+    use super::*;
+
+    impl GlobalState {
+        /// Make a new task with default values for testing.
+        pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
+            Task {
+                global: self,
+                _session_id: 1,
+                ta_app_id: TeeUuid::default(),
+                client_identity: TeeIdentity {
+                    login: TeeLogin::User,
+                    uuid: TeeUuid::default(),
+                },
+                tee_cryp_state_map: TeeCrypStateMap::new(),
+                tee_obj_map: TeeObjMap::new(),
+                ta_loaded: AtomicBool::new(false),
+                ta_base_addr: AtomicUsize::new(0),
+                ta_handle_map: TaHandleMap::new(),
+                ta_stack_base_addr: AtomicUsize::new(0),
+            }
+        }
+    }
 }

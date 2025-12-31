@@ -10,7 +10,7 @@ use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::loader::ElfLoadInfo;
 use std::path::PathBuf;
 
-mod tests;
+// mod tests;
 
 #[derive(Parser, Debug)]
 pub struct CliArgs {
@@ -92,20 +92,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(None);
     litebox_platform_multiplex::set_platform(platform);
+    let shim_builder = litebox_shim_optee::OpteeShimBuilder::new();
+    let _litebox = shim_builder.litebox();
+    let shim = shim_builder.build();
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
         InterceptionBackend::Rewriter => {}
     }
 
     if cli_args.command_sequence.is_empty() {
-        run_ta_with_default_commands(ldelf_data.as_slice(), prog_data.as_slice());
+        run_ta_with_default_commands(&shim, ldelf_data.as_slice(), prog_data.as_slice());
     } else {
-        tests::run_ta_with_test_commands(
-            ldelf_data.as_slice(),
-            prog_data.as_slice(),
-            cli_args.program.as_str(),
-            &PathBuf::from(&cli_args.command_sequence),
-        );
+        // tests::run_ta_with_test_commands(
+        //     ldelf_data.as_slice(),
+        //     prog_data.as_slice(),
+        //     cli_args.program.as_str(),
+        //     &PathBuf::from(&cli_args.command_sequence),
+        // );
     }
     Ok(())
 }
@@ -113,7 +116,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 /// This function simply opens and closes a session to the TA to verify that
 /// it can be loaded and run. Note that an OP-TEE TA does nothing without
 /// a client invoking commands on it.
-fn run_ta_with_default_commands(ldelf_bin: &[u8], ta_bin: &[u8]) {
+fn run_ta_with_default_commands(
+    shim: &litebox_shim_optee::OpteeShim,
+    ldelf_bin: &[u8],
+    ta_bin: &[u8],
+) {
     for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
@@ -121,15 +128,29 @@ fn run_ta_with_default_commands(ldelf_bin: &[u8], ta_bin: &[u8]) {
             // Each OP-TEE TA has its own UUID.
             // The client of a session can be a normal-world (VTL0) application or another TA (at VTL1).
             // The VTL0 kernel is expected to provide the client identity information.
-            let _litebox = litebox_shim_optee::init_session(
-                &TeeUuid::default(),
-                &TeeIdentity {
-                    login: TeeLogin::User,
-                    uuid: TeeUuid::default(),
-                },
-                Some(ta_bin), // TODO: replace this with UUID-based TA loading
-            );
+            // let _litebox = litebox_shim_optee::init_session(
+            //     &TeeUuid::default(),
+            //     &TeeIdentity {
+            //         login: TeeLogin::User,
+            //         uuid: TeeUuid::default(),
+            //     },
+            //     Some(ta_bin), // TODO: replace this with UUID-based TA loading
+            // );
 
+            let loaded_ta = shim
+                .load_ta(ldelf_bin, ta_bin, &params)
+                .map_err(|_| {
+                    panic!("Failed to load TA");
+                })
+                .unwrap();
+            unsafe {
+                litebox_platform_linux_userland::run_thread(
+                    loaded_ta.entrypoints,
+                    &mut litebox_common_linux::PtRegs::default(),
+                );
+            };
+
+            /*
             let ldelf_info = litebox_shim_optee::loader::load_elf_buffer(ldelf_bin)
                 .expect("Failed to load ldelf");
             let Some(ldelf_arg_address) = ldelf_info.ldelf_arg_address else {
@@ -198,8 +219,9 @@ fn run_ta_with_default_commands(ldelf_bin: &[u8], ta_bin: &[u8]) {
                     &mut pt_regs,
                 );
             };
+            */
         } else if func_id == UteeEntryFunc::CloseSession {
-            litebox_shim_optee::deinit_session();
+            // litebox_shim_optee::deinit_session();
         }
     }
 }

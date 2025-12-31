@@ -70,7 +70,11 @@ pub fn is_pta_session(ta_sess_id: u32) -> bool {
 
 impl Task {
     /// Handle a command of the system PTA.
-    pub fn handle_system_pta_command(cmd_id: u32, params: &UteeParams) -> Result<(), TeeResult> {
+    pub fn handle_system_pta_command(
+        &self,
+        cmd_id: u32,
+        params: &UteeParams,
+    ) -> Result<(), TeeResult> {
         #[allow(clippy::single_match_else)]
         match PtaSystemCommandId::try_from(cmd_id).map_err(|_| TeeResult::BadParameters)? {
             PtaSystemCommandId::DeriveTaUniqueKey => {
@@ -104,13 +108,13 @@ impl Task {
 
                     // TODO: derive a TA unique key using the hardware unique key (HUK), TA's UUID, and `extra_data`
                     litebox::log_println!(
-                        litebox_platform_multiplex::platform(),
+                        self.global.platform,
                         "derive a key and store it in the secure memory (ptr: {:#x}, size: {})",
                         key_slice.as_ptr() as usize,
                         key_slice.len()
                     );
                     // TODO: replace below with a secure key derivation function
-                    Task::sys_cryp_random_number_generate(key_slice)?;
+                    self.sys_cryp_random_number_generate(key_slice)?;
 
                     Ok(())
                 } else {

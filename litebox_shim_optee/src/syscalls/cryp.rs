@@ -289,12 +289,12 @@ impl Task {
         Ok(())
     }
 
-    pub(crate) fn sys_cryp_random_number_generate(buf: &mut [u8]) -> Result<(), TeeResult> {
+    pub(crate) fn sys_cryp_random_number_generate(&self, buf: &mut [u8]) -> Result<(), TeeResult> {
         if buf.is_empty() {
             return Err(TeeResult::BadParameters);
         }
         <crate::Platform as litebox::platform::CrngProvider>::fill_bytes_crng(
-            litebox_platform_multiplex::platform(),
+            self.global.platform,
             buf,
         );
         Ok(())

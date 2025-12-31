@@ -14,7 +14,7 @@ use litebox_common_optee::{
 use num_enum::TryFromPrimitive;
 
 use crate::{
-    Task, UserConstPtr, UserMutPtr, litebox_page_manager,
+    Task, UserConstPtr, UserMutPtr,
     syscalls::pta::{close_pta_session, is_pta, is_pta_session},
 };
 
@@ -33,37 +33,31 @@ fn align_down(addr: usize, align: usize) -> usize {
 impl Task {
     /// A system call to return to the kernel. A TA calls this function when
     /// it finishes its job delivered through a TA command invocation.
-    pub fn sys_return(ret: usize) -> usize {
+    pub fn sys_return(&self, ret: usize) -> usize {
         #[cfg(debug_assertions)]
-        litebox::log_println!(
-            litebox_platform_multiplex::platform(),
-            "sys_return: ret {}",
-            ret
-        );
+        litebox::log_println!(self.global.platform, "sys_return: ret {}", ret);
 
         ret
     }
 
     /// A system call that a TA calls when it panics.
-    pub fn sys_panic(code: usize) -> usize {
-        litebox::log_println!(
-            litebox_platform_multiplex::platform(),
-            "panic with code {}",
-            code,
-        );
+    pub fn sys_panic(&self, code: usize) -> usize {
+        litebox::log_println!(self.global.platform, "panic with code {}", code,);
 
         code
     }
 
     /// A system call to print out a message.
-    pub fn sys_log(buf: &[u8]) -> Result<(), TeeResult> {
+    pub fn sys_log(&self, buf: &[u8]) -> Result<(), TeeResult> {
         let msg = core::str::from_utf8(buf).map_err(|_| TeeResult::BadFormat)?;
-        litebox::log_println!(litebox_platform_multiplex::platform(), "{}", msg);
+        litebox::log_println!(self.global.platform, "{}", msg);
         Ok(())
     }
 
     /// A system call to get system, client, or TA property information.
+    #[allow(clippy::too_many_arguments)]
     pub fn sys_get_property(
+        &self,
         prop_set: TeePropSet,
         index: u32,
         name_buf: Option<&mut [u8]>,
@@ -83,7 +77,7 @@ impl Task {
                 if prop_buf.len() < core::mem::size_of::<TeeIdentity>() {
                     return Err(TeeResult::ShortBuffer);
                 }
-                let identity = crate::with_current_task(|task| task.client_identity);
+                let identity = self.client_identity;
                 prop_buf.copy_from_slice(unsafe {
                     core::slice::from_raw_parts(
                         (&raw const identity).cast::<u8>(),
@@ -110,7 +104,7 @@ impl Task {
                 if prop_buf.len() < core::mem::size_of::<TeeUuid>() {
                     return Err(TeeResult::ShortBuffer);
                 }
-                let ta_uuid = crate::with_current_task(|task| task.ta_app_id);
+                let ta_uuid = self.ta_app_id;
                 prop_buf.copy_from_slice(unsafe {
                     core::slice::from_raw_parts(
                         (&raw const ta_uuid).cast::<u8>(),
@@ -216,6 +210,7 @@ impl Task {
 
     /// A system call to invoke a command on a TA.
     pub fn sys_invoke_ta_command(
+        &self,
         ta_sess_id: u32,
         _cancel_req_to: u32,
         cmd_id: u32,
@@ -230,7 +225,7 @@ impl Task {
         }
         if is_pta_session(ta_sess_id) {
             // TODO: check whether `ta_sess_id` is associated with the system PTA.
-            Task::handle_system_pta_command(cmd_id, &params)
+            self.handle_system_pta_command(cmd_id, &params)
         } else {
             todo!("support inter TA interaction")
         }
@@ -238,6 +233,7 @@ impl Task {
 
     /// A system call to check the memory permissions of a given buffer.
     pub fn sys_check_access_rights(
+        &self,
         flags: TeeMemoryAccessRights,
         buf: UserConstPtr<u8>,
         len: usize,
@@ -261,7 +257,7 @@ impl Task {
             NonZeroPageSize::<PAGE_SIZE>::new(align_up(len, PAGE_SIZE))
                 .ok_or(TeeResult::AccessConflict)?
         };
-        if let Some(perms) = litebox_page_manager().get_memory_permissions(start, aligned_len) {
+        if let Some(perms) = self.global.pm.get_memory_permissions(start, aligned_len) {
             if (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_READ)
                 && !perms.contains(MemoryRegionPermissions::READ))
                 || (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_WRITE)

@@ -44,19 +44,19 @@ pub fn run_ta_with_test_commands(
             TaEntryFunc::InvokeCommand => UteeEntryFunc::InvokeCommand,
         };
         if func_id == UteeEntryFunc::CloseSession {
-            litebox_shim_optee::deinit_session();
+            // litebox_shim_optee::deinit_session();
             continue;
         }
 
         if func_id == UteeEntryFunc::OpenSession {
-            let _litebox = litebox_shim_optee::init_session(
-                &TeeUuid::default(),
-                &TeeIdentity {
-                    login: TeeLogin::User,
-                    uuid: TeeUuid::default(),
-                },
-                Some(ta_bin), // TODO: replace it with UUID-based TA loading
-            );
+            // let _litebox = litebox_shim_optee::init_session(
+            //     &TeeUuid::default(),
+            //     &TeeIdentity {
+            //         login: TeeLogin::User,
+            //         uuid: TeeUuid::default(),
+            //     },
+            //     Some(ta_bin), // TODO: replace it with UUID-based TA loading
+            // );
 
             let ldelf_info = litebox_shim_optee::loader::load_elf_buffer(ldelf_bin)
                 .expect("Failed to load ldelf");

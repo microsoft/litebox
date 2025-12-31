@@ -6,23 +6,33 @@
 pub(crate) mod elf;
 pub(crate) mod ta_stack;
 
-pub fn load_elf_buffer(elf_buf: &[u8]) -> Result<ElfLoadInfo, elf::ElfLoaderError> {
-    elf::ElfLoader::load_buffer(elf_buf)
+/*
+pub fn load_elf_buffer(
+    elf_buf: &[u8],
+    task: &crate::Task,
+) -> Result<ElfLoadInfo, elf::ElfLoaderError> {
+    elf::ElfLoader::load_buffer(elf_buf, task)
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn allocate_guest_tls(
     tls_size: Option<usize>,
+    task: &crate::Task,
 ) -> Result<(), litebox_common_linux::errno::Errno> {
-    elf::allocate_guest_tls(tls_size)
+    elf::allocate_guest_tls(tls_size, task)
 }
 
 /// Load the trampoline code based on the given base address.
 /// This function might overwrite (i.e., unmap) `ldelf`'s memory region if there is overlap.
 #[cfg(feature = "platform_linux_userland")]
-pub fn load_ta_trampoline(elf_buf: &[u8], base: usize) -> Result<(), elf::ElfLoaderError> {
-    elf::ElfLoader::load_trampoline(elf_buf, base)
+pub fn load_ta_trampoline(
+    elf_buf: &[u8],
+    base: usize,
+    task: &crate::Task,
+) -> Result<(), elf::ElfLoaderError> {
+    elf::ElfLoader::load_trampoline(elf_buf, base, task)
 }
+*/
 
 /// Struct to hold the information needed to start the program (entry point and stack_base).
 #[derive(Clone, Copy)]
@@ -35,20 +45,22 @@ pub struct ElfLoadInfo {
 
 /// Initialize the TA stack with the given base address and parameters.
 pub fn init_stack(
+    task: &crate::Task,
     stack_base: Option<usize>,
     params: &[litebox_common_optee::UteeParamOwned],
 ) -> Option<ta_stack::TaStack> {
-    let mut stack = ta_stack::allocate_stack(stack_base)?;
+    let mut stack = ta_stack::allocate_stack(task, stack_base)?;
     stack.init(params)?;
     Some(stack)
 }
 
 /// Initialize the ldelf stack with the given base address and argument.
 pub fn init_ldelf_stack(
+    task: &crate::Task,
     stack_base: Option<usize>,
     ldelf_arg: &litebox_common_optee::LdelfArg,
 ) -> Option<ta_stack::TaStack> {
-    let mut stack = ta_stack::allocate_stack(stack_base)?;
+    let mut stack = ta_stack::allocate_stack(task, stack_base)?;
     stack.init_with_ldelf_arg(ldelf_arg)?;
     Some(stack)
 }
@@ -124,3 +136,7 @@ pub const REWRITER_MAGIC_NUMBER: u64 = u64::from_le_bytes(*b"LITE BOX");
 pub const REWRITER_VERSION_NUMBER: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
 pub(crate) const DEFAULT_STACK_SIZE: usize = 1024 * 1024; // 1 MB
+
+/// A default low address is used for the binary (which grows upwards) to avoid
+/// conflicts with the kernel's memory mappings (which grows downwards).
+pub(crate) const DEFAULT_LOW_ADDR: usize = 0x1000_0000;
