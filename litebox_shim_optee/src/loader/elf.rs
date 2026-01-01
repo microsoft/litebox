@@ -132,7 +132,7 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
                 address,
                 len,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
                 -1,
                 offset.truncate(),
             )?
@@ -267,19 +267,21 @@ impl<'a> ElfLoader<'a> {
         };
         Ok(ctx)
     }
+}
 
-    /// Load the CPU context to run the loaded TA for the first time.
-    ///
-    /// The caller should call `load_ldelf` and run `ldelf` with `run_thread` before
-    /// calling this function. If not, this function returns an error.
-    pub fn load_ta_context(
-        &mut self,
-        params: &[litebox_common_optee::UteeParamOwned],
-        session_id: u32,
-        func_id: u32,
-        cmd_id: Option<u32>,
-    ) -> Result<litebox_common_linux::PtRegs, ElfLoaderError> {
-        let task = self.ldelf.file.task;
+/// Load the CPU context to run the loaded TA for the first time.
+///
+/// The caller should call `load_ldelf` and run `ldelf` with `run_thread` before
+/// calling this function. If not, this function returns an error.
+pub(crate) fn load_ta_context(
+    task: &mut crate::Task,
+    params: &[litebox_common_optee::UteeParamOwned],
+    session_id: Option<u32>,
+    func_id: u32,
+    cmd_id: Option<u32>,
+) -> Result<litebox_common_linux::PtRegs, ElfLoaderError> {
+    // Expected to be the first invocation of this function after `ldelf` has loaded the TA.
+    if !task.ta_loaded.load(core::sync::atomic::Ordering::SeqCst) {
         // `load_ldelf` invokes `set_ta_stack_base_addr`, so the stack base addr must be set here.
         if task.get_ta_stack_base_addr().is_none() {
             return Err(ElfLoaderError::InvalidStackAddr);
@@ -297,61 +299,53 @@ impl<'a> ElfLoader<'a> {
         if entry_func == 0 {
             return Err(ElfLoaderError::InvalidStackAddr);
         }
+        task.set_ta_entry_point(entry_func);
 
-        if !task.ta_loaded.load(core::sync::atomic::Ordering::SeqCst) {
-            task.ta_loaded
-                .store(true, core::sync::atomic::Ordering::SeqCst);
-            task.set_ta_entry_point(entry_func);
-            allocate_guest_tls(None, task).map_err(|e| {
-                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
-            })?;
-        }
-        self.reload_ta_context(params, session_id, func_id, cmd_id)
+        // Note: `ldelf` allocates stack (returned via `stack_ptr`) but we don't use it here.
+        // Need to revisit this to see whether the stack is large enough for our use cases (e.g.,
+        // copy owned data through stack to minimize TOCTTOU threats).
+
+        allocate_guest_tls(None, task).map_err(|e| {
+            ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
+        })?;
+
+        task.ta_loaded
+            .store(true, core::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Reload the CPU context to re-run the loaded TA.
-    pub fn reload_ta_context(
-        &mut self,
-        params: &[litebox_common_optee::UteeParamOwned],
-        session_id: u32,
-        func_id: u32,
-        cmd_id: Option<u32>,
-    ) -> Result<litebox_common_linux::PtRegs, ElfLoaderError> {
-        let task = self.ldelf.file.task;
-        let mut ta_stack =
-            crate::loader::ta_stack::allocate_stack(task, task.get_ta_stack_base_addr()).ok_or(
-                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
-            )?;
-        ta_stack
-            .init(params)
-            .ok_or(ElfLoaderError::InvalidStackAddr)?;
+    let mut ta_stack = crate::loader::ta_stack::allocate_stack(task, task.get_ta_stack_base_addr())
+        .ok_or(ElfLoaderError::MappingError(
+            litebox::mm::linux::MappingError::OutOfMemory,
+        ))?;
+    ta_stack
+        .init(params)
+        .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
-        #[cfg(target_arch = "x86_64")]
-        let ctx = litebox_common_linux::PtRegs {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            rbp: 0,
-            rbx: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rax: 0,
-            rcx: usize::try_from(cmd_id.unwrap_or(0)).unwrap(),
-            rdx: ta_stack.get_params_address(),
-            rsi: usize::try_from(session_id).unwrap(),
-            rdi: usize::try_from(func_id).unwrap(),
-            orig_rax: 0,
-            rip: task.get_ta_entry_point(),
-            cs: 0x33, // __USER_CS
-            eflags: 0,
-            rsp: ta_stack.get_cur_stack_top(),
-            ss: 0x2b, // __USER_DS
-        };
-        Ok(ctx)
-    }
+    #[cfg(target_arch = "x86_64")]
+    let ctx = litebox_common_linux::PtRegs {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        rbp: 0,
+        rbx: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rax: 0,
+        rcx: usize::try_from(cmd_id.unwrap_or(0)).unwrap(),
+        rdx: ta_stack.get_params_address(),
+        rsi: usize::try_from(session_id.unwrap_or(task.session_id)).unwrap(),
+        rdi: usize::try_from(func_id).unwrap(),
+        orig_rax: 0,
+        rip: task.get_ta_entry_point(),
+        cs: 0x33, // __USER_CS
+        eflags: 0,
+        rsp: ta_stack.get_cur_stack_top(),
+        ss: 0x2b, // __USER_DS
+    };
+    Ok(ctx)
 }
 
 #[derive(Error, Debug)]

@@ -310,10 +310,10 @@ impl litebox::platform::Provider for LinuxUserland {}
 /// # Safety
 /// The context must be valid guest context.
 pub unsafe fn run_thread(
-    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    shim: &impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
-    run_thread_inner(&shim, ctx);
+    run_thread_inner(shim, ctx);
 }
 
 struct ThreadContext<'a> {

@@ -63,7 +63,7 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
         _ctx: &mut Self::ExecutionContext,
         _info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        todo!("terminate the optee process on exception")
+        ContinueOperation::ExitThread
     }
 
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -108,7 +108,7 @@ impl OpteeShimBuilder {
             platform: self.platform,
             pm: PageManager::new(&self.litebox),
             _litebox: self.litebox,
-            _session_id_pool: SessionIdPool::new(),
+            session_id_pool: SessionIdPool::new(),
             ta_uuid_map: TaUuidMap::new(),
         });
         OpteeShim(global)
@@ -124,78 +124,10 @@ struct GlobalState {
     /// The LiteBox instance used throughout the shim.
     _litebox: litebox::LiteBox<Platform>,
     /// Session ID pool.
-    _session_id_pool: SessionIdPool,
+    session_id_pool: SessionIdPool,
     /// The TA UUID to binary map for TA loading.
     ta_uuid_map: TaUuidMap,
 }
-
-/*
-/// Initialize the shim to run a task with the given parameters.
-/// This function optionally accepts the TA binary data for TA loading without RPC.
-///
-/// Returns the global litebox object.
-pub fn init_session<'a>(
-    ta_app_id: &TeeUuid,
-    client_identity: &TeeIdentity,
-    ta_bin: Option<&[u8]>,
-) -> &'a LiteBox<Platform> {
-    SHIM_TLS.init(OpteeShimTls {
-        current_task: Task {
-            global: Arc<GlobalState>,
-            session_id: session_id_pool().allocate(),
-            ta_app_id: *ta_app_id,
-            client_identity: *client_identity,
-            tee_cryp_state_map: TeeCrypStateMap::new(),
-            tee_obj_map: TeeObjMap::new(),
-            ta_loaded: AtomicBool::new(false),
-            ta_base_addr: AtomicUsize::new(0),
-            ta_bin: ta_bin.map(Box::from),
-        },
-    });
-    litebox()
-}
-
-/// Deinitialize the shim for the current task.
-pub fn deinit_session() {
-    let session_id = get_session_id();
-    SHIM_TLS.deinit();
-    session_id_pool().recycle(session_id);
-}
-
-/// Get the session ID of the current task.
-/// Note. OP-TEE does not have a syscall to get the session ID. When the kernel runs a TA,
-/// it passes the session ID to the TA through a CPU register. This function is for internal use only.
-pub fn get_session_id() -> u32 {
-    with_current_task(|task| task.session_id)
-}
-
-/// Set the flag representing whether a TA is loaded for the current task.
-/// This flag determines whether the ldelf syscall handler (`false`) or
-/// the OP-TEE TA syscall handler (`true`) will be used.
-pub fn set_ta_loaded() {
-    with_current_task(|task| task.ta_loaded.store(true, SeqCst));
-}
-
-/// Check whether a TA is loaded for the current task.
-fn is_ta_loaded() -> bool {
-    with_current_task(|task| task.ta_loaded.load(SeqCst))
-}
-
-/// Set the base address of the loaded TA for the current task.
-/// This address is used for loading the TA's trampoline.
-pub fn set_ta_base_addr(addr: usize) {
-    with_current_task(|task| task.ta_base_addr.store(addr, SeqCst));
-}
-
-/// Get the base address of the loaded TA for the current task.
-/// This address is used for loading the TA's trampoline.
-pub fn get_ta_base_addr() -> Option<usize> {
-    with_current_task(|task| {
-        let addr = task.ta_base_addr.load(SeqCst);
-        if addr == 0 { None } else { Some(addr) }
-    })
-}
-*/
 
 type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,
@@ -212,18 +144,17 @@ type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPoin
 pub struct OpteeShim(Arc<GlobalState>);
 
 impl OpteeShim {
-    pub fn load_ta(
+    pub fn load_ldelf(
         &self,
-        _ldelf_bin: &[u8],
-        ta_bin: &[u8],
-        _params: &[litebox_common_optee::UteeParamOwned;
-             litebox_common_optee::UteeParamOwned::TEE_NUM_PARAMS],
-    ) -> Result<LoadedTa, loader::elf::ElfLoaderError> {
+        ldelf_bin: &[u8],
+        ta_uuid: TeeUuid,
+        ta_bin: Option<&[u8]>,
+    ) -> Result<(LoadedTa, litebox_common_linux::PtRegs), loader::elf::ElfLoaderError> {
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                _session_id: 0,
+                session_id: self.0.session_id_pool.allocate(),
                 ta_app_id: TeeUuid::default(),
                 client_identity: TeeIdentity {
                     login: TeeLogin::User,
@@ -238,12 +169,31 @@ impl OpteeShim {
                 ta_entry_point: AtomicUsize::new(0),
             },
         };
-        Ok(LoadedTa { entrypoints })
+        let mut elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin)?;
+        let ctx = elf_loader.load_ldelf(ta_uuid, ta_bin)?;
+
+        Ok((LoadedTa { entrypoints }, ctx))
     }
 
     /// Get the global page manager
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self.0.pm
+    }
+}
+
+impl OpteeShimEntrypoints {
+    pub fn load_ta_context(
+        &mut self,
+        params: &[litebox_common_optee::UteeParamOwned],
+        session_id: Option<u32>,
+        func_id: u32,
+        cmd_id: Option<u32>,
+    ) -> Result<litebox_common_linux::PtRegs, loader::elf::ElfLoaderError> {
+        crate::loader::elf::load_ta_context(&mut self.task, params, session_id, func_id, cmd_id)
+    }
+
+    pub fn get_session_id(&self) -> u32 {
+        self.task.session_id
     }
 }
 
@@ -930,11 +880,15 @@ impl TaUuidMap {
 
 // TODO: OP-TEE supports global, persistent objects across sessions. Implement this map if needed.
 
+// Each OP-TEE TA has its own UUID.
+// The client of a session can be a normal-world (VTL0) application or another TA (at VTL1).
+// The VTL0 kernel is expected to provide the client identity information.
+
 /// TA/session-related information for the current task
 struct Task {
     global: Arc<GlobalState>,
     /// Session ID
-    _session_id: u32,
+    session_id: u32,
     /// TA UUID
     ta_app_id: TeeUuid,
     /// Client identity (VTL0 process or another TA)
@@ -954,6 +908,12 @@ struct Task {
     /// TA entry point
     ta_entry_point: AtomicUsize,
     // TODO: add more fields as needed
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.global.session_id_pool.recycle(self.session_id);
+    }
 }
 
 pub struct SessionIdPool {
@@ -1007,8 +967,8 @@ mod test_utils {
         /// Make a new task with default values for testing.
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
             Task {
-                global: self,
-                _session_id: 1,
+                global: self.clone(),
+                session_id: self.session_id_pool.allocate(),
                 ta_app_id: TeeUuid::default(),
                 client_identity: TeeIdentity {
                     login: TeeLogin::User,

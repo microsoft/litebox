@@ -3,14 +3,11 @@
 
 use anyhow::Result;
 use clap::Parser;
-use litebox_common_optee::{
-    LdelfArg, TeeIdentity, TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned,
-};
+use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
-use litebox_shim_optee::loader::ElfLoadInfo;
 use std::path::PathBuf;
 
-// mod tests;
+mod tests;
 
 #[derive(Parser, Debug)]
 pub struct CliArgs {
@@ -103,12 +100,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     if cli_args.command_sequence.is_empty() {
         run_ta_with_default_commands(&shim, ldelf_data.as_slice(), prog_data.as_slice());
     } else {
-        // tests::run_ta_with_test_commands(
-        //     ldelf_data.as_slice(),
-        //     prog_data.as_slice(),
-        //     cli_args.program.as_str(),
-        //     &PathBuf::from(&cli_args.command_sequence),
-        // );
+        tests::run_ta_with_test_commands(
+            &shim,
+            ldelf_data.as_slice(),
+            prog_data.as_slice(),
+            cli_args.program.as_str(),
+            &PathBuf::from(&cli_args.command_sequence),
+        );
     }
     Ok(())
 }
@@ -125,103 +123,30 @@ fn run_ta_with_default_commands(
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
         if func_id == UteeEntryFunc::OpenSession {
-            // Each OP-TEE TA has its own UUID.
-            // The client of a session can be a normal-world (VTL0) application or another TA (at VTL1).
-            // The VTL0 kernel is expected to provide the client identity information.
-            // let _litebox = litebox_shim_optee::init_session(
-            //     &TeeUuid::default(),
-            //     &TeeIdentity {
-            //         login: TeeLogin::User,
-            //         uuid: TeeUuid::default(),
-            //     },
-            //     Some(ta_bin), // TODO: replace this with UUID-based TA loading
-            // );
-
-            let loaded_ta = shim
-                .load_ta(ldelf_bin, ta_bin, &params)
+            let (loaded_ta, mut ctx) = shim
+                .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin))
                 .map_err(|_| {
                     panic!("Failed to load TA");
                 })
                 .unwrap();
+            let mut entrypoints = loaded_ta.entrypoints;
             unsafe {
-                litebox_platform_linux_userland::run_thread(
-                    loaded_ta.entrypoints,
-                    &mut litebox_common_linux::PtRegs::default(),
-                );
-            };
-
-            /*
-            let ldelf_info = litebox_shim_optee::loader::load_elf_buffer(ldelf_bin)
-                .expect("Failed to load ldelf");
-            let Some(ldelf_arg_address) = ldelf_info.ldelf_arg_address else {
-                panic!("ldelf_arg_address not found");
-            };
-            let ldelf_arg = LdelfArg::new(); // TODO: set TA UUID
-
-            let stack = litebox_shim_optee::loader::init_ldelf_stack(
-                Some(ldelf_info.stack_base),
-                &ldelf_arg,
-            )
-            .expect("Failed to initialize stack for ldelf");
-            let mut pt_regs =
-                litebox_shim_optee::loader::prepare_ldelf_registers(&ldelf_info, &stack);
-            unsafe {
-                litebox_platform_linux_userland::run_thread(
-                    litebox_shim_optee::OpteeShim,
-                    &mut pt_regs,
-                );
-            };
-
-            // Note: `ldelf` allocates stack (returned via `stack_ptr`) but we don't use it here.
-            // Need to revisit this to see whether the stack is large enough for our use cases (e.g.,
-            // copy owned data through stack to minimize TOCTTOU threats).
-            let ldelf_arg_out = unsafe { &*(ldelf_arg_address as *const LdelfArg) };
-            let entry_func = usize::try_from(ldelf_arg_out.entry_func).unwrap();
-            #[cfg(debug_assertions)]
-            litebox::log_println!(
-                litebox_platform_multiplex::platform(),
-                "ldelf has loaded TA: entry_func is at {:#x}",
-                entry_func,
-            );
-
-            litebox_shim_optee::set_ta_loaded();
-
-            let base = litebox_shim_optee::get_ta_base_addr()
-                .ok_or(litebox_common_linux::errno::Errno::ENOENT)
-                .expect("TA base addr not set");
-            litebox_shim_optee::loader::load_ta_trampoline(ta_bin, base)
-                .expect("Failed to load trampoline");
-            litebox_shim_optee::loader::allocate_guest_tls(None).expect("Failed to allocate TLS");
-
-            let ta_info = ElfLoadInfo {
-                entry_point: entry_func,
-                stack_base: ldelf_info.stack_base,
-                params_address: ldelf_info.params_address,
-                ldelf_arg_address: None,
+                litebox_platform_linux_userland::run_thread(&entrypoints, &mut ctx);
             };
 
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
-            let stack =
-                litebox_shim_optee::loader::init_stack(Some(ta_info.stack_base), params.as_slice())
-                    .expect("Failed to initialize stack with parameters");
-            let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
-                &ta_info,
-                &stack,
-                litebox_shim_optee::get_session_id(),
-                func_id as u32,
-                None,
-            );
+            let mut ctx = entrypoints
+                .load_ta_context(params.as_slice(), None, func_id as u32, None)
+                .map_err(|_| {
+                    panic!("Failed to prepare TA context");
+                })
+                .unwrap();
             unsafe {
-                litebox_platform_linux_userland::run_thread(
-                    litebox_shim_optee::OpteeShim,
-                    &mut pt_regs,
-                );
+                litebox_platform_linux_userland::run_thread(&entrypoints, &mut ctx);
             };
-            */
         } else if func_id == UteeEntryFunc::CloseSession {
-            // litebox_shim_optee::deinit_session();
         }
     }
 }
