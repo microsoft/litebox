@@ -235,6 +235,7 @@ impl OpteeShim {
                 ta_base_addr: AtomicUsize::new(0),
                 ta_handle_map: TaHandleMap::new(),
                 ta_stack_base_addr: AtomicUsize::new(0),
+                ta_entry_point: AtomicUsize::new(0),
             },
         };
         Ok(LoadedTa { entrypoints })
@@ -542,6 +543,27 @@ impl Task {
     pub(crate) fn get_ta_base_addr(&self) -> Option<usize> {
         let addr = self.ta_base_addr.load(SeqCst);
         if addr == 0 { None } else { Some(addr) }
+    }
+
+    /// Set the base address of the TA stack for the current task.
+    pub(crate) fn set_ta_stack_base_addr(&self, addr: usize) {
+        self.ta_stack_base_addr.store(addr, SeqCst);
+    }
+
+    /// Get the base address of the TA stack for the current task.
+    pub(crate) fn get_ta_stack_base_addr(&self) -> Option<usize> {
+        let addr = self.ta_stack_base_addr.load(SeqCst);
+        if addr == 0 { None } else { Some(addr) }
+    }
+
+    /// Set the entry point of the TA for the current task.
+    pub(crate) fn set_ta_entry_point(&self, addr: usize) {
+        self.ta_entry_point.store(addr, SeqCst);
+    }
+
+    /// Get the entry point of the TA for the current task.
+    pub(crate) fn get_ta_entry_point(&self) -> usize {
+        self.ta_entry_point.load(SeqCst)
     }
 }
 
@@ -929,6 +951,8 @@ struct Task {
     ta_handle_map: TaHandleMap,
     /// TA stack base addr
     ta_stack_base_addr: AtomicUsize,
+    /// TA entry point
+    ta_entry_point: AtomicUsize,
     // TODO: add more fields as needed
 }
 
@@ -996,6 +1020,7 @@ mod test_utils {
                 ta_base_addr: AtomicUsize::new(0),
                 ta_handle_map: TaHandleMap::new(),
                 ta_stack_base_addr: AtomicUsize::new(0),
+                ta_entry_point: AtomicUsize::new(0),
             }
         }
     }

@@ -208,119 +208,150 @@ impl<'a> ElfLoader<'a> {
         Ok(Self { ldelf })
     }
 
-    // `ldelf` original usage:
-    // OP-TEE OS loads and runs `ldelf` with a TA UUID as an argument. Then, `ldelf` makes
-    // several ldelf syscalls to load the target TA with the given UUID.
-    // Since we do not implement UUID-based TA lookup and loading yet, `with_ta_bin`
-    // preloads a TA binary into memory and passes it to `ldelf` when it makes
-    // the syscall.
-
-    // Load a TA with the given UUID using `ldelf`.
-    // pub fn load_ta(&mut self, ta_uuid: TeeUuid) -> Result<ElfLoadInfo, ElfLoaderError> {
-    //     let ldelf_arg = LdelfArg::new(ta_uuid);
-    //     self.load_ldelf(&ldelf_arg)
-    // }
-
-    // Load a TA from the given binary using `ldelf`.
-    // pub fn load_ta_bin(
-    //     &mut self,
-    //     ta_uuid: TeeUuid,
-    //     ta_bin: &[u8],
-    // ) -> Result<ElfLoadInfo, ElfLoaderError> {
-    //     // Preload the TA binary into the global TA UUID map.
-    //     let global = &self.ldelf.file.task.global;
-    //     global.ta_uuid_map.insert(ta_uuid, ta_bin.into());
-
-    //     self.load_ta(ta_uuid)
-    // }
-
-    /// Load `ldelf` and prepare the stack for it.
+    /// Load `ldelf` and prepare the stack and CPU context for it with the given TA UUID and
+    /// optional TA binary (to compensate for the lack of RPC).
     ///
-    /// `ta_bin` is an optional TA binary to load without relying on RPC.
-    fn load_ldelf(
+    /// The runner should run the returned CPU context to start `ldelf` which in turn loads
+    /// the target TA through using several ldelf syscalls.
+    ///
+    /// `ta_bin` is an optional TA binary to load without using RPC.
+    pub fn load_ldelf(
         &mut self,
         ta_uuid: TeeUuid,
         ta_bin: Option<&[u8]>,
     ) -> Result<litebox_common_linux::PtRegs, ElfLoaderError> {
-        if ta_bin.is_none() {
+        let task = self.ldelf.file.task;
+        let global = &task.global;
+        let Some(ta_bin) = ta_bin else {
             todo!("RPC is not implemented yet. TA binary must be provided");
-        }
+        };
+        global.ta_uuid_map.insert(ta_uuid, ta_bin.into());
 
-        let global = &self.ldelf.file.task.global;
         let ldelf_info = self
             .ldelf
             .parsed
             .load(&mut self.ldelf.file, &mut &*global.platform)?;
 
-        todo!()
+        let ldelf_arg = LdelfArg::new(ta_uuid);
+        let mut ta_stack = crate::loader::ta_stack::allocate_stack(task, None).ok_or(
+            ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
+        )?;
+        ta_stack
+            .init_with_ldelf_arg(&ldelf_arg)
+            .ok_or(ElfLoaderError::InvalidStackAddr)?;
+        task.set_ta_stack_base_addr(ta_stack.get_stack_base());
 
-        // let stack = crate::loader::ta_stack::allocate_stack(&self.ldelf.file.task, None).ok_or(
-        //     ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
-        // )?;
-        // let ctx = prepare_ldelf_context(ldelf_info.entry_point, &stack);
-        // Ok(ctx)
+        #[cfg(target_arch = "x86_64")]
+        let ctx = litebox_common_linux::PtRegs {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbp: 0,
+            rbx: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: ta_stack.get_ldelf_arg_address(),
+            orig_rax: 0,
+            rip: ldelf_info.entry_point,
+            cs: 0x33, // __USER_CS
+            eflags: 0,
+            rsp: ta_stack.get_cur_stack_top(),
+            ss: 0x2b, // __USER_DS
+        };
+        Ok(ctx)
     }
 
-    /*
-    /// Load an ELF file and prepare the stack for the new process.
-    pub fn load(
+    /// Load the CPU context to run the loaded TA for the first time.
+    ///
+    /// The caller should call `load_ldelf` and run `ldelf` with `run_thread` before
+    /// calling this function. If not, this function returns an error.
+    pub fn load_ta_context(
         &mut self,
-        argv: Vec<CString>,
-        envp: Vec<CString>,
-        mut aux: AuxVec,
-    ) -> Result<ElfLoadInfo, ElfLoaderError> {
-        let global = &self.main.file.task.global;
+        params: &[litebox_common_optee::UteeParamOwned],
+        session_id: u32,
+        func_id: u32,
+        cmd_id: Option<u32>,
+    ) -> Result<litebox_common_linux::PtRegs, ElfLoaderError> {
+        let task = self.ldelf.file.task;
+        // `load_ldelf` invokes `set_ta_stack_base_addr`, so the stack base addr must be set here.
+        if task.get_ta_stack_base_addr().is_none() {
+            return Err(ElfLoaderError::InvalidStackAddr);
+        }
+        let ta_stack = crate::loader::ta_stack::allocate_stack(task, task.get_ta_stack_base_addr())
+            .ok_or(ElfLoaderError::MappingError(
+                litebox::mm::linux::MappingError::OutOfMemory,
+            ))?;
+        // SAFETY: `load_ldelf` must be called before this function. If not, the below access will fail.
+        let ldelf_arg_out = unsafe { &*(ta_stack.get_ldelf_arg_address() as *const LdelfArg) };
+        let entry_func = usize::try_from(ldelf_arg_out.entry_func).unwrap();
+        // If `ldelf` has been successfully executed, it will parse the given TA and stores the TA's entry
+        // point into `ldelf_arg.entry_func`. `entry_func == 0` implies that `ldelf` has not yet executed
+        // or failed.
+        if entry_func == 0 {
+            return Err(ElfLoaderError::InvalidStackAddr);
+        }
 
-        // Load the main ELF file first so that it gets privileged addresses.
-        let info = self
-            .main
-            .parsed
-            .load(&mut self.main.file, &mut &*global.platform)?;
-
-        // Load the interpreter ELF file, if any.
-        let interp = if let Some(interp) = &mut self.interp {
-            Some(
-                interp
-                    .parsed
-                    .load(&mut interp.file, &mut &*global.platform)?,
-            )
-        } else {
-            None
-        };
-
-        global.pm.set_initial_brk(info.brk);
-        aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
-        aux.insert(AuxKey::AT_PHDR, info.phdrs_addr);
-        aux.insert(AuxKey::AT_PHENT, info.phent_size());
-        aux.insert(AuxKey::AT_PHNUM, info.num_phdrs);
-        aux.insert(AuxKey::AT_ENTRY, info.entry_point);
-        let entry = if let Some(interp) = &interp {
-            aux.insert(AuxKey::AT_BASE, interp.base_addr);
-            interp.entry_point
-        } else {
-            info.entry_point
-        };
-
-        let sp = unsafe {
-            let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
-                .expect("DEFAULT_STACK_SIZE is not page-aligned");
-            global
-                .pm
-                .create_stack_pages(None, length, CreatePagesFlags::empty())
-                .map_err(ElfLoaderError::MappingError)?
-        };
-        let mut stack = UserStack::new(sp, super::DEFAULT_STACK_SIZE)
-            .ok_or(ElfLoaderError::InvalidStackAddr)?;
-        stack
-            .init(argv, envp, aux)
-            .ok_or(ElfLoaderError::InvalidStackAddr)?;
-
-        Ok(ElfLoadInfo {
-            entry_point: entry,
-            user_stack_top: stack.get_cur_stack_top(),
-        })
+        if !task.ta_loaded.load(core::sync::atomic::Ordering::SeqCst) {
+            task.ta_loaded
+                .store(true, core::sync::atomic::Ordering::SeqCst);
+            task.set_ta_entry_point(entry_func);
+            allocate_guest_tls(None, task).map_err(|e| {
+                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
+            })?;
+        }
+        self.reload_ta_context(params, session_id, func_id, cmd_id)
     }
-    */
+
+    /// Reload the CPU context to re-run the loaded TA.
+    pub fn reload_ta_context(
+        &mut self,
+        params: &[litebox_common_optee::UteeParamOwned],
+        session_id: u32,
+        func_id: u32,
+        cmd_id: Option<u32>,
+    ) -> Result<litebox_common_linux::PtRegs, ElfLoaderError> {
+        let task = self.ldelf.file.task;
+        let mut ta_stack =
+            crate::loader::ta_stack::allocate_stack(task, task.get_ta_stack_base_addr()).ok_or(
+                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
+            )?;
+        ta_stack
+            .init(params)
+            .ok_or(ElfLoaderError::InvalidStackAddr)?;
+
+        #[cfg(target_arch = "x86_64")]
+        let ctx = litebox_common_linux::PtRegs {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbp: 0,
+            rbx: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rax: 0,
+            rcx: usize::try_from(cmd_id.unwrap_or(0)).unwrap(),
+            rdx: ta_stack.get_params_address(),
+            rsi: usize::try_from(session_id).unwrap(),
+            rdi: usize::try_from(func_id).unwrap(),
+            orig_rax: 0,
+            rip: task.get_ta_entry_point(),
+            cs: 0x33, // __USER_CS
+            eflags: 0,
+            rsp: ta_stack.get_cur_stack_top(),
+            ss: 0x2b, // __USER_DS
+        };
+        Ok(ctx)
+    }
 }
 
 #[derive(Error, Debug)]
@@ -386,32 +417,4 @@ fn allocate_guest_tls(
         _ => unimplemented!("Unsupported punchthrough error {:?}", e),
     });
     Ok(())
-}
-
-/// Prepare the CPU registers for starting ldelf.
-#[allow(clippy::missing_panics_doc)]
-fn prepare_ldelf_context(entry_point: usize, stack: &TaStack) -> litebox_common_linux::PtRegs {
-    litebox_common_linux::PtRegs {
-        r15: 0,
-        r14: 0,
-        r13: 0,
-        r12: 0,
-        rbp: 0,
-        rbx: 0,
-        r11: 0,
-        r10: 0,
-        r9: 0,
-        r8: 0,
-        rax: 0,
-        rcx: 0,
-        rdx: 0,
-        rsi: 0,
-        rdi: stack.get_ldelf_arg_address(),
-        orig_rax: 0,
-        rip: entry_point,
-        cs: 0x33, // __USER_CS
-        eflags: 0,
-        rsp: stack.get_cur_stack_top(),
-        ss: 0x2b, // __USER_DS
-    }
 }
