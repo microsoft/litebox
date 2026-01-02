@@ -6,6 +6,7 @@
 //! Instead, these tests use pre-defined JSON-formatted command sequences to test TAs.
 
 use litebox_common_optee::{TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams};
+use litebox_shim_optee::LoadedProgram;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -22,7 +23,7 @@ pub fn run_ta_with_test_commands(
         serde_json::from_str(&json_str).unwrap()
     };
     let is_kmpp_ta = prog_name.contains("kmpp-ta.elf.hooked");
-    // let mut ta_info: Option<ElfLoadInfo> = None;
+    let mut ta_info: Option<LoadedProgram> = None;
 
     for cmd in ta_commands {
         assert!(
@@ -43,31 +44,23 @@ pub fn run_ta_with_test_commands(
         if func_id == UteeEntryFunc::CloseSession {
             continue;
         }
-
         if func_id == UteeEntryFunc::OpenSession {
-            let (loaded_ta, mut ctx) = shim
+            let (loaded, mut ctx) = shim
                 .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin), None)
                 .map_err(|_| {
                     panic!("Failed to load TA");
                 })
                 .unwrap();
-            let mut entrypoints = loaded_ta.entrypoints;
+            ta_info = Some(loaded);
+            let ta_info = ta_info.as_mut().unwrap();
             unsafe {
-                litebox_platform_linux_userland::run_thread(&entrypoints, &mut ctx);
+                litebox_platform_linux_userland::run_thread(&ta_info.entrypoints, &mut ctx);
             };
-
-            // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
-            // loaded binary and heap. In that sense, we can create (and destroy) a stack
-            // for each command freely.
-            let mut ctx = entrypoints
-                .load_ta_context(params.as_slice(), None, func_id as u32, None)
-                .map_err(|_| {
-                    panic!("Failed to prepare TA context");
-                })
-                .unwrap();
-            unsafe {
-                litebox_platform_linux_userland::run_thread(&entrypoints, &mut ctx);
-            };
+            assert!(
+                ctx.rax == 0,
+                "ldelf exits with error: return_code={:#x}",
+                ctx.rax
+            );
 
             // special handling for the KMPP TA whose `OpenSession` expects a session ID that we cannot determine in advance
             if is_kmpp_ta
@@ -76,38 +69,35 @@ pub fn run_ta_with_test_commands(
                     value_b: _,
                 } = params[0]
             {
-                *value_a = u64::from(entrypoints.get_session_id());
+                *value_a = u64::from(ta_info.entrypoints.get_session_id());
             }
         }
 
-        // if let Some(ta_info) = ta_info {
-        //     let stack =
-        //         litebox_shim_optee::loader::init_stack(Some(ta_info.stack_base), params.as_slice())
-        //             .expect("Failed to initialize stack with parameters");
-        //     let mut pt_regs = litebox_shim_optee::loader::prepare_registers(
-        //         &ta_info,
-        //         &stack,
-        //         litebox_shim_optee::get_session_id(),
-        //         func_id as u32,
-        //         Some(cmd.cmd_id),
-        //     );
-        //     unsafe {
-        //         litebox_platform_linux_userland::run_thread(
-        //             litebox_shim_optee::OpteeShim,
-        //             &mut pt_regs,
-        //         );
-        //     };
-        //     assert!(
-        //         pt_regs.rax == 0,
-        //         "TA exits with error: return_code={:#x}",
-        //         pt_regs.rax
-        //     );
-        //     // TA stores results in the `UteeParams` structure and/or buffers it refers to.
-        //     let params = unsafe { &*(ta_info.params_address as *const UteeParams) };
-        //     handle_ta_command_output(params);
-        // } else {
-        //     panic!("TA info is not available.");
-        // }
+        if let Some(ta_info) = &mut ta_info {
+            // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
+            // loaded binary and heap. In that sense, we can create (and destroy) a stack
+            // for each command freely.
+            let mut ctx = ta_info
+                .entrypoints
+                .load_ta_context(params.as_slice(), None, func_id as u32, Some(cmd.cmd_id))
+                .map_err(|_| {
+                    panic!("Failed to load TA context");
+                })
+                .unwrap();
+            unsafe {
+                litebox_platform_linux_userland::run_thread(&ta_info.entrypoints, &mut ctx);
+            };
+            assert!(
+                ctx.rax == 0,
+                "TA exits with error: return_code={:#x}",
+                ctx.rax
+            );
+            // TA stores results in the `UteeParams` structure and/or buffers it refers to.
+            if let Some(params_address) = ta_info.params_address {
+                let params = unsafe { &*(params_address as *const UteeParams) };
+                handle_ta_command_output(params);
+            }
+        }
     }
 }
 

@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::Task;
 use litebox_platform_multiplex::{Platform, set_platform};
 
 // Ensure we only init the platform once
@@ -23,8 +22,8 @@ pub(crate) fn init_platform() -> crate::Task {
         set_platform(platform);
     });
 
-    let mut shim_builder = crate::OpteeShimBuilder::new();
-    let litebox = shim_builder.litebox();
+    let shim_builder = crate::OpteeShimBuilder::new();
+    let _litebox = shim_builder.litebox();
     shim_builder.build().0.new_test_task()
 }
 

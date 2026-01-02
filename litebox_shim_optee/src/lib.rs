@@ -8,10 +8,6 @@
 
 extern crate alloc;
 
-// TODO(jayb) Replace out all uses of once_cell and such with our own implementation that uses
-// platform-specific things within it.
-use once_cell::race::OnceBox;
-
 use aes::{Aes128, Aes192, Aes256};
 use alloc::{collections::vec_deque::VecDeque, sync::Arc, vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::SeqCst};
@@ -152,7 +148,7 @@ impl OpteeShim {
         ta_uuid: TeeUuid,
         ta_bin: Option<&[u8]>,
         client: Option<TeeIdentity>,
-    ) -> Result<(LoadedTa, litebox_common_linux::PtRegs), loader::elf::ElfLoaderError> {
+    ) -> Result<(LoadedProgram, litebox_common_linux::PtRegs), loader::elf::ElfLoaderError> {
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
@@ -173,9 +169,27 @@ impl OpteeShim {
             },
         };
         let mut elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin)?;
-        let ctx = elf_loader.load_ldelf(ta_uuid, ta_bin)?;
 
-        Ok((LoadedTa { entrypoints }, ctx))
+        let ctx = elf_loader.load_ldelf(ta_uuid, ta_bin)?;
+        let params_address = if entrypoints.task.get_ta_stack_base_addr().is_some() {
+            let ta_stack = crate::loader::ta_stack::allocate_stack(
+                &entrypoints.task,
+                entrypoints.task.get_ta_stack_base_addr(),
+            )
+            .ok_or(loader::elf::ElfLoaderError::MappingError(
+                litebox::mm::linux::MappingError::OutOfMemory,
+            ))?;
+            Some(ta_stack.get_params_address())
+        } else {
+            None
+        };
+        Ok((
+            LoadedProgram {
+                entrypoints,
+                params_address,
+            },
+            ctx,
+        ))
     }
 
     /// Get the global page manager
@@ -200,8 +214,9 @@ impl OpteeShimEntrypoints {
     }
 }
 
-pub struct LoadedTa {
+pub struct LoadedProgram {
     pub entrypoints: OpteeShimEntrypoints,
+    pub params_address: Option<usize>,
 }
 
 impl Task {
@@ -876,6 +891,8 @@ impl TaUuidMap {
         self.inner.lock().get(uuid).cloned()
     }
 
+    // Lazy removal of TA binaries when they are no longer needed.
+    #[allow(dead_code)]
     pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
         self.inner.lock().remove(uuid)
     }
@@ -963,6 +980,7 @@ impl Default for SessionIdPool {
     }
 }
 
+#[cfg(test)]
 mod test_utils {
     use super::*;
 

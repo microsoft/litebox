@@ -24,18 +24,12 @@ use litebox::{
     },
     utils::TruncateExt,
 };
-use litebox_common_linux::{
-    MapFlags, ProtFlags,
-    errno::Errno,
-    loader::{ElfLoadError, ElfParsedFile},
-};
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, loader::ElfParsedFile};
 use litebox_common_optee::{LdelfArg, TeeUuid};
-use once_cell::race::OnceBox;
 use thiserror::Error;
 
 use crate::MutPtr;
 
-use super::ta_stack::TaStack;
 use crate::{Task, UserMutPtr};
 
 /// An ELF file loaded in memory
@@ -178,13 +172,6 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
         let addr = crate::MutPtr::<u8>::from_usize(address);
         self.task.sys_mprotect(addr, len, prot.flags())
     }
-}
-
-/// Struct to hold the information needed to start the program
-/// (entry point and user stack top).
-pub struct ElfLoadInfo {
-    pub entry_point: usize,
-    pub user_stack_top: usize,
 }
 
 /// Loader for ELF files
