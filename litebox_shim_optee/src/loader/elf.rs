@@ -96,7 +96,7 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
                 super::DEFAULT_LOW_ADDR,
                 mapping_len,
                 ProtFlags::PROT_NONE,
-                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_POPULATE,
                 -1,
                 0,
             )?
@@ -132,7 +132,10 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
                 address,
                 len,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                MapFlags::MAP_ANONYMOUS
+                    | MapFlags::MAP_PRIVATE
+                    | MapFlags::MAP_FIXED
+                    | MapFlags::MAP_POPULATE,
                 -1,
                 offset.truncate(),
             )?
@@ -156,7 +159,10 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
             address,
             len,
             prot.flags(),
-            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+            MapFlags::MAP_ANONYMOUS
+                | MapFlags::MAP_PRIVATE
+                | MapFlags::MAP_FIXED
+                | MapFlags::MAP_POPULATE,
             -1,
             0,
         )?;
@@ -300,19 +306,18 @@ pub(crate) fn load_ta_context(
             return Err(ElfLoaderError::InvalidStackAddr);
         }
         task.set_ta_entry_point(entry_func);
-
-        // Note: `ldelf` allocates stack (returned via `stack_ptr`) but we don't use it here.
-        // Need to revisit this to see whether the stack is large enough for our use cases (e.g.,
-        // copy owned data through stack to minimize TOCTTOU threats).
-
-        allocate_guest_tls(None, task).map_err(|e| {
+        load_ta_trampoline(task)?;
+        allocate_guest_tls(None, task).map_err(|_| {
             ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
         })?;
-
         task.ta_loaded
             .store(true, core::sync::atomic::Ordering::SeqCst);
     }
 
+    // Note: `ldelf` allocates stack (returned via `stack_ptr`) but we don't use it and instead re-use the stack
+    // allocated for running `ldelf`.
+    // Need to revisit this to see whether the stack is large enough for our use cases (e.g.,
+    // copy owned data through stack to minimize TOCTTOU threats).
     let mut ta_stack = crate::loader::ta_stack::allocate_stack(task, task.get_ta_stack_base_addr())
         .ok_or(ElfLoaderError::MappingError(
             litebox::mm::linux::MappingError::OutOfMemory,
@@ -346,6 +351,25 @@ pub(crate) fn load_ta_context(
         ss: 0x2b, // __USER_DS
     };
     Ok(ctx)
+}
+
+/// Load the TA trampoline.
+pub(crate) fn load_ta_trampoline(task: &mut crate::Task) -> Result<(), ElfLoaderError> {
+    let base_addr = task
+        .get_ta_base_addr()
+        .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
+    let ta_bin = task
+        .global
+        .ta_uuid_map
+        .get(&task.ta_app_id)
+        .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
+    let mut file = ElfFileInMemory::new(task, &ta_bin);
+    let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
+        .map_err(ElfLoaderError::ParseError)?;
+    parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point())?;
+    parsed
+        .load_secondary_trampoline(&mut file, &mut &*task.global.platform, base_addr)
+        .map_err(|_| ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory))
 }
 
 #[derive(Error, Debug)]

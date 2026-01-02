@@ -87,7 +87,6 @@ impl Task {
     }
 
     /// OP-TEE's syscall to open a TA binary.
-    #[expect(clippy::unnecessary_wraps)]
     pub fn sys_open_bin(&self, ta_uuid: TeeUuid, handle: UserMutPtr<u32>) -> Result<(), TeeResult> {
         // TODO: This function requires an RPC from the secure world to the normal world to
         // open the TA binary identified by `ta_uuid` and return a handle to it in `handle`.
@@ -112,7 +111,6 @@ impl Task {
     }
 
     /// OP-TEE's syscall to close a TA binary.
-    #[expect(clippy::unnecessary_wraps)]
     pub fn sys_close_bin(&self, handle: u32) -> Result<(), TeeResult> {
         // TODO: This function requires an RPC from the secure world to the normal world to
         // close the TA binary identified by `handle`.

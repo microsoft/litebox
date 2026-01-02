@@ -484,6 +484,27 @@ impl ElfParsedFile {
         info.brk = info.brk.max(trampoline_end);
         Ok(())
     }
+
+    /// Load the secondary LiteBox trampoline into memory.
+    ///
+    /// This function is for the OP-TEE shim which uses an external `ldelf` program to load the target TA.
+    /// Since `ldelf` is not aware of the LiteBox trampoline, we should call this function after `ldelf` has
+    /// loaded the TA into memory whose base address is different from that of `ldelf`.
+    pub fn load_secondary_trampoline<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        base_addr: usize,
+    ) -> Result<(), ElfLoadError<M::Error>> {
+        let mut info = MappingInfo {
+            base_addr,
+            brk: 0,
+            entry_point: 0,
+            phdrs_addr: 0,
+            num_phdrs: 0,
+        };
+        self.load_trampoline(mapper, mem, &mut info)
+    }
 }
 
 /// Trait for reading ELF binary data at specific offsets.

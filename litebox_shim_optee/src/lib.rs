@@ -61,9 +61,9 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
     fn exception(
         &self,
         _ctx: &mut Self::ExecutionContext,
-        _info: &litebox::shim::ExceptionInfo,
+        info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        ContinueOperation::ExitThread
+        unimplemented!("Unhandled exception in OP-TEE shim: {:?}", info,);
     }
 
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -144,22 +144,25 @@ type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPoin
 pub struct OpteeShim(Arc<GlobalState>);
 
 impl OpteeShim {
+    /// Load the given `ldelf` binary into memory while making it ready to load the TA binary specified
+    /// by `ta_uuid` (and optionally `ta_bin`). `client` specifies the one requesting the TA load.
     pub fn load_ldelf(
         &self,
         ldelf_bin: &[u8],
         ta_uuid: TeeUuid,
         ta_bin: Option<&[u8]>,
+        client: Option<TeeIdentity>,
     ) -> Result<(LoadedTa, litebox_common_linux::PtRegs), loader::elf::ElfLoaderError> {
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
                 session_id: self.0.session_id_pool.allocate(),
-                ta_app_id: TeeUuid::default(),
-                client_identity: TeeIdentity {
+                ta_app_id: ta_uuid,
+                client_identity: client.unwrap_or(TeeIdentity {
                     login: TeeLogin::User,
                     uuid: TeeUuid::default(),
-                },
+                }),
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_loaded: AtomicBool::new(false),

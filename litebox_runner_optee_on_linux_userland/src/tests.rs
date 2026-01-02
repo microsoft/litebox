@@ -46,7 +46,7 @@ pub fn run_ta_with_test_commands(
 
         if func_id == UteeEntryFunc::OpenSession {
             let (loaded_ta, mut ctx) = shim
-                .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin))
+                .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin), None)
                 .map_err(|_| {
                     panic!("Failed to load TA");
                 })
