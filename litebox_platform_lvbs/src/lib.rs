@@ -381,16 +381,9 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         pt
     }
 
-    /// Register the shim. This function must be called for each core to program
-    /// its MSRs.
-    pub fn register_shim(
-        shim: &'static (
-                     dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>
-                         + Send
-                         + Sync
-                 ),
-    ) {
-        syscall_entry::init(shim);
+    /// Enable syscall support in the platform.
+    pub fn enable_syscall_support() {
+        syscall_entry::init();
     }
 }
 
@@ -754,6 +747,16 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
     }
 
     fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
+        unimplemented!()
+    }
+}
+
+impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
+    fn get_syscall_entry_point(&self) -> usize {
+        todo!("PR 566 should be merged to implement this function");
+    }
+
+    fn get_vdso_address(&self) -> Option<usize> {
         unimplemented!()
     }
 }

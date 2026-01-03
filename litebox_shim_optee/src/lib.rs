@@ -161,11 +161,11 @@ impl OpteeShim {
                 }),
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
+                ta_handle_map: TaHandleMap::new(),
                 ta_loaded: AtomicBool::new(false),
                 ta_base_addr: AtomicUsize::new(0),
-                ta_handle_map: TaHandleMap::new(),
-                ta_stack_base_addr: AtomicUsize::new(0),
                 ta_entry_point: AtomicUsize::new(0),
+                ta_stack_base_addr: AtomicUsize::new(0),
             },
         };
         let mut elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin)?;
@@ -913,20 +913,20 @@ struct Task {
     ta_app_id: TeeUuid,
     /// Client identity (VTL0 process or another TA)
     client_identity: TeeIdentity,
-    /// TEE cryptography state map (per session)
+    /// TEE cryptography state map
     tee_cryp_state_map: TeeCrypStateMap,
-    /// TEE object map (per session)
+    /// TEE object map
     tee_obj_map: TeeObjMap,
+    /// TA handle to UUID map
+    ta_handle_map: TaHandleMap,
     /// Track whether a TA is loaded via ldelf
     ta_loaded: AtomicBool,
     /// Base address where the TA is loaded
     ta_base_addr: AtomicUsize,
-    /// TA handle to UUID map
-    ta_handle_map: TaHandleMap,
-    /// TA stack base addr
-    ta_stack_base_addr: AtomicUsize,
     /// TA entry point
     ta_entry_point: AtomicUsize,
+    /// TA stack base address
+    ta_stack_base_addr: AtomicUsize,
     // TODO: add more fields as needed
 }
 
@@ -997,11 +997,11 @@ mod test_utils {
                 },
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
+                ta_handle_map: TaHandleMap::new(),
                 ta_loaded: AtomicBool::new(false),
                 ta_base_addr: AtomicUsize::new(0),
-                ta_handle_map: TaHandleMap::new(),
-                ta_stack_base_addr: AtomicUsize::new(0),
                 ta_entry_point: AtomicUsize::new(0),
+                ta_stack_base_addr: AtomicUsize::new(0),
             }
         }
     }

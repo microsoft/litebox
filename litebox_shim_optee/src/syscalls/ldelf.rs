@@ -206,6 +206,10 @@ impl Task {
             )
             .map_err(|_| TeeResult::OutOfMemory)?;
         let padded_start = addr.as_usize() + pad_begin;
+        if padded_start == 0 {
+            let _ = self.sys_munmap(addr, total_size).ok();
+            return Err(TeeResult::BadFormat);
+        }
         if self
             .sys_mprotect(
                 UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
@@ -216,7 +220,7 @@ impl Task {
             .is_err()
         {
             let _ = self.sys_munmap(addr, total_size).ok();
-            return Err(TeeResult::OutOfMemory);
+            return Err(TeeResult::AccessDenied);
         }
 
         unsafe {
@@ -249,13 +253,15 @@ impl Task {
             .is_err()
         {
             let _ = self.sys_munmap(addr, total_size).ok();
-            return Err(TeeResult::OutOfMemory);
+            return Err(TeeResult::AccessDenied);
         }
 
         if offs == PAGE_SIZE
             && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
             && self.get_ta_base_addr().is_none()
         {
+            // Set the base address of the TA loaded. We use this information to calculate
+            // the TA trampoline address later.
             self.set_ta_base_addr(padded_start);
         }
 
