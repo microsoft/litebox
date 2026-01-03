@@ -54,7 +54,10 @@ pub fn run_ta_with_test_commands(
             ta_info = Some(loaded);
             let ta_info = ta_info.as_mut().unwrap();
             unsafe {
-                litebox_platform_linux_userland::run_thread(&ta_info.entrypoints, &mut ctx);
+                litebox_platform_linux_userland::run_thread_with_shim_ref(
+                    &ta_info.entrypoints,
+                    &mut ctx,
+                );
             };
             assert!(
                 ctx.rax == 0,
@@ -85,7 +88,10 @@ pub fn run_ta_with_test_commands(
                 })
                 .unwrap();
             unsafe {
-                litebox_platform_linux_userland::run_thread(&ta_info.entrypoints, &mut ctx);
+                litebox_platform_linux_userland::run_thread_with_shim_ref(
+                    &ta_info.entrypoints,
+                    &mut ctx,
+                );
             };
             assert!(
                 ctx.rax == 0,

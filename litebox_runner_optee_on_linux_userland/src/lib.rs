@@ -131,7 +131,7 @@ fn run_ta_with_default_commands(
                 .unwrap();
             let mut entrypoints = loaded_program.entrypoints;
             unsafe {
-                litebox_platform_linux_userland::run_thread(&entrypoints, &mut ctx);
+                litebox_platform_linux_userland::run_thread_with_shim_ref(&entrypoints, &mut ctx);
             };
 
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
@@ -144,7 +144,7 @@ fn run_ta_with_default_commands(
                 })
                 .unwrap();
             unsafe {
-                litebox_platform_linux_userland::run_thread(&entrypoints, &mut ctx);
+                litebox_platform_linux_userland::run_thread_with_shim_ref(&entrypoints, &mut ctx);
             };
         } else if func_id == UteeEntryFunc::CloseSession {
         }
