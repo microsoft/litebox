@@ -270,26 +270,24 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let shim = shim.clone();
         let shutdown_clone = shutdown.clone();
         let child = std::thread::spawn(move || {
+            const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(50);
             pin_thread_to_cpu(0);
 
             while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
                 let timeout = loop {
                     match shim.perform_network_interaction() {
-                        litebox_shim_linux::NetworkInteractionAdvice::CallAgainImmediately => {}
-                        litebox_shim_linux::NetworkInteractionAdvice::WaitUntil(timeout) => {
+                        litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
+                        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(timeout) => {
                             break timeout;
                         }
                     }
                 };
-                if let Some(timeout) = timeout {
-                    litebox_platform_multiplex::platform().wait_on_tun(Some(timeout));
-                }
+                litebox_platform_multiplex::platform()
+                    .wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT)));
             }
             // Final flush
             // TODO: keep running until all sockets are closed?
-            while let litebox_shim_linux::NetworkInteractionAdvice::CallAgainImmediately =
-                shim.perform_network_interaction()
-            {}
+            while shim.perform_network_interaction().call_again_immediately() {}
         });
         Some(child)
     } else {
@@ -351,9 +349,8 @@ fn pin_thread_to_cpu(cpu: usize) {
         libc::CPU_ZERO(&mut set);
         libc::CPU_SET(cpu, &mut set);
 
-        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set as *const _) != 0
-        {
-            eprintln!("Warning: Failed to pin thread to CPU core {}", cpu);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set) != 0 {
+            eprintln!("Warning: Failed to pin thread to CPU core {cpu}");
         }
     }
 }

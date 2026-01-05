@@ -531,14 +531,6 @@ pub enum PollDirection {
     /// Both directions
     Both,
 }
-impl PollDirection {
-    fn ingress(self) -> bool {
-        matches!(self, PollDirection::Ingress | PollDirection::Both)
-    }
-    fn egress(self) -> bool {
-        matches!(self, PollDirection::Egress | PollDirection::Both)
-    }
-}
 
 /// Advice on when to invoke [`Network::perform_platform_interaction`] again.
 ///
@@ -552,9 +544,9 @@ pub enum PlatformInteractionReinvocationAdvice {
     /// control back to you to prevent unbounded length waits (crucial to prevent in
     /// non-pre-emptible environments), but otherwise has more work it anticipates it can do.
     CallAgainImmediately,
-    /// You don't need to call again until more packets arrive on the device's receive side or if
-    /// any socket interaction has occurred.
-    WaitOnDeviceOrSocketInteraction,
+    /// You don't need to call again until more packets arrive on the device's receive side or
+    /// the given timeout expires.
+    WaitOnDeviceOrSocketInteraction(Option<core::time::Duration>),
 }
 impl PlatformInteractionReinvocationAdvice {
     /// Convenience function to match against [`Self::CallAgainImmediately`]
@@ -593,21 +585,25 @@ where
     ///
     /// This function panics if run without first using [`Self::set_platform_interaction`] to set
     /// interactions to manual.
-    pub fn perform_platform_interaction(
-        &mut self,
-        direction: PollDirection,
-    ) -> PlatformInteractionReinvocationAdvice {
+    pub fn perform_platform_interaction(&mut self) -> PlatformInteractionReinvocationAdvice {
         assert!(
             matches!(self.platform_interaction, PlatformInteraction::Manual),
             "Requires manual-mode interactions"
         );
-        self.internal_perform_platform_interaction(direction)
+        if let PlatformInteractionReinvocationAdvice::CallAgainImmediately =
+            self.internal_perform_platform_interaction()
+        {
+            PlatformInteractionReinvocationAdvice::CallAgainImmediately
+        } else {
+            let poll_at = self.poll_at();
+            PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(poll_at)
+        }
     }
 
     /// Return a _soft timeout_ (duration to wait) before calling [`Self::perform_platform_interaction`] again.
     ///
     /// Returns `None` if there is no pending timeout (i.e., no scheduled work requiring network operations).
-    pub fn poll_at(&mut self) -> Option<core::time::Duration> {
+    fn poll_at(&mut self) -> Option<core::time::Duration> {
         let timestamp = self.now();
         self.interface
             .poll_at(timestamp, &self.socket_set)
@@ -622,64 +618,27 @@ where
     }
 
     /// (Internal-only API) Actually perform the queued interactions with the outside world.
-    fn internal_perform_platform_interaction(
-        &mut self,
-        direction: PollDirection,
-    ) -> PlatformInteractionReinvocationAdvice {
-        if self.attempt_to_close_queued() {
-            return PlatformInteractionReinvocationAdvice::CallAgainImmediately;
-        }
+    fn internal_perform_platform_interaction(&mut self) -> PlatformInteractionReinvocationAdvice {
+        self.attempt_to_close_queued();
+
         let timestamp = self.now();
-        let mut socket_state_changed = false;
-        let ingress_advice = if direction.ingress() {
-            match self.interface.poll_ingress_single(
-                timestamp,
-                &mut self.device,
-                &mut self.socket_set,
-            ) {
-                smoltcp::iface::PollIngressSingleResult::None => {
-                    Some(PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction)
-                }
-                smoltcp::iface::PollIngressSingleResult::PacketProcessed => {
-                    Some(PlatformInteractionReinvocationAdvice::CallAgainImmediately)
-                }
-                smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                    socket_state_changed = true;
-                    Some(PlatformInteractionReinvocationAdvice::CallAgainImmediately)
-                }
+        match self
+            .interface
+            .poll(timestamp, &mut self.device, &mut self.socket_set)
+        {
+            smoltcp::iface::PollResult::None => {
+                PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(None)
             }
-        } else {
-            None
-        };
-        if direction.egress() {
-            match self
-                .interface
-                .poll_egress(timestamp, &mut self.device, &mut self.socket_set)
-            {
-                smoltcp::iface::PollResult::None => {}
-                smoltcp::iface::PollResult::SocketStateChanged => {
-                    socket_state_changed = true;
-                }
+            smoltcp::iface::PollResult::SocketStateChanged => {
+                self.check_and_update_events();
+                PlatformInteractionReinvocationAdvice::CallAgainImmediately
             }
-        }
-        if socket_state_changed {
-            PlatformInteractionReinvocationAdvice::CallAgainImmediately
-        } else {
-            ingress_advice
-                .unwrap_or(PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction)
         }
     }
 
     /// (Internal-only API) Perform the queued interactions.
-    fn automated_platform_interaction(&mut self, direction: PollDirection) {
-        while self
-            .internal_perform_platform_interaction(direction)
-            .call_again_immediately()
-        {
-            // We just loop until all platform interaction is completed, _roughly_ analogous
-            // to smoltcp's `poll`.
-        }
-        self.check_and_update_events();
+    fn automated_platform_interaction(&mut self, _direction: PollDirection) {
+        self.internal_perform_platform_interaction();
     }
 
     /// (Internal-only API) Socket states could have changed, update events
@@ -1349,8 +1308,6 @@ where
                 // Release the locks, needed to be able to use `self` below
                 drop(table_entry);
                 drop(descriptor_table);
-                // Trigger some automated platform interaction, to keep things flowing
-                self.automated_platform_interaction(PollDirection::Both);
                 // Create a new FD to hand it back out to the user
                 let handle = SocketHandle {
                     consider_closed: false,
