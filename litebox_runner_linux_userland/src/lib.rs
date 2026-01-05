@@ -270,6 +270,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let shim = shim.clone();
         let shutdown_clone = shutdown.clone();
         let child = std::thread::spawn(move || {
+            pin_thread_to_cpu(0);
+
             while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
                 let timeout = loop {
                     match shim.perform_network_interaction() {
@@ -340,6 +342,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         net_worker.join().unwrap();
     }
     std::process::exit(program.process.wait())
+}
+
+/// Pin the current thread to a specific CPU core
+fn pin_thread_to_cpu(cpu: usize) {
+    unsafe {
+        let mut set = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set as *const _) != 0
+        {
+            eprintln!("Warning: Failed to pin thread to CPU core {}", cpu);
+        }
+    }
 }
 
 fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
