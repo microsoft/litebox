@@ -5,8 +5,9 @@
 //! OP-TEE TAs need clients to work with that this Linux userland runner lacks.
 //! Instead, these tests use pre-defined JSON-formatted command sequences to test TAs.
 
+use litebox::platform::RawConstPointer;
 use litebox_common_optee::{TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams};
-use litebox_shim_optee::LoadedProgram;
+use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -45,7 +46,7 @@ pub fn run_ta_with_test_commands(
             continue;
         }
         if func_id == UteeEntryFunc::OpenSession {
-            let (loaded, mut ctx) = shim
+            let loaded = shim
                 .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin), None)
                 .map_err(|_| {
                     panic!("Failed to load TA");
@@ -53,6 +54,7 @@ pub fn run_ta_with_test_commands(
                 .unwrap();
             ta_info = Some(loaded);
             let ta_info = ta_info.as_mut().unwrap();
+            let mut ctx = litebox_common_linux::PtRegs::default();
             unsafe {
                 litebox_platform_linux_userland::run_thread_with_shim_ref(
                     &ta_info.entrypoints,
@@ -80,13 +82,13 @@ pub fn run_ta_with_test_commands(
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
-            let mut ctx = ta_info
+            let _ = ta_info
                 .entrypoints
                 .load_ta_context(params.as_slice(), None, func_id as u32, Some(cmd.cmd_id))
                 .map_err(|_| {
                     panic!("Failed to load TA context");
-                })
-                .unwrap();
+                });
+            let mut ctx = litebox_common_linux::PtRegs::default();
             unsafe {
                 litebox_platform_linux_userland::run_thread_with_shim_ref(
                     &ta_info.entrypoints,
@@ -100,8 +102,9 @@ pub fn run_ta_with_test_commands(
             );
             // TA stores results in the `UteeParams` structure and/or buffers it refers to.
             if let Some(params_address) = ta_info.params_address {
-                let params = unsafe { &*(params_address as *const UteeParams) };
-                handle_ta_command_output(params);
+                let ptr = UserConstPtr::<UteeParams>::from_usize(params_address);
+                let params = unsafe { ptr.read_at_offset(0) }.expect("Failed to read UteeParams");
+                handle_ta_command_output(&params);
             }
         }
     }

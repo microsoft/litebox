@@ -8,22 +8,25 @@
 
 extern crate alloc;
 
+use crate::loader::elf::ElfLoaderError;
 use aes::{Aes128, Aes192, Aes256};
 use alloc::{collections::vec_deque::VecDeque, sync::Arc, vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::SeqCst};
+use core::cell::Cell;
+use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use ctr::Ctr128BE;
 use hashbrown::HashMap;
 use litebox::{
     LiteBox,
     mm::{PageManager, linux::PAGE_SIZE},
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{PunchthroughProvider, PunchthroughToken, RawConstPointer as _, RawMutPointer as _},
     shim::ContinueOperation,
     utils::ReinterpretUnsignedExt,
 };
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 use litebox_common_optee::{
-    LdelfSyscallRequest, SyscallRequest, TeeAlgorithm, TeeAlgorithmClass, TeeAttributeType,
-    TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle, TeeObjectInfo,
-    TeeObjectType, TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
+    LdelfArg, LdelfSyscallRequest, SyscallRequest, TeeAlgorithm, TeeAlgorithmClass,
+    TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle,
+    TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -42,16 +45,12 @@ pub struct OpteeShimEntrypoints {
 impl litebox::shim::EnterShim for OpteeShimEntrypoints {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
-    fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        ContinueOperation::ResumeGuest
+    fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.enter_shim(true, ctx, Task::handle_init_request)
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        if self.task.ta_loaded.load(SeqCst) {
-            self.task.handle_syscall_request(ctx)
-        } else {
-            self.task.handle_ldelf_syscall_request(ctx)
-        }
+        self.enter_shim(false, ctx, Task::handle_syscall_request)
     }
 
     fn exception(
@@ -59,11 +58,22 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
         _ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        unimplemented!("Unhandled exception in OP-TEE shim: {:?}", info,);
+        todo!("Handle exception in OP-TEE shim: {:?}", info,);
     }
 
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        ContinueOperation::ResumeGuest
+        todo!("Handle interrupt in OP-TEE shim");
+    }
+}
+
+impl OpteeShimEntrypoints {
+    fn enter_shim(
+        &self,
+        _is_init: bool,
+        ctx: &mut litebox_common_linux::PtRegs,
+        f: impl FnOnce(&Task, &mut litebox_common_linux::PtRegs) -> ContinueOperation,
+    ) -> ContinueOperation {
+        f(&self.task, ctx)
     }
 }
 
@@ -95,10 +105,6 @@ impl OpteeShimBuilder {
     }
 
     /// Build the shim.
-    ///
-    /// # Panics
-    /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
-    /// before calling this method.
     pub fn build(self) -> OpteeShim {
         let global = Arc::new(GlobalState {
             platform: self.platform,
@@ -125,11 +131,44 @@ struct GlobalState {
     ta_uuid_map: TaUuidMap,
 }
 
+impl GlobalState {
+    /// Store the TA binary associated with the given TA UUID.
+    pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) {
+        self.ta_uuid_map.insert(*ta_uuid, ta_bin.into());
+    }
+
+    /// Get the TA binary associated with the given TA UUID.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+        if let Some(ta_bin) = self.ta_uuid_map.get(ta_uuid) {
+            Some(ta_bin)
+        } else {
+            let ta_bin = Self::rpc_get_ta_bin(ta_uuid)?;
+            self.store_ta_bin(ta_uuid, &ta_bin);
+            Some(ta_bin)
+        }
+    }
+
+    /// Remove the TA binary associated with the given TA UUID.
+    ///
+    /// Since multiple clients can use the same TA binary (multiple instances), we remove
+    /// TA binaries if there is a memory pressure.
+    #[allow(dead_code)]
+    pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
+        let _ = self.ta_uuid_map.remove(ta_uuid);
+    }
+
+    /// RPC to get the TA binary associated with the given TA UUID. Placeholder for now.
+    fn rpc_get_ta_bin(_ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+        None
+    }
+}
+
 type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,
     T,
 >;
-type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
+pub type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,
     T,
 >;
@@ -148,11 +187,12 @@ impl OpteeShim {
         ta_uuid: TeeUuid,
         ta_bin: Option<&[u8]>,
         client: Option<TeeIdentity>,
-    ) -> Result<(LoadedProgram, litebox_common_linux::PtRegs), loader::elf::ElfLoaderError> {
+    ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
+                thread: ThreadState::new(),
                 session_id: self.0.session_id_pool.allocate(),
                 ta_app_id: ta_uuid,
                 client_identity: client.unwrap_or(TeeIdentity {
@@ -162,15 +202,17 @@ impl OpteeShim {
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
-                ta_loaded: AtomicBool::new(false),
-                ta_base_addr: AtomicUsize::new(0),
-                ta_entry_point: AtomicUsize::new(0),
-                ta_stack_base_addr: AtomicUsize::new(0),
+                ta_base_addr: Cell::new(0),
+                ta_entry_point: Cell::new(0),
+                ta_stack_base_addr: Cell::new(0),
+                ta_prepared: Cell::new(false),
             },
         };
-        let mut elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin)?;
-
-        let ctx = elf_loader.load_ldelf(ta_uuid, ta_bin)?;
+        if let Some(ta_bin) = ta_bin {
+            entrypoints.task.global.store_ta_bin(&ta_uuid, ta_bin);
+        }
+        let elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin)?;
+        entrypoints.task.load_ldelf(elf_loader, ta_uuid)?;
         let params_address = if entrypoints.task.get_ta_stack_base_addr().is_some() {
             let ta_stack = crate::loader::ta_stack::allocate_stack(
                 &entrypoints.task,
@@ -183,13 +225,10 @@ impl OpteeShim {
         } else {
             None
         };
-        Ok((
-            LoadedProgram {
-                entrypoints,
-                params_address,
-            },
-            ctx,
-        ))
+        Ok(LoadedProgram {
+            entrypoints,
+            params_address,
+        })
     }
 
     /// Get the global page manager
@@ -199,14 +238,19 @@ impl OpteeShim {
 }
 
 impl OpteeShimEntrypoints {
+    /// Load the CPU context to (re)run the loaded TA.
     pub fn load_ta_context(
-        &mut self,
+        &self,
         params: &[litebox_common_optee::UteeParamOwned],
         session_id: Option<u32>,
         func_id: u32,
         cmd_id: Option<u32>,
-    ) -> Result<litebox_common_linux::PtRegs, loader::elf::ElfLoaderError> {
-        crate::loader::elf::load_ta_context(&mut self.task, params, session_id, func_id, cmd_id)
+    ) -> Result<(), loader::elf::ElfLoaderError> {
+        let init_state = self
+            .task
+            .load_ta_context(params, session_id, func_id, cmd_id)?;
+        self.task.thread.init_state.set(init_state);
+        Ok(())
     }
 
     pub fn get_session_id(&self) -> u32 {
@@ -222,10 +266,23 @@ pub struct LoadedProgram {
 impl Task {
     /// Handle OP-TEE syscalls
     ///
+    /// It dispatches the syscall handling based on the current thread initialization state (ldelf or TA).
+    ///
     /// # Panics
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+        match self.thread.init_state.get() {
+            ThreadInitState::None => ContinueOperation::ExitThread,
+            ThreadInitState::Ldelf { .. } => self.handle_ldelf_syscall_request(ctx),
+            ThreadInitState::Ta { .. } => self.handle_ta_syscall_request(ctx),
+        }
+    }
+
+    fn handle_ta_syscall_request(
+        &self,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) -> ContinueOperation {
         let request = match SyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
             Ok(request) => request,
             Err(err) => {
@@ -414,6 +471,44 @@ impl Task {
         ContinueOperation::ResumeGuest
     }
 
+    fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+        match self.thread.init_state.get() {
+            ThreadInitState::None => ContinueOperation::ExitThread,
+            ThreadInitState::Ldelf {
+                ldelf_arg_address,
+                entry_point,
+                stack_top,
+            } => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    ctx.rdi = ldelf_arg_address;
+                    ctx.rip = entry_point;
+                    ctx.rsp = stack_top;
+                }
+                ContinueOperation::ResumeGuest
+            }
+            ThreadInitState::Ta {
+                cmd_id,
+                params_address,
+                session_id,
+                func_id,
+                entry_point,
+                stack_top,
+            } => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    ctx.rdi = func_id;
+                    ctx.rsi = session_id;
+                    ctx.rdx = params_address;
+                    ctx.rcx = cmd_id;
+                    ctx.rip = entry_point;
+                    ctx.rsp = stack_top;
+                }
+                ContinueOperation::ResumeGuest
+            }
+        }
+    }
+
     fn handle_ldelf_syscall_request(
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
@@ -429,6 +524,9 @@ impl Task {
 
         if let LdelfSyscallRequest::Return { ret } = request {
             ctx.rax = self.sys_return(ret);
+            if ctx.rax == 0 {
+                self.get_ldelf_result();
+            }
             return ContinueOperation::ExitThread;
         } else if let LdelfSyscallRequest::Panic { code } = request {
             ctx.rax = self.sys_panic(code);
@@ -500,38 +598,168 @@ impl Task {
         ContinueOperation::ResumeGuest
     }
 
-    // Set the base address of the loaded TA for the current task.
-    // This address is used for loading the TA's trampoline.
-    pub(crate) fn set_ta_base_addr(&self, addr: usize) {
-        self.ta_base_addr.store(addr, SeqCst);
+    /// Load `ldelf` and prepare the stack and CPU context for it with the given TA UUID.
+    fn load_ldelf(
+        &self,
+        mut loader: crate::loader::elf::ElfLoader<'_>,
+        ta_uuid: TeeUuid,
+    ) -> Result<(), ElfLoaderError> {
+        let init_state = loader.load_ldelf(ta_uuid)?;
+        self.thread.init_state.set(init_state);
+        Ok(())
     }
 
-    // Get the base address of the loaded TA for the current task.
-    // This address is used for loading the TA's trampoline.
+    /// Load the CPU context to (re)run the loaded TA.
+    fn load_ta_context(
+        &self,
+        params: &[litebox_common_optee::UteeParamOwned],
+        session_id: Option<u32>,
+        func_id: u32,
+        cmd_id: Option<u32>,
+    ) -> Result<ThreadInitState, ElfLoaderError> {
+        if !self.ta_prepared.get() {
+            let ta_bin = self
+                .global
+                .get_ta_bin(&self.ta_app_id)
+                .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
+            let base_addr = self
+                .get_ta_base_addr()
+                .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
+            let mut elf_loader = loader::elf::ElfLoader::new(self, &ta_bin)?;
+            elf_loader.load_ta_trampoline(base_addr)?;
+            self.allocate_guest_tls(None).map_err(|_| {
+                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
+            })?;
+            self.ta_prepared.set(true);
+        }
+
+        let mut ta_stack =
+            crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
+                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
+            )?;
+        ta_stack
+            .init(params)
+            .ok_or(ElfLoaderError::InvalidStackAddr)?;
+
+        Ok(ThreadInitState::Ta {
+            cmd_id: usize::try_from(cmd_id.unwrap_or(0)).unwrap(),
+            params_address: ta_stack.get_params_address(),
+            session_id: usize::try_from(session_id.unwrap_or(self.session_id)).unwrap(),
+            func_id: usize::try_from(func_id).unwrap(),
+            entry_point: self.get_ta_entry_point(),
+            stack_top: ta_stack.get_cur_stack_top(),
+        })
+    }
+
+    /// Allocate the guest TLS for an OP-TEE TA.
+    ///
+    /// This function is required to overcome the compatibility issue coming from
+    /// system and build toolchain differences. OP-TEE OS only supports a single thread and
+    /// thus does not explicitly set up the TLS area. In contrast, we do use an x86 toolchain to
+    /// compile OP-TEE TAs and this toolchain assumes there is a valid TLS areas for various purposes
+    /// including stack protection. To this end, the toolchain generates binaries using
+    /// the `FS` register for TLS access.
+    /// This function allocates a TLS area on behalf of the TA to satisfy the toolchain's assumption.
+    /// Instead of using this function, we could change the flags of the toolchain to not use TLS
+    /// (e.g., `-fno-stack-protector`), but this might be insecure. Also, the toolchain might have
+    /// other features relying on TLS.
+    #[cfg(target_arch = "x86_64")]
+    fn allocate_guest_tls(
+        &self,
+        tls_size: Option<usize>,
+    ) -> Result<(), litebox_common_linux::errno::Errno> {
+        let tls_size = tls_size.unwrap_or(PAGE_SIZE).next_multiple_of(PAGE_SIZE);
+        let addr = self.sys_mmap(
+            0,
+            tls_size,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_POPULATE,
+            -1,
+            0,
+        )?;
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase {
+            addr: addr.as_usize(),
+        };
+        let token = litebox_platform_multiplex::platform()
+            .get_punchthrough_token_for(punchthrough)
+            .expect("Failed to get punchthrough token for SET_FS");
+        let _ = token.execute().map(|_| ()).map_err(|e| match e {
+            litebox::platform::PunchthroughError::Failure(errno) => errno,
+            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+        });
+        Ok(())
+    }
+
+    /// Retrieve the result of the `ldelf` execution.
+    fn get_ldelf_result(&self) {
+        let ldelf_arg_address = match self.thread.init_state.get() {
+            ThreadInitState::Ldelf {
+                ldelf_arg_address, ..
+            } => Some(ldelf_arg_address),
+            _ => None,
+        };
+        if let Some(ldelf_arg_address) = ldelf_arg_address {
+            let ldelf_arg_ptr = UserConstPtr::<LdelfArg>::from_usize(ldelf_arg_address);
+            if let Some(ldef_arg) = unsafe { ldelf_arg_ptr.read_at_offset(0) } {
+                let entry_func = usize::try_from(ldef_arg.entry_func).unwrap();
+                // If `ldelf` has been successfully executed, it loads the given TA and stores the TA's entry
+                // point into `ldelf_arg.entry_func`.
+                self.set_ta_entry_point(entry_func);
+            }
+        }
+        // Note: `ldelf` allocates stack (returned via `ldelf_arg_out.stack_ptr`) but we don't use it.
+        // Need to revisit this to see whether the stack is large enough for our use cases (e.g.,
+        // copy owned data through stack to minimize TOCTTOU threats).
+    }
+
+    /// Set the base address of the loaded TA for the current task.
+    ///
+    /// Since the TA base address is provided by `ldelf` which is untrusted, we checks whether
+    /// the given `addr` is within the user space.
+    ///
+    /// This address is used for loading the TA's trampoline.
+    pub(crate) fn set_ta_base_addr(&self, addr: usize) {
+        let ptr = UserConstPtr::<u8>::from_usize(addr);
+        if unsafe { ptr.read_at_offset(0) }.is_some() {
+            self.ta_base_addr.set(addr);
+        }
+    }
+
+    /// Get the base address of the loaded TA for the current task.
+    ///
+    /// This address is used for loading the TA's trampoline.
     pub(crate) fn get_ta_base_addr(&self) -> Option<usize> {
-        let addr = self.ta_base_addr.load(SeqCst);
+        let addr = self.ta_base_addr.get();
         if addr == 0 { None } else { Some(addr) }
     }
 
     /// Set the base address of the TA stack for the current task.
+    ///
+    /// The TA stack base is provided by LiteBox and trusted.
     pub(crate) fn set_ta_stack_base_addr(&self, addr: usize) {
-        self.ta_stack_base_addr.store(addr, SeqCst);
+        self.ta_stack_base_addr.set(addr);
     }
 
     /// Get the base address of the TA stack for the current task.
     pub(crate) fn get_ta_stack_base_addr(&self) -> Option<usize> {
-        let addr = self.ta_stack_base_addr.load(SeqCst);
+        let addr = self.ta_stack_base_addr.get();
         if addr == 0 { None } else { Some(addr) }
     }
 
     /// Set the entry point of the TA for the current task.
+    ///
+    /// Since the TA entry point is provided by `ldelf` which is untrusted, we checks whether
+    /// the given `addr` is within the user space.
     pub(crate) fn set_ta_entry_point(&self, addr: usize) {
-        self.ta_entry_point.store(addr, SeqCst);
+        let ptr = UserConstPtr::<u8>::from_usize(addr);
+        if unsafe { ptr.read_at_offset(0) }.is_some() {
+            self.ta_entry_point.set(addr);
+        }
     }
 
     /// Get the entry point of the TA for the current task.
     pub(crate) fn get_ta_entry_point(&self) -> usize {
-        self.ta_entry_point.load(SeqCst)
+        self.ta_entry_point.get()
     }
 }
 
@@ -580,7 +808,7 @@ pub(crate) struct TeeObj {
 
 impl TeeObj {
     pub fn new(typ: TeeObjectType, max_size: u32) -> Self {
-        TeeObj {
+        Self {
             info: TeeObjectInfo::new(typ, max_size),
             busy: false,
             key: None,
@@ -629,7 +857,7 @@ pub(crate) struct TeeObjMap {
 
 impl TeeObjMap {
     pub fn new() -> Self {
-        TeeObjMap {
+        Self {
             inner: spin::mutex::SpinMutex::new(HashMap::new()),
         }
     }
@@ -733,7 +961,7 @@ impl TeeCrypState {
         primary_object: Option<TeeObjHandle>,
         secondary_object: Option<TeeObjHandle>,
     ) -> Self {
-        TeeCrypState {
+        Self {
             algo,
             mode,
             objs: [primary_object, secondary_object],
@@ -787,7 +1015,7 @@ pub(crate) struct TeeCrypStateMap {
 
 impl TeeCrypStateMap {
     pub fn new() -> Self {
-        TeeCrypStateMap {
+        Self {
             inner: spin::mutex::SpinMutex::new(HashMap::new()),
         }
     }
@@ -907,6 +1135,7 @@ impl TaUuidMap {
 /// TA/session-related information for the current task
 struct Task {
     global: Arc<GlobalState>,
+    thread: ThreadState,
     /// Session ID
     session_id: u32,
     /// TA UUID
@@ -919,14 +1148,14 @@ struct Task {
     tee_obj_map: TeeObjMap,
     /// TA handle to UUID map
     ta_handle_map: TaHandleMap,
-    /// Track whether a TA is loaded via ldelf
-    ta_loaded: AtomicBool,
     /// Base address where the TA is loaded
-    ta_base_addr: AtomicUsize,
+    ta_base_addr: Cell<usize>,
     /// TA entry point
-    ta_entry_point: AtomicUsize,
+    ta_entry_point: Cell<usize>,
     /// TA stack base address
-    ta_stack_base_addr: AtomicUsize,
+    ta_stack_base_addr: Cell<usize>,
+    /// Whether the TA has been prepared
+    ta_prepared: Cell<bool>,
     // TODO: add more fields as needed
 }
 
@@ -934,6 +1163,37 @@ impl Drop for Task {
     fn drop(&mut self) {
         self.global.session_id_pool.recycle(self.session_id);
     }
+}
+
+struct ThreadState {
+    init_state: Cell<ThreadInitState>,
+}
+
+impl ThreadState {
+    pub fn new() -> Self {
+        Self {
+            init_state: Cell::new(ThreadInitState::None),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) enum ThreadInitState {
+    #[default]
+    None,
+    Ldelf {
+        ldelf_arg_address: usize,
+        entry_point: usize,
+        stack_top: usize,
+    },
+    Ta {
+        cmd_id: usize,
+        params_address: usize,
+        session_id: usize,
+        func_id: usize,
+        entry_point: usize,
+        stack_top: usize,
+    },
 }
 
 pub struct SessionIdPool {
@@ -945,7 +1205,7 @@ impl SessionIdPool {
     const PTA_SESSION_ID: u32 = 0xffff_fffe;
 
     pub fn new() -> Self {
-        SessionIdPool {
+        Self {
             inner: spin::mutex::SpinMutex::new(VecDeque::new()),
             next_session_id: 1.into(),
         }
@@ -989,6 +1249,7 @@ mod test_utils {
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
             Task {
                 global: self.clone(),
+                thread: ThreadState::new(),
                 session_id: self.session_id_pool.allocate(),
                 ta_app_id: TeeUuid::default(),
                 client_identity: TeeIdentity {
@@ -998,10 +1259,10 @@ mod test_utils {
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
-                ta_loaded: AtomicBool::new(false),
-                ta_base_addr: AtomicUsize::new(0),
-                ta_entry_point: AtomicUsize::new(0),
-                ta_stack_base_addr: AtomicUsize::new(0),
+                ta_base_addr: Cell::new(0),
+                ta_entry_point: Cell::new(0),
+                ta_stack_base_addr: Cell::new(0),
+                ta_prepared: Cell::new(false),
             }
         }
     }

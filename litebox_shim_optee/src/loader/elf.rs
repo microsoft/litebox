@@ -17,20 +17,15 @@
 //! result in uncessary data copies and higher memory usage. To avoid this,
 //! we need to implement file-backed mapping, demand paging, and/or shared
 //! mapping in the future.
+use crate::{MutPtr, Task, ThreadInitState, UserMutPtr};
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE},
-    platform::{
-        PunchthroughProvider, PunchthroughToken, RawConstPointer as _, SystemInfoProvider as _,
-    },
+    platform::{RawConstPointer as _, SystemInfoProvider as _},
     utils::TruncateExt,
 };
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, loader::ElfParsedFile};
 use litebox_common_optee::{LdelfArg, TeeUuid};
 use thiserror::Error;
-
-use crate::MutPtr;
-
-use crate::{Task, UserMutPtr};
 
 /// An ELF file loaded in memory
 struct ElfFileInMemory<'a> {
@@ -176,7 +171,7 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
 
 /// Loader for ELF files
 pub(crate) struct ElfLoader<'a> {
-    ldelf: FileAndParsed<'a>,
+    main: FileAndParsed<'a>,
 }
 
 struct FileAndParsed<'a> {
@@ -196,34 +191,19 @@ impl<'a> FileAndParsed<'a> {
 
 impl<'a> ElfLoader<'a> {
     /// Create an ELF loader with a `ldelf` binary.
-    pub fn new(task: &'a Task, ldelf_bin: &[u8]) -> Result<Self, ElfLoaderError> {
-        let ldelf = FileAndParsed::new(task, ldelf_bin)?;
-        Ok(Self { ldelf })
+    pub fn new(task: &'a Task, elf_bin: &[u8]) -> Result<Self, ElfLoaderError> {
+        let ldelf = FileAndParsed::new(task, elf_bin)?;
+        Ok(Self { main: ldelf })
     }
 
-    /// Load `ldelf` and prepare the stack and CPU context for it with the given TA UUID and
-    /// optional TA binary (to compensate for the lack of RPC).
-    ///
-    /// The runner should run the returned CPU context to start `ldelf` which in turn loads
-    /// the target TA through using several ldelf syscalls.
-    ///
-    /// `ta_bin` is an optional TA binary to load without using RPC.
-    pub fn load_ldelf(
-        &mut self,
-        ta_uuid: TeeUuid,
-        ta_bin: Option<&[u8]>,
-    ) -> Result<litebox_common_linux::PtRegs, ElfLoaderError> {
-        let task = self.ldelf.file.task;
+    /// Load `ldelf` and prepare the stack and CPU context for it with the given TA UUID.
+    pub fn load_ldelf(&mut self, ta_uuid: TeeUuid) -> Result<ThreadInitState, ElfLoaderError> {
+        let task = self.main.file.task;
         let global = &task.global;
-        let Some(ta_bin) = ta_bin else {
-            todo!("RPC is not implemented yet. TA binary must be provided");
-        };
-        global.ta_uuid_map.insert(ta_uuid, ta_bin.into());
-
         let ldelf_info = self
-            .ldelf
+            .main
             .parsed
-            .load(&mut self.ldelf.file, &mut &*global.platform)?;
+            .load(&mut self.main.file, &mut &*global.platform)?;
 
         let ldelf_arg = LdelfArg::new(ta_uuid);
         let mut ta_stack = crate::loader::ta_stack::allocate_stack(task, None).ok_or(
@@ -234,129 +214,28 @@ impl<'a> ElfLoader<'a> {
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
         task.set_ta_stack_base_addr(ta_stack.get_stack_base());
 
-        #[cfg(target_arch = "x86_64")]
-        let ctx = litebox_common_linux::PtRegs {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            rbp: 0,
-            rbx: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rax: 0,
-            rcx: 0,
-            rdx: 0,
-            rsi: 0,
-            rdi: ta_stack.get_ldelf_arg_address(),
-            orig_rax: 0,
-            rip: ldelf_info.entry_point,
-            cs: 0x33, // __USER_CS
-            eflags: 0,
-            rsp: ta_stack.get_cur_stack_top(),
-            ss: 0x2b, // __USER_DS
-        };
-        Ok(ctx)
-    }
-}
-
-/// Load the CPU context to run the loaded TA for the first time.
-///
-/// The caller should call `load_ldelf` and run `ldelf` with `run_thread` before
-/// calling this function. If not, this function returns an error.
-pub(crate) fn load_ta_context(
-    task: &mut crate::Task,
-    params: &[litebox_common_optee::UteeParamOwned],
-    session_id: Option<u32>,
-    func_id: u32,
-    cmd_id: Option<u32>,
-) -> Result<litebox_common_linux::PtRegs, ElfLoaderError> {
-    // Expected to be the first invocation of this function after `ldelf` has loaded the TA.
-    if !task.ta_loaded.load(core::sync::atomic::Ordering::SeqCst) {
-        // `load_ldelf` invokes `set_ta_stack_base_addr`, so the stack base addr must be set here.
-        if task.get_ta_stack_base_addr().is_none() {
-            return Err(ElfLoaderError::InvalidStackAddr);
-        }
-        let ta_stack = crate::loader::ta_stack::allocate_stack(task, task.get_ta_stack_base_addr())
-            .ok_or(ElfLoaderError::MappingError(
-                litebox::mm::linux::MappingError::OutOfMemory,
-            ))?;
-        // SAFETY: `load_ldelf` must be called before this function. If not, the below access will fail.
-        let ldelf_arg_out = unsafe { &*(ta_stack.get_ldelf_arg_address() as *const LdelfArg) };
-        let entry_func = usize::try_from(ldelf_arg_out.entry_func).unwrap();
-        // If `ldelf` has been successfully executed, it will parse the given TA and stores the TA's entry
-        // point into `ldelf_arg.entry_func`. `entry_func == 0` implies that `ldelf` has not yet executed
-        // or failed.
-        if entry_func == 0 {
-            return Err(ElfLoaderError::InvalidStackAddr);
-        }
-        task.set_ta_entry_point(entry_func);
-        load_ta_trampoline(task)?;
-        allocate_guest_tls(None, task).map_err(|_| {
-            ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
-        })?;
-        task.ta_loaded
-            .store(true, core::sync::atomic::Ordering::SeqCst);
+        Ok(ThreadInitState::Ldelf {
+            ldelf_arg_address: ta_stack.get_ldelf_arg_address(),
+            entry_point: ldelf_info.entry_point,
+            stack_top: ta_stack.get_cur_stack_top(),
+        })
     }
 
-    // Note: `ldelf` allocates stack (returned via `stack_ptr`) but we don't use it and instead re-use the stack
-    // allocated for running `ldelf`.
-    // Need to revisit this to see whether the stack is large enough for our use cases (e.g.,
-    // copy owned data through stack to minimize TOCTTOU threats).
-    let mut ta_stack = crate::loader::ta_stack::allocate_stack(task, task.get_ta_stack_base_addr())
-        .ok_or(ElfLoaderError::MappingError(
-            litebox::mm::linux::MappingError::OutOfMemory,
-        ))?;
-    ta_stack
-        .init(params)
-        .ok_or(ElfLoaderError::InvalidStackAddr)?;
+    /// Load the TA trampoline.
+    ///
+    /// Note that the TA itself is loaded by `ldelf`. This function only loads the trampoline
+    /// to support the TA's syscalls.
+    pub fn load_ta_trampoline(&mut self, base_addr: usize) -> Result<(), ElfLoaderError> {
+        let task = self.main.file.task;
+        let global = &task.global;
 
-    #[cfg(target_arch = "x86_64")]
-    let ctx = litebox_common_linux::PtRegs {
-        r15: 0,
-        r14: 0,
-        r13: 0,
-        r12: 0,
-        rbp: 0,
-        rbx: 0,
-        r11: 0,
-        r10: 0,
-        r9: 0,
-        r8: 0,
-        rax: 0,
-        rcx: usize::try_from(cmd_id.unwrap_or(0)).unwrap(),
-        rdx: ta_stack.get_params_address(),
-        rsi: usize::try_from(session_id.unwrap_or(task.session_id)).unwrap(),
-        rdi: usize::try_from(func_id).unwrap(),
-        orig_rax: 0,
-        rip: task.get_ta_entry_point(),
-        cs: 0x33, // __USER_CS
-        eflags: 0,
-        rsp: ta_stack.get_cur_stack_top(),
-        ss: 0x2b, // __USER_DS
-    };
-    Ok(ctx)
-}
-
-/// Load the TA trampoline.
-pub(crate) fn load_ta_trampoline(task: &mut crate::Task) -> Result<(), ElfLoaderError> {
-    let base_addr = task
-        .get_ta_base_addr()
-        .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
-    let ta_bin = task
-        .global
-        .ta_uuid_map
-        .get(&task.ta_app_id)
-        .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
-    let mut file = ElfFileInMemory::new(task, &ta_bin);
-    let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
-        .map_err(ElfLoaderError::ParseError)?;
-    parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point())?;
-    parsed
-        .load_secondary_trampoline(&mut file, &mut &*task.global.platform, base_addr)
-        .map_err(|_| ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory))
+        self.main
+            .parsed
+            .load_secondary_trampoline(&mut self.main.file, &mut &*global.platform, base_addr)
+            .map_err(|_| {
+                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
+            })
+    }
 }
 
 #[derive(Error, Debug)]
@@ -384,42 +263,4 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
             ElfLoaderError::LoadError(e) => e.into(),
         }
     }
-}
-
-/// Allocate the guest TLS for an OP-TEE TA.
-/// This function is required to overcome the compatibility issue coming from
-/// system and build toolchain differences. OP-TEE OS only supports a single thread and
-/// thus does not explicitly set up the TLS area. In contrast, we do use an x86 toolchain to
-/// compile OP-TEE TAs and this toolchain assumes there is a valid TLS areas for various purposes
-/// including stack protection. To this end, the toolchain generates binaries using
-/// the `FS` register for TLS access.
-/// This function allocates a TLS area on behalf of the TA to satisfy the toolchain's assumption.
-/// Instead of using this function, we could change the flags of the toolchain to not use TLS
-/// (e.g., `-fno-stack-protector`), but this might be insecure. Also, the toolchain might have
-/// other features relying on TLS.
-#[cfg(target_arch = "x86_64")]
-fn allocate_guest_tls(
-    tls_size: Option<usize>,
-    task: &crate::Task,
-) -> Result<(), litebox_common_linux::errno::Errno> {
-    let tls_size = tls_size.unwrap_or(PAGE_SIZE).next_multiple_of(PAGE_SIZE);
-    let addr = task.sys_mmap(
-        0,
-        tls_size,
-        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-        MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_POPULATE,
-        -1,
-        0,
-    )?;
-    let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase {
-        addr: addr.as_usize(),
-    };
-    let token = litebox_platform_multiplex::platform()
-        .get_punchthrough_token_for(punchthrough)
-        .expect("Failed to get punchthrough token for SET_FS");
-    let _ = token.execute().map(|_| ()).map_err(|e| match e {
-        litebox::platform::PunchthroughError::Failure(errno) => errno,
-        _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-    });
-    Ok(())
 }

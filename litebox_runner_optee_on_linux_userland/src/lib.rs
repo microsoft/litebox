@@ -123,28 +123,35 @@ fn run_ta_with_default_commands(
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
         if func_id == UteeEntryFunc::OpenSession {
-            let (loaded_program, mut ctx) = shim
+            let loaded_program = shim
                 .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin), None)
                 .map_err(|_| {
                     panic!("Failed to load ldelf");
                 })
                 .unwrap();
-            let mut entrypoints = loaded_program.entrypoints;
+            let entrypoints = &loaded_program.entrypoints;
             unsafe {
-                litebox_platform_linux_userland::run_thread_with_shim_ref(&entrypoints, &mut ctx);
+                litebox_platform_linux_userland::run_thread_with_shim_ref(
+                    entrypoints,
+                    &mut litebox_common_linux::PtRegs::default(),
+                );
             };
 
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
-            let mut ctx = entrypoints
+            let _ = entrypoints
                 .load_ta_context(params.as_slice(), None, func_id as u32, None)
                 .map_err(|_| {
                     panic!("Failed to load TA context");
-                })
-                .unwrap();
+                });
+            // TODO: instead of using `run_thread_with_shim_ref`, we can use interrupts to enter the TA. This requires
+            // better interrupt handling in `litebox_shim_optee` and `litebox_platform_lvbs`.
             unsafe {
-                litebox_platform_linux_userland::run_thread_with_shim_ref(&entrypoints, &mut ctx);
+                litebox_platform_linux_userland::run_thread_with_shim_ref(
+                    entrypoints,
+                    &mut litebox_common_linux::PtRegs::default(),
+                );
             };
         } else if func_id == UteeEntryFunc::CloseSession {
         }

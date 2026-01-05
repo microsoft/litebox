@@ -99,7 +99,7 @@ impl Task {
             handle.as_usize()
         );
 
-        if self.global.ta_uuid_map.get(&ta_uuid).is_none() {
+        if self.global.get_ta_bin(&ta_uuid).is_none() {
             return Err(TeeResult::ItemNotFound);
         }
         let new_handle = self.ta_handle_map.insert(ta_uuid);
@@ -311,7 +311,7 @@ impl Task {
         count: usize,
     ) -> Option<()> {
         if let Some(ta_uuid) = self.ta_handle_map.get(handle)
-            && let Some(ta_bin) = self.global.ta_uuid_map.get(&ta_uuid)
+            && let Some(ta_bin) = self.global.get_ta_bin(&ta_uuid)
         {
             let end_offset = offset.checked_add(count)?;
             if end_offset <= ta_bin.len() {
