@@ -324,8 +324,9 @@ pub unsafe fn run_thread(
 /// times on the same shim instance. `run_thread` does not support this because the given
 /// shim instance is *moved* to `run_thread`.
 ///
-/// CAUTION: `run_thread_with_shim_ref` does not work for the Linux Shim with multiple threads
-/// and/or waiters likely due to dangling pointers/references.
+/// CAUTION: This function doesn't work for multi-threaded processes, so it is only for
+/// OP-TEE use cases.
+///
 ///
 /// # Safety
 /// The context must be valid guest context.

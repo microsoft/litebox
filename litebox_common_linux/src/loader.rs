@@ -485,17 +485,18 @@ impl ElfParsedFile {
         Ok(())
     }
 
-    /// Load the secondary LiteBox trampoline into memory.
-    ///
-    /// This function is for the OP-TEE shim which uses an external `ldelf` program to load the target TA.
-    /// Since `ldelf` is not aware of the LiteBox trampoline, we should call this function after `ldelf` has
-    /// loaded the TA into memory whose base address is different from that of `ldelf`.
+    /// Load the secondary LiteBox trampoline into memory whose location is relative to
+    /// the based address which is the difference of `loaded_entry_point` and `e_entry`
+    /// in the ELF header.
     pub fn load_secondary_trampoline<M: MapMemory>(
         &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
-        base_addr: usize,
+        loaded_entry_point: usize,
     ) -> Result<(), ElfLoadError<M::Error>> {
+        let base_addr = loaded_entry_point
+            .checked_sub(self.header.e_entry.truncate())
+            .ok_or(ElfLoadError::InvalidProgramHeader)?;
         let mut info = MappingInfo {
             base_addr,
             brk: 0,

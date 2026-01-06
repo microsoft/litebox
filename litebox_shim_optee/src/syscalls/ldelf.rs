@@ -256,15 +256,6 @@ impl Task {
             return Err(TeeResult::AccessDenied);
         }
 
-        if offs == PAGE_SIZE
-            && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
-            && self.get_ta_base_addr().is_none()
-        {
-            // Set the base address of the TA loaded. We use this information to calculate
-            // the TA trampoline address later.
-            self.set_ta_base_addr(padded_start);
-        }
-
         unsafe {
             let _ = va.write_at_offset(0, padded_start);
         }

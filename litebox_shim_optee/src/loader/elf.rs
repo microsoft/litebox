@@ -24,7 +24,7 @@ use litebox::{
     utils::TruncateExt,
 };
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, loader::ElfParsedFile};
-use litebox_common_optee::{LdelfArg, TeeUuid};
+use litebox_common_optee::LdelfArg;
 use thiserror::Error;
 
 /// An ELF file loaded in memory
@@ -172,6 +172,7 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
 /// Loader for ELF files
 pub(crate) struct ElfLoader<'a> {
     main: FileAndParsed<'a>,
+    is_ldelf: bool,
 }
 
 struct FileAndParsed<'a> {
@@ -190,14 +191,17 @@ impl<'a> FileAndParsed<'a> {
 }
 
 impl<'a> ElfLoader<'a> {
-    /// Create an ELF loader with a `ldelf` binary.
-    pub fn new(task: &'a Task, elf_bin: &[u8]) -> Result<Self, ElfLoaderError> {
-        let ldelf = FileAndParsed::new(task, elf_bin)?;
-        Ok(Self { main: ldelf })
+    /// Parse a given ELF binary in memory.
+    pub fn new(task: &'a Task, elf_bin: &[u8], is_ldelf: bool) -> Result<Self, ElfLoaderError> {
+        let main = FileAndParsed::new(task, elf_bin)?;
+        Ok(Self { main, is_ldelf })
     }
 
     /// Load `ldelf` and prepare the stack and CPU context for it with the given TA UUID.
-    pub fn load_ldelf(&mut self, ta_uuid: TeeUuid) -> Result<ThreadInitState, ElfLoaderError> {
+    pub fn load_ldelf(&mut self, ldelf_arg: &LdelfArg) -> Result<ThreadInitState, ElfLoaderError> {
+        if !self.is_ldelf {
+            return Err(ElfLoaderError::OpenError(Errno::ENOENT));
+        }
         let task = self.main.file.task;
         let global = &task.global;
         let ldelf_info = self
@@ -205,12 +209,11 @@ impl<'a> ElfLoader<'a> {
             .parsed
             .load(&mut self.main.file, &mut &*global.platform)?;
 
-        let ldelf_arg = LdelfArg::new(ta_uuid);
         let mut ta_stack = crate::loader::ta_stack::allocate_stack(task, None).ok_or(
             ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
         )?;
         ta_stack
-            .init_with_ldelf_arg(&ldelf_arg)
+            .init_with_ldelf_arg(ldelf_arg)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
         task.set_ta_stack_base_addr(ta_stack.get_stack_base());
 
@@ -223,15 +226,19 @@ impl<'a> ElfLoader<'a> {
 
     /// Load the TA trampoline.
     ///
-    /// Note that the TA itself is loaded by `ldelf`. This function only loads the trampoline
-    /// to support the TA's syscalls.
-    pub fn load_ta_trampoline(&mut self, base_addr: usize) -> Result<(), ElfLoaderError> {
+    /// This function is for the OP-TEE shim which uses an external `ldelf` program to load the target TA.
+    /// Since `ldelf` is not aware of the LiteBox trampoline, we should call this function after `ldelf` has
+    /// loaded the TA into memory whose base address is different from that of `ldelf`.
+    pub fn load_ta_trampoline(&mut self, ta_entry_point: usize) -> Result<(), ElfLoaderError> {
+        if self.is_ldelf {
+            return Err(ElfLoaderError::OpenError(Errno::ENOENT));
+        }
         let task = self.main.file.task;
         let global = &task.global;
 
         self.main
             .parsed
-            .load_secondary_trampoline(&mut self.main.file, &mut &*global.platform, base_addr)
+            .load_secondary_trampoline(&mut self.main.file, &mut &*global.platform, ta_entry_point)
             .map_err(|_| {
                 ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
             })

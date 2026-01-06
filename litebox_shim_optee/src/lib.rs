@@ -202,7 +202,6 @@ impl OpteeShim {
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
-                ta_base_addr: Cell::new(0),
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
@@ -211,7 +210,7 @@ impl OpteeShim {
         if let Some(ta_bin) = ta_bin {
             entrypoints.task.global.store_ta_bin(&ta_uuid, ta_bin);
         }
-        let elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin)?;
+        let elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin, true)?;
         entrypoints.task.load_ldelf(elf_loader, ta_uuid)?;
         let params_address = if entrypoints.task.get_ta_stack_base_addr().is_some() {
             let ta_stack = crate::loader::ta_stack::allocate_stack(
@@ -604,7 +603,8 @@ impl Task {
         mut loader: crate::loader::elf::ElfLoader<'_>,
         ta_uuid: TeeUuid,
     ) -> Result<(), ElfLoaderError> {
-        let init_state = loader.load_ldelf(ta_uuid)?;
+        let ldelf_arg = LdelfArg::new(ta_uuid);
+        let init_state = loader.load_ldelf(&ldelf_arg)?;
         self.thread.init_state.set(init_state);
         Ok(())
     }
@@ -622,11 +622,9 @@ impl Task {
                 .global
                 .get_ta_bin(&self.ta_app_id)
                 .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
-            let base_addr = self
-                .get_ta_base_addr()
-                .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
-            let mut elf_loader = loader::elf::ElfLoader::new(self, &ta_bin)?;
-            elf_loader.load_ta_trampoline(base_addr)?;
+            let ta_entry_point = self.get_ta_entry_point();
+            let mut elf_loader = loader::elf::ElfLoader::new(self, &ta_bin, false)?;
+            elf_loader.load_ta_trampoline(ta_entry_point)?;
             self.allocate_guest_tls(None).map_err(|_| {
                 ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
             })?;
@@ -710,27 +708,6 @@ impl Task {
         // Note: `ldelf` allocates stack (returned via `ldelf_arg_out.stack_ptr`) but we don't use it.
         // Need to revisit this to see whether the stack is large enough for our use cases (e.g.,
         // copy owned data through stack to minimize TOCTTOU threats).
-    }
-
-    /// Set the base address of the loaded TA for the current task.
-    ///
-    /// Since the TA base address is provided by `ldelf` which is untrusted, we checks whether
-    /// the given `addr` is within the user space.
-    ///
-    /// This address is used for loading the TA's trampoline.
-    pub(crate) fn set_ta_base_addr(&self, addr: usize) {
-        let ptr = UserConstPtr::<u8>::from_usize(addr);
-        if unsafe { ptr.read_at_offset(0) }.is_some() {
-            self.ta_base_addr.set(addr);
-        }
-    }
-
-    /// Get the base address of the loaded TA for the current task.
-    ///
-    /// This address is used for loading the TA's trampoline.
-    pub(crate) fn get_ta_base_addr(&self) -> Option<usize> {
-        let addr = self.ta_base_addr.get();
-        if addr == 0 { None } else { Some(addr) }
     }
 
     /// Set the base address of the TA stack for the current task.
@@ -1126,12 +1103,6 @@ impl TaUuidMap {
     }
 }
 
-// TODO: OP-TEE supports global, persistent objects across sessions. Implement this map if needed.
-
-// Each OP-TEE TA has its own UUID.
-// The client of a session can be a normal-world (VTL0) application or another TA (at VTL1).
-// The VTL0 kernel is expected to provide the client identity information.
-
 /// TA/session-related information for the current task
 struct Task {
     global: Arc<GlobalState>,
@@ -1148,15 +1119,13 @@ struct Task {
     tee_obj_map: TeeObjMap,
     /// TA handle to UUID map
     ta_handle_map: TaHandleMap,
-    /// Base address where the TA is loaded
-    ta_base_addr: Cell<usize>,
     /// TA entry point
     ta_entry_point: Cell<usize>,
     /// TA stack base address
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
-    // TODO: add more fields as needed
+    // TODO: OP-TEE supports global, persistent objects across sessions. Add these maps if needed.
 }
 
 impl Drop for Task {
@@ -1259,7 +1228,6 @@ mod test_utils {
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
-                ta_base_addr: Cell::new(0),
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
