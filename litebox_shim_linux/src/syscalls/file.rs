@@ -1310,51 +1310,46 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
             Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                 *raw_fd,
                 |fd| {
-                    self.global.litebox
-                    .descriptor_table()
-                    .with_metadata(fd, |crate::StdioStatusFlags(_)| self.stdio_ioctl(&arg))
-                    .unwrap_or_else(|err| {
-                        match err {
-                            MetadataError::NoSuchMetadata => {},
-                            MetadataError::ClosedFd => {
-                                todo!()
-                            }
+                    match self.global.litebox.descriptor_table().with_metadata(fd, |crate::StdioStatusFlags(_)| self.stdio_ioctl(&arg)) {
+                        Ok(r) => return r,
+                        Err(MetadataError::ClosedFd) => return Err(Errno::EBADF),
+                        Err(MetadataError::NoSuchMetadata) => {},
+                    }
+                    // Not stdio
+                    match arg {
+                        IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
+                        IoctlArg::FIOCLEX => {
+                            files.run_on_raw_fd(
+                                *raw_fd,
+                                |fd| {
+                                    let _old = self.global.litebox
+                                        .descriptor_table_mut()
+                                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                                },
+                                |_fd| todo!("net"),
+                                |_fd| todo!("pipes"),
+                            )?;
+                            Ok(0)
                         }
-                        match arg {
-                            IoctlArg::TCGETS(..) => Err(Errno::ENOTTY),
-                            IoctlArg::FIOCLEX => {
-                                files.run_on_raw_fd(
-                                    *raw_fd,
-                                    |fd| {
-                                        let _old = self.global.litebox
-                                            .descriptor_table_mut()
-                                            .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-                                    },
-                                    |_fd| todo!("net"),
-                                    |_fd| todo!("pipes"),
-                                )?;
-                                Ok(0)
-                            }
-                            IoctlArg::TIOCGWINSZ(_) | IoctlArg::TCSETS(_) => {
-                                #[cfg(debug_assertions)]
-                                litebox::log_println!(
-                                    self.global.platform,
-                                    "Got {:?} for non-stdio file; this is likely temporary during the migration away from stdio and should get cleaned up at some point",
-                                    arg
-                                );
-                                Err(Errno::EPERM)
-                            }
-                            _ => {
-                                #[cfg(debug_assertions)]
-                                litebox::log_println!(
-                                    self.global.platform,
-                                    "\n\n\n{:?}\n\n\n",
-                                    arg
-                                );
-                                todo!()
-                            }
+                        IoctlArg::TIOCGWINSZ(_) | IoctlArg::TCSETS(_) => {
+                            #[cfg(debug_assertions)]
+                            litebox::log_println!(
+                                self.global.platform,
+                                "Got {:?} for non-stdio file; this is likely temporary during the migration away from stdio and should get cleaned up at some point",
+                                arg
+                            );
+                            Err(Errno::EPERM)
                         }
-                    })
+                        _ => {
+                            #[cfg(debug_assertions)]
+                            litebox::log_println!(
+                                self.global.platform,
+                                "\n\n\n{:?}\n\n\n",
+                                arg
+                            );
+                            todo!()
+                        }
+                    }
                 },
                 |_fd| todo!("net"),
                 |_fd| todo!("pipes"),
