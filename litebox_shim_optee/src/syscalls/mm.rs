@@ -8,13 +8,6 @@ use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
 use crate::{Task, UserMutPtr};
 
-// `litebox_shim_optee` memory management
-// OP-TEE OS does have `ldelf_*` syscalls for memory management, but they are for LDELF (an ELF loader) not TAs.
-// These syscalls are not exposed to TAs. Further, LiteBox uses its own ELF loader.
-// To this end, we don't need to implement `ldelf_*` syscalls for memory management and, instead, can use
-// existing Linux kernel-style `mmap*` syscalls (or kernel functions because they are not exposed to the user space).
-// For now, `litebox_shim_optee` only needs `mmap`, `munmap`, and `mprotect` syscalls.
-
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());

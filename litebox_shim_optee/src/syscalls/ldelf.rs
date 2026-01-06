@@ -88,9 +88,6 @@ impl Task {
 
     /// OP-TEE's syscall to open a TA binary.
     pub fn sys_open_bin(&self, ta_uuid: TeeUuid, handle: UserMutPtr<u32>) -> Result<(), TeeResult> {
-        // TODO: This function requires an RPC from the secure world to the normal world to
-        // open the TA binary identified by `ta_uuid` and return a handle to it in `handle`.
-        // Since we don't have RPC implementation yet, we just return a dummy handle value.
         #[cfg(debug_assertions)]
         litebox::log_println!(
             self.global.platform,
@@ -112,9 +109,6 @@ impl Task {
 
     /// OP-TEE's syscall to close a TA binary.
     pub fn sys_close_bin(&self, handle: u32) -> Result<(), TeeResult> {
-        // TODO: This function requires an RPC from the secure world to the normal world to
-        // close the TA binary identified by `handle`.
-        // Since we don't have RPC implementation yet, we just do nothing.
         #[cfg(debug_assertions)]
         litebox::log_println!(self.global.platform, "sys_close_bin: handle {}", handle);
 
@@ -142,10 +136,6 @@ impl Task {
             return Err(TeeResult::BadParameters);
         };
 
-        // TODO: this function requires an RPC from the secure world to the normal world to
-        // map a portion of the TA binary identified by `handle` at offset `offs` into
-        // the secure world. Since we don't have RPC implementation yet, we use a contained
-        // TA binary to do this.
         #[cfg(debug_assertions)]
         litebox::log_println!(
             self.global.platform,
