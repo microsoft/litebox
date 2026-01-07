@@ -365,15 +365,57 @@ impl Descriptors {
             ],
         }
     }
+    /// Inserts a descriptor at the first available file descriptor number,
+    /// respecting the RLIMIT_NOFILE limit for the task.
+    ///
+    /// Returns the assigned file descriptor number, or the descriptor back on failure
+    /// if the limit is exceeded.
     fn insert(&mut self, task: &Task, descriptor: Descriptor) -> Result<u32, Descriptor> {
+        self.insert_in_range(
+            descriptor,
+            0,
+            task.process()
+                .limits
+                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE),
+        )
+    }
+    /// Inserts a descriptor at the first available slot within the specified range [min_idx, max_idx).
+    ///
+    /// Automatically grows the descriptor table if needed. Returns the assigned file descriptor number,
+    /// or the descriptor back if no slot is found within the limit.
+    fn insert_in_range(
+        &mut self,
+        descriptor: Descriptor,
+        min_idx: usize,
+        max_idx: usize,
+    ) -> Result<u32, Descriptor> {
         let idx = self
             .descriptors
             .iter()
+            .skip(min_idx)
             .position(Option::is_none)
             .unwrap_or_else(|| {
                 self.descriptors.push(None);
                 self.descriptors.len() - 1
             });
+        if idx >= max_idx {
+            return Err(descriptor);
+        }
+        let old = self.descriptors[idx].replace(descriptor);
+        assert!(old.is_none());
+        Ok(u32::try_from(idx).unwrap())
+    }
+    /// Attempts to insert a descriptor at a specific file descriptor number,
+    /// respecting the RLIMIT_NOFILE limit for the task.
+    ///
+    /// Returns the previous descriptor at that slot (if any), or the new descriptor back on failure
+    /// if the index exceeds the limit.
+    fn insert_at(
+        &mut self,
+        task: &Task,
+        descriptor: Descriptor,
+        idx: usize,
+    ) -> Result<Option<Descriptor>, Descriptor> {
         if idx
             >= task
                 .process()
@@ -382,17 +424,13 @@ impl Descriptors {
         {
             return Err(descriptor);
         }
-        let old = self.descriptors[idx].replace(descriptor);
-        assert!(old.is_none());
-        Ok(u32::try_from(idx).unwrap())
-    }
-    fn insert_at(&mut self, descriptor: Descriptor, idx: usize) -> Option<Descriptor> {
         if idx >= self.descriptors.len() {
             self.descriptors.resize_with(idx + 1, Default::default);
         }
-        self.descriptors
+        Ok(self
+            .descriptors
             .get_mut(idx)
-            .and_then(|v| v.replace(descriptor))
+            .and_then(|v| v.replace(descriptor)))
     }
     fn remove(&mut self, fd: u32) -> Option<Descriptor> {
         let fd = fd as usize;
