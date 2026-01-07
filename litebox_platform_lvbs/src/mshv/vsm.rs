@@ -23,9 +23,9 @@ use crate::{
         HvCrInterceptControlFlags, HvPageProtFlags, HvRegisterVsmPartitionConfig,
         HvRegisterVsmVpSecureVtlConfig, VsmFunction, X86Cr0Flags, X86Cr4Flags,
         heki::{
-            HekiKdataType, HekiKernelInfo, HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch,
-            HekiPatchInfo, HekiRange, MemAttr, ModMemType, mem_attr_to_hv_page_prot_flags,
-            mod_mem_type_to_mem_attr,
+            HekiDataDesc, HekiDataPage, HekiDataRange, HekiKdataType, HekiKernelInfo,
+            HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch, HekiPatchInfo, HekiRange,
+            MemAttr, ModMemType, mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
         },
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
@@ -39,7 +39,7 @@ use crate::{
     },
     serial_println,
 };
-use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};
+use alloc::{boxed::Box, ffi::CString, string::String, vec, vec::Vec};
 use core::{
     mem,
     ops::Range,
@@ -53,6 +53,7 @@ use x86_64::{
     structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use x509_cert::{Certificate, der::Decode};
+use zerocopy::FromBytes;
 
 #[derive(Copy, Clone)]
 #[repr(align(4096))]
@@ -415,6 +416,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     } else {
         let cert_buf = &system_certs_mem[..];
+        serial_println!("cert_buf:{}", pretty_hex::pretty_hex(&cert_buf));
 
         let certs = parse_certs(cert_buf);
 
@@ -472,6 +474,111 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, Errno> {
     Ok(0)
     // TODO: create blocklist keys
     // TODO: save blocklist hashes
+}
+
+fn mshv_vsm_get_system_certs(certs_mem: MemoryContainer) -> Result<(), Errno> {
+    let vtl0_info = &crate::platform_low().vtl0_kernel_info;
+
+    if certs_mem.is_empty() {
+        serial_println!("VSM: No system certificate found");
+        return Err(Errno::EINVAL);
+    }
+    let cert_buf = &certs_mem[..];
+    serial_println!("cert_buf:{}", pretty_hex::pretty_hex(&cert_buf));
+    let certs = parse_certs(cert_buf);
+
+    // The system certificate is loaded into VTL1 and locked down before `end_of_boot` is signaled.
+    // Its integrity depends on UEFI Secure Boot which ensures only trusted software is loaded during
+    // the boot process.
+    vtl0_info.set_system_certificates(certs.clone());
+    serial_println!("VSM: Loaded {} system certificate(s)", certs.len());
+    Ok(())
+}
+
+pub fn mshv_vsm_load_data_page(data_page_mem: MemoryContainer) -> Result<(), Errno> {
+    let data_page_len = mem::size_of::<HekiDataPage>();
+    let data_page_buf = &data_page_mem[..data_page_len];
+    let data_page = HekiDataPage::ref_from_bytes(data_page_buf).map_err(|_| Errno::EINVAL)?;
+
+    serial_println!(
+        "Data Page: Tag:{} size:{} desc:{} range:{}",
+        data_page.pg_type,
+        data_page.len,
+        data_page.desc_count,
+        data_page.range_count
+    );
+    let range_buf_start = data_page_len;
+    let range_buf_end =
+        range_buf_start + mem::size_of::<HekiDataRange>() * data_page.range_count as usize;
+    if (range_buf_end - range_buf_start) > data_page_mem[data_page_len..].len() {
+        return Err(Errno::EINVAL);
+    }
+
+    let data_range_buf = &data_page_mem[range_buf_start..range_buf_end];
+    let mut data_range_index = 0;
+    let data_range = <[HekiDataRange]>::ref_from_bytes_with_elems(
+        data_range_buf,
+        data_page.range_count as usize,
+    )
+    .map_err(|_| Errno::EINVAL)?;
+
+    for i in 0..data_page.desc_count as usize {
+        let desc = &data_page.desc[i];
+        serial_println!(
+            "Desc: type:{} count:{} va:{:#x} va_end:{:#x} size:{}",
+            desc.data_type,
+            desc.range_count,
+            desc.va_start,
+            desc.va_end,
+            desc.va_end - desc.va_start
+        );
+        for _ in 0..desc.range_count {
+            let range = &data_range[data_range_index];
+            serial_println!("Range: {} {}", range.pa, range.epa);
+            data_range_index += 1;
+        }
+    }
+    Ok(())
+}
+pub fn mshv_vsm_load_data(attr: u64, pa: u64, va: u64) -> Result<i64, Errno> {
+    if crate::platform_low().vtl0_kernel_info.check_end_of_boot() {
+        serial_println!(
+            "VSM: VTL0 is not allowed to load kernel data after the end of boot process"
+        );
+        return Err(Errno::EINVAL);
+    }
+    let data_type = HekiKdataType::try_from(attr & 0xff).unwrap_or(HekiKdataType::Unknown);
+    let data_len = (attr >> 16) & 0xffff_ffff;
+
+    let phys_start = PhysAddr::try_new(pa).map_err(|_| Errno::EINVAL)?;
+    if !phys_start.is_aligned(Size4KiB::SIZE) {
+        return Err(Errno::EINVAL);
+    }
+    let phys_end = PhysAddr::try_new(pa + data_len).map_err(|_| Errno::EINVAL)?;
+    let addr = VirtAddr::try_new(va).map_err(|_| Errno::EINVAL)?;
+
+    serial_println!(
+        "mshv_vsm_load_data: attr:{attr:#x} type:{data_type:?} len:{data_len} start:{phys_start:#x} end:{phys_end:#x}"
+    );
+
+    match data_type {
+        HekiKdataType::DataPage => {
+            let mem = MemoryContainer::from_vtl0_addr(addr, phys_start, phys_end)?;
+            mshv_vsm_load_data_page(mem)?;
+        }
+        HekiKdataType::Unknown => {
+            serial_println!("VSM: Invalid kernel data type");
+            return Err(Errno::EINVAL);
+        }
+        simple_data_type @ _ => {
+            let mem = MemoryContainer::from_vtl0_addr(addr, phys_start, phys_end)?;
+            match simple_data_type {
+                HekiKdataType::SystemCerts => mshv_vsm_get_system_certs(mem)?,
+                _ => {}
+            }
+        }
+    }
+    Ok(0)
 }
 
 /// VSM function for validating a guest kernel module and applying specified protection to its memory ranges after validation.
@@ -964,6 +1071,7 @@ pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
         VsmFunction::CopySecondaryKey => mshv_vsm_copy_secondary_key(params[0], params[1]),
         VsmFunction::KexecValidate => mshv_vsm_kexec_validate(params[0], params[1], params[2]),
         VsmFunction::PatchText => mshv_vsm_patch_text(params[0], params[1]),
+        VsmFunction::LoadData => mshv_vsm_load_data(params[0], params[1], params[2]),
         _ => {
             serial_println!("VSM: Unknown function ID {:?}", func_id);
             Err(Errno::EINVAL)
@@ -1408,6 +1516,24 @@ impl MemoryContainer {
             range: Vec::new(),
             buf: Vec::new(),
         }
+    }
+
+    pub fn from_vtl0_addr(
+        addr: VirtAddr,
+        phys_start: PhysAddr,
+        phys_end: PhysAddr,
+    ) -> Result<Self, Errno> {
+        let mut mem = Self {
+            range: vec![MemoryRange {
+                addr: addr,
+                phys_addr: phys_start,
+                len: phys_end - phys_start,
+            }],
+            buf: Vec::new(),
+        };
+        mem.write_vtl0_phys_bytes(phys_start, phys_end)
+            .map_err(|_| Errno::EINVAL)?;
+        Ok(mem)
     }
 
     /// Return the byte length of the memory container

@@ -12,6 +12,7 @@ use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{PageSize, Size4KiB},
 };
+use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -52,6 +53,7 @@ pub enum HekiKdataType {
     KernelData = 4,
     PatchInfo = 5,
     KexecTrampoline = 6,
+    DataPage = 0xf0,
     #[default]
     Unknown = 0xffff_ffff_ffff_ffff,
 }
@@ -413,4 +415,32 @@ impl HekiKernelInfo {
             })
         }
     }
+}
+
+#[repr(C)]
+#[derive(FromBytes, Immutable)]
+pub struct HekiDataRange {
+    pub pa: u64,
+    pub epa: u64,
+}
+
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout)]
+pub struct HekiDataDesc {
+    pub data_type: u16,
+    pub range_count: u16,
+    pub va_start: u64,
+    pub va_end: u64
+}
+
+pub const HEKI_DATA_PAGE_MAX_DESC:usize = 16;
+
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout)]
+pub struct HekiDataPage {
+    pub pg_type: u16,
+    pub len: u16,
+    pub desc_count: u16,
+    pub range_count: u16,
+    pub desc: [HekiDataDesc; HEKI_DATA_PAGE_MAX_DESC],
 }
