@@ -1244,6 +1244,19 @@ impl Task {
         }
     }
 
+    fn is_stdio(&self, fd: &TypedFd<crate::LinuxFS>) -> Result<bool, Errno> {
+        match self.global.fs.fd_file_status(fd) {
+            Ok(status) => {
+                // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
+                let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
+                Ok((136..=143).contains(&major)
+                    && status.file_type == litebox::fs::FileType::CharacterDevice)
+            }
+            Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
+            Err(_) => unimplemented!(),
+        }
+    }
+
     /// Handle syscall `ioctl`
     pub fn sys_ioctl(
         &self,
@@ -1330,33 +1343,23 @@ impl Task {
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
             | IoctlArg::TIOCGPTN(..)
-            | IoctlArg::TIOCGWINSZ(..) => {
-                match desc {
-                    Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
-                        *raw_fd,
-                        |fd| {
-                            match self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .with_metadata(fd, |crate::StdioStatusFlags(_)| {
-                                    self.stdio_ioctl(&arg)
-                                }) {
-                                Ok(r) => return r,
-                                Err(MetadataError::ClosedFd) => return Err(Errno::EBADF),
-                                Err(MetadataError::NoSuchMetadata) => {}
-                            }
-                            // Not stdio
+            | IoctlArg::TIOCGWINSZ(..) => match desc {
+                Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
+                    *raw_fd,
+                    |fd| {
+                        if self.is_stdio(fd)? {
+                            self.stdio_ioctl(&arg)
+                        } else {
                             Err(Errno::ENOTTY)
-                        },
-                        |_fd| Err(Errno::ENOTTY),
-                        |_fd| Err(Errno::ENOTTY),
-                    )?,
-                    Descriptor::Eventfd { .. }
-                    | Descriptor::Epoll { .. }
-                    | Descriptor::Unix { .. } => Err(Errno::ENOTTY),
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )?,
+                Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
+                    Err(Errno::ENOTTY)
                 }
-            }
+            },
             _ => {
                 #[cfg(debug_assertions)]
                 litebox::log_println!(self.global.platform, "\n\n\n{:?}\n\n\n", arg);
