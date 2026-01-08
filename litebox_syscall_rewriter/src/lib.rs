@@ -67,9 +67,6 @@ pub const TRAMPOLINE_SECTION_NAME_PREFIX: &str = ".trampolineLB";
 /// to know that they have a trampoline that satisfies the expected version.
 pub const TRAMPOLINE_SECTION_NAME: &str = ".trampolineLB0";
 
-/// The size of the trampoline section, which includes the magic number, the trampoline address, and the size of the trampoline data.
-const TRAMPOLINE_SECTION_SIZE: usize = 0x18;
-
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
 ///
 /// The `trampoline` must be an absolute address if specified; if unspecified, it will be set to
@@ -130,47 +127,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // Get control transfer targets
     let control_transfer_targets = get_control_transfer_targets(arch, &builder, &text_sections);
 
-    let last_segment_id = {
-        let s: Vec<_> = builder
-            .segments
-            .iter()
-            .collect::<Vec<_>>()
-            .windows(2)
-            .filter(|seg| {
-                // ensure the segment is okay to insert the trampoline section
-                if seg[0].p_type != object::elf::PT_LOAD
-                    || seg[0].p_flags & object::elf::PF_R == 0
-                    || seg[0].p_filesz != seg[0].p_memsz
-                {
-                    return false;
-                }
-                // ensure the segment has enough space for the trampoline section
-                let end_offset = seg[0].p_offset + seg[0].p_filesz;
-                if seg[1].p_type == object::elf::PT_LOAD
-                    && seg[1].p_offset - end_offset < TRAMPOLINE_SECTION_SIZE as u64
-                {
-                    return false;
-                }
-                if end_offset.next_multiple_of(0x1000) - end_offset < TRAMPOLINE_SECTION_SIZE as u64
-                {
-                    return false;
-                }
-                true
-            })
-            .map(|seg| seg[0])
-            .collect();
-        if s.is_empty() {
-            return Err(Error::NoTextSectionFound);
-        }
-        s[s.len() - 1].id()
-    };
-    builder
-        .segments
-        .get_mut(last_segment_id)
-        .append_section(builder.sections.get_mut(trampoline_section));
-
     let trampoline_base_addr = find_addr_for_trampoline_code(&builder);
-
     let mut trampoline_data = vec![];
     // The magic prefix for the trampoline section
     // This constant should be consistent with the definitions in the shim
@@ -212,16 +169,10 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         return Err(Error::NoSyscallInstructionsFound);
     }
 
-    let mut trampoline_vec = Vec::new();
-    // This constant should be consistent with the definitions in the shim
-    // (litebox_shim_linux/src/loader/mod.rs)
-    trampoline_vec.extend_from_slice("LITE BOX".as_bytes());
-    trampoline_vec.extend_from_slice(&trampoline_base_addr.to_le_bytes());
-    trampoline_vec.extend_from_slice(&(trampoline_data.len() as u64).to_le_bytes());
-    assert_eq!(trampoline_vec.len(), TRAMPOLINE_SECTION_SIZE);
-    builder.sections.get_mut(trampoline_section).sh_size = trampoline_vec.len() as u64;
-    builder.sections.get_mut(trampoline_section).data =
-        object::build::elf::SectionData::Data(trampoline_vec.into());
+    // Repurpose the section header fields to store trampoline info
+    builder.sections.get_mut(trampoline_section).sh_addr = u64::from_le_bytes(*b"LITE BOX");
+    builder.sections.get_mut(trampoline_section).sh_offset = trampoline_base_addr;
+    builder.sections.get_mut(trampoline_section).sh_entsize = trampoline_data.len() as u64;
 
     let mut out = vec![];
     builder

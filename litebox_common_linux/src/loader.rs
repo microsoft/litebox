@@ -16,7 +16,7 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };
 use thiserror::Error;
-use zerocopy::{FromBytes, FromZeros as _, IntoBytes};
+use zerocopy::IntoBytes as _;
 
 use crate::errno::Errno;
 
@@ -69,17 +69,9 @@ struct TrampolineInfo {
     syscall_entry_point: usize,
 }
 
-#[repr(C)]
-#[derive(Debug, IntoBytes, FromBytes)]
-struct TrampolineSection {
-    magic_number: u64,
-    trampoline_addr: u64,
-    trampoline_size: u64,
-}
-
 /// The magic number used to identify the LiteBox rewriter and where we should
 /// update the syscall callback pointer.
-pub const REWRITER_MAGIC_NUMBER: u64 = u64::from_le_bytes(*b"LITE BOX");
+const REWRITER_MAGIC_NUMBER: u64 = u64::from_le_bytes(*b"LITE BOX");
 const REWRITER_VERSION_NUMBER: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
 const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
@@ -238,31 +230,28 @@ impl ElfParsedFile {
             &buf,
         )?;
 
-        let mut data = TrampolineSection::new_zeroed();
-        if shdr.sh_size < size_of_val(&data) as u64 {
-            return Ok(());
-        }
-        file.read_at(shdr.sh_offset, data.as_mut_bytes())
-            .map_err(ElfParseError::Io)?;
+        // Note these fields are repurposed to store our trampoline info.
+        // See litebox_syscall_rewriter for details.
+        let magic_number = shdr.sh_addr;
+        let tramp_offset = shdr.sh_offset;
+        let tramp_size = shdr.sh_entsize;
         // TODO: check section name instead of magic number
-        if data.magic_number != REWRITER_MAGIC_NUMBER {
+        if magic_number != REWRITER_MAGIC_NUMBER {
             // Not a trampoline section.
             return Ok(());
         }
-        let size: usize = data
-            .trampoline_size
+        let size: usize = tramp_size
             .try_into()
             .map_err(|_| ElfParseError::BadTrampoline)?;
         // The trampoline is located at the end of the file.
         let file_offset = file
             .size()
             .map_err(ElfParseError::Io)?
-            .checked_sub(data.trampoline_size)
+            .checked_sub(tramp_size)
             .ok_or(ElfParseError::BadTrampoline)?;
 
         self.trampoline = Some(TrampolineInfo {
-            vaddr: data
-                .trampoline_addr
+            vaddr: tramp_offset
                 .try_into()
                 .map_err(|_| ElfParseError::BadTrampoline)?,
             size,
