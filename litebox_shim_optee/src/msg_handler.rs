@@ -60,15 +60,23 @@ fn page_align_up(len: u64) -> u64 {
     len.next_multiple_of(PAGE_SIZE as u64)
 }
 
+/// The result of handling an OP-TEE SMC call along with an extracted OP-TEE message argument to handle.
+pub struct OpteeSmcHandled<'a> {
+    pub result: OpteeSmcResult<'a>,
+    pub msg_to_handle: Option<OpteeMsgArg>,
+}
+
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
 /// It returns an `OpteeSmcResult` representing the result of the SMC call and
 /// an optional `OpteeMsgArg` if the SMC call involves with an OP-TEE messagewhich should be handled by
 /// `handle_optee_msg_arg` or `handle_ta_request`.
+///
 /// # Panics
+///
 /// Panics if the normal world physical address in `smc` cannot be converted to `usize`.
 pub fn handle_optee_smc_args(
     smc: &mut OpteeSmcArgs,
-) -> Result<(OpteeSmcResult<'_>, Option<OpteeMsgArg>), OpteeSmcReturn> {
+) -> Result<OpteeSmcHandled<'_>, OpteeSmcReturn> {
     let func_id = smc.func_id()?;
     match func_id {
         OpteeSmcFunction::CallWithArg
@@ -79,41 +87,41 @@ pub fn handle_optee_smc_args(
             let mut ptr = NormalWorldConstPtr::<OpteeMsgArg, PAGE_SIZE>::with_usize(msg_arg_addr)
                 .map_err(|_| OpteeSmcReturn::EBadAddr)?;
             let msg_arg = unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturn::EBadAddr)?;
-            Ok((
-                OpteeSmcResult::Generic {
+            Ok(OpteeSmcHandled {
+                result: OpteeSmcResult::Generic {
                     status: OpteeSmcReturn::Ok,
                 },
-                Some(*msg_arg),
-            ))
+                msg_to_handle: Some(*msg_arg),
+            })
         }
         OpteeSmcFunction::ExchangeCapabilities => {
             // TODO: update the below when we support more features
             let default_cap = OpteeSecureWorldCapabilities::DYNAMIC_SHM
                 | OpteeSecureWorldCapabilities::MEMREF_NULL
                 | OpteeSecureWorldCapabilities::RPC_ARG;
-            Ok((
-                OpteeSmcResult::ExchangeCapabilities {
+            Ok(OpteeSmcHandled {
+                result: OpteeSmcResult::ExchangeCapabilities {
                     status: OpteeSmcReturn::Ok,
                     capabilities: default_cap,
                     max_notif_value: MAX_NOTIF_VALUE,
                     data: NUM_RPC_PARMS,
                 },
-                None,
-            ))
+                msg_to_handle: None,
+            })
         }
         OpteeSmcFunction::DisableShmCache => {
             // Currently, we do not support this feature.
-            Ok((
-                OpteeSmcResult::DisableShmCache {
+            Ok(OpteeSmcHandled {
+                result: OpteeSmcResult::DisableShmCache {
                     status: OpteeSmcReturn::ENotAvail,
                     shm_upper32: 0,
                     shm_lower32: 0,
                 },
-                None,
-            ))
+                msg_to_handle: None,
+            })
         }
-        OpteeSmcFunction::GetOsUuid => Ok((
-            OpteeSmcResult::Uuid {
+        OpteeSmcFunction::GetOsUuid => Ok(OpteeSmcHandled {
+            result: OpteeSmcResult::Uuid {
                 data: &[
                     OPTEE_MSG_OS_OPTEE_UUID_0,
                     OPTEE_MSG_OS_OPTEE_UUID_1,
@@ -121,10 +129,10 @@ pub fn handle_optee_smc_args(
                     OPTEE_MSG_OS_OPTEE_UUID_3,
                 ],
             },
-            None,
-        )),
-        OpteeSmcFunction::CallsUid => Ok((
-            OpteeSmcResult::Uuid {
+            msg_to_handle: None,
+        }),
+        OpteeSmcFunction::CallsUid => Ok(OpteeSmcHandled {
+            result: OpteeSmcResult::Uuid {
                 data: &[
                     OPTEE_MSG_UID_0,
                     OPTEE_MSG_UID_1,
@@ -132,29 +140,29 @@ pub fn handle_optee_smc_args(
                     OPTEE_MSG_UID_3,
                 ],
             },
-            None,
-        )),
-        OpteeSmcFunction::GetOsRevision => Ok((
-            OpteeSmcResult::OsRevision {
+            msg_to_handle: None,
+        }),
+        OpteeSmcFunction::GetOsRevision => Ok(OpteeSmcHandled {
+            result: OpteeSmcResult::OsRevision {
                 major: OPTEE_MSG_REVISION_MAJOR,
                 minor: OPTEE_MSG_REVISION_MINOR,
                 build_id: OPTEE_MSG_BUILD_ID,
             },
-            None,
-        )),
-        OpteeSmcFunction::CallsRevision => Ok((
-            OpteeSmcResult::Revision {
+            msg_to_handle: None,
+        }),
+        OpteeSmcFunction::CallsRevision => Ok(OpteeSmcHandled {
+            result: OpteeSmcResult::Revision {
                 major: OPTEE_MSG_REVISION_MAJOR,
                 minor: OPTEE_MSG_REVISION_MINOR,
             },
-            None,
-        )),
+            msg_to_handle: None,
+        }),
         _ => Err(OpteeSmcReturn::UnknownFunction),
     }
 }
 
 /// This function handles an OP-TEE message contained in `OpteeMsgArg`.
-/// Currently, it only handles share memory registration and unregistration.
+/// Currently, it only handles shared memory registration and unregistration.
 /// If an OP-TEE message involves with a TA request, it simply returns
 /// `Err(OpteeSmcReturn::Ok)` while expecting that the caller will handle
 /// the message with `handle_ta_request`.
@@ -166,7 +174,7 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), OpteeSmcReturn>
             if tmem.buf_ptr == 0 || tmem.size == 0 || tmem.shm_ref == 0 {
                 return Err(OpteeSmcReturn::EBadAddr);
             }
-            // `tmem.buf_ptr` embeds two different information:
+            // `tmem.buf_ptr` encodes two different information:
             // - The physical page address of the first `ShmRefPagesData`
             // - The page offset of the first shared memory page (`pages_list[0]`)
             let shm_ref_pages_data_phys_addr = page_align_down(tmem.buf_ptr);

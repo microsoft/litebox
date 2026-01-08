@@ -1412,7 +1412,6 @@ impl OpteeSmcArgs {
 
     /// Get the physical address of `OpteeMsgArg`. The secure world is expected to map and copy
     /// this structure.
-    #[cfg(target_pointer_width = "64")]
     pub fn optee_msg_arg_phys_addr(&self) -> Result<u64, OpteeSmcReturn> {
         // To avoid potential sign extension and overflow issues, OP-TEE stores the low and
         // high 32 bits of a 64-bit address in `args[2]` and `args[1]`, respectively.

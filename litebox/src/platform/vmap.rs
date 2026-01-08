@@ -30,8 +30,8 @@ pub trait VmapProvider<const ALIGN: usize> {
     /// (especially, there should be no read/write or write/write conflicts).
     /// Unfortunately, LiteBox itself cannot fully guarantee this and it needs some helps
     /// from the caller, hypervisor, or hardware.
-    /// Multiple LiteBox threads might concurrently call this function (and `vunmap()`) with
-    /// overlapping physical pages, so the implementation should safely handle such cases.
+    /// Multiple LiteBox threads might concurrently call this function with overlapping
+    /// physical pages, so the implementation should safely handle such cases.
     unsafe fn vmap(
         &self,
         pages: Self::PhysPageAddrArray,
@@ -46,13 +46,10 @@ pub trait VmapProvider<const ALIGN: usize> {
     /// # Safety
     ///
     /// The caller should ensure that the virtual addresses in `vmap_info` are not in active
-    /// use by other entities. Like `vmap()`, LiteBox itself cannot fully guarantee this and
-    /// it needs some helps from other parties.
-    /// Multiple LiteBox threads might concurrently call this function (and `vmap()`) with
-    /// overlapping physical pages, so the implementation should safely handle such cases.
+    /// use by other entities.
     unsafe fn vunmap(&self, vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError>;
 
-    /// Validate that the given physical pages do not belong to LiteBox-managed memory.
+    /// Validate that the given physical pages do not belong to LiteBox-owned memory.
     /// Use `&self` to get the memory layout of the platform (i.e., the physical memory
     /// range assigned to LiteBox).
     ///
@@ -61,12 +58,13 @@ pub trait VmapProvider<const ALIGN: usize> {
     /// Returns `Ok(())` if valid. If the pages are not valid, returns `Err(PhysPointerError)`.
     fn validate(&self, pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError>;
 
-    /// Protect the given physical pages to ensure concurrent read or exclusive write access.
-    /// Read protection prevents others from modifying the pages. Read/write protection prevents
-    /// others from accessing the pages.
-    /// This can be implemented using EPT/NPT, TZASC, PMP, or some other hardware mechanisms.
+    /// Protect the given physical pages to ensure concurrent read or exclusive write access:
+    /// - Read protection: prevent others from writing to the pages.
+    /// - Read/write protection: prevent others from reading or writing to the pages.
+    /// - No protection: allow others to read and write the pages.
     ///
-    /// This function is a no-op if there is no other world or VM sharing the physical memory.
+    /// This function can be implemented using EPT/NPT, TZASC, PMP, or some other hardware mechanisms.
+    /// It is a no-op if there is no other world or VM sharing the physical memory.
     ///
     /// Returns `Ok(())` if it successfully protects the pages. If it fails, returns
     /// `Err(PhysPointerError)`.
@@ -75,6 +73,7 @@ pub trait VmapProvider<const ALIGN: usize> {
     ///
     /// Since this function is expected to use hypercalls or other privileged hardware features,
     /// the caller must ensure that it is safe to perform such operations at the time of the call.
+    /// Also, the caller should unprotect the pages when they are no longer needed to be protected.
     unsafe fn protect(
         &self,
         pages: Self::PhysPageAddrArray,
