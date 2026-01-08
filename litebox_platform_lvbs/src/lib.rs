@@ -766,8 +766,8 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
 /// Checks whether the given physical addresses are contiguous with respect to ALIGN.
 ///
 /// Note: This is a temporary check to let `VmapProvider` work with this platform
-/// which maps physical pages with a fixed offset (`MemoryProvider::GVA_OFFSET`) such that
-/// does not support non-contiguous physical page mapping with contiguous virtual addresses.
+/// which does not yet support virtually contiguous mapping of non-contiguous physical pages
+/// (for now, it maps physical pages with a fixed offset).
 fn check_contiguity<const ALIGN: usize>(
     addrs: &[PhysPageAddr<ALIGN>],
 ) -> Result<(), PhysPointerError> {

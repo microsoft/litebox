@@ -19,9 +19,9 @@
 //! leakage due to concurrent or persistent access).
 //!
 //! Instead, the approach this module takes is to map the required physical memory
-//! region on-demand when accessing them while using a LiteBox-managed buffer to copy
+//! region on-demand when accessing them while using a LiteBox-owned buffer to copy
 //! data to/from those regions. This way, this module can ensure that data must be
-//! copied into LiteBox-managed memory before being used while avoiding any unknown
+//! copied into LiteBox-owned memory before being used while avoiding any unknown
 //! side effects due to persistent memory mapping.
 //!
 //! Considerations:
@@ -97,10 +97,10 @@ pub struct PhysMutPtr<T: Clone, const ALIGN: usize> {
 impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     /// Create a new `PhysMutPtr` from the given physical page array and offset.
     ///
-    /// All addresses in `pages` should be valid and aligned to `ALIGN`, and `offset` should be smaller
-    /// than `ALIGN`. Also, `pages` should contain enough pages to cover at least one object of
-    /// type `T` starting from `offset`. If these conditions are not met, this function returns
-    /// `Err(PhysPointerError)`.
+    /// All addresses in `pages` should be valid and aligned to `ALIGN`, and `offset` should be
+    /// smaller than `ALIGN`. Also, `pages` should contain enough pages to cover at least one
+    /// object of type `T` starting from `offset`. If these conditions are not met, this function
+    /// returns `Err(PhysPointerError)`.
     pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError> {
         if offset >= ALIGN {
             return Err(PhysPointerError::InvalidBaseOffset(offset, ALIGN));
@@ -133,9 +133,9 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     /// Create a new `PhysMutPtr` from the given contiguous physical address and length.
     ///
     /// This is a shortcut for
-    /// `PhysMutPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(align_down(pa) + bytes)], pa % ALIGN)`.
+    /// `PhysMutPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(pa + bytes) - ALIGN], pa % ALIGN)`.
     /// This function assumes that `pa`, ..., `pa+bytes` are both physically and virtually contiguous. If not,
-    /// later accesses through `PhysMutPtr` may read/write incorrect data.
+    /// later accesses through `PhysMutPtr` may read/write data in a wrong order.
     pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
         if bytes < core::mem::size_of::<T>() {
             return Err(PhysPointerError::InsufficientPhysicalPages(
@@ -197,7 +197,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             self.map_range(start, end, PhysPageMapPermissions::READ)?;
         }
         // Don't forget to call unmap() before returning to the caller
-        let Some(src) = (unsafe { self.base_ptr() }) else {
+        let Some(src) = self.base_ptr() else {
             unsafe {
                 self.unmap()?;
             }
@@ -259,7 +259,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             self.map_range(start, end, PhysPageMapPermissions::READ)?;
         }
         // Don't forget to call unmap() before returning to the caller
-        let Some(src) = (unsafe { self.base_ptr() }) else {
+        let Some(src) = self.base_ptr() else {
             unsafe {
                 self.unmap()?;
             }
@@ -289,7 +289,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     ///
     /// # Safety
     ///
-    /// The caller should be aware that the given physical address might be concurrently writtenby
+    /// The caller should be aware that the given physical address might be concurrently written by
     /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
     /// in place (e.g., by the hypervisor or hardware). That is, data it writes might be overwritten.
     pub unsafe fn write_at_offset(
@@ -318,7 +318,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             )?;
         }
         // Don't forget to call unmap() before returning to the caller
-        let Some(dst) = (unsafe { self.base_ptr() }) else {
+        let Some(dst) = self.base_ptr() else {
             unsafe {
                 self.unmap()?;
             }
@@ -372,7 +372,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             )?;
         }
         // Don't forget to call unmap() before returning to the caller
-        let Some(dst) = (unsafe { self.base_ptr() }) else {
+        let Some(dst) = self.base_ptr() else {
             unsafe {
                 self.unmap()?;
             }
@@ -453,16 +453,12 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     }
 
     /// Get the base virtual pointer if mapped.
-    ///
-    /// # Safety
-    ///
-    /// This function performs pointer arithmetic on the mapped base pointer.
     #[inline]
-    unsafe fn base_ptr(&self) -> Option<*mut T> {
+    fn base_ptr(&self) -> Option<*mut T> {
         let Some(map_info) = &self.map_info else {
             return None;
         };
-        Some(unsafe { map_info.base.add(self.offset) }.cast::<T>())
+        Some(map_info.base.wrapping_add(self.offset).cast::<T>())
     }
 }
 
@@ -505,9 +501,9 @@ impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     /// Create a new `PhysConstPtr` from the given contiguous physical address and length.
     ///
     /// This is a shortcut for
-    /// `PhysConstPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(align_down(pa) + bytes)], pa % ALIGN)`.
+    /// `PhysConstPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(pa + bytes) - ALIGN], pa % ALIGN)`.
     /// This function assumes that `pa`, ..., `pa+bytes` are both physically and virtually contiguous. If not,
-    /// later accesses through `PhysConstPtr` may read incorrect data.
+    /// later accesses through `PhysConstPtr` may read data in a wrong order.
     pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
         Ok(Self {
             inner: PhysMutPtr::with_contiguous_pages(pa, bytes)?,
