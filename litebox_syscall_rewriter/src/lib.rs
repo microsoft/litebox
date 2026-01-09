@@ -172,7 +172,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // Repurpose the section header fields to store trampoline info
     // This constant should be consistent with the definitions in the shim
     // (litebox_shim_linux/src/loader/mod.rs)
-    builder.sections.get_mut(trampoline_section).sh_addr = u64::from_le_bytes(*b"LITE BOX");
+    builder.sections.get_mut(trampoline_section).sh_addr = u32::from_le_bytes(*b"LTBX").into();
     builder.sections.get_mut(trampoline_section).sh_offset = trampoline_base_addr;
     builder.sections.get_mut(trampoline_section).sh_entsize = trampoline_data.len() as u64;
 

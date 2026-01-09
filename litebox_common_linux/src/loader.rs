@@ -71,7 +71,7 @@ struct TrampolineInfo {
 
 /// The magic number used to identify the LiteBox rewriter and where we should
 /// update the syscall callback pointer.
-const REWRITER_MAGIC_NUMBER: u64 = u64::from_le_bytes(*b"LITE BOX");
+const REWRITER_MAGIC_NUMBER: u32 = u32::from_le_bytes(*b"LTBX");
 const REWRITER_VERSION_NUMBER: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
 const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
@@ -236,7 +236,7 @@ impl ElfParsedFile {
         let tramp_offset = shdr.sh_offset;
         let tramp_size = shdr.sh_entsize;
         // TODO: check section name instead of magic number
-        if magic_number != REWRITER_MAGIC_NUMBER {
+        if magic_number != REWRITER_MAGIC_NUMBER.into() {
             // Not a trampoline section.
             return Ok(());
         }

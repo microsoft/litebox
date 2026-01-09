@@ -8,7 +8,7 @@
 #include <stdint.h>
 
 #define TARGET_SECTION_NAME ".trampolineLB0"
-#define HEADER_MAGIC ((uint64_t)0x584f42204554494c) // "LITE BOX"
+#define HEADER_MAGIC ((uint32_t)0x5842544c) // "LTBX"
 #define TRAMP_MAGIC ((uint64_t)0x30584f424554494c)  // "LITEBOX0"
 
 #if !defined(__x86_64__)
