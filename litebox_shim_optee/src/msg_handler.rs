@@ -212,7 +212,7 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), OpteeSmcReturn>
 /// TA request information extracted from an OP-TEE message.
 ///
 /// In addition to standard TA information (i.e., TA UUID, session ID, command ID,
-/// and parameters), it contains shared memory addresses (`out_phys_addrs` and `page_offsets`) to
+/// and parameters), it contains shared memory addresses (`out_page_addrs` and `page_offsets`) to
 /// write back output data to the normal world once the TA execution is done.
 pub struct TaRequestInfo {
     pub uuid: Option<TeeUuid>,
@@ -220,7 +220,7 @@ pub struct TaRequestInfo {
     pub entry_func: UteeEntryFunc,
     pub cmd_id: u32,
     pub params: [UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
-    pub out_phys_addrs: [Option<Box<[PhysPageAddr<PAGE_SIZE>]>>; UteeParamOwned::TEE_NUM_PARAMS],
+    pub out_page_addrs: [Option<Box<[PhysPageAddr<PAGE_SIZE>]>>; UteeParamOwned::TEE_NUM_PARAMS],
     pub page_offsets: [Option<usize>; UteeParamOwned::TEE_NUM_PARAMS],
 }
 
@@ -252,7 +252,7 @@ pub fn decode_ta_request(msg_arg: &OpteeMsgArg) -> Result<TaRequestInfo, OpteeSm
         entry_func: ta_entry_func,
         cmd_id: msg_arg.func,
         params: [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS],
-        out_phys_addrs: [const { None }; UteeParamOwned::TEE_NUM_PARAMS],
+        out_page_addrs: [const { None }; UteeParamOwned::TEE_NUM_PARAMS],
         page_offsets: [const { None }; UteeParamOwned::TEE_NUM_PARAMS],
     };
 
@@ -282,83 +282,71 @@ pub fn decode_ta_request(msg_arg: &OpteeMsgArg) -> Result<TaRequestInfo, OpteeSm
                 }
             }
             OpteeMsgAttrType::TmemInput | OpteeMsgAttrType::RmemInput => {
-                let (phys_addrs, page_offset, data_size) = match param.attr_type() {
+                let (shm_info, data_size) = match param.attr_type() {
                     OpteeMsgAttrType::TmemInput => {
                         let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        let shm_phys_addrs = get_shm_phys_addrs_from_optee_msg_param_tmem(tmem)?;
                         (
-                            shm_phys_addrs.0,
-                            shm_phys_addrs.1,
+                            get_shm_info_from_optee_msg_param_tmem(tmem)?,
                             usize::try_from(tmem.size).unwrap(),
                         )
                     }
                     OpteeMsgAttrType::RmemInput => {
                         let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        let shm_phys_addrs = get_shm_phys_addrs_from_optee_msg_param_rmem(rmem)?;
                         (
-                            shm_phys_addrs.0,
-                            shm_phys_addrs.1,
+                            get_shm_info_from_optee_msg_param_rmem(rmem)?,
                             usize::try_from(rmem.size).unwrap(),
                         )
                     }
                     _ => unreachable!(),
                 };
                 let mut data = alloc::vec![0u8; data_size];
-                read_data_from_shm_phys_addrs(&phys_addrs, page_offset, &mut data)?;
+                read_data_from_shm_info(&shm_info, &mut data)?;
                 UteeParamOwned::MemrefInput { data: data.into() }
             }
             OpteeMsgAttrType::TmemOutput | OpteeMsgAttrType::RmemOutput => {
-                let (phys_addrs, page_offset, buffer_size) = match param.attr_type() {
+                let (shm_info, buffer_size) = match param.attr_type() {
                     OpteeMsgAttrType::TmemOutput => {
                         let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        let shm_phys_addrs = get_shm_phys_addrs_from_optee_msg_param_tmem(tmem)?;
                         (
-                            shm_phys_addrs.0,
-                            shm_phys_addrs.1,
+                            get_shm_info_from_optee_msg_param_tmem(tmem)?,
                             usize::try_from(tmem.size).unwrap(),
                         )
                     }
                     OpteeMsgAttrType::RmemOutput => {
                         let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        let shm_phys_addrs = get_shm_phys_addrs_from_optee_msg_param_rmem(rmem)?;
                         (
-                            shm_phys_addrs.0,
-                            shm_phys_addrs.1,
+                            get_shm_info_from_optee_msg_param_rmem(rmem)?,
                             usize::try_from(rmem.size).unwrap(),
                         )
                     }
                     _ => unreachable!(),
                 };
-                ta_req_info.out_phys_addrs[i] = Some(phys_addrs.into_boxed_slice());
-                ta_req_info.page_offsets[i] = Some(page_offset);
+                ta_req_info.out_page_addrs[i] = Some(shm_info.page_addrs);
+                ta_req_info.page_offsets[i] = Some(shm_info.page_offset);
                 UteeParamOwned::MemrefOutput { buffer_size }
             }
             OpteeMsgAttrType::TmemInout | OpteeMsgAttrType::RmemInout => {
-                let (phys_addrs, page_offset, buffer_size) = match param.attr_type() {
+                let (shm_info, buffer_size) = match param.attr_type() {
                     OpteeMsgAttrType::TmemInout => {
                         let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        let shm_phys_addrs = get_shm_phys_addrs_from_optee_msg_param_tmem(tmem)?;
                         (
-                            shm_phys_addrs.0,
-                            shm_phys_addrs.1,
+                            get_shm_info_from_optee_msg_param_tmem(tmem)?,
                             usize::try_from(tmem.size).unwrap(),
                         )
                     }
                     OpteeMsgAttrType::RmemInout => {
                         let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        let shm_phys_addrs = get_shm_phys_addrs_from_optee_msg_param_rmem(rmem)?;
                         (
-                            shm_phys_addrs.0,
-                            shm_phys_addrs.1,
+                            get_shm_info_from_optee_msg_param_rmem(rmem)?,
                             usize::try_from(rmem.size).unwrap(),
                         )
                     }
                     _ => unreachable!(),
                 };
                 let mut buffer = alloc::vec![0u8; buffer_size];
-                read_data_from_shm_phys_addrs(&phys_addrs, page_offset, &mut buffer)?;
-                ta_req_info.out_phys_addrs[i] = Some(phys_addrs.into_boxed_slice());
-                ta_req_info.page_offsets[i] = Some(page_offset);
+                read_data_from_shm_info(&shm_info, &mut buffer)?;
+                ta_req_info.out_page_addrs[i] = Some(shm_info.page_addrs);
+                ta_req_info.page_offsets[i] = Some(shm_info.page_offset);
                 UteeParamOwned::MemrefInout {
                     data: buffer.into(),
                     buffer_size,
@@ -414,10 +402,12 @@ pub fn prepare_for_return_to_normal_world(
                     if slice.is_empty() {
                         continue;
                     }
-                    if let Some(out_addrs) = &ta_req_info.out_phys_addrs[index] {
-                        write_data_to_shm_phys_addrs(
-                            out_addrs,
-                            ta_req_info.page_offsets[index].unwrap_or(0),
+                    if let Some(out_addrs) = &ta_req_info.out_page_addrs[index] {
+                        write_data_to_shm_info(
+                            &ShmInfo {
+                                page_addrs: out_addrs.clone(),
+                                page_offset: ta_req_info.page_offsets[index].unwrap_or(0),
+                            },
                             slice,
                         )?;
                     }
@@ -449,12 +439,12 @@ impl ShmRefPagesData {
 }
 
 /// Data structure to maintain the information of OP-TEE shared memory in VTL0 referenced by `shm_ref`.
-/// `pages` contains an array of physical page addresses.
+/// `page_addrs` contains an array of physical page addresses.
 /// `page_offset` indicates the page offset of the first page (i.e., `pages[0]`) which should be
 /// smaller than `ALIGN`.
 #[derive(Clone)]
-struct ShmRefInfo<const ALIGN: usize> {
-    pub pages: Box<[PhysPageAddr<ALIGN>]>,
+struct ShmInfo<const ALIGN: usize> {
+    pub page_addrs: Box<[PhysPageAddr<ALIGN>]>,
     pub page_offset: usize,
 }
 
@@ -463,7 +453,7 @@ struct ShmRefInfo<const ALIGN: usize> {
 /// used during OP-TEE calls with parameters referencing shared memory.
 /// Any normal memory references without this registration will be rejected.
 struct ShmRefMap<const ALIGN: usize> {
-    inner: spin::mutex::SpinMutex<HashMap<u64, ShmRefInfo<ALIGN>>>,
+    inner: spin::mutex::SpinMutex<HashMap<u64, ShmInfo<ALIGN>>>,
 }
 
 impl<const ALIGN: usize> ShmRefMap<ALIGN> {
@@ -473,7 +463,7 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         }
     }
 
-    pub fn insert(&self, shm_ref: u64, info: ShmRefInfo<ALIGN>) -> Result<(), OpteeSmcReturn> {
+    pub fn insert(&self, shm_ref: u64, info: ShmInfo<ALIGN>) -> Result<(), OpteeSmcReturn> {
         let mut guard = self.inner.lock();
         if guard.contains_key(&shm_ref) {
             Err(OpteeSmcReturn::ENotAvail)
@@ -483,12 +473,12 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         }
     }
 
-    pub fn remove(&self, shm_ref: u64) -> Option<ShmRefInfo<ALIGN>> {
+    pub fn remove(&self, shm_ref: u64) -> Option<ShmInfo<ALIGN>> {
         let mut guard = self.inner.lock();
         guard.remove(&shm_ref)
     }
 
-    pub fn get(&self, shm_ref: u64) -> Option<ShmRefInfo<ALIGN>> {
+    pub fn get(&self, shm_ref: u64) -> Option<ShmInfo<ALIGN>> {
         let guard = self.inner.lock();
         guard.get(&shm_ref).cloned()
     }
@@ -536,8 +526,8 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
 
         self.insert(
             shm_ref,
-            ShmRefInfo {
-                pages: pages.into_boxed_slice(),
+            ShmInfo {
+                page_addrs: pages.into_boxed_slice(),
                 page_offset: usize::try_from(page_offset).unwrap(),
             },
         )?;
@@ -550,36 +540,36 @@ fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {
     SHM_REF_MAP.get_or_init(|| Box::new(ShmRefMap::new()))
 }
 
-/// Get the normal world physical addresses and page offset of OP-TEE shared memory from `OpteeMsgParamTmem`.
+/// Get the normal world shared memory information (physical addresses and page offset) from `OpteeMsgParamTmem`.
 ///
 /// Note that we use this function for handing TA requests and in this context
 /// `OpteeMsgParamTmem` and `OpteeMsgParamRmem` are equivalent because every shared memory
 /// reference accessible by TAs must be registered in advance.
 /// `OpteeMsgParamTmem` is matter for the registration of shared memory regions.
-fn get_shm_phys_addrs_from_optee_msg_param_tmem(
+fn get_shm_info_from_optee_msg_param_tmem(
     tmem: OpteeMsgParamTmem,
-) -> Result<(Vec<PhysPageAddr<PAGE_SIZE>>, usize), OpteeSmcReturn> {
+) -> Result<ShmInfo<PAGE_SIZE>, OpteeSmcReturn> {
     let rmem = OpteeMsgParamRmem {
         offs: tmem.buf_ptr,
         size: tmem.size,
         shm_ref: tmem.shm_ref,
     };
-    get_shm_phys_addrs_from_optee_msg_param_rmem(rmem)
+    get_shm_info_from_optee_msg_param_rmem(rmem)
 }
 
-/// Get a list of the normal world physical addresses and page offset of OP-TEE shared memory from `OpteeMsgParamRmem`.
+/// Get the normal world shared memory information (physical addresses and page offset) from `OpteeMsgParamRmem`.
 ///
 /// `rmem.offs` must be an offset within the shared memory region registered with `rmem.shm_ref` before
 /// and `rmem.offs + rmem.size` must not exceed the size of the registered shared memory region.
 /// All addresses this function returns are page aligned and virtually contiguous within the normal world but
 /// not necessarily physically contiguous.
-fn get_shm_phys_addrs_from_optee_msg_param_rmem(
+fn get_shm_info_from_optee_msg_param_rmem(
     rmem: OpteeMsgParamRmem,
-) -> Result<(Vec<PhysPageAddr<PAGE_SIZE>>, usize), OpteeSmcReturn> {
-    let Some(shm_ref_info) = shm_ref_map().get(rmem.shm_ref) else {
+) -> Result<ShmInfo<PAGE_SIZE>, OpteeSmcReturn> {
+    let Some(shm_info) = shm_ref_map().get(rmem.shm_ref) else {
         return Err(OpteeSmcReturn::ENotAvail);
     };
-    let page_offset = shm_ref_info.page_offset;
+    let page_offset = shm_info.page_offset;
     let start = page_offset
         .checked_add(usize::try_from(rmem.offs).unwrap())
         .ok_or(OpteeSmcReturn::EBadAddr)?;
@@ -588,22 +578,25 @@ fn get_shm_phys_addrs_from_optee_msg_param_rmem(
         .ok_or(OpteeSmcReturn::EBadAddr)?;
     let start_page_index = start / PAGE_SIZE;
     let end_page_index = end.div_ceil(PAGE_SIZE);
-    if start_page_index >= shm_ref_info.pages.len() || end_page_index > shm_ref_info.pages.len() {
+    if start_page_index >= shm_info.page_addrs.len() || end_page_index > shm_info.page_addrs.len() {
         return Err(OpteeSmcReturn::EBadAddr);
     }
-    let mut pages = Vec::with_capacity(end_page_index - start_page_index);
-    pages.copy_from_slice(&shm_ref_info.pages[start_page_index..end_page_index]);
-    Ok((pages, page_offset))
+    let mut page_addrs = Vec::with_capacity(end_page_index - start_page_index);
+    page_addrs.copy_from_slice(&shm_info.page_addrs[start_page_index..end_page_index]);
+    Ok(ShmInfo {
+        page_addrs: page_addrs.into_boxed_slice(),
+        page_offset,
+    })
 }
 
 /// Read data from the normal world shared memory pages whose physical addresses are given in
-/// `phys_addrs` and `page_offset` into `buffer`. The size of `buffer` indicates how many bytes to read.
-fn read_data_from_shm_phys_addrs<const ALIGN: usize>(
-    phys_addrs: &[PhysPageAddr<ALIGN>],
-    page_offset: usize,
+/// `shm_info` into `buffer`. The size of `buffer` indicates the number of bytes to read.
+fn read_data_from_shm_info<const ALIGN: usize>(
+    shm_info: &ShmInfo<ALIGN>,
     buffer: &mut [u8],
 ) -> Result<(), OpteeSmcReturn> {
-    let mut ptr = NormalWorldConstPtr::<u8, ALIGN>::new(phys_addrs, page_offset)?;
+    let mut ptr =
+        NormalWorldConstPtr::<u8, ALIGN>::new(&shm_info.page_addrs, shm_info.page_offset)?;
     unsafe {
         ptr.read_slice_at_offset(0, buffer)?;
     }
@@ -611,13 +604,12 @@ fn read_data_from_shm_phys_addrs<const ALIGN: usize>(
 }
 
 /// Write data in `buffer` to the normal world shared memory pages whose physical addresses are given
-/// in `phys_addrs` and `page_offset`. The size of `buffer` indicates how many bytes to write.
-fn write_data_to_shm_phys_addrs<const ALIGN: usize>(
-    phys_addrs: &[PhysPageAddr<ALIGN>],
-    page_offset: usize,
+/// in `shm_info`. The size of `buffer` indicates the number of bytes to write.
+fn write_data_to_shm_info<const ALIGN: usize>(
+    shm_info: &ShmInfo<ALIGN>,
     buffer: &[u8],
 ) -> Result<(), OpteeSmcReturn> {
-    let mut ptr = NormalWorldMutPtr::<u8, ALIGN>::new(phys_addrs, page_offset)
+    let mut ptr = NormalWorldMutPtr::<u8, ALIGN>::new(&shm_info.page_addrs, shm_info.page_offset)
         .map_err(|_| OpteeSmcReturn::EBadAddr)?;
     unsafe {
         ptr.write_slice_at_offset(0, buffer)?;

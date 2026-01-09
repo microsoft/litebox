@@ -123,8 +123,8 @@ fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeS
         NormalWorldConstPtr::<OpteeSmcArgs, PAGE_SIZE>::with_usize(smc_args_addr)?;
     let mut smc_args = unsafe { smc_args_ptr.read_at_offset(0) }?;
     let msg_arg_phys_addr = smc_args.optee_msg_arg_phys_addr()?;
-    let (res, msg_arg) = handle_optee_smc_args(&mut smc_args)?;
-    if let Some(mut msg_arg) = msg_arg {
+    let smc_handled = handle_optee_smc_args(&mut smc_args)?;
+    if let Some(mut msg_arg) = smc_handled.msg_to_handle {
         match msg_arg.cmd {
             OpteeMessageCommand::OpenSession
             | OpteeMessageCommand::InvokeCommand
@@ -222,15 +222,15 @@ fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeS
                     // retrieve `ta_info` from global data structure
                     todo!()
                 }
-                Ok(res.into())
+                Ok(smc_handled.result.into())
             }
             _ => {
                 handle_optee_msg_arg(&msg_arg)?;
-                Ok(res.into())
+                Ok(smc_handled.result.into())
             }
         }
     } else {
-        Ok(res.into())
+        Ok(smc_handled.result.into())
     }
 }
 
