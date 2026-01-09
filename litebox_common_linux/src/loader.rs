@@ -236,7 +236,7 @@ impl ElfParsedFile {
         let tramp_offset = shdr.sh_offset;
         let tramp_size = shdr.sh_entsize;
         // TODO: check section name instead of magic number
-        if magic_number != REWRITER_MAGIC_NUMBER.into() {
+        if magic_number != REWRITER_MAGIC_NUMBER.into() || shdr.sh_size != 0 {
             // Not a trampoline section.
             return Ok(());
         }
