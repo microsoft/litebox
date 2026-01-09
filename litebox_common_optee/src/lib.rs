@@ -1612,3 +1612,18 @@ impl From<PhysPointerError> for OpteeSmcReturn {
         }
     }
 }
+
+impl From<OpteeSmcReturn> for litebox_common_linux::errno::Errno {
+    fn from(ret: OpteeSmcReturn) -> Self {
+        match ret {
+            OpteeSmcReturn::EBusy | OpteeSmcReturn::EThreadLimit => {
+                litebox_common_linux::errno::Errno::EBUSY
+            }
+            OpteeSmcReturn::EResume => litebox_common_linux::errno::Errno::EAGAIN,
+            OpteeSmcReturn::EBadAddr => litebox_common_linux::errno::Errno::EFAULT,
+            OpteeSmcReturn::ENomem => litebox_common_linux::errno::Errno::ENOMEM,
+            OpteeSmcReturn::ENotAvail => litebox_common_linux::errno::Errno::ENOENT,
+            _ => litebox_common_linux::errno::Errno::EINVAL,
+        }
+    }
+}

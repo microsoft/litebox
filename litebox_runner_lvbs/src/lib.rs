@@ -1,7 +1,7 @@
 #![no_std]
 
 use core::panic::PanicInfo;
-use litebox::mm::linux::PAGE_SIZE;
+use litebox::{mm::linux::PAGE_SIZE, utils::TruncateExt};
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
     debug_serial_println,
@@ -117,8 +117,31 @@ use litebox_shim_optee::msg_handler::{
     prepare_for_return_to_normal_world,
 };
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
+
+/// An entry point function for OP-TEE message handler upcall/callback.
+///
+/// This entry point function is intended to be called from the LVBS platform which is unware of
+/// OP-TEE semantics. Thus, we align this function's signature with other VSM/HVCI functions (i.e.,
+/// up to three u64 arguments and returning Result<i64, Errno>).
 #[expect(dead_code)]
-fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeSmcReturn> {
+fn optee_msg_handler_upcall_entry(
+    smc_args_addr: u64,
+) -> Result<i64, litebox_common_linux::errno::Errno> {
+    let smc_args_addr: usize = smc_args_addr.truncate();
+    match optee_msg_handler(smc_args_addr) {
+        Ok(smc_arg) => {
+            let mut smc_args_ptr =
+                NormalWorldMutPtr::<OpteeSmcArgs, PAGE_SIZE>::with_usize(smc_args_addr)
+                    .map_err(|_| litebox_common_linux::errno::Errno::EINVAL)?;
+            unsafe { smc_args_ptr.write_at_offset(0, smc_arg) }
+                .map_err(|_| litebox_common_linux::errno::Errno::EFAULT)?;
+            Ok(0)
+        }
+        Err(smc_ret) => Err(smc_ret.into()),
+    }
+}
+
+fn optee_msg_handler(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeSmcReturn> {
     let mut smc_args_ptr =
         NormalWorldConstPtr::<OpteeSmcArgs, PAGE_SIZE>::with_usize(smc_args_addr)?;
     let mut smc_args = unsafe { smc_args_ptr.read_at_offset(0) }?;
@@ -164,7 +187,7 @@ fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeS
                     // Need to revisit this to see whether the stack is large enough for our use cases (e.g.,
                     // copy owned data through stack to minimize TOCTTOU threats).
                     let ldelf_arg_out = unsafe { &*(ldelf_arg_address as *const LdelfArg) };
-                    let entry_func = usize::try_from(ldelf_arg_out.entry_func).unwrap();
+                    let entry_func: usize = ldelf_arg_out.entry_func.truncate();
 
                     litebox_shim_optee::set_ta_loaded();
 
@@ -215,7 +238,7 @@ fn optee_msg_handler_upcall(smc_args_addr: usize) -> Result<OpteeSmcArgs, OpteeS
 
                     // Overwrite `msg_arg` back to normal world memory to return value outputs (`ValueOutput` or `VapueInout`).
                     let mut ptr = NormalWorldMutPtr::<OpteeMsgArg, PAGE_SIZE>::with_usize(
-                        usize::try_from(msg_arg_phys_addr).unwrap(),
+                        msg_arg_phys_addr.truncate(),
                     )?;
                     unsafe { ptr.write_at_offset(0, msg_arg) }?;
                 } else {
