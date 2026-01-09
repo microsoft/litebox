@@ -1765,19 +1765,21 @@ mod tests {
     fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
         let task = crate::syscalls::tests::init_platform(tun_device_name);
         let global = task.global.clone();
-        // Start a background thread to perform network interaction
-        // Naive implementation for testing purpose only
-        std::thread::spawn(move || {
-            loop {
-                while global
-                    .net
-                    .lock()
-                    .perform_platform_interaction()
-                    .call_again_immediately()
-                {}
-                core::hint::spin_loop();
-            }
-        });
+        if tun_device_name.is_some() {
+            // Start a background thread to perform network interaction
+            // Naive implementation for testing purpose only
+            std::thread::spawn(move || {
+                loop {
+                    while global
+                        .net
+                        .lock()
+                        .perform_platform_interaction()
+                        .call_again_immediately()
+                    {}
+                    core::hint::spin_loop();
+                }
+            });
+        }
         task
     }
 
