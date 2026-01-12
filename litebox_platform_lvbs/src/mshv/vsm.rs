@@ -43,7 +43,7 @@ use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};
 use core::{
     mem,
     ops::Range,
-    sync::atomic::{AtomicBool, AtomicI64, Ordering},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 use hashbrown::HashMap;
 use litebox_common_linux::errno::Errno;
@@ -62,6 +62,29 @@ struct AlignedPage([u8; PAGE_SIZE]);
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
 
 static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
+static RINGBUFFER_PHYS_ADDR: AtomicU64 = AtomicU64::new(0);
+static RINGBUFFER_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// Get the physical address of the allocated ring buffer
+pub fn get_ringbuffer_phys_addr() -> Option<PhysAddr> {
+    let addr = RINGBUFFER_PHYS_ADDR.load(Ordering::SeqCst);
+    if addr == 0 {
+        None
+    } else {
+        Some(PhysAddr::new(addr))
+    }
+}
+
+/// Get the size of the allocated ring buffer
+pub fn get_ringbuffer_size() -> Option<usize> {
+    let size = RINGBUFFER_SIZE.load(Ordering::SeqCst);
+    if size == 0 { None } else { Some(size) }
+}
+
+/// Check if ring buffer has been allocated
+pub fn is_ringbuffer_allocated() -> bool {
+    RINGBUFFER_PHYS_ADDR.load(Ordering::SeqCst) != 0
+}
 
 pub(crate) fn init() {
     assert!(
@@ -945,6 +968,21 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), Errno> {
     Ok(())
 }
 
+fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i64, Errno> {
+    // Store the physical address and size globally
+    RINGBUFFER_PHYS_ADDR.store(phys_addr, Ordering::SeqCst);
+    RINGBUFFER_SIZE.store(size, Ordering::SeqCst);
+    protect_physical_memory_range(
+        PhysFrame::range(
+            PhysFrame::containing_address(PhysAddr::new(phys_addr)),
+            PhysFrame::containing_address(PhysAddr::new(phys_addr + (size as u64) - 1)),
+        ),
+        MemAttr::MEM_ATTR_READ, // Read-only
+    )?;
+    serial_println!("VSM: Ring buffer allocated");
+    Ok(0)
+}
+
 /// VSM function dispatcher
 pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
     let result = match func_id {
@@ -964,6 +1002,9 @@ pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
         VsmFunction::CopySecondaryKey => mshv_vsm_copy_secondary_key(params[0], params[1]),
         VsmFunction::KexecValidate => mshv_vsm_kexec_validate(params[0], params[1], params[2]),
         VsmFunction::PatchText => mshv_vsm_patch_text(params[0], params[1]),
+        VsmFunction::AllocateRingbufferMemory => {
+            mshv_vsm_allocate_ringbuffer_memory(params[0], params[1].try_into().unwrap())
+        }
         _ => {
             serial_println!("VSM: Unknown function ID {:?}", func_id);
             Err(Errno::EINVAL)
