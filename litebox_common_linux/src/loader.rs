@@ -74,6 +74,10 @@ struct TrampolineInfo {
 const REWRITER_MAGIC_NUMBER: u32 = u32::from_le_bytes(*b"LTBX");
 const REWRITER_VERSION_NUMBER: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
+/// The expected section name for the trampoline section.
+/// This must match `TRAMPOLINE_SECTION_NAME` in `litebox_syscall_rewriter`.
+const TRAMPOLINE_SECTION_NAME: &[u8] = b".trampolineLB0";
+
 const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
     elf::file::Class::ELF64
 } else {
@@ -216,6 +220,7 @@ impl ElfParsedFile {
             return Ok(());
         }
 
+        // Read the last section header (where our trampoline section should be).
         let offset = self
             .header
             .e_shoff
@@ -235,11 +240,54 @@ impl ElfParsedFile {
         let magic_number = shdr.sh_addr;
         let tramp_offset = shdr.sh_offset;
         let tramp_size = shdr.sh_entsize;
-        // TODO: check section name instead of magic number
+        // Quick check using the magic number stored in sh_addr.
+        // This avoids reading the string table for non-trampoline sections.
         if magic_number != REWRITER_MAGIC_NUMBER.into() || shdr.sh_size != 0 {
             // Not a trampoline section.
             return Ok(());
         }
+
+        // Read the section header string table header to get its offset.
+        let shstrtab_index = self.header.e_shstrndx;
+        if shstrtab_index == 0 || shstrtab_index >= self.header.e_shnum {
+            // No section header string table.
+            return Ok(());
+        }
+        let shstrtab_offset = self
+            .header
+            .e_shoff
+            .checked_add(u64::from(self.header.e_shentsize) * u64::from(shstrtab_index))
+            .ok_or(ElfParseError::BadFormat)?;
+        let mut shstrtab_hdr_buf = [0u8; size_of::<elf::section::Elf64_Shdr>()];
+        file.read_at(shstrtab_offset, &mut shstrtab_hdr_buf)
+            .map_err(ElfParseError::Io)?;
+        let shstrtab_hdr = elf::section::SectionHeader::parse_at(
+            self.header.endianness,
+            self.header.class,
+            &mut 0,
+            &shstrtab_hdr_buf,
+        )?;
+
+        // Verify the section name from the string table.
+        let name_offset = shstrtab_hdr
+            .sh_offset
+            .checked_add(u64::from(shdr.sh_name))
+            .ok_or(ElfParseError::BadFormat)?;
+        let mut name_buf = [0u8; 32]; // Enough for ".trampolineLB0" and similar names
+        file.read_at(name_offset, &mut name_buf)
+            .map_err(ElfParseError::Io)?;
+        let name_end = name_buf
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(name_buf.len());
+        let section_name = &name_buf[..name_end];
+
+        // Verify this is our trampoline section by checking the section name.
+        if section_name != TRAMPOLINE_SECTION_NAME {
+            // Not a trampoline section.
+            return Ok(());
+        }
+
         let size: usize = tramp_size
             .try_into()
             .map_err(|_| ElfParseError::BadTrampoline)?;
