@@ -35,7 +35,7 @@ const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 /// Maximum size of rx/tx buffers for sockets
-pub const SOCKET_BUFFER_SIZE: usize = 65536;
+pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
 
 /// Limits maximum number of packets in a buffer
 const MAX_PACKET_COUNT: usize = 32;
@@ -260,7 +260,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PollableSocketHandle<'_
         };
 
         if new_events_only {
-            if recv_queue_now > recv_queue_last && receivable_now {
+            // if recv_queue_now > recv_queue_last && receivable_now {
+            if recv_queue_now > recv_queue_last {
                 self.socket_handle
                     .recv_queue
                     .store(recv_queue_now, Ordering::Relaxed);
@@ -556,6 +557,33 @@ impl PlatformInteractionReinvocationAdvice {
     }
 }
 
+pub enum PollIngressSingleResult {
+    /// No packet was processed. You don't need to call [`Interface::poll_ingress_single`]
+    /// again, until more packets arrive.
+    ///
+    /// Socket state is guaranteed to not have changed.
+    None,
+    /// A packet was processed.
+    ///
+    /// There may be more packets in the device's RX queue, so you should call [`Interface::poll_ingress_single`] again.
+    ///
+    /// Socket state is guaranteed to not have changed.
+    PacketProcessed,
+    /// A packet was processed, which might have caused socket state to change.
+    ///
+    /// There may be more packets in the device's RX queue, so you should call [`Interface::poll_ingress_single`] again.
+    ///
+    /// You should check the state of sockets again for received data or completion of operations.
+    SocketStateChanged,
+}
+
+pub enum PollResult {
+    /// Socket state is guaranteed to not have changed.
+    None,
+    /// You should check the state of sockets again for received data or completion of operations.
+    SocketStateChanged,
+}
+
 impl<Platform> Network<Platform>
 where
     Platform:
@@ -603,7 +631,7 @@ where
     /// Return a _soft timeout_ (duration to wait) before calling [`Self::perform_platform_interaction`] again.
     ///
     /// Returns `None` if there is no pending timeout (i.e., no scheduled work requiring network operations).
-    fn poll_at(&mut self) -> Option<core::time::Duration> {
+    pub fn poll_at(&mut self) -> Option<core::time::Duration> {
         let timestamp = self.now();
         self.interface
             .poll_at(timestamp, &self.socket_set)
@@ -617,28 +645,103 @@ where
             })
     }
 
+    pub fn perform_platform_interaction_ingress(&mut self, timestamp: smoltcp::time::Instant) -> PollIngressSingleResult {
+        match self.interface.poll_ingress_single(timestamp, &mut self.device, &mut self.socket_set) {
+            smoltcp::iface::PollIngressSingleResult::None => {
+                PollIngressSingleResult::None
+            }
+            smoltcp::iface::PollIngressSingleResult::PacketProcessed => {
+                PollIngressSingleResult::PacketProcessed
+            }
+            smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                PollIngressSingleResult::SocketStateChanged
+            }
+        }
+    }
+
+    pub fn perform_platform_interaction_egress(&mut self, timestamp: smoltcp::time::Instant) -> PollResult {
+        match self.interface.poll_egress(timestamp, &mut self.device, &mut self.socket_set) {
+            smoltcp::iface::PollResult::None => {
+                PollResult::None
+            }
+            smoltcp::iface::PollResult::SocketStateChanged => {
+                PollResult::SocketStateChanged
+            }
+        }
+    }
+
     /// (Internal-only API) Actually perform the queued interactions with the outside world.
-    fn internal_perform_platform_interaction(&mut self) -> PlatformInteractionReinvocationAdvice {
+    pub fn internal_perform_platform_interaction(&mut self) -> PlatformInteractionReinvocationAdvice {
         self.attempt_to_close_queued();
 
+        let timestamp = self.now();
+        let mut socket_state_changed = false;
+        loop {
+            match self.interface.poll_ingress_single(
+                timestamp,
+                &mut self.device,
+                &mut self.socket_set,
+            ) {
+                smoltcp::iface::PollIngressSingleResult::None => {
+                    break;
+                }
+                smoltcp::iface::PollIngressSingleResult::PacketProcessed => {
+                    // PlatformInteractionReinvocationAdvice::CallAgainImmediately
+                }
+                smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                    socket_state_changed = true;
+                    // self.check_and_update_events();
+                    // PlatformInteractionReinvocationAdvice::CallAgainImmediately
+                }
+            }
+        };
+        if socket_state_changed {
+            self.check_and_update_events();
+        }
+
+        match self
+            .interface
+            .poll_egress(timestamp, &mut self.device, &mut self.socket_set)
+        {
+            smoltcp::iface::PollResult::None => {}
+            smoltcp::iface::PollResult::SocketStateChanged => {
+                // socket_state_changed = true;
+                self.check_and_update_events();
+                return PlatformInteractionReinvocationAdvice::CallAgainImmediately;
+            }
+        }
+
+        PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(None)
+
+        // let timestamp = self.now();
+        // match self
+        //     .interface
+        //     .poll(timestamp, &mut self.device, &mut self.socket_set)
+        // {
+        //     smoltcp::iface::PollResult::None => {
+        //         PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(None)
+        //     }
+        //     smoltcp::iface::PollResult::SocketStateChanged => {
+        //         self.check_and_update_events();
+        //         PlatformInteractionReinvocationAdvice::CallAgainImmediately
+        //     }
+        // }
+    }
+
+    /// (Internal-only API) Perform the queued interactions.
+    fn automated_platform_interaction(&mut self, _direction: PollDirection) {
+        // self.internal_perform_platform_interaction();
         let timestamp = self.now();
         match self
             .interface
             .poll(timestamp, &mut self.device, &mut self.socket_set)
         {
             smoltcp::iface::PollResult::None => {
-                PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(None)
             }
             smoltcp::iface::PollResult::SocketStateChanged => {
-                self.check_and_update_events();
-                PlatformInteractionReinvocationAdvice::CallAgainImmediately
+                // self.check_and_update_events();
             }
         }
-    }
-
-    /// (Internal-only API) Perform the queued interactions.
-    fn automated_platform_interaction(&mut self, _direction: PollDirection) {
-        self.internal_perform_platform_interaction();
     }
 
     /// (Internal-only API) Socket states could have changed, update events
@@ -721,7 +824,7 @@ where
 {
     /// Explicitly private-only function that returns the current (smoltcp) Instant, relative to the
     /// initialized arbitrary 0-point in time.
-    fn now(&self) -> smoltcp::time::Instant {
+    pub fn now(&self) -> smoltcp::time::Instant {
         smoltcp::time::Instant::from_micros(
             // This conversion from u128 to i64 should practically never fail, since 2^63
             // microseconds is roughly 250 years. If a system has been up for that long, then it
@@ -873,7 +976,7 @@ where
 
     /// Attempt to close as many queued-to-close FDs as possible. Returns `true` iff any of them
     /// were closed.
-    fn attempt_to_close_queued(&mut self) -> bool {
+    pub fn attempt_to_close_queued(&mut self) -> bool {
         if self.queued_for_closure.is_empty() {
             // fast path
             return false;

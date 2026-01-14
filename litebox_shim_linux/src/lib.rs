@@ -268,7 +268,53 @@ impl LinuxShim {
     pub fn perform_network_interaction(
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
-        self.0.net.lock().perform_platform_interaction()
+        use crate::alloc::string::ToString as _;
+        use litebox::platform::Instant as _;
+        let start_timestamp = self.0.platform.now();
+        // let advice = self.0.net.lock().perform_platform_interaction();
+        self.0.net.lock().attempt_to_close_queued();
+        let timestamp = self.0.net.lock().now();
+        let mut socket_state_changed = false;
+        loop {
+            match self.0.net.lock().perform_platform_interaction_ingress(
+                timestamp,
+            ) {
+                litebox::net::PollIngressSingleResult::None => {
+                    break;
+                }
+                litebox::net::PollIngressSingleResult::PacketProcessed => {
+                    continue;
+                }
+                litebox::net::PollIngressSingleResult::SocketStateChanged => {
+                    socket_state_changed = true;
+                }
+            }
+            // self.0.net.lock().check_and_update_events();
+        }
+        if socket_state_changed {
+            self.0.net.lock().check_and_update_events();
+        }
+
+        let mut socket_state_changed = false;
+        match self.0.net.lock().perform_platform_interaction_egress(timestamp) {
+            litebox::net::PollResult::None => {}
+            litebox::net::PollResult::SocketStateChanged => {
+                socket_state_changed = true;
+            }
+        }
+        let advice = if socket_state_changed {
+            self.0.net.lock().check_and_update_events();
+            litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately
+        } else {
+            let poll_at = self.0.net.lock().poll_at();
+            litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(poll_at)
+        };
+
+        // let end_timestamp = self.0.platform.now();
+        // let dur = end_timestamp.duration_since(&start_timestamp);
+        // let log = format_args!("[{:?}]: PlatformInteractionReinvocationAdvice => {:?}\n", start_timestamp, dur).to_string();
+        // litebox::log_println!(self.0.platform, &log);
+        advice
     }
 }
 
@@ -592,7 +638,14 @@ impl Task {
         let request =
             SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
-        match request {
+        use crate::alloc::string::ToString as _;
+        let start_timestamp = litebox_platform_multiplex::platform().now();
+        let req = format_args!("[{:?}]: {:?}", start_timestamp, request).to_string();
+
+        // let req = format_args!("[{:?}]: {:?}", timestamp, request).to_string();
+        // litebox::log_println!(litebox_platform_multiplex::platform(), "{:?}", req);
+
+        let ret = match request {
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
                 Ok(0)
@@ -610,7 +663,10 @@ impl Task {
                 // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
                 // requested indicates EOF.
                 if count <= MAX_KERNEL_BUF_SIZE {
-                    let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
+                    // let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
+                    let mut kernel_buf = unsafe {
+                        &mut *core::ptr::slice_from_raw_parts_mut(buf.as_usize() as *mut u8, count)
+                    };
                     self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
                         buf.copy_from_slice(0, &kernel_buf[..size])
                             .map(|()| size)
@@ -1103,7 +1159,15 @@ impl Task {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)
             }
-        }
+        };
+
+        // use litebox::platform::Instant as _;
+        // let end_timestamp = litebox_platform_multiplex::platform().now();
+        // let dur = end_timestamp.duration_since(&start_timestamp);
+        // let log = format_args!("{:?} => {:?}\n", req, dur).to_string();
+        // litebox::log_println!(litebox_platform_multiplex::platform(), &log);
+
+        ret
     }
 }
 
