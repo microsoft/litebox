@@ -805,6 +805,41 @@ impl Descriptor {
             ),
         }
     }
+    fn set_file_descriptor_flags(
+        &self,
+        global: &GlobalState,
+        files: &FilesState,
+        flags: FileDescriptorFlags,
+    ) -> Result<(), Errno> {
+        fn set_flags<S: FdEnabledSubsystem>(
+            global: &GlobalState,
+            fd: &TypedFd<S>,
+            flags: FileDescriptorFlags,
+        ) {
+            let _old = global
+                .litebox
+                .descriptor_table_mut()
+                .set_fd_metadata(fd, flags);
+        }
+
+        match self {
+            Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
+                *raw_fd,
+                |fd| set_flags(global, fd, flags),
+                |fd| set_flags(global, fd, flags),
+                |fd| set_flags(global, fd, flags),
+            )?,
+            Descriptor::Eventfd { close_on_exec, .. }
+            | Descriptor::Epoll { close_on_exec, .. }
+            | Descriptor::Unix { close_on_exec, .. } => {
+                close_on_exec.store(
+                    flags.contains(FileDescriptorFlags::FD_CLOEXEC),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Task {
@@ -897,43 +932,11 @@ impl Task {
                 .ok_or(Errno::EBADF)?
                 .get_file_descriptor_flags(&self.global, &files)?
                 .bits()),
-            FcntlArg::SETFD(flags) => {
-                match locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)? {
-                    Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
-                        *raw_fd,
-                        |fd| {
-                            let _old = self
-                                .global
-                                .litebox
-                                .descriptor_table_mut()
-                                .set_fd_metadata(fd, flags);
-                        },
-                        |fd| {
-                            let _old = self
-                                .global
-                                .litebox
-                                .descriptor_table_mut()
-                                .set_fd_metadata(fd, flags);
-                        },
-                        |fd| {
-                            let _old = self
-                                .global
-                                .litebox
-                                .descriptor_table_mut()
-                                .set_fd_metadata(fd, flags);
-                        },
-                    )?,
-                    Descriptor::Eventfd { close_on_exec, .. }
-                    | Descriptor::Epoll { close_on_exec, .. }
-                    | Descriptor::Unix { close_on_exec, .. } => {
-                        close_on_exec.store(
-                            flags.contains(FileDescriptorFlags::FD_CLOEXEC),
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
-                }
-                Ok(0)
-            }
+            FcntlArg::SETFD(flags) => locked_file_descriptors
+                .get_fd(fd)
+                .ok_or(Errno::EBADF)?
+                .set_file_descriptor_flags(&self.global, &files, flags)
+                .map(|()| 0),
             FcntlArg::GETFL => match desc {
                 Descriptor::LiteBoxRawFd(raw_fd) => Ok(files
                     .run_on_raw_fd(
@@ -1107,6 +1110,29 @@ impl Task {
                         |_fd| todo!("pipes"),
                     )
                     .flatten()
+            }
+            FcntlArg::DUPFD { cloexec, min_fd } => {
+                let new_file = self.do_dup(
+                    desc,
+                    if cloexec {
+                        OFlags::CLOEXEC
+                    } else {
+                        OFlags::empty()
+                    },
+                )?;
+                let max_fd = self
+                    .process()
+                    .limits
+                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE);
+                if min_fd as usize >= max_fd {
+                    return Err(Errno::EINVAL);
+                }
+                drop(locked_file_descriptors); // drop before acquiring write lock
+                files
+                    .file_descriptors
+                    .write()
+                    .insert_in_range(new_file, min_fd as usize, max_fd)
+                    .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
             }
             _ => unimplemented!(),
         }
@@ -1776,23 +1802,23 @@ impl Task {
                     Ok(oldfd)
                 };
             }
-            if newfd as usize
-                > self
-                    .process()
-                    .limits
-                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
-            {
-                return Err(Errno::EBADF);
-            }
-
-            if let Some(old_file) = files
+            match files
                 .file_descriptors
                 .write()
-                .insert_at(new_file, newfd as usize)
+                .insert_at(self, new_file, newfd as usize)
             {
-                self.do_close(old_file)?;
+                Ok(old_file) => {
+                    // replace an existing file descriptor
+                    if let Some(old_file) = old_file {
+                        self.do_close(old_file)?;
+                    }
+                    Ok(newfd)
+                }
+                Err(new_file) => {
+                    // failed to insert due to file limit
+                    Err(self.do_close(new_file).err().unwrap_or(Errno::EMFILE))
+                }
             }
-            Ok(newfd)
         } else {
             // dup
             files
