@@ -8,7 +8,7 @@
 #include <stdint.h>
 
 #define TARGET_SECTION_NAME ".trampolineLB0"
-#define HEADER_MAGIC ((uint64_t)0x584f42204554494c) // "LITE BOX"
+#define HEADER_MAGIC ((uint32_t)0x5842544c) // "LTBX"
 #define TRAMP_MAGIC ((uint64_t)0x30584f424554494c)  // "LITEBOX0"
 
 #if !defined(__x86_64__)
@@ -289,16 +289,15 @@ unsigned int la_objopen(struct link_map *map,
       continue;
 
     syscall_print("[audit] found section\n", 22);
-    if (shdrs[i].sh_size < 24)
-      break;
-    const uint8_t *sec = (uint8_t *)map_base + shdrs[i].sh_offset;
-    if (read_u64(sec) != HEADER_MAGIC) {
+    // Note sh_addr, sh_offset, and sh_entsize are repurposed to store our trampoline info.
+    // See litebox_syscall_rewriter for details.
+    if (shdrs[i].sh_addr != HEADER_MAGIC) {
       syscall_print("[audit] invalid header magic\n", 29);
       break;
     }
 
-    uint64_t tramp_addr = map->l_addr + read_u64(sec + 8);
-    uint64_t tramp_size_raw = read_u64(sec + 16);
+    uint64_t tramp_addr = map->l_addr + shdrs[i].sh_offset;
+    uint64_t tramp_size_raw = shdrs[i].sh_entsize;
     uint64_t tramp_off = file_size - tramp_size_raw;
     uint64_t tramp_size = align_up(tramp_size_raw, 0x1000);
 
