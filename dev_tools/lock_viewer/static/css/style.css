@@ -123,21 +123,187 @@ body {
     gap: 0.5rem;
 }
 
-.lock-filter {
+/* Lock Table Container */
+.lock-table-container {
+    background: #16213e;
+    padding: 1rem 2rem;
+    border-bottom: 1px solid #0f3460;
+}
+
+.lock-table-header {
     display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    max-height: 200px;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+
+.lock-table-header h3 {
+    font-size: 1rem;
+    color: #e94560;
+    margin: 0;
+}
+
+.lock-filter {
+    max-height: 300px;
     overflow-y: auto;
-    padding: 0.5rem;
+    padding: 0;
     background: #0f3460;
     border-radius: 4px;
+}
+
+/* Lock Table */
+.lock-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    table-layout: fixed;
+}
+
+.lock-table th {
+    background: #16213e;
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    font-weight: 600;
+    color: #888;
+    text-transform: uppercase;
+    font-size: 0.7rem;
+    border-bottom: 1px solid #0f3460;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+
+.lock-table th:nth-child(1) {
+    width: 30px;
+}
+
+/* Checkbox */
+.lock-table th:nth-child(2) {
+    width: 120px;
+}
+
+/* Lock */
+.lock-table th:nth-child(3) {
+    width: 90px;
+}
+
+/* Total Wait */
+.lock-table th:nth-child(4) {
+    width: 70px;
+}
+
+/* Attempts */
+.lock-table th:nth-child(5) {
+    width: 90px;
+}
+
+/* Max Wait */
+.lock-table th:nth-child(6) {
+    width: auto;
+}
+
+/* Source File - expands */
+
+.lock-table th.sortable {
+    cursor: pointer;
+    user-select: none;
+}
+
+.lock-table th.sortable:hover {
+    color: #e94560;
+}
+
+.lock-table td {
+    padding: 0.4rem 0.75rem;
+    border-bottom: 1px solid #1a1a2e;
+}
+
+.lock-table-checkbox {
+    width: 30px;
+    text-align: center;
+}
+
+.lock-row {
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.lock-row:hover {
+    background: #1a4a7a;
+}
+
+.lock-row.selected {
+    background: rgba(233, 69, 96, 0.2);
+}
+
+.lock-row.selected:hover {
+    background: rgba(233, 69, 96, 0.3);
+}
+
+.lock-addr {
+    font-family: monospace;
+    color: #e94560;
+}
+
+.lock-stat {
+    font-family: monospace;
+    color: #eee;
+    text-align: right;
+}
+
+.lock-file {
+    color: #888;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 /* Timeline */
 .timeline-container {
     padding: 2rem;
     overflow-x: auto;
+}
+
+.timeline-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+    padding: 0.75rem 1rem;
+    background: #16213e;
+    border-radius: 4px;
+}
+
+.zoom-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.zoom-level {
+    min-width: 50px;
+    text-align: center;
+    font-size: 0.85rem;
+    color: #e94560;
+    font-weight: 600;
+}
+
+.timeline-time-range {
+    font-size: 0.85rem;
+    color: #888;
+    display: flex;
+    gap: 0.5rem;
+}
+
+.timeline-scroll-container {
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-left: 230px;
+}
+
+.timeline-tracks {
+    position: relative;
+    min-width: 100%;
 }
 
 .timeline {
@@ -165,6 +331,7 @@ body {
     position: absolute;
     left: -220px;
     width: 210px;
+    height: 30px;
     text-align: right;
     font-size: 0.75rem;
     color: #888;
@@ -172,11 +339,6 @@ body {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-}
-
-.timeline-tracks {
-    margin-left: 230px;
-    position: relative;
 }
 
 /* Event Markers */
@@ -357,29 +519,4 @@ body {
     font-size: 0.65rem;
     margin-left: 0.5rem;
     vertical-align: middle;
-}
-
-/* Lock tag improvements */
-.lock-tag {
-    background: #1a1a2e;
-    padding: 0.3rem 0.6rem;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    cursor: pointer;
-    border: 1px solid #0f3460;
-    transition: all 0.2s;
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.lock-tag:hover {
-    background: #1a4a7a;
-    border-color: #1a4a7a;
-}
-
-.lock-tag.selected {
-    background: #e94560;
-    border-color: #e94560;
 }

@@ -17,17 +17,6 @@
     <div class="summary-panel" id="summary-panel"></div>
 
     <div class="controls">
-        <div class="control-group lock-control-group">
-            <div class="control-header">
-                <label>Lock Filter (click to toggle)</label>
-                <div class="lock-buttons">
-                    <button class="btn btn-small" onclick="selectAllLocks()">Select All</button>
-                    <button class="btn btn-small btn-secondary" onclick="selectNoLocks()">Select None</button>
-                </div>
-            </div>
-            <div class="lock-filter" id="lock-filter"></div>
-        </div>
-
         <div class="control-group">
             <label>Event Type</label>
             <select id="event-type-filter">
@@ -49,6 +38,17 @@
 
         <button class="btn btn-secondary" onclick="resetFilters()">Reset Filters</button>
         <button class="btn" onclick="loadData()">Reload Data</button>
+    </div>
+
+    <div class="lock-table-container">
+        <div class="lock-table-header">
+            <h3>🔐 Lock Selection</h3>
+            <div class="lock-buttons">
+                <button class="btn btn-small" onclick="selectAllLocks()">Select All</button>
+                <button class="btn btn-small btn-secondary" onclick="selectNoLocks()">Select None</button>
+            </div>
+        </div>
+        <div class="lock-filter" id="lock-filter"></div>
     </div>
 
     <div class="timeline-container">
