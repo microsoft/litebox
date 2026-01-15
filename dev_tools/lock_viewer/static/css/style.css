@@ -202,7 +202,12 @@ body {
     width: auto;
 }
 
-/* Source File - expands */
+/* Created At - shares space with First Use */
+.lock-table th:nth-child(7) {
+    width: auto;
+}
+
+/* First Use - shares space with Created At */
 
 .lock-table th.sortable {
     cursor: pointer;
@@ -369,6 +374,16 @@ body {
     width: 2px;
 }
 
+.event-marker.created {
+    background: #17a2b8;
+    width: 4px;
+}
+
+.event-marker.destroyed {
+    background: #6c757d;
+    width: 4px;
+}
+
 /* Tooltip */
 .tooltip {
     position: fixed;
@@ -430,6 +445,14 @@ body {
 
 .legend-color.released {
     background: #dc3545;
+}
+
+.legend-color.created {
+    background: #17a2b8;
+}
+
+.legend-color.destroyed {
+    background: #6c757d;
 }
 
 /* No Data State */

@@ -166,6 +166,10 @@ impl Locked {
 /// Event types recorded for lock operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockEventType {
+    /// A lock was created.
+    Created,
+    /// A lock was destroyed.
+    Destroyed,
     /// A lock acquisition was attempted (before blocking).
     Attempt,
     /// A lock was successfully acquired.
@@ -177,6 +181,8 @@ pub enum LockEventType {
 impl LockEventType {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Created => "created",
+            Self::Destroyed => "destroyed",
             Self::Attempt => "attempt",
             Self::Acquired => "acquired",
             Self::Released => "released",
@@ -322,6 +328,57 @@ pub fn stop_recording() {
 /// This clears the internal buffer after returning.
 pub fn flush_to_jsonl() -> alloc::vec::Vec<alloc::string::String> {
     EVENT_RECORDER.lock().flush()
+}
+
+/// Record a lock creation event.
+///
+/// This should be called when a lock (Mutex or RwLock) is created.
+/// The event captures the file and line where the lock was instantiated,
+/// which provides a stable identity for the lock.
+pub(crate) fn record_lock_created<T>(
+    lock_type: LockType,
+    lock_addr: *const T,
+    file: &'static str,
+    line: u32,
+) {
+    if CONFIG_ENABLE_RECORDING {
+        // Get timestamp from tracker if available, otherwise use 0
+        let timestamp_ns =
+            LockTracker::global().map_or(0, |t| t.x.lock().platform.now().as_nanos());
+        EVENT_RECORDER.lock().record(RecordedEvent {
+            event_type: LockEventType::Created,
+            timestamp_ns,
+            lock_addr: lock_addr as usize,
+            lock_type,
+            file,
+            line,
+        });
+    }
+}
+
+/// Record a lock destruction event.
+///
+/// This should be called when a lock (Mutex or RwLock) is dropped.
+/// The event captures the file and line where the lock was created.
+pub(crate) fn record_lock_destroyed<T>(
+    lock_type: LockType,
+    lock_addr: *const T,
+    file: &'static str,
+    line: u32,
+) {
+    if CONFIG_ENABLE_RECORDING {
+        // Get timestamp from tracker if available, otherwise use 0
+        let timestamp_ns =
+            LockTracker::global().map_or(0, |t| t.x.lock().platform.now().as_nanos());
+        EVENT_RECORDER.lock().record(RecordedEvent {
+            event_type: LockEventType::Destroyed,
+            timestamp_ns,
+            lock_addr: lock_addr as usize,
+            lock_type,
+            file,
+            line,
+        });
+    }
 }
 
 /// The lock tracker, which manages both tracking and (if necessary) panicking

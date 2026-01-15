@@ -12,7 +12,8 @@ let maxTime = 0;
 let minTimeWithDrops = 0;  // Time threshold accounting for dropped events
 let commonPathPrefix = '';  // Common prefix to strip from file paths
 let lockContention = {};   // Map of lock_addr -> contention duration in ns
-let lockSourceFiles = {};  // Map of lock_addr -> first seen source file
+let lockSourceFiles = {};  // Map of lock_addr -> first seen source file (for lock/unlock operations)
+let lockCreationLocations = {};  // Map of lock_addr -> creation location (from 'created' events)
 let zoomLevel = 1;         // Timeline zoom level (1 = 100%)
 let lockTableSortColumn = 'totalWait';  // Current sort column
 let lockTableSortAsc = false;  // Sort direction (false = descending)
@@ -59,10 +60,19 @@ async function loadData() {
             commonPathPrefix = calculateCommonPrefix();
             console.log('Common path prefix:', commonPathPrefix);  // Debug
 
-            // Build lock source file map
+            // Build lock creation location map from 'created' events
+            lockCreationLocations = {};
+            for (const event of allEvents) {
+                if (event.event_type === 'created') {
+                    lockCreationLocations[event.lock_addr] = { file: event.file, line: event.line };
+                }
+            }
+
+            // Build lock source file map (for lock/unlock operations, as fallback)
             lockSourceFiles = {};
             for (const event of allEvents) {
-                if (!lockSourceFiles[event.lock_addr]) {
+                if (!lockSourceFiles[event.lock_addr] &&
+                    (event.event_type === 'attempt' || event.event_type === 'acquired' || event.event_type === 'released')) {
                     lockSourceFiles[event.lock_addr] = { file: event.file, line: event.line };
                 }
             }
@@ -252,12 +262,15 @@ function updateLockFilter() {
     // Build lock data array for sorting
     const lockData = Array.from(uniqueLocks).map(lock => {
         const cont = lockContention[lock] || { totalWait: 0, attempts: 0, maxWait: 0 };
+        const creation = lockCreationLocations[lock] || null;
         const source = lockSourceFiles[lock] || { file: '', line: 0 };
         return {
             lock,
             totalWait: cont.totalWait,
             attempts: cont.attempts,
             maxWait: cont.maxWait,
+            creationFile: creation ? creation.file : '',
+            creationLine: creation ? creation.line : 0,
             file: source.file,
             line: source.line,
             selected: selectedLocks.has(lock)
@@ -283,6 +296,10 @@ function updateLockFilter() {
             case 'maxWait':
                 valA = a.maxWait;
                 valB = b.maxWait;
+                break;
+            case 'creation':
+                valA = a.creationFile;
+                valB = b.creationFile;
                 break;
             case 'file':
                 valA = a.file;
@@ -317,15 +334,23 @@ function updateLockFilter() {
                     <th class="sortable" onclick="sortLockTable('totalWait')">Total Wait${sortIndicator('totalWait')}</th>
                     <th class="sortable" onclick="sortLockTable('attempts')">Attempts${sortIndicator('attempts')}</th>
                     <th class="sortable" onclick="sortLockTable('maxWait')">Max Wait${sortIndicator('maxWait')}</th>
-                    <th class="sortable" onclick="sortLockTable('file')">Source File${sortIndicator('file')}</th>
+                    <th class="sortable" onclick="sortLockTable('creation')">Created At${sortIndicator('creation')}</th>
+                    <th class="sortable" onclick="sortLockTable('file')">First Use${sortIndicator('file')}</th>
                 </tr>
             </thead>
             <tbody>
     `;
 
     for (const data of lockData) {
+        const strippedCreationFile = data.creationFile ? stripCommonPrefix(data.creationFile) : '';
         const strippedFile = stripCommonPrefix(data.file);
         const selectedClass = data.selected ? 'selected' : '';
+        const creationDisplay = data.creationFile
+            ? `${strippedCreationFile}:${data.creationLine}`
+            : '<span style="color: #666;">—</span>';
+        const creationTitle = data.creationFile
+            ? `${data.creationFile}:${data.creationLine}`
+            : 'No creation event recorded';
         html += `
             <tr class="lock-row ${selectedClass}" onclick="toggleLock('${data.lock}')">
                 <td class="lock-table-checkbox">
@@ -335,6 +360,7 @@ function updateLockFilter() {
                 <td class="lock-stat">${formatDuration(data.totalWait)}</td>
                 <td class="lock-stat">${data.attempts}</td>
                 <td class="lock-stat">${formatDuration(data.maxWait)}</td>
+                <td class="lock-file" title="${creationTitle}">${creationDisplay}</td>
                 <td class="lock-file" title="${data.file}:${data.line}">${strippedFile}:${data.line}</td>
             </tr>
         `;
@@ -488,11 +514,20 @@ function renderTimeline() {
 
     sortedLocks.forEach(lock => {
         const lockEvents = lockGroups[lock];
-        // Get first event to show file:line info (with stripped path)
-        const firstEvent = lockEvents[0];
-        const strippedFile = stripCommonPrefix(firstEvent.file);
-        const label = `${lock} (${strippedFile}:${firstEvent.line})`;
-        const fullLabel = `${lock} (${firstEvent.file}:${firstEvent.line})`;
+
+        // Use creation location as primary identity if available, otherwise use first event
+        const creation = lockCreationLocations[lock];
+        let label, fullLabel;
+        if (creation) {
+            const strippedCreationFile = stripCommonPrefix(creation.file);
+            label = `${lock} (${strippedCreationFile}:${creation.line})`;
+            fullLabel = `Created at: ${creation.file}:${creation.line}`;
+        } else {
+            const firstEvent = lockEvents[0];
+            const strippedFile = stripCommonPrefix(firstEvent.file);
+            label = `${lock} (${strippedFile}:${firstEvent.line})`;
+            fullLabel = `First use at: ${firstEvent.file}:${firstEvent.line}`;
+        }
 
         html += `<div class="timeline-track">`;
         html += `<div class="timeline-track-label" title="${fullLabel}">${label}</div>`;
@@ -519,6 +554,10 @@ function renderTimeline() {
     html += `
         <div class="legend">
             <div class="legend-item">
+                <div class="legend-color created"></div>
+                <span>Created</span>
+            </div>
+            <div class="legend-item">
                 <div class="legend-color attempt"></div>
                 <span>Attempt</span>
             </div>
@@ -529,6 +568,10 @@ function renderTimeline() {
             <div class="legend-item">
                 <div class="legend-color released"></div>
                 <span>Released</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color destroyed"></div>
+                <span>Destroyed</span>
             </div>
         </div>
     `;
@@ -576,6 +619,7 @@ function showTooltip(mouseEvent, eventIdx) {
     const tooltip = document.getElementById('tooltip');
     const strippedFile = stripCommonPrefix(event.file);
     const cont = lockContention[event.lock_addr];
+    const creation = lockCreationLocations[event.lock_addr];
 
     let contentionInfo = '';
     if (cont && cont.totalWait > 0) {
@@ -585,11 +629,20 @@ function showTooltip(mouseEvent, eventIdx) {
         `;
     }
 
+    let creationInfo = '';
+    if (creation) {
+        const strippedCreationFile = stripCommonPrefix(creation.file);
+        creationInfo = `
+            <div class="tooltip-row"><span class="tooltip-label">Created At:</span>${strippedCreationFile}:${creation.line}</div>
+        `;
+    }
+
     tooltip.innerHTML = `
         <div class="tooltip-row"><span class="tooltip-label">Event:</span>${event.event_type}</div>
         <div class="tooltip-row"><span class="tooltip-label">Time:</span>${formatTime(event.timestamp_ns)}</div>
         <div class="tooltip-row"><span class="tooltip-label">Lock:</span>${event.lock_addr}</div>
         <div class="tooltip-row"><span class="tooltip-label">Type:</span>${event.lock_type}</div>
+        ${creationInfo}
         <div class="tooltip-row"><span class="tooltip-label">Location:</span>${strippedFile}:${event.line}</div>
         ${contentionInfo}
     `;
