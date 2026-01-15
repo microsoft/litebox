@@ -498,7 +498,9 @@ function renderTimeline() {
         html += `<div class="timeline-track-label" title="${fullLabel}">${label}</div>`;
 
         lockEvents.forEach((event, idx) => {
-            const position = ((event.timestamp_ns - visibleMinTime) / timeRange) * 100;
+            // Cap position to leave room for marker width (max ~99.5% to prevent overflow)
+            const rawPosition = ((event.timestamp_ns - visibleMinTime) / timeRange) * 100;
+            const position = Math.min(rawPosition, 99.5);
             html += `
                 <div class="event-marker ${event.event_type}"
                      style="left: ${position}%"
