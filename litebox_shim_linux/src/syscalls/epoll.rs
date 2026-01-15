@@ -695,9 +695,11 @@ mod test {
 
         let no_fds = FilesState::new();
         let fds = FilesState::new();
-        fds.file_descriptors
-            .write()
-            .insert_at(descriptor, fd.reinterpret_as_unsigned() as usize);
+        let _ = fds.file_descriptors.write().insert_at(
+            &task,
+            descriptor,
+            fd.reinterpret_as_unsigned() as usize,
+        );
         set.add_fd(fd, Events::IN);
 
         let revents = |set: &super::PollSet| {

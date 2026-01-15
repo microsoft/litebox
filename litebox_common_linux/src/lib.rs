@@ -470,6 +470,8 @@ pub enum FcntlArg<Platform: litebox::platform::RawPointerProvider> {
     SETLK(Platform::RawConstPointer<Flock>),
     /// Set a file lock and wait if blocked
     SETLKW(Platform::RawConstPointer<Flock>),
+    /// Duplicate file descriptor
+    DUPFD { cloexec: bool, min_fd: u32 },
 }
 
 #[repr(i16)]
@@ -498,6 +500,8 @@ pub struct Flock {
     pub pid: i32,
 }
 
+const F_DUPFD: i32 = 0;
+const F_DUPFD_CLOEXEC: i32 = 1030;
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
@@ -526,6 +530,14 @@ impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
             F_GETLK => Self::GETLK(Platform::RawMutPointer::from_usize(arg)),
             F_SETLK => Self::SETLK(Platform::RawConstPointer::from_usize(arg)),
             F_SETLKW => Self::SETLKW(Platform::RawConstPointer::from_usize(arg)),
+            F_DUPFD => Self::DUPFD {
+                cloexec: false,
+                min_fd: arg.truncate(),
+            },
+            F_DUPFD_CLOEXEC => Self::DUPFD {
+                cloexec: true,
+                min_fd: arg.truncate(),
+            },
             _ => return None,
         })
     }
