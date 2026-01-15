@@ -540,7 +540,7 @@ function renderTimeline() {
  * Zoom in on the timeline.
  */
 function zoomIn() {
-    zoomLevel = zoomLevel * 1.5;  // No max limit
+    zoomLevel = zoomLevel * 2;  // No max limit
     renderTimeline();
 }
 
@@ -548,7 +548,7 @@ function zoomIn() {
  * Zoom out on the timeline.
  */
 function zoomOut() {
-    zoomLevel = Math.max(zoomLevel / 1.5, 1);  // Min 100%
+    zoomLevel = Math.max(zoomLevel / 2, 1);  // Min 100%
     renderTimeline();
 }
 
