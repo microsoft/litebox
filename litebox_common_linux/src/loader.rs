@@ -484,6 +484,28 @@ impl ElfParsedFile {
         info.brk = info.brk.max(trampoline_end);
         Ok(())
     }
+
+    /// Load the secondary LiteBox trampoline into memory whose location is relative to
+    /// the based address which is the difference of `loaded_entry_point` and `e_entry`
+    /// in the ELF header.
+    pub fn load_secondary_trampoline<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        loaded_entry_point: usize,
+    ) -> Result<(), ElfLoadError<M::Error>> {
+        let base_addr = loaded_entry_point
+            .checked_sub(self.header.e_entry.truncate())
+            .ok_or(ElfLoadError::InvalidProgramHeader)?;
+        let mut info = MappingInfo {
+            base_addr,
+            brk: 0,
+            entry_point: 0,
+            phdrs_addr: 0,
+            num_phdrs: 0,
+        };
+        self.load_trampoline(mapper, mem, &mut info)
+    }
 }
 
 /// Trait for reading ELF binary data at specific offsets.

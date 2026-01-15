@@ -517,7 +517,7 @@ pub enum TeeAttributeType {
 
 /// `TEE_UUID` from `optee_os/lib/libutee/include/tee_api_types.h`. It uniquely identifies
 /// TAs, cryptographic keys, and more.
-#[derive(Clone, Copy, PartialEq, Default, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
 #[repr(C)]
 pub struct TeeUuid {
     pub time_low: u32,
@@ -1084,8 +1084,11 @@ pub struct LdelfArg {
 }
 
 impl LdelfArg {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(ta_uuid: TeeUuid) -> Self {
+        Self {
+            uuid: ta_uuid,
+            ..Default::default()
+        }
     }
 }
 

@@ -93,7 +93,7 @@ pub fn init() -> Option<&'static Platform> {
     gdt::init();
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
-    Platform::register_shim(&litebox_shim_optee::OpteeShim);
+    Platform::enable_syscall_support();
 
     ret
 }

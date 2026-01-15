@@ -10,7 +10,6 @@ bitflags = "2.9.0"
 cfg-if = "1.0.0"
 ctr = { version = "0.8", default-features = false }
 elf = { version = "0.8.0", default-features = false }
-elf_loader = { version = "0.12.0", default-features = false }
 hashbrown = "0.15.2"
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }

@@ -316,6 +316,28 @@ pub unsafe fn run_thread(
     run_thread_inner(&shim, ctx);
 }
 
+/// Runs a guest thread using the provided shim reference and the given initial context.
+///
+/// This will run until the thread terminates.
+///
+/// Unlike `run_thread`, `run_thread_with_shim_ref` is expected to be executed multiple
+/// times on the same shim instance. `run_thread` does not support this because the given
+/// shim instance is *moved* to `run_thread`.
+///
+/// CAUTION: This function doesn't work for multi-threaded processes, so it is only for
+/// OP-TEE use cases.
+///
+///
+/// # Safety
+/// The context must be valid guest context.
+#[cfg(feature = "optee_syscall")]
+pub unsafe fn run_thread_with_shim_ref(
+    shim: &impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    run_thread_inner(shim, ctx);
+}
+
 struct ThreadContext<'a> {
     shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &'a mut litebox_common_linux::PtRegs,

@@ -88,18 +88,24 @@ fn setup_gdt_tss() {
 
     let mut tss = Box::new(AlignedTss(TaskStateSegment::new()));
     tss.0.interrupt_stack_table[0] = VirtAddr::new(stack_top);
-
-    let mut gdt = Box::new(GdtWrapper::new());
-
     // `tss_segment()` requires `&'static TaskStateSegment`. Leaking `tss` is fine because
     // it will be used until the LVBS kernel resets.
     let tss = Box::leak(tss);
-    gdt.selectors.tss = gdt.gdt.append(Descriptor::tss_segment(&tss.0));
 
+    // Canonical x86_64 GDT layout
+    // Index 0 -> NULL
+    // Index 1 -> KERNEL_CS (0x08)
+    // Index 2 -> KERNEL_DS (0x10)
+    // Index 3 -> TSS_LOW   (0x18)
+    // Index 4 -> TSS_HIGH  (0x20)
+    // Index 5 -> USER_DS   (0x28|3 = 0x2B)
+    // Index 6 -> USER_CS   (0x30|3 = 0x33)
+    let mut gdt = Box::new(GdtWrapper::new());
     gdt.selectors.kernel_code = gdt.gdt.append(Descriptor::kernel_code_segment());
     gdt.selectors.kernel_data = gdt.gdt.append(Descriptor::kernel_data_segment());
-    gdt.selectors.user_code = gdt.gdt.append(Descriptor::user_code_segment());
+    gdt.selectors.tss = gdt.gdt.append(Descriptor::tss_segment(&tss.0));
     gdt.selectors.user_data = gdt.gdt.append(Descriptor::user_data_segment());
+    gdt.selectors.user_code = gdt.gdt.append(Descriptor::user_code_segment());
 
     // `gdt.load()` requires `&'static self`. Leaking `gdt` is fine because
     // it will be used until the LVBS kernel resets.

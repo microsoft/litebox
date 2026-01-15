@@ -55,15 +55,22 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     todo!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
-extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _error_code: u64) {
-    panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
+extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    panic!(
+        "EXCEPTION: DOUBLE FAULT (Error Code: {:#x})\n{:#?}",
+        error_code, stack_frame
+    );
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
-    _error_code: u64,
+    error_code: u64,
 ) {
-    todo!("EXCEPTION: GENERAL PROTECTION FAULT\n{:#?}", stack_frame);
+    todo!(
+        "EXCEPTION: GENERAL PROTECTION FAULT (Error Code: {:#x})\n{:#?}",
+        error_code,
+        stack_frame
+    );
 }
 
 extern "x86-interrupt" fn page_fault_handler(

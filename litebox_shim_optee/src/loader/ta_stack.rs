@@ -9,7 +9,7 @@ use litebox::{
 };
 use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 
-use crate::{UserMutPtr, litebox_page_manager};
+use crate::UserMutPtr;
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
@@ -279,14 +279,15 @@ impl TaStack {
 /// # Safety
 /// The caller must ensure that `sp` is a valid stack pointer and is not currently used.
 /// Normally, `sp` should be the return value of this function's previous call (with `None`).
-pub(crate) fn allocate_stack(stack_base: Option<usize>) -> Option<TaStack> {
+pub(crate) fn allocate_stack(task: &crate::Task, stack_base: Option<usize>) -> Option<TaStack> {
     let sp = if let Some(stack_base) = stack_base {
         UserMutPtr::from_usize(stack_base)
     } else {
         let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
             .expect("DEFAULT_STACK_SIZE is not page-aligned");
         unsafe {
-            litebox_page_manager()
+            task.global
+                .pm
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .ok()?
         }
