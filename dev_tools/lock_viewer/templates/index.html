@@ -17,8 +17,14 @@
     <div class="summary-panel" id="summary-panel"></div>
 
     <div class="controls">
-        <div class="control-group">
-            <label>Lock Filter (click to toggle)</label>
+        <div class="control-group lock-control-group">
+            <div class="control-header">
+                <label>Lock Filter (click to toggle)</label>
+                <div class="lock-buttons">
+                    <button class="btn btn-small" onclick="selectAllLocks()">Select All</button>
+                    <button class="btn btn-small btn-secondary" onclick="selectNoLocks()">Select None</button>
+                </div>
+            </div>
             <div class="lock-filter" id="lock-filter"></div>
         </div>
 
@@ -33,11 +39,12 @@
         </div>
 
         <div class="control-group">
-            <label>Time Range</label>
+            <label>Time Range <span id="time-range-display" class="time-range-display">0% - 100%</span></label>
             <div class="time-range-slider">
-                <input type="range" id="time-start" min="0" max="100" value="0">
-                <input type="range" id="time-end" min="0" max="100" value="100">
+                <input type="range" id="time-start" min="0" max="100" value="0" step="1">
+                <input type="range" id="time-end" min="0" max="100" value="100" step="1">
             </div>
+            <div class="time-range-hint" id="time-range-hint"></div>
         </div>
 
         <button class="btn btn-secondary" onclick="resetFilters()">Reset Filters</button>

@@ -106,30 +106,32 @@ body {
 }
 
 /* Lock Filter */
+.lock-control-group {
+    flex: 1;
+    min-width: 300px;
+}
+
+.control-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+}
+
+.lock-buttons {
+    display: flex;
+    gap: 0.5rem;
+}
+
 .lock-filter {
     display: flex;
     flex-wrap: wrap;
     gap: 0.5rem;
-    max-width: 400px;
-}
-
-.lock-tag {
+    max-height: 200px;
+    overflow-y: auto;
+    padding: 0.5rem;
     background: #0f3460;
-    padding: 0.3rem 0.6rem;
     border-radius: 4px;
-    font-size: 0.8rem;
-    cursor: pointer;
-    border: 1px solid transparent;
-    transition: all 0.2s;
-}
-
-.lock-tag:hover {
-    background: #1a4a7a;
-}
-
-.lock-tag.selected {
-    background: #e94560;
-    border-color: #e94560;
 }
 
 /* Timeline */
@@ -313,4 +315,71 @@ body {
 
 .btn-secondary:hover {
     background: #1a4a7a;
+}
+
+.btn-small {
+    padding: 0.25rem 0.5rem;
+    font-size: 0.75rem;
+}
+
+/* Time Range Display */
+.time-range-display {
+    font-size: 0.75rem;
+    color: #e94560;
+    margin-left: 0.5rem;
+}
+
+.time-range-hint {
+    font-size: 0.7rem;
+    color: #ffc107;
+    margin-top: 0.25rem;
+}
+
+/* Welcome Message */
+.welcome-message {
+    background: #16213e;
+    border: 2px dashed #0f3460;
+    border-radius: 8px;
+}
+
+.welcome-message .muted {
+    color: #666;
+    font-size: 0.85rem;
+    margin-top: 1rem;
+}
+
+/* Contention Badge */
+.contention-badge {
+    background: #e94560;
+    color: white;
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+    font-size: 0.65rem;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+}
+
+/* Lock tag improvements */
+.lock-tag {
+    background: #1a1a2e;
+    padding: 0.3rem 0.6rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    border: 1px solid #0f3460;
+    transition: all 0.2s;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.lock-tag:hover {
+    background: #1a4a7a;
+    border-color: #1a4a7a;
+}
+
+.lock-tag.selected {
+    background: #e94560;
+    border-color: #e94560;
 }
