@@ -145,8 +145,8 @@ fn run_ta_with_default_commands(
                 .map_err(|_| {
                     panic!("Failed to load TA context");
                 });
-            // TODO: instead of using `run_thread_with_shim_ref`, we can use interrupts to enter the TA. This requires
-            // better interrupt handling in `litebox_shim_optee` and `litebox_platform_lvbs`.
+            // TODO: instead of using `run_thread_with_shim_ref`, we might be able to use interrupts to enter the TA.
+            // This requires better interrupt handling in `litebox_shim_optee` and `litebox_platform_lvbs`.
             unsafe {
                 litebox_platform_linux_userland::run_thread_with_shim_ref(
                     entrypoints,

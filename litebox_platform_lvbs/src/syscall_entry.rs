@@ -42,6 +42,7 @@ use x86_64::{
 // r11: userspace rflags
 // Note. rsp should point to the userspace stack before calling `sysretq`
 
+// TODO: revisit this with PR 566.
 #[allow(dead_code)]
 static SHIM: spin::Once<
     &'static (dyn litebox::shim::EnterShim<ExecutionContext = PtRegs> + Send + Sync),
@@ -231,10 +232,13 @@ const STACK_ALIGNMENT: isize = -16;
 
 /// This function enables 64-bit syscall extensions and sets up the necessary MSRs.
 /// It must be called for each core.
+///
 /// # Panics
+///
 /// Panics if GDT is not initialized for the current core.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn init() {
+    // TODO: Revisit this function with PR 566.
     // enable 64-bit syscall/sysret
     let mut efer = Efer::read();
     efer.insert(EferFlags::SYSTEM_CALL_EXTENSIONS);

@@ -138,7 +138,6 @@ impl GlobalState {
     }
 
     /// Get the TA binary associated with the given TA UUID.
-    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
         if let Some(ta_bin) = self.ta_uuid_map.get(ta_uuid) {
             Some(ta_bin)
@@ -151,9 +150,13 @@ impl GlobalState {
 
     /// Remove the TA binary associated with the given TA UUID.
     ///
-    /// Since multiple clients can use the same TA binary (multiple instances), we remove
-    /// TA binaries if there is a memory pressure.
-    #[allow(dead_code)]
+    /// Since a TA binary can be continuously loaded/used by multiple clients, we cache it
+    /// to avoid repeated RPCs and memory transfers. We remove it lazily if there is
+    /// a memory pressure.
+    ///
+    /// TODO: Use something like `Arc` to to ensure no active ldelf/TA holds a handle to
+    /// this TA binary
+    #[expect(dead_code)]
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
         let _ = self.ta_uuid_map.remove(ta_uuid);
     }
@@ -1097,7 +1100,6 @@ impl TaUuidMap {
     }
 
     // Lazy removal of TA binaries when they are no longer needed.
-    #[allow(dead_code)]
     pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
         self.inner.lock().remove(uuid)
     }
