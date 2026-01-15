@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lock Viewer</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+    <div class="header">
+        <h1>🔒 Lock Viewer</h1>
+        <div class="stats" id="stats">Loading...</div>
+    </div>
+
+    <div class="summary-panel" id="summary-panel"></div>
+
+    <div class="controls">
+        <div class="control-group">
+            <label>Lock Filter (click to toggle)</label>
+            <div class="lock-filter" id="lock-filter"></div>
+        </div>
+
+        <div class="control-group">
+            <label>Event Type</label>
+            <select id="event-type-filter">
+                <option value="all">All Events</option>
+                <option value="attempt">Attempts Only</option>
+                <option value="acquired">Acquired Only</option>
+                <option value="released">Released Only</option>
+            </select>
+        </div>
+
+        <div class="control-group">
+            <label>Time Range</label>
+            <div class="time-range-slider">
+                <input type="range" id="time-start" min="0" max="100" value="0">
+                <input type="range" id="time-end" min="0" max="100" value="100">
+            </div>
+        </div>
+
+        <button class="btn btn-secondary" onclick="resetFilters()">Reset Filters</button>
+        <button class="btn" onclick="loadData()">Reload Data</button>
+    </div>
+
+    <div class="timeline-container">
+        <div id="timeline-content"></div>
+    </div>
+
+    <div class="tooltip" id="tooltip"></div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+
+</html>

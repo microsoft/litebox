@@ -20,6 +20,9 @@ mod rwlock;
 #[cfg(feature = "lock_tracing")]
 pub(crate) mod lock_tracing;
 
+#[cfg(feature = "lock_tracing")]
+pub use lock_tracing::{RecordingSummary, flush_to_jsonl, start_recording, stop_recording};
+
 pub use condvar::Condvar;
 pub use mutex::{Mutex, MutexGuard};
 pub use rwlock::{

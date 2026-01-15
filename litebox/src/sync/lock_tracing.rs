@@ -77,6 +77,16 @@ const CONFIG_PRINT_LOCKS_AND_UNLOCKS: bool = false;
 const CONFIG_PRINT_LOCKS_SLOWER_THAN: Option<core::time::Duration> =
     Some(core::time::Duration::from_millis(10));
 
+/// Enable recording of lock events to JSONL format.
+///
+/// When enabled, lock events (attempts, acquisitions, releases) are recorded
+/// to an internal buffer that can be flushed to JSONL format using
+/// [`flush_to_jsonl`].
+const CONFIG_ENABLE_RECORDING: bool = true;
+
+/// Maximum number of events that can be recorded before the buffer wraps.
+const CONFIG_MAX_RECORDED_EVENTS: usize = 100_000;
+
 /// The kind of lock that has been applied, either for locking or unlocking.
 #[non_exhaustive]
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
@@ -151,6 +161,167 @@ impl Locked {
             ) | (LockType::Mutex, LockType::Mutex)
         )
     }
+}
+
+/// Event types recorded for lock operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockEventType {
+    /// A lock acquisition was attempted (before blocking).
+    Attempt,
+    /// A lock was successfully acquired.
+    Acquired,
+    /// A lock was released.
+    Released,
+}
+
+impl LockEventType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Attempt => "attempt",
+            Self::Acquired => "acquired",
+            Self::Released => "released",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RecordedEvent {
+    event_type: LockEventType,
+    timestamp_ns: u128,
+    lock_addr: usize,
+    lock_type: LockType,
+    file: &'static str,
+    line: u32,
+}
+
+impl RecordedEvent {
+    fn to_jsonl(&self) -> alloc::string::String {
+        use core::fmt::Write;
+        let lock_type_str = match self.lock_type {
+            LockType::RwLockRead => "RwLockRead",
+            LockType::RwLockWrite => "RwLockWrite",
+            LockType::Mutex => "Mutex",
+        };
+        let mut out = alloc::string::String::with_capacity(256);
+        let _ = write!(
+            out,
+            "{{\"event_type\":\"{}\",\"timestamp_ns\":{},\"lock_addr\":\"0x{:x}\",\"lock_type\":\"{}\",\"file\":\"{}\",\"line\":{}}}",
+            self.event_type.as_str(),
+            self.timestamp_ns,
+            self.lock_addr,
+            lock_type_str,
+            self.file,
+            self.line,
+        );
+        out
+    }
+}
+
+/// Summary statistics for the recording session.
+#[derive(Clone, Copy, Default)]
+pub struct RecordingSummary {
+    /// Number of events that were recorded.
+    pub recorded_events: u64,
+    /// Number of events that were dropped due to buffer overflow.
+    pub dropped_events: u64,
+}
+
+impl RecordingSummary {
+    fn to_jsonl(self) -> alloc::string::String {
+        use core::fmt::Write;
+        let mut out = alloc::string::String::with_capacity(128);
+        let _ = write!(
+            out,
+            "{{\"type\":\"summary\",\"recorded_events\":{},\"dropped_events\":{}}}",
+            self.recorded_events, self.dropped_events,
+        );
+        out
+    }
+}
+
+struct EventRecorder {
+    events: alloc::collections::VecDeque<RecordedEvent>,
+    recording: bool,
+    total_recorded: u64,
+    dropped_events: u64,
+}
+
+impl EventRecorder {
+    const fn new() -> Self {
+        Self {
+            events: alloc::collections::VecDeque::new(),
+            recording: false,
+            total_recorded: 0,
+            dropped_events: 0,
+        }
+    }
+
+    fn record(&mut self, event: RecordedEvent) {
+        if self.recording && CONFIG_ENABLE_RECORDING {
+            self.total_recorded += 1;
+            if self.events.len() == CONFIG_MAX_RECORDED_EVENTS {
+                self.events.pop_front();
+                self.dropped_events += 1;
+            }
+            self.events.push_back(event);
+        }
+    }
+
+    fn start(&mut self) {
+        self.recording = true;
+    }
+
+    fn stop(&mut self) {
+        self.recording = false;
+    }
+
+    fn get_summary(&self) -> RecordingSummary {
+        RecordingSummary {
+            recorded_events: self.total_recorded,
+            dropped_events: self.dropped_events,
+        }
+    }
+
+    fn flush(&mut self) -> alloc::vec::Vec<alloc::string::String> {
+        let summary = self.get_summary();
+        let mut result = alloc::vec::Vec::with_capacity(self.events.len() + 1);
+        result.push(summary.to_jsonl());
+        for event in &self.events {
+            result.push(event.to_jsonl());
+        }
+        self.events.clear();
+        self.total_recorded = 0;
+        self.dropped_events = 0;
+        result
+    }
+}
+
+static EVENT_RECORDER: spin::Mutex<EventRecorder> = spin::Mutex::new(EventRecorder::new());
+
+/// Start recording lock events.
+///
+/// Call this before the code section you want to trace. Events will be
+/// accumulated in an internal buffer until [`flush_to_jsonl`] is called.
+pub fn start_recording() {
+    EVENT_RECORDER.lock().start();
+}
+
+/// Stop recording lock events.
+///
+/// Call this after the code section you want to trace. Previously recorded
+/// events are preserved until [`flush_to_jsonl`] is called.
+pub fn stop_recording() {
+    EVENT_RECORDER.lock().stop();
+}
+
+/// Flush all recorded events and return them as JSONL lines.
+///
+/// Each string in the returned vector is a single JSON object on one line,
+/// suitable for writing to a `.jsonl` file.
+///
+/// This clears the internal buffer after returning.
+pub fn flush_to_jsonl() -> alloc::vec::Vec<alloc::string::String> {
+    EVENT_RECORDER.lock().flush()
 }
 
 /// The lock tracker, which manages both tracking and (if necessary) panicking
@@ -384,6 +555,17 @@ impl LockTrackerX {
                 width = tracker.as_ref().unwrap().active(),
             );
         }
+        if CONFIG_ENABLE_RECORDING {
+            let timestamp_ns = tracker.as_ref().map_or(0, |t| t.platform.now().as_nanos());
+            EVENT_RECORDER.lock().record(RecordedEvent {
+                event_type: LockEventType::Attempt,
+                timestamp_ns,
+                lock_addr: locked.lock_addr,
+                lock_type: locked.lock_type,
+                file: locked.location.file,
+                line: locked.location.line,
+            });
+        }
         LockAttemptWitness {
             locked,
             start_time: tracker.as_ref().unwrap().platform.now(),
@@ -445,6 +627,17 @@ impl LockTrackerX {
                 locked = &tracker.held[idx].as_ref().unwrap(),
             );
         }
+        if CONFIG_ENABLE_RECORDING {
+            let held_lock = tracker.held[idx].as_ref().unwrap();
+            EVENT_RECORDER.lock().record(RecordedEvent {
+                event_type: LockEventType::Acquired,
+                timestamp_ns: tracker.platform.now().as_nanos(),
+                lock_addr: held_lock.lock_addr,
+                lock_type: held_lock.lock_type,
+                file: held_lock.location.file,
+                line: held_lock.location.line,
+            });
+        }
         LockedWitness {
             idx,
             unlocked: false,
@@ -484,6 +677,16 @@ impl LockedWitness {
         #[allow(clippy::manual_assert)]
         if self.idx != tracker.held.len() - 1 && CONFIG_PANIC_ON_NON_BRACKETED_UNLOCK {
             panic!("Non-bracketed unlock, tracker={tracker}, unlock={locked}");
+        }
+        if CONFIG_ENABLE_RECORDING {
+            EVENT_RECORDER.lock().record(RecordedEvent {
+                event_type: LockEventType::Released,
+                timestamp_ns: tracker.platform.now().as_nanos(),
+                lock_addr: locked.lock_addr,
+                lock_type: locked.lock_type,
+                file: locked.location.file,
+                line: locked.location.line,
+            });
         }
         // Perform some compaction; prevents us from getting overfull error.
         while let Some(None) = tracker.held.last() {
