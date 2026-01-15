@@ -67,6 +67,9 @@ struct CliArgs {
     /// Technique to summarize across multiple iterations.
     #[arg(long, default_value = "min", requires = "iterations")]
     summarization: Summarization,
+    /// Enable lock tracing feature.
+    #[arg(long)]
+    lock_tracing: bool,
 }
 
 // JB: We are not actually storing `n` or the type of summarization into the csv files, so
@@ -215,6 +218,7 @@ fn run_benchmark(name: &str, func: BenchFn, cli_args: &CliArgs) -> Result<()> {
         cli_args,
         project_root: &std::env::current_dir()?,
         is_init: true,
+        lock_tracing: cli_args.lock_tracing,
     };
     func(ctx.with_init(true))?;
     info!(benchmark = %name, iterations=cli_args.iterations, "Running benchmark");
@@ -383,6 +387,7 @@ struct BenchCtx<'a> {
     cli_args: &'a CliArgs,
     project_root: &'a Path,
     is_init: bool,
+    lock_tracing: bool,
 }
 
 impl BenchCtx<'_> {
@@ -419,6 +424,7 @@ fn rewriter_hello_static(ctx: BenchCtx) -> Result<()> {
         cli_args: _,
         project_root,
         is_init,
+        lock_tracing: _,
     } = ctx;
     if is_init {
         cmd!(sh, "gcc -o hello_static {project_root}/litebox_runner_linux_userland/tests/hello.c -static -m64").run()?;
@@ -435,11 +441,13 @@ fn run_rewritten_hello_static(ctx: BenchCtx<'_>) -> Result<()> {
         cli_args: _,
         project_root,
         is_init,
+        lock_tracing,
     } = ctx;
     if is_init {
         rewriter_hello_static(ctx.with_init(true))?;
         rewriter_hello_static(ctx.with_init(false))?;
-        cmd!(sh, "cargo build -p litebox_runner_linux_userland --release").run()?;
+        let features: &[&str] = if lock_tracing { &["--features", "lock_tracing"] } else { &[] };
+        cmd!(sh, "cargo build -p litebox_runner_linux_userland --release {features...}").run()?;
     } else {
         cmd!(
             sh,
@@ -506,6 +514,7 @@ fn rewriter_node(ctx: BenchCtx) -> Result<()> {
         cli_args: _,
         project_root,
         is_init,
+        lock_tracing: _,
     } = ctx;
     let node = locate_command(sh, "node")?;
     if is_init {
@@ -526,6 +535,7 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
         cli_args: _,
         project_root,
         is_init,
+        lock_tracing,
     } = ctx;
     let tar_file = sh.current_dir().join("node_rootfs.tar");
     let release_mode = true;
@@ -560,9 +570,10 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
         // ustar allows longer file names
         cmd!(sh, "tar --format=ustar -C {tar_base_dir} -cvf {tar_file} .").run()?;
         let release = release_mode.then_some("--release");
+        let features: &[&str] = if lock_tracing { &["--features", "lock_tracing"] } else { &[] };
         cmd!(
             sh,
-            "cargo build -p litebox_runner_linux_userland {release...}"
+            "cargo build -p litebox_runner_linux_userland {release...} {features...}"
         )
         .run()?;
     } else {
