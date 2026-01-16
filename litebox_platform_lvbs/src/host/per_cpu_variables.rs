@@ -48,6 +48,8 @@ pub struct PerCpuVariables {
 impl PerCpuVariables {
     const XSAVE_ALIGNMENT: usize = 64; // XSAVE and XRSTORE require a 64-byte aligned buffer
     const VTL1_XSAVE_MASK: u64 = 0b11; // let XSAVE and XRSTORE deal with x87 and SSE states
+    // XSAVE area size for VTL1: 512 bytes (legacy x87+SSE area) + 64 bytes (XSAVE header)
+    const VTL1_XSAVE_AREA_SIZE: usize = 512 + 64;
 
     pub fn kernel_stack_top(&self) -> u64 {
         &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
@@ -107,16 +109,16 @@ impl PerCpuVariables {
             0,
             "VTL1 cannot have extended states that VTL0 does not enable"
         );
-        let xsave_area_size = get_xsave_area_size();
+        let vtl0_xsave_area_size = get_xsave_area_size();
         // Leaking `xsave_area` buffers are okay because they are never reused
         // until the core gets reset.
         let vtl0_xsave_area = Box::leak(
-            avec![[{ Self::XSAVE_ALIGNMENT }] | 0u8; xsave_area_size]
+            avec![[{ Self::XSAVE_ALIGNMENT }] | 0u8; vtl0_xsave_area_size]
                 .into_boxed_slice()
                 .into(),
         );
         let vtl1_xsave_area = Box::leak(
-            avec![[{ Self::XSAVE_ALIGNMENT }] | 0u8; xsave_area_size]
+            avec![[{ Self::XSAVE_ALIGNMENT }] | 0u8; Self::VTL1_XSAVE_AREA_SIZE]
                 .into_boxed_slice()
                 .into(),
         );
@@ -125,6 +127,10 @@ impl PerCpuVariables {
     }
 
     /// Save the extended states of each core (VTL0 or VTL1).
+    ///
+    /// NOTE: We use standard XSAVE format (not compacted XSAVES) because XSAVES causes GP fault
+    /// in VTL1. This may be due to Hyper-V not virtualizing XSAVES/XRSTORS for VTL1 or requiring
+    /// specific IA32_XSS MSR configuration.
     pub(crate) fn save_extended_states(&mut self, vtl: u8) {
         if self.vtl0_xsave_area_addr.is_null() || self.vtl1_xsave_area_addr.is_null() {
             panic!("XSAVE areas are not allocated");
@@ -142,38 +148,26 @@ impl PerCpuVariables {
                 ),
                 _ => panic!("Invalid VTL value: {}", vtl),
             };
-            let compact = xcr0_compaction_on();
+            // The first instruction to save the extended states must be XSAVE,
+            // and subsequent instructions can use XSAVEOPT for better performance.
+            // Safety: xsave_area_addr is valid and properly aligned
             unsafe {
-                if compact {
-                    // Compacted format: XSAVES
+                if *initialized {
                     core::arch::asm!(
-                        "xsaves [{}]",
+                        "xsaveopt [{}]",
                         in(reg) xsave_area_addr,
                         in("eax") mask & 0xffff_ffff,
                         in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
                         options(nostack, preserves_flags)
                     );
                 } else {
-                    // Standard format: XSAVE then XSAVEOPT
-                    // If XSAVE area is configured to use the standard format, the first instruction to
-                    // save the extended states must be XSAVE, and subsequent instructions can use XSAVEOPT.
-                    if *initialized {
-                        core::arch::asm!(
-                            "xsaveopt [{}]",
-                            in(reg) xsave_area_addr,
-                            in("eax") mask & 0xffff_ffff,
-                            in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
-                            options(nostack, preserves_flags)
-                        );
-                    } else {
-                        core::arch::asm!(
-                            "xsave [{}]",
-                            in(reg) xsave_area_addr,
-                            in("eax") mask & 0xffff_ffff,
-                            in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
-                            options(nostack, preserves_flags)
-                        );
-                    }
+                    core::arch::asm!(
+                        "xsave [{}]",
+                        in(reg) xsave_area_addr,
+                        in("eax") mask & 0xffff_ffff,
+                        in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
+                        options(nostack, preserves_flags)
+                    );
                 }
             }
             *initialized = true;
@@ -190,27 +184,15 @@ impl PerCpuVariables {
                 HV_VTL_SECURE => (self.vtl1_xsave_area_addr.as_u64(), Self::VTL1_XSAVE_MASK),
                 _ => panic!("Invalid VTL value: {}", vtl),
             };
-            let compact = xcr0_compaction_on();
+            // Safety: xsave_area_addr is valid and properly aligned
             unsafe {
-                if compact {
-                    // Compacted format: XRSTORS
-                    core::arch::asm!(
-                        "xrstors [{}]",
-                        in(reg) xsave_area_addr,
-                        in("eax") mask & 0xffff_ffff,
-                        in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
-                        options(nostack, preserves_flags)
-                    );
-                } else {
-                    // Standard format: XRSTOR
-                    core::arch::asm!(
-                        "xrstor [{}]",
-                        in(reg) xsave_area_addr,
-                        in("eax") mask & 0xffff_ffff,
-                        in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
-                        options(nostack, preserves_flags)
-                    );
-                }
+                core::arch::asm!(
+                    "xrstor [{}]",
+                    in(reg) xsave_area_addr,
+                    in("eax") mask & 0xffff_ffff,
+                    in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
+                    options(nostack, preserves_flags)
+                );
             }
         }
     }
@@ -412,10 +394,10 @@ pub fn allocate_per_cpu_variables() {
     }
 }
 
-/// Get the XSAVE area size based on enabled features (XCR0)
+/// Get the XSAVE area size for VTL0 based on enabled features in XCR0
 ///
-/// VTL0 and VTL1 share the same XCR0 register. This function assumes that VTL1 does not overwrite
-/// XCR0. If VTL1 should have its own XCR0, we need to save and restore VTL0's XCR0 and call
+/// VTL0 and VTL1 share the same XCR0 register. This function assumes that VTL1 maintains VTL0's
+/// XCR0. If VTL1 should program XCR0, we need to save and restore VTL0's XCR0 and call
 /// this function against the stored value.
 /// In addition, HVCI/HEKI prevents VTL0 from modifying XCR0, so we don't need to worry about VTL0
 /// changing XCR0 either.
@@ -436,6 +418,8 @@ fn get_xsave_area_size() -> usize {
 fn xgetbv0() -> u64 {
     let eax: u32;
     let edx: u32;
+    // Safety: We have already verified XSAVE support in get_xsave_area_size()
+    // which is called before any xgetbv0() call.
     unsafe {
         core::arch::asm!(
             "xgetbv",
@@ -446,10 +430,4 @@ fn xgetbv0() -> u64 {
         );
     }
     (u64::from(edx) << 32) | u64::from(eax)
-}
-
-#[allow(clippy::inline_always)]
-#[inline(always)]
-fn xcr0_compaction_on() -> bool {
-    (xgetbv0() >> 63) & 1 != 0
 }
