@@ -125,7 +125,11 @@ impl Creation {
     /// Ensures the lock creation event has been recorded, calling the provided
     /// closure to get the lock address if registration is needed.
     #[inline]
-    pub(crate) fn ensure_registered<T>(&self, lock_type: LockType, get_addr: impl FnOnce() -> *const T) {
+    pub(crate) fn ensure_registered<T>(
+        &self,
+        lock_type: LockType,
+        get_addr: impl FnOnce() -> *const T,
+    ) {
         use core::sync::atomic::Ordering;
         if !self.registered.swap(true, Ordering::Relaxed) {
             record_lock_created(lock_type, get_addr(), self.file, self.line);
