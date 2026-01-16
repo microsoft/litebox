@@ -116,6 +116,13 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+      # LVBS requires a nightly toolchain because:
+      # 1. It uses a custom target (x86_64_vtl1.json) for bare-metal VTL1 kernel development
+      # 2. The custom target requires `-Z build-std` to build core/alloc from source
+      # 3. build-std is needed to compile the standard library with SSE support, which is
+      #    required by dependencies like `libm` (used by RSA/crypto for authenticode verification)
+      # 4. The built-in x86_64-unknown-none target uses soft-float (no SSE), causing ABI
+      #    incompatibility when SSE-using dependencies are linked against a soft-float stdlib
       - name: Set up Rust
         run: |
           RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
