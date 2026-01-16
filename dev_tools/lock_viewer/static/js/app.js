@@ -14,6 +14,7 @@ let commonPathPrefix = '';  // Common prefix to strip from file paths
 let lockContention = {};   // Map of lock_addr -> contention duration in ns
 let lockSourceFiles = {};  // Map of lock_addr -> first seen source file (for lock/unlock operations)
 let lockCreationLocations = {};  // Map of lock_addr -> creation location (from 'created' events)
+let lockTypes = {};        // Map of lock_addr -> lock type (from 'created' events)
 let zoomLevel = 1;         // Timeline zoom level (1 = 100%)
 let lockTableSortColumn = 'totalWait';  // Current sort column
 let lockTableSortAsc = false;  // Sort direction (false = descending)
@@ -70,11 +71,13 @@ async function loadData() {
             commonPathPrefix = calculateCommonPrefix();
             console.log('Common path prefix:', commonPathPrefix);  // Debug
 
-            // Build lock creation location map from 'created' events
+            // Build lock creation location map and lock types from 'created' events
             lockCreationLocations = {};
+            lockTypes = {};
             for (const event of allEvents) {
                 if (event.event_type === 'created') {
                     lockCreationLocations[event.lock_addr] = { file: event.file, line: event.line };
+                    lockTypes[event.lock_addr] = event.lock_type || 'unknown';
                 }
             }
 
@@ -281,6 +284,7 @@ function updateLockFilter() {
         const source = lockSourceFiles[lock] || { file: '', line: 0 };
         return {
             lock,
+            lockType: lockTypes[lock] || 'unknown',
             totalWait: cont.totalWait,
             attempts: cont.attempts,
             maxWait: cont.maxWait,
@@ -299,6 +303,10 @@ function updateLockFilter() {
             case 'lock':
                 valA = a.lock;
                 valB = b.lock;
+                break;
+            case 'lockType':
+                valA = a.lockType;
+                valB = b.lockType;
                 break;
             case 'totalWait':
                 valA = a.totalWait;
@@ -346,6 +354,7 @@ function updateLockFilter() {
                 <tr>
                     <th class="lock-table-checkbox"></th>
                     <th class="sortable" onclick="sortLockTable('lock')">Lock${sortIndicator('lock')}</th>
+                    <th class="sortable" onclick="sortLockTable('lockType')">Type${sortIndicator('lockType')}</th>
                     <th class="sortable" onclick="sortLockTable('totalWait')">Total Wait${sortIndicator('totalWait')}</th>
                     <th class="sortable" onclick="sortLockTable('attempts')">Attempts${sortIndicator('attempts')}</th>
                     <th class="sortable" onclick="sortLockTable('maxWait')">Max Wait${sortIndicator('maxWait')}</th>
@@ -372,6 +381,7 @@ function updateLockFilter() {
                     <input type="checkbox" ${data.selected ? 'checked' : ''} onclick="event.stopPropagation(); toggleLock('${data.lock}')">
                 </td>
                 <td class="lock-addr">${data.lock}</td>
+                <td class="lock-type">${data.lockType}</td>
                 <td class="lock-stat">${formatDuration(data.totalWait)}</td>
                 <td class="lock-stat">${data.attempts}</td>
                 <td class="lock-stat">${formatDuration(data.maxWait)}</td>
@@ -458,6 +468,60 @@ function getFilteredEvents() {
 }
 
 /**
+ * Build spans from events for a specific lock and location.
+ * Returns array of { type: 'waiting'|'holding'|'holding-read'|'holding-write', start, end } spans.
+ */
+function buildSpans(events) {
+    const spans = [];
+    const sortedEvents = [...events].sort((a, b) => a.timestamp_ns - b.timestamp_ns);
+
+    let pendingAttempt = null;
+    let pendingAcquired = null;
+
+    for (const event of sortedEvents) {
+        if (event.event_type === 'attempt') {
+            pendingAttempt = event;
+        } else if (event.event_type === 'acquired') {
+            if (pendingAttempt) {
+                // Create waiting span (attempt -> acquired)
+                spans.push({
+                    type: 'waiting',
+                    start: pendingAttempt.timestamp_ns,
+                    end: event.timestamp_ns,
+                    startEvent: pendingAttempt,
+                    endEvent: event
+                });
+                pendingAttempt = null;
+            }
+            pendingAcquired = event;
+        } else if (event.event_type === 'released') {
+            if (pendingAcquired) {
+                // Determine holding span type based on lock_type field
+                // Events have lock_type like "RwLockRead", "RwLockWrite", "Mutex", etc.
+                const eventLockType = (pendingAcquired.lock_type || '').toLowerCase();
+                let holdType = 'holding';
+                if (eventLockType.includes('read')) {
+                    holdType = 'holding-read';
+                } else if (eventLockType.includes('write')) {
+                    holdType = 'holding-write';
+                }
+                // Create holding span (acquired -> released)
+                spans.push({
+                    type: holdType,
+                    start: pendingAcquired.timestamp_ns,
+                    end: event.timestamp_ns,
+                    startEvent: pendingAcquired,
+                    endEvent: event
+                });
+                pendingAcquired = null;
+            }
+        }
+    }
+
+    return spans;
+}
+
+/**
  * Render the timeline visualization.
  */
 function renderTimeline() {
@@ -490,13 +554,17 @@ function renderTimeline() {
         return;
     }
 
-    // Group events by lock
+    // Group events by lock, then by location (file:line)
     const lockGroups = {};
     events.forEach(event => {
         if (!lockGroups[event.lock_addr]) {
-            lockGroups[event.lock_addr] = [];
+            lockGroups[event.lock_addr] = {};
         }
-        lockGroups[event.lock_addr].push(event);
+        const locationKey = `${event.file}:${event.line}`;
+        if (!lockGroups[event.lock_addr][locationKey]) {
+            lockGroups[event.lock_addr][locationKey] = [];
+        }
+        lockGroups[event.lock_addr][locationKey].push(event);
     });
 
     // Calculate visible time range
@@ -532,40 +600,76 @@ function renderTimeline() {
     });
 
     sortedLocks.forEach(lock => {
-        const lockEvents = lockGroups[lock];
+        const locationGroups = lockGroups[lock];
+        const lockType = lockTypes[lock] || 'unknown';
 
-        // Use creation location as primary identity if available, otherwise use first event
+        // Use creation location as primary identity if available
         const creation = lockCreationLocations[lock];
-        let label, fullLabel;
+        let lockLabel, fullLockLabel;
         if (creation) {
             const strippedCreationFile = stripCommonPrefix(creation.file);
-            label = `${lock} (${strippedCreationFile}:${creation.line})`;
-            fullLabel = `Created at: ${creation.file}:${creation.line}`;
+            lockLabel = `${lock} [${lockType} @ ${strippedCreationFile}:${creation.line}]`;
+            fullLockLabel = `Created at: ${creation.file}:${creation.line}`;
         } else {
-            const firstEvent = lockEvents[0];
-            const strippedFile = stripCommonPrefix(firstEvent.file);
-            label = `${lock} (${strippedFile}:${firstEvent.line})`;
-            fullLabel = `First use at: ${firstEvent.file}:${firstEvent.line}`;
+            lockLabel = `${lock} [${lockType}]`;
+            fullLockLabel = `Lock address: ${lock}`;
         }
 
-        html += `<div class="timeline-track">`;
-        html += `<div class="timeline-track-label" title="${fullLabel}">${label}</div>`;
+        // Create a group container for this lock
+        html += `<div class="timeline-lock-group">`;
+        html += `<div class="timeline-lock-header" title="${fullLockLabel}">${lockLabel}</div>`;
 
-        lockEvents.forEach((event, idx) => {
-            // Cap position to leave room for marker width (max ~99.5% to prevent overflow)
-            const rawPosition = ((event.timestamp_ns - visibleMinTime) / timeRange) * 100;
-            const position = Math.min(rawPosition, 99.5);
-            html += `
-                <div class="event-marker ${event.event_type}"
-                     style="left: ${position}%"
-                     data-event-idx="${allEvents.indexOf(event)}"
-                     onmouseenter="showTooltip(event, ${allEvents.indexOf(event)})"
-                     onmouseleave="hideTooltip()">
-                </div>
-            `;
+        // Sort locations by total span time (most active first)
+        const sortedLocations = Object.keys(locationGroups).sort((a, b) => {
+            const spansA = buildSpans(locationGroups[a]);
+            const spansB = buildSpans(locationGroups[b]);
+            const totalA = spansA.reduce((sum, s) => sum + (s.end - s.start), 0);
+            const totalB = spansB.reduce((sum, s) => sum + (s.end - s.start), 0);
+            return totalB - totalA;
         });
 
-        html += `</div>`;
+        sortedLocations.forEach(location => {
+            const locationEvents = locationGroups[location];
+            const spans = buildSpans(locationEvents);
+            const strippedLocation = stripCommonPrefix(location.split(':')[0]) + ':' + location.split(':')[1];
+
+            html += `<div class="timeline-track">`;
+            html += `<div class="timeline-track-label" title="${location}">${strippedLocation}</div>`;
+
+            // Render spans
+            spans.forEach(span => {
+                const startPos = ((span.start - visibleMinTime) / timeRange) * 100;
+                const endPos = ((span.end - visibleMinTime) / timeRange) * 100;
+                const width = Math.max(endPos - startPos, 0.1); // Minimum width for visibility
+                const duration = span.end - span.start;
+                let spanClass;
+                switch (span.type) {
+                    case 'waiting':
+                        spanClass = 'span-waiting';
+                        break;
+                    case 'holding-read':
+                        spanClass = 'span-holding-read';
+                        break;
+                    case 'holding-write':
+                        spanClass = 'span-holding-write';
+                        break;
+                    default:
+                        spanClass = 'span-holding';
+                }
+
+                html += `
+                    <div class="timeline-span ${spanClass}"
+                         style="left: ${startPos}%; width: ${width}%;"
+                         onmouseenter="showSpanTooltip(event, '${span.type}', ${duration}, '${lock}', '${location.replace(/'/g, "\\'")}')"
+                         onmouseleave="hideTooltip()">
+                    </div>
+                `;
+            });
+
+            html += `</div>`;
+        });
+
+        html += `</div>`; // Close timeline-lock-group
     });
 
     html += `</div>`;
@@ -573,24 +677,20 @@ function renderTimeline() {
     html += `
         <div class="legend">
             <div class="legend-item">
-                <div class="legend-color created"></div>
-                <span>Created</span>
+                <div class="legend-color span-waiting"></div>
+                <span>Waiting (attempt → acquired)</span>
             </div>
             <div class="legend-item">
-                <div class="legend-color attempt"></div>
-                <span>Attempt</span>
+                <div class="legend-color span-holding"></div>
+                <span>Holding (mutex)</span>
             </div>
             <div class="legend-item">
-                <div class="legend-color acquired"></div>
-                <span>Acquired</span>
+                <div class="legend-color span-holding-read"></div>
+                <span>Holding Read (RwLock)</span>
             </div>
             <div class="legend-item">
-                <div class="legend-color released"></div>
-                <span>Released</span>
-            </div>
-            <div class="legend-item">
-                <div class="legend-color destroyed"></div>
-                <span>Destroyed</span>
+                <div class="legend-color span-holding-write"></div>
+                <span>Holding Write (RwLock)</span>
             </div>
         </div>
     `;
@@ -631,38 +731,27 @@ function formatTime(ns) {
 }
 
 /**
- * Show the tooltip for an event.
+ * Show the tooltip for a span.
  */
-function showTooltip(mouseEvent, eventIdx) {
-    const event = allEvents[eventIdx];
+function showSpanTooltip(mouseEvent, spanType, duration, lock, location) {
     const tooltip = document.getElementById('tooltip');
-    const strippedFile = stripCommonPrefix(event.file);
-    const cont = lockContention[event.lock_addr];
-    const creation = lockCreationLocations[event.lock_addr];
+    const spanLabel = spanType === 'waiting' ? 'Waiting' : 'Holding';
+    const cont = lockContention[lock];
+    const lockType = lockTypes[lock] || 'unknown';
 
     let contentionInfo = '';
     if (cont && cont.totalWait > 0) {
         contentionInfo = `
-            <div class="tooltip-row"><span class="tooltip-label">Total Wait:</span>${formatDuration(cont.totalWait)}</div>
-            <div class="tooltip-row"><span class="tooltip-label">Max Wait:</span>${formatDuration(cont.maxWait)}</div>
-        `;
-    }
-
-    let creationInfo = '';
-    if (creation) {
-        const strippedCreationFile = stripCommonPrefix(creation.file);
-        creationInfo = `
-            <div class="tooltip-row"><span class="tooltip-label">Created At:</span>${strippedCreationFile}:${creation.line}</div>
+            <div class="tooltip-row"><span class="tooltip-label">Total Wait (all locations):</span>${formatDuration(cont.totalWait)}</div>
         `;
     }
 
     tooltip.innerHTML = `
-        <div class="tooltip-row"><span class="tooltip-label">Event:</span>${event.event_type}</div>
-        <div class="tooltip-row"><span class="tooltip-label">Time:</span>${formatTime(event.timestamp_ns)}</div>
-        <div class="tooltip-row"><span class="tooltip-label">Lock:</span>${event.lock_addr}</div>
-        <div class="tooltip-row"><span class="tooltip-label">Type:</span>${event.lock_type}</div>
-        ${creationInfo}
-        <div class="tooltip-row"><span class="tooltip-label">Location:</span>${strippedFile}:${event.line}</div>
+        <div class="tooltip-row"><span class="tooltip-label">Span:</span>${spanLabel}</div>
+        <div class="tooltip-row"><span class="tooltip-label">Duration:</span>${formatDuration(duration)}</div>
+        <div class="tooltip-row"><span class="tooltip-label">Lock:</span>${lock}</div>
+        <div class="tooltip-row"><span class="tooltip-label">Type:</span>${lockType}</div>
+        <div class="tooltip-row"><span class="tooltip-label">Location:</span>${location}</div>
         ${contentionInfo}
     `;
 
