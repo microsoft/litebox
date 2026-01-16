@@ -656,19 +656,30 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     /// Since this function consumes `self`, it is guaranteed that no other thread has borrowed it
     /// or has unreleased locks.
     #[inline]
-    #[cfg_attr(not(feature = "lock_tracing"), allow(unused_mut))]
+    #[cfg(not(feature = "lock_tracing"))]
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+
+    /// Consumes this `RwLock`, returning the underlying data.
+    ///
+    /// Since this function consumes `self`, it is guaranteed that no other thread has borrowed it
+    /// or has unreleased locks.
+    #[inline]
+    #[cfg(feature = "lock_tracing")]
     pub fn into_inner(mut self) -> T {
         // Record destruction event before consuming self, since Drop won't run
-        // after we use ManuallyDrop. Only record if the lock was ever registered.
-        #[cfg(feature = "lock_tracing")]
+        // after we use ManuallyDrop.
         self.creation
             .record_destruction_if_registered(LockType::RwLock, &raw const self.raw.state);
 
-        // Prevent Drop from running since we're manually handling destruction
+        // Prevent Drop from running since we've manually recorded destruction.
+        // ManuallyDrop is required because RwLock has a Drop impl when lock_tracing
+        // is enabled, and Rust won't let us move `self.data` out of a type with Drop.
         let this = core::mem::ManuallyDrop::new(self);
 
         // SAFETY: We're consuming self and have prevented Drop from running,
-        // so it's safe to read and move out of the data field
+        // so it's safe to read and move out of the data field.
         unsafe { core::ptr::read(&raw const this.data).into_inner() }
     }
 
