@@ -338,6 +338,7 @@ body {
 /* Lock Group */
 .timeline-lock-group {
     margin-bottom: 1rem;
+    margin-top: 1.5rem;
     border: 1px solid #0f3460;
     border-radius: 4px;
     background: rgba(15, 52, 96, 0.3);
@@ -348,13 +349,15 @@ body {
     position: relative;
     left: -220px;
     width: calc(100% + 220px);
-    padding: 0.25rem 0.5rem 0.25rem 0;
+    padding: 0.25rem 0.5rem 0.5rem 0;
     font-size: 0.8rem;
     font-weight: 600;
     color: #e94560;
     text-align: left;
     padding-left: 10px;
-    margin-bottom: 0.25rem;
+    margin-bottom: 0.5rem;
+    margin-top: -1.5rem;
+    background: #1a1a2e;
     border-bottom: 1px solid #0f3460;
 }
 
@@ -364,6 +367,7 @@ body {
     margin-bottom: 0.25rem;
     margin-left: 0;
     margin-right: 0.5rem;
+    margin-top: 0.25rem;
     background: #0f3460;
     border-radius: 4px;
 }
