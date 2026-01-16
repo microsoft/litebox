@@ -88,9 +88,14 @@ unsafe fn apply_relocations() {
             // Calculate target address: original offset + load offset
             // SAFETY: Target address is valid after offset adjustment
             let target = (offset.wrapping_add(rela.offset)) as *mut u64;
+            // SAFETY: Target is within the .rela.dyn section and properly aligned
             unsafe {
-                let value = (rela.addend as i64).wrapping_add(offset as i64);
-                target.write_volatile(value as u64);
+                // Relocation calculation: addend + load_offset
+                // The casts between signed/unsigned are intentional for ELF relocation math
+                #[allow(clippy::cast_possible_wrap)]
+                #[allow(clippy::cast_sign_loss)]
+                let value = rela.addend.wrapping_add(offset as i64) as u64;
+                target.write_volatile(value);
             }
         }
 
@@ -99,8 +104,9 @@ unsafe fn apply_relocations() {
     }
 
     // Reclaim rela.dyn section memory to heap after applying relocations
-    let mem_fill_start = unsafe { &_rela_start as *const _ as usize };
-    let mem_fill_end = unsafe { &_rela_end as *const _ as usize };
+    // These extern statics are defined by the linker script
+    let mem_fill_start = &raw const _rela_start as usize;
+    let mem_fill_end = &raw const _rela_end as usize;
     let mem_fill_size = mem_fill_end - mem_fill_start;
     unsafe {
         Platform::mem_fill_pages(mem_fill_start, mem_fill_size);

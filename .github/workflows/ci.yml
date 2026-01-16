@@ -123,6 +123,9 @@ jobs:
       #    required by dependencies like `libm` (used by RSA/crypto for authenticode verification)
       # 4. The built-in x86_64-unknown-none target uses soft-float (no SSE), causing ABI
       #    incompatibility when SSE-using dependencies are linked against a soft-float stdlib
+      #
+      # Version alignment: The nightly version should match the stable version (e.g., stable
+      # 1.91.x -> nightly 1.91.x). Use `rustc +nightly-YYYY-MM-DD --version` to find a date.
       - name: Set up Rust
         run: |
           RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
@@ -145,7 +148,10 @@ jobs:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
-      - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
+      - run: |
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
+          # Run clippy for lvbs with custom target (requires build-std)
+          ./.github/tools/github_actions_run_cargo clippy -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json --all-features
       - run: |
           ./.github/tools/github_actions_run_cargo build
           ./.github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
