@@ -446,8 +446,16 @@ fn run_rewritten_hello_static(ctx: BenchCtx<'_>) -> Result<()> {
     if is_init {
         rewriter_hello_static(ctx.with_init(true))?;
         rewriter_hello_static(ctx.with_init(false))?;
-        let features: &[&str] = if lock_tracing { &["--features", "lock_tracing"] } else { &[] };
-        cmd!(sh, "cargo build -p litebox_runner_linux_userland --release {features...}").run()?;
+        let features: &[&str] = if lock_tracing {
+            &["--features", "lock_tracing"]
+        } else {
+            &[]
+        };
+        cmd!(
+            sh,
+            "cargo build -p litebox_runner_linux_userland --release {features...}"
+        )
+        .run()?;
     } else {
         cmd!(
             sh,
@@ -570,7 +578,11 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
         // ustar allows longer file names
         cmd!(sh, "tar --format=ustar -C {tar_base_dir} -cvf {tar_file} .").run()?;
         let release = release_mode.then_some("--release");
-        let features: &[&str] = if lock_tracing { &["--features", "lock_tracing"] } else { &[] };
+        let features: &[&str] = if lock_tracing {
+            &["--features", "lock_tracing"]
+        } else {
+            &[]
+        };
         cmd!(
             sh,
             "cargo build -p litebox_runner_linux_userland {release...} {features...}"

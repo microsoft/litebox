@@ -17,6 +17,7 @@ let lockCreationLocations = {};  // Map of lock_addr -> creation location (from 
 let zoomLevel = 1;         // Timeline zoom level (1 = 100%)
 let lockTableSortColumn = 'totalWait';  // Current sort column
 let lockTableSortAsc = false;  // Sort direction (false = descending)
+let ignoredUnusedLockCount = 0;  // Count of locks that only had create/destroy events
 
 /**
  * Load events from the API endpoint.
@@ -51,8 +52,17 @@ async function loadData() {
                 minTimeWithDrops = minTime;
             }
 
-            // Find unique locks
-            uniqueLocks = new Set(allEvents.map(e => e.lock_addr));
+            // Find unique locks, filtering out those that were only created/destroyed
+            const allLocks = new Set(allEvents.map(e => e.lock_addr));
+            const usedLocks = new Set();
+            for (const event of allEvents) {
+                if (event.event_type === 'attempt' || event.event_type === 'acquired' || event.event_type === 'released') {
+                    usedLocks.add(event.lock_addr);
+                }
+            }
+            // Count ignored locks and keep only used ones
+            ignoredUnusedLockCount = allLocks.size - usedLocks.size;
+            uniqueLocks = usedLocks;
             // Default to NO locks selected (user must toggle them on)
             selectedLocks = new Set();
 
@@ -453,12 +463,16 @@ function getFilteredEvents() {
 function renderTimeline() {
     // Check if no locks are selected first
     if (selectedLocks.size === 0) {
-        const totalLocks = uniqueLocks.size;
+        const shownLocks = uniqueLocks.size;
+        let locksMessage = `${shownLocks} locks available`;
+        if (ignoredUnusedLockCount > 0) {
+            locksMessage += `; ${ignoredUnusedLockCount} never used`;
+        }
         document.getElementById('timeline-content').innerHTML = `
             <div class="no-data welcome-message">
                 <h2>👆 Select Locks to View</h2>
                 <p>Click on rows in the lock table above to enable them, or use "Select All" to show everything.</p>
-                <p class="muted">${totalLocks} locks available</p>
+                <p class="muted">${locksMessage}</p>
             </div>
         `;
         return;

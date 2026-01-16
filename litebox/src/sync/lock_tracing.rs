@@ -264,13 +264,26 @@ impl EventRecorder {
 
     fn record(&mut self, event: RecordedEvent) {
         if self.recording && CONFIG_ENABLE_RECORDING {
-            self.total_recorded += 1;
-            if self.events.len() == CONFIG_MAX_RECORDED_EVENTS {
-                self.events.pop_front();
-                self.dropped_events += 1;
-            }
-            self.events.push_back(event);
+            self.record_unconditionally(event);
         }
+    }
+
+    /// Record an event unconditionally (used for lifecycle events like
+    /// created/destroyed that should always be captured once recording
+    /// eventually starts or is already active).
+    fn record_always(&mut self, event: RecordedEvent) {
+        if CONFIG_ENABLE_RECORDING {
+            self.record_unconditionally(event);
+        }
+    }
+
+    fn record_unconditionally(&mut self, event: RecordedEvent) {
+        self.total_recorded += 1;
+        if self.events.len() == CONFIG_MAX_RECORDED_EVENTS {
+            self.events.pop_front();
+            self.dropped_events += 1;
+        }
+        self.events.push_back(event);
     }
 
     fn start(&mut self) {
@@ -345,7 +358,9 @@ pub(crate) fn record_lock_created<T>(
         // Get timestamp from tracker if available, otherwise use 0
         let timestamp_ns =
             LockTracker::global().map_or(0, |t| t.x.lock().platform.now().as_nanos());
-        EVENT_RECORDER.lock().record(RecordedEvent {
+        // Use record_always so creation events are captured even if recording
+        // hasn't started yet (the lock might be used later during recording).
+        EVENT_RECORDER.lock().record_always(RecordedEvent {
             event_type: LockEventType::Created,
             timestamp_ns,
             lock_addr: lock_addr as usize,
@@ -370,7 +385,9 @@ pub(crate) fn record_lock_destroyed<T>(
         // Get timestamp from tracker if available, otherwise use 0
         let timestamp_ns =
             LockTracker::global().map_or(0, |t| t.x.lock().platform.now().as_nanos());
-        EVENT_RECORDER.lock().record(RecordedEvent {
+        // Use record_always so destruction events are captured even if
+        // recording has stopped (matches behavior of record_lock_created).
+        EVENT_RECORDER.lock().record_always(RecordedEvent {
             event_type: LockEventType::Destroyed,
             timestamp_ns,
             lock_addr: lock_addr as usize,
