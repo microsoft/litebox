@@ -267,13 +267,10 @@ extern "C" fn simd_floating_point_handler_impl(regs: &PtRegs) {
     );
 }
 
-/// Rust handler for Hyper-V synthetic interrupt (vector 0xf3).
-/// Called from assembly stub with pointer to saved register state.
-///
-/// This handler is called when there is a synthetic interrupt.
-/// Instead of implementing this handler, we let it immediately return to the VTL switch loop
-/// (i.e., the current RIP) which will handle synthetic interrupts.
-#[unsafe(no_mangle)]
-extern "C" fn hyperv_sint_handler_impl(_regs: &PtRegs) {
-    // Intentionally empty - just return to let the VTL switch loop handle it
-}
+// Note: isr_hyperv_sint is defined in interrupts.S as a minimal stub that only
+// performs iretq. This synthetic interrupt is an exception for VTL0 security
+// violations (e.g., tampering with write-protected MSRs) delivered by Hyper-V
+// to VTL1 as a SINT. Since the handler does nothing, registers are naturally
+// preserved. After iretq, the VTL switch loop will save registers and handle
+// the violation. VTL1 is not executed concurrently with VTL0, so an immediate
+// iretq is safe.

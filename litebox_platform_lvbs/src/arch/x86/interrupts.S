@@ -149,5 +149,18 @@ isr_with_err_code isr_alignment_check alignment_check_handler_impl
 /* Vector 19: SIMD Floating-Point Exception (#XM) - No error code */
 isr_no_err_code isr_simd_floating_point simd_floating_point_handler_impl
 
-/* Hypervisor synthetic interrupt handler (vector 0xf3) */
-isr_no_err_code isr_hyperv_sint hyperv_sint_handler_impl
+/*
+ * Hypervisor synthetic interrupt handler (vector 0xf3)
+ *
+ * This synthetic interrupt is an exception for VTL0 security violations (e.g.,
+ * tampering with write-protected MSRs). Hyper-V delivers this exception to VTL1
+ * as a SINT.
+ *
+ * This stub only performs iretq without saving/restoring registers. Since the
+ * handler does nothing, registers are naturally preserved. After iretq, the VTL
+ * switch loop will save registers and check for synthetic interrupts. VTL1 is
+ * not executed concurrently with VTL0, so an immediate iretq is safe.
+ */
+.global isr_hyperv_sint
+isr_hyperv_sint:
+    iretq
