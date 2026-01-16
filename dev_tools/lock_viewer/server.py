@@ -50,14 +50,14 @@ def parse_args():
 def load_events(file_path: str) -> tuple[dict | None, list[dict]]:
     """
     Load and parse JSONL events from file.
-    
+
     Returns:
         A tuple of (summary, events) where summary is the first line's
         summary object (or None) and events is the list of lock events.
     """
     summary = None
     events = []
-    
+
     if not os.path.exists(file_path):
         return summary, events
 
@@ -75,7 +75,7 @@ def load_events(file_path: str) -> tuple[dict | None, list[dict]]:
                     events.append(obj)
             except json.JSONDecodeError:
                 continue
-                
+
     return summary, events
 
 
@@ -96,46 +96,46 @@ def get_events():
     """API endpoint to fetch lock events."""
     file_path = app.config.get("LOCK_FILE_PATH", LOCK_FILE_PATH)
     summary, events = load_events(file_path)
-    return jsonify({
-        "summary": summary,
-        "events": events,
-        "count": len(events),
-    })
+    return jsonify(
+        {
+            "summary": summary,
+            "events": events,
+            "count": len(events),
+        }
+    )
 
 
 @app.route("/api/snippet")
 def get_snippet():
     """API endpoint to fetch a code snippet from a file."""
     from flask import request
-    
+
     file_path = request.args.get("file", "")
     line = request.args.get("line", type=int, default=1)
     context = request.args.get("context", type=int, default=3)
-    
+
     if not file_path or not os.path.exists(file_path):
         return jsonify({"error": "File not found", "lines": [], "target_line": line})
-    
+
     try:
         with open(file_path, "r") as f:
             all_lines = f.readlines()
-        
+
         # Calculate line range (1-indexed to 0-indexed)
         start = max(0, line - 1 - context)
         end = min(len(all_lines), line + context)
-        
+
         snippet_lines = []
         for i in range(start, end):
-            snippet_lines.append({
-                "number": i + 1,
-                "content": all_lines[i].rstrip(),
-                "is_target": (i + 1) == line
-            })
-        
-        return jsonify({
-            "lines": snippet_lines,
-            "target_line": line,
-            "file": file_path
-        })
+            snippet_lines.append(
+                {
+                    "number": i + 1,
+                    "content": all_lines[i].rstrip(),
+                    "is_target": (i + 1) == line,
+                }
+            )
+
+        return jsonify({"lines": snippet_lines, "target_line": line, "file": file_path})
     except Exception as e:
         return jsonify({"error": str(e), "lines": [], "target_line": line})
 
@@ -144,10 +144,10 @@ def main():
     """Main entry point."""
     args = parse_args()
     app.config["LOCK_FILE_PATH"] = args.file
-    
+
     print(f"🔒 Lock Viewer starting on http://localhost:{args.port}")
     print(f"   Reading events from: {args.file}")
-    
+
     app.run(host="0.0.0.0", port=args.port, debug=True)
 
 
