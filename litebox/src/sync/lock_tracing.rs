@@ -85,7 +85,7 @@ const CONFIG_PRINT_LOCKS_SLOWER_THAN: Option<core::time::Duration> =
 const CONFIG_ENABLE_RECORDING: bool = true;
 
 /// Maximum number of events that can be recorded before the buffer wraps.
-const CONFIG_MAX_RECORDED_EVENTS: usize = 100_000;
+const CONFIG_MAX_RECORDED_EVENTS: usize = 1_000_000;
 
 /// The kind of lock that has been applied, either for locking or unlocking.
 #[non_exhaustive]

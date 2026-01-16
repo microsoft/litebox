@@ -36,8 +36,8 @@ async function loadData() {
 
         // Calculate time range from actual events
         if (allEvents.length > 0) {
-            minTime = Math.min(...allEvents.map(e => e.timestamp_ns));
-            maxTime = Math.max(...allEvents.map(e => e.timestamp_ns));
+            minTime = allEvents.reduce((min, e) => e.timestamp_ns < min ? e.timestamp_ns : min, Infinity);
+            maxTime = allEvents.reduce((max, e) => e.timestamp_ns > max ? e.timestamp_ns : max, -Infinity);
 
             // Calculate minimum time threshold based on dropped events
             // If events were dropped, we can't trust early data
@@ -218,20 +218,25 @@ function updateSummary() {
         return;
     }
 
-    const droppedClass = summary.dropped_events > 0 ? 'warning' : 'success';
+    const recordedEvents = summary.recorded_events || 0;
+    const droppedEvents = summary.dropped_events || 0;
+    const droppedClass = droppedEvents > 0 ? 'warning' : 'success';
+    const utilization = recordedEvents > 0
+        ? ((recordedEvents - droppedEvents) / recordedEvents * 100).toFixed(1)
+        : '100.0';
 
     panel.innerHTML = `
         <div class="summary-item">
             <span class="label">Total Recorded</span>
-            <span class="value">${summary.recorded_events.toLocaleString()}</span>
+            <span class="value">${recordedEvents.toLocaleString()}</span>
         </div>
         <div class="summary-item">
             <span class="label">Events Dropped</span>
-            <span class="value ${droppedClass}">${summary.dropped_events.toLocaleString()}</span>
+            <span class="value ${droppedClass}">${droppedEvents.toLocaleString()}</span>
         </div>
         <div class="summary-item">
             <span class="label">Buffer Utilization</span>
-            <span class="value">${((summary.recorded_events - summary.dropped_events) / summary.recorded_events * 100).toFixed(1)}%</span>
+            <span class="value">${utilization}%</span>
         </div>
         <div class="summary-item">
             <span class="label">Events in View</span>
@@ -481,8 +486,8 @@ function renderTimeline() {
     });
 
     // Calculate visible time range
-    const visibleMinTime = Math.min(...events.map(e => e.timestamp_ns));
-    const visibleMaxTime = Math.max(...events.map(e => e.timestamp_ns));
+    const visibleMinTime = events.reduce((min, e) => e.timestamp_ns < min ? e.timestamp_ns : min, Infinity);
+    const visibleMaxTime = events.reduce((max, e) => e.timestamp_ns > max ? e.timestamp_ns : max, -Infinity);
     const timeRange = visibleMaxTime - visibleMinTime || 1;
 
     // Build timeline HTML
