@@ -103,6 +103,43 @@ def get_events():
     })
 
 
+@app.route("/api/snippet")
+def get_snippet():
+    """API endpoint to fetch a code snippet from a file."""
+    from flask import request
+    
+    file_path = request.args.get("file", "")
+    line = request.args.get("line", type=int, default=1)
+    context = request.args.get("context", type=int, default=3)
+    
+    if not file_path or not os.path.exists(file_path):
+        return jsonify({"error": "File not found", "lines": [], "target_line": line})
+    
+    try:
+        with open(file_path, "r") as f:
+            all_lines = f.readlines()
+        
+        # Calculate line range (1-indexed to 0-indexed)
+        start = max(0, line - 1 - context)
+        end = min(len(all_lines), line + context)
+        
+        snippet_lines = []
+        for i in range(start, end):
+            snippet_lines.append({
+                "number": i + 1,
+                "content": all_lines[i].rstrip(),
+                "is_target": (i + 1) == line
+            })
+        
+        return jsonify({
+            "lines": snippet_lines,
+            "target_line": line,
+            "file": file_path
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "lines": [], "target_line": line})
+
+
 def main():
     """Main entry point."""
     args = parse_args()

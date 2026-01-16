@@ -469,7 +469,7 @@ body {
     font-size: 0.8rem;
     z-index: 1000;
     pointer-events: none;
-    max-width: 400px;
+    max-width: 600px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
     display: none;
 }
@@ -485,6 +485,54 @@ body {
 .tooltip-label {
     color: #888;
     margin-right: 0.5rem;
+}
+
+/* Code Snippet in Tooltip */
+.snippet-container {
+    margin-top: 0.75rem;
+    background: #0d1b2a;
+    border: 1px solid #0f3460;
+    border-radius: 4px;
+    padding: 0.5rem 0;
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;
+    font-size: 0.75rem;
+    overflow-x: auto;
+    max-width: 500px;
+}
+
+.snippet-line {
+    display: flex;
+    padding: 0.1rem 0.5rem;
+    white-space: pre;
+}
+
+.snippet-target {
+    background: rgba(233, 69, 96, 0.25);
+    border-left: 3px solid #e94560;
+    padding-left: calc(0.5rem - 3px);
+}
+
+.snippet-line-number {
+    color: #555;
+    min-width: 3em;
+    text-align: right;
+    margin-right: 1em;
+    user-select: none;
+}
+
+.snippet-code {
+    color: #b8c7d9;
+}
+
+.snippet-target .snippet-code {
+    color: #fff;
+}
+
+.snippet-loading {
+    margin-top: 0.5rem;
+    color: #666;
+    font-style: italic;
+    font-size: 0.75rem;
 }
 
 /* Legend */

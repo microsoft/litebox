@@ -375,6 +375,12 @@ function updateLockFilter() {
         const creationTitle = data.creationFile
             ? `${data.creationFile}:${data.creationLine}`
             : 'No creation event recorded';
+        const creationHover = data.creationFile
+            ? `onmouseenter="showFileTooltip(event, '${data.creationFile.replace(/'/g, "\\'")}', ${data.creationLine}, 'Created At')" onmouseleave="hideTooltip()"`
+            : '';
+        const firstUseHover = data.file
+            ? `onmouseenter="showFileTooltip(event, '${data.file.replace(/'/g, "\\'")}', ${data.line}, 'First Use')" onmouseleave="hideTooltip()"`
+            : '';
         html += `
             <tr class="lock-row ${selectedClass}" onclick="toggleLock('${data.lock}')">
                 <td class="lock-table-checkbox">
@@ -385,8 +391,8 @@ function updateLockFilter() {
                 <td class="lock-stat">${formatDuration(data.totalWait)}</td>
                 <td class="lock-stat">${data.attempts}</td>
                 <td class="lock-stat">${formatDuration(data.maxWait)}</td>
-                <td class="lock-file" title="${creationTitle}">${creationDisplay}</td>
-                <td class="lock-file" title="${data.file}:${data.line}">${strippedFile}:${data.line}</td>
+                <td class="lock-file" ${creationHover}>${creationDisplay}</td>
+                <td class="lock-file" ${firstUseHover}>${strippedFile}:${data.line}</td>
             </tr>
         `;
     }
@@ -605,19 +611,19 @@ function renderTimeline() {
 
         // Use creation location as primary identity if available
         const creation = lockCreationLocations[lock];
-        let lockLabel, fullLockLabel;
+        let lockLabel, headerHover;
         if (creation) {
             const strippedCreationFile = stripCommonPrefix(creation.file);
             lockLabel = `${lock} [${lockType} @ ${strippedCreationFile}:${creation.line}]`;
-            fullLockLabel = `Created at: ${creation.file}:${creation.line}`;
+            headerHover = `onmouseenter="showFileTooltip(event, '${creation.file.replace(/'/g, "\\'")}', ${creation.line}, 'Created At')" onmouseleave="hideTooltip()"`;
         } else {
             lockLabel = `${lock} [${lockType}]`;
-            fullLockLabel = `Lock address: ${lock}`;
+            headerHover = '';
         }
 
         // Create a group container for this lock
         html += `<div class="timeline-lock-group">`;
-        html += `<div class="timeline-lock-header" title="${fullLockLabel}">${lockLabel}</div>`;
+        html += `<div class="timeline-lock-header" ${headerHover}>${lockLabel}</div>`;
 
         // Sort locations by total span time (most active first)
         const sortedLocations = Object.keys(locationGroups).sort((a, b) => {
@@ -631,10 +637,13 @@ function renderTimeline() {
         sortedLocations.forEach(location => {
             const locationEvents = locationGroups[location];
             const spans = buildSpans(locationEvents);
-            const strippedLocation = stripCommonPrefix(location.split(':')[0]) + ':' + location.split(':')[1];
+            const locationFile = location.split(':')[0];
+            const locationLine = parseInt(location.split(':')[1]) || 0;
+            const strippedLocation = stripCommonPrefix(locationFile) + ':' + locationLine;
+            const trackHover = `onmouseenter="showFileTooltip(event, '${locationFile.replace(/'/g, "\\'")}', ${locationLine}, 'Location')" onmouseleave="hideTooltip()"`;
 
             html += `<div class="timeline-track">`;
-            html += `<div class="timeline-track-label" title="${location}">${strippedLocation}</div>`;
+            html += `<div class="timeline-track-label" ${trackHover}>${strippedLocation}</div>`;
 
             // Render spans
             spans.forEach(span => {
@@ -728,6 +737,84 @@ function resetZoom() {
 function formatTime(ns) {
     const ms = ns / 1_000_000;
     return ms.toFixed(3) + 'ms';
+}
+
+// Cache for fetched code snippets
+let snippetCache = {};
+
+/**
+ * Fetch a code snippet from the server.
+ * Returns a promise that resolves to the snippet HTML.
+ */
+async function fetchSnippet(filePath, line) {
+    const cacheKey = `${filePath}:${line}`;
+    if (snippetCache[cacheKey]) {
+        return snippetCache[cacheKey];
+    }
+
+    try {
+        const response = await fetch(`/api/snippet?file=${encodeURIComponent(filePath)}&line=${line}&context=3`);
+        const data = await response.json();
+
+        if (data.error || !data.lines || data.lines.length === 0) {
+            snippetCache[cacheKey] = '';
+            return '';
+        }
+
+        const linesHtml = data.lines.map(l => {
+            const lineClass = l.is_target ? 'snippet-line snippet-target' : 'snippet-line';
+            const escapedContent = escapeHtml(l.content);
+            return `<div class="${lineClass}"><span class="snippet-line-number">${l.number}</span><span class="snippet-code">${escapedContent}</span></div>`;
+        }).join('');
+
+        const snippetHtml = `<div class="snippet-container">${linesHtml}</div>`;
+        snippetCache[cacheKey] = snippetHtml;
+        return snippetHtml;
+    } catch (error) {
+        console.error('Error fetching snippet:', error);
+        snippetCache[cacheKey] = '';
+        return '';
+    }
+}
+
+/**
+ * Escape HTML entities to prevent XSS.
+ */
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+/**
+ * Show a tooltip with a code snippet for a file location.
+ */
+async function showFileTooltip(mouseEvent, filePath, line, label) {
+    const tooltip = document.getElementById('tooltip');
+
+    // Reconstruct full path if it was stripped
+    const fullPath = filePath.startsWith('/') ? filePath : (commonPathPrefix + filePath);
+
+    // Show tooltip immediately with loading state
+    tooltip.innerHTML = `
+        <div class="tooltip-row"><span class="tooltip-label">${label}:</span>${filePath}:${line}</div>
+        <div class="snippet-loading">Loading code...</div>
+    `;
+
+    tooltip.style.left = (mouseEvent.clientX + 10) + 'px';
+    tooltip.style.top = (mouseEvent.clientY + 10) + 'px';
+    tooltip.classList.add('visible');
+
+    // Fetch and display snippet
+    if (line > 0) {
+        const snippet = await fetchSnippet(fullPath, line);
+        if (tooltip.classList.contains('visible')) {
+            tooltip.innerHTML = `
+                <div class="tooltip-row"><span class="tooltip-label">${label}:</span>${filePath}:${line}</div>
+                ${snippet || '<div class="snippet-loading">Could not load source</div>'}
+            `;
+        }
+    }
 }
 
 /**
