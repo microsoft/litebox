@@ -136,6 +136,25 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
 
     /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
     fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
+
+    /// Get static backing data for a file, if available and supported.
+    ///
+    /// This method returns the underlying static data slice if the file's contents are backed
+    /// by borrowed static data (e.g., loaded via `initialize_primarily_read_heavy_file` with
+    /// a `Cow::Borrowed` slice). This is useful for enabling copy-on-write memory mappings
+    /// where the platform can re-mmap the original file instead of copying data.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(&'static [u8])` if the file is backed by static borrowed data
+    /// - `None` if the file has been modified (owned data) or the file system doesn't support this
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `None`, indicating no static backing data is available/supported.
+    fn get_static_backing_data(&self, _fd: &TypedFd<Self>) -> Option<&'static [u8]> {
+        None
+    }
 }
 
 bitflags! {

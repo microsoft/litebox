@@ -91,6 +91,17 @@ fn mmapped_file_data(path: impl AsRef<Path>) -> Result<&'static [u8]> {
     )?)))
 }
 
+/// Load a file via mmap and return both the data and the absolute path.
+///
+/// The returned path can be used to register COW regions with the platform.
+fn mmapped_file_data_with_path(path: impl AsRef<Path>) -> Result<(&'static [u8], PathBuf)> {
+    let path = path.as_ref();
+    let abs_path = std::path::absolute(path)
+        .map_err(|e| anyhow!("Could not get absolute path for {}: {}", path.display(), e))?;
+    let data = mmapped_file_data(path)?;
+    Ok((data, abs_path))
+}
+
 /// Run Linux programs with LiteBox on unmodified Linux
 ///
 /// # Panics
@@ -104,6 +115,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             "this should (hopefully soon) have a nicer interface to support loading in files"
         )
     }
+
+    // Collect COW-eligible regions: (data, path) pairs for files that can use COW mappings.
+    // These will be registered with the platform after it's created.
+    let mut cow_regions: Vec<(&'static [u8], PathBuf)> = Vec::new();
 
     let (ancestor_modes_and_users, prog_data): (
         Vec<(litebox::fs::Mode, u32)>,
@@ -123,12 +138,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 )
             })
             .collect();
-        let data = mmapped_file_data(prog)?;
+        let (data, prog_path) = mmapped_file_data_with_path(&prog)?;
         let data = if cli_args.rewrite_syscalls {
+            // Rewritten data becomes owned, not eligible for COW
             litebox_syscall_rewriter::hook_syscalls_in_elf(data, None)
                 .unwrap()
                 .into()
         } else {
+            // Original mmap'd data is COW-eligible
+            cow_regions.push((data, prog_path));
             data.into()
         };
         (modes, data)
@@ -137,7 +155,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
             anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
         }
-        mmapped_file_data(tar_file)?
+        let (data, tar_path) = mmapped_file_data_with_path(tar_file)?;
+        cow_regions.push((data, tar_path));
+        data
     } else {
         litebox::fs::tar_ro::EMPTY_TAR_FILE
     };
@@ -148,6 +168,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // systrap/sigsys interception, or binary rewriting interception. Currently
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
+
+    // Register COW-eligible regions with the platform
+    for (data, path) in cow_regions {
+        platform.register_cow_region(data, path);
+    }
+
     litebox_platform_multiplex::set_platform(platform);
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();

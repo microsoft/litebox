@@ -9,12 +9,15 @@
 
 use std::cell::Cell;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
 use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
-use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
+use litebox::platform::page_mgmt::{
+    CowNotSupported, FixedAddressBehavior, MemoryRegionPermissions,
+};
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
@@ -23,6 +26,16 @@ use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall
 mod syscall_intercept;
 
 extern crate alloc;
+
+/// Information about a COW-eligible memory region backed by a file.
+#[derive(Debug, Clone)]
+struct CowRegionInfo {
+    /// The path to the backing file on the host filesystem.
+    file_path: PathBuf,
+    /// The offset within the file where this region's data starts.
+    /// This is always 0 for regions registered via `register_cow_region`.
+    file_offset: usize,
+}
 
 /// The userland Linux platform.
 ///
@@ -36,6 +49,12 @@ pub struct LinuxUserland {
     reserved_pages: Vec<core::ops::Range<usize>>,
     /// The base address of the VDSO.
     vdso_address: Option<usize>,
+    /// Registry of COW-eligible memory regions, mapping address ranges to file information.
+    /// The key is the start address of the static slice, and the value contains the file path
+    /// and length information needed to re-mmap the file.
+    ///
+    /// TODO: Consider using file descriptors instead of paths if performance becomes an issue.
+    cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, (usize, CowRegionInfo)>>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -159,8 +178,72 @@ impl LinuxUserland {
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages,
             vdso_address,
+            cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
         };
         Box::leak(Box::new(platform))
+    }
+
+    /// Register a COW-eligible memory region backed by a file.
+    ///
+    /// When `try_allocate_cow_pages` is called with a source_data slice that falls within
+    /// a registered region, the platform can use the host's mmap with `MAP_PRIVATE` to
+    /// create an efficient copy-on-write mapping instead of performing a memcpy.
+    ///
+    /// # Parameters
+    ///
+    /// - `data`: The static slice that was mmap'd from the file
+    /// - `file_path`: The path to the file on the host filesystem
+    ///
+    /// # Panics
+    ///
+    /// Panics if a region with the same start address is already registered.
+    pub fn register_cow_region(&self, data: &'static [u8], file_path: impl Into<PathBuf>) {
+        let start = data.as_ptr() as usize;
+        let len = data.len();
+        let info = CowRegionInfo {
+            file_path: file_path.into(),
+            file_offset: 0,
+        };
+
+        let mut regions = self.cow_regions.write().unwrap();
+        let old = regions.insert(start, (len, info));
+        assert!(
+            old.is_none(),
+            "COW region at address {start:#x} already registered"
+        );
+    }
+
+    /// Look up the file backing a static slice for COW mapping.
+    ///
+    /// Returns `Some((file_path, offset_in_file))` if the slice is backed by a registered
+    /// COW region, `None` otherwise.
+    fn lookup_cow_region(
+        &self,
+        source_data: &'static [u8],
+        source_offset: usize,
+    ) -> Option<(PathBuf, usize)> {
+        let slice_start = source_data.as_ptr() as usize;
+        let slice_len = source_data.len();
+
+        let regions = self.cow_regions.read().unwrap();
+
+        // Find the region that contains this slice
+        // Use range query to find potential containing region
+        // We look for regions that start at or before the slice start
+        if let Some((&region_start, (region_len, info))) = regions.range(..=slice_start).next_back()
+        {
+            let region_end = region_start.saturating_add(*region_len);
+            let slice_end = slice_start.saturating_add(slice_len);
+
+            // Check if the slice is fully contained within this region
+            if slice_start >= region_start && slice_end <= region_end {
+                // Calculate the offset within the file
+                let offset_in_region = slice_start - region_start;
+                let file_offset = info.file_offset + offset_in_region + source_offset;
+                return Some((info.file_path.clone(), file_offset));
+            }
+        }
+        None
     }
 
     /// Enable seccomp syscall interception on the platform.
@@ -1441,6 +1524,97 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
         self.reserved_pages.iter()
+    }
+
+    fn try_allocate_cow_pages(
+        &self,
+        suggested_range: core::ops::Range<usize>,
+        source_data: &'static [u8],
+        source_offset: usize,
+        permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, CowNotSupported> {
+        const PAGE_SIZE: usize = 4096;
+
+        // Look up the file backing this static slice
+        let Some((file_path, file_offset)) = self.lookup_cow_region(source_data, source_offset)
+        else {
+            return Err(CowNotSupported);
+        };
+
+        // Check alignment - host mmap requires page-aligned offsets
+        if !file_offset.is_multiple_of(PAGE_SIZE) {
+            return Err(CowNotSupported);
+        }
+
+        // Open the file
+        let Ok(file_path_cstr) = std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes())
+        else {
+            return Err(CowNotSupported);
+        };
+
+        let fd = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::open,
+                file_path_cstr.as_ptr() as usize,
+                OFlags::RDONLY.bits() as usize,
+                0,
+            )
+        };
+
+        let Ok(fd) = fd else {
+            return Err(CowNotSupported);
+        };
+
+        // Build mmap flags - MAP_PRIVATE for COW semantics
+        let mut flags = MapFlags::MAP_PRIVATE;
+        match fixed_address_behavior {
+            FixedAddressBehavior::Hint => {}
+            FixedAddressBehavior::Replace => flags |= MapFlags::MAP_FIXED,
+            FixedAddressBehavior::NoReplace => flags |= MapFlags::MAP_FIXED_NOREPLACE,
+        }
+
+        // Perform the file-backed mmap
+        let result = unsafe {
+            syscalls::syscall6(
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        syscalls::Sysno::mmap
+                    }
+                    #[cfg(target_arch = "x86")]
+                    {
+                        syscalls::Sysno::mmap2
+                    }
+                },
+                suggested_range.start,
+                suggested_range.len(),
+                prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
+                (flags.bits().reinterpret_as_unsigned()
+                    // This is to ensure it won't be intercepted by Seccomp if enabled.
+                    | syscall_intercept::MMAP_FLAG_MAGIC) as usize,
+                fd,
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        file_offset
+                    }
+                    #[cfg(target_arch = "x86")]
+                    {
+                        // mmap2 takes offset in pages, not bytes
+                        file_offset / PAGE_SIZE
+                    }
+                },
+            )
+        };
+
+        // Close the file descriptor regardless of mmap result
+        let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) };
+
+        match result {
+            Ok(ptr) => Ok(UserMutPtr::from_usize(ptr)),
+            Err(_) => Err(CowNotSupported),
+        }
     }
 }
 

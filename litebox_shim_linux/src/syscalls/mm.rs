@@ -5,13 +5,32 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use litebox::{
+    fs::FileSystem as _,
     mm::linux::{MappingError, PAGE_SIZE},
-    platform::RawMutPointer,
+    platform::{
+        PageManagementProvider, RawConstPointer, RawMutPointer,
+        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
+    },
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 use crate::MutPtr;
 use crate::Task;
+
+/// Convert `ProtFlags` to `MemoryRegionPermissions` for use with COW allocation.
+fn prot_to_permissions(prot: &ProtFlags) -> MemoryRegionPermissions {
+    let mut perms = MemoryRegionPermissions::empty();
+    if prot.contains(ProtFlags::PROT_READ) {
+        perms |= MemoryRegionPermissions::READ;
+    }
+    if prot.contains(ProtFlags::PROT_WRITE) {
+        perms |= MemoryRegionPermissions::WRITE;
+    }
+    if prot.contains(ProtFlags::PROT_EXEC) {
+        perms |= MemoryRegionPermissions::EXEC;
+    }
+    perms
+}
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -64,6 +83,127 @@ impl Task {
     }
 
     fn do_mmap_file(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Result<MutPtr<u8>, MappingError> {
+        // Try COW allocation if the file has static backing data
+        if let Some(cow_result) =
+            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset)
+        {
+            return cow_result;
+        }
+
+        // Fall back to page-by-page memcpy
+        self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)
+    }
+
+    /// Attempt to create a COW mapping for a file with static backing data.
+    ///
+    /// Returns `Some(result)` if COW was attempted (success or failure),
+    /// `None` if COW is not applicable (fall back to memcpy).
+    #[allow(clippy::items_after_statements)]
+    fn try_cow_mmap_file(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: &ProtFlags,
+        flags: &MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Option<Result<MutPtr<u8>, MappingError>> {
+        // Only attempt COW for valid file descriptors pointing to file system files
+        let Ok(fd_u32) = u32::try_from(fd) else {
+            return None;
+        };
+
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+        let desc = file_table.get_fd(fd_u32)?;
+
+        let crate::Descriptor::LiteBoxRawFd(raw_fd) = desc else {
+            return None;
+        };
+        let raw_fd = *raw_fd;
+        drop(file_table);
+
+        // Try to get static backing data for this file
+        let static_data = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| self.global.fs.get_static_backing_data(typed_fd),
+                |_| None, // Network fds don't have static backing
+                |_| None, // Pipe fds don't have static backing
+            )
+            .ok()??;
+
+        // Check if offset is within bounds of the static data
+        if offset > static_data.len() {
+            return None;
+        }
+
+        // Calculate the actual mapping range
+        let available_len = static_data.len().saturating_sub(offset);
+        let map_len = len.min(available_len);
+
+        // Determine fixed address behavior
+        let fixed_behavior = if flags.contains(MapFlags::MAP_FIXED) {
+            FixedAddressBehavior::Replace
+        } else {
+            FixedAddressBehavior::Hint
+        };
+
+        // Calculate suggested range
+        let range_start = suggested_addr.unwrap_or(0);
+        let range_end = range_start.saturating_add(len);
+        let suggested_range = range_start..range_end;
+
+        // Convert protection flags to memory permissions
+        let permissions = prot_to_permissions(prot);
+
+        // Get the platform for COW allocation
+        let platform = litebox_platform_multiplex::platform();
+
+        // Attempt COW allocation using fully-qualified syntax to specify the const generic
+        type Platform = litebox_platform_multiplex::Platform;
+        match <Platform as PageManagementProvider<{ PAGE_SIZE }>>::try_allocate_cow_pages(
+            platform,
+            suggested_range,
+            static_data,
+            offset,
+            permissions,
+            fixed_behavior,
+        ) {
+            Ok(ptr) => {
+                // If the requested length exceeds available data, we need to zero-fill the rest.
+                // For simplicity, if map_len < len, fall back to memcpy approach.
+                // Partial-page cases are handled by the fallback path per the design doc.
+                if map_len < len {
+                    // COW succeeded but we need to handle partial data - fall back to memcpy
+                    // First deallocate the COW pages we just allocated
+                    let _ = unsafe {
+                        <Platform as PageManagementProvider<{ PAGE_SIZE }>>::deallocate_pages(
+                            platform,
+                            ptr.as_usize()..ptr.as_usize().saturating_add(len),
+                        )
+                    };
+                    return None;
+                }
+                Some(Ok(ptr))
+            }
+            Err(_cow_not_supported) => {
+                // Platform doesn't support COW, fall back to memcpy
+                None
+            }
+        }
+    }
+
+    /// Fallback mmap implementation using page-by-page memcpy.
+    fn do_mmap_file_memcpy(
         &self,
         suggested_addr: Option<usize>,
         len: usize,

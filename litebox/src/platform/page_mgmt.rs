@@ -172,6 +172,44 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// Note that the returned ranges should be `ALIGN`-aligned.
     fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>>;
+
+    /// Attempt to allocate pages with copy-on-write semantics backed by static data.
+    ///
+    /// This method allows platforms that support it to create COW mappings instead of
+    /// performing expensive page-by-page memory copies. This is particularly useful when
+    /// mapping pre-loaded file data that was mmap'd by the host.
+    ///
+    /// # Parameters
+    ///
+    /// - `suggested_range`: The suggested address range for the allocation.
+    /// - `source_data`: A reference to static data that should back the COW mapping.
+    /// - `source_offset`: The offset within the source data where the mapping should start.
+    /// - `permissions`: The permissions to apply to the allocated memory region.
+    /// - `fixed_address_behavior`: Specifies the required semantics of `suggested_range`.
+    ///
+    /// # Returns
+    ///
+    /// On success, returns a raw mutable pointer to the start of the allocated
+    /// memory region. Returns `Err(CowNotSupported)` if the platform does not
+    /// support COW mappings (either in general, or for the specific parameters
+    /// provided), indicating the caller should fall back to explicit memory
+    /// copying.
+    ///
+    /// # Default Implementation
+    ///
+    /// The default implementation returns `Err(CowNotSupported)`, indicating that the
+    /// platform does not support COW mappings. Platforms that do support COW should
+    /// override this method to unlock better performance.
+    fn try_allocate_cow_pages(
+        &self,
+        _suggested_range: Range<usize>,
+        _source_data: &'static [u8],
+        _source_offset: usize,
+        _permissions: MemoryRegionPermissions,
+        _fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, CowNotSupported> {
+        Err(CowNotSupported)
+    }
 }
 
 /// Behavior when allocating pages at a fixed address.
@@ -241,3 +279,12 @@ pub enum PermissionUpdateError {
     #[error("provided range contains unallocated pages")]
     Unallocated,
 }
+
+/// Error returned when COW allocation is not supported by the platform.
+///
+/// This is used as the error type for [`PageManagementProvider::try_allocate_cow_pages`]
+/// to indicate that the platform does not support copy-on-write mappings and the caller
+/// should fall back to explicit memory copying.
+#[derive(Error, Debug)]
+#[error("copy-on-write page allocation is not supported by this platform")]
+pub struct CowNotSupported;
