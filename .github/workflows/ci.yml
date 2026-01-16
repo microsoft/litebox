@@ -56,8 +56,8 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_platform_lvbs --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox_runner_optee_on_linux_userland
-          # We exclude `litebox_platform_lvbs` and `litebox_runner_lvbs` because we cannot build them with a stable toolchain.
-          # They depend on the unstable `abi_x86_interrupt` feature. `build_and_test_nightly` cover them.
+          # We exclude `litebox_platform_lvbs` and `litebox_runner_lvbs` because they require
+          # a custom target and nightly features. `build_and_test_lvbs` covers them.
           # `litebox_runner_optee_on_linux_userland` conflicts with `litebox_runner_linux_userland` due to
           # feature unification (`optee_syscall` versus `linux_syscall`). Build it separately for now.
       - run: |

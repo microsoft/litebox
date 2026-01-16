@@ -45,7 +45,6 @@ x86_64 = { version = "0.15.2", default-features = false, features = ["instructio
 default = ["optee_syscall"]
 optee_syscall = []
 linux_syscall = []
-interrupt = ["x86_64/abi_x86_interrupt"]
 
 [lints]
 workspace = true

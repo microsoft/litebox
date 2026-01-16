@@ -38,9 +38,8 @@ default-members = [
     "dev_tests",
     "dev_bench",
 ]
-# We exclude `litebox_runner_lvbs` from `default-members` because its interrupt handling
-# depends on the unstable `abi_x86_interrupt` feature, which requires a nightly toolchain.
-# Once this feature stabilizes, we can add `litebox_runner_lvbs` to `default-members`.
+# We exclude `litebox_runner_lvbs` from `default-members` because it requires
+# a custom target and `-Z build-std`, which requires a nightly toolchain.
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy
