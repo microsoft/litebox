@@ -91,6 +91,7 @@ const CONFIG_MAX_RECORDED_EVENTS: usize = 1_000_000;
 #[non_exhaustive]
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub(crate) enum LockType {
+    RwLock,
     RwLockRead,
     RwLockWrite,
     Mutex,
@@ -204,6 +205,7 @@ impl RecordedEvent {
     fn to_jsonl(&self) -> alloc::string::String {
         use core::fmt::Write;
         let lock_type_str = match self.lock_type {
+            LockType::RwLock => "RwLock",
             LockType::RwLockRead => "RwLockRead",
             LockType::RwLockWrite => "RwLockWrite",
             LockType::Mutex => "Mutex",

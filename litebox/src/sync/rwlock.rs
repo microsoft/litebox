@@ -676,7 +676,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
             .load(core::sync::atomic::Ordering::Relaxed)
         {
             super::lock_tracing::record_lock_destroyed(
-                LockType::RwLockWrite,
+                LockType::RwLock,
                 &raw const self.raw.state,
                 self.creation_file,
                 self.creation_line,
@@ -707,7 +707,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
         use core::sync::atomic::Ordering;
         if !self.creation_registered.swap(true, Ordering::Relaxed) {
             super::lock_tracing::record_lock_created(
-                LockType::RwLockWrite, // Use Write as the canonical type for the lock itself
+                LockType::RwLock,
                 &raw const self.raw.state,
                 self.creation_file,
                 self.creation_line,
@@ -722,7 +722,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for RwLock<Platform, T
         // Only record destruction if the lock was ever registered (i.e., used at least once)
         if *self.creation_registered.get_mut() {
             super::lock_tracing::record_lock_destroyed(
-                LockType::RwLockWrite, // Use Write as the canonical type for the lock itself
+                LockType::RwLock,
                 &raw const self.raw.state,
                 self.creation_file,
                 self.creation_line,
