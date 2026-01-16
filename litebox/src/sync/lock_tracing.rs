@@ -102,6 +102,55 @@ impl core::fmt::Display for LockType {
     }
 }
 
+/// Tracks the creation location and registration state of a lock.
+pub(crate) struct Creation {
+    file: &'static str,
+    line: u32,
+    registered: core::sync::atomic::AtomicBool,
+}
+
+impl Creation {
+    /// Creates a new `Creation` instance, capturing the caller's location.
+    #[inline]
+    #[track_caller]
+    pub(crate) const fn new() -> Self {
+        let loc = core::panic::Location::caller();
+        Self {
+            file: loc.file(),
+            line: loc.line(),
+            registered: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Ensures the lock creation event has been recorded, calling the provided
+    /// closure to get the lock address if registration is needed.
+    #[inline]
+    pub(crate) fn ensure_registered<T>(&self, lock_type: LockType, get_addr: impl FnOnce() -> *const T) {
+        use core::sync::atomic::Ordering;
+        if !self.registered.swap(true, Ordering::Relaxed) {
+            record_lock_created(lock_type, get_addr(), self.file, self.line);
+        }
+    }
+
+    /// Records the lock destruction event if it was ever registered.
+    ///
+    /// Returns `true` if the lock was registered (and thus destruction was recorded),
+    /// `false` otherwise.
+    #[inline]
+    pub(crate) fn record_destruction_if_registered<T>(
+        &mut self,
+        lock_type: LockType,
+        addr: *const T,
+    ) -> bool {
+        if *self.registered.get_mut() {
+            record_lock_destroyed(lock_type, addr, self.file, self.line);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Internal to this tracker: location tracking information
 #[derive(PartialEq, Eq, Clone)]
 struct Location {

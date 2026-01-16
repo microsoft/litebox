@@ -12,11 +12,11 @@ let maxTime = 0;
 let minTimeWithDrops = 0;  // Time threshold accounting for dropped events
 let commonPathPrefix = '';  // Common prefix to strip from file paths
 let lockContention = {};   // Map of lock_addr -> contention duration in ns
-let lockSourceFiles = {};  // Map of lock_addr -> first seen source file (for lock/unlock operations)
+let lockMaxWaitLocations = {};  // Map of lock_addr -> location with max wait time
 let lockCreationLocations = {};  // Map of lock_addr -> creation location (from 'created' events)
 let lockTypes = {};        // Map of lock_addr -> lock type (from 'created' events)
 let zoomLevel = 1;         // Timeline zoom level (1 = 100%)
-let lockTableSortColumn = 'totalWait';  // Current sort column
+let lockTableSortColumn = 'maxWait';  // Current sort column
 let lockTableSortAsc = false;  // Sort direction (false = descending)
 let ignoredUnusedLockCount = 0;  // Count of locks that only had create/destroy events
 
@@ -81,17 +81,17 @@ async function loadData() {
                 }
             }
 
-            // Build lock source file map (for lock/unlock operations, as fallback)
-            lockSourceFiles = {};
-            for (const event of allEvents) {
-                if (!lockSourceFiles[event.lock_addr] &&
-                    (event.event_type === 'attempt' || event.event_type === 'acquired' || event.event_type === 'released')) {
-                    lockSourceFiles[event.lock_addr] = { file: event.file, line: event.line };
+            // Calculate lock contention statistics (also builds max wait locations)
+            lockContention = calculateContention();
+
+            // Build max wait location map from contention data
+            lockMaxWaitLocations = {};
+            for (const lock of Object.keys(lockContention)) {
+                const cont = lockContention[lock];
+                if (cont.maxWaitFile) {
+                    lockMaxWaitLocations[lock] = { file: cont.maxWaitFile, line: cont.maxWaitLine };
                 }
             }
-
-            // Calculate lock contention statistics
-            lockContention = calculateContention();
         }
 
         updateSummary();
@@ -164,7 +164,7 @@ function stripCommonPrefix(filePath) {
  */
 function calculateContention() {
     const contention = {};
-    const pendingAttempts = {};  // Map lock_addr -> array of attempt timestamps
+    const pendingAttempts = {};  // Map lock_addr -> array of {timestamp, file, line}
 
     // Sort events by timestamp for accurate calculation
     const sortedEvents = [...allEvents].sort((a, b) => a.timestamp_ns - b.timestamp_ns);
@@ -173,20 +173,24 @@ function calculateContention() {
         const lock = event.lock_addr;
 
         if (!contention[lock]) {
-            contention[lock] = { totalWait: 0, attempts: 0, maxWait: 0 };
+            contention[lock] = { totalWait: 0, attempts: 0, maxWait: 0, maxWaitFile: '', maxWaitLine: 0 };
         }
         if (!pendingAttempts[lock]) {
             pendingAttempts[lock] = [];
         }
 
         if (event.event_type === 'attempt') {
-            pendingAttempts[lock].push(event.timestamp_ns);
+            pendingAttempts[lock].push({ timestamp: event.timestamp_ns, file: event.file, line: event.line });
         } else if (event.event_type === 'acquired' && pendingAttempts[lock].length > 0) {
-            const attemptTime = pendingAttempts[lock].shift();
-            const waitTime = event.timestamp_ns - attemptTime;
+            const attempt = pendingAttempts[lock].shift();
+            const waitTime = event.timestamp_ns - attempt.timestamp;
             contention[lock].totalWait += waitTime;
             contention[lock].attempts++;
-            contention[lock].maxWait = Math.max(contention[lock].maxWait, waitTime);
+            if (waitTime > contention[lock].maxWait) {
+                contention[lock].maxWait = waitTime;
+                contention[lock].maxWaitFile = attempt.file;
+                contention[lock].maxWaitLine = attempt.line;
+            }
         }
     }
 
@@ -281,7 +285,7 @@ function updateLockFilter() {
     const lockData = Array.from(uniqueLocks).map(lock => {
         const cont = lockContention[lock] || { totalWait: 0, attempts: 0, maxWait: 0 };
         const creation = lockCreationLocations[lock] || null;
-        const source = lockSourceFiles[lock] || { file: '', line: 0 };
+        const maxWaitLoc = lockMaxWaitLocations[lock] || { file: '', line: 0 };
         return {
             lock,
             lockType: lockTypes[lock] || 'unknown',
@@ -290,8 +294,8 @@ function updateLockFilter() {
             maxWait: cont.maxWait,
             creationFile: creation ? creation.file : '',
             creationLine: creation ? creation.line : 0,
-            file: source.file,
-            line: source.line,
+            file: maxWaitLoc.file,
+            line: maxWaitLoc.line,
             selected: selectedLocks.has(lock)
         };
     });
@@ -359,7 +363,7 @@ function updateLockFilter() {
                     <th class="sortable" onclick="sortLockTable('attempts')">Attempts${sortIndicator('attempts')}</th>
                     <th class="sortable" onclick="sortLockTable('maxWait')">Max Wait${sortIndicator('maxWait')}</th>
                     <th class="sortable" onclick="sortLockTable('creation')">Created At${sortIndicator('creation')}</th>
-                    <th class="sortable" onclick="sortLockTable('file')">First Use${sortIndicator('file')}</th>
+                    <th class="sortable" onclick="sortLockTable('file')">Max Wait At${sortIndicator('file')}</th>
                 </tr>
             </thead>
             <tbody>
@@ -378,9 +382,12 @@ function updateLockFilter() {
         const creationHover = data.creationFile
             ? `onmouseenter="showFileTooltip(event, '${data.creationFile.replace(/'/g, "\\'")}', ${data.creationLine}, 'Created At')" onmouseleave="hideTooltip()"`
             : '';
-        const firstUseHover = data.file
-            ? `onmouseenter="showFileTooltip(event, '${data.file.replace(/'/g, "\\'")}', ${data.line}, 'First Use')" onmouseleave="hideTooltip()"`
+        const maxWaitAtHover = data.file
+            ? `onmouseenter="showFileTooltip(event, '${data.file.replace(/'/g, "\\'")}', ${data.line}, 'Max Wait At')" onmouseleave="hideTooltip()"`
             : '';
+        const maxWaitAtDisplay = data.file
+            ? `${strippedFile}:${data.line}`
+            : '<span style="color: #666;">—</span>';
         html += `
             <tr class="lock-row ${selectedClass}" onclick="toggleLock('${data.lock}')">
                 <td class="lock-table-checkbox">
@@ -392,7 +399,7 @@ function updateLockFilter() {
                 <td class="lock-stat">${data.attempts}</td>
                 <td class="lock-stat">${formatDuration(data.maxWait)}</td>
                 <td class="lock-file" ${creationHover}>${creationDisplay}</td>
-                <td class="lock-file" ${firstUseHover}>${strippedFile}:${data.line}</td>
+                <td class="lock-file" ${maxWaitAtHover}>${maxWaitAtDisplay}</td>
             </tr>
         `;
     }

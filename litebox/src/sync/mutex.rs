@@ -183,15 +183,9 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for MutexGuard<'_, Pla
 /// information, thus its [`lock`](Self::lock) functionality directly returns a locked guard.
 pub struct Mutex<Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     raw: SpinEnabledRawMutex<Platform>,
-    /// File where this mutex was created (for lock tracing).
+    /// Creation location and registration state for lock tracing.
     #[cfg(feature = "lock_tracing")]
-    creation_file: &'static str,
-    /// Line where this mutex was created (for lock tracing).
-    #[cfg(feature = "lock_tracing")]
-    creation_line: u32,
-    /// Whether this mutex has been registered with the lock tracer.
-    #[cfg(feature = "lock_tracing")]
-    creation_registered: core::sync::atomic::AtomicBool,
+    creation: super::lock_tracing::Creation,
     // NOTE: `data` must be the last field because T may be ?Sized
     data: UnsafeCell<T>,
 }
@@ -201,19 +195,12 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     #[inline]
     #[cfg_attr(feature = "lock_tracing", track_caller)]
     pub const fn new(val: T) -> Self {
-        #[cfg(feature = "lock_tracing")]
-        let loc = core::panic::Location::caller();
-
         Self {
             raw: SpinEnabledRawMutex::new(
                 <Platform as crate::platform::RawMutexProvider>::RawMutex::INIT,
             ),
             #[cfg(feature = "lock_tracing")]
-            creation_file: loc.file(),
-            #[cfg(feature = "lock_tracing")]
-            creation_line: loc.line(),
-            #[cfg(feature = "lock_tracing")]
-            creation_registered: core::sync::atomic::AtomicBool::new(false),
+            creation: super::lock_tracing::Creation::new(),
             data: UnsafeCell::new(val),
         }
     }
@@ -231,7 +218,8 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, Platform, T> {
         #[cfg(feature = "lock_tracing")]
-        self.ensure_creation_registered();
+        self.creation
+            .ensure_registered(LockType::Mutex, || self.raw.raw.underlying_atomic());
 
         #[cfg(feature = "lock_tracing")]
         let attempt = super::lock_tracing::LockTracker::begin_lock_attempt(
@@ -256,33 +244,12 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
         // SAFETY: We have &mut self, so no other threads can have access to the data.
         unsafe { &mut *self.data.get() }
     }
-
-    /// Ensures that the lock creation event has been recorded.
-    #[cfg(feature = "lock_tracing")]
-    fn ensure_creation_registered(&self) {
-        use core::sync::atomic::Ordering;
-        if !self.creation_registered.swap(true, Ordering::Relaxed) {
-            super::lock_tracing::record_lock_created(
-                LockType::Mutex,
-                self.raw.raw.underlying_atomic(),
-                self.creation_file,
-                self.creation_line,
-            );
-        }
-    }
 }
 
 #[cfg(feature = "lock_tracing")]
 impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for Mutex<Platform, T> {
     fn drop(&mut self) {
-        // Only record destruction if the lock was ever registered (i.e., used at least once)
-        if *self.creation_registered.get_mut() {
-            super::lock_tracing::record_lock_destroyed(
-                LockType::Mutex,
-                self.raw.raw.underlying_atomic(),
-                self.creation_file,
-                self.creation_line,
-            );
-        }
+        self.creation
+            .record_destruction_if_registered(LockType::Mutex, self.raw.raw.underlying_atomic());
     }
 }

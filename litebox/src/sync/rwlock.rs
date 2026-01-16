@@ -394,15 +394,9 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
 /// information.
 pub struct RwLock<Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     raw: RawRwLock<Platform>,
-    /// File where this rwlock was created (for lock tracing).
+    /// Creation location and registration state for lock tracing.
     #[cfg(feature = "lock_tracing")]
-    creation_file: &'static str,
-    /// Line where this rwlock was created (for lock tracing).
-    #[cfg(feature = "lock_tracing")]
-    creation_line: u32,
-    /// Whether this rwlock has been registered with the lock tracer.
-    #[cfg(feature = "lock_tracing")]
-    creation_registered: core::sync::atomic::AtomicBool,
+    creation: super::lock_tracing::Creation,
     // NOTE: `data` must be the last field because T may be ?Sized
     data: UnsafeCell<T>,
 }
@@ -607,17 +601,10 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     #[inline]
     #[cfg_attr(feature = "lock_tracing", track_caller)]
     pub const fn new(val: T) -> Self {
-        #[cfg(feature = "lock_tracing")]
-        let loc = core::panic::Location::caller();
-
         Self {
             raw: RawRwLock::new(),
             #[cfg(feature = "lock_tracing")]
-            creation_file: loc.file(),
-            #[cfg(feature = "lock_tracing")]
-            creation_line: loc.line(),
-            #[cfg(feature = "lock_tracing")]
-            creation_registered: core::sync::atomic::AtomicBool::new(false),
+            creation: super::lock_tracing::Creation::new(),
             data: UnsafeCell::new(val),
         }
     }
@@ -628,7 +615,8 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     #[track_caller]
     pub fn read(&self) -> RwLockReadGuard<'_, Platform, T> {
         #[cfg(feature = "lock_tracing")]
-        self.ensure_creation_registered();
+        self.creation
+            .ensure_registered(LockType::RwLock, || &raw const self.raw.state);
 
         #[cfg(feature = "lock_tracing")]
         let attempt = super::lock_tracing::LockTracker::begin_lock_attempt(
@@ -647,7 +635,8 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     #[track_caller]
     pub fn write(&self) -> RwLockWriteGuard<'_, Platform, T> {
         #[cfg(feature = "lock_tracing")]
-        self.ensure_creation_registered();
+        self.creation
+            .ensure_registered(LockType::RwLock, || &raw const self.raw.state);
 
         #[cfg(feature = "lock_tracing")]
         let attempt = super::lock_tracing::LockTracker::begin_lock_attempt(
@@ -667,21 +656,13 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     /// Since this function consumes `self`, it is guaranteed that no other thread has borrowed it
     /// or has unreleased locks.
     #[inline]
-    pub fn into_inner(self) -> T {
+    #[cfg_attr(not(feature = "lock_tracing"), allow(unused_mut))]
+    pub fn into_inner(mut self) -> T {
         // Record destruction event before consuming self, since Drop won't run
         // after we use ManuallyDrop. Only record if the lock was ever registered.
         #[cfg(feature = "lock_tracing")]
-        if self
-            .creation_registered
-            .load(core::sync::atomic::Ordering::Relaxed)
-        {
-            super::lock_tracing::record_lock_destroyed(
-                LockType::RwLock,
-                &raw const self.raw.state,
-                self.creation_file,
-                self.creation_line,
-            );
-        }
+        self.creation
+            .record_destruction_if_registered(LockType::RwLock, &raw const self.raw.state);
 
         // Prevent Drop from running since we're manually handling destruction
         let this = core::mem::ManuallyDrop::new(self);
@@ -700,34 +681,13 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     pub fn get_mut(&mut self) -> &mut T {
         self.data.get_mut()
     }
-
-    /// Ensures that the lock creation event has been recorded.
-    #[cfg(feature = "lock_tracing")]
-    fn ensure_creation_registered(&self) {
-        use core::sync::atomic::Ordering;
-        if !self.creation_registered.swap(true, Ordering::Relaxed) {
-            super::lock_tracing::record_lock_created(
-                LockType::RwLock,
-                &raw const self.raw.state,
-                self.creation_file,
-                self.creation_line,
-            );
-        }
-    }
 }
 
 #[cfg(feature = "lock_tracing")]
 impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for RwLock<Platform, T> {
     fn drop(&mut self) {
-        // Only record destruction if the lock was ever registered (i.e., used at least once)
-        if *self.creation_registered.get_mut() {
-            super::lock_tracing::record_lock_destroyed(
-                LockType::RwLock,
-                &raw const self.raw.state,
-                self.creation_file,
-                self.creation_line,
-            );
-        }
+        self.creation
+            .record_destruction_if_registered(LockType::RwLock, &raw const self.raw.state);
     }
 }
 
