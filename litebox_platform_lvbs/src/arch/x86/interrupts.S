@@ -110,20 +110,44 @@
 /* Vector 0: Divide Error (#DE) - No error code */
 isr_no_err_code isr_divide_error divide_error_handler_impl
 
+/* Vector 1: Debug (#DB) - No error code */
+isr_no_err_code isr_debug debug_handler_impl
+
 /* Vector 3: Breakpoint (#BP) - No error code */
 isr_no_err_code isr_breakpoint breakpoint_handler_impl
+
+/* Vector 4: Overflow (#OF) - No error code */
+isr_no_err_code isr_overflow overflow_handler_impl
+
+/* Vector 5: Bound Range Exceeded (#BR) - No error code */
+isr_no_err_code isr_bound_range_exceeded bound_range_exceeded_handler_impl
 
 /* Vector 6: Invalid Opcode (#UD) - No error code */
 isr_no_err_code isr_invalid_opcode invalid_opcode_handler_impl
 
+/* Vector 7: Device Not Available (#NM) - No error code */
+isr_no_err_code isr_device_not_available device_not_available_handler_impl
+
 /* Vector 8: Double Fault (#DF) - Error code (always 0) */
 isr_with_err_code isr_double_fault double_fault_handler_impl
+
+/* Vector 12: Stack-Segment Fault (#SS) - Error code */
+isr_with_err_code isr_stack_segment_fault stack_segment_fault_handler_impl
 
 /* Vector 13: General Protection Fault (#GP) - Error code */
 isr_with_err_code isr_general_protection_fault general_protection_fault_handler_impl
 
 /* Vector 14: Page Fault (#PF) - Error code */
 isr_with_err_code isr_page_fault page_fault_handler_impl
+
+/* Vector 16: x87 Floating-Point Exception (#MF) - No error code */
+isr_no_err_code isr_x87_floating_point x87_floating_point_handler_impl
+
+/* Vector 17: Alignment Check (#AC) - Error code */
+isr_with_err_code isr_alignment_check alignment_check_handler_impl
+
+/* Vector 19: SIMD Floating-Point Exception (#XM) - No error code */
+isr_no_err_code isr_simd_floating_point simd_floating_point_handler_impl
 
 /* Hypervisor synthetic interrupt handler (vector 0xf3) */
 isr_no_err_code isr_hyperv_sint hyperv_sint_handler_impl
