@@ -468,7 +468,6 @@ body {
     padding: 0.75rem;
     font-size: 0.8rem;
     z-index: 1000;
-    pointer-events: none;
     max-width: 600px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
     display: none;
@@ -497,7 +496,9 @@ body {
     font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;
     font-size: 0.75rem;
     overflow-x: auto;
+    overflow-y: auto;
     max-width: 500px;
+    max-height: 300px;
 }
 
 .snippet-line {

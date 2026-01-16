@@ -753,7 +753,8 @@ async function fetchSnippet(filePath, line) {
     }
 
     try {
-        const response = await fetch(`/api/snippet?file=${encodeURIComponent(filePath)}&line=${line}&context=3`);
+        // Fetch ~10 lines of context around the target line
+        const response = await fetch(`/api/snippet?file=${encodeURIComponent(filePath)}&line=${line}&context=10`);
         const data = await response.json();
 
         if (data.error || !data.lines || data.lines.length === 0) {
@@ -787,9 +788,28 @@ function escapeHtml(text) {
 }
 
 /**
+ * Scroll the snippet container to show the highlighted line with ~5 lines of context above.
+ */
+function scrollToHighlightedLine(tooltip) {
+    const container = tooltip.querySelector('.snippet-container');
+    const targetLine = tooltip.querySelector('.snippet-target');
+    if (container && targetLine) {
+        // Get the height of a single line
+        const lineHeight = targetLine.offsetHeight;
+        // Calculate position to show ~5 lines above the target
+        const targetOffset = targetLine.offsetTop - container.offsetTop;
+        const scrollPosition = Math.max(0, targetOffset - (lineHeight * 5));
+        container.scrollTop = scrollPosition;
+    }
+}
+
+/**
  * Show a tooltip with a code snippet for a file location.
  */
 async function showFileTooltip(mouseEvent, filePath, line, label) {
+    // Cancel any pending hide
+    keepTooltipVisible();
+
     const tooltip = document.getElementById('tooltip');
 
     // Show tooltip immediately with loading state
@@ -810,6 +830,8 @@ async function showFileTooltip(mouseEvent, filePath, line, label) {
                 <div class="tooltip-row"><span class="tooltip-label">${label}:</span>${filePath}:${line}</div>
                 ${snippet || '<div class="snippet-loading">Could not load source</div>'}
             `;
+            // Auto-scroll to the highlighted line in the snippet
+            scrollToHighlightedLine(tooltip);
         }
     }
 }
@@ -818,6 +840,9 @@ async function showFileTooltip(mouseEvent, filePath, line, label) {
  * Show the tooltip for a span.
  */
 function showSpanTooltip(mouseEvent, spanType, duration, lock, location) {
+    // Cancel any pending hide
+    keepTooltipVisible();
+
     const tooltip = document.getElementById('tooltip');
     const spanLabel = spanType === 'waiting' ? 'Waiting' : 'Holding';
     const cont = lockContention[lock];
@@ -844,10 +869,37 @@ function showSpanTooltip(mouseEvent, spanType, duration, lock, location) {
     tooltip.classList.add('visible');
 }
 
+// Timer for delayed tooltip hiding
+let tooltipHideTimer = null;
+
 /**
- * Hide the tooltip.
+ * Hide the tooltip after a short delay.
+ * The delay allows users to move their mouse to the tooltip.
  */
 function hideTooltip() {
+    tooltipHideTimer = setTimeout(() => {
+        document.getElementById('tooltip').classList.remove('visible');
+    }, 150);
+}
+
+/**
+ * Cancel any pending tooltip hide and keep it visible.
+ */
+function keepTooltipVisible() {
+    if (tooltipHideTimer) {
+        clearTimeout(tooltipHideTimer);
+        tooltipHideTimer = null;
+    }
+}
+
+/**
+ * Hide the tooltip immediately (used when leaving the tooltip itself).
+ */
+function hideTooltipNow() {
+    if (tooltipHideTimer) {
+        clearTimeout(tooltipHideTimer);
+        tooltipHideTimer = null;
+    }
     document.getElementById('tooltip').classList.remove('visible');
 }
 
@@ -901,6 +953,11 @@ document.addEventListener('DOMContentLoaded', () => {
         updateTimeRangeDisplay();
         renderTimeline();
     });
+
+    // Tooltip hover handlers - keep tooltip visible when mouse is over it
+    const tooltip = document.getElementById('tooltip');
+    tooltip.addEventListener('mouseenter', keepTooltipVisible);
+    tooltip.addEventListener('mouseleave', hideTooltipNow);
 
     // Initial load
     loadData().then(() => {
