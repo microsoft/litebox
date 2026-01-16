@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 /**
  * Lock Viewer - Interactive timeline visualization for lock traces.
  */

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 """
 Lock Viewer - A Flask server for visualizing LiteBox lock trace data.
 

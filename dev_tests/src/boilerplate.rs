@@ -94,6 +94,22 @@ const HEADERS_REQUIRED_PREFIX: &[(&str, &str)] = &[
         "S",
         "/* Copyright (c) Microsoft Corporation.\n   Licensed under the MIT license. */\n\n",
     ),
+    (
+        "html",
+        "<!-- Copyright (c) Microsoft Corporation.\n     Licensed under the MIT license. -->\n",
+    ),
+    (
+        "css",
+        "/* Copyright (c) Microsoft Corporation.\n   Licensed under the MIT license. */\n",
+    ),
+    (
+        "js",
+        "// Copyright (c) Microsoft Corporation.\n// Licensed under the MIT license.\n\n",
+    ),
+    (
+        "py",
+        "#!/usr/bin/env python3\n\n# Copyright (c) Microsoft Corporation.\n# Licensed under the MIT license.\n",
+    ),
     ("2", ""),
     ("6", ""),
     ("elf", ""),
