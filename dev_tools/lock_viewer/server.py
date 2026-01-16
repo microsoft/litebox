@@ -110,8 +110,6 @@ def main():
     
     print(f"🔒 Lock Viewer starting on http://localhost:{args.port}")
     print(f"   Reading events from: {args.file}")
-    print()
-    print("   Tip: Use 'uv run python3 server.py' for automatic dependency management")
     
     app.run(host="0.0.0.0", port=args.port, debug=True)
 
