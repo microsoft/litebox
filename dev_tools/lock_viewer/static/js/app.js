@@ -792,9 +792,6 @@ function escapeHtml(text) {
 async function showFileTooltip(mouseEvent, filePath, line, label) {
     const tooltip = document.getElementById('tooltip');
 
-    // Reconstruct full path if it was stripped
-    const fullPath = filePath.startsWith('/') ? filePath : (commonPathPrefix + filePath);
-
     // Show tooltip immediately with loading state
     tooltip.innerHTML = `
         <div class="tooltip-row"><span class="tooltip-label">${label}:</span>${filePath}:${line}</div>
@@ -807,7 +804,7 @@ async function showFileTooltip(mouseEvent, filePath, line, label) {
 
     // Fetch and display snippet
     if (line > 0) {
-        const snippet = await fetchSnippet(fullPath, line);
+        const snippet = await fetchSnippet(filePath, line);
         if (tooltip.classList.contains('visible')) {
             tooltip.innerHTML = `
                 <div class="tooltip-row"><span class="tooltip-label">${label}:</span>${filePath}:${line}</div>
