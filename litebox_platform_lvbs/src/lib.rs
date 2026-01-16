@@ -867,10 +867,39 @@ impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKerne
 
     unsafe fn protect(
         &self,
-        _pages: Self::PhysPageAddrArray,
-        _perms: PhysPageMapPermissions,
+        pages: Self::PhysPageAddrArray,
+        perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError> {
-        todo!("use hypercall to protect/unprotect physical pages")
+        let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
+        let phys_end = x86_64::PhysAddr::new(
+            pages
+                .last()
+                .unwrap()
+                .as_usize()
+                .checked_add(ALIGN)
+                .ok_or(PhysPointerError::Overflow)? as u64,
+        );
+        let frame_range = if ALIGN == PAGE_SIZE {
+            PhysFrame::range(
+                PhysFrame::<Size4KiB>::containing_address(phys_start),
+                PhysFrame::<Size4KiB>::containing_address(phys_end),
+            )
+        } else {
+            unimplemented!("ALIGN other than 4KiB is not supported yet")
+        };
+
+        let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
+            // VTL1 wants to write data to the pages, preventing VTL0 from reading/executing the pages.
+            crate::mshv::heki::MemAttr::empty()
+        } else if perms.contains(PhysPageMapPermissions::READ) {
+            // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
+            crate::mshv::heki::MemAttr::MEM_ATTR_READ | crate::mshv::heki::MemAttr::MEM_ATTR_EXEC
+        } else {
+            // VTL1 no longer protects the pages.
+            crate::mshv::heki::MemAttr::all()
+        };
+        crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
+            .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))
     }
 }
 
