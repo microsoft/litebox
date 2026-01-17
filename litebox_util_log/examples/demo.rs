@@ -146,7 +146,27 @@ fn main() {
     demonstrate_instrument();
     println!();
 
+    // -------------------------------------------------------------------------
+    // Instrument on struct methods with &self
+    // -------------------------------------------------------------------------
+    println!("--- Instrument on Struct Methods ---");
+    demonstrate_struct_methods();
+    println!();
+
     println!("=== Demo Complete ===");
+}
+
+/// Demonstrates #[instrument] on struct methods that take &self or &mut self.
+fn demonstrate_struct_methods() {
+    let mut calc = Calculator::new("MyCalc", 2);
+
+    // Test method with &self
+    let product = calc.multiply(6, 7);
+    info!(product:?; "multiply returned");
+
+    // Test method with &mut self
+    calc.set_precision(4);
+    info!(precision:? = calc.precision; "precision updated");
 }
 
 /// Simulates a realistic request handling scenario with nested spans and logging.
@@ -271,4 +291,36 @@ fn my_internal_function() {
 fn double_value(x: i32) -> i32 {
     debug!("Doubling the value");
     x * 2
+}
+
+// -------------------------------------------------------------------------
+// Test: #[instrument] on struct methods with &self
+// -------------------------------------------------------------------------
+
+struct Calculator {
+    name: String,
+    precision: u32,
+}
+
+impl Calculator {
+    fn new(name: &str, precision: u32) -> Self {
+        Self {
+            name: name.to_string(),
+            precision,
+        }
+    }
+
+    /// Method with &self - testing #[instrument] on methods
+    #[instrument(level = debug)]
+    fn multiply(&self, a: i32, b: i32) -> i32 {
+        debug!(calculator_name:% = &self.name; "Using calculator");
+        a * b
+    }
+
+    /// Method with &mut self
+    #[instrument(level = info, skip_all)]
+    fn set_precision(&mut self, new_precision: u32) {
+        info!("Updating precision");
+        self.precision = new_precision;
+    }
 }
