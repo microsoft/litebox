@@ -75,7 +75,7 @@ pub(crate) fn init() {
     );
 
     assert!(
-        (mshv_vsm_secure_config_vtl0().is_ok()),
+        mshv_vsm_secure_config_vtl0().is_ok(),
         "Failed to secure VTL0 configuration"
     );
 

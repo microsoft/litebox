@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 litebox = { version = "0.1.0", path = "../litebox" }
-litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", default-features = false, features = ["interrupt"] }
+litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", default-features = false }
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_lvbs"] }
 litebox_shim_optee = { path = "../litebox_shim_optee/", version = "0.1.0" }
 

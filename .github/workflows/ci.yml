@@ -54,10 +54,10 @@ jobs:
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_platform_lvbs --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox_runner_optee_on_linux_userland
-          # We exclude `litebox_platform_lvbs` and `litebox_runner_lvbs` because we cannot build them with a stable toolchain.
-          # They depend on the unstable `abi_x86_interrupt` feature. `build_and_test_nightly` cover them.
+          # We exclude `litebox_runner_lvbs` because it requires a custom target and nightly
+          # features. `build_and_test_lvbs` covers it.
           # `litebox_runner_optee_on_linux_userland` conflicts with `litebox_runner_linux_userland` due to
           # feature unification (`optee_syscall` versus `linux_syscall`). Build it separately for now.
       - run: |
@@ -72,7 +72,7 @@ jobs:
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_platform_lvbs --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
 
   build_and_test_32bit:
     name: Build and Test (32-bit)
@@ -116,6 +116,16 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+      # LVBS requires a nightly toolchain because:
+      # 1. It uses a custom target (x86_64_vtl1.json) for bare-metal VTL1 kernel development
+      # 2. The custom target requires `-Z build-std` to build core/alloc from source
+      # 3. build-std is needed to compile the standard library with SSE support, which is
+      #    required by dependencies like `libm` (used by RSA/crypto for authenticode verification)
+      # 4. The built-in x86_64-unknown-none target uses soft-float (no SSE), causing ABI
+      #    incompatibility when SSE-using dependencies are linked against a soft-float stdlib
+      #
+      # Version alignment: The nightly version should match the stable version (e.g., stable
+      # 1.91.x -> nightly 1.91.x). Use `rustc +nightly-YYYY-MM-DD --version` to find a date.
       - name: Set up Rust
         run: |
           RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
@@ -138,7 +148,10 @@ jobs:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
-      - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
+      - run: |
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
+          # Run clippy for lvbs with custom target (requires build-std)
+          ./.github/tools/github_actions_run_cargo clippy -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json --all-features
       - run: |
           ./.github/tools/github_actions_run_cargo build
           ./.github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
