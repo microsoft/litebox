@@ -10,6 +10,20 @@
 //! The macros in this module transform our unified key-value syntax into
 //! tracing's native field syntax using a tt-muncher pattern.
 
+impl crate::Level {
+    /// Converts this level to the corresponding `tracing::Level`.
+    #[doc(hidden)]
+    pub const fn to_tracing_level(self) -> tracing::Level {
+        match self {
+            crate::Level::Error => tracing::Level::ERROR,
+            crate::Level::Warn => tracing::Level::WARN,
+            crate::Level::Info => tracing::Level::INFO,
+            crate::Level::Debug => tracing::Level::DEBUG,
+            crate::Level::Trace => tracing::Level::TRACE,
+        }
+    }
+}
+
 /// RAII guard that wraps a tracing span's entered guard.
 ///
 /// This type is returned by span macros (e.g., [`info_span!`](crate::info_span)) when
@@ -65,23 +79,7 @@ macro_rules! __log_impl {
 #[macro_export]
 macro_rules! __tracing_event_emit {
     ([$level:expr], $($fields:tt)+) => {
-        match $level {
-            $crate::Level::Error => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::ERROR, $($fields)+)
-            }
-            $crate::Level::Warn => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::WARN, $($fields)+)
-            }
-            $crate::Level::Info => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::INFO, $($fields)+)
-            }
-            $crate::Level::Debug => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::DEBUG, $($fields)+)
-            }
-            $crate::Level::Trace => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::TRACE, $($fields)+)
-            }
-        }
+        $crate::__private::tracing::event!($crate::Level::to_tracing_level($level), $($fields)+)
     };
 }
 
@@ -393,23 +391,7 @@ macro_rules! __span_impl {
 #[macro_export]
 macro_rules! __tracing_span_emit {
     ([$level:expr], [$name:expr], $($fields:tt)*) => {{
-        let span = match $level {
-            $crate::Level::Error => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::ERROR, $name, $($fields)*)
-            }
-            $crate::Level::Warn => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::WARN, $name, $($fields)*)
-            }
-            $crate::Level::Info => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::INFO, $name, $($fields)*)
-            }
-            $crate::Level::Debug => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::DEBUG, $name, $($fields)*)
-            }
-            $crate::Level::Trace => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::TRACE, $name, $($fields)*)
-            }
-        };
+        let span = $crate::__private::tracing::span!($crate::Level::to_tracing_level($level), $name, $($fields)*);
         $crate::SpanGuard { inner: span.entered() }
     }};
 }
