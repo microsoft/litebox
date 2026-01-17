@@ -523,128 +523,643 @@ mod tracing_backend {
 pub use tracing_backend::SpanGuard;
 
 /// Internal macro for tracing backend implementation.
+///
+/// This properly captures key-value pairs as structured tracing fields.
 #[doc(hidden)]
 #[cfg(feature = "backend_tracing")]
 #[macro_export]
 macro_rules! __log_impl {
-    // With key-value pairs - format them into the message (like log backend)
+    // With key-value pairs - dispatch to field processor
     ($level:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {{
-        // Use the same formatting approach as log backend for consistency
-        $crate::__tracing_event_simple!(
-            $level,
-            concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
-            $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+        $crate::__tracing_event_dispatch!(
+            [$level]
+            [$msg]
+            []
+            [$($key $(:$cap)? $(= $value)?),+]
         )
     }};
     // Without key-value pairs (literal only)
     ($level:expr, $msg:literal) => {
-        $crate::__tracing_event_simple!($level, $msg)
+        $crate::__tracing_event_emit!([$level], $msg)
     };
 }
 
-/// Internal macro for tracing events with key-value pairs.
-/// Internal macro for simple tracing events.
+/// Internal macro to emit a tracing event at the specified level.
 #[doc(hidden)]
 #[cfg(feature = "backend_tracing")]
 #[macro_export]
-macro_rules! __tracing_event_simple {
-    // With format arguments
-    ($level:expr, $fmt:expr, $($arg:expr),+) => {
+macro_rules! __tracing_event_emit {
+    // With fields
+    ([$level:expr], $($fields:tt)+) => {
         match $level {
             $crate::Level::Error => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::ERROR, $fmt, $($arg),+)
+                $crate::__private::tracing::event!($crate::__private::tracing::Level::ERROR, $($fields)+)
             }
             $crate::Level::Warn => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::WARN, $fmt, $($arg),+)
+                $crate::__private::tracing::event!($crate::__private::tracing::Level::WARN, $($fields)+)
             }
             $crate::Level::Info => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::INFO, $fmt, $($arg),+)
+                $crate::__private::tracing::event!($crate::__private::tracing::Level::INFO, $($fields)+)
             }
             $crate::Level::Debug => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::DEBUG, $fmt, $($arg),+)
+                $crate::__private::tracing::event!($crate::__private::tracing::Level::DEBUG, $($fields)+)
             }
             $crate::Level::Trace => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::TRACE, $fmt, $($arg),+)
+                $crate::__private::tracing::event!($crate::__private::tracing::Level::TRACE, $($fields)+)
             }
         }
     };
-    // Just a literal message
-    ($level:expr, $msg:literal) => {
-        match $level {
-            $crate::Level::Error => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::ERROR, $msg)
-            }
-            $crate::Level::Warn => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::WARN, $msg)
-            }
-            $crate::Level::Info => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::INFO, $msg)
-            }
-            $crate::Level::Debug => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::DEBUG, $msg)
-            }
-            $crate::Level::Trace => {
-                $crate::__private::tracing::event!($crate::__private::tracing::Level::TRACE, $msg)
-            }
-        }
+}
+
+/// Internal macro to dispatch and process key-value pairs for tracing events.
+/// Uses tt-muncher pattern to transform fields into tracing's native syntax.
+/// Arguments: [level] [msg] [accumulated_fields] [remaining_input]
+#[doc(hidden)]
+#[cfg(feature = "backend_tracing")]
+#[macro_export]
+macro_rules! __tracing_event_dispatch {
+    // === Field processing rules (with explicit value) ===
+
+    // Field: key:? = value (Debug with explicit value)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :? = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :? = $value:expr]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$value,]
+            []
+        )
+    };
+
+    // Field: key:debug = value
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :debug = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :debug = $value:expr]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$value,]
+            []
+        )
+    };
+
+    // Field: key:% = value (Display with explicit value)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :% = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :% = $value:expr]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$value,]
+            []
+        )
+    };
+
+    // Field: key:display = value
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :display = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :display = $value:expr]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$value,]
+            []
+        )
+    };
+
+    // Field: key:err = value (errors use Display)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :err = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :err = $value:expr]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$value,]
+            []
+        )
+    };
+
+    // Field: key:sval = value (fallback to Debug)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :sval = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :sval = $value:expr]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$value,]
+            []
+        )
+    };
+
+    // Field: key:serde = value (fallback to Debug)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :serde = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :serde = $value:expr]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$value,]
+            []
+        )
+    };
+
+    // Field: key = value (no capture mode, default to Debug)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident = $value:expr]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$value,]
+            []
+        )
+    };
+
+    // === Field processing rules (shorthand - value is variable with same name) ===
+
+    // Field: key:? (Debug shorthand)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :? , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :?]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$key,]
+            []
+        )
+    };
+
+    // Field: key:debug (Debug shorthand)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :debug , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :debug]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$key,]
+            []
+        )
+    };
+
+    // Field: key:% (Display shorthand)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :% , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :%]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$key,]
+            []
+        )
+    };
+
+    // Field: key:display (Display shorthand)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :display , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :display]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$key,]
+            []
+        )
+    };
+
+    // Field: key:err (Display shorthand for errors)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :err , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :err]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = %$key,]
+            []
+        )
+    };
+
+    // Field: key:sval (fallback shorthand)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :sval , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :sval]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$key,]
+            []
+        )
+    };
+
+    // Field: key:serde (fallback shorthand)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :serde , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :serde]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$key,]
+            []
+        )
+    };
+
+    // Field: key (bare identifier, default to Debug)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident , $($rest:tt)*]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident]) => {
+        $crate::__tracing_event_dispatch!(
+            [$level] [$msg]
+            [$($acc)* $key = ?$key,]
+            []
+        )
+    };
+
+    // === Base case: no more input, emit the event ===
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] []) => {
+        $crate::__tracing_event_emit!([$level], $($acc)* $msg)
     };
 }
 
 /// Internal macro for span implementation with tracing backend.
 ///
-/// Note: Due to tracing's macro parsing limitations, key-value pairs cannot be
-/// passed as span fields. Instead, they are logged as an event at span entry.
+/// This properly captures key-value pairs as structured span fields.
 #[doc(hidden)]
 #[cfg(feature = "backend_tracing")]
 #[macro_export]
 macro_rules! __span_impl {
     ($level:expr, $name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {{
-        // Create a real tracing span (without fields due to macro limitations)
-        let __level = $level;
-        let span = match __level {
-            $crate::Level::Error => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::ERROR, $name)
-            }
-            $crate::Level::Warn => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::WARN, $name)
-            }
-            $crate::Level::Info => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::INFO, $name)
-            }
-            $crate::Level::Debug => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::DEBUG, $name)
-            }
-            $crate::Level::Trace => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::TRACE, $name)
-            }
-        };
-        let guard = span.entered();
-        // Log kv pairs as an event within the span
-        $crate::__tracing_event_simple!(
-            __level,
-            concat!("[SPAN FIELDS] ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
-            $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
-        );
-        $crate::SpanGuard { inner: guard }
+        $crate::__tracing_span_dispatch!(
+            [$level]
+            [$name]
+            []
+            [$($key $(:$cap)? $(= $value)?),+]
+        )
     }};
     ($level:expr, $name:expr) => {{
+        $crate::__tracing_span_emit!([$level], [$name],)
+    }};
+}
+
+/// Internal macro to emit a tracing span at the specified level.
+#[doc(hidden)]
+#[cfg(feature = "backend_tracing")]
+#[macro_export]
+macro_rules! __tracing_span_emit {
+    ([$level:expr], [$name:expr], $($fields:tt)*) => {{
         let span = match $level {
             $crate::Level::Error => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::ERROR, $name)
+                $crate::__private::tracing::span!($crate::__private::tracing::Level::ERROR, $name, $($fields)*)
             }
             $crate::Level::Warn => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::WARN, $name)
+                $crate::__private::tracing::span!($crate::__private::tracing::Level::WARN, $name, $($fields)*)
             }
             $crate::Level::Info => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::INFO, $name)
+                $crate::__private::tracing::span!($crate::__private::tracing::Level::INFO, $name, $($fields)*)
             }
             $crate::Level::Debug => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::DEBUG, $name)
+                $crate::__private::tracing::span!($crate::__private::tracing::Level::DEBUG, $name, $($fields)*)
             }
             $crate::Level::Trace => {
-                $crate::__private::tracing::span!($crate::__private::tracing::Level::TRACE, $name)
+                $crate::__private::tracing::span!($crate::__private::tracing::Level::TRACE, $name, $($fields)*)
             }
         };
         $crate::SpanGuard { inner: span.entered() }
     }};
+}
+
+/// Internal macro to dispatch and process key-value pairs for tracing spans.
+/// Uses tt-muncher pattern to transform fields into tracing's native syntax.
+/// Arguments: [level] [name] [accumulated_fields] [remaining_input]
+#[doc(hidden)]
+#[cfg(feature = "backend_tracing")]
+#[macro_export]
+macro_rules! __tracing_span_dispatch {
+    // === Field processing rules (with explicit value) ===
+
+    // Field: key:? = value (Debug with explicit value)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :? = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :? = $value:expr]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$value,]
+            []
+        )
+    };
+
+    // Field: key:debug = value
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :debug = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :debug = $value:expr]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$value,]
+            []
+        )
+    };
+
+    // Field: key:% = value (Display with explicit value)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :% = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :% = $value:expr]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$value,]
+            []
+        )
+    };
+
+    // Field: key:display = value
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :display = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :display = $value:expr]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$value,]
+            []
+        )
+    };
+
+    // Field: key:err = value (errors use Display)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :err = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :err = $value:expr]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$value,]
+            []
+        )
+    };
+
+    // Field: key:sval = value (fallback to Debug)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :sval = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :sval = $value:expr]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$value,]
+            []
+        )
+    };
+
+    // Field: key:serde = value (fallback to Debug)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :serde = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :serde = $value:expr]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$value,]
+            []
+        )
+    };
+
+    // Field: key = value (no capture mode, default to Debug)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident = $value:expr , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$value,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident = $value:expr]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$value,]
+            []
+        )
+    };
+
+    // === Field processing rules (shorthand - value is variable with same name) ===
+
+    // Field: key:? (Debug shorthand)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :? , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :?]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$key,]
+            []
+        )
+    };
+
+    // Field: key:debug (Debug shorthand)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :debug , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :debug]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$key,]
+            []
+        )
+    };
+
+    // Field: key:% (Display shorthand)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :% , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :%]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$key,]
+            []
+        )
+    };
+
+    // Field: key:display (Display shorthand)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :display , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :display]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$key,]
+            []
+        )
+    };
+
+    // Field: key:err (Display shorthand for errors)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :err , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :err]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = %$key,]
+            []
+        )
+    };
+
+    // Field: key:sval (fallback shorthand)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :sval , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :sval]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$key,]
+            []
+        )
+    };
+
+    // Field: key:serde (fallback shorthand)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :serde , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident :serde]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$key,]
+            []
+        )
+    };
+
+    // Field: key (bare identifier, default to Debug)
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident , $($rest:tt)*]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$key,]
+            [$($rest)*]
+        )
+    };
+    ([$level:expr] [$name:expr] [$($acc:tt)*] [$key:ident]) => {
+        $crate::__tracing_span_dispatch!(
+            [$level] [$name]
+            [$($acc)* $key = ?$key,]
+            []
+        )
+    };
+
+    // === Base case: no more input, emit the span ===
+    ([$level:expr] [$name:expr] [$($acc:tt)*] []) => {
+        $crate::__tracing_span_emit!([$level], [$name], $($acc)*)
+    };
 }
