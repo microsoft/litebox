@@ -51,19 +51,14 @@
 pub use litebox_util_log_macros::instrument;
 
 // Re-export useful items from backends
-#[cfg(feature = "backend_log")]
+#[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
 pub use log::{LevelFilter, log_enabled};
 
 #[cfg(feature = "backend_tracing")]
 pub use tracing::level_enabled as log_enabled;
 
-// Compile-time check: exactly one backend must be enabled
-#[cfg(all(feature = "backend_log", feature = "backend_tracing"))]
-compile_error!(
-    "Features `backend_log` and `backend_tracing` are mutually exclusive. \
-     Please enable only one."
-);
-
+// Compile-time check: at least one backend must be enabled
+// Note: When both backends are enabled, backend_tracing takes precedence.
 #[cfg(not(any(feature = "backend_log", feature = "backend_tracing")))]
 compile_error!("Either `backend_log` or `backend_tracing` feature must be enabled.");
 
@@ -89,9 +84,9 @@ pub enum Level {
 /// Not part of the public API.
 #[doc(hidden)]
 pub mod __private {
-    #[cfg(feature = "backend_log")]
+    #[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
     pub use log;
-    #[cfg(feature = "backend_log")]
+    #[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
     pub use log::Level;
 
     #[cfg(feature = "backend_tracing")]
@@ -334,7 +329,7 @@ macro_rules! trace_span {
 // BACKEND-SPECIFIC IMPLEMENTATION - LOG
 // =============================================================================
 
-#[cfg(feature = "backend_log")]
+#[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
 mod log_backend {
     /// Guard that logs span exit when dropped.
     pub struct SpanGuard {
@@ -369,12 +364,12 @@ mod log_backend {
     }
 }
 
-#[cfg(feature = "backend_log")]
+#[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
 pub use log_backend::SpanGuard;
 
 /// Internal macro for log backend implementation.
 #[doc(hidden)]
-#[cfg(feature = "backend_log")]
+#[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
 #[macro_export]
 macro_rules! __log_impl {
     // With key-value pairs - format them into the message
@@ -463,7 +458,7 @@ macro_rules! __kv_value_log {
 
 /// Internal macro for span implementation with log backend.
 #[doc(hidden)]
-#[cfg(feature = "backend_log")]
+#[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
 #[macro_export]
 macro_rules! __span_impl {
     ($level:expr, $name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {{
