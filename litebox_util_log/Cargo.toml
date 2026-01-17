@@ -1,0 +1,24 @@
+[package]
+name = "litebox_util_log"
+version = "0.1.0"
+edition = "2024"
+description = "Logging facade for LiteBox that supports log or tracing backends"
+
+[features]
+default = ["backend_log"]
+# Use the `log` crate as the logging backend (default)
+backend_log = ["dep:log", "log/kv"]
+# Use the `tracing` crate as the logging backend with full span support
+backend_tracing = ["dep:tracing"]
+
+# Key-value capture features (mirrors log's kv features)
+kv_std = ["log?/kv_std"]
+kv_sval = ["log?/kv_sval"]
+kv_serde = ["log?/kv_serde"]
+
+[dependencies]
+log = { version = "0.4", optional = true, default-features = false }
+tracing = { version = "0.1", optional = true, default-features = false }
+
+[lints]
+workspace = true
