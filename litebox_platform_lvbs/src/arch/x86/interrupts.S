@@ -21,7 +21,7 @@
  *   r15, r14, r13, r12, rbp, rbx,     (callee-preserved)
  *   r11, r10, r9, r8, rax, rcx, rdx, rsi, rdi,  (callee-clobbered)
  *   orig_rax (error code),
- *   rip, cs, eflags, rsp, ss          (iret frame)
+ *   rip, cs, rflags, rsp, ss          (iret frame)
  */
 
 .code64
