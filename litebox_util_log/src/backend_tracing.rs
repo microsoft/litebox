@@ -162,75 +162,21 @@ macro_rules! __tracing_dispatch {
 
     // === Field processing rules (shorthand - value is variable with same name) ===
 
-    // Field: key:? (Debug shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :? $(, $($rest:tt)*)?]) => {
+    // Field: key:cap (shorthand with capture mode) -> delegates to key:cap = key
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :$cap:tt $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
-            [$($acc)* $key = ?$key,]
-            [$($($rest)*)?]
+            [$($acc)*]
+            [$key :$cap = $key $(, $($rest)*)?]
         )
     };
 
-    // Field: key:debug (Debug shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :debug $(, $($rest:tt)*)?]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$key,]
-            [$($($rest)*)?]
-        )
-    };
-
-    // Field: key:% (Display shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :% $(, $($rest:tt)*)?]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = %$key,]
-            [$($($rest)*)?]
-        )
-    };
-
-    // Field: key:display (Display shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :display $(, $($rest:tt)*)?]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = %$key,]
-            [$($($rest)*)?]
-        )
-    };
-
-    // Field: key:err (Display shorthand for errors)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :err $(, $($rest:tt)*)?]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = %$key,]
-            [$($($rest)*)?]
-        )
-    };
-
-    // Field: key:sval (fallback shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :sval $(, $($rest:tt)*)?]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$key,]
-            [$($($rest)*)?]
-        )
-    };
-
-    // Field: key:serde (fallback shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :serde $(, $($rest:tt)*)?]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$key,]
-            [$($($rest)*)?]
-        )
-    };
-
-    // Field: key (bare identifier, default to Debug)
+    // Field: key (bare identifier) -> delegates to key = key
     ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
-            [$($acc)* $key = ?$key,]
-            [$($($rest)*)?]
+            [$($acc)*]
+            [$key = $key $(, $($rest)*)?]
         )
     };
 
