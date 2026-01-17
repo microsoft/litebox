@@ -89,260 +89,148 @@ macro_rules! __tracing_dispatch {
     // === Field processing rules (with explicit value) ===
 
     // Field: key:? = value (Debug with explicit value)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :? = $value:expr , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :? = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = ?$value,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :? = $value:expr]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$value,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:debug = value
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :debug = $value:expr , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :debug = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = ?$value,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :debug = $value:expr]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$value,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:% = value (Display with explicit value)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :% = $value:expr , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :% = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = %$value,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :% = $value:expr]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = %$value,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:display = value
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :display = $value:expr , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :display = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = %$value,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :display = $value:expr]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = %$value,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:err = value (errors use Display)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :err = $value:expr , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :err = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = %$value,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :err = $value:expr]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = %$value,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:sval = value (fallback to Debug)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :sval = $value:expr , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :sval = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = ?$value,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :sval = $value:expr]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$value,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:serde = value (fallback to Debug)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :serde = $value:expr , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :serde = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = ?$value,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :serde = $value:expr]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$value,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key = value (no capture mode, default to Debug)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident = $value:expr , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = ?$value,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident = $value:expr]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$value,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // === Field processing rules (shorthand - value is variable with same name) ===
 
     // Field: key:? (Debug shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :? , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :? $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = ?$key,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :?]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$key,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:debug (Debug shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :debug , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :debug $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = ?$key,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :debug]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$key,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:% (Display shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :% , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :% $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = %$key,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :%]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = %$key,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:display (Display shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :display , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :display $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = %$key,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :display]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = %$key,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:err (Display shorthand for errors)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :err , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :err $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = %$key,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :err]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = %$key,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:sval (fallback shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :sval , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :sval $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = ?$key,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :sval]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$key,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key:serde (fallback shorthand)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :serde , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :serde $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = ?$key,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :serde]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$key,]
-            []
+            [$($($rest)*)?]
         )
     };
 
     // Field: key (bare identifier, default to Debug)
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident , $($rest:tt)*]) => {
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
             [$($acc)* $key = ?$key,]
-            [$($rest)*]
-        )
-    };
-    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident]) => {
-        $crate::__tracing_dispatch!(
-            [$mode] [$level] [$target]
-            [$($acc)* $key = ?$key,]
-            []
+            [$($($rest)*)?]
         )
     };
 
