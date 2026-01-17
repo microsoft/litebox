@@ -3,8 +3,8 @@
 //! These tests exercise the unified API and work with either backend.
 
 use litebox_util_log::{
-    Level, debug, debug_span, error, error_span, info, info_span, log, span, trace, trace_span,
-    warn, warn_span,
+    Level, debug, debug_span, error, error_span, info, info_span, instrument, log, span, trace,
+    trace_span, warn, warn_span,
 };
 
 #[test]
@@ -140,4 +140,94 @@ fn test_mixed_kv_captures() {
 fn test_kv_with_explicit_and_implicit_values() {
     let implicit = 42;
     log!(Level::Info, implicit:?, explicit:? = 100; "mixed implicit and explicit");
+}
+
+// =============================================================================
+// INSTRUMENT MACRO TESTS
+// =============================================================================
+
+#[instrument(level = info)]
+fn instrumented_simple() {
+    info!("inside instrumented function");
+}
+
+#[test]
+fn test_instrument_simple() {
+    instrumented_simple();
+}
+
+#[instrument(level = debug)]
+fn instrumented_with_args(x: u32, y: &str) {
+    debug!("processing");
+    let _ = (x, y);
+}
+
+#[test]
+fn test_instrument_with_args() {
+    instrumented_with_args(42, "hello");
+}
+
+#[instrument(level = trace, fields(id:?, name:%))]
+fn instrumented_with_specific_fields(id: u64, name: &str, _secret: &str) {
+    trace!("handling request");
+    let _ = (id, name);
+}
+
+#[test]
+fn test_instrument_with_specific_fields() {
+    instrumented_with_specific_fields(123, "test", "secret_value");
+}
+
+#[instrument(level = info, skip(password))]
+fn instrumented_with_skip(username: &str, password: &str) {
+    info!("authenticating user");
+    let _ = (username, password);
+}
+
+#[test]
+fn test_instrument_with_skip() {
+    instrumented_with_skip("alice", "hunter2");
+}
+
+#[instrument(level = debug, skip_all)]
+fn instrumented_skip_all(sensitive: &str, also_sensitive: u64) {
+    debug!("doing something sensitive");
+    let _ = (sensitive, also_sensitive);
+}
+
+#[test]
+fn test_instrument_skip_all() {
+    instrumented_skip_all("secret", 42);
+}
+
+#[instrument(level = warn, name = "custom_span_name")]
+fn instrumented_with_custom_name() {
+    warn!("inside custom named span");
+}
+
+#[test]
+fn test_instrument_custom_name() {
+    instrumented_with_custom_name();
+}
+
+#[instrument(level = info)]
+fn instrumented_returning_value(x: i32) -> i32 {
+    x * 2
+}
+
+#[test]
+fn test_instrument_with_return_value() {
+    let result = instrumented_returning_value(21);
+    assert_eq!(result, 42);
+}
+
+#[instrument(level = debug, fields(a:debug, b:display))]
+fn instrumented_with_explicit_capture_modes(a: i32, b: &str) {
+    debug!("explicit modes");
+    let _ = (a, b);
+}
+
+#[test]
+fn test_instrument_explicit_capture_modes() {
+    instrumented_with_explicit_capture_modes(42, "hello");
 }

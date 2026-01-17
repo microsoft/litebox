@@ -23,7 +23,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use litebox_util_log::{info, debug, info_span};
+//! use litebox_util_log::{info, debug, info_span, instrument};
 //!
 //! // Simple logging
 //! info!("Hello, world!");
@@ -37,9 +37,18 @@
 //! // ... do work ...
 //! debug!("Processing request");
 //! // span exits when _span is dropped
+//!
+//! // Using the instrument attribute macro
+//! #[instrument(level = debug, fields(user_id:?))]
+//! fn process_user(user_id: u64, data: &str) {
+//!     info!("Processing user");
+//! }
 //! ```
 
 #![no_std]
+
+// Re-export the instrument attribute macro
+pub use litebox_util_log_macros::instrument;
 
 // Re-export useful items from backends
 #[cfg(feature = "backend_log")]
@@ -341,19 +350,19 @@ mod log_backend {
         fn drop(&mut self) {
             match self.level {
                 crate::Level::Error => {
-                    log::log!(target: self.module_path, log::Level::Error, "[SPAN EXIT] {}", self.name)
+                    log::log!(target: self.module_path, log::Level::Error, "[SPAN EXIT] {}", self.name);
                 }
                 crate::Level::Warn => {
-                    log::log!(target: self.module_path, log::Level::Warn, "[SPAN EXIT] {}", self.name)
+                    log::log!(target: self.module_path, log::Level::Warn, "[SPAN EXIT] {}", self.name);
                 }
                 crate::Level::Info => {
-                    log::log!(target: self.module_path, log::Level::Info, "[SPAN EXIT] {}", self.name)
+                    log::log!(target: self.module_path, log::Level::Info, "[SPAN EXIT] {}", self.name);
                 }
                 crate::Level::Debug => {
-                    log::log!(target: self.module_path, log::Level::Debug, "[SPAN EXIT] {}", self.name)
+                    log::log!(target: self.module_path, log::Level::Debug, "[SPAN EXIT] {}", self.name);
                 }
                 crate::Level::Trace => {
-                    log::log!(target: self.module_path, log::Level::Trace, "[SPAN EXIT] {}", self.name)
+                    log::log!(target: self.module_path, log::Level::Trace, "[SPAN EXIT] {}", self.name);
                 }
             }
         }

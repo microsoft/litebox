@@ -13,8 +13,8 @@
 //!   RUST_LOG=trace cargo run -p litebox_util_log --example demo
 
 use litebox_util_log::{
-    Level, debug, debug_span, error, error_span, info, info_span, log, trace, trace_span, warn,
-    warn_span,
+    Level, debug, debug_span, error, error_span, info, info_span, instrument, log, trace,
+    trace_span, warn, warn_span,
 };
 
 fn main() {
@@ -136,6 +136,13 @@ fn main() {
     simulate_request_handling();
     println!();
 
+    // -------------------------------------------------------------------------
+    // Instrument attribute macro
+    // -------------------------------------------------------------------------
+    println!("--- Instrument Macro ---");
+    demonstrate_instrument();
+    println!();
+
     println!("=== Demo Complete ===");
 }
 
@@ -195,4 +202,70 @@ fn simulate_request_handling() {
     }
 
     info!("Request completed successfully");
+}
+
+/// Demonstrates the #[instrument] attribute macro.
+fn demonstrate_instrument() {
+    // Basic instrumented function - captures all args
+    let result = add_numbers(10, 20);
+    info!(result:?; "add_numbers returned");
+
+    // Function with specific field capture modes
+    process_user(42, "alice", "secret123");
+
+    // Function that skips sensitive data
+    authenticate("admin", "hunter2");
+
+    // Function with skip_all
+    handle_sensitive_data("classified", 9001);
+
+    // Function with custom span name
+    my_internal_function();
+
+    // Instrumented function that returns a value
+    let doubled = double_value(21);
+    info!(doubled:?; "double_value returned");
+}
+
+/// Basic instrumented function - automatically captures all arguments with Debug.
+#[instrument(level = debug)]
+fn add_numbers(a: i32, b: i32) -> i32 {
+    debug!("Performing addition");
+    a + b
+}
+
+/// Instrumented function with specific fields and capture modes.
+/// Only captures `id` (Debug) and `name` (Display), not `password`.
+#[instrument(level = info, fields(id:?, name:%))]
+fn process_user(id: u64, name: &str, password: &str) {
+    info!("Processing user data");
+    // password is intentionally not captured in the span
+    let _ = password;
+}
+
+/// Instrumented function that skips specific arguments.
+#[instrument(level = warn, skip(password))]
+fn authenticate(username: &str, password: &str) {
+    warn!("Authenticating user");
+    let _ = password;
+}
+
+/// Instrumented function that skips all arguments.
+#[instrument(level = trace, skip_all)]
+fn handle_sensitive_data(data: &str, classification: u32) {
+    trace!("Handling sensitive data");
+    let _ = (data, classification);
+}
+
+/// Instrumented function with a custom span name.
+#[instrument(level = info, name = "custom_operation")]
+fn my_internal_function() {
+    info!("Inside function with custom span name");
+}
+
+/// Instrumented function that returns a value.
+#[instrument(level = debug)]
+fn double_value(x: i32) -> i32 {
+    debug!("Doubling the value");
+    x * 2
 }

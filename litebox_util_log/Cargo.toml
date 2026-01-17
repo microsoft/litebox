@@ -19,6 +19,7 @@ kv_serde = ["log?/kv_serde"]
 [dependencies]
 log = { version = "0.4", optional = true, default-features = false }
 tracing = { version = "0.1", optional = true, default-features = false }
+litebox_util_log_macros = { path = "../litebox_util_log_macros" }
 
 [dev-dependencies]
 env_logger = "0.11"

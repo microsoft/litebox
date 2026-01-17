@@ -1169,9 +1169,19 @@ name = "litebox_util_log"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "litebox_util_log_macros",
  "log",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "litebox_util_log_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
