@@ -68,19 +68,7 @@ macro_rules! __log_impl {
         )
     }};
     ($level:expr, $msg:literal) => {
-        $crate::__tracing_event_emit!([$level], $msg)
-    };
-}
-
-/// Internal macro to emit a tracing event at the specified level.
-///
-/// This handles the runtime-to-compile-time level dispatch required by
-/// tracing's event macro.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __tracing_event_emit {
-    ([$level:expr], $($fields:tt)+) => {
-        $crate::__private::tracing::event!($crate::Level::to_tracing_level($level), $($fields)+)
+        $crate::__private::tracing::event!($crate::Level::to_tracing_level($level), $msg)
     };
 }
 
@@ -360,11 +348,12 @@ macro_rules! __tracing_dispatch {
 
     // === Base cases: no more input, emit based on mode ===
     ([event] [$level:expr] [$msg:literal] [$($acc:tt)*] []) => {
-        $crate::__tracing_event_emit!([$level], $($acc)* $msg)
+        $crate::__private::tracing::event!($crate::Level::to_tracing_level($level), $($acc)* $msg)
     };
-    ([span] [$level:expr] [$name:expr] [$($acc:tt)*] []) => {
-        $crate::__tracing_span_emit!([$level], [$name], $($acc)*)
-    };
+    ([span] [$level:expr] [$name:expr] [$($acc:tt)*] []) => {{
+        let span = $crate::__private::tracing::span!($crate::Level::to_tracing_level($level), $name, $($acc)*);
+        $crate::SpanGuard { inner: span.entered() }
+    }};
 }
 
 /// Internal macro for span implementation with tracing backend.
@@ -386,19 +375,7 @@ macro_rules! __span_impl {
         )
     }};
     ($level:expr, $name:expr) => {{
-        $crate::__tracing_span_emit!([$level], [$name],)
-    }};
-}
-
-/// Internal macro to emit a tracing span at the specified level.
-///
-/// Creates and enters the span, returning a [`SpanGuard`] that exits the span
-/// when dropped.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __tracing_span_emit {
-    ([$level:expr], [$name:expr], $($fields:tt)*) => {{
-        let span = $crate::__private::tracing::span!($crate::Level::to_tracing_level($level), $name, $($fields)*);
+        let span = $crate::__private::tracing::span!($crate::Level::to_tracing_level($level), $name,);
         $crate::SpanGuard { inner: span.entered() }
     }};
 }
