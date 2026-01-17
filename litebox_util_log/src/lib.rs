@@ -1,16 +1,24 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Logging facade for LiteBox that provides a unified interface for logging
-//! with support for either `log` or `tracing` backends.
+//! # LiteBox Logging Utilities
 //!
-//! # Features
+//! A unified logging facade for LiteBox that abstracts over different logging backends.
 //!
-//! - `backend_log` (default): Uses the `log` crate for logging events.
+//! This crate provides macros for structured logging and tracing spans that work
+//! consistently regardless of whether the underlying backend is `log` or `tracing`.
+//! This allows LiteBox components to emit diagnostic information without coupling
+//! to a specific logging implementation.
+//!
+//! ## Features
+//!
+//! - `backend_log` (default): Uses the [`log`](https://docs.rs/log) crate for logging events.
 //!   Spans are emulated by logging events at span entry and exit.
-//! - `backend_tracing`: Uses the `tracing` crate with full span support.
+//! - `backend_tracing`: Uses the [`tracing`](https://docs.rs/tracing) crate with full span support.
 //!
-//! # Key-Value Capture Modes
+//! When both features are enabled, `backend_tracing` takes precedence.
+//!
+//! ## Key-Value Capture Modes
 //!
 //! This crate supports the same capture modes as `log`'s `kv` feature:
 //!
@@ -20,7 +28,7 @@
 //! - `:sval` - Capture the value using `sval::Value` (requires `kv_sval`)
 //! - `:serde` - Capture the value using `serde::Serialize` (requires `kv_serde`)
 //!
-//! # Example
+//! ## Example
 //!
 //! ```ignore
 //! use litebox_util_log::{info, debug, info_span, instrument};
@@ -85,21 +93,38 @@ pub use litebox_util_log_macros::instrument;
 ///
 /// This enum provides a unified way to specify log levels regardless of
 /// whether the `backend_log` or `backend_tracing` feature is enabled.
+///
+/// Levels are ordered from most severe to least severe: `Error` > `Warn` > `Info` > `Debug` > `Trace`.
+/// This ordering is used by logging implementations to filter messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Level {
     /// Error level - for serious problems that need immediate attention.
+    ///
+    /// Use this for failures that prevent normal operation or indicate bugs.
     Error,
     /// Warn level - for potential issues or unexpected situations.
+    ///
+    /// Use this for recoverable problems or deprecated usage patterns.
     Warn,
     /// Info level - for general informational messages.
+    ///
+    /// Use this for high-level progress updates visible in normal operation.
     Info,
     /// Debug level - for debugging information useful during development.
+    ///
+    /// Use this for detailed diagnostic information not needed in production.
     Debug,
     /// Trace level - for very verbose debugging, typically disabled in production.
+    ///
+    /// Use this for fine-grained tracing of control flow and data.
     Trace,
 }
 
-// Re-export SpanGuard from the active backend
+// Re-export SpanGuard from the active backend.
+//
+// SpanGuard is the RAII type returned by span macros. When using the log backend,
+// it emits a log message on drop; when using the tracing backend, it wraps
+// tracing's entered span guard.
 #[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
 pub use backend_log::SpanGuard;
 
@@ -110,8 +135,11 @@ pub use backend_tracing::SpanGuard;
 // Internal module for macro implementation details
 // =============================================================================
 
-/// Internal module for macro implementation details.
-/// Not part of the public API.
+/// Internal module exposing backend types for use by exported macros.
+///
+/// This module is public only because macros need access to backend types at the
+/// call site. It is not part of the public API and should not be used directly.
+/// Breaking changes to this module are not considered semver violations.
 #[doc(hidden)]
 pub mod __private {
     #[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]

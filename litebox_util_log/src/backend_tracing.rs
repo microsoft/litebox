@@ -4,17 +4,51 @@
 //! Tracing backend implementation.
 //!
 //! This module provides the backend implementation when using the `tracing` crate.
+//! Unlike the log backend, this provides full native span support with proper
+//! hierarchical context propagation.
+//!
+//! The macros in this module transform our unified key-value syntax into
+//! tracing's native field syntax using a tt-muncher pattern.
 
-/// Guard that wraps a tracing span's entered guard.
+// =============================================================================
+// SpanGuard
+// =============================================================================
+
+/// RAII guard that wraps a tracing span's entered guard.
+///
+/// This type is returned by span macros (e.g., [`info_span!`](crate::info_span)) when
+/// using the `backend_tracing` feature. The span remains "entered" (active) as long
+/// as this guard exists. When dropped, the span is exited.
+///
+/// Unlike the log backend's `SpanGuard`, this provides full tracing semantics
+/// including hierarchical span relationships and context propagation.
+///
+/// # Example
+///
+/// ```ignore
+/// let _guard = info_span!("my_operation");
+/// // Span is now entered and active
+/// info!("This log is inside the span");
+/// // Span exits when _guard goes out of scope
+/// ```
 pub struct SpanGuard {
+    /// The wrapped tracing span guard. Public for macro access but not part of
+    /// the public API.
     #[doc(hidden)]
     #[allow(dead_code)]
     pub inner: tracing::span::EnteredSpan,
 }
 
+// =============================================================================
+// Internal macros
+// =============================================================================
+
 /// Internal macro for tracing backend implementation.
 ///
-/// This properly captures key-value pairs as structured tracing fields.
+/// This macro transforms our unified key-value syntax into tracing's native
+/// event syntax. The transformation is handled by [`__tracing_event_dispatch`].
+///
+/// Not intended for direct use; called by the public logging macros.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __log_impl {
@@ -34,6 +68,9 @@ macro_rules! __log_impl {
 }
 
 /// Internal macro to emit a tracing event at the specified level.
+///
+/// This handles the runtime-to-compile-time level dispatch required by
+/// tracing's event macro.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tracing_event_emit {
@@ -60,8 +97,14 @@ macro_rules! __tracing_event_emit {
 }
 
 /// Internal macro to dispatch and process key-value pairs for tracing events.
-/// Uses tt-muncher pattern to transform fields into tracing's native syntax.
-/// Arguments: [level] [msg] [accumulated_fields] [remaining_input]
+///
+/// Uses a tt-muncher pattern to transform fields from our unified syntax
+/// (e.g., `key:? = value`) into tracing's native syntax (e.g., `key = ?value`).
+///
+/// The macro processes fields one at a time, accumulating transformed fields
+/// until no input remains, then emits the final event.
+///
+/// Arguments: `[level] [msg] [accumulated_fields] [remaining_input]`
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tracing_event_dispatch {
@@ -331,9 +374,16 @@ macro_rules! __tracing_event_dispatch {
     };
 }
 
+// =============================================================================
+// Span macros
+// =============================================================================
+
 /// Internal macro for span implementation with tracing backend.
 ///
-/// This properly captures key-value pairs as structured span fields.
+/// Creates a tracing span with the given name and fields, enters it, and
+/// returns a [`SpanGuard`] wrapping the entered span.
+///
+/// Not intended for direct use; called by the public span macros.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __span_impl {
@@ -351,6 +401,9 @@ macro_rules! __span_impl {
 }
 
 /// Internal macro to emit a tracing span at the specified level.
+///
+/// Creates and enters the span, returning a [`SpanGuard`] that exits the span
+/// when dropped.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tracing_span_emit {
@@ -377,8 +430,12 @@ macro_rules! __tracing_span_emit {
 }
 
 /// Internal macro to dispatch and process key-value pairs for tracing spans.
-/// Uses tt-muncher pattern to transform fields into tracing's native syntax.
-/// Arguments: [level] [name] [accumulated_fields] [remaining_input]
+///
+/// Uses a tt-muncher pattern to transform fields from our unified syntax
+/// into tracing's native span field syntax. Similar to [`__tracing_event_dispatch`]
+/// but for span creation rather than event emission.
+///
+/// Arguments: `[level] [name] [accumulated_fields] [remaining_input]`
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tracing_span_dispatch {
