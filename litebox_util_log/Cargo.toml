@@ -22,7 +22,7 @@ tracing = { version = "0.1", optional = true, default-features = false }
 litebox_util_log_macros = { path = "../litebox_util_log_macros" }
 
 [dev-dependencies]
-env_logger = "0.11"
+env_logger = { version = "0.11", features = ["unstable-kv"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]
