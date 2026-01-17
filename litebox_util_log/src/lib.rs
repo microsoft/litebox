@@ -333,16 +333,28 @@ mod log_backend {
         pub name: &'static str,
         #[doc(hidden)]
         pub level: crate::Level,
+        #[doc(hidden)]
+        pub module_path: &'static str,
     }
 
     impl Drop for SpanGuard {
         fn drop(&mut self) {
             match self.level {
-                crate::Level::Error => log::log!(log::Level::Error, "[SPAN EXIT] {}", self.name),
-                crate::Level::Warn => log::log!(log::Level::Warn, "[SPAN EXIT] {}", self.name),
-                crate::Level::Info => log::log!(log::Level::Info, "[SPAN EXIT] {}", self.name),
-                crate::Level::Debug => log::log!(log::Level::Debug, "[SPAN EXIT] {}", self.name),
-                crate::Level::Trace => log::log!(log::Level::Trace, "[SPAN EXIT] {}", self.name),
+                crate::Level::Error => {
+                    log::log!(target: self.module_path, log::Level::Error, "[SPAN EXIT] {}", self.name)
+                }
+                crate::Level::Warn => {
+                    log::log!(target: self.module_path, log::Level::Warn, "[SPAN EXIT] {}", self.name)
+                }
+                crate::Level::Info => {
+                    log::log!(target: self.module_path, log::Level::Info, "[SPAN EXIT] {}", self.name)
+                }
+                crate::Level::Debug => {
+                    log::log!(target: self.module_path, log::Level::Debug, "[SPAN EXIT] {}", self.name)
+                }
+                crate::Level::Trace => {
+                    log::log!(target: self.module_path, log::Level::Trace, "[SPAN EXIT] {}", self.name)
+                }
             }
         }
     }
@@ -474,7 +486,7 @@ macro_rules! __span_impl {
                 $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
             ),
         };
-        $crate::SpanGuard { name: $name, level: __level }
+        $crate::SpanGuard { name: $name, level: __level, module_path: module_path!() }
     }};
     ($level:expr, $name:expr) => {{
         let __level = $level;
@@ -485,7 +497,7 @@ macro_rules! __span_impl {
             $crate::Level::Debug => $crate::__private::log::log!($crate::__private::log::Level::Debug, "[SPAN ENTER] {}", $name),
             $crate::Level::Trace => $crate::__private::log::log!($crate::__private::log::Level::Trace, "[SPAN ENTER] {}", $name),
         };
-        $crate::SpanGuard { name: $name, level: __level }
+        $crate::SpanGuard { name: $name, level: __level, module_path: module_path!() }
     }};
 }
 
