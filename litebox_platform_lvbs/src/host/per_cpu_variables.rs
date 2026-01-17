@@ -182,6 +182,8 @@ impl PerCpuVariables {
     }
 
     /// Restore the extended states of each core (VTL0 or VTL1).
+    ///
+    /// This function is a no-op if the state was never saved.
     pub(crate) fn restore_extended_states(&self, vtl: u8) {
         if self.vtl0_xsave_area_addr.is_null()
             || self.vtl1_xsave_area_addr.is_null()
@@ -189,12 +191,25 @@ impl PerCpuVariables {
         {
             panic!("XSAVE areas are not allocated");
         } else {
-            let (xsave_area_addr, mask) = match vtl {
-                HV_VTL_NORMAL => (self.vtl0_xsave_area_addr.as_u64(), self.vtl0_xsave_mask),
-                HV_VTL_SECURE => (self.vtl1_xsave_area_addr.as_u64(), Self::VTL1_XSAVE_MASK),
+            let (xsave_area_addr, mask, xsaved) = match vtl {
+                HV_VTL_NORMAL => (
+                    self.vtl0_xsave_area_addr.as_u64(),
+                    self.vtl0_xsave_mask,
+                    self.vtl0_xsaved,
+                ),
+                HV_VTL_SECURE => (
+                    self.vtl1_xsave_area_addr.as_u64(),
+                    Self::VTL1_XSAVE_MASK,
+                    self.vtl1_xsaved,
+                ),
                 _ => panic!("Invalid VTL value: {}", vtl),
             };
-            // Safety: xsave_area_addr is valid and properly aligned
+            // Skip restore if state was never saved
+            if !xsaved {
+                return;
+            }
+            // Safety: xsave_area_addr is valid, properly aligned, and contains
+            // valid XSAVE data from a previous save_extended_states() call.
             unsafe {
                 core::arch::asm!(
                     "xrstor [{}]",
