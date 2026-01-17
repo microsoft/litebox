@@ -52,14 +52,15 @@ pub struct SpanGuard {
 /// Internal macro for tracing backend implementation.
 ///
 /// This macro transforms our unified key-value syntax into tracing's native
-/// event syntax. The transformation is handled by [`__tracing_event_dispatch`].
+/// event syntax. The transformation is handled by [`__tracing_dispatch`].
 ///
 /// Not intended for direct use; called by the public logging macros.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __log_impl {
     ($level:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {{
-        $crate::__tracing_event_dispatch!(
+        $crate::__tracing_dispatch!(
+            [event]
             [$level]
             [$msg]
             []
@@ -80,42 +81,6 @@ macro_rules! __log_impl {
 macro_rules! __tracing_event_emit {
     ([$level:expr], $($fields:tt)+) => {
         $crate::__private::tracing::event!($crate::Level::to_tracing_level($level), $($fields)+)
-    };
-}
-
-/// Internal macro to dispatch and process key-value pairs for tracing events.
-///
-/// This is a thin wrapper around [`__tracing_dispatch`] that specifies event mode.
-///
-/// Arguments: `[level] [msg] [accumulated_fields] [remaining_input]`
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __tracing_event_dispatch {
-    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$($rest:tt)*]) => {
-        $crate::__tracing_dispatch!(
-            [event]
-            [$level] [$msg]
-            [$($acc)*]
-            [$($rest)*]
-        )
-    };
-}
-
-/// Internal macro to dispatch and process key-value pairs for tracing spans.
-///
-/// This is a thin wrapper around [`__tracing_dispatch`] that specifies span mode.
-///
-/// Arguments: `[level] [name] [accumulated_fields] [remaining_input]`
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __tracing_span_dispatch {
-    ([$level:expr] [$name:expr] [$($acc:tt)*] [$($rest:tt)*]) => {
-        $crate::__tracing_dispatch!(
-            [span]
-            [$level] [$name]
-            [$($acc)*]
-            [$($rest)*]
-        )
     };
 }
 
@@ -412,7 +377,8 @@ macro_rules! __tracing_dispatch {
 #[macro_export]
 macro_rules! __span_impl {
     ($level:expr, $name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {{
-        $crate::__tracing_span_dispatch!(
+        $crate::__tracing_dispatch!(
+            [span]
             [$level]
             [$name]
             []
