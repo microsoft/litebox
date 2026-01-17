@@ -3,7 +3,8 @@
 
 //! Log backend implementation.
 //!
-//! This module provides the backend implementation when using the `log` crate.
+//! This module provides the backend implementation when using the `log` crate
+//! with proper structured key-value logging via the `kv` feature.
 
 /// Guard that logs span exit when dropped.
 pub struct SpanGuard {
@@ -19,55 +20,57 @@ impl Drop for SpanGuard {
     fn drop(&mut self) {
         match self.level {
             crate::Level::Error => {
-                log::log!(target: self.module_path, log::Level::Error, "[SPAN EXIT] {}", self.name);
+                log::log!(target: self.module_path, log::Level::Error, span = self.name; "[SPAN EXIT]");
             }
             crate::Level::Warn => {
-                log::log!(target: self.module_path, log::Level::Warn, "[SPAN EXIT] {}", self.name);
+                log::log!(target: self.module_path, log::Level::Warn, span = self.name; "[SPAN EXIT]");
             }
             crate::Level::Info => {
-                log::log!(target: self.module_path, log::Level::Info, "[SPAN EXIT] {}", self.name);
+                log::log!(target: self.module_path, log::Level::Info, span = self.name; "[SPAN EXIT]");
             }
             crate::Level::Debug => {
-                log::log!(target: self.module_path, log::Level::Debug, "[SPAN EXIT] {}", self.name);
+                log::log!(target: self.module_path, log::Level::Debug, span = self.name; "[SPAN EXIT]");
             }
             crate::Level::Trace => {
-                log::log!(target: self.module_path, log::Level::Trace, "[SPAN EXIT] {}", self.name);
+                log::log!(target: self.module_path, log::Level::Trace, span = self.name; "[SPAN EXIT]");
             }
         }
     }
 }
 
 /// Internal macro for log backend implementation.
+///
+/// This properly uses log's kv feature to pass structured key-value pairs.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __log_impl {
-    // With key-value pairs - format them into the message
-    ($level:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {{
+    // With key-value pairs - pass them directly to log's kv syntax
+    ($level:expr, $($key:tt $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {{
         match $level {
             $crate::Level::Error => $crate::__private::log::log!(
                 $crate::__private::log::Level::Error,
-                concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
-                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+                $($key $(:$cap)? $(= $value)?),+;
+                $msg
             ),
             $crate::Level::Warn => $crate::__private::log::log!(
                 $crate::__private::log::Level::Warn,
-                concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
-                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+                $($key $(:$cap)? $(= $value)?),+;
+                $msg
             ),
             $crate::Level::Info => $crate::__private::log::log!(
                 $crate::__private::log::Level::Info,
-                concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
-                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+                $($key $(:$cap)? $(= $value)?),+;
+                $msg
             ),
             $crate::Level::Debug => $crate::__private::log::log!(
                 $crate::__private::log::Level::Debug,
-                concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
-                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+                $($key $(:$cap)? $(= $value)?),+;
+                $msg
             ),
             $crate::Level::Trace => $crate::__private::log::log!(
                 $crate::__private::log::Level::Trace,
-                concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
-                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+                $($key $(:$cap)? $(= $value)?),+;
+                $msg
             ),
         }
     }};
@@ -83,79 +86,37 @@ macro_rules! __log_impl {
     };
 }
 
-/// Internal macro to format key-value pairs for string-based logging.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __kv_format_log {
-    ($key:ident :?) => {
-        concat!(stringify!($key), "={:?} ")
-    };
-    ($key:ident :debug) => {
-        concat!(stringify!($key), "={:?} ")
-    };
-    ($key:ident :%) => {
-        concat!(stringify!($key), "={} ")
-    };
-    ($key:ident :display) => {
-        concat!(stringify!($key), "={} ")
-    };
-    ($key:ident :err) => {
-        concat!(stringify!($key), "={} ")
-    };
-    ($key:ident :sval) => {
-        concat!(stringify!($key), "={:?} ")
-    };
-    ($key:ident :serde) => {
-        concat!(stringify!($key), "={:?} ")
-    };
-    ($key:ident) => {
-        concat!(stringify!($key), "={:?} ")
-    };
-}
-
-/// Internal macro to extract values for string-based logging.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __kv_value_log {
-    ($key:ident $(:$cap:tt)? = $value:expr) => {
-        $value
-    };
-    ($key:ident $(:$cap:tt)?) => {
-        $key
-    };
-}
-
 /// Internal macro for span implementation with log backend.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __span_impl {
-    ($level:expr, $name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {{
+    ($level:expr, $name:expr, $($key:tt $(:$cap:tt)? $(= $value:expr)?),+) => {{
         let __level = $level;
         match __level {
             $crate::Level::Error => $crate::__private::log::log!(
                 $crate::__private::log::Level::Error,
-                concat!("[SPAN ENTER] ", $name, " | ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
-                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+                span = $name, $($key $(:$cap)? $(= $value)?),+;
+                "[SPAN ENTER]"
             ),
             $crate::Level::Warn => $crate::__private::log::log!(
                 $crate::__private::log::Level::Warn,
-                concat!("[SPAN ENTER] ", $name, " | ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
-                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+                span = $name, $($key $(:$cap)? $(= $value)?),+;
+                "[SPAN ENTER]"
             ),
             $crate::Level::Info => $crate::__private::log::log!(
                 $crate::__private::log::Level::Info,
-                concat!("[SPAN ENTER] ", $name, " | ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
-                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+                span = $name, $($key $(:$cap)? $(= $value)?),+;
+                "[SPAN ENTER]"
             ),
             $crate::Level::Debug => $crate::__private::log::log!(
                 $crate::__private::log::Level::Debug,
-                concat!("[SPAN ENTER] ", $name, " | ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
-                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+                span = $name, $($key $(:$cap)? $(= $value)?),+;
+                "[SPAN ENTER]"
             ),
             $crate::Level::Trace => $crate::__private::log::log!(
                 $crate::__private::log::Level::Trace,
-                concat!("[SPAN ENTER] ", $name, " | ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
-                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+                span = $name, $($key $(:$cap)? $(= $value)?),+;
+                "[SPAN ENTER]"
             ),
         };
         $crate::SpanGuard { name: $name, level: __level, module_path: module_path!() }
@@ -163,11 +124,11 @@ macro_rules! __span_impl {
     ($level:expr, $name:expr) => {{
         let __level = $level;
         match __level {
-            $crate::Level::Error => $crate::__private::log::log!($crate::__private::log::Level::Error, "[SPAN ENTER] {}", $name),
-            $crate::Level::Warn => $crate::__private::log::log!($crate::__private::log::Level::Warn, "[SPAN ENTER] {}", $name),
-            $crate::Level::Info => $crate::__private::log::log!($crate::__private::log::Level::Info, "[SPAN ENTER] {}", $name),
-            $crate::Level::Debug => $crate::__private::log::log!($crate::__private::log::Level::Debug, "[SPAN ENTER] {}", $name),
-            $crate::Level::Trace => $crate::__private::log::log!($crate::__private::log::Level::Trace, "[SPAN ENTER] {}", $name),
+            $crate::Level::Error => $crate::__private::log::log!($crate::__private::log::Level::Error, span = $name; "[SPAN ENTER]"),
+            $crate::Level::Warn => $crate::__private::log::log!($crate::__private::log::Level::Warn, span = $name; "[SPAN ENTER]"),
+            $crate::Level::Info => $crate::__private::log::log!($crate::__private::log::Level::Info, span = $name; "[SPAN ENTER]"),
+            $crate::Level::Debug => $crate::__private::log::log!($crate::__private::log::Level::Debug, span = $name; "[SPAN ENTER]"),
+            $crate::Level::Trace => $crate::__private::log::log!($crate::__private::log::Level::Trace, span = $name; "[SPAN ENTER]"),
         };
         $crate::SpanGuard { name: $name, level: __level, module_path: module_path!() }
     }};

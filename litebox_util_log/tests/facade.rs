@@ -44,18 +44,21 @@ fn test_log_macro_with_multiple_kv() {
 }
 
 #[test]
+#[cfg(feature = "kv_std")]
 fn test_log_macro_with_kv_err() {
     let error = "something went wrong";
     log!(Level::Error, error:err; "error capture");
 }
 
 #[test]
+#[cfg(feature = "kv_sval")]
 fn test_log_macro_with_kv_sval() {
     let data = vec![1, 2, 3];
     log!(Level::Debug, data:sval; "sval capture");
 }
 
 #[test]
+#[cfg(feature = "kv_serde")]
 fn test_log_macro_with_kv_serde() {
     let data = (1, "two", 3.0);
     log!(Level::Debug, data:serde; "serde capture");

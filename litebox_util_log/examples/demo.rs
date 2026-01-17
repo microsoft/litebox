@@ -71,9 +71,12 @@ fn main() {
     let z = 30;
     debug!(x:?, y:?, z:?; "Coordinates");
 
-    // Error capture (:err)
-    let error_msg = "connection timeout";
-    error!(reason:err = error_msg; "Operation failed");
+    // Error capture (:err) - requires kv_std feature
+    #[cfg(feature = "kv_std")]
+    {
+        let error_msg = "connection timeout";
+        error!(reason:err = error_msg; "Operation failed");
+    }
     println!();
 
     // -------------------------------------------------------------------------
