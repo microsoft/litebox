@@ -40,8 +40,9 @@ pub struct PerCpuVariables {
     pub gdt: Option<&'static gdt::GdtWrapper>,
     vtl0_xsave_area_addr: VirtAddr,
     vtl1_xsave_area_addr: VirtAddr,
-    vtl0_xsave_area_initialized: bool,
-    vtl1_xsave_area_initialized: bool,
+    vtl0_xsave_mask: u64,
+    vtl0_xsaved: bool,
+    vtl1_xsaved: bool,
     pub tls: VirtAddr,
 }
 
@@ -99,19 +100,22 @@ impl PerCpuVariables {
             self.vtl0_xsave_area_addr.is_null() && self.vtl1_xsave_area_addr.is_null(),
             "XSAVE areas are already allocated"
         );
-        // We should use VTL0's XCR0 (XSAVE mask) to save and restore VTL0's extended states
+        // We should use VTL0's XSAVE mask (XCR0) to save and restore VTL0's extended states
         // to satisfy the requirement of XSAVE/XRSTOR instructions.
         // Hyper-V VTLs share the same XCR0 register, so we use xgetbv instruction here.
-        // Also, we should ensure that VTL1 does not enable any extended states that VTL0 does not enable.
-        let xcr0 = xgetbv0();
+        // Here, we cache VTL0's XSAVE mask for better performance. This is safe because
+        // HVCI/HEKI prevents VTL0 from modifying XCR0.
+        // In addition, we ensure that VTL1 does not enable any extended states that VTL0 does not enable.
+        self.vtl0_xsave_mask = xgetbv0();
         assert_eq!(
-            Self::VTL1_XSAVE_MASK & !xcr0,
+            Self::VTL1_XSAVE_MASK & !self.vtl0_xsave_mask,
             0,
             "VTL1 cannot have extended states that VTL0 does not enable"
         );
         let vtl0_xsave_area_size = get_xsave_area_size();
         // Leaking `xsave_area` buffers are okay because they are never reused
         // until the core gets reset.
+        // TODO: let's revisit this if VTL0 is allowed to modify XCR0 such that xsave area size may change.
         let vtl0_xsave_area = Box::leak(
             avec![[{ Self::XSAVE_ALIGNMENT }] | 0u8; vtl0_xsave_area_size]
                 .into_boxed_slice()
@@ -132,19 +136,22 @@ impl PerCpuVariables {
     /// in VTL1. This may be due to Hyper-V not virtualizing XSAVES/XRSTORS for VTL1 or requiring
     /// specific IA32_XSS MSR configuration.
     pub(crate) fn save_extended_states(&mut self, vtl: u8) {
-        if self.vtl0_xsave_area_addr.is_null() || self.vtl1_xsave_area_addr.is_null() {
+        if self.vtl0_xsave_area_addr.is_null()
+            || self.vtl1_xsave_area_addr.is_null()
+            || self.vtl0_xsave_mask == 0
+        {
             panic!("XSAVE areas are not allocated");
         } else {
-            let (xsave_area_addr, mask, initialized) = match vtl {
+            let (xsave_area_addr, mask, xsaved) = match vtl {
                 HV_VTL_NORMAL => (
                     self.vtl0_xsave_area_addr.as_u64(),
-                    xgetbv0(),
-                    &mut self.vtl0_xsave_area_initialized,
+                    self.vtl0_xsave_mask,
+                    &mut self.vtl0_xsaved,
                 ),
                 HV_VTL_SECURE => (
                     self.vtl1_xsave_area_addr.as_u64(),
                     Self::VTL1_XSAVE_MASK,
-                    &mut self.vtl1_xsave_area_initialized,
+                    &mut self.vtl1_xsaved,
                 ),
                 _ => panic!("Invalid VTL value: {}", vtl),
             };
@@ -152,7 +159,7 @@ impl PerCpuVariables {
             // and subsequent instructions can use XSAVEOPT for better performance.
             // Safety: xsave_area_addr is valid and properly aligned
             unsafe {
-                if *initialized {
+                if *xsaved {
                     core::arch::asm!(
                         "xsaveopt [{}]",
                         in(reg) xsave_area_addr,
@@ -168,19 +175,22 @@ impl PerCpuVariables {
                         in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
                         options(nostack, preserves_flags)
                     );
+                    *xsaved = true;
                 }
             }
-            *initialized = true;
         }
     }
 
     /// Restore the extended states of each core (VTL0 or VTL1).
     pub(crate) fn restore_extended_states(&self, vtl: u8) {
-        if self.vtl0_xsave_area_addr.is_null() || self.vtl1_xsave_area_addr.is_null() {
+        if self.vtl0_xsave_area_addr.is_null()
+            || self.vtl1_xsave_area_addr.is_null()
+            || self.vtl0_xsave_mask == 0
+        {
             panic!("XSAVE areas are not allocated");
         } else {
             let (xsave_area_addr, mask) = match vtl {
-                HV_VTL_NORMAL => (self.vtl0_xsave_area_addr.as_u64(), xgetbv0()),
+                HV_VTL_NORMAL => (self.vtl0_xsave_area_addr.as_u64(), self.vtl0_xsave_mask),
                 HV_VTL_SECURE => (self.vtl1_xsave_area_addr.as_u64(), Self::VTL1_XSAVE_MASK),
                 _ => panic!("Invalid VTL value: {}", vtl),
             };
@@ -250,8 +260,9 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     gdt: const { None },
     vtl0_xsave_area_addr: VirtAddr::zero(),
     vtl1_xsave_area_addr: VirtAddr::zero(),
-    vtl0_xsave_area_initialized: false,
-    vtl1_xsave_area_initialized: false,
+    vtl0_xsave_mask: 0,
+    vtl0_xsaved: false,
+    vtl1_xsaved: false,
     tls: VirtAddr::zero(),
 };
 
@@ -399,8 +410,7 @@ pub fn allocate_per_cpu_variables() {
 /// VTL0 and VTL1 share the same XCR0 register. This function assumes that VTL1 maintains VTL0's
 /// XCR0. If VTL1 should program XCR0, we need to save and restore VTL0's XCR0 and call
 /// this function against the stored value.
-/// In addition, HVCI/HEKI prevents VTL0 from modifying XCR0, so we don't need to worry about VTL0
-/// changing XCR0 either.
+/// In addition, HVCI/HEKI prevents VTL0 from modifying XCR0.
 fn get_xsave_area_size() -> usize {
     let cpuid = raw_cpuid::CpuId::new();
     let finfo = cpuid
