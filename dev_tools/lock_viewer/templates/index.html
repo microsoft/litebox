@@ -1,0 +1,67 @@
+<!-- Copyright (c) Microsoft Corporation.
+     Licensed under the MIT license. -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lock Viewer</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+
+<body>
+    <div class="header">
+        <h1>🔒 Lock Viewer</h1>
+        <div class="stats" id="stats">Loading...</div>
+    </div>
+
+    <div class="summary-panel" id="summary-panel"></div>
+
+    <div class="controls">
+        <div class="control-group">
+            <label>Event Type</label>
+            <select id="event-type-filter">
+                <option value="all">All Events</option>
+                <option value="created">Created Only</option>
+                <option value="attempt">Attempts Only</option>
+                <option value="acquired">Acquired Only</option>
+                <option value="released">Released Only</option>
+                <option value="destroyed">Destroyed Only</option>
+            </select>
+        </div>
+
+        <div class="control-group">
+            <label>Time Range <span id="time-range-display" class="time-range-display">0% - 100%</span></label>
+            <div class="time-range-slider">
+                <input type="range" id="time-start" min="0" max="100" value="0" step="1">
+                <input type="range" id="time-end" min="0" max="100" value="100" step="1">
+            </div>
+            <div class="time-range-hint" id="time-range-hint"></div>
+        </div>
+
+        <button class="btn btn-secondary" onclick="resetFilters()">Reset Filters</button>
+        <button class="btn" onclick="loadData()">Reload Data</button>
+    </div>
+
+    <div class="lock-table-container">
+        <div class="lock-table-header">
+            <h3>🔐 Lock Selection</h3>
+            <div class="lock-buttons">
+                <button class="btn btn-small" onclick="selectAllLocks()">Select All</button>
+                <button class="btn btn-small btn-secondary" onclick="selectNoLocks()">Select None</button>
+            </div>
+        </div>
+        <div class="lock-filter" id="lock-filter"></div>
+    </div>
+
+    <div class="timeline-container">
+        <div id="timeline-content"></div>
+    </div>
+
+    <div class="tooltip" id="tooltip"></div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+
+</html>

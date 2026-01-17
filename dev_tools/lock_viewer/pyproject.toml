@@ -1,0 +1,11 @@
+[project]
+name = "lock-viewer"
+version = "0.1.0"
+description = "Web-based visualization tool for LiteBox lock trace data"
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=2.0.0",
+]
+
+[project.scripts]
+lock-viewer = "server:main"

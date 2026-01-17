@@ -20,5 +20,8 @@ sha2 = "0.10"
 walkdir = "2.0"
 glob = "0.3"
 
+[features]
+lock_tracing = ["litebox/lock_tracing"]
+
 [lints]
 workspace = true

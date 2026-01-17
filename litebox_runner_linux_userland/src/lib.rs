@@ -320,12 +320,30 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let program = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
+
+    #[cfg(feature = "lock_tracing")]
+    litebox::sync::start_recording();
+
     unsafe {
         litebox_platform_linux_userland::run_thread(
             program.entrypoints,
             &mut litebox_common_linux::PtRegs::default(),
         );
     };
+
+    #[cfg(feature = "lock_tracing")]
+    {
+        litebox::sync::stop_recording();
+        let events = litebox::sync::flush_to_jsonl();
+        if !events.is_empty() {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::File::create("/tmp/locks.jsonl") {
+                for line in &events {
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+        }
+    }
 
     if let Some(net_worker) = net_worker {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);

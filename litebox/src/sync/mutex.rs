@@ -183,17 +183,24 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for MutexGuard<'_, Pla
 /// information, thus its [`lock`](Self::lock) functionality directly returns a locked guard.
 pub struct Mutex<Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     raw: SpinEnabledRawMutex<Platform>,
+    /// Creation location and registration state for lock tracing.
+    #[cfg(feature = "lock_tracing")]
+    creation: super::lock_tracing::Creation,
+    // NOTE: `data` must be the last field because T may be ?Sized
     data: UnsafeCell<T>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     /// Returns a new mutex wrapping the given value.
     #[inline]
+    #[cfg_attr(feature = "lock_tracing", track_caller)]
     pub const fn new(val: T) -> Self {
         Self {
             raw: SpinEnabledRawMutex::new(
                 <Platform as crate::platform::RawMutexProvider>::RawMutex::INIT,
             ),
+            #[cfg(feature = "lock_tracing")]
+            creation: super::lock_tracing::Creation::new(),
             data: UnsafeCell::new(val),
         }
     }
@@ -210,6 +217,10 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     #[inline]
     #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, Platform, T> {
+        #[cfg(feature = "lock_tracing")]
+        self.creation
+            .ensure_registered(LockType::Mutex, || self.raw.raw.underlying_atomic());
+
         #[cfg(feature = "lock_tracing")]
         let attempt = super::lock_tracing::LockTracker::begin_lock_attempt(
             LockType::Mutex,
@@ -232,5 +243,13 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     pub fn get_mut(&mut self) -> &mut T {
         // SAFETY: We have &mut self, so no other threads can have access to the data.
         unsafe { &mut *self.data.get() }
+    }
+}
+
+#[cfg(feature = "lock_tracing")]
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for Mutex<Platform, T> {
+    fn drop(&mut self) {
+        self.creation
+            .record_destruction_if_registered(LockType::Mutex, self.raw.raw.underlying_atomic());
     }
 }
