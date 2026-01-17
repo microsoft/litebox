@@ -102,10 +102,10 @@ impl PerCpuVariables {
         );
         // We should use VTL0's XSAVE mask (XCR0) to save and restore VTL0's extended states
         // to satisfy the requirement of XSAVE/XRSTOR instructions.
-        // Hyper-V VTLs share the same XCR0 register, so we use xgetbv instruction here.
+        // Hyper-V VTLs share the same XCR0 register, so we use xgetbv instruction.
         // Here, we cache VTL0's XSAVE mask for better performance. This is safe because
-        // HVCI/HEKI prevents VTL0 from modifying XCR0.
-        // In addition, we ensure that VTL1 does not enable any extended states that VTL0 does not enable.
+        // Linux kernel (VTL0) initializes XCR0 during boot and does not expands it to
+        // cover other extended states (which require nontrivial per-CPU xsave buffer changes).
         self.vtl0_xsave_mask = xgetbv0();
         assert_eq!(
             Self::VTL1_XSAVE_MASK & !self.vtl0_xsave_mask,
