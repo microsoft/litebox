@@ -13,10 +13,6 @@
 //! This allows log subscribers to correlate related log messages, though it
 //! lacks the full hierarchical context that `tracing` provides.
 
-// =============================================================================
-// SpanGuard
-// =============================================================================
-
 /// RAII guard that logs span exit when dropped.
 ///
 /// This type is returned by span macros (e.g., [`info_span!`](crate::info_span)) when
@@ -44,9 +40,7 @@ pub struct SpanGuard {
 }
 
 impl Drop for SpanGuard {
-    /// Logs a `[SPAN EXIT]` message at the span's level when the guard is dropped.
     fn drop(&mut self) {
-        // Match to convert from our Level enum to log::Level.
         match self.level {
             crate::Level::Error => {
                 log::log!(target: self.module_path, log::Level::Error, span = self.name; "[SPAN EXIT]");
@@ -67,10 +61,6 @@ impl Drop for SpanGuard {
     }
 }
 
-// =============================================================================
-// Internal macros
-// =============================================================================
-
 /// Internal macro for log backend implementation.
 ///
 /// This macro dispatches log events to the `log` crate, properly using log's `kv`
@@ -81,7 +71,6 @@ impl Drop for SpanGuard {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __log_impl {
-    // With key-value pairs - pass them directly to log's kv syntax
     ($level:expr, $($key:tt $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {{
         match $level {
             $crate::Level::Error => $crate::__private::log::log!(
@@ -111,7 +100,6 @@ macro_rules! __log_impl {
             ),
         }
     }};
-    // Without key-value pairs - simple message (literal only)
     ($level:expr, $msg:literal) => {
         match $level {
             $crate::Level::Error => $crate::__private::log::log!($crate::__private::log::Level::Error, $msg),

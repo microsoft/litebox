@@ -11,10 +11,6 @@
 //! - Simple message: `info!("message")`
 //! - Key-value pairs with message: `info!(key:? = value; "message")`
 
-// =============================================================================
-// LOGGING MACROS
-// =============================================================================
-
 /// Log at the error level.
 ///
 /// Use this for serious problems that need immediate attention, such as
@@ -28,11 +24,9 @@
 /// ```
 #[macro_export]
 macro_rules! error {
-    // Key-value pairs with message
     ($($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {
         $crate::__log_impl!($crate::Level::Error, $($key $(:$cap)? $(= $value)?),+ ; $msg)
     };
-    // Just message (literal only)
     ($msg:literal) => {
         $crate::__log_impl!($crate::Level::Error, $msg)
     };
@@ -144,10 +138,6 @@ macro_rules! log {
     };
 }
 
-// =============================================================================
-// SPAN MACROS
-// =============================================================================
-
 /// Create a span at the specified level. Returns a guard that exits the span when dropped.
 ///
 /// Spans are used to represent a period of time or a logical operation. With the
@@ -169,11 +159,9 @@ macro_rules! log {
 /// ```
 #[macro_export]
 macro_rules! span {
-    // With key-value pairs
     ($level:expr, $name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {
         $crate::__span_impl!($level, $name, $($key $(:$cap)? $(= $value)?),+)
     };
-    // Just name
     ($level:expr, $name:expr) => {
         $crate::__span_impl!($level, $name)
     };

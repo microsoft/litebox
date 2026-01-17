@@ -10,10 +10,6 @@
 //! The macros in this module transform our unified key-value syntax into
 //! tracing's native field syntax using a tt-muncher pattern.
 
-// =============================================================================
-// SpanGuard
-// =============================================================================
-
 /// RAII guard that wraps a tracing span's entered guard.
 ///
 /// This type is returned by span macros (e.g., [`info_span!`](crate::info_span)) when
@@ -39,10 +35,6 @@ pub struct SpanGuard {
     pub inner: tracing::span::EnteredSpan,
 }
 
-// =============================================================================
-// Internal macros
-// =============================================================================
-
 /// Internal macro for tracing backend implementation.
 ///
 /// This macro transforms our unified key-value syntax into tracing's native
@@ -52,7 +44,6 @@ pub struct SpanGuard {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __log_impl {
-    // With key-value pairs - dispatch to field processor
     ($level:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {{
         $crate::__tracing_event_dispatch!(
             [$level]
@@ -61,7 +52,6 @@ macro_rules! __log_impl {
             [$($key $(:$cap)? $(= $value)?),+]
         )
     }};
-    // Without key-value pairs (literal only)
     ($level:expr, $msg:literal) => {
         $crate::__tracing_event_emit!([$level], $msg)
     };
@@ -74,7 +64,6 @@ macro_rules! __log_impl {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tracing_event_emit {
-    // With fields
     ([$level:expr], $($fields:tt)+) => {
         match $level {
             $crate::Level::Error => {
@@ -373,10 +362,6 @@ macro_rules! __tracing_event_dispatch {
         $crate::__tracing_event_emit!([$level], $($acc)* $msg)
     };
 }
-
-// =============================================================================
-// Span macros
-// =============================================================================
 
 /// Internal macro for span implementation with tracing backend.
 ///

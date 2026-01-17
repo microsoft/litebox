@@ -60,16 +60,9 @@
 #[cfg(not(any(feature = "backend_log", feature = "backend_tracing")))]
 compile_error!("Either `backend_log` or `backend_tracing` feature must be enabled.");
 
-// =============================================================================
-// Module declarations
-// =============================================================================
-
-// Public macros module - macros are exported at crate root via #[macro_export]
 #[macro_use]
 mod macros;
 
-// Backend-specific implementations
-// Only one backend is active at a time (tracing takes precedence if both enabled)
 #[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
 #[macro_use]
 mod backend_log;
@@ -78,16 +71,7 @@ mod backend_log;
 #[macro_use]
 mod backend_tracing;
 
-// =============================================================================
-// Public re-exports
-// =============================================================================
-
-// Re-export the instrument attribute macro
 pub use litebox_util_log_macros::instrument;
-
-// =============================================================================
-// Level enum
-// =============================================================================
 
 /// Log level that abstracts over backend-specific level types.
 ///
@@ -120,20 +104,11 @@ pub enum Level {
     Trace,
 }
 
-// Re-export SpanGuard from the active backend.
-//
-// SpanGuard is the RAII type returned by span macros. When using the log backend,
-// it emits a log message on drop; when using the tracing backend, it wraps
-// tracing's entered span guard.
 #[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
 pub use backend_log::SpanGuard;
 
 #[cfg(feature = "backend_tracing")]
 pub use backend_tracing::SpanGuard;
-
-// =============================================================================
-// Internal module for macro implementation details
-// =============================================================================
 
 /// Internal module exposing backend types for use by exported macros.
 ///
