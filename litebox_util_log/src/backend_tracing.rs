@@ -151,11 +151,11 @@ macro_rules! __tracing_dispatch {
         )
     };
 
-    // Field: key = value (no capture mode, default to Debug)
+    // Field: key = value (no capture mode)
     ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
-            [$($acc)* $key = ?$value,]
+            [$($acc)* $key = $value,]
             [$($($rest)*)?]
         )
     };
