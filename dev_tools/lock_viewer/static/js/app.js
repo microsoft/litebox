@@ -12,7 +12,7 @@ let uniqueLocks = new Set();
 let selectedLocks = new Set();
 let minTime = 0;
 let maxTime = 0;
-let minTimeWithDrops = 0;  // Time threshold accounting for dropped events
+let minTimeWithDrops = 0;  // Time threshold accounting for evicted events
 let commonPathPrefix = '';  // Common prefix to strip from file paths
 let lockContention = {};   // Map of lock_addr -> contention duration in ns
 let lockMaxWaitLocations = {};  // Map of lock_addr -> location with max wait time
@@ -44,14 +44,14 @@ async function loadData() {
             minTime = allEvents.reduce((min, e) => e.timestamp_ns < min ? e.timestamp_ns : min, Infinity);
             maxTime = allEvents.reduce((max, e) => e.timestamp_ns > max ? e.timestamp_ns : max, -Infinity);
 
-            // Calculate minimum time threshold based on dropped events
-            // If events were dropped, we can't trust early data
-            if (summary && summary.dropped_events > 0) {
+            // Calculate minimum time threshold based on evicted events
+            // If events were evicted (oldest events removed), we can't trust early data
+            if (summary && summary.evicted_events > 0) {
                 const totalEvents = summary.recorded_events;
-                const droppedRatio = summary.dropped_events / totalEvents;
+                const evictedRatio = summary.evicted_events / totalEvents;
                 const timeRange = maxTime - minTime;
-                // Set the minimum threshold to skip the early portion where drops occurred
-                minTimeWithDrops = minTime + (timeRange * droppedRatio);
+                // Set the minimum threshold to skip the early portion where evictions occurred
+                minTimeWithDrops = minTime + (timeRange * evictedRatio);
             } else {
                 minTimeWithDrops = minTime;
             }
@@ -239,10 +239,10 @@ function updateSummary() {
     }
 
     const recordedEvents = summary.recorded_events || 0;
-    const droppedEvents = summary.dropped_events || 0;
-    const droppedClass = droppedEvents > 0 ? 'warning' : 'success';
+    const evictedEvents = summary.evicted_events || 0;
+    const evictedClass = evictedEvents > 0 ? 'warning' : 'success';
     const utilization = recordedEvents > 0
-        ? ((recordedEvents - droppedEvents) / recordedEvents * 100).toFixed(1)
+        ? ((recordedEvents - evictedEvents) / recordedEvents * 100).toFixed(1)
         : '100.0';
 
     panel.innerHTML = `
@@ -251,8 +251,8 @@ function updateSummary() {
             <span class="value">${recordedEvents.toLocaleString()}</span>
         </div>
         <div class="summary-item">
-            <span class="label">Events Dropped</span>
-            <span class="value ${droppedClass}">${droppedEvents.toLocaleString()}</span>
+            <span class="label">Events Evicted</span>
+            <span class="value ${evictedClass}">${evictedEvents.toLocaleString()}</span>
         </div>
         <div class="summary-item">
             <span class="label">Buffer Utilization</span>
@@ -928,13 +928,13 @@ function resetFilters() {
 }
 
 /**
- * Get the minimum slider value based on dropped events.
+ * Get the minimum slider value based on evicted events.
  */
 function getMinTimeSliderValue() {
-    if (summary && summary.dropped_events > 0) {
+    if (summary && summary.evicted_events > 0) {
         const totalEvents = summary.recorded_events;
-        const droppedRatio = summary.dropped_events / totalEvents;
-        return Math.round(droppedRatio * 100);
+        const evictedRatio = summary.evicted_events / totalEvents;
+        return Math.round(evictedRatio * 100);
     }
     return 0;
 }
@@ -971,7 +971,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Initial load
     loadData().then(() => {
-        // Set initial slider values based on dropped events
+        // Set initial slider values based on evicted events
         const minSliderValue = getMinTimeSliderValue();
         document.getElementById('time-start').value = minSliderValue;
         document.getElementById('time-start').min = minSliderValue;

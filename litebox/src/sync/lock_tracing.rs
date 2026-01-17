@@ -283,8 +283,8 @@ impl RecordedEvent {
 pub struct RecordingSummary {
     /// Number of events that were recorded.
     pub recorded_events: u64,
-    /// Number of events that were dropped due to buffer overflow.
-    pub dropped_events: u64,
+    /// Number of oldest events that were evicted due to buffer overflow.
+    pub evicted_events: u64,
 }
 
 impl RecordingSummary {
@@ -293,8 +293,8 @@ impl RecordingSummary {
         let mut out = alloc::string::String::with_capacity(128);
         let _ = write!(
             out,
-            "{{\"type\":\"summary\",\"recorded_events\":{},\"dropped_events\":{}}}",
-            self.recorded_events, self.dropped_events,
+            "{{\"type\":\"summary\",\"recorded_events\":{},\"evicted_events\":{}}}",
+            self.recorded_events, self.evicted_events,
         );
         out
     }
@@ -304,7 +304,7 @@ struct EventRecorder {
     events: alloc::collections::VecDeque<RecordedEvent>,
     recording: bool,
     total_recorded: u64,
-    dropped_events: u64,
+    evicted_events: u64,
 }
 
 impl EventRecorder {
@@ -313,7 +313,7 @@ impl EventRecorder {
             events: alloc::collections::VecDeque::new(),
             recording: false,
             total_recorded: 0,
-            dropped_events: 0,
+            evicted_events: 0,
         }
     }
 
@@ -336,7 +336,7 @@ impl EventRecorder {
         self.total_recorded += 1;
         if self.events.len() == CONFIG_MAX_RECORDED_EVENTS {
             self.events.pop_front();
-            self.dropped_events += 1;
+            self.evicted_events += 1;
         }
         self.events.push_back(event);
     }
@@ -352,7 +352,7 @@ impl EventRecorder {
     fn get_summary(&self) -> RecordingSummary {
         RecordingSummary {
             recorded_events: self.total_recorded,
-            dropped_events: self.dropped_events,
+            evicted_events: self.evicted_events,
         }
     }
 
@@ -365,7 +365,7 @@ impl EventRecorder {
         }
         self.events.clear();
         self.total_recorded = 0;
-        self.dropped_events = 0;
+        self.evicted_events = 0;
         result
     }
 }
