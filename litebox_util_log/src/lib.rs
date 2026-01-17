@@ -41,14 +41,10 @@
 
 #![no_std]
 
-// Re-export the Level type for convenience
-#[cfg(feature = "backend_log")]
-pub use log::Level;
+// Re-export useful items from backends
 #[cfg(feature = "backend_log")]
 pub use log::{LevelFilter, log_enabled};
 
-#[cfg(feature = "backend_tracing")]
-pub use tracing::Level;
 #[cfg(feature = "backend_tracing")]
 pub use tracing::level_enabled as log_enabled;
 
@@ -61,6 +57,24 @@ compile_error!(
 
 #[cfg(not(any(feature = "backend_log", feature = "backend_tracing")))]
 compile_error!("Either `backend_log` or `backend_tracing` feature must be enabled.");
+
+/// Log level that abstracts over backend-specific level types.
+///
+/// This enum provides a unified way to specify log levels regardless of
+/// whether the `backend_log` or `backend_tracing` feature is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Level {
+    /// Error level - for serious problems that need immediate attention.
+    Error,
+    /// Warn level - for potential issues or unexpected situations.
+    Warn,
+    /// Info level - for general informational messages.
+    Info,
+    /// Debug level - for debugging information useful during development.
+    Debug,
+    /// Trace level - for very verbose debugging, typically disabled in production.
+    Trace,
+}
 
 /// Internal module for macro implementation details.
 /// Not part of the public API.
@@ -75,29 +89,6 @@ pub mod __private {
     pub use tracing;
     #[cfg(feature = "backend_tracing")]
     pub use tracing::Level;
-
-    // Backend-agnostic level constants for use in macros
-    #[cfg(feature = "backend_log")]
-    pub const LEVEL_ERROR: log::Level = log::Level::Error;
-    #[cfg(feature = "backend_log")]
-    pub const LEVEL_WARN: log::Level = log::Level::Warn;
-    #[cfg(feature = "backend_log")]
-    pub const LEVEL_INFO: log::Level = log::Level::Info;
-    #[cfg(feature = "backend_log")]
-    pub const LEVEL_DEBUG: log::Level = log::Level::Debug;
-    #[cfg(feature = "backend_log")]
-    pub const LEVEL_TRACE: log::Level = log::Level::Trace;
-
-    #[cfg(feature = "backend_tracing")]
-    pub const LEVEL_ERROR: tracing::Level = tracing::Level::ERROR;
-    #[cfg(feature = "backend_tracing")]
-    pub const LEVEL_WARN: tracing::Level = tracing::Level::WARN;
-    #[cfg(feature = "backend_tracing")]
-    pub const LEVEL_INFO: tracing::Level = tracing::Level::INFO;
-    #[cfg(feature = "backend_tracing")]
-    pub const LEVEL_DEBUG: tracing::Level = tracing::Level::DEBUG;
-    #[cfg(feature = "backend_tracing")]
-    pub const LEVEL_TRACE: tracing::Level = tracing::Level::TRACE;
 }
 
 // =============================================================================
@@ -116,11 +107,11 @@ pub mod __private {
 macro_rules! error {
     // Key-value pairs with message
     ($($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {
-        $crate::__log_impl!($crate::__private::LEVEL_ERROR, $($key $(:$cap)? $(= $value)?),+ ; $msg)
+        $crate::__log_impl!($crate::Level::Error, $($key $(:$cap)? $(= $value)?),+ ; $msg)
     };
     // Just message (literal only)
     ($msg:literal) => {
-        $crate::__log_impl!($crate::__private::LEVEL_ERROR, $msg)
+        $crate::__log_impl!($crate::Level::Error, $msg)
     };
 }
 
@@ -135,10 +126,10 @@ macro_rules! error {
 #[macro_export]
 macro_rules! warn {
     ($($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {
-        $crate::__log_impl!($crate::__private::LEVEL_WARN, $($key $(:$cap)? $(= $value)?),+ ; $msg)
+        $crate::__log_impl!($crate::Level::Warn, $($key $(:$cap)? $(= $value)?),+ ; $msg)
     };
     ($msg:literal) => {
-        $crate::__log_impl!($crate::__private::LEVEL_WARN, $msg)
+        $crate::__log_impl!($crate::Level::Warn, $msg)
     };
 }
 
@@ -153,10 +144,10 @@ macro_rules! warn {
 #[macro_export]
 macro_rules! info {
     ($($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {
-        $crate::__log_impl!($crate::__private::LEVEL_INFO, $($key $(:$cap)? $(= $value)?),+ ; $msg)
+        $crate::__log_impl!($crate::Level::Info, $($key $(:$cap)? $(= $value)?),+ ; $msg)
     };
     ($msg:literal) => {
-        $crate::__log_impl!($crate::__private::LEVEL_INFO, $msg)
+        $crate::__log_impl!($crate::Level::Info, $msg)
     };
 }
 
@@ -171,10 +162,10 @@ macro_rules! info {
 #[macro_export]
 macro_rules! debug {
     ($($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {
-        $crate::__log_impl!($crate::__private::LEVEL_DEBUG, $($key $(:$cap)? $(= $value)?),+ ; $msg)
+        $crate::__log_impl!($crate::Level::Debug, $($key $(:$cap)? $(= $value)?),+ ; $msg)
     };
     ($msg:literal) => {
-        $crate::__log_impl!($crate::__private::LEVEL_DEBUG, $msg)
+        $crate::__log_impl!($crate::Level::Debug, $msg)
     };
 }
 
@@ -189,10 +180,10 @@ macro_rules! debug {
 #[macro_export]
 macro_rules! trace {
     ($($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {
-        $crate::__log_impl!($crate::__private::LEVEL_TRACE, $($key $(:$cap)? $(= $value)?),+ ; $msg)
+        $crate::__log_impl!($crate::Level::Trace, $($key $(:$cap)? $(= $value)?),+ ; $msg)
     };
     ($msg:literal) => {
-        $crate::__log_impl!($crate::__private::LEVEL_TRACE, $msg)
+        $crate::__log_impl!($crate::Level::Trace, $msg)
     };
 }
 
@@ -255,10 +246,10 @@ macro_rules! span {
 #[macro_export]
 macro_rules! error_span {
     ($name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {
-        $crate::span!($crate::__private::LEVEL_ERROR, $name, $($key $(:$cap)? $(= $value)?),+)
+        $crate::span!($crate::Level::Error, $name, $($key $(:$cap)? $(= $value)?),+)
     };
     ($name:expr) => {
-        $crate::span!($crate::__private::LEVEL_ERROR, $name)
+        $crate::span!($crate::Level::Error, $name)
     };
 }
 
@@ -272,10 +263,10 @@ macro_rules! error_span {
 #[macro_export]
 macro_rules! warn_span {
     ($name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {
-        $crate::span!($crate::__private::LEVEL_WARN, $name, $($key $(:$cap)? $(= $value)?),+)
+        $crate::span!($crate::Level::Warn, $name, $($key $(:$cap)? $(= $value)?),+)
     };
     ($name:expr) => {
-        $crate::span!($crate::__private::LEVEL_WARN, $name)
+        $crate::span!($crate::Level::Warn, $name)
     };
 }
 
@@ -289,10 +280,10 @@ macro_rules! warn_span {
 #[macro_export]
 macro_rules! info_span {
     ($name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {
-        $crate::span!($crate::__private::LEVEL_INFO, $name, $($key $(:$cap)? $(= $value)?),+)
+        $crate::span!($crate::Level::Info, $name, $($key $(:$cap)? $(= $value)?),+)
     };
     ($name:expr) => {
-        $crate::span!($crate::__private::LEVEL_INFO, $name)
+        $crate::span!($crate::Level::Info, $name)
     };
 }
 
@@ -306,10 +297,10 @@ macro_rules! info_span {
 #[macro_export]
 macro_rules! debug_span {
     ($name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {
-        $crate::span!($crate::__private::LEVEL_DEBUG, $name, $($key $(:$cap)? $(= $value)?),+)
+        $crate::span!($crate::Level::Debug, $name, $($key $(:$cap)? $(= $value)?),+)
     };
     ($name:expr) => {
-        $crate::span!($crate::__private::LEVEL_DEBUG, $name)
+        $crate::span!($crate::Level::Debug, $name)
     };
 }
 
@@ -323,10 +314,10 @@ macro_rules! debug_span {
 #[macro_export]
 macro_rules! trace_span {
     ($name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {
-        $crate::span!($crate::__private::LEVEL_TRACE, $name, $($key $(:$cap)? $(= $value)?),+)
+        $crate::span!($crate::Level::Trace, $name, $($key $(:$cap)? $(= $value)?),+)
     };
     ($name:expr) => {
-        $crate::span!($crate::__private::LEVEL_TRACE, $name)
+        $crate::span!($crate::Level::Trace, $name)
     };
 }
 
@@ -341,12 +332,18 @@ mod log_backend {
         #[doc(hidden)]
         pub name: &'static str,
         #[doc(hidden)]
-        pub level: log::Level,
+        pub level: crate::Level,
     }
 
     impl Drop for SpanGuard {
         fn drop(&mut self) {
-            log::log!(self.level, "[SPAN EXIT] {}", self.name);
+            match self.level {
+                crate::Level::Error => log::log!(log::Level::Error, "[SPAN EXIT] {}", self.name),
+                crate::Level::Warn => log::log!(log::Level::Warn, "[SPAN EXIT] {}", self.name),
+                crate::Level::Info => log::log!(log::Level::Info, "[SPAN EXIT] {}", self.name),
+                crate::Level::Debug => log::log!(log::Level::Debug, "[SPAN EXIT] {}", self.name),
+                crate::Level::Trace => log::log!(log::Level::Trace, "[SPAN EXIT] {}", self.name),
+            }
         }
     }
 }
@@ -361,15 +358,43 @@ pub use log_backend::SpanGuard;
 macro_rules! __log_impl {
     // With key-value pairs - format them into the message
     ($level:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {{
-        $crate::__private::log::log!(
-            $level,
-            concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
-            $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
-        )
+        match $level {
+            $crate::Level::Error => $crate::__private::log::log!(
+                $crate::__private::log::Level::Error,
+                concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
+                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+            ),
+            $crate::Level::Warn => $crate::__private::log::log!(
+                $crate::__private::log::Level::Warn,
+                concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
+                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+            ),
+            $crate::Level::Info => $crate::__private::log::log!(
+                $crate::__private::log::Level::Info,
+                concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
+                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+            ),
+            $crate::Level::Debug => $crate::__private::log::log!(
+                $crate::__private::log::Level::Debug,
+                concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
+                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+            ),
+            $crate::Level::Trace => $crate::__private::log::log!(
+                $crate::__private::log::Level::Trace,
+                concat!($($crate::__kv_format_log!($key $(:$cap)?)),+ , " | ", $msg),
+                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+            ),
+        }
     }};
     // Without key-value pairs - simple message (literal only)
     ($level:expr, $msg:literal) => {
-        $crate::__private::log::log!($level, $msg)
+        match $level {
+            $crate::Level::Error => $crate::__private::log::log!($crate::__private::log::Level::Error, $msg),
+            $crate::Level::Warn => $crate::__private::log::log!($crate::__private::log::Level::Warn, $msg),
+            $crate::Level::Info => $crate::__private::log::log!($crate::__private::log::Level::Info, $msg),
+            $crate::Level::Debug => $crate::__private::log::log!($crate::__private::log::Level::Debug, $msg),
+            $crate::Level::Trace => $crate::__private::log::log!($crate::__private::log::Level::Trace, $msg),
+        }
     };
 }
 
@@ -421,16 +446,46 @@ macro_rules! __kv_value_log {
 #[macro_export]
 macro_rules! __span_impl {
     ($level:expr, $name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {{
-        $crate::__private::log::log!(
-            $level,
-            concat!("[SPAN ENTER] ", $name, " | ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
-            $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
-        );
-        $crate::SpanGuard { name: $name, level: $level }
+        let __level = $level;
+        match __level {
+            $crate::Level::Error => $crate::__private::log::log!(
+                $crate::__private::log::Level::Error,
+                concat!("[SPAN ENTER] ", $name, " | ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
+                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+            ),
+            $crate::Level::Warn => $crate::__private::log::log!(
+                $crate::__private::log::Level::Warn,
+                concat!("[SPAN ENTER] ", $name, " | ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
+                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+            ),
+            $crate::Level::Info => $crate::__private::log::log!(
+                $crate::__private::log::Level::Info,
+                concat!("[SPAN ENTER] ", $name, " | ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
+                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+            ),
+            $crate::Level::Debug => $crate::__private::log::log!(
+                $crate::__private::log::Level::Debug,
+                concat!("[SPAN ENTER] ", $name, " | ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
+                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+            ),
+            $crate::Level::Trace => $crate::__private::log::log!(
+                $crate::__private::log::Level::Trace,
+                concat!("[SPAN ENTER] ", $name, " | ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
+                $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
+            ),
+        };
+        $crate::SpanGuard { name: $name, level: __level }
     }};
     ($level:expr, $name:expr) => {{
-        $crate::__private::log::log!($level, "[SPAN ENTER] {}", $name);
-        $crate::SpanGuard { name: $name, level: $level }
+        let __level = $level;
+        match __level {
+            $crate::Level::Error => $crate::__private::log::log!($crate::__private::log::Level::Error, "[SPAN ENTER] {}", $name),
+            $crate::Level::Warn => $crate::__private::log::log!($crate::__private::log::Level::Warn, "[SPAN ENTER] {}", $name),
+            $crate::Level::Info => $crate::__private::log::log!($crate::__private::log::Level::Info, "[SPAN ENTER] {}", $name),
+            $crate::Level::Debug => $crate::__private::log::log!($crate::__private::log::Level::Debug, "[SPAN ENTER] {}", $name),
+            $crate::Level::Trace => $crate::__private::log::log!($crate::__private::log::Level::Trace, "[SPAN ENTER] {}", $name),
+        };
+        $crate::SpanGuard { name: $name, level: __level }
     }};
 }
 
@@ -480,45 +535,41 @@ macro_rules! __tracing_event_simple {
     // With format arguments
     ($level:expr, $fmt:expr, $($arg:expr),+) => {
         match $level {
-            $crate::__private::LEVEL_ERROR => {
+            $crate::Level::Error => {
                 $crate::__private::tracing::event!($crate::__private::tracing::Level::ERROR, $fmt, $($arg),+)
             }
-            $crate::__private::LEVEL_WARN => {
+            $crate::Level::Warn => {
                 $crate::__private::tracing::event!($crate::__private::tracing::Level::WARN, $fmt, $($arg),+)
             }
-            $crate::__private::LEVEL_INFO => {
+            $crate::Level::Info => {
                 $crate::__private::tracing::event!($crate::__private::tracing::Level::INFO, $fmt, $($arg),+)
             }
-            $crate::__private::LEVEL_DEBUG => {
+            $crate::Level::Debug => {
                 $crate::__private::tracing::event!($crate::__private::tracing::Level::DEBUG, $fmt, $($arg),+)
             }
-            $crate::__private::LEVEL_TRACE => {
+            $crate::Level::Trace => {
                 $crate::__private::tracing::event!($crate::__private::tracing::Level::TRACE, $fmt, $($arg),+)
             }
-            // unreachable but needed for exhaustiveness with Level type
-            _ => {}
         }
     };
     // Just a literal message
     ($level:expr, $msg:literal) => {
         match $level {
-            $crate::__private::LEVEL_ERROR => {
+            $crate::Level::Error => {
                 $crate::__private::tracing::event!($crate::__private::tracing::Level::ERROR, $msg)
             }
-            $crate::__private::LEVEL_WARN => {
+            $crate::Level::Warn => {
                 $crate::__private::tracing::event!($crate::__private::tracing::Level::WARN, $msg)
             }
-            $crate::__private::LEVEL_INFO => {
+            $crate::Level::Info => {
                 $crate::__private::tracing::event!($crate::__private::tracing::Level::INFO, $msg)
             }
-            $crate::__private::LEVEL_DEBUG => {
+            $crate::Level::Debug => {
                 $crate::__private::tracing::event!($crate::__private::tracing::Level::DEBUG, $msg)
             }
-            $crate::__private::LEVEL_TRACE => {
+            $crate::Level::Trace => {
                 $crate::__private::tracing::event!($crate::__private::tracing::Level::TRACE, $msg)
             }
-            // unreachable but needed for exhaustiveness with Level type
-            _ => {}
         }
     };
 }
@@ -533,28 +584,28 @@ macro_rules! __tracing_event_simple {
 macro_rules! __span_impl {
     ($level:expr, $name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {{
         // Create a real tracing span (without fields due to macro limitations)
-        let span = match $level {
-            $crate::__private::LEVEL_ERROR => {
+        let __level = $level;
+        let span = match __level {
+            $crate::Level::Error => {
                 $crate::__private::tracing::span!($crate::__private::tracing::Level::ERROR, $name)
             }
-            $crate::__private::LEVEL_WARN => {
+            $crate::Level::Warn => {
                 $crate::__private::tracing::span!($crate::__private::tracing::Level::WARN, $name)
             }
-            $crate::__private::LEVEL_INFO => {
+            $crate::Level::Info => {
                 $crate::__private::tracing::span!($crate::__private::tracing::Level::INFO, $name)
             }
-            $crate::__private::LEVEL_DEBUG => {
+            $crate::Level::Debug => {
                 $crate::__private::tracing::span!($crate::__private::tracing::Level::DEBUG, $name)
             }
-            $crate::__private::LEVEL_TRACE => {
+            $crate::Level::Trace => {
                 $crate::__private::tracing::span!($crate::__private::tracing::Level::TRACE, $name)
             }
-            _ => unreachable!()
         };
         let guard = span.entered();
         // Log kv pairs as an event within the span
         $crate::__tracing_event_simple!(
-            $level,
+            __level,
             concat!("[SPAN FIELDS] ", $($crate::__kv_format_log!($key $(:$cap)?)),+),
             $($crate::__kv_value_log!($key $(:$cap)? $(= $value)?)),+
         );
@@ -562,22 +613,21 @@ macro_rules! __span_impl {
     }};
     ($level:expr, $name:expr) => {{
         let span = match $level {
-            $crate::__private::LEVEL_ERROR => {
+            $crate::Level::Error => {
                 $crate::__private::tracing::span!($crate::__private::tracing::Level::ERROR, $name)
             }
-            $crate::__private::LEVEL_WARN => {
+            $crate::Level::Warn => {
                 $crate::__private::tracing::span!($crate::__private::tracing::Level::WARN, $name)
             }
-            $crate::__private::LEVEL_INFO => {
+            $crate::Level::Info => {
                 $crate::__private::tracing::span!($crate::__private::tracing::Level::INFO, $name)
             }
-            $crate::__private::LEVEL_DEBUG => {
+            $crate::Level::Debug => {
                 $crate::__private::tracing::span!($crate::__private::tracing::Level::DEBUG, $name)
             }
-            $crate::__private::LEVEL_TRACE => {
+            $crate::Level::Trace => {
                 $crate::__private::tracing::span!($crate::__private::tracing::Level::TRACE, $name)
             }
-            _ => unreachable!()
         };
         $crate::SpanGuard { inner: span.entered() }
     }};
