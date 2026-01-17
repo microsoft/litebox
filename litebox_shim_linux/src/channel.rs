@@ -3,19 +3,19 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use litebox::{
-    event::polling::Pollee,
+    event::{Events, observer::Observer, polling::Pollee},
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
 use litebox_common_linux::errno::Errno;
-use ringbuf::traits::{Consumer as _, Producer as _};
+use ringbuf::traits::{Consumer as _, Observer as _, Producer as _};
 
 macro_rules! common_functions_for_channel {
     () => {
         /// Has this been shut down?
-        fn is_shutdown(&self) -> bool {
+        pub(crate) fn is_shutdown(&self) -> bool {
             self.endpoint.is_shutdown()
         }
 
@@ -38,15 +38,15 @@ macro_rules! common_functions_for_channel {
 
 struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     rb: Mutex<Platform, T>,
-    pollee: Pollee<Platform>,
+    pollee: Arc<Pollee<Platform>>,
     is_shutdown: AtomicBool,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform, T> {
-    fn new(rb: T) -> Self {
+    fn new(rb: T, pollee: Arc<Pollee<Platform>>) -> Self {
         Self {
             rb: Mutex::new(rb),
-            pollee: Pollee::new(),
+            pollee,
             is_shutdown: AtomicBool::new(false),
         }
     }
@@ -70,6 +70,10 @@ impl<T> ReadEnd<T> {
         if let Some(peer) = self.peer.upgrade() {
             peer.pollee.notify_observers(litebox::event::Events::OUT);
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.endpoint.rb.lock().is_empty()
     }
 
     /// Peeks at the first item in the channel and conditionally consumes it.
@@ -133,12 +137,20 @@ impl<T> WriteEnd<T> {
         }
     }
 
+    pub(crate) fn is_full(&self) -> bool {
+        self.endpoint.rb.lock().is_full()
+    }
+
     pub(crate) fn is_pair(&self, reader: &ReadEnd<T>) -> bool {
         if let Some(peer) = self.peer.upgrade() {
             Arc::ptr_eq(&peer, &reader.endpoint)
         } else {
             false
         }
+    }
+
+    pub(crate) fn register_observer(&self, observer: Weak<dyn Observer<Events>>, filter: Events) {
+        self.endpoint.pollee.register_observer(observer, filter);
     }
 
     common_functions_for_channel!();
@@ -150,17 +162,21 @@ pub(crate) struct Channel<T> {
 }
 
 impl<T> Channel<T> {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(
+        capacity: usize,
+        writer_pollee: Arc<Pollee<crate::Platform>>,
+        reader_pollee: Arc<Pollee<crate::Platform>>,
+    ) -> Self {
         use ringbuf::traits::Split as _;
         let rb: ringbuf::HeapRb<T> = ringbuf::HeapRb::new(capacity);
         let (rb_prod, rb_cons) = rb.split();
 
         let mut writer = WriteEnd {
-            endpoint: Arc::new(EndPointer::new(rb_prod)),
+            endpoint: Arc::new(EndPointer::new(rb_prod, writer_pollee)),
             peer: alloc::sync::Weak::new(),
         };
         let mut reader = ReadEnd {
-            endpoint: Arc::new(EndPointer::new(rb_cons)),
+            endpoint: Arc::new(EndPointer::new(rb_cons, reader_pollee)),
             peer: alloc::sync::Weak::new(),
         };
 

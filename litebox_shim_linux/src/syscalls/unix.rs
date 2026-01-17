@@ -12,7 +12,11 @@ use alloc::{
     vec::Vec,
 };
 use litebox::{
-    event::IOPollable,
+    event::{
+        Events, IOPollable,
+        polling::{Pollee, TryOpError},
+        wait::WaitContext,
+    },
     fs::{FileSystem, Mode, OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
 };
@@ -164,11 +168,15 @@ impl From<&UnixBoundSocketAddr> for UnixSocketAddr {
 struct UnixInitStream {
     /// Optional bound address for this socket
     addr: Option<UnixBoundSocketAddr>,
+    pollee: Pollee<crate::Platform>,
 }
 
 impl UnixInitStream {
     fn new() -> Self {
-        Self { addr: None }
+        Self {
+            addr: None,
+            pollee: Pollee::new(),
+        }
     }
 
     /// Binds this socket to the given address.
@@ -197,7 +205,7 @@ impl UnixInitStream {
             return Err((self, Errno::EINVAL));
         };
         let key = addr.to_key();
-        let backlog = Arc::new(Backlog::new(addr, backlog));
+        let backlog = Arc::new(Backlog::new(addr, backlog, self.pollee));
         global
             .unix_addr_table
             .write()
@@ -211,43 +219,10 @@ impl UnixInitStream {
     /// Converts this initial socket into a connected stream pair.
     fn into_connected(
         self,
-        addr: Arc<UnixBoundSocketAddr>,
+        peer_addr: Arc<UnixBoundSocketAddr>,
     ) -> (UnixConnectedStream, UnixConnectedStream) {
-        UnixConnectedStream::new_pair(self.addr.map(Arc::new), Some(addr))
-    }
-
-    /// Connects this socket to the given address.
-    ///
-    /// # Arguments
-    ///
-    /// * `task` - The current task context
-    /// * `addr` - The address to connect to
-    /// * `is_nonblocking` - Whether to use non-blocking mode
-    fn connect(
-        self,
-        task: &Task,
-        addr: UnixSocketAddr,
-        is_nonblocking: bool,
-    ) -> Result<UnixConnectedStream, (Self, Errno)> {
-        let guard = task.global.unix_addr_table.read();
-        let Some(key) = addr.to_key() else {
-            return Err((self, Errno::EINVAL));
-        };
-        let Some(entry) = guard.get(&key) else {
-            return Err((self, Errno::ECONNREFUSED));
-        };
-        // check if we can bind to the address
-        if let Err(err) = addr.bind(task, false) {
-            return Err((self, err));
-        }
-        match &entry.0 {
-            UnixEntryInner::Stream(backlog) => {
-                let backlog = backlog.clone();
-                drop(guard);
-                backlog.connect(self, is_nonblocking)
-            }
-            UnixEntryInner::Datagram(_) => Err((self, Errno::EPROTOTYPE)),
-        }
+        let UnixInitStream { addr, pollee } = self;
+        UnixConnectedStream::new_pair(addr.map(Arc::new), Some(Arc::new(pollee)), Some(peer_addr))
     }
 }
 
@@ -261,14 +236,16 @@ struct Backlog {
     limit: AtomicU16,
     /// Queue of pending connections (None when shut down)
     sockets: Mutex<crate::Platform, Option<VecDeque<UnixConnectedStream>>>,
+    pollee: Pollee<crate::Platform>,
 }
 
 impl Backlog {
-    fn new(addr: UnixBoundSocketAddr, backlog: u16) -> Self {
+    fn new(addr: UnixBoundSocketAddr, backlog: u16, pollee: Pollee<crate::Platform>) -> Self {
         Self {
             addr: Arc::new(addr),
             limit: AtomicU16::new(backlog),
             sockets: litebox::sync::Mutex::new(Some(VecDeque::new())),
+            pollee,
         }
     }
 
@@ -295,59 +272,41 @@ impl Backlog {
 
         let (client, server) = init.into_connected(self.addr.clone());
         sockets.push_back(server);
+
+        self.pollee.notify_observers(Events::IN);
         Ok(client)
     }
 
-    /// Establishes a connection, blocking if necessary.
-    fn connect(
-        &self,
-        mut init: UnixInitStream,
-        is_nonblocking: bool,
-    ) -> Result<UnixConnectedStream, (UnixInitStream, Errno)> {
-        if is_nonblocking {
-            self.try_connect(init)
-        } else {
-            // TODO: use polling instead of busy loop
-            loop {
-                init = match self.try_connect(init) {
-                    Ok(stream) => return Ok(stream),
-                    Err((init, Errno::EAGAIN)) => init,
-                    Err((init, err)) => return Err((init, err)),
-                };
-                core::hint::spin_loop();
-            }
-        }
-    }
-
     /// Attempts to accept a pending connection without blocking.
-    fn try_accept(&self) -> Result<UnixConnectedStream, Errno> {
+    fn try_accept(&self) -> Result<UnixConnectedStream, TryOpError<Errno>> {
         let mut sockets = self.sockets.lock();
         let Some(sockets) = &mut *sockets else {
             // the server socket is shutdown
-            return Err(Errno::ECONNREFUSED);
+            return Err(TryOpError::Other(Errno::ECONNREFUSED));
         };
 
         match sockets.pop_front() {
-            Some(stream) => Ok(stream),
-            None => Err(Errno::EAGAIN),
+            Some(stream) => {
+                self.pollee.notify_observers(Events::OUT);
+                Ok(stream)
+            }
+            None => Err(TryOpError::TryAgain),
         }
     }
 
-    /// Accepts a pending connection, blocking if necessary.
-    fn accept(&self, is_nonblocking: bool) -> Result<UnixConnectedStream, Errno> {
-        if is_nonblocking {
-            self.try_accept()
-        } else {
-            // TODO: use polling instead of busy loop
-            loop {
-                match self.try_accept() {
-                    Ok(stream) => return Ok(stream),
-                    Err(Errno::EAGAIN) => {}
-                    Err(err) => return Err(err),
-                }
-                core::hint::spin_loop();
-            }
+    fn check_io_events(&self) -> Events {
+        let sockets = self.sockets.lock();
+        let Some(sockets) = &*sockets else {
+            return Events::HUP;
+        };
+        let mut events = Events::empty();
+        if !sockets.is_empty() {
+            events |= Events::IN;
         }
+        if sockets.len() < self.limit.load(Ordering::Relaxed) as usize {
+            events |= Events::OUT;
+        }
+        events
     }
 
     /// Shuts down this backlog, preventing new connections.
@@ -369,9 +328,12 @@ impl UnixListenStream {
         self.backlog.set_backlog(backlog);
     }
 
-    /// Accepts a pending connection.
-    fn accept(&self, is_nonblocking: bool) -> Result<UnixConnectedStream, Errno> {
-        self.backlog.accept(is_nonblocking)
+    fn register_observer(
+        &self,
+        observer: Weak<dyn litebox::event::observer::Observer<litebox::event::Events>>,
+        mask: litebox::event::Events,
+    ) {
+        self.backlog.pollee.register_observer(observer, mask);
     }
 
     /// Returns the local address this socket is bound to.
@@ -441,8 +403,11 @@ struct Message {
 /// Represents a connected Unix stream socket.
 struct UnixConnectedStream {
     addr: AddrView,
-    reader: crate::channel::ReadEnd<Message>,
-    writer: crate::channel::WriteEnd<Message>,
+    /// The read end of the local socket's channel for receiving messages.
+    recv_channel: crate::channel::ReadEnd<Message>,
+    /// The write end of the connected peer socket for sending messages.
+    connected_send_channel: crate::channel::WriteEnd<Message>,
+    pollee: Arc<Pollee<crate::Platform>>,
 }
 
 const UNIX_BUF_SIZE: usize = 65536;
@@ -450,22 +415,29 @@ impl UnixConnectedStream {
     /// Creates a pair of connected Unix stream sockets.
     fn new_pair(
         addr: Option<Arc<UnixBoundSocketAddr>>,
+        pollee: Option<Arc<Pollee<crate::Platform>>>,
         peer: Option<Arc<UnixBoundSocketAddr>>,
     ) -> (Self, Self) {
         let (addr1, addr2) = AddrView::new_pair(addr, peer);
-
-        let (writer_peer, reader) = crate::channel::Channel::new(UNIX_BUF_SIZE).split();
-        let (writer, reader_peer) = crate::channel::Channel::new(UNIX_BUF_SIZE).split();
+        let pollee1 = pollee.unwrap_or(Arc::new(Pollee::new()));
+        let pollee2 = Arc::new(Pollee::new());
+        let (send_channel, recv_channel) =
+            crate::channel::Channel::new(UNIX_BUF_SIZE, pollee2.clone(), pollee1.clone()).split();
+        let (send_channel_peer, recv_channel_peer) =
+            crate::channel::Channel::new(UNIX_BUF_SIZE, pollee1.clone(), pollee2.clone()).split();
         (
+            // Cross-wire: each socket keeps the other side's send channel.
             UnixConnectedStream {
                 addr: addr1,
-                reader,
-                writer,
+                recv_channel,
+                connected_send_channel: send_channel_peer,
+                pollee: pollee1,
             },
             UnixConnectedStream {
                 addr: addr2,
-                reader: reader_peer,
-                writer: writer_peer,
+                recv_channel: recv_channel_peer,
+                connected_send_channel: send_channel,
+                pollee: pollee2,
             },
         )
     }
@@ -486,31 +458,13 @@ impl UnixConnectedStream {
 
     fn try_sendto(&self, msg: Message) -> Result<(), (Message, Errno)> {
         // TODO: write partial data?
-        self.writer.try_write_one(msg)
+        self.connected_send_channel.try_write_one(msg)
     }
 
-    fn sendto(&self, buf: &[u8], is_nonblocking: bool) -> Result<usize, Errno> {
-        let mut msg = Message { data: buf.to_vec() };
-        if is_nonblocking {
-            self.try_sendto(msg).map_err(|(_, err)| err)?;
-            Ok(buf.len())
-        } else {
-            // TODO: use polling instead of busy loop
-            loop {
-                msg = match self.try_sendto(msg) {
-                    Ok(()) => return Ok(buf.len()),
-                    Err((msg, Errno::EAGAIN)) => msg,
-                    Err((_, err)) => return Err(err),
-                };
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    fn try_recvfrom(&self, mut buf: &mut [u8]) -> Result<usize, Errno> {
+    fn try_recvfrom(&self, mut buf: &mut [u8]) -> Result<usize, TryOpError<Errno>> {
         let mut total_read = 0;
         while !buf.is_empty() {
-            let n = match self.reader.peek_and_consume_one(|msg| {
+            let n = match self.recv_channel.peek_and_consume_one(|msg| {
                 if buf.len() >= msg.data.len() {
                     buf[..msg.data.len()].copy_from_slice(&msg.data);
                     Ok((true, msg.data.len()))
@@ -525,7 +479,10 @@ impl UnixConnectedStream {
                     if total_read > 0 {
                         break;
                     }
-                    return Err(e);
+                    return match e {
+                        Errno::EAGAIN => Err(TryOpError::TryAgain),
+                        other => Err(TryOpError::Other(other)),
+                    };
                 }
             };
             total_read += n;
@@ -534,32 +491,300 @@ impl UnixConnectedStream {
         Ok(total_read)
     }
 
+    fn check_io_events(&self) -> Events {
+        let mut events = Events::empty();
+        let is_read_shutdown = self.recv_channel.is_shutdown();
+        let is_write_shutdown = self.connected_send_channel.is_shutdown();
+        if is_read_shutdown {
+            events |= Events::RDHUP | Events::IN;
+            if is_write_shutdown {
+                events |= Events::HUP;
+            }
+        }
+        if !self.recv_channel.is_empty() {
+            events |= Events::IN;
+        }
+        if !self.connected_send_channel.is_full() {
+            events |= Events::OUT;
+        }
+        events
+    }
+}
+
+enum UnixStreamState {
+    Init(UnixInitStream),
+    Listen(UnixListenStream),
+    Connected(UnixConnectedStream),
+}
+
+impl UnixStreamState {
+    fn connected(&self) -> Option<&UnixConnectedStream> {
+        match self {
+            UnixStreamState::Connected(conn) => Some(conn),
+            _ => None,
+        }
+    }
+    fn listen(&self) -> Option<&UnixListenStream> {
+        match self {
+            UnixStreamState::Listen(listen) => Some(listen),
+            _ => None,
+        }
+    }
+}
+
+struct UnixStream {
+    state: RwLock<crate::Platform, Option<UnixStreamState>>,
+}
+
+impl UnixStream {
+    fn new(state: UnixStreamState) -> Self {
+        Self {
+            state: litebox::sync::RwLock::new(Some(state)),
+        }
+    }
+
+    fn with_state_ref<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&UnixStreamState) -> R,
+    {
+        let old = self.state.read();
+        f(old.as_ref().expect("state should never be None"))
+    }
+
+    fn with_state_mut_ref<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut UnixStreamState) -> R,
+    {
+        let mut old = self.state.write();
+        f(old.as_mut().expect("state should never be None"))
+    }
+
+    fn with_state<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(UnixStreamState) -> (UnixStreamState, R),
+    {
+        let mut old = self.state.write();
+        let (new, result) = f(old.take().expect("state should never be None"));
+        *old = Some(new);
+        result
+    }
+
+    fn bind(&self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
+        self.with_state_mut_ref(|state| {
+            match state {
+                UnixStreamState::Init(init) => init.bind(task, addr),
+                UnixStreamState::Listen(_) => {
+                    // Note Linux checks the given address and thus may return
+                    // a different error code (e.g., EADDRINUSE).
+                    Err(Errno::EINVAL)
+                }
+                UnixStreamState::Connected(_) => Err(Errno::EISCONN),
+            }
+        })
+    }
+
+    fn listen(&self, backlog: u16, global: &Arc<GlobalState>) -> Result<(), Errno> {
+        self.with_state(|state| {
+            let ret = match state {
+                UnixStreamState::Init(init) => {
+                    return match init.listen(backlog, global) {
+                        Ok(listen) => (UnixStreamState::Listen(listen), Ok(())),
+                        Err((init, err)) => (UnixStreamState::Init(init), Err(err)),
+                    };
+                }
+                UnixStreamState::Listen(ref listen) => {
+                    listen.listen(backlog);
+                    Ok(())
+                }
+                UnixStreamState::Connected(_) => Err(Errno::EISCONN),
+            };
+            (state, ret)
+        })
+    }
+
+    fn lookup(&self, task: &Task, addr: &UnixSocketAddr) -> Result<Arc<Backlog>, Errno> {
+        let guard = task.global.unix_addr_table.read();
+        let Some(key) = addr.to_key() else {
+            return Err(Errno::EINVAL);
+        };
+        let Some(entry) = guard.get(&key) else {
+            return Err(Errno::ECONNREFUSED);
+        };
+        match &entry.0 {
+            UnixEntryInner::Stream(backlog) => Ok(backlog.clone()),
+            UnixEntryInner::Datagram(_) => Err(Errno::EPROTOTYPE),
+        }
+    }
+    fn try_connect(&self, backlog: &Backlog) -> Result<(), TryOpError<Errno>> {
+        self.with_state(|state| match state {
+            UnixStreamState::Init(init) => match backlog.try_connect(init) {
+                Ok(connected) => (UnixStreamState::Connected(connected), Ok(())),
+                Err((init, err)) => (UnixStreamState::Init(init), Err(err)),
+            },
+            UnixStreamState::Listen(s) => (UnixStreamState::Listen(s), Err(Errno::EINVAL)),
+            UnixStreamState::Connected(s) => (UnixStreamState::Connected(s), Err(Errno::EISCONN)),
+        })
+        .map_err(|err| match err {
+            Errno::EAGAIN => TryOpError::TryAgain,
+            other => TryOpError::Other(other),
+        })
+    }
+    fn connect(
+        &self,
+        task: &Task,
+        addr: UnixSocketAddr,
+        is_nonblocking: bool,
+    ) -> Result<(), Errno> {
+        let backlog = self.lookup(task, &addr)?;
+        // check if we can bind to the address
+        let _ = addr.bind(task, false)?;
+        task.wait_cx()
+            .wait_on_events(
+                is_nonblocking,
+                Events::OUT,
+                |observer, mask| {
+                    backlog.pollee.register_observer(observer, mask);
+                    Ok(())
+                },
+                || self.try_connect(&backlog),
+            )
+            .map_err(Errno::from)
+    }
+
+    fn accept(
+        &self,
+        cx: &WaitContext<'_, crate::Platform>,
+        mut peer: Option<&mut UnixSocketAddr>,
+        is_nonblocking: bool,
+    ) -> Result<UnixSocketInner, Errno> {
+        let backlog = self.with_state_ref(|state| -> Result<Arc<Backlog>, Errno> {
+            let listen = state.listen().ok_or(Errno::EINVAL)?;
+            Ok(listen.backlog.clone())
+        })?;
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::IN,
+            |observer, mask| {
+                backlog.pollee.register_observer(observer, mask);
+                Ok(())
+            },
+            || {
+                let accepted = backlog.try_accept()?;
+                if let Some(peer) = peer.as_deref_mut() {
+                    *peer = accepted.get_peer_addr();
+                }
+                Ok(UnixSocketInner::Stream(UnixStream::new(
+                    UnixStreamState::Connected(accepted),
+                )))
+            },
+        )
+        .map_err(Errno::from)
+    }
+
+    fn sendto(
+        &self,
+        cx: &WaitContext<'_, crate::Platform>,
+        buf: &[u8],
+        is_nonblocking: bool,
+        addr: Option<UnixSocketAddr>,
+    ) -> Result<usize, Errno> {
+        let mut msg = Some(Message { data: buf.to_vec() });
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::OUT,
+            |observer, mask| {
+                self.with_state_ref(|state| {
+                    let conn = state.connected().ok_or(Errno::ENOTCONN)?;
+                    conn.pollee.register_observer(observer, mask);
+                    Ok(())
+                })
+            },
+            || {
+                self.with_state_ref(|state| {
+                    let conn = state
+                        .connected()
+                        .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
+                    if addr.is_some() {
+                        return Err(TryOpError::Other(Errno::EISCONN));
+                    }
+                    match conn.try_sendto(msg.take().unwrap()) {
+                        Ok(()) => Ok(buf.len()),
+                        Err((m, Errno::EAGAIN)) => {
+                            let _ = msg.replace(m);
+                            Err(TryOpError::TryAgain)
+                        }
+                        Err((_, err)) => Err(TryOpError::Other(err)),
+                    }
+                })
+            },
+        )
+        .map_err(Errno::from)
+    }
+
     fn recvfrom(
         &self,
+        cx: &WaitContext<'_, crate::Platform>,
         buf: &mut [u8],
         is_nonblocking: bool,
-        source_addr: Option<&mut Option<UnixSocketAddr>>,
+        mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        if let Some(source_addr) = source_addr {
-            *source_addr = None;
-        }
-        let ret = if is_nonblocking {
-            self.try_recvfrom(buf)
-        } else {
-            // TODO: use polling instead of busy loop
-            loop {
-                match self.try_recvfrom(buf) {
-                    Ok(size) => break Ok(size),
-                    Err(Errno::EAGAIN) => {}
-                    Err(err) => break Err(err),
-                }
-                core::hint::spin_loop();
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::IN,
+            |observer, mask| {
+                self.with_state_ref(|state| {
+                    let conn = state.connected().ok_or(Errno::ENOTCONN)?;
+                    conn.pollee.register_observer(observer, mask);
+                    Ok(())
+                })
+            },
+            || {
+                self.with_state_ref(|state| {
+                    let conn = state
+                        .connected()
+                        .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
+                    let n = conn.try_recvfrom(buf)?;
+                    // For connected stream sockets, no need to return the source address
+                    if let Some(source_addr) = source_addr.as_deref_mut() {
+                        *source_addr = None;
+                    }
+                    Ok(n)
+                })
+            },
+        )
+        .map_err(Errno::from)
+    }
+
+    fn get_local_addr(&self) -> UnixSocketAddr {
+        self.with_state_ref(|state| match state {
+            UnixStreamState::Init(init) => match &init.addr {
+                Some(addr) => UnixSocketAddr::from(addr),
+                None => UnixSocketAddr::Unnamed,
+            },
+            UnixStreamState::Listen(listen) => UnixSocketAddr::from(listen.get_local_addr()),
+            UnixStreamState::Connected(connect) => connect.get_local_addr(),
+        })
+    }
+
+    fn register_observer(
+        &self,
+        observer: Weak<dyn litebox::event::observer::Observer<Events>>,
+        mask: Events,
+    ) {
+        self.with_state_ref(|state| match state {
+            UnixStreamState::Init(init) => init.pollee.register_observer(observer, mask),
+            UnixStreamState::Listen(listen) => listen.register_observer(observer, mask),
+            UnixStreamState::Connected(connect) => {
+                connect.pollee.register_observer(observer, mask);
             }
-        };
-        match ret {
-            Err(Errno::ESHUTDOWN) => Ok(0),
-            other => other,
-        }
+        });
+    }
+    fn check_io_events(&self) -> Events {
+        self.with_state_ref(|state| match state {
+            UnixStreamState::Init(_) => Events::OUT | Events::HUP,
+            UnixStreamState::Listen(listen) => listen.backlog.check_io_events(),
+            UnixStreamState::Connected(conn) => conn.check_io_events(),
+        })
     }
 }
 
@@ -576,20 +801,30 @@ impl WriteEnd<DatagramMessage> {
     fn try_write(&self, msg: DatagramMessage) -> Result<(), (DatagramMessage, Errno)> {
         self.try_write_one(msg)
     }
-    fn write(&self, mut msg: DatagramMessage, is_nonblocking: bool) -> Result<(), Errno> {
-        if is_nonblocking {
-            self.try_write(msg).map_err(|(_, err)| err)?;
-            Ok(())
-        } else {
-            // TODO: use polling instead of busy loop
-            loop {
-                msg = match self.try_write(msg) {
-                    Ok(()) => return Ok(()),
-                    Err((msg, Errno::EAGAIN)) => msg,
-                    Err((_, err)) => return Err(err),
+    fn write(
+        &self,
+        cx: &WaitContext<'_, crate::Platform>,
+        msg: DatagramMessage,
+        is_nonblocking: bool,
+    ) -> Result<(), Errno> {
+        let mut msg = Some(msg);
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::OUT,
+            |observer, mask| {
+                self.register_observer(observer, mask);
+                Ok(())
+            },
+            || match self.try_write(msg.take().unwrap()) {
+                Ok(()) => Ok(()),
+                Err((m, Errno::EAGAIN)) => {
+                    let _ = msg.replace(m);
+                    Err(TryOpError::TryAgain)
                 }
-            }
-        }
+                Err((_, err)) => Err(TryOpError::Other(err)),
+            },
+        )
+        .map_err(Errno::from)
     }
 }
 impl ReadEnd<DatagramMessage> {
@@ -601,7 +836,7 @@ impl ReadEnd<DatagramMessage> {
         &self,
         mut buf: &mut [u8],
         source_addr: Option<&mut Option<UnixSocketAddr>>,
-    ) -> Result<usize, Errno> {
+    ) -> Result<usize, TryOpError<Errno>> {
         let mut src = None;
         let mut total_read = 0;
         let mut stop = false;
@@ -629,7 +864,10 @@ impl ReadEnd<DatagramMessage> {
                     if total_read > 0 {
                         break;
                     }
-                    return Err(e);
+                    return match e {
+                        Errno::EAGAIN => Err(TryOpError::TryAgain),
+                        other => Err(TryOpError::Other(other)),
+                    };
                 }
             };
             total_read += n;
@@ -642,25 +880,31 @@ impl ReadEnd<DatagramMessage> {
     }
 }
 
-/// Represents a Unix datagram socket.
-struct UnixDatagram {
+struct UnixDatagramInner {
     /// The local address this socket is bound to, if any.
     addr: Option<(UnixBoundSocketAddr, Arc<GlobalState>)>,
-    /// The read end of the local socket's channel.
-    reader: Option<ReadEnd<DatagramMessage>>,
-    /// The write end of the remote socket it is connected to, if any.
-    peer_writer: Option<WriteEnd<DatagramMessage>>,
+    /// The read end of the local socket's channel for receiving messages.
+    /// Set when the socket is bound via `bind` or `new_pair`.
+    recv_channel: Option<ReadEnd<DatagramMessage>>,
+    /// The write end of the connected peer socket for sending messages.
+    /// Set when the socket is connected via `connect` or `new_pair`.
+    connected_send_channel: Option<WriteEnd<DatagramMessage>>,
+    pollee: Arc<Pollee<crate::Platform>>,
+}
+/// Represents a Unix datagram socket.
+struct UnixDatagram {
+    inner: RwLock<crate::Platform, UnixDatagramInner>,
 }
 
-impl Drop for UnixDatagram {
+impl Drop for UnixDatagramInner {
     fn drop(&mut self) {
         if let Some((addr, global)) = self.addr.take() {
             let key = addr.to_key();
             let mut table = global.unix_addr_table.write();
             // Only remove the entry if it matches the current socket
-            if let Some(UnixEntry(UnixEntryInner::Datagram(writer))) = table.get(&key)
-                && let Some(reader) = &self.reader
-                && writer.is_pair(reader)
+            if let Some(UnixEntry(UnixEntryInner::Datagram(send_channel))) = table.get(&key)
+                && let Some(recv_channel) = &self.recv_channel
+                && send_channel.is_pair(recv_channel)
             {
                 table.remove(&key);
             }
@@ -668,32 +912,7 @@ impl Drop for UnixDatagram {
     }
 }
 
-impl UnixDatagram {
-    fn new() -> Self {
-        Self {
-            addr: None,
-            reader: None,
-            peer_writer: None,
-        }
-    }
-
-    fn new_pair() -> (UnixDatagram, UnixDatagram) {
-        let (writer, reader) = crate::channel::Channel::new(UNIX_BUF_SIZE).split();
-        let (writer_peer, reader_peer) = crate::channel::Channel::new(UNIX_BUF_SIZE).split();
-        (
-            UnixDatagram {
-                addr: None,
-                reader: Some(reader),
-                peer_writer: Some(writer_peer),
-            },
-            UnixDatagram {
-                addr: None,
-                reader: Some(reader_peer),
-                peer_writer: Some(writer),
-            },
-        )
-    }
-
+impl UnixDatagramInner {
     /// Binds this socket to the given address.
     fn bind(&mut self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
         if self.addr.is_some() {
@@ -708,15 +927,62 @@ impl UnixDatagram {
         let key = bound_addr.to_key();
         // Registers the write end of the socket in the global address table so it
         // can receive messages sent to this address.
-        let (writer, reader) = Channel::new(UNIX_BUF_SIZE).split();
+        let (send_channel, recv_channel) =
+            Channel::new(UNIX_BUF_SIZE, Arc::new(Pollee::new()), self.pollee.clone()).split();
         let _ = task
             .global
             .unix_addr_table
             .write()
-            .insert(key, UnixEntry(UnixEntryInner::Datagram(writer)));
+            .insert(key, UnixEntry(UnixEntryInner::Datagram(send_channel)));
         self.addr = Some((bound_addr, task.global.clone()));
-        self.reader = Some(reader);
+        self.recv_channel = Some(recv_channel);
         Ok(())
+    }
+}
+
+impl UnixDatagram {
+    fn new() -> Self {
+        Self {
+            inner: RwLock::new(UnixDatagramInner {
+                addr: None,
+                recv_channel: None,
+                connected_send_channel: None,
+                pollee: Arc::new(Pollee::new()),
+            }),
+        }
+    }
+
+    fn new_pair() -> (UnixDatagram, UnixDatagram) {
+        let pollee1 = Arc::new(Pollee::new());
+        let pollee2 = Arc::new(Pollee::new());
+        let (send_channel, recv_channel) =
+            crate::channel::Channel::new(UNIX_BUF_SIZE, pollee2.clone(), pollee1.clone()).split();
+        let (send_channel_peer, recv_channel_peer) =
+            crate::channel::Channel::new(UNIX_BUF_SIZE, pollee1.clone(), pollee2.clone()).split();
+        (
+            // Cross-wire: each socket keeps the other side's send channel.
+            UnixDatagram {
+                inner: RwLock::new(UnixDatagramInner {
+                    addr: None,
+                    recv_channel: Some(recv_channel),
+                    connected_send_channel: Some(send_channel_peer),
+                    pollee: pollee1,
+                }),
+            },
+            UnixDatagram {
+                inner: RwLock::new(UnixDatagramInner {
+                    addr: None,
+                    recv_channel: Some(recv_channel_peer),
+                    connected_send_channel: Some(send_channel),
+                    pollee: pollee2,
+                }),
+            },
+        )
+    }
+
+    /// Binds this socket to the given address.
+    fn bind(&self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
+        self.inner.write().bind(task, addr)
     }
 
     /// Looks up a socket address and returns its write endpoint.
@@ -736,16 +1002,41 @@ impl UnixDatagram {
         let _ = addr.bind(task, false)?;
         match &entry.0 {
             UnixEntryInner::Stream(_) => Err(Errno::EPROTOTYPE),
-            UnixEntryInner::Datagram(writer) => Ok(writer.clone()),
+            UnixEntryInner::Datagram(send_channel) => Ok(send_channel.clone()),
         }
     }
 
     /// Connects this socket to a default peer address.
     ///
     /// Subsequent sends without an address will use this peer.
-    fn connect(&mut self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
-        self.peer_writer = Some(self.lookup(task, addr)?);
+    fn connect(&self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
+        self.inner.write().connected_send_channel = Some(self.lookup(task, addr)?);
         Ok(())
+    }
+
+    fn recvfrom(
+        &self,
+        cx: &WaitContext<'_, crate::Platform>,
+        buf: &mut [u8],
+        is_nonblocking: bool,
+        mut source_addr: Option<&mut Option<UnixSocketAddr>>,
+    ) -> Result<usize, Errno> {
+        cx.wait_on_events(
+            is_nonblocking,
+            Events::IN,
+            |observer, mask| {
+                self.inner.read().pollee.register_observer(observer, mask);
+                Ok(())
+            },
+            || {
+                let guard = self.inner.read();
+                let Some(recv_channel) = &guard.recv_channel else {
+                    return Err(TryOpError::Other(Errno::ENOTCONN));
+                };
+                recv_channel.try_read(buf, source_addr.as_deref_mut())
+            },
+        )
+        .map_err(Errno::from)
     }
 
     // Sends data to the specified or connected peer.
@@ -760,212 +1051,129 @@ impl UnixDatagram {
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
         let source = self.get_local_addr();
-        if let Some(addr) = addr {
-            let peer_writer = self.lookup(task, addr)?;
-            peer_writer.write(
-                DatagramMessage {
-                    data: buf.to_vec(),
-                    source,
-                },
-                is_nonblocking,
-            )?;
-        } else if let Some(peer_writer) = &self.peer_writer {
-            peer_writer.write(
-                DatagramMessage {
-                    data: buf.to_vec(),
-                    source,
-                },
-                is_nonblocking,
-            )?;
+        let send_channel = if let Some(addr) = addr {
+            self.lookup(task, addr)?
+        } else if let Some(connected_send_channel) = &self.inner.read().connected_send_channel {
+            connected_send_channel.clone()
         } else {
             return Err(Errno::ENOTCONN);
-        }
+        };
+        send_channel.write(
+            &task.wait_cx(),
+            DatagramMessage {
+                data: buf.to_vec(),
+                source,
+            },
+            is_nonblocking,
+        )?;
         Ok(buf.len())
     }
 
-    /// Receives data from any sender.
-    ///
-    /// If `source_addr` is provided, it will be populated with the sender's address.
-    fn recvfrom(
-        &self,
-        buf: &mut [u8],
-        is_nonblocking: bool,
-        mut source_addr: Option<&mut Option<UnixSocketAddr>>,
-    ) -> Result<usize, Errno> {
-        let Some(reader) = &self.reader else {
-            return Err(Errno::ENOTCONN);
-        };
-        let ret = if is_nonblocking {
-            reader.try_read(buf, source_addr.as_deref_mut())
-        } else {
-            // TODO: use polling instead of busy wait
-            loop {
-                match reader.try_read(buf, source_addr.as_deref_mut()) {
-                    Ok(size) => break Ok(size),
-                    Err(Errno::EAGAIN) => {}
-                    Err(err) => break Err(err),
-                }
-                core::hint::spin_loop();
-            }
-        };
-        match ret {
-            Err(Errno::ESHUTDOWN) => Ok(0),
-            other => other,
-        }
-    }
-
     fn get_local_addr(&self) -> UnixSocketAddr {
-        if let Some((addr, _)) = &self.addr {
+        if let Some((addr, _)) = &self.inner.read().addr {
             UnixSocketAddr::from(addr)
         } else {
             UnixSocketAddr::Unnamed
         }
     }
+
+    fn check_io_events(&self) -> Events {
+        let mut events = Events::empty();
+        if let Some(recv_channel) = &self.inner.read().recv_channel {
+            if recv_channel.is_shutdown() {
+                events |= Events::IN | Events::RDHUP;
+            } else if !recv_channel.is_empty() {
+                events |= Events::IN;
+            }
+        }
+        if let Some(connected_send_channel) = &self.inner.read().connected_send_channel {
+            if !connected_send_channel.is_full() {
+                events |= Events::OUT;
+            }
+        } else {
+            // If not connected, allow to sendto any address?
+            events |= Events::OUT;
+        }
+        events
+    }
 }
 
-enum UnixSocketState {
-    InitStream(UnixInitStream),
-    ListenStream(UnixListenStream),
-    ConnectedStream(UnixConnectedStream),
-
+enum UnixSocketInner {
+    Stream(UnixStream),
     Datagram(UnixDatagram),
 }
-
-pub struct UnixSocket {
-    state: RwLock<crate::Platform, Option<UnixSocketState>>,
+pub(crate) struct UnixSocket {
+    inner: UnixSocketInner,
     status: AtomicU32,
     // options: Mutex<crate::Platform, SocketOptions>,
 }
 
 impl UnixSocket {
-    fn new_with_state(state: UnixSocketState, flags: SockFlags) -> Self {
+    fn new_with_inner(inner: UnixSocketInner, flags: SockFlags) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
         Self {
-            state: litebox::sync::RwLock::new(Some(state)),
+            inner,
             status: AtomicU32::new(status.bits()),
             // options: litebox::sync::Mutex::new(SocketOptions::default()),
         }
     }
 
     pub(super) fn new(sock_type: SockType, flags: SockFlags) -> Option<Self> {
-        let state = match sock_type {
-            SockType::Stream => UnixSocketState::InitStream(UnixInitStream::new()),
-            SockType::Datagram => UnixSocketState::Datagram(UnixDatagram::new()),
+        let inner = match sock_type {
+            SockType::Stream => UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Init(
+                UnixInitStream::new(),
+            ))),
+            SockType::Datagram => UnixSocketInner::Datagram(UnixDatagram::new()),
             e => {
                 log_unsupported!("Unsupported unix socket type: {:?}", e);
                 return None;
             }
         };
-        Some(Self::new_with_state(state, flags))
-    }
-
-    fn with_state_ref<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&UnixSocketState) -> R,
-    {
-        let old = self.state.read();
-        f(old.as_ref().expect("state should never be None"))
-    }
-
-    fn with_state_mut_ref<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut UnixSocketState) -> R,
-    {
-        let mut old = self.state.write();
-        f(old.as_mut().expect("state should never be None"))
-    }
-
-    fn with_state<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(UnixSocketState) -> (UnixSocketState, R),
-    {
-        let mut old = self.state.write();
-        let (new, result) = f(old.take().expect("state should never be None"));
-        *old = Some(new);
-        result
+        Some(Self::new_with_inner(inner, flags))
     }
 
     pub(super) fn bind(&self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
-        self.with_state_mut_ref(|state| {
-            match state {
-                UnixSocketState::InitStream(init) => init.bind(task, addr),
-                UnixSocketState::ListenStream(_) => {
-                    // Note Linux checks the given address and thus may return
-                    // a different error code (e.g., EADDRINUSE).
-                    Err(Errno::EINVAL)
-                }
-                UnixSocketState::ConnectedStream(_) => Err(Errno::EISCONN),
-                UnixSocketState::Datagram(unix) => unix.bind(task, addr),
-            }
-        })
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.bind(task, addr),
+            UnixSocketInner::Datagram(datagram) => datagram.bind(task, addr),
+        }
     }
 
     pub(super) fn listen(&self, backlog: u16, global: &Arc<GlobalState>) -> Result<(), Errno> {
-        self.with_state(|state| {
-            let ret = match state {
-                UnixSocketState::InitStream(init) => {
-                    return match init.listen(backlog, global) {
-                        Ok(listen) => (UnixSocketState::ListenStream(listen), Ok(())),
-                        Err((init, err)) => (UnixSocketState::InitStream(init), Err(err)),
-                    };
-                }
-                UnixSocketState::ListenStream(ref listen) => {
-                    listen.listen(backlog);
-                    Ok(())
-                }
-                UnixSocketState::ConnectedStream(_) => Err(Errno::EISCONN),
-                UnixSocketState::Datagram(_) => Err(Errno::EOPNOTSUPP),
-            };
-            (state, ret)
-        })
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.listen(backlog, global),
+            UnixSocketInner::Datagram(_) => Err(Errno::EOPNOTSUPP),
+        }
     }
 
     pub(super) fn connect(&self, task: &Task, addr: UnixSocketAddr) -> Result<(), Errno> {
-        self.with_state(|state| {
-            let ret = match state {
-                UnixSocketState::InitStream(init) => {
-                    return match init.connect(
-                        task,
-                        addr,
-                        self.get_status().contains(OFlags::NONBLOCK),
-                    ) {
-                        Ok(connected) => (UnixSocketState::ConnectedStream(connected), Ok(())),
-                        Err((init, err)) => (UnixSocketState::InitStream(init), Err(err)),
-                    };
-                }
-                UnixSocketState::ListenStream(_) => Err(Errno::EINVAL),
-                UnixSocketState::ConnectedStream(_) => Err(Errno::EISCONN),
-                UnixSocketState::Datagram(mut unix) => {
-                    let ret = unix.connect(task, addr);
-                    return (UnixSocketState::Datagram(unix), ret);
-                }
-            };
-            (state, ret)
-        })
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => {
+                stream.connect(task, addr, self.get_status().contains(OFlags::NONBLOCK))
+            }
+            UnixSocketInner::Datagram(datagram) => datagram.connect(task, addr),
+        }
     }
 
     pub(super) fn accept(
         &self,
+        cx: &WaitContext<'_, crate::Platform>,
         flags: SockFlags,
         peer: Option<&mut UnixSocketAddr>,
     ) -> Result<UnixSocket, Errno> {
-        self.with_state_ref(|state| match state {
-            UnixSocketState::ListenStream(listen) => {
-                let accepted = listen.accept(self.get_status().contains(OFlags::NONBLOCK))?;
-                if let Some(peer) = peer {
-                    *peer = accepted.get_peer_addr();
-                }
-                Ok(UnixSocket::new_with_state(
-                    UnixSocketState::ConnectedStream(accepted),
-                    flags,
-                ))
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => {
+                let accepted = stream.accept(
+                    cx,
+                    peer,
+                    self.get_status().contains(OFlags::NONBLOCK)
+                        | flags.contains(SockFlags::NONBLOCK),
+                )?;
+                Ok(UnixSocket::new_with_inner(accepted, flags))
             }
-            UnixSocketState::InitStream(_) | UnixSocketState::ConnectedStream(_) => {
-                Err(Errno::EINVAL)
-            }
-            UnixSocketState::Datagram(_) => Err(Errno::EOPNOTSUPP),
-        })
+            UnixSocketInner::Datagram(_) => Err(Errno::EOPNOTSUPP),
+        }
     }
 
     pub(super) fn sendto(
@@ -983,18 +1191,12 @@ impl UnixSocket {
         let is_nonblocking =
             flags.contains(SendFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
 
-        let ret = self.with_state_ref(|state| match state {
-            UnixSocketState::InitStream(_) | UnixSocketState::ListenStream(_) => {
-                Err(Errno::ENOTCONN)
+        let ret = match &self.inner {
+            UnixSocketInner::Stream(stream) => {
+                stream.sendto(&task.wait_cx(), buf, is_nonblocking, addr)
             }
-            UnixSocketState::ConnectedStream(connect) => {
-                if addr.is_some() {
-                    return Err(Errno::EISCONN);
-                }
-                connect.sendto(buf, is_nonblocking)
-            }
-            UnixSocketState::Datagram(sock) => sock.sendto(task, buf, is_nonblocking, addr),
-        });
+            UnixSocketInner::Datagram(datagram) => datagram.sendto(task, buf, is_nonblocking, addr),
+        };
         if let Err(Errno::EPIPE) = ret
             && !flags.contains(SendFlags::NOSIGNAL)
         {
@@ -1006,6 +1208,7 @@ impl UnixSocket {
 
     pub(super) fn recvfrom(
         &self,
+        cx: &WaitContext<'_, crate::Platform>,
         buf: &mut [u8],
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
@@ -1018,25 +1221,25 @@ impl UnixSocket {
         let is_nonblocking =
             flags.contains(ReceiveFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
 
-        self.with_state_ref(|state| match state {
-            UnixSocketState::InitStream(_) | UnixSocketState::ListenStream(_) => Err(Errno::EINVAL),
-            UnixSocketState::ConnectedStream(connect) => {
-                connect.recvfrom(buf, is_nonblocking, source_addr)
+        let ret = match &self.inner {
+            UnixSocketInner::Stream(stream) => {
+                stream.recvfrom(cx, buf, is_nonblocking, source_addr)
             }
-            UnixSocketState::Datagram(sock) => sock.recvfrom(buf, is_nonblocking, source_addr),
-        })
+            UnixSocketInner::Datagram(datagram) => {
+                datagram.recvfrom(cx, buf, is_nonblocking, source_addr)
+            }
+        };
+        match ret {
+            Err(Errno::ESHUTDOWN) => Ok(0),
+            other => other,
+        }
     }
 
     pub(super) fn get_local_addr(&self) -> UnixSocketAddr {
-        self.with_state_ref(|state| match state {
-            UnixSocketState::InitStream(init) => match &init.addr {
-                Some(addr) => UnixSocketAddr::from(addr),
-                None => UnixSocketAddr::Unnamed,
-            },
-            UnixSocketState::ListenStream(listen) => UnixSocketAddr::from(listen.get_local_addr()),
-            UnixSocketState::ConnectedStream(connect) => connect.get_local_addr(),
-            UnixSocketState::Datagram(sock) => sock.get_local_addr(),
-        })
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.get_local_addr(),
+            UnixSocketInner::Datagram(datagram) => datagram.get_local_addr(),
+        }
     }
 
     pub(super) fn new_connected_pair(
@@ -1045,17 +1248,23 @@ impl UnixSocket {
     ) -> Option<(UnixSocket, UnixSocket)> {
         match ty {
             SockType::Stream => {
-                let (conn1, conn2) = UnixConnectedStream::new_pair(None, None);
+                let (conn1, conn2) = UnixConnectedStream::new_pair(None, None, None);
                 Some((
-                    UnixSocket::new_with_state(UnixSocketState::ConnectedStream(conn1), flags),
-                    UnixSocket::new_with_state(UnixSocketState::ConnectedStream(conn2), flags),
+                    UnixSocket::new_with_inner(
+                        UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Connected(conn1))),
+                        flags,
+                    ),
+                    UnixSocket::new_with_inner(
+                        UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Connected(conn2))),
+                        flags,
+                    ),
                 ))
             }
             SockType::Datagram => {
                 let (datagram1, datagram2) = UnixDatagram::new_pair();
                 Some((
-                    UnixSocket::new_with_state(UnixSocketState::Datagram(datagram1), flags),
-                    UnixSocket::new_with_state(UnixSocketState::Datagram(datagram2), flags),
+                    UnixSocket::new_with_inner(UnixSocketInner::Datagram(datagram1), flags),
+                    UnixSocket::new_with_inner(UnixSocketInner::Datagram(datagram2), flags),
                 ))
             }
             _ => None,
@@ -1068,14 +1277,28 @@ impl UnixSocket {
 impl IOPollable for UnixSocket {
     fn register_observer(
         &self,
-        _observer: Weak<dyn litebox::event::observer::Observer<litebox::event::Events>>,
-        _mask: litebox::event::Events,
+        observer: Weak<dyn litebox::event::observer::Observer<Events>>,
+        mask: Events,
     ) {
-        todo!()
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => {
+                stream.register_observer(observer, mask);
+            }
+            UnixSocketInner::Datagram(datagram) => {
+                datagram
+                    .inner
+                    .read()
+                    .pollee
+                    .register_observer(observer, mask);
+            }
+        }
     }
 
-    fn check_io_events(&self) -> litebox::event::Events {
-        todo!()
+    fn check_io_events(&self) -> Events {
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.check_io_events(),
+            UnixSocketInner::Datagram(datagram) => datagram.check_io_events(),
+        }
     }
 }
 
