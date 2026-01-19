@@ -3,13 +3,10 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use smoltcp::iface::SocketSet;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::event::{Events, IOPollable};
-use crate::net::socket_channel::{
-    DatagramMessage, NetworkProxy, NetworkSocketHandle, UserNetworkProxy,
-};
+use crate::event::Events;
+use crate::net::socket_channel::{DatagramMessage, NetworkProxy};
 use crate::platform::{Instant, TimeProvider};
 use crate::sync::RawSyncPrimitivesProvider;
 use crate::{LiteBox, platform, sync};
@@ -134,7 +131,7 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
     specific: ProtocolSpecific,
-    proxy: Option<NetworkProxy<Platform>>,
+    proxy: Option<alloc::sync::Arc<NetworkProxy<Platform>>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> {
@@ -469,7 +466,9 @@ where
         );
         self.drain_all_socket_channel_buffers();
         match self.internal_perform_platform_interaction() {
-            smoltcp::iface::PollResult::SocketStateChanged => PlatformInteractionReinvocationAdvice::CallAgainImmediately,
+            smoltcp::iface::PollResult::SocketStateChanged => {
+                PlatformInteractionReinvocationAdvice::CallAgainImmediately
+            }
             smoltcp::iface::PollResult::None => {
                 let poll_at = self.poll_at();
                 PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(poll_at)
@@ -495,13 +494,12 @@ where
     }
 
     /// (Internal-only API) Actually perform the queued interactions with the outside world.
-    pub fn internal_perform_platform_interaction(
-        &mut self,
-    ) -> smoltcp::iface::PollResult {
+    pub fn internal_perform_platform_interaction(&mut self) -> smoltcp::iface::PollResult {
         self.attempt_to_close_queued();
         self.remove_dead_sockets();
         self.close_pending_sockets();
-        self.interface.poll(self.now(), &mut self.device, &mut self.socket_set)
+        self.interface
+            .poll(self.now(), &mut self.device, &mut self.socket_set)
     }
 
     /// (Internal-only API) Perform the queued interactions.
@@ -510,8 +508,7 @@ where
             PlatformInteraction::Automatic => {
                 self.internal_perform_platform_interaction();
             }
-            PlatformInteraction::Manual => {
-            }
+            PlatformInteraction::Manual => {}
         }
     }
 
@@ -586,7 +583,7 @@ where
         port_allocator: &mut LocalPortAllocator,
     ) {
         let proxy = match &socket_handle.proxy {
-            Some(proxy) => proxy,
+            Some(proxy) => proxy.as_ref(),
             None => return,
         };
         match (socket_handle.protocol(), proxy) {
@@ -803,7 +800,11 @@ where
         self.litebox.descriptor_table_mut().insert(socket_handle)
     }
 
-    pub fn set_socket_proxy(&mut self, fd: &SocketFd<Platform>, proxy: NetworkProxy<Platform>) {
+    pub fn set_socket_proxy(
+        &mut self,
+        fd: &SocketFd<Platform>,
+        proxy: alloc::sync::Arc<NetworkProxy<Platform>>,
+    ) {
         let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table.get_entry_mut(fd).expect("invalid fd");
         let socket_handle = &mut table_entry.entry;
@@ -929,7 +930,7 @@ where
                 }
                 self.closing_in_background.push(handle);
             }
-        };
+        }
         if let Some(proxy) = proxy {
             proxy.set_state(socket_channel::SocketState::Closed);
         }

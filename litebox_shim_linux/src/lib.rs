@@ -268,9 +268,9 @@ impl LinuxShim {
     pub fn perform_network_interaction(
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
-        use crate::alloc::string::ToString as _;
-        use litebox::platform::Instant as _;
-        let start_timestamp = self.0.platform.now();
+        // use crate::alloc::string::ToString as _;
+        // use litebox::platform::Instant as _;
+        // let start_timestamp = self.0.platform.now();
 
         let advice = self.0.net.lock().perform_platform_interaction();
         // let advice = self.0.net.lock().perform_platform_interaction();
@@ -316,7 +316,7 @@ impl LinuxShim {
         //         socket_state_changed = true;
         //     }
         // }
-        
+
         // let advice = if socket_state_changed {
         //     // self.0.net.lock().check_and_update_events();
         //     litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately
@@ -509,7 +509,7 @@ enum Descriptor {
     },
     Socket {
         file: alloc::sync::Arc<TypedFd<Network<Platform>>>,
-        user: litebox::net::socket_channel::UserNetworkProxy<Platform>,
+        proxy: alloc::sync::Arc<litebox::net::socket_channel::NetworkProxy<Platform>>,
     },
 }
 
@@ -655,9 +655,9 @@ impl Task {
         let request =
             SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
-        use crate::alloc::string::ToString as _;
-        let start_timestamp = litebox_platform_multiplex::platform().now();
-        let req = format_args!("[{:?}]: {:?}", start_timestamp, request).to_string();
+        // use crate::alloc::string::ToString as _;
+        // let start_timestamp = litebox_platform_multiplex::platform().now();
+        // let req = format_args!("[{:?}]: {:?}", start_timestamp, request).to_string();
 
         // let req = format_args!("[{:?}]: {:?}", timestamp, request).to_string();
         // litebox::log_println!(litebox_platform_multiplex::platform(), "{:?}", req);

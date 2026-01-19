@@ -19,9 +19,7 @@ use litebox::{
     net::{
         CloseBehavior, TcpOptionData,
         errors::AcceptError,
-        socket_channel::{
-            NetworkProxy, NetworkSocketHandle, SocketState, UserNetworkProxy, UserSocketHandle,
-        },
+        socket_channel::{NetworkProxy, SocketState},
     },
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt as _,
@@ -156,7 +154,7 @@ impl GlobalState {
         fd: &SocketFd,
         sock_type: SockType,
         flags: SockFlags,
-    ) -> UserNetworkProxy<litebox_platform_multiplex::Platform> {
+    ) -> Arc<NetworkProxy<litebox_platform_multiplex::Platform>> {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
 
@@ -173,26 +171,21 @@ impl GlobalState {
         assert!(old.is_none());
         drop(dt);
 
-        let (user, network) = match sock_type {
+        let proxy = match sock_type {
             SockType::Stream => {
-                let (user, network) = litebox::net::socket_channel::new_socket_channel();
-                (
-                    UserNetworkProxy::Stream(user),
-                    NetworkProxy::Stream(network),
-                )
+                let proxy = litebox::net::socket_channel::new_socket_channel();
+                NetworkProxy::Stream(proxy)
             }
             SockType::Datagram => {
-                let (user, network) = litebox::net::socket_channel::new_datagram_channel();
-                (
-                    UserNetworkProxy::Datagram(user),
-                    NetworkProxy::Datagram(network),
-                )
+                let proxy = litebox::net::socket_channel::new_datagram_channel();
+                NetworkProxy::Datagram(proxy)
             }
-            SockType::Raw => (UserNetworkProxy::Raw, NetworkProxy::Raw),
+            SockType::Raw => NetworkProxy::Raw,
             _ => unimplemented!(),
         };
-        self.net.lock().set_socket_proxy(&fd, network);
-        user
+        let proxy = Arc::new(proxy);
+        self.net.lock().set_socket_proxy(fd, proxy.clone());
+        proxy
     }
 
     fn with_socket_options<R>(&self, fd: &SocketFd, f: impl FnOnce(&SocketOptions) -> R) -> R {
@@ -553,14 +546,14 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
-        user: &litebox::net::socket_channel::UserNetworkProxy<Platform>,
+        proxy: &litebox::net::socket_channel::NetworkProxy<Platform>,
         mut peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd, Errno> {
         cx.wait_on_events(
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN,
             |observer, filter| {
-                user.register_observer(observer, filter);
+                proxy.register_observer(observer, filter);
                 Ok(())
             },
             || self.try_accept(fd, peer.as_deref_mut()),
@@ -576,7 +569,7 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
-        user: &litebox::net::socket_channel::UserNetworkProxy<Platform>,
+        proxy: &litebox::net::socket_channel::NetworkProxy<Platform>,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
         let mut check_progress = false;
@@ -584,7 +577,7 @@ impl GlobalState {
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN | Events::OUT,
             |observer, filter| {
-                user.register_observer(observer, filter);
+                proxy.register_observer(observer, filter);
                 Ok(())
             },
             || match self.net.lock().connect(fd, &sockaddr, check_progress) {
@@ -614,7 +607,7 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
-        user: &litebox::net::socket_channel::UserNetworkProxy<Platform>,
+        proxy: &litebox::net::socket_channel::NetworkProxy<Platform>,
         buf: &[u8],
         flags: SendFlags,
         sockaddr: Option<SocketAddr>,
@@ -644,10 +637,10 @@ impl GlobalState {
                 is_nonblock,
                 Events::OUT,
                 |observer, filter| {
-                    user.register_observer(observer, filter);
+                    proxy.register_observer(observer, filter);
                     Ok(())
                 },
-                || match user.try_write(buf, new_flags, sockaddr) {
+                || match proxy.try_write(buf, new_flags, sockaddr) {
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
                     Err(SocketChannelError::WouldBlock | SocketChannelError::BufferFull) => {
@@ -680,7 +673,7 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
-        user: &litebox::net::socket_channel::UserNetworkProxy<Platform>,
+        proxy: &litebox::net::socket_channel::NetworkProxy<Platform>,
         buf: &mut [u8],
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
@@ -719,10 +712,10 @@ impl GlobalState {
                 is_nonblock,
                 Events::IN,
                 |observer, filter| {
-                    user.register_observer(observer, filter);
+                    proxy.register_observer(observer, filter);
                     Ok(())
                 },
-                || match user.try_read(buf, new_flags, source_addr.as_deref_mut()) {
+                || match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
                     Err(SocketChannelError::WouldBlock) => Err(TryOpError::TryAgain),
@@ -768,7 +761,7 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: Arc<SocketFd>,
-        user: litebox::net::socket_channel::UserNetworkProxy<Platform>,
+        proxy: Arc<litebox::net::socket_channel::NetworkProxy<Platform>>,
     ) -> Result<(), Errno> {
         let linger_timeout = self.with_socket_options(&fd, |opt| opt.linger_timeout);
         let behavior = match linger_timeout {
@@ -780,7 +773,7 @@ impl GlobalState {
             self.get_status(&fd).contains(OFlags::NONBLOCK),
             Events::HUP,
             |observer, filter| {
-                user.register_observer(observer, filter);
+                proxy.register_observer(observer, filter);
                 Ok(())
             },
             || match self.net.lock().close(&fd, behavior) {
@@ -860,7 +853,7 @@ impl Task {
                     _ => unimplemented!(),
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
-                let user_proxy = self.global.initialize_socket(&socket, ty, flags);
+                let proxy = self.global.initialize_socket(&socket, ty, flags);
                 // Descriptor::LiteBoxRawFd(
                 //     files
                 //         .raw_descriptor_store
@@ -869,7 +862,7 @@ impl Task {
                 // )
                 Descriptor::Socket {
                     file: Arc::new(socket),
-                    user: user_proxy,
+                    proxy,
                 }
             }
             AddressFamily::UNIX => {
@@ -1128,8 +1121,8 @@ impl Task {
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
         let file = match socket {
-            Descriptor::Socket { file, user } => {
-                let (file, user) = (file.clone(), user.clone());
+            Descriptor::Socket { file, proxy } => {
+                let (file, proxy) = (file.clone(), proxy.clone());
                 drop(file_table); // Drop before possibly-blocking `accept`
                 let sock_type = self.global.get_socket_type(&file)?;
                 let mut socket_addr = peer
@@ -1137,18 +1130,18 @@ impl Task {
                     .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
                 let accepted_file =
                     self.global
-                        .accept(&self.wait_cx(), &file, &user, socket_addr.as_mut())?;
+                        .accept(&self.wait_cx(), &file, &proxy, socket_addr.as_mut())?;
                 if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
                     *peer = SocketAddress::Inet(socket_addr);
                 }
 
-                let user = self
+                let proxy = self
                     .global
                     .initialize_socket(&accepted_file, sock_type, flags);
-                user.set_state(SocketState::Connected);
+                proxy.set_state(SocketState::Connected);
                 Descriptor::Socket {
                     file: Arc::new(accepted_file),
-                    user,
+                    proxy,
                 }
             }
             Descriptor::Unix { file, .. } => {
@@ -1194,11 +1187,11 @@ impl Task {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
-            Descriptor::Socket { file, user } => {
+            Descriptor::Socket { file, proxy } => {
                 let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
-                let (file, user) = (file.clone(), user.clone());
+                let (file, proxy) = (file.clone(), proxy.clone());
                 drop(file_table); // Drop before possibly-blocking `connect`
-                self.global.connect(&self.wait_cx(), &file, &user, addr)
+                self.global.connect(&self.wait_cx(), &file, &proxy, addr)
             }
             Descriptor::Unix { file, .. } => {
                 let addr = sockaddr.unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -1235,9 +1228,9 @@ impl Task {
             //     let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
             //     self.global.bind(fd, addr)
             // }),
-            Descriptor::Socket { file, user } => {
+            Descriptor::Socket { file, .. } => {
                 let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
-                self.global.bind(&file, addr)
+                self.global.bind(file, addr)
             }
             Descriptor::Unix { file, .. } => {
                 let addr = sockaddr.unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -1265,7 +1258,7 @@ impl Task {
             // Descriptor::LiteBoxRawFd(raw_fd) => {
             //     files.with_socket_fd(*raw_fd, |fd| self.global.listen(fd, backlog))
             // }
-            Descriptor::Socket { file, user } => self.global.listen(&file, backlog),
+            Descriptor::Socket { file, .. } => self.global.listen(file, backlog),
             Descriptor::Unix { file, .. } => file.listen(backlog, &self.global),
             _ => Err(Errno::ENOTSOCK),
         }
@@ -1310,14 +1303,14 @@ impl Task {
             //     self.global
             //         .sendto(&self.wait_cx(), fd, &buf, flags, sockaddr)
             // }),
-            Descriptor::Socket { file, user } => {
+            Descriptor::Socket { file, proxy } => {
                 let sockaddr = sockaddr
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                let (file, user) = (file.clone(), user.clone());
+                let (file, proxy) = (file.clone(), proxy.clone());
                 drop(file_table); // Drop before possibly-blocking `sendto`
                 self.global
-                    .sendto(&self.wait_cx(), &file, &user, &buf, flags, sockaddr)
+                    .sendto(&self.wait_cx(), &file, &proxy, &buf, flags, sockaddr)
             }
             Descriptor::Unix { file, .. } => {
                 let addr = sockaddr
@@ -1369,11 +1362,11 @@ impl Task {
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
         match socket {
-            Descriptor::Socket { file, user } => {
+            Descriptor::Socket { file, proxy } => {
                 let sock_addr = sock_addr
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                let (file, user) = (file.clone(), user.clone());
+                let (file, proxy) = (file.clone(), proxy.clone());
                 // drop file table as `sendto` may block
                 drop(file_table);
                 let mut total_sent = 0;
@@ -1386,7 +1379,7 @@ impl Task {
                     total_sent += self.global.sendto(
                         &self.wait_cx(),
                         &file,
-                        &user,
+                        &proxy,
                         &buf,
                         flags,
                         sock_addr,
@@ -1441,17 +1434,17 @@ impl Task {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         match file_table.get_fd(sockfd).ok_or(Errno::EBADF)? {
-            Descriptor::Socket { file, user } => {
+            Descriptor::Socket { file, proxy } => {
                 const MAX_LEN: usize = 4096;
                 let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
                 let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
                 let mut addr = None;
-                let (file, user) = (file.clone(), user.clone());
+                let (file, proxy) = (file.clone(), proxy.clone());
                 drop(file_table); // Drop before possibly-blocking `receive`
                 let size = self.global.receive(
                     &self.wait_cx(),
                     &file,
-                    &user,
+                    &proxy,
                     buffer,
                     flags,
                     if source_addr.is_some() {
@@ -1534,7 +1527,7 @@ impl Task {
             // Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
             //     self.global.setsockopt(fd, optname, optval, optlen)
             // }),
-            Descriptor::Socket { file, user } => {
+            Descriptor::Socket { file, .. } => {
                 self.global.setsockopt(&file, optname, optval, optlen)
             }
             _ => Err(Errno::ENOTSOCK),
@@ -1576,7 +1569,7 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 self.global.getsockopt(fd, optname, optval, optlen)
             }),
-            Descriptor::Socket { file, user } => {
+            Descriptor::Socket { file, .. } => {
                 self.global.getsockopt(&file, optname, optval, optlen)
             }
             _ => Err(Errno::ENOTSOCK),
@@ -1612,7 +1605,7 @@ impl Task {
             //         .map(SocketAddress::Inet)
             //         .map_err(Errno::from)
             // }),
-            Descriptor::Socket { file, user } => self
+            Descriptor::Socket { file, .. } => self
                 .global
                 .net
                 .lock()
@@ -1653,7 +1646,7 @@ impl Task {
             //         .map(SocketAddress::Inet)
             //         .map_err(Errno::from)
             // }),
-            Descriptor::Socket { file, user } => self
+            Descriptor::Socket { file, .. } => self
                 .global
                 .net
                 .lock()

@@ -273,13 +273,13 @@ impl Task {
             Descriptor::Unix { file, .. } => {
                 file.recvfrom(buf, litebox_common_linux::ReceiveFlags::empty(), None)
             }
-            Descriptor::Socket { file, user } => {
-                let (file, user) = (file.clone(), user.clone());
+            Descriptor::Socket { file, proxy } => {
+                let (file, proxy) = (file.clone(), proxy.clone());
                 drop(file_table);
                 self.global.receive(
                     &self.wait_cx(),
                     &file,
-                    &user,
+                    &proxy,
                     buf,
                     litebox_common_linux::ReceiveFlags::empty(),
                     None,
@@ -330,13 +330,13 @@ impl Task {
             Descriptor::Unix { file, .. } => {
                 file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
             }
-            Descriptor::Socket { file, user } => {
-                let (file, user) = (file.clone(), user.clone());
+            Descriptor::Socket { file, proxy } => {
+                let (file, proxy) = (file.clone(), proxy.clone());
                 drop(file_table);
                 self.global.sendto(
                     &self.wait_cx(),
                     &file,
-                    &user,
+                    &proxy,
                     buf,
                     litebox_common_linux::SendFlags::empty(),
                     None,
@@ -435,11 +435,11 @@ impl Task {
             Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
                 Ok(())
             }
-            Descriptor::Socket { file, user } => {
+            Descriptor::Socket { file, proxy } => {
                 // let (file, user) = (file.clone(), user.clone());
                 // drop(files);
                 // Close the underlying socket through the network subsystem
-                self.global.close_socket(&self.wait_cx(), file, user)
+                self.global.close_socket(&self.wait_cx(), file, proxy)
             }
         }
     }
@@ -579,11 +579,11 @@ impl Task {
             Descriptor::Epoll { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { .. } => todo!(),
             Descriptor::Unix { .. } => todo!(),
-            Descriptor::Socket { file, user } => write_to_iovec(iovs, |buf| {
+            Descriptor::Socket { file, proxy } => write_to_iovec(iovs, |buf| {
                 self.global.sendto(
                     &self.wait_cx(),
-                    &file,
-                    &user,
+                    file,
+                    proxy,
                     buf,
                     litebox_common_linux::SendFlags::empty(),
                     None,
@@ -813,7 +813,7 @@ impl Descriptor {
                     FileDescriptorFlags::empty()
                 },
             ),
-            Descriptor::Socket { file, .. } => Ok(get_flags(global, &file)),
+            Descriptor::Socket { file, .. } => Ok(get_flags(global, file)),
         }
     }
 }
@@ -1758,16 +1758,16 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                 file: file.clone(),
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
             }),
-            Descriptor::Socket { file, user } => {
+            Descriptor::Socket { file, proxy } => {
                 let mut dt = self.global.litebox.descriptor_table_mut();
-                let new_fd: TypedFd<_> = dt.duplicate(&file).ok_or(Errno::EBADF)?;
+                let new_fd: TypedFd<_> = dt.duplicate(file).ok_or(Errno::EBADF)?;
                 if close_on_exec {
                     let old = dt.set_fd_metadata(&new_fd, FileDescriptorFlags::FD_CLOEXEC);
                     assert!(old.is_none());
                 }
                 Ok(Descriptor::Socket {
                     file: alloc::sync::Arc::new(new_fd),
-                    user: user.clone(),
+                    proxy: proxy.clone(),
                 })
             }
         }
