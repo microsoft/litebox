@@ -271,48 +271,69 @@ impl LinuxShim {
         use crate::alloc::string::ToString as _;
         use litebox::platform::Instant as _;
         let start_timestamp = self.0.platform.now();
-        // let advice = self.0.net.lock().perform_platform_interaction();
-        self.0.net.lock().attempt_to_close_queued();
-        let timestamp = self.0.net.lock().now();
-        let mut socket_state_changed = false;
-        loop {
-            match self.0.net.lock().perform_platform_interaction_ingress(
-                timestamp,
-            ) {
-                litebox::net::PollIngressSingleResult::None => {
-                    break;
-                }
-                litebox::net::PollIngressSingleResult::PacketProcessed => {
-                    continue;
-                }
-                litebox::net::PollIngressSingleResult::SocketStateChanged => {
-                    socket_state_changed = true;
-                }
-            }
-            // self.0.net.lock().check_and_update_events();
-        }
-        if socket_state_changed {
-            self.0.net.lock().check_and_update_events();
-        }
 
-        let mut socket_state_changed = false;
-        match self.0.net.lock().perform_platform_interaction_egress(timestamp) {
-            litebox::net::PollResult::None => {}
-            litebox::net::PollResult::SocketStateChanged => {
-                socket_state_changed = true;
-            }
-        }
-        let advice = if socket_state_changed {
-            self.0.net.lock().check_and_update_events();
-            litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately
-        } else {
-            let poll_at = self.0.net.lock().poll_at();
-            litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(poll_at)
-        };
+        let advice = self.0.net.lock().perform_platform_interaction();
+        // let advice = self.0.net.lock().perform_platform_interaction();
+        // self.0.net.lock().attempt_to_close_queued();
+        // self.0.net.lock().check_and_update_events();
+
+        // let timestamp = self.0.net.lock().now();
+        // let mut socket_state_changed = false;
+        // self.0.net.lock().drain_all_socket_channel_buffers();
+        // loop {
+        //     match self
+        //         .0
+        //         .net
+        //         .lock()
+        //         .perform_platform_interaction_ingress(timestamp)
+        //     {
+        //         litebox::net::PollIngressSingleResult::None => {
+        //             break;
+        //         }
+        //         litebox::net::PollIngressSingleResult::PacketProcessed => {
+        //             continue;
+        //         }
+        //         litebox::net::PollIngressSingleResult::SocketStateChanged => {
+        //             socket_state_changed = true;
+        //         }
+        //     }
+        //     // self.0.net.lock().check_and_update_events();
+        // }
+        // if socket_state_changed {
+        //     self.0.net.lock().check_and_update_events();
+        // }
+
+        // let mut socket_state_changed = false;
+        // self.0.net.lock().drain_all_socket_channel_buffers();
+        // match self
+        //     .0
+        //     .net
+        //     .lock()
+        //     .perform_platform_interaction_egress(timestamp)
+        // {
+        //     litebox::net::PollResult::None => {}
+        //     litebox::net::PollResult::SocketStateChanged => {
+        //         socket_state_changed = true;
+        //     }
+        // }
+        
+        // let advice = if socket_state_changed {
+        //     // self.0.net.lock().check_and_update_events();
+        //     litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately
+        // } else {
+        //     let poll_at = self.0.net.lock().poll_at();
+        //     litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(
+        //         poll_at,
+        //     )
+        // };
 
         // let end_timestamp = self.0.platform.now();
         // let dur = end_timestamp.duration_since(&start_timestamp);
-        // let log = format_args!("[{:?}]: PlatformInteractionReinvocationAdvice => {:?}\n", start_timestamp, dur).to_string();
+        // let log = format_args!(
+        //     "[{:?}]: PlatformInteractionReinvocationAdvice => {:?}\n",
+        //     start_timestamp, dur
+        // )
+        // .to_string();
         // litebox::log_println!(self.0.platform, &log);
         advice
     }
@@ -486,6 +507,10 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::unix::UnixSocket>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
+    Socket {
+        file: alloc::sync::Arc<TypedFd<Network<Platform>>>,
+        user: litebox::net::socket_channel::UserNetworkProxy<Platform>,
+    },
 }
 
 /// A strongly-typed FD.
@@ -494,7 +519,6 @@ enum Descriptor {
 /// alongside them (i.e., it is a trivial tagged union across the subsystems being used).
 enum StrongFd {
     FileSystem(Arc<TypedFd<LinuxFS>>),
-    Network(Arc<TypedFd<Network<Platform>>>),
     Pipes(Arc<TypedFd<Pipes<Platform>>>),
 }
 impl StrongFd {
@@ -502,7 +526,7 @@ impl StrongFd {
         match files
             .raw_descriptor_store
             .read()
-            .typed_fd_at_raw_3::<StrongFd, LinuxFS, Network<Platform>, Pipes<Platform>>(fd)
+            .typed_fd_at_raw_2::<StrongFd, LinuxFS, Pipes<Platform>>(fd)
         {
             Ok(r) => Ok(r),
             Err(ErrRawIntFd::InvalidSubsystem) => {
@@ -519,11 +543,6 @@ impl From<Arc<TypedFd<LinuxFS>>> for StrongFd {
         StrongFd::FileSystem(v)
     }
 }
-impl From<Arc<TypedFd<Network<Platform>>>> for StrongFd {
-    fn from(v: Arc<TypedFd<Network<Platform>>>) -> Self {
-        StrongFd::Network(v)
-    }
-}
 impl From<Arc<TypedFd<Pipes<Platform>>>> for StrongFd {
     fn from(v: Arc<TypedFd<Pipes<Platform>>>) -> Self {
         StrongFd::Pipes(v)
@@ -535,12 +554,10 @@ impl syscalls::file::FilesState {
         &self,
         fd: usize,
         fs: impl FnOnce(&TypedFd<LinuxFS>) -> R,
-        net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
         pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
     ) -> Result<R, Errno> {
         match StrongFd::from_raw(self, fd)? {
             StrongFd::FileSystem(fd) => Ok(fs(&fd)),
-            StrongFd::Network(fd) => Ok(net(&fd)),
             StrongFd::Pipes(fd) => Ok(pipes(&fd)),
         }
     }

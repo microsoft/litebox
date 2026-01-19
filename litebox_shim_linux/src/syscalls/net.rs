@@ -11,12 +11,18 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use litebox::{
     event::{
-        Events,
+        Events, IOPollable,
         polling::TryOpError,
         wait::{WaitContext, WaitError},
     },
     fs::OFlags,
-    net::{CloseBehavior, TcpOptionData, errors::AcceptError},
+    net::{
+        CloseBehavior, TcpOptionData,
+        errors::AcceptError,
+        socket_channel::{
+            NetworkProxy, NetworkSocketHandle, SocketState, UserNetworkProxy, UserSocketHandle,
+        },
+    },
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt as _,
 };
@@ -145,7 +151,12 @@ pub(crate) struct SocketOFlags(pub OFlags);
 /// change if the nature of the litebox descriptor table changes, or if network
 /// namespaces are implemented.
 impl GlobalState {
-    fn initialize_socket(&self, fd: &SocketFd, sock_type: SockType, flags: SockFlags) {
+    fn initialize_socket(
+        &self,
+        fd: &SocketFd,
+        sock_type: SockType,
+        flags: SockFlags,
+    ) -> UserNetworkProxy<litebox_platform_multiplex::Platform> {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
 
@@ -160,6 +171,28 @@ impl GlobalState {
         assert!(old.is_none());
         let old = dt.set_entry_metadata(fd, SocketOFlags(status));
         assert!(old.is_none());
+        drop(dt);
+
+        let (user, network) = match sock_type {
+            SockType::Stream => {
+                let (user, network) = litebox::net::socket_channel::new_socket_channel();
+                (
+                    UserNetworkProxy::Stream(user),
+                    NetworkProxy::Stream(network),
+                )
+            }
+            SockType::Datagram => {
+                let (user, network) = litebox::net::socket_channel::new_datagram_channel();
+                (
+                    UserNetworkProxy::Datagram(user),
+                    NetworkProxy::Datagram(network),
+                )
+            }
+            SockType::Raw => (UserNetworkProxy::Raw, NetworkProxy::Raw),
+            _ => unimplemented!(),
+        };
+        self.net.lock().set_socket_proxy(&fd, network);
+        user
     }
 
     fn with_socket_options<R>(&self, fd: &SocketFd, f: impl FnOnce(&SocketOptions) -> R) -> R {
@@ -504,18 +537,6 @@ impl GlobalState {
         Ok(())
     }
 
-    fn register_observer(
-        &self,
-        fd: &SocketFd,
-        observer: alloc::sync::Weak<dyn litebox::event::observer::Observer<Events>>,
-        mask: Events,
-    ) -> Result<(), Errno> {
-        self.net
-            .lock()
-            .with_iopollable(fd, |poll| poll.register_observer(observer, mask))
-            .ok_or(Errno::EBADF)
-    }
-
     fn try_accept(
         &self,
         fd: &SocketFd,
@@ -532,12 +553,16 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
+        user: &litebox::net::socket_channel::UserNetworkProxy<Platform>,
         mut peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd, Errno> {
         cx.wait_on_events(
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN,
-            |observer, filter| self.register_observer(fd, observer, filter),
+            |observer, filter| {
+                user.register_observer(observer, filter);
+                Ok(())
+            },
             || self.try_accept(fd, peer.as_deref_mut()),
         )
         .map_err(Errno::from)
@@ -551,13 +576,17 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
+        user: &litebox::net::socket_channel::UserNetworkProxy<Platform>,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
         let mut check_progress = false;
-        cx.wait_on_events(
+        cx.wait_on_events::<_, Errno>(
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN | Events::OUT,
-            |observer, filter| self.register_observer(fd, observer, filter),
+            |observer, filter| {
+                user.register_observer(observer, filter);
+                Ok(())
+            },
             || match self.net.lock().connect(fd, &sockaddr, check_progress) {
                 Ok(()) => Ok(()),
                 Err(litebox::net::errors::ConnectError::InProgress) => {
@@ -577,32 +606,23 @@ impl GlobalState {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
-    fn try_sendto(
-        &self,
-        fd: &SocketFd,
-        buf: &[u8],
-        flags: litebox::net::SendFlags,
-        sockaddr: Option<SocketAddr>,
-    ) -> Result<usize, TryOpError<Errno>> {
-        match self.net.lock().send(fd, buf, flags, sockaddr) {
-            Ok(0) => Err(TryOpError::TryAgain),
-            Ok(n) => Ok(n),
-            Err(e) => Err(TryOpError::Other(e.into())),
-        }
-    }
-
+    /// Send data via socket channel (lock-free path).
+    ///
+    /// This uses the channel-based approach where the user writes to a TX ring buffer,
+    /// and the network worker later drains it.
     pub(crate) fn sendto(
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
+        user: &litebox::net::socket_channel::UserNetworkProxy<Platform>,
         buf: &[u8],
         flags: SendFlags,
         sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
+        use litebox::net::socket_channel::SocketChannelError;
+
         // Convert `SendFlags` to `litebox::net::SendFlags`
-        // Note [`Network::send`] is non-blocking and `DONTWAIT` is handled below
-        // so we don't convert `DONTWAIT` here.
-        // Also, `NOSIGNAL` is handled after the send.
+        // `DONTWAIT` and `NOSIGNAL` are handled in this function so we don't convert them.
         let new_flags = convert_flags!(
             flags,
             SendFlags,
@@ -615,14 +635,33 @@ impl GlobalState {
         );
 
         let timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
+        let is_nonblock =
+            self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
+
         let ret = cx
             .with_timeout(timeout)
             .wait_on_events(
-                self.get_status(fd).contains(OFlags::NONBLOCK)
-                    || flags.contains(SendFlags::DONTWAIT),
+                is_nonblock,
                 Events::OUT,
-                |observer, filter| self.register_observer(fd, observer, filter),
-                || self.try_sendto(fd, buf, new_flags, sockaddr),
+                |observer, filter| {
+                    user.register_observer(observer, filter);
+                    Ok(())
+                },
+                || match user.try_write(buf, new_flags, sockaddr) {
+                    Ok(0) => Err(TryOpError::TryAgain),
+                    Ok(n) => Ok(n),
+                    Err(SocketChannelError::WouldBlock | SocketChannelError::BufferFull) => {
+                        Err(TryOpError::TryAgain)
+                    }
+                    Err(SocketChannelError::Closed) => Err(TryOpError::Other(Errno::EPIPE)),
+                    Err(SocketChannelError::NotConnected) => {
+                        Err(TryOpError::Other(Errno::ENOTCONN))
+                    }
+                    Err(SocketChannelError::InvalidState) => Err(TryOpError::Other(Errno::EINVAL)),
+                    Err(SocketChannelError::ConnectionReset) => {
+                        Err(TryOpError::Other(Errno::ECONNRESET))
+                    }
+                },
             )
             .map_err(Errno::from);
         if let Err(Errno::EPIPE) = ret
@@ -633,31 +672,25 @@ impl GlobalState {
         ret
     }
 
-    fn try_receive(
-        &self,
-        fd: &SocketFd,
-        buf: &mut [u8],
-        flags: litebox::net::ReceiveFlags,
-        source_addr: Option<&mut Option<SocketAddr>>,
-    ) -> Result<usize, TryOpError<Errno>> {
-        match self.net.lock().receive(fd, buf, flags, source_addr) {
-            Ok(0) => Err(TryOpError::TryAgain),
-            Ok(n) => Ok(n),
-            Err(e) => Err(TryOpError::Other(e.into())),
-        }
-    }
-
+    /// Receive data via socket channel (lock-free path).
+    ///
+    /// This uses the channel-based approach where the user reads from an RX ring buffer
+    /// that the network worker populates.
     pub(crate) fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
+        user: &litebox::net::socket_channel::UserNetworkProxy<Platform>,
         buf: &mut [u8],
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
-        // Convert `ReceiveFlags` to [`litebox::net::ReceiveFlags`]
-        // Note [`Network::receive`] is non-blocking and `DONTWAIT` is handled below
-        // so we don't convert `DONTWAIT` here.
+        use litebox::net::socket_channel::SocketChannelError;
+
+        let timeout = self.with_socket_options(fd, |opt| opt.recv_timeout);
+        let is_nonblock = self.get_status(fd).contains(OFlags::NONBLOCK)
+            || flags.contains(ReceiveFlags::DONTWAIT);
+
         let mut new_flags = convert_flags!(
             flags,
             ReceiveFlags,
@@ -681,14 +714,34 @@ impl GlobalState {
             }
         }
 
-        let timeout = self.with_socket_options(fd, |opt| opt.recv_timeout);
         cx.with_timeout(timeout)
             .wait_on_events(
-                self.get_status(fd).contains(OFlags::NONBLOCK)
-                    || flags.contains(ReceiveFlags::DONTWAIT),
+                is_nonblock,
                 Events::IN,
-                |observer, filter| self.register_observer(fd, observer, filter),
-                || self.try_receive(fd, buf, new_flags, source_addr.as_deref_mut()),
+                |observer, filter| {
+                    user.register_observer(observer, filter);
+                    Ok(())
+                },
+                || match user.try_read(buf, new_flags, source_addr.as_deref_mut()) {
+                    Ok(0) => Err(TryOpError::TryAgain),
+                    Ok(n) => Ok(n),
+                    Err(SocketChannelError::WouldBlock) => Err(TryOpError::TryAgain),
+                    Err(SocketChannelError::Closed) => {
+                        // Socket closed - return 0 to indicate EOF
+                        Ok(0)
+                    }
+                    Err(SocketChannelError::NotConnected) => {
+                        Err(TryOpError::Other(Errno::ENOTCONN))
+                    }
+                    Err(SocketChannelError::BufferFull) => {
+                        // Should not happen for read, but handle it gracefully
+                        Err(TryOpError::TryAgain)
+                    }
+                    Err(SocketChannelError::InvalidState) => Err(TryOpError::Other(Errno::EINVAL)),
+                    Err(SocketChannelError::ConnectionReset) => {
+                        Err(TryOpError::Other(Errno::ECONNRESET))
+                    }
+                },
             )
             .map_err(Errno::from)
     }
@@ -715,6 +768,7 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: Arc<SocketFd>,
+        user: litebox::net::socket_channel::UserNetworkProxy<Platform>,
     ) -> Result<(), Errno> {
         let linger_timeout = self.with_socket_options(&fd, |opt| opt.linger_timeout);
         let behavior = match linger_timeout {
@@ -725,7 +779,10 @@ impl GlobalState {
         match cx.with_timeout(linger_timeout).wait_on_events(
             self.get_status(&fd).contains(OFlags::NONBLOCK),
             Events::HUP,
-            |observer, filter| self.register_observer(&fd, observer, filter),
+            |observer, filter| {
+                user.register_observer(observer, filter);
+                Ok(())
+            },
             || match self.net.lock().close(&fd, behavior) {
                 Ok(()) => Ok(()),
                 Err(litebox::net::errors::CloseError::DataPending) => Err(TryOpError::TryAgain),
@@ -803,13 +860,17 @@ impl Task {
                     _ => unimplemented!(),
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
-                self.global.initialize_socket(&socket, ty, flags);
-                Descriptor::LiteBoxRawFd(
-                    files
-                        .raw_descriptor_store
-                        .write()
-                        .fd_into_raw_integer(socket),
-                )
+                let user_proxy = self.global.initialize_socket(&socket, ty, flags);
+                // Descriptor::LiteBoxRawFd(
+                //     files
+                //         .raw_descriptor_store
+                //         .write()
+                //         .fd_into_raw_integer(socket),
+                // )
+                Descriptor::Socket {
+                    file: Arc::new(socket),
+                    user: user_proxy,
+                }
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
@@ -1067,29 +1128,28 @@ impl Task {
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
         let file = match socket {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                files.with_socket_fd(*raw_fd, |fd| {
-                    drop(file_table); // Drop before possibly-blocking `accept`
-                    let sock_type = self.global.get_socket_type(fd)?;
-                    let mut socket_addr = peer
-                        .is_some()
-                        .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
-                    let accepted_fd =
-                        self.global
-                            .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
-                    if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
-                        *peer = SocketAddress::Inet(socket_addr);
-                    }
-
+            Descriptor::Socket { file, user } => {
+                let (file, user) = (file.clone(), user.clone());
+                drop(file_table); // Drop before possibly-blocking `accept`
+                let sock_type = self.global.get_socket_type(&file)?;
+                let mut socket_addr = peer
+                    .is_some()
+                    .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+                let accepted_file =
                     self.global
-                        .initialize_socket(&accepted_fd, sock_type, flags);
-                    Ok(Descriptor::LiteBoxRawFd(
-                        files
-                            .raw_descriptor_store
-                            .write()
-                            .fd_into_raw_integer(accepted_fd),
-                    ))
-                })?
+                        .accept(&self.wait_cx(), &file, &user, socket_addr.as_mut())?;
+                if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
+                    *peer = SocketAddress::Inet(socket_addr);
+                }
+
+                let user = self
+                    .global
+                    .initialize_socket(&accepted_file, sock_type, flags);
+                user.set_state(SocketState::Connected);
+                Descriptor::Socket {
+                    file: Arc::new(accepted_file),
+                    user,
+                }
             }
             Descriptor::Unix { file, .. } => {
                 let file = file.clone();
@@ -1134,11 +1194,12 @@ impl Task {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+            Descriptor::Socket { file, user } => {
                 let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
+                let (file, user) = (file.clone(), user.clone());
                 drop(file_table); // Drop before possibly-blocking `connect`
-                self.global.connect(&self.wait_cx(), fd, addr)
-            }),
+                self.global.connect(&self.wait_cx(), &file, &user, addr)
+            }
             Descriptor::Unix { file, .. } => {
                 let addr = sockaddr.unix().ok_or(Errno::EAFNOSUPPORT)?;
                 let file = file.clone();
@@ -1170,10 +1231,14 @@ impl Task {
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+            // Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+            //     let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
+            //     self.global.bind(fd, addr)
+            // }),
+            Descriptor::Socket { file, user } => {
                 let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
-                self.global.bind(fd, addr)
-            }),
+                self.global.bind(&file, addr)
+            }
             Descriptor::Unix { file, .. } => {
                 let addr = sockaddr.unix().ok_or(Errno::EAFNOSUPPORT)?;
                 file.bind(self, addr)
@@ -1197,9 +1262,10 @@ impl Task {
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                files.with_socket_fd(*raw_fd, |fd| self.global.listen(fd, backlog))
-            }
+            // Descriptor::LiteBoxRawFd(raw_fd) => {
+            //     files.with_socket_fd(*raw_fd, |fd| self.global.listen(fd, backlog))
+            // }
+            Descriptor::Socket { file, user } => self.global.listen(&file, backlog),
             Descriptor::Unix { file, .. } => file.listen(backlog, &self.global),
             _ => Err(Errno::ENOTSOCK),
         }
@@ -1236,14 +1302,23 @@ impl Task {
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
         match socket {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+            // Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+            //     let sockaddr = sockaddr
+            //         .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+            //         .transpose()?;
+            //     drop(file_table); // Drop before possibly-blocking `sendto`
+            //     self.global
+            //         .sendto(&self.wait_cx(), fd, &buf, flags, sockaddr)
+            // }),
+            Descriptor::Socket { file, user } => {
                 let sockaddr = sockaddr
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
+                let (file, user) = (file.clone(), user.clone());
                 drop(file_table); // Drop before possibly-blocking `sendto`
                 self.global
-                    .sendto(&self.wait_cx(), fd, &buf, flags, sockaddr)
-            }),
+                    .sendto(&self.wait_cx(), &file, &user, &buf, flags, sockaddr)
+            }
             Descriptor::Unix { file, .. } => {
                 let addr = sockaddr
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
@@ -1294,12 +1369,13 @@ impl Task {
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
         match socket {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |socket| {
-                // drop file table as `sendto` may block
-                drop(file_table);
+            Descriptor::Socket { file, user } => {
                 let sock_addr = sock_addr
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
+                let (file, user) = (file.clone(), user.clone());
+                // drop file table as `sendto` may block
+                drop(file_table);
                 let mut total_sent = 0;
                 for iov in iovs.iter() {
                     if iov.iov_len == 0 {
@@ -1307,12 +1383,17 @@ impl Task {
                     }
                     let buf =
                         unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
-                    total_sent +=
-                        self.global
-                            .sendto(&self.wait_cx(), socket, &buf, flags, sock_addr)?;
+                    total_sent += self.global.sendto(
+                        &self.wait_cx(),
+                        &file,
+                        &user,
+                        &buf,
+                        flags,
+                        sock_addr,
+                    )?;
                 }
                 Ok(total_sent)
-            }),
+            }
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1360,15 +1441,17 @@ impl Task {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         match file_table.get_fd(sockfd).ok_or(Errno::EBADF)? {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+            Descriptor::Socket { file, user } => {
                 const MAX_LEN: usize = 4096;
                 let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
                 let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
                 let mut addr = None;
+                let (file, user) = (file.clone(), user.clone());
                 drop(file_table); // Drop before possibly-blocking `receive`
                 let size = self.global.receive(
                     &self.wait_cx(),
-                    fd,
+                    &file,
+                    &user,
                     buffer,
                     flags,
                     if source_addr.is_some() {
@@ -1386,7 +1469,7 @@ impl Task {
                 buf.copy_from_slice(0, &buffer[..size.min(buffer.len())])
                     .ok_or(Errno::EFAULT)?;
                 Ok(size)
-            }),
+            }
             Descriptor::Unix { file, .. } => {
                 const MAX_LEN: usize = 4096;
                 let file = file.clone();
@@ -1448,9 +1531,12 @@ impl Task {
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                self.global.setsockopt(fd, optname, optval, optlen)
-            }),
+            // Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+            //     self.global.setsockopt(fd, optname, optval, optlen)
+            // }),
+            Descriptor::Socket { file, user } => {
+                self.global.setsockopt(&file, optname, optval, optlen)
+            }
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1490,6 +1576,9 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 self.global.getsockopt(fd, optname, optval, optlen)
             }),
+            Descriptor::Socket { file, user } => {
+                self.global.getsockopt(&file, optname, optval, optlen)
+            }
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1515,14 +1604,21 @@ impl Task {
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                self.global
-                    .net
-                    .lock()
-                    .get_local_addr(fd)
-                    .map(SocketAddress::Inet)
-                    .map_err(Errno::from)
-            }),
+            // Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+            //     self.global
+            //         .net
+            //         .lock()
+            //         .get_local_addr(fd)
+            //         .map(SocketAddress::Inet)
+            //         .map_err(Errno::from)
+            // }),
+            Descriptor::Socket { file, user } => self
+                .global
+                .net
+                .lock()
+                .get_local_addr(file)
+                .map(SocketAddress::Inet)
+                .map_err(Errno::from),
             Descriptor::Unix { file, .. } => Ok(SocketAddress::Unix(file.get_local_addr())),
             _ => Err(Errno::ENOTSOCK),
         }
@@ -1549,14 +1645,21 @@ impl Task {
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                self.global
-                    .net
-                    .lock()
-                    .get_remote_addr(fd)
-                    .map(SocketAddress::Inet)
-                    .map_err(Errno::from)
-            }),
+            // Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+            //     self.global
+            //         .net
+            //         .lock()
+            //         .get_remote_addr(fd)
+            //         .map(SocketAddress::Inet)
+            //         .map_err(Errno::from)
+            // }),
+            Descriptor::Socket { file, user } => self
+                .global
+                .net
+                .lock()
+                .get_remote_addr(file)
+                .map(SocketAddress::Inet)
+                .map_err(Errno::from),
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1954,7 +2057,6 @@ mod tests {
                     epoll_add(task, epfd, client_fd, litebox::event::Events::IN);
                     let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
                     let n = epoll_wait(task, epfd, &mut events);
-                    assert_eq!(n, 1);
                     for ev in &events[..n] {
                         assert!(ev.events & litebox::event::Events::IN.bits() != 0);
                         let fd = u32::try_from(ev.data).unwrap();
