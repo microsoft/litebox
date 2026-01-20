@@ -8,7 +8,6 @@ use litebox_platform_multiplex::Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 extern crate alloc;
 
@@ -273,9 +272,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let shim = shim.clone();
         let shutdown_clone = shutdown.clone();
         let child = std::thread::spawn(move || {
+            const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(5);
+            pin_thread_to_cpu(0);
+
             while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
-                while shim.perform_network_interaction().call_again_immediately() {}
-                litebox_platform_multiplex::platform().wait_on_tun(Some(Duration::from_millis(50)));
+                let timeout = loop {
+                    match shim.perform_network_interaction() {
+                        litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
+                        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(timeout) => {
+                            break timeout;
+                        }
+                    }
+                };
+                litebox_platform_multiplex::platform()
+                    .wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT)));
             }
             // Final flush
             // TODO: keep running until all sockets are closed?
@@ -350,6 +360,19 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         net_worker.join().unwrap();
     }
     std::process::exit(program.process.wait())
+}
+
+/// Pin the current thread to a specific CPU core
+fn pin_thread_to_cpu(cpu: usize) {
+    unsafe {
+        let mut set = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set) != 0 {
+            eprintln!("Warning: Failed to pin thread to CPU core {cpu}");
+        }
+    }
 }
 
 fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {

@@ -6,9 +6,10 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::event::{Events, IOPollable};
+use crate::event::Events;
+use crate::net::socket_channel::{DatagramMessage, NetworkProxy};
 use crate::platform::{Instant, TimeProvider};
 use crate::sync::RawSyncPrimitivesProvider;
 use crate::{LiteBox, platform, sync};
@@ -19,6 +20,7 @@ use smoltcp::socket::{icmp, raw, tcp, udp};
 pub mod errors;
 pub mod local_ports;
 mod phy;
+pub mod socket_channel;
 
 #[cfg(test)]
 mod tests;
@@ -38,7 +40,7 @@ const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 /// Maximum size of rx/tx buffers for sockets
-pub const SOCKET_BUFFER_SIZE: usize = 65536;
+pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
 
 /// Limits maximum number of packets in a buffer
 const MAX_PACKET_COUNT: usize = 32;
@@ -132,11 +134,7 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
     specific: ProtocolSpecific,
-    pollee: crate::event::polling::Pollee<Platform>,
-    /// Whether the socket was last known to be able to send
-    previously_sendable: AtomicBool,
-    /// Number of octets in the receive queue
-    recv_queue: AtomicUsize,
+    proxy: Option<alloc::sync::Arc<NetworkProxy<Platform>>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> {
@@ -209,153 +207,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> core::ops::DerefMut
     }
 }
 
-struct PollableSocketHandle<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    socket_handle: &'a SocketHandle<Platform>,
-    socket_set: &'a smoltcp::iface::SocketSet<'static>,
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PollableSocketHandle<'_, Platform> {
-    /// Get the [`Events`] for a socket handle [`SocketHandle`].
-    ///
-    /// If `new_events_only` is true, only events representing meaningful state changes
-    /// since the last check are returned (e.g., new data arrived, socket became writable,
-    /// new connections became acceptable).
-    ///
-    /// Note this is still just an approximation; for example, if data arrives multiple times
-    /// before this is called, only one `Events::IN` will be sent. This is probably fine
-    /// because we also update the internal state (i.e., `recv_queue`) in [`Network::receive`] calls
-    /// so that the following common pattern won't get stuck (it may miss some duplicate `Events::IN`
-    /// events, but they are not necessary to make progress; one is sufficient):
-    ///
-    /// ```text
-    /// loop {
-    ///     if (poll(socket, Events::IN) > 0) {
-    ///         assert!(receive(socket, ...) > 0);
-    ///     }
-    /// }
-    /// ```
-    fn check_socket_events(&self, new_events_only: bool) -> Events {
-        let mut events = Events::empty();
-        let recv_queue_last = self.socket_handle.recv_queue.load(Ordering::Relaxed);
-        let (recv_queue_now, sendable_now, receivable_now) = match self.socket_handle.protocol() {
-            Protocol::Tcp => {
-                let tcp_socket = self
-                    .socket_set
-                    .get::<tcp::Socket>(self.socket_handle.handle);
-                (
-                    tcp_socket.recv_queue(),
-                    tcp_socket.can_send(),
-                    tcp_socket.can_recv(),
-                )
-            }
-            Protocol::Udp => {
-                let udp_socket = self
-                    .socket_set
-                    .get::<udp::Socket>(self.socket_handle.handle);
-                (
-                    udp_socket.recv_queue(),
-                    udp_socket.can_send(),
-                    udp_socket.can_recv(),
-                )
-            }
-            Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol: _ } => unimplemented!(),
-        };
-
-        if new_events_only {
-            if recv_queue_now > recv_queue_last && receivable_now {
-                self.socket_handle
-                    .recv_queue
-                    .store(recv_queue_now, Ordering::Relaxed);
-                // We have more data to receive than last time, so we should notify
-                events |= Events::IN;
-            }
-
-            let previously_sendable = self
-                .socket_handle
-                .previously_sendable
-                .load(Ordering::Relaxed);
-            if !previously_sendable && sendable_now {
-                self.socket_handle
-                    .previously_sendable
-                    .store(true, Ordering::Relaxed);
-                // We can now send, so we should notify
-                events |= Events::OUT;
-            }
-        } else {
-            if receivable_now {
-                events |= Events::IN;
-            }
-            if sendable_now {
-                events |= Events::OUT;
-            }
-        }
-
-        if let Protocol::Tcp = self.socket_handle.protocol() {
-            let tcp_specific = self.socket_handle.specific.tcp();
-            let is_open = self
-                .socket_set
-                .get::<tcp::Socket>(self.socket_handle.handle)
-                .is_open();
-            if !is_open {
-                let should_emit_hup = if new_events_only {
-                    tcp_specific
-                        .was_connection_initiated
-                        .swap(false, Ordering::Relaxed)
-                } else {
-                    // server socket that is listening also has closed state
-                    tcp_specific.server_socket.is_none()
-                };
-
-                if should_emit_hup {
-                    events |= Events::HUP;
-                }
-            }
-
-            // A server socket should have `Events::IN` if any of its listening sockets is connected.
-            if !events.contains(Events::IN)
-                && let Some(server_socket) = tcp_specific.server_socket.as_ref()
-            {
-                let previously_acceptable =
-                    tcp_specific.previously_acceptable.load(Ordering::Relaxed);
-                if !new_events_only || !previously_acceptable {
-                    server_socket
-                        .socket_set_handles
-                        .iter()
-                        .any(|&h| {
-                            let socket: &tcp::Socket = self.socket_set.get(h);
-                            socket.state() == tcp::State::Established
-                        })
-                        .then(|| {
-                            tcp_specific
-                                .previously_acceptable
-                                .store(true, Ordering::Relaxed);
-                            events.insert(Events::IN);
-                        });
-                }
-            }
-        }
-
-        events
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
-    for PollableSocketHandle<'_, Platform>
-{
-    fn register_observer(
-        &self,
-        observer: alloc::sync::Weak<dyn crate::event::observer::Observer<Events>>,
-        mask: Events,
-    ) {
-        self.socket_handle.pollee.register_observer(observer, mask);
-    }
-
-    fn check_io_events(&self) -> Events {
-        self.check_socket_events(false)
-    }
-}
-
 /// The [`ProtocolSpecific`] stores socket-type-specific data
 #[expect(
     dead_code,
@@ -374,10 +225,6 @@ pub(crate) struct TcpSpecific {
     local_port: Option<LocalPort>,
     /// Server socket specific data
     server_socket: Option<TcpServerSpecific>,
-    /// Whether the socket was last known to be able to accept
-    previously_acceptable: AtomicBool,
-    /// Whether a connection was initiated on this socket
-    was_connection_initiated: AtomicBool,
     /// Whether to immediately close the socket when closed (i.e., no graceful FIN handshake)
     immediate_close: AtomicBool,
 }
@@ -524,19 +371,15 @@ pub enum PlatformInteraction {
     Manual,
 }
 
+/// Direction of polling for platform interaction
 #[derive(Clone, Copy)]
-enum PollDirection {
+pub enum PollDirection {
+    /// Ingress (receiving) direction
     Ingress,
+    /// Egress (sending) direction
     Egress,
+    /// Both directions
     Both,
-}
-impl PollDirection {
-    fn ingress(self) -> bool {
-        matches!(self, PollDirection::Ingress | PollDirection::Both)
-    }
-    fn egress(self) -> bool {
-        matches!(self, PollDirection::Egress | PollDirection::Both)
-    }
 }
 
 /// Advice on when to invoke [`Network::perform_platform_interaction`] again.
@@ -551,9 +394,9 @@ pub enum PlatformInteractionReinvocationAdvice {
     /// control back to you to prevent unbounded length waits (crucial to prevent in
     /// non-pre-emptible environments), but otherwise has more work it anticipates it can do.
     CallAgainImmediately,
-    /// You don't need to call again until more packets arrive on the device's receive side or if
-    /// any socket interaction has occurred.
-    WaitOnDeviceOrSocketInteraction,
+    /// You don't need to call again until more packets arrive on the device's receive side or
+    /// the given timeout expires.
+    WaitOnDeviceOrSocketInteraction(Option<core::time::Duration>),
 }
 impl PlatformInteractionReinvocationAdvice {
     /// Convenience function to match against [`Self::CallAgainImmediately`]
@@ -597,96 +440,51 @@ where
             matches!(self.platform_interaction, PlatformInteraction::Manual),
             "Requires manual-mode interactions"
         );
-        self.internal_perform_platform_interaction(PollDirection::Both)
+        self.drain_all_socket_channel_buffers();
+        match self.internal_perform_platform_interaction() {
+            smoltcp::iface::PollResult::SocketStateChanged => {
+                PlatformInteractionReinvocationAdvice::CallAgainImmediately
+            }
+            smoltcp::iface::PollResult::None => {
+                let poll_at = self.poll_at();
+                PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(poll_at)
+            }
+        }
+    }
+
+    /// Return a _soft timeout_ (duration to wait) before calling [`Self::perform_platform_interaction`] again.
+    ///
+    /// Returns `None` if there is no pending timeout (i.e., no scheduled work requiring network operations).
+    pub fn poll_at(&mut self) -> Option<core::time::Duration> {
+        let timestamp = self.now();
+        self.interface
+            .poll_at(timestamp, &self.socket_set)
+            .map(|instant| {
+                if timestamp < instant {
+                    let diff = instant - timestamp;
+                    diff.into()
+                } else {
+                    core::time::Duration::ZERO
+                }
+            })
     }
 
     /// (Internal-only API) Actually perform the queued interactions with the outside world.
-    fn internal_perform_platform_interaction(
-        &mut self,
-        direction: PollDirection,
-    ) -> PlatformInteractionReinvocationAdvice {
-        if self.attempt_to_close_queued() {
-            return PlatformInteractionReinvocationAdvice::CallAgainImmediately;
-        }
-        let timestamp = self.now();
-        let mut socket_state_changed = false;
-        let ingress_advice = if direction.ingress() {
-            match self.interface.poll_ingress_single(
-                timestamp,
-                &mut self.device,
-                &mut self.socket_set,
-            ) {
-                smoltcp::iface::PollIngressSingleResult::None => {
-                    Some(PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction)
-                }
-                smoltcp::iface::PollIngressSingleResult::PacketProcessed => {
-                    Some(PlatformInteractionReinvocationAdvice::CallAgainImmediately)
-                }
-                smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                    socket_state_changed = true;
-                    Some(PlatformInteractionReinvocationAdvice::CallAgainImmediately)
-                }
-            }
-        } else {
-            None
-        };
-        if direction.egress() {
-            match self
-                .interface
-                .poll_egress(timestamp, &mut self.device, &mut self.socket_set)
-            {
-                smoltcp::iface::PollResult::None => {}
-                smoltcp::iface::PollResult::SocketStateChanged => {
-                    socket_state_changed = true;
-                }
-            }
-        }
-        if socket_state_changed {
-            self.check_and_update_events();
-            PlatformInteractionReinvocationAdvice::CallAgainImmediately
-        } else {
-            ingress_advice
-                .unwrap_or(PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction)
-        }
-    }
-
-    /// (Internal-only API) Perform the queued interactions only in automatic mode.
-    fn automated_platform_interaction(&mut self, direction: PollDirection) {
-        match self.platform_interaction {
-            PlatformInteraction::Automatic => {
-                while self
-                    .internal_perform_platform_interaction(direction)
-                    .call_again_immediately()
-                {
-                    // We just loop until all platform interaction is completed, _roughly_ analogous
-                    // to smoltcp's `poll`.
-                }
-            }
-            PlatformInteraction::Manual => {}
-        }
-    }
-
-    /// (Internal-only API) Socket states could have changed, update events
-    #[expect(
-        unused_variables,
-        reason = "this implementation is undergoing change due to change in underlying interfaces for events"
-    )]
-    fn check_and_update_events(&mut self) {
+    pub fn internal_perform_platform_interaction(&mut self) -> smoltcp::iface::PollResult {
+        self.attempt_to_close_queued();
         self.remove_dead_sockets();
         self.close_pending_sockets();
+        self.interface
+            .poll(self.now(), &mut self.device, &mut self.socket_set)
+    }
 
-        for (internal_fd, socket_handle) in
-            self.litebox.descriptor_table().iter::<Network<Platform>>()
-        {
-            let socket_handle = &socket_handle.entry;
-            let events = PollableSocketHandle {
-                socket_handle,
-                socket_set: &self.socket_set,
+    /// (Internal-only API) Perform the queued interactions.
+    fn automated_platform_interaction(&mut self, _direction: PollDirection) {
+        match self.platform_interaction {
+            PlatformInteraction::Automatic => {
+                self.internal_perform_platform_interaction();
             }
-            .check_socket_events(true);
-            if !events.is_empty() {
-                socket_handle.pollee.notify_observers(events);
-            }
+            PlatformInteraction::Manual => {}
         }
     }
 
@@ -735,6 +533,137 @@ where
                     socket_handle.consider_closed = false;
                 }
             }
+        }
+    }
+
+    /// Drain all socket channel buffers
+    fn drain_all_socket_channel_buffers(&mut self) {
+        let table = self.litebox.descriptor_table();
+        for (_, entry) in table.iter::<Network<Platform>>() {
+            Self::drain_socket_channel_buffers(
+                &mut self.socket_set,
+                &entry.entry,
+                &mut self.local_port_allocator,
+            );
+        }
+    }
+
+    /// Drain data between socket channels and smoltcp sockets.
+    ///
+    /// This transfers data from the TX ring buffer (user writes) to the smoltcp socket,
+    /// and from the smoltcp socket to the RX ring buffer (user reads).
+    ///
+    /// Should be called periodically by the network worker to keep data flowing.
+    fn drain_socket_channel_buffers(
+        socket_set: &mut smoltcp::iface::SocketSet<'static>,
+        socket_handle: &SocketHandle<Platform>,
+        port_allocator: &mut LocalPortAllocator,
+    ) {
+        let proxy = match &socket_handle.proxy {
+            Some(proxy) => proxy.as_ref(),
+            None => return,
+        };
+        match (socket_handle.protocol(), proxy) {
+            (Protocol::Tcp, NetworkProxy::Stream(proxy)) => {
+                let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                let mut buf = [0u8; 4096];
+
+                // Drain TX buffer: pop from channel, push to smoltcp
+                let send_capacity = tcp_socket.send_capacity();
+                while tcp_socket.can_send() {
+                    let to_send = 4096.min(send_capacity - tcp_socket.send_queue());
+                    let n = proxy.pop_tx_data(&mut buf[..to_send]);
+                    if n == 0 {
+                        break;
+                    }
+                    match tcp_socket.send_slice(&buf[..n]) {
+                        Ok(sent) => {
+                            assert_eq!(sent, n, "we already checked send vacancy {to_send}");
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                // Drain RX buffer: pop from smoltcp, push to channel
+                while tcp_socket.can_recv() {
+                    let rx_space = proxy.rx_space();
+                    match tcp_socket.recv_slice(&mut buf[..4096.min(rx_space)]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let pushed = proxy.push_rx_data(&buf[..n]);
+                            assert_eq!(pushed, n, "we already checked rx_space {rx_space}");
+                        }
+                    }
+                }
+
+                if let tcp::State::Established = tcp_socket.state() {
+                    proxy.set_state(socket_channel::SocketState::Connected);
+                }
+                let tcp_specific = socket_handle.specific.tcp();
+                // Update socket state in the channel
+                // server socket that is listening also has closed state
+                if !tcp_socket.is_open() && tcp_specific.server_socket.is_none() {
+                    proxy.set_state(socket_channel::SocketState::Closed);
+                }
+
+                if let Some(server_socket) = tcp_specific.server_socket.as_ref()
+                    && !proxy.is_readable()
+                {
+                    server_socket
+                        .socket_set_handles
+                        .iter()
+                        .any(|&h| {
+                            let socket: &tcp::Socket = socket_set.get(h);
+                            socket.state() == tcp::State::Established
+                        })
+                        .then(|| {
+                            proxy.set_readable(true);
+                            proxy.notify_io_event(Events::IN);
+                        });
+                }
+            }
+            (Protocol::Udp, NetworkProxy::Datagram(udp_proxy)) => {
+                // Drain TX queue: pop datagrams from channel, send via smoltcp
+                while udp_proxy.has_pending_tx() {
+                    if let Some(datagram) = udp_proxy.pop_datagram() {
+                        let DatagramMessage { data, addr } = datagram;
+                        if Network::do_send(socket_set, socket_handle, port_allocator, &data, addr)
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                // Drain RX: receive from smoltcp, push to channel
+                let udp_socket = socket_set.get_mut::<udp::Socket>(socket_handle.handle);
+                while !udp_proxy.is_rx_full() {
+                    match udp_socket.recv() {
+                        Ok((data, meta)) => {
+                            let source_addr = match meta.endpoint.addr {
+                                smoltcp::wire::IpAddress::Ipv4(ipv4) => SocketAddr::V4(
+                                    core::net::SocketAddrV4::new(ipv4, meta.endpoint.port),
+                                ),
+                            };
+                            if udp_proxy
+                                .push_datagram(DatagramMessage {
+                                    data: data.to_vec(),
+                                    addr: Some(source_addr),
+                                })
+                                .is_err()
+                            {
+                                // Channel buffer full
+                                unreachable!("we already checked is_rx_full");
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            (Protocol::Icmp | Protocol::Raw { .. }, _) => {
+                unimplemented!()
+            }
+            _ => panic!("Mismatched protocol and proxy type"),
         }
     }
 }
@@ -819,8 +748,6 @@ where
                 Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific {
                     local_port: None,
                     server_socket: None,
-                    previously_acceptable: AtomicBool::new(false),
-                    was_connection_initiated: AtomicBool::new(false),
                     immediate_close: AtomicBool::new(false),
                 }),
                 Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
@@ -829,15 +756,28 @@ where
                 Protocol::Icmp => unimplemented!(),
                 Protocol::Raw { protocol: _ } => unimplemented!(),
             },
-            pollee: crate::event::polling::Pollee::new(),
-            previously_sendable: AtomicBool::new(false),
-            recv_queue: AtomicUsize::new(0),
+            proxy: None,
         }))
     }
 
     /// Creates a new [`SocketFd`] for a newly-created [`SocketHandle`].
     fn new_socket_fd_for(&mut self, socket_handle: SocketHandle<Platform>) -> SocketFd<Platform> {
         self.litebox.descriptor_table_mut().insert(socket_handle)
+    }
+
+    /// Set the network proxy for the socket at `fd`
+    pub fn set_socket_proxy(
+        &mut self,
+        fd: &SocketFd<Platform>,
+        proxy: alloc::sync::Arc<NetworkProxy<Platform>>,
+    ) -> Result<(), alloc::sync::Arc<NetworkProxy<Platform>>> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let Some(mut table_entry) = descriptor_table.get_entry_mut(fd) else {
+            return Err(proxy);
+        };
+        let socket_handle = &mut table_entry.entry;
+        socket_handle.proxy = Some(proxy);
+        Ok(())
     }
 
     /// Close the socket at `fd`
@@ -864,8 +804,13 @@ where
                     CloseBehavior::Graceful => return true,
                     CloseBehavior::GracefulIfNoPendingData => {}
                 }
-                let socket_handle = &entry.entry;
                 // check if there is pending data to be sent
+                let socket_handle = &entry.entry;
+                if let Some(proxy) = &socket_handle.proxy
+                    && proxy.has_pending_tx()
+                {
+                    return false;
+                }
                 !socket_handle.with_socket(
                     &self.socket_set,
                     |tcp_socket| tcp_socket.may_send() && tcp_socket.send_queue() > 0,
@@ -898,7 +843,7 @@ where
 
     /// Attempt to close as many queued-to-close FDs as possible. Returns `true` iff any of them
     /// were closed.
-    fn attempt_to_close_queued(&mut self) -> bool {
+    pub fn attempt_to_close_queued(&mut self) -> bool {
         if self.queued_for_closure.is_empty() {
             // fast path
             return false;
@@ -921,15 +866,12 @@ where
             consider_closed: _,
             handle,
             mut specific,
-            pollee,
-            previously_sendable: _,
-            recv_queue: _,
+            proxy,
         } = socket_handle;
-        let notify = match specific.protocol() {
+        match specific.protocol() {
             Protocol::Raw { .. } | Protocol::Icmp => {
                 // There is no close/abort for raw and icmp sockets
                 let _ = self.socket_set.remove(handle);
-                true
             }
             Protocol::Udp => {
                 let smoltcp::socket::Socket::Udp(mut socket) = self.socket_set.remove(handle)
@@ -937,7 +879,6 @@ where
                     unreachable!()
                 };
                 socket.close();
-                true
             }
             Protocol::Tcp => {
                 let tcp_specific = specific.tcp_mut();
@@ -957,13 +898,10 @@ where
                     tcp_socket.close();
                 }
                 self.closing_in_background.push(handle);
-                tcp_specific
-                    .was_connection_initiated
-                    .swap(false, Ordering::Relaxed)
             }
-        };
-        if notify {
-            pollee.notify_observers(Events::HUP);
+        }
+        if let Some(proxy) = proxy {
+            proxy.set_state(socket_channel::SocketState::Closed);
         }
         self.automated_platform_interaction(PollDirection::Both);
     }
@@ -987,6 +925,9 @@ where
             .get_entry_mut(fd)
             .ok_or(ConnectError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if let Some(proxy) = &socket_handle.proxy {
+            proxy.set_state(socket_channel::SocketState::Connecting);
+        }
         let ret = match socket_handle.protocol() {
             Protocol::Tcp => {
                 let check_state = |state: tcp::State| -> Result<(), ConnectError> {
@@ -1019,9 +960,6 @@ where
                         }
                     }
                     let tcp_specific = socket_handle.tcp_mut();
-                    tcp_specific
-                        .was_connection_initiated
-                        .store(true, Ordering::Relaxed);
                     let old_port = tcp_specific.local_port.replace(local_port);
                     if old_port.is_some() {
                         // Need to think about how to handle this situation
@@ -1050,6 +988,9 @@ where
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };
 
+        if let Some(proxy) = &socket_handle.proxy {
+            proxy.set_state(socket_channel::SocketState::Connected);
+        }
         drop(table_entry);
         drop(descriptor_table);
 
@@ -1275,6 +1216,10 @@ where
             ProtocolSpecific::Raw(_) => unimplemented!(),
         }
 
+        if let Some(proxy) = &socket_handle.proxy {
+            proxy.set_state(socket_channel::SocketState::Listening);
+        }
+
         drop(table_entry);
         drop(descriptor_table);
 
@@ -1316,11 +1261,19 @@ where
                     let socket: &tcp::Socket = self.socket_set.get(h);
                     socket.state() == tcp::State::Established
                 }) else {
+                    if let Some(proxy) = &socket_handle.proxy {
+                        // No connections are ready; make sure the readable flag is cleared
+                        proxy.set_readable(false);
+                    }
                     return Err(AcceptError::NoConnectionsReady);
                 };
                 // reset the accept state so that [`PollableSocketHandle::check_socket_events`] can send
                 // one [`Events::In`] per accepted connection.
-                handle.previously_acceptable.store(false, Ordering::Relaxed);
+                // handle.previously_acceptable.store(false, Ordering::Relaxed);
+                if let Some(proxy) = &socket_handle.proxy {
+                    // No connections are ready; make sure the readable flag is cleared
+                    proxy.set_readable(false);
+                }
                 // Pull that position out of the listening handles
                 let ready_handle = server_socket.socket_set_handles.swap_remove(position);
                 // Refill to the backlog, so that we can have more listening sockets again if needed
@@ -1333,8 +1286,6 @@ where
                 // Release the locks, needed to be able to use `self` below
                 drop(table_entry);
                 drop(descriptor_table);
-                // Trigger some automated platform interaction, to keep things flowing
-                self.automated_platform_interaction(PollDirection::Both);
                 // Create a new FD to hand it back out to the user
                 let handle = SocketHandle {
                     consider_closed: false,
@@ -1342,13 +1293,9 @@ where
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port,
                         server_socket: None,
-                        previously_acceptable: AtomicBool::new(false),
-                        was_connection_initiated: AtomicBool::new(true),
                         immediate_close: AtomicBool::new(false),
                     }),
-                    pollee: crate::event::polling::Pollee::new(),
-                    previously_sendable: AtomicBool::new(true),
-                    recv_queue: AtomicUsize::new(0),
+                    proxy: None,
                 };
                 if let Some(peer) = peer {
                     let Ok(remote_addr) = self.get_remote_addr_for_handle(&handle) else {
@@ -1364,6 +1311,58 @@ where
         }
     }
 
+    fn do_send(
+        socket_set: &mut smoltcp::iface::SocketSet,
+        socket_handle: &SocketHandle<Platform>,
+        port_allocator: &mut local_ports::LocalPortAllocator,
+        buf: &[u8],
+        destination: Option<SocketAddr>,
+    ) -> Result<usize, SendError> {
+        match socket_handle.protocol() {
+            Protocol::Tcp => {
+                if destination.is_some() {
+                    // TCP is connection-oriented, so no destination address should be provided
+                    return Err(SendError::UnnecessaryDestinationAddress);
+                }
+                socket_set
+                    .get_mut::<tcp::Socket>(socket_handle.handle)
+                    .send_slice(buf)
+                    .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState)
+            }
+            Protocol::Udp => {
+                let destination = destination
+                    .map(|s| match s {
+                        SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::from(addr),
+                        SocketAddr::V6(_) => unimplemented!(),
+                    })
+                    .or_else(|| socket_handle.udp().remote_endpoint);
+                let Some(remote_endpoint) = destination else {
+                    return Err(SendError::Unaddressable);
+                };
+                let udp_socket: &mut udp::Socket = socket_set.get_mut(socket_handle.handle);
+                if !udp_socket.is_open() {
+                    let Ok(()) = udp_socket.bind(smoltcp::wire::IpListenEndpoint {
+                        addr: None,
+                        port: port_allocator
+                            .ephemeral_port()
+                            .map_err(SendError::PortAllocationFailure)?
+                            .port(),
+                    }) else {
+                        unreachable!("binding to a free port cannot fail")
+                    };
+                }
+                udp_socket
+                    .send_slice(buf, remote_endpoint)
+                    .map(|()| buf.len())
+                    .map_err(|e| match e {
+                        udp::SendError::BufferFull => SendError::BufferFull,
+                        udp::SendError::Unaddressable => SendError::Unaddressable,
+                    })
+            }
+            Protocol::Icmp => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
+        }
+    }
     /// Send data over a socket, optionally specifying the destination address.
     ///
     /// If the socket is connection-mode and the destination address is provided,
@@ -1384,57 +1383,13 @@ where
             unimplemented!()
         }
 
-        let ret = match socket_handle.protocol() {
-            Protocol::Tcp => {
-                if destination.is_some() {
-                    // TCP is connection-oriented, so no destination address should be provided
-                    return Err(SendError::UnnecessaryDestinationAddress);
-                }
-                self.socket_set
-                    .get_mut::<tcp::Socket>(socket_handle.handle)
-                    .send_slice(buf)
-                    .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState)
-            }
-            Protocol::Udp => {
-                let destination = destination
-                    .map(|s| match s {
-                        SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::from(addr),
-                        SocketAddr::V6(_) => unimplemented!(),
-                    })
-                    .or_else(|| socket_handle.udp().remote_endpoint);
-                let Some(remote_endpoint) = destination else {
-                    return Err(SendError::Unaddressable);
-                };
-                let udp_socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
-                if !udp_socket.is_open() {
-                    let Ok(()) = udp_socket.bind(smoltcp::wire::IpListenEndpoint {
-                        addr: None,
-                        port: self
-                            .local_port_allocator
-                            .ephemeral_port()
-                            .map_err(SendError::PortAllocationFailure)?
-                            .port(),
-                    }) else {
-                        unreachable!("binding to a free port cannot fail")
-                    };
-                }
-                udp_socket
-                    .send_slice(buf, remote_endpoint)
-                    .map(|()| buf.len())
-                    .map_err(|e| match e {
-                        udp::SendError::BufferFull => SendError::BufferFull,
-                        udp::SendError::Unaddressable => SendError::Unaddressable,
-                    })
-            }
-            Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol: _ } => unimplemented!(),
-        };
-        if let Ok(0) = ret {
-            // If we sent 0 bytes, then we are not writable anymore
-            socket_handle
-                .previously_sendable
-                .store(false, Ordering::Relaxed);
-        }
+        let ret = Self::do_send(
+            &mut self.socket_set,
+            socket_handle,
+            &mut self.local_port_allocator,
+            buf,
+            destination,
+        );
 
         drop(table_entry);
         drop(descriptor_table);
@@ -1472,7 +1427,7 @@ where
             unimplemented!("flags: {:?}", flags);
         }
 
-        let (ret, recv_queue_left) = match socket_handle.protocol() {
+        let ret = match socket_handle.protocol() {
             Protocol::Tcp => {
                 if let Some(source_addr) = source_addr {
                     // TCP is connection-oriented, so no need to provide a source address
@@ -1482,7 +1437,7 @@ where
                 if flags.contains(ReceiveFlags::TRUNC) {
                     unimplemented!("TRUNC flag for tcp");
                 }
-                let ret = if flags.contains(ReceiveFlags::DISCARD) {
+                if flags.contains(ReceiveFlags::DISCARD) {
                     let discard_slice =
                         |tcp_socket: &mut tcp::Socket<'_>| -> Result<usize, tcp::RecvError> {
                             // See [`tcp::Socket::recv_slice`] and [`tcp::Socket::recv`] for why we do two `recv` calls.
@@ -1499,8 +1454,7 @@ where
                 .map_err(|e| match e {
                     tcp::RecvError::InvalidState => ReceiveError::SocketInInvalidState,
                     tcp::RecvError::Finished => ReceiveError::OperationFinished,
-                });
-                (ret, tcp_socket.recv_queue())
+                })
             }
             Protocol::Udp => {
                 let udp_socket = self.socket_set.get_mut::<udp::Socket>(socket_handle.handle);
@@ -1527,19 +1481,15 @@ where
                                 length
                             }
                         };
-                        (Ok(n), udp_socket.recv_queue())
+                        Ok(n)
                     }
-                    Err(udp::RecvError::Exhausted) => (Ok(0), 0),
+                    Err(udp::RecvError::Exhausted) => Ok(0),
                     Err(udp::RecvError::Truncated) => unreachable!(),
                 }
             }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };
-        // Update the recv_queue size for event tracking
-        socket_handle
-            .recv_queue
-            .store(recv_queue_left, Ordering::Relaxed);
 
         drop(table_entry);
         drop(descriptor_table);
@@ -1615,23 +1565,6 @@ where
                 Err(errors::GetTcpOptionError::NotTcpSocket)
             }
         }
-    }
-
-    /// Perform `f` with the [`IOPollable`] for the socket at `fd`.
-    ////
-    /// Returns `None` if the `fd` is closed.
-    pub fn with_iopollable<R>(
-        &self,
-        fd: &SocketFd<Platform>,
-        f: impl FnOnce(&dyn IOPollable) -> R,
-    ) -> Option<R> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let table_entry = descriptor_table.get_entry(fd)?;
-        let socket_handle = &table_entry.entry;
-        Some(f(&PollableSocketHandle {
-            socket_handle,
-            socket_set: &self.socket_set,
-        }))
     }
 }
 

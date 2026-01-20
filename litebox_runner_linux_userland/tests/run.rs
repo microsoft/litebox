@@ -492,6 +492,7 @@ fn test_tun_with_tcp_socket() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tun_and_runner_with_iperf3() {
+    const NUM_CLIENTS: usize = 1;
     let iperf3_path = run_which("iperf3");
     let cloned_path = iperf3_path.clone();
     let has_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -504,7 +505,7 @@ fn test_tun_and_runner_with_iperf3() {
         std::thread::sleep(std::time::Duration::from_secs(5)); // wait a bit more to ensure server is ready
         std::println!("Starting iperf3 client...");
         let mut client = std::process::Command::new(&cloned_path)
-            .args(["-c", "10.0.0.2"])
+            .args(["-c", "10.0.0.2", "-P", NUM_CLIENTS.to_string().as_str()])
             .spawn()
             .expect("Failed to start iperf3 server");
         client.wait().expect("Failed to wait on iperf3 client");

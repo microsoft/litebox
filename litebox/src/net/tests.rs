@@ -39,9 +39,13 @@ fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<Moc
     comms(&mut network);
 
     // Accept the connection on the listening socket
-    let server_fd = network
-        .accept(&listener_fd, None)
-        .expect("Failed to accept connection");
+    let server_fd = loop {
+        match network.accept(&listener_fd, None) {
+            Ok(fd) => break fd,
+            Err(AcceptError::NoConnectionsReady) => {}
+            Err(other) => panic!("Unexpected accept error: {other:?}"),
+        }
+    };
 
     // Send data from client to server
     let client_to_server_data = b"Hello from client!";

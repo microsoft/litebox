@@ -573,28 +573,32 @@ impl Task {
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         let res = match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => files
-                .run_on_raw_fd(
-                    *raw_fd,
-                    |fd| {
-                        write_to_iovec(iovs, |buf: &[u8]| {
-                            self.global.fs.write(fd, buf, None).map_err(Errno::from)
-                        })
-                    },
-                    |fd| {
-                        write_to_iovec(iovs, |buf: &[u8]| {
-                            self.global.sendto(
-                                &self.wait_cx(),
-                                fd,
-                                buf,
-                                litebox_common_linux::SendFlags::empty(),
-                                None,
-                            )
-                        })
-                    },
-                    |_fd| todo!("pipes"),
-                )
-                .flatten(),
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                let raw_fd = *raw_fd;
+                drop(locked_file_descriptors);
+                files
+                    .run_on_raw_fd(
+                        raw_fd,
+                        |fd| {
+                            write_to_iovec(iovs, |buf: &[u8]| {
+                                self.global.fs.write(fd, buf, None).map_err(Errno::from)
+                            })
+                        },
+                        |fd| {
+                            write_to_iovec(iovs, |buf| {
+                                self.global.sendto(
+                                    &self.wait_cx(),
+                                    fd,
+                                    buf,
+                                    litebox_common_linux::SendFlags::empty(),
+                                    None,
+                                )
+                            })
+                        },
+                        |_fd| todo!("pipes"),
+                    )
+                    .flatten()
+            }
             Descriptor::Epoll { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { .. } => todo!(),
             Descriptor::Unix { .. } => todo!(),
@@ -701,7 +705,24 @@ impl Descriptor {
                             .map(FileStat::from)
                             .map_err(Errno::from)
                     },
-                    |_fd| todo!("net"),
+                    |_fd| {
+                        Ok(FileStat {
+                            // TODO: give correct values
+                            st_dev: 0,
+                            st_ino: 0,
+                            st_nlink: 1,
+                            st_mode: (litebox_common_linux::InodeType::Socket as u32
+                                | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+                            .truncate(),
+                            st_uid: 0,
+                            st_gid: 0,
+                            st_rdev: 0,
+                            st_size: 0,
+                            st_blksize: 4096,
+                            st_blocks: 0,
+                            ..Default::default()
+                        })
+                    },
                     |fd| {
                         let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
                         let read_write_mode = match half_pipe_type {
