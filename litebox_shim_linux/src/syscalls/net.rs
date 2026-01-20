@@ -173,7 +173,7 @@ impl GlobalState {
 
         let proxy = match sock_type {
             SockType::Stream => {
-                let proxy = litebox::net::socket_channel::new_socket_channel();
+                let proxy = litebox::net::socket_channel::new_stream_channel();
                 NetworkProxy::Stream(proxy)
             }
             SockType::Datagram => {
@@ -188,7 +188,7 @@ impl GlobalState {
         assert!(old.is_none());
         drop(dt);
 
-        if let Err(_) = self.net.lock().set_socket_proxy(fd, proxy.clone()) {
+        if self.net.lock().set_socket_proxy(fd, proxy.clone()).is_err() {
             unreachable!("failed to set socket proxy for initialized socket");
         }
         proxy

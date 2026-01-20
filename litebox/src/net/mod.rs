@@ -403,33 +403,6 @@ impl PlatformInteractionReinvocationAdvice {
     }
 }
 
-pub enum PollIngressSingleResult {
-    /// No packet was processed. You don't need to call [`Interface::poll_ingress_single`]
-    /// again, until more packets arrive.
-    ///
-    /// Socket state is guaranteed to not have changed.
-    None,
-    /// A packet was processed.
-    ///
-    /// There may be more packets in the device's RX queue, so you should call [`Interface::poll_ingress_single`] again.
-    ///
-    /// Socket state is guaranteed to not have changed.
-    PacketProcessed,
-    /// A packet was processed, which might have caused socket state to change.
-    ///
-    /// There may be more packets in the device's RX queue, so you should call [`Interface::poll_ingress_single`] again.
-    ///
-    /// You should check the state of sockets again for received data or completion of operations.
-    SocketStateChanged,
-}
-
-pub enum PollResult {
-    /// Socket state is guaranteed to not have changed.
-    None,
-    /// You should check the state of sockets again for received data or completion of operations.
-    SocketStateChanged,
-}
-
 impl<Platform> Network<Platform>
 where
     Platform:
@@ -602,7 +575,7 @@ where
                     }
                     match tcp_socket.send_slice(&buf[..n]) {
                         Ok(sent) => {
-                            assert_eq!(sent, n, "we already checked send vacancy {}", to_send);
+                            assert_eq!(sent, n, "we already checked send vacancy {to_send}");
                         }
                         Err(_) => break,
                     }
@@ -615,7 +588,7 @@ where
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let pushed = proxy.push_rx_data(&buf[..n]);
-                            assert_eq!(pushed, n, "we already checked rx_space {}", rx_space);
+                            assert_eq!(pushed, n, "we already checked rx_space {rx_space}");
                         }
                     }
                 }
