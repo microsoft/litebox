@@ -678,13 +678,13 @@ pub enum UnixProtocol {
 }
 
 #[repr(u32)]
-#[derive(Debug, IntEnum)]
+#[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
 }
 
 #[repr(u32)]
-#[derive(Debug, IntEnum)]
+#[derive(Debug, IntEnum, Clone, Copy)]
 pub enum SocketOption {
     REUSEADDR = 2,
     TYPE = 3,
@@ -703,7 +703,7 @@ pub enum SocketOption {
 }
 
 #[repr(u32)]
-#[derive(Debug, IntEnum)]
+#[derive(Debug, IntEnum, Clone, Copy)]
 pub enum TcpOption {
     NODELAY = 1,
     CORK = 3,
@@ -717,7 +717,7 @@ pub enum TcpOption {
     CONGESTION = 13,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum SocketOptionName {
     IP(IpOption),
     Socket(SocketOption),
@@ -744,6 +744,14 @@ impl SocketOptionName {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct Ucred {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 // Following libc's definition of time_t and suseconds_t.

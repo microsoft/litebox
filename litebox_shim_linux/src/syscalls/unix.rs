@@ -3,7 +3,10 @@
 
 //! Unix domain socket implementation for the Linux shim layer.
 
-use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use core::{
+    sync::atomic::{AtomicU16, AtomicU32, Ordering},
+    time::Duration,
+};
 
 use alloc::{
     collections::{btree_map::BTreeMap, vec_deque::VecDeque},
@@ -19,12 +22,17 @@ use litebox::{
     },
     fs::{FileSystem, Mode, OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
+    utils::TruncateExt as _,
 };
-use litebox_common_linux::{ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno};
+use litebox_common_linux::{
+    IpOption, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption, SocketOptionName,
+    errno::Errno,
+};
 
 use crate::{
-    FileFd, GlobalState, Task,
+    ConstPtr, FileFd, GlobalState, MutPtr, Task,
     channel::{Channel, ReadEnd, WriteEnd},
+    syscalls::net::{SocketOptionValue, SocketOptions},
 };
 
 /// C-compatible structure for Unix socket addresses.
@@ -684,75 +692,79 @@ impl UnixStream {
     fn sendto(
         &self,
         cx: &WaitContext<'_, crate::Platform>,
+        timeout: Option<Duration>,
         buf: &[u8],
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
         let mut msg = Some(Message { data: buf.to_vec() });
-        cx.wait_on_events(
-            is_nonblocking,
-            Events::OUT,
-            |observer, mask| {
-                self.with_state_ref(|state| {
-                    let conn = state.connected().ok_or(Errno::ENOTCONN)?;
-                    conn.pollee.register_observer(observer, mask);
-                    Ok(())
-                })
-            },
-            || {
-                self.with_state_ref(|state| {
-                    let conn = state
-                        .connected()
-                        .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
-                    if addr.is_some() {
-                        return Err(TryOpError::Other(Errno::EISCONN));
-                    }
-                    match conn.try_sendto(msg.take().unwrap()) {
-                        Ok(()) => Ok(buf.len()),
-                        Err((m, Errno::EAGAIN)) => {
-                            let _ = msg.replace(m);
-                            Err(TryOpError::TryAgain)
+        cx.with_timeout(timeout)
+            .wait_on_events(
+                is_nonblocking,
+                Events::OUT,
+                |observer, mask| {
+                    self.with_state_ref(|state| {
+                        let conn = state.connected().ok_or(Errno::ENOTCONN)?;
+                        conn.pollee.register_observer(observer, mask);
+                        Ok(())
+                    })
+                },
+                || {
+                    self.with_state_ref(|state| {
+                        let conn = state
+                            .connected()
+                            .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
+                        if addr.is_some() {
+                            return Err(TryOpError::Other(Errno::EISCONN));
                         }
-                        Err((_, err)) => Err(TryOpError::Other(err)),
-                    }
-                })
-            },
-        )
-        .map_err(Errno::from)
+                        match conn.try_sendto(msg.take().unwrap()) {
+                            Ok(()) => Ok(buf.len()),
+                            Err((m, Errno::EAGAIN)) => {
+                                let _ = msg.replace(m);
+                                Err(TryOpError::TryAgain)
+                            }
+                            Err((_, err)) => Err(TryOpError::Other(err)),
+                        }
+                    })
+                },
+            )
+            .map_err(Errno::from)
     }
 
     fn recvfrom(
         &self,
         cx: &WaitContext<'_, crate::Platform>,
+        timeout: Option<Duration>,
         buf: &mut [u8],
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        cx.wait_on_events(
-            is_nonblocking,
-            Events::IN,
-            |observer, mask| {
-                self.with_state_ref(|state| {
-                    let conn = state.connected().ok_or(Errno::ENOTCONN)?;
-                    conn.pollee.register_observer(observer, mask);
-                    Ok(())
-                })
-            },
-            || {
-                self.with_state_ref(|state| {
-                    let conn = state
-                        .connected()
-                        .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
-                    let n = conn.try_recvfrom(buf)?;
-                    // For connected stream sockets, no need to return the source address
-                    if let Some(source_addr) = source_addr.as_deref_mut() {
-                        *source_addr = None;
-                    }
-                    Ok(n)
-                })
-            },
-        )
-        .map_err(Errno::from)
+        cx.with_timeout(timeout)
+            .wait_on_events(
+                is_nonblocking,
+                Events::IN,
+                |observer, mask| {
+                    self.with_state_ref(|state| {
+                        let conn = state.connected().ok_or(Errno::ENOTCONN)?;
+                        conn.pollee.register_observer(observer, mask);
+                        Ok(())
+                    })
+                },
+                || {
+                    self.with_state_ref(|state| {
+                        let conn = state
+                            .connected()
+                            .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
+                        let n = conn.try_recvfrom(buf)?;
+                        // For connected stream sockets, no need to return the source address
+                        if let Some(source_addr) = source_addr.as_deref_mut() {
+                            *source_addr = None;
+                        }
+                        Ok(n)
+                    })
+                },
+            )
+            .map_err(Errno::from)
     }
 
     fn get_local_addr(&self) -> UnixSocketAddr {
@@ -804,27 +816,29 @@ impl WriteEnd<DatagramMessage> {
     fn write(
         &self,
         cx: &WaitContext<'_, crate::Platform>,
+        timeout: Option<Duration>,
         msg: DatagramMessage,
         is_nonblocking: bool,
     ) -> Result<(), Errno> {
         let mut msg = Some(msg);
-        cx.wait_on_events(
-            is_nonblocking,
-            Events::OUT,
-            |observer, mask| {
-                self.register_observer(observer, mask);
-                Ok(())
-            },
-            || match self.try_write(msg.take().unwrap()) {
-                Ok(()) => Ok(()),
-                Err((m, Errno::EAGAIN)) => {
-                    let _ = msg.replace(m);
-                    Err(TryOpError::TryAgain)
-                }
-                Err((_, err)) => Err(TryOpError::Other(err)),
-            },
-        )
-        .map_err(Errno::from)
+        cx.with_timeout(timeout)
+            .wait_on_events(
+                is_nonblocking,
+                Events::OUT,
+                |observer, mask| {
+                    self.register_observer(observer, mask);
+                    Ok(())
+                },
+                || match self.try_write(msg.take().unwrap()) {
+                    Ok(()) => Ok(()),
+                    Err((m, Errno::EAGAIN)) => {
+                        let _ = msg.replace(m);
+                        Err(TryOpError::TryAgain)
+                    }
+                    Err((_, err)) => Err(TryOpError::Other(err)),
+                },
+            )
+            .map_err(Errno::from)
     }
 }
 impl ReadEnd<DatagramMessage> {
@@ -1017,26 +1031,28 @@ impl UnixDatagram {
     fn recvfrom(
         &self,
         cx: &WaitContext<'_, crate::Platform>,
+        timeout: Option<Duration>,
         buf: &mut [u8],
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        cx.wait_on_events(
-            is_nonblocking,
-            Events::IN,
-            |observer, mask| {
-                self.inner.read().pollee.register_observer(observer, mask);
-                Ok(())
-            },
-            || {
-                let guard = self.inner.read();
-                let Some(recv_channel) = &guard.recv_channel else {
-                    return Err(TryOpError::Other(Errno::ENOTCONN));
-                };
-                recv_channel.try_read(buf, source_addr.as_deref_mut())
-            },
-        )
-        .map_err(Errno::from)
+        cx.with_timeout(timeout)
+            .wait_on_events(
+                is_nonblocking,
+                Events::IN,
+                |observer, mask| {
+                    self.inner.read().pollee.register_observer(observer, mask);
+                    Ok(())
+                },
+                || {
+                    let guard = self.inner.read();
+                    let Some(recv_channel) = &guard.recv_channel else {
+                        return Err(TryOpError::Other(Errno::ENOTCONN));
+                    };
+                    recv_channel.try_read(buf, source_addr.as_deref_mut())
+                },
+            )
+            .map_err(Errno::from)
     }
 
     // Sends data to the specified or connected peer.
@@ -1046,6 +1062,7 @@ impl UnixDatagram {
     fn sendto(
         &self,
         task: &Task,
+        timeout: Option<Duration>,
         buf: &[u8],
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
@@ -1060,6 +1077,7 @@ impl UnixDatagram {
         };
         send_channel.write(
             &task.wait_cx(),
+            timeout,
             DatagramMessage {
                 data: buf.to_vec(),
                 source,
@@ -1105,7 +1123,7 @@ enum UnixSocketInner {
 pub(crate) struct UnixSocket {
     inner: UnixSocketInner,
     status: AtomicU32,
-    // options: Mutex<crate::Platform, SocketOptions>,
+    options: Mutex<crate::Platform, SocketOptions>,
 }
 
 impl UnixSocket {
@@ -1115,7 +1133,7 @@ impl UnixSocket {
         Self {
             inner,
             status: AtomicU32::new(status.bits()),
-            // options: litebox::sync::Mutex::new(SocketOptions::default()),
+            options: litebox::sync::Mutex::new(SocketOptions::default()),
         }
     }
 
@@ -1190,12 +1208,14 @@ impl UnixSocket {
         }
         let is_nonblocking =
             flags.contains(SendFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
-
+        let timeout = self.options.lock().send_timeout;
         let ret = match &self.inner {
             UnixSocketInner::Stream(stream) => {
-                stream.sendto(&task.wait_cx(), buf, is_nonblocking, addr)
+                stream.sendto(&task.wait_cx(), timeout, buf, is_nonblocking, addr)
             }
-            UnixSocketInner::Datagram(datagram) => datagram.sendto(task, buf, is_nonblocking, addr),
+            UnixSocketInner::Datagram(datagram) => {
+                datagram.sendto(task, timeout, buf, is_nonblocking, addr)
+            }
         };
         if let Err(Errno::EPIPE) = ret
             && !flags.contains(SendFlags::NOSIGNAL)
@@ -1220,13 +1240,13 @@ impl UnixSocket {
         }
         let is_nonblocking =
             flags.contains(ReceiveFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
-
+        let timeout = self.options.lock().recv_timeout;
         let ret = match &self.inner {
             UnixSocketInner::Stream(stream) => {
-                stream.recvfrom(cx, buf, is_nonblocking, source_addr)
+                stream.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
             }
             UnixSocketInner::Datagram(datagram) => {
-                datagram.recvfrom(cx, buf, is_nonblocking, source_addr)
+                datagram.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
             }
         };
         match ret {
@@ -1269,6 +1289,134 @@ impl UnixSocket {
             }
             _ => None,
         }
+    }
+
+    pub(super) fn setsockopt(
+        &self,
+        global: &GlobalState,
+        optname: SocketOptionName,
+        optval: ConstPtr<u8>,
+        optlen: usize,
+    ) -> Result<(), Errno> {
+        match global.setsockopt_common(optname, optval, optlen, |so, value| {
+            match (so, value) {
+                (SocketOption::RCVTIMEO, SocketOptionValue::Timeout(timeout)) => {
+                    self.options.lock().recv_timeout = timeout;
+                }
+                (SocketOption::SNDTIMEO, SocketOptionValue::Timeout(timeout)) => {
+                    self.options.lock().send_timeout = timeout;
+                }
+                (SocketOption::LINGER, SocketOptionValue::Timeout(timeout)) => {
+                    self.options.lock().linger_timeout = timeout;
+                }
+                (SocketOption::REUSEADDR, SocketOptionValue::U32(val)) => {
+                    self.options.lock().reuse_address = val != 0;
+                }
+                (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
+                    self.options.lock().keep_alive = val != 0;
+                }
+                (SocketOption::BROADCAST, SocketOptionValue::U32(val)) => {
+                    self.options.lock().broadcast = val != 0;
+                }
+                _ => unreachable!(),
+            }
+            Ok(())
+        }) {
+            Err(Errno::ENOPROTOOPT) => {} // continue to handle unix
+            other => return other,
+        }
+
+        match optname {
+            SocketOptionName::IP(ip) => match ip {
+                IpOption::TOS => Err(Errno::EOPNOTSUPP),
+            },
+            SocketOptionName::Socket(so) => match so {
+                // handled by `setsockopt_common`
+                SocketOption::RCVTIMEO
+                | SocketOption::SNDTIMEO
+                | SocketOption::LINGER
+                | SocketOption::REUSEADDR
+                | SocketOption::KEEPALIVE
+                | SocketOption::BROADCAST => {
+                    unreachable!()
+                }
+                // Don't allow changing socket type and credentials
+                SocketOption::TYPE | SocketOption::PEERCRED => Err(Errno::ENOPROTOOPT),
+                // We use fixed buffer size for now
+                SocketOption::RCVBUF | SocketOption::SNDBUF => Err(Errno::EOPNOTSUPP),
+            },
+            SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
+        }
+    }
+    pub(super) fn getsockopt(
+        &self,
+        global: &GlobalState,
+        optname: SocketOptionName,
+        optval: MutPtr<u8>,
+        len: u32,
+    ) -> Result<usize, Errno> {
+        match global.getsockopt_common(optname, optval, len, |sopt| match sopt {
+            SocketOption::RCVTIMEO => SocketOptionValue::Timeout(self.options.lock().recv_timeout),
+            SocketOption::SNDTIMEO => SocketOptionValue::Timeout(self.options.lock().send_timeout),
+            SocketOption::LINGER => SocketOptionValue::Timeout(self.options.lock().linger_timeout),
+            SocketOption::REUSEADDR => {
+                SocketOptionValue::U32(u32::from(self.options.lock().reuse_address))
+            }
+            SocketOption::KEEPALIVE => {
+                SocketOptionValue::U32(u32::from(self.options.lock().keep_alive))
+            }
+            SocketOption::BROADCAST => {
+                SocketOptionValue::U32(u32::from(self.options.lock().broadcast))
+            }
+            _ => unreachable!(),
+        }) {
+            Err(Errno::ENOPROTOOPT) => {} // continue to handle unix
+            other => return other,
+        }
+
+        let val: u32 = match optname {
+            SocketOptionName::IP(ip) => match ip {
+                IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+            },
+            SocketOptionName::Socket(so) => match so {
+                // handled by `getsockopt_common`
+                SocketOption::RCVTIMEO
+                | SocketOption::SNDTIMEO
+                | SocketOption::LINGER
+                | SocketOption::REUSEADDR
+                | SocketOption::KEEPALIVE
+                | SocketOption::BROADCAST => {
+                    unreachable!()
+                }
+                SocketOption::TYPE => match self.inner {
+                    UnixSocketInner::Stream(_) => SockType::Stream as u32,
+                    UnixSocketInner::Datagram(_) => SockType::Datagram as u32,
+                },
+                SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.truncate(),
+                SocketOption::PEERCRED => match &self.inner {
+                    UnixSocketInner::Stream(stream) => {
+                        let ucred = stream.with_state_ref(|state| match state {
+                            UnixStreamState::Connected(_) => {
+                                log_unsupported!("get PEERCRED for unix socket");
+                                Err(Errno::EOPNOTSUPP)
+                            }
+                            _ => Ok(litebox_common_linux::Ucred {
+                                pid: 0,
+                                uid: u32::MAX,
+                                gid: u32::MAX,
+                            }),
+                        })?;
+                        return super::write_to_user(ucred, optval, len);
+                    }
+                    UnixSocketInner::Datagram(_) => {
+                        log_unsupported!("get PEERCRED for unix datagram socket");
+                        return Err(Errno::EOPNOTSUPP);
+                    }
+                },
+            },
+            SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
+        };
+        super::write_to_user(val, optval, len)
     }
 
     super::common_functions_for_file_status!();
