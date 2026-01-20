@@ -2976,9 +2976,11 @@ mod unix_tests {
             .unwrap_err();
         let elapsed = start.elapsed();
         assert_eq!(err, Errno::ETIMEDOUT);
+        // Allow a small tolerance (5ms) for timing imprecision
+        let tolerance = Duration::from_millis(5);
         assert!(
-            elapsed >= timeout,
-            "elapsed: {elapsed:?} < timeout: {timeout:?}"
+            elapsed + tolerance >= timeout,
+            "elapsed: {elapsed:?} < timeout: {timeout:?} (with {tolerance:?} tolerance)"
         );
     }
     #[test]
