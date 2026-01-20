@@ -188,7 +188,9 @@ impl GlobalState {
         assert!(old.is_none());
         drop(dt);
 
-        self.net.lock().set_socket_proxy(fd, proxy.clone());
+        if let Err(_) = self.net.lock().set_socket_proxy(fd, proxy.clone()) {
+            unreachable!("failed to set socket proxy for initialized socket");
+        }
         proxy
     }
 
@@ -550,13 +552,13 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
-        proxy: &litebox::net::socket_channel::NetworkProxy<Platform>,
         mut peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd, Errno> {
         cx.wait_on_events(
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN,
             |observer, filter| {
+                let proxy = self.get_proxy(fd)?;
                 proxy.register_observer(observer, filter);
                 Ok(())
             },
@@ -573,7 +575,6 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
-        proxy: &litebox::net::socket_channel::NetworkProxy<Platform>,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
         let mut check_progress = false;
@@ -581,6 +582,7 @@ impl GlobalState {
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN | Events::OUT,
             |observer, filter| {
+                let proxy = self.get_proxy(fd)?;
                 proxy.register_observer(observer, filter);
                 Ok(())
             },
@@ -611,7 +613,6 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
-        proxy: &litebox::net::socket_channel::NetworkProxy<Platform>,
         buf: &[u8],
         flags: SendFlags,
         sockaddr: Option<SocketAddr>,
@@ -635,6 +636,7 @@ impl GlobalState {
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
 
+        let proxy = self.get_proxy(fd)?;
         let ret = cx
             .with_timeout(timeout)
             .wait_on_events(
@@ -653,10 +655,6 @@ impl GlobalState {
                     Err(SocketChannelError::Closed) => Err(TryOpError::Other(Errno::EPIPE)),
                     Err(SocketChannelError::NotConnected) => {
                         Err(TryOpError::Other(Errno::ENOTCONN))
-                    }
-                    Err(SocketChannelError::InvalidState) => Err(TryOpError::Other(Errno::EINVAL)),
-                    Err(SocketChannelError::ConnectionReset) => {
-                        Err(TryOpError::Other(Errno::ECONNRESET))
                     }
                 },
             )
@@ -677,7 +675,6 @@ impl GlobalState {
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
-        proxy: &litebox::net::socket_channel::NetworkProxy<Platform>,
         buf: &mut [u8],
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
@@ -711,6 +708,7 @@ impl GlobalState {
             }
         }
 
+        let proxy = self.get_proxy(fd)?;
         cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblock,
@@ -720,9 +718,8 @@ impl GlobalState {
                     Ok(())
                 },
                 || match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
-                    Ok(0) => Err(TryOpError::TryAgain),
+                    Ok(0) | Err(SocketChannelError::WouldBlock) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
-                    Err(SocketChannelError::WouldBlock) => Err(TryOpError::TryAgain),
                     Err(SocketChannelError::Closed) => {
                         // Socket closed - return 0 to indicate EOF
                         Ok(0)
@@ -731,12 +728,7 @@ impl GlobalState {
                         Err(TryOpError::Other(Errno::ENOTCONN))
                     }
                     Err(SocketChannelError::BufferFull) => {
-                        // Should not happen for read, but handle it gracefully
-                        Err(TryOpError::TryAgain)
-                    }
-                    Err(SocketChannelError::InvalidState) => Err(TryOpError::Other(Errno::EINVAL)),
-                    Err(SocketChannelError::ConnectionReset) => {
-                        Err(TryOpError::Other(Errno::ECONNRESET))
+                        unreachable!("BufferFull should not happen on receive");
                     }
                 },
             )
@@ -761,11 +753,14 @@ impl GlobalState {
             & litebox::fs::OFlags::STATUS_FLAGS_MASK
     }
 
-    pub(crate) fn get_proxy(&self, fd: &SocketFd) -> Arc<NetworkProxy<Platform>> {
+    pub(crate) fn get_proxy(&self, fd: &SocketFd) -> Result<Arc<NetworkProxy<Platform>>, Errno> {
         self.litebox
             .descriptor_table()
             .with_metadata(fd, |SocketProxy(proxy)| proxy.clone())
-            .unwrap()
+            .map_err(|e| match e {
+                litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
+                litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
+            })
     }
 
     pub(crate) fn close_socket(
@@ -779,7 +774,7 @@ impl GlobalState {
             Some(_) => CloseBehavior::GracefulIfNoPendingData,
             None => CloseBehavior::Graceful,
         };
-        let proxy = self.get_proxy(&fd);
+        let proxy = self.get_proxy(&fd)?;
         match cx.with_timeout(linger_timeout).wait_on_events(
             self.get_status(&fd).contains(OFlags::NONBLOCK),
             Events::HUP,
@@ -1136,12 +1131,9 @@ impl Task {
                     let mut socket_addr = peer
                         .is_some()
                         .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
-                    let accepted_file = self.global.accept(
-                        &self.wait_cx(),
-                        fd,
-                        &self.global.get_proxy(fd),
-                        socket_addr.as_mut(),
-                    )?;
+                    let accepted_file =
+                        self.global
+                            .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
                     if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
                         *peer = SocketAddress::Inet(socket_addr);
                     }
@@ -1206,8 +1198,7 @@ impl Task {
                 drop(file_table); // Drop before possibly-blocking `connect`
                 files.with_socket_fd(raw_fd, |fd| {
                     let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
-                    let proxy = self.global.get_proxy(&fd);
-                    self.global.connect(&self.wait_cx(), &fd, &proxy, addr)
+                    self.global.connect(&self.wait_cx(), fd, addr)
                 })
             }
             Descriptor::Unix { file, .. } => {
@@ -1314,14 +1305,8 @@ impl Task {
                     let sockaddr = sockaddr
                         .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                         .transpose()?;
-                    self.global.sendto(
-                        &self.wait_cx(),
-                        &fd,
-                        &self.global.get_proxy(&fd),
-                        &buf,
-                        flags,
-                        sockaddr,
-                    )
+                    self.global
+                        .sendto(&self.wait_cx(), fd, &buf, flags, sockaddr)
                 })
             }
             Descriptor::Unix { file, .. } => {
@@ -1381,7 +1366,6 @@ impl Task {
                     let sock_addr = sock_addr
                         .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                         .transpose()?;
-                    let proxy = self.global.get_proxy(&fd);
                     let mut total_sent = 0;
                     for iov in iovs.iter() {
                         if iov.iov_len == 0 {
@@ -1389,14 +1373,9 @@ impl Task {
                         }
                         let buf = unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }
                             .ok_or(Errno::EFAULT)?;
-                        total_sent += self.global.sendto(
-                            &self.wait_cx(),
-                            &fd,
-                            &proxy,
-                            &buf,
-                            flags,
-                            sock_addr,
-                        )?;
+                        total_sent +=
+                            self.global
+                                .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)?;
                     }
                     Ok(total_sent)
                 })
@@ -1458,8 +1437,7 @@ impl Task {
                     let mut addr = None;
                     let size = self.global.receive(
                         &self.wait_cx(),
-                        &fd,
-                        &self.global.get_proxy(fd),
+                        fd,
                         buffer,
                         flags,
                         if source_addr.is_some() {

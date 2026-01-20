@@ -560,7 +560,8 @@ where
         }
     }
 
-    pub fn drain_all_socket_channel_buffers(&mut self) {
+    /// Drain all socket channel buffers
+    fn drain_all_socket_channel_buffers(&mut self) {
         let table = self.litebox.descriptor_table();
         for (_, entry) in table.iter::<Network<Platform>>() {
             Self::drain_socket_channel_buffers(
@@ -589,42 +590,32 @@ where
         match (socket_handle.protocol(), proxy) {
             (Protocol::Tcp, NetworkProxy::Stream(proxy)) => {
                 let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                let mut buf = [0u8; 4096];
 
                 // Drain TX buffer: pop from channel, push to smoltcp
-                if tcp_socket.can_send() && proxy.has_pending_tx() {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        let n = proxy.pop_tx_data(&mut buf);
-                        if n == 0 {
-                            break;
+                let send_capacity = tcp_socket.send_capacity();
+                while tcp_socket.can_send() {
+                    let to_send = 4096.min(send_capacity - tcp_socket.send_queue());
+                    let n = proxy.pop_tx_data(&mut buf[..to_send]);
+                    if n == 0 {
+                        break;
+                    }
+                    match tcp_socket.send_slice(&buf[..n]) {
+                        Ok(sent) => {
+                            assert_eq!(sent, n, "we already checked send vacancy {}", to_send);
                         }
-                        match tcp_socket.send_slice(&buf[..n]) {
-                            Ok(sent) if sent < n => {
-                                // Couldn't send all data, would need to buffer the rest
-                                // For now, this is a simplification - in practice you'd want to handle partial sends
-                                break;
-                            }
-                            Ok(_) => {}
-                            Err(_) => break,
-                        }
+                        Err(_) => break,
                     }
                 }
 
                 // Drain RX buffer: pop from smoltcp, push to channel
-                let rx_space = proxy.rx_space();
-                if tcp_socket.can_recv() && rx_space > 0 {
-                    let mut buf = vec![0u8; 4096.min(rx_space)];
-                    loop {
-                        match tcp_socket.recv_slice(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                let pushed = proxy.push_rx_data(&buf[..n]);
-                                if pushed < n {
-                                    // Channel buffer full
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
+                while tcp_socket.can_recv() {
+                    let rx_space = proxy.rx_space();
+                    match tcp_socket.recv_slice(&mut buf[..4096.min(rx_space)]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let pushed = proxy.push_rx_data(&buf[..n]);
+                            assert_eq!(pushed, n, "we already checked rx_space {}", rx_space);
                         }
                     }
                 }
@@ -639,25 +630,23 @@ where
                     proxy.set_state(socket_channel::SocketState::Closed);
                 }
 
-                if let Some(server_socket) = tcp_specific.server_socket.as_ref() {
-                    if !proxy.is_readable() {
-                        server_socket
-                            .socket_set_handles
-                            .iter()
-                            .any(|&h| {
-                                let socket: &tcp::Socket = socket_set.get(h);
-                                socket.state() == tcp::State::Established
-                            })
-                            .then(|| {
-                                proxy.set_readable(true);
-                                proxy.notify_io_event(Events::IN);
-                            });
-                    }
+                if let Some(server_socket) = tcp_specific.server_socket.as_ref()
+                    && !proxy.is_readable()
+                {
+                    server_socket
+                        .socket_set_handles
+                        .iter()
+                        .any(|&h| {
+                            let socket: &tcp::Socket = socket_set.get(h);
+                            socket.state() == tcp::State::Established
+                        })
+                        .then(|| {
+                            proxy.set_readable(true);
+                            proxy.notify_io_event(Events::IN);
+                        });
                 }
             }
             (Protocol::Udp, NetworkProxy::Datagram(udp_proxy)) => {
-                // let udp_socket = socket_set.get_mut::<udp::Socket>(socket_handle.handle);
-
                 // Drain TX queue: pop datagrams from channel, send via smoltcp
                 while udp_proxy.has_pending_tx() {
                     if let Some(datagram) = udp_proxy.pop_datagram() {
@@ -696,7 +685,7 @@ where
                 }
             }
             (Protocol::Icmp | Protocol::Raw { .. }, _) => {
-                // Not supported for channel-based I/O
+                unimplemented!()
             }
             _ => panic!("Mismatched protocol and proxy type"),
         }
@@ -710,7 +699,7 @@ where
 {
     /// Explicitly private-only function that returns the current (smoltcp) Instant, relative to the
     /// initialized arbitrary 0-point in time.
-    pub fn now(&self) -> smoltcp::time::Instant {
+    fn now(&self) -> smoltcp::time::Instant {
         smoltcp::time::Instant::from_micros(
             // This conversion from u128 to i64 should practically never fail, since 2^63
             // microseconds is roughly 250 years. If a system has been up for that long, then it
@@ -800,15 +789,19 @@ where
         self.litebox.descriptor_table_mut().insert(socket_handle)
     }
 
+    /// Set the network proxy for the socket at `fd`
     pub fn set_socket_proxy(
         &mut self,
         fd: &SocketFd<Platform>,
         proxy: alloc::sync::Arc<NetworkProxy<Platform>>,
-    ) {
+    ) -> Result<(), alloc::sync::Arc<NetworkProxy<Platform>>> {
         let descriptor_table = self.litebox.descriptor_table();
-        let mut table_entry = descriptor_table.get_entry_mut(fd).expect("invalid fd");
+        let Some(mut table_entry) = descriptor_table.get_entry_mut(fd) else {
+            return Err(proxy);
+        };
         let socket_handle = &mut table_entry.entry;
         socket_handle.proxy = Some(proxy);
+        Ok(())
     }
 
     /// Close the socket at `fd`
@@ -837,10 +830,10 @@ where
                 }
                 // check if there is pending data to be sent
                 let socket_handle = &entry.entry;
-                if let Some(proxy) = &socket_handle.proxy {
-                    if proxy.has_pending_tx() {
-                        return false;
-                    }
+                if let Some(proxy) = &socket_handle.proxy
+                    && proxy.has_pending_tx()
+                {
+                    return false;
                 }
                 !socket_handle.with_socket(
                     &self.socket_set,

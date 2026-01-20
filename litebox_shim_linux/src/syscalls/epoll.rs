@@ -111,7 +111,13 @@ impl EpollDescriptor {
                 return Some(Events::OUT & mask);
             }
             EpollDescriptor::Socket(fd) => {
-                let proxy = global.get_proxy(fd);
+                let proxy = match global.get_proxy(fd) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log_unsupported!("epoll poll with socket fd: {:?}", e);
+                        return None;
+                    }
+                };
                 return Some(poll(&proxy));
             }
             EpollDescriptor::Pipe(fd) => {

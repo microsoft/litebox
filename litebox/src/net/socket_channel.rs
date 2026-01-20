@@ -74,10 +74,8 @@ pub enum SocketState {
     Connected = 2,
     /// Socket is listening for incoming connections
     Listening = 3,
-    /// Socket is closing gracefully
-    Closing = 4,
     /// Socket encountered an error
-    Error = 5,
+    Error = 4,
 }
 
 impl From<u32> for SocketState {
@@ -87,7 +85,6 @@ impl From<u32> for SocketState {
             1 => SocketState::Connecting,
             2 => SocketState::Connected,
             3 => SocketState::Listening,
-            4 => SocketState::Closing,
             _ => SocketState::Error,
         }
     }
@@ -102,7 +99,7 @@ pub enum NetworkProxy<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> {
     pub fn set_state(&self, state: SocketState) {
         match self {
-            NetworkProxy::Stream(handle) => handle.inner.set_state(state),
+            NetworkProxy::Stream(handle) => handle.set_state(state),
             NetworkProxy::Datagram(_) | NetworkProxy::Raw => {}
         }
     }
@@ -212,12 +209,8 @@ pub enum SocketChannelError {
     NotConnected,
     /// The socket is closed
     Closed,
-    /// The socket is in an invalid state for this operation
-    InvalidState,
     /// Buffer is full (for write operations)
     BufferFull,
-    /// Connection was reset by peer
-    ConnectionReset,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketChannelInner<Platform> {
@@ -269,7 +262,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkSocketHandle<Pla
         }
 
         match self.inner.state() {
-            SocketState::Connected | SocketState::Closing => {}
+            SocketState::Connected => {}
             SocketState::Closed => return Err(SocketChannelError::Closed),
             _ => return Err(SocketChannelError::NotConnected),
         }
@@ -306,7 +299,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkSocketHandle<Pla
 
         match self.state() {
             SocketState::Connected => {}
-            SocketState::Closed | SocketState::Closing => return Err(SocketChannelError::Closed),
+            SocketState::Closed => return Err(SocketChannelError::Closed),
             _ => return Err(SocketChannelError::NotConnected),
         }
 
@@ -326,11 +319,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkSocketHandle<Pla
     pub fn is_writable(&self) -> bool {
         self.inner.tx_available.load(Ordering::Acquire) > 0
     }
-
-    /// Get the current socket state.
-    // pub fn state(&self) -> SocketState {
-    //     self.inner.state()
-    // }
 
     /// Shutdown the read side of the socket.
     pub fn shutdown_read(&self) {
@@ -421,12 +409,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkSocketHandle<Pla
         !tx_cons.is_empty()
     }
 
-    /// Check if there's space in the RX buffer.
-    // pub(super) fn has_rx_space(&self) -> bool {
-    //     let rx_prod = self.inner.rx_prod.lock();
-    //     !rx_prod.is_full()
-    // }
-
     pub(super) fn rx_space(&self) -> usize {
         let rx_prod = self.inner.rx_prod.lock();
         rx_prod.vacant_len()
@@ -459,11 +441,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkSocketHandle<Pla
     pub(super) fn state(&self) -> SocketState {
         self.inner.state()
     }
-
-    /// Check if write side is shut down.
-    // pub(super) fn is_write_shutdown(&self) -> bool {
-    //     self.inner.write_shutdown.load(Ordering::Acquire)
-    // }
 
     pub(super) fn notify_io_event(&self, events: Events) {
         self.inner.pollee.notify_observers(events);

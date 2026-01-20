@@ -254,8 +254,7 @@ impl Task {
                         |fd| {
                             self.global.receive(
                                 &self.wait_cx(),
-                                &fd,
-                                &self.global.get_proxy(&fd),
+                                fd,
                                 &mut buf.borrow_mut(),
                                 litebox_common_linux::ReceiveFlags::empty(),
                                 None,
@@ -310,7 +309,6 @@ impl Task {
                             self.global.sendto(
                                 &self.wait_cx(),
                                 fd,
-                                &self.global.get_proxy(fd),
                                 buf,
                                 litebox_common_linux::SendFlags::empty(),
                                 None,
@@ -579,12 +577,10 @@ impl Task {
                             })
                         },
                         |fd| {
-                            let proxy = self.global.get_proxy(fd);
                             write_to_iovec(iovs, |buf| {
                                 self.global.sendto(
                                     &self.wait_cx(),
                                     fd,
-                                    &proxy,
                                     buf,
                                     litebox_common_linux::SendFlags::empty(),
                                     None,
