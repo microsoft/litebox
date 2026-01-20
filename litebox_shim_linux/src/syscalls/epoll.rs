@@ -35,7 +35,7 @@ pub(crate) enum EpollDescriptor {
     Eventfd(Arc<super::eventfd::EventFile<Platform>>),
     Epoll(Arc<super::epoll::EpollFile>),
     File(Arc<crate::FileFd>),
-    Socket(Arc<litebox::net::socket_channel::NetworkProxy<Platform>>),
+    Socket(Arc<super::net::SocketFd>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
     Unix(Arc<crate::syscalls::unix::UnixSocket>),
 }
@@ -45,12 +45,12 @@ impl EpollDescriptor {
         match desc {
             Descriptor::LiteBoxRawFd(raw_fd) => match StrongFd::from_raw(files, *raw_fd)? {
                 StrongFd::FileSystem(fd) => Ok(EpollDescriptor::File(fd)),
+                StrongFd::Network(fd) => Ok(EpollDescriptor::Socket(fd)),
                 StrongFd::Pipes(fd) => Ok(EpollDescriptor::Pipe(fd)),
             },
             Descriptor::Eventfd { file, .. } => Ok(EpollDescriptor::Eventfd(file.clone())),
             Descriptor::Epoll { file, .. } => Ok(EpollDescriptor::Epoll(file.clone())),
             Descriptor::Unix { file, .. } => Ok(EpollDescriptor::Unix(file.clone())),
-            Descriptor::Socket { proxy, .. } => Ok(EpollDescriptor::Socket(proxy.clone())),
         }
     }
 }
@@ -59,7 +59,7 @@ enum DescriptorRef {
     Eventfd(Weak<crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform>>),
     Epoll(Weak<super::epoll::EpollFile>),
     File(Weak<crate::FileFd>),
-    Socket(Weak<litebox::net::socket_channel::NetworkProxy<Platform>>),
+    Socket(Weak<super::net::SocketFd>),
     Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
     Unix(Weak<crate::syscalls::unix::UnixSocket>),
 }
@@ -70,7 +70,7 @@ impl DescriptorRef {
             EpollDescriptor::Eventfd(file) => Self::Eventfd(Arc::downgrade(file)),
             EpollDescriptor::Epoll(file) => Self::Epoll(Arc::downgrade(file)),
             EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
-            EpollDescriptor::Socket(proxy) => Self::Socket(Arc::downgrade(proxy)),
+            EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
             EpollDescriptor::Pipe(pipe) => Self::Pipe(Arc::downgrade(pipe)),
             EpollDescriptor::Unix(unix) => Self::Unix(Arc::downgrade(unix)),
         }
@@ -81,7 +81,7 @@ impl DescriptorRef {
             DescriptorRef::Eventfd(eventfd) => eventfd.upgrade().map(EpollDescriptor::Eventfd),
             DescriptorRef::Epoll(epoll) => epoll.upgrade().map(EpollDescriptor::Epoll),
             DescriptorRef::File(file) => file.upgrade().map(EpollDescriptor::File),
-            DescriptorRef::Socket(proxy) => proxy.upgrade().map(EpollDescriptor::Socket),
+            DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
             DescriptorRef::Pipe(pipe) => pipe.upgrade().map(EpollDescriptor::Pipe),
             DescriptorRef::Unix(unix) => unix.upgrade().map(EpollDescriptor::Unix),
         }
@@ -110,8 +110,9 @@ impl EpollDescriptor {
                 // TODO: probably polling on stdio files, return dummy events for now
                 return Some(Events::OUT & mask);
             }
-            EpollDescriptor::Socket(proxy) => {
-                return Some(poll(proxy));
+            EpollDescriptor::Socket(fd) => {
+                let proxy = global.get_proxy(fd);
+                return Some(poll(&proxy));
             }
             EpollDescriptor::Pipe(fd) => {
                 return global.pipes.with_iopollable(fd, poll).ok();
@@ -287,7 +288,7 @@ impl EpollEntryKey {
             EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).addr(),
             EpollDescriptor::Epoll(file) => Arc::as_ptr(file).addr(),
             EpollDescriptor::File(file) => Arc::as_ptr(file).addr(),
-            EpollDescriptor::Socket(proxy) => Arc::as_ptr(proxy).addr(),
+            EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).addr(),
             EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).addr(),
             EpollDescriptor::Unix(unix) => Arc::as_ptr(unix).addr(),
         };

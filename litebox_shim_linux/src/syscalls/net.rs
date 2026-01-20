@@ -143,6 +143,7 @@ pub(super) struct SocketOptions {
 }
 
 pub(crate) struct SocketOFlags(pub OFlags);
+pub(crate) struct SocketProxy(pub Arc<NetworkProxy<Platform>>);
 
 /// Socket-related implementation. Currently these methods are on `GlobalState`
 /// so that they can access `net` and the litebox descriptor table. This might
@@ -169,7 +170,6 @@ impl GlobalState {
         assert!(old.is_none());
         let old = dt.set_entry_metadata(fd, SocketOFlags(status));
         assert!(old.is_none());
-        drop(dt);
 
         let proxy = match sock_type {
             SockType::Stream => {
@@ -184,6 +184,10 @@ impl GlobalState {
             _ => unimplemented!(),
         };
         let proxy = Arc::new(proxy);
+        let old = dt.set_entry_metadata(fd, SocketProxy(proxy.clone()));
+        assert!(old.is_none());
+        drop(dt);
+
         self.net.lock().set_socket_proxy(fd, proxy.clone());
         proxy
     }
@@ -757,11 +761,17 @@ impl GlobalState {
             & litebox::fs::OFlags::STATUS_FLAGS_MASK
     }
 
+    pub(crate) fn get_proxy(&self, fd: &SocketFd) -> Arc<NetworkProxy<Platform>> {
+        self.litebox
+            .descriptor_table()
+            .with_metadata(fd, |SocketProxy(proxy)| proxy.clone())
+            .unwrap()
+    }
+
     pub(crate) fn close_socket(
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: Arc<SocketFd>,
-        proxy: Arc<litebox::net::socket_channel::NetworkProxy<Platform>>,
     ) -> Result<(), Errno> {
         let linger_timeout = self.with_socket_options(&fd, |opt| opt.linger_timeout);
         let behavior = match linger_timeout {
@@ -769,6 +779,7 @@ impl GlobalState {
             Some(_) => CloseBehavior::GracefulIfNoPendingData,
             None => CloseBehavior::Graceful,
         };
+        let proxy = self.get_proxy(&fd);
         match cx.with_timeout(linger_timeout).wait_on_events(
             self.get_status(&fd).contains(OFlags::NONBLOCK),
             Events::HUP,
@@ -853,17 +864,13 @@ impl Task {
                     _ => unimplemented!(),
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
-                let proxy = self.global.initialize_socket(&socket, ty, flags);
-                // Descriptor::LiteBoxRawFd(
-                //     files
-                //         .raw_descriptor_store
-                //         .write()
-                //         .fd_into_raw_integer(socket),
-                // )
-                Descriptor::Socket {
-                    file: Arc::new(socket),
-                    proxy,
-                }
+                let _ = self.global.initialize_socket(&socket, ty, flags);
+                Descriptor::LiteBoxRawFd(
+                    files
+                        .raw_descriptor_store
+                        .write()
+                        .fd_into_raw_integer(socket),
+                )
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
@@ -1121,28 +1128,35 @@ impl Task {
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
         let file = match socket {
-            Descriptor::Socket { file, proxy } => {
-                let (file, proxy) = (file.clone(), proxy.clone());
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                let raw_fd = *raw_fd;
                 drop(file_table); // Drop before possibly-blocking `accept`
-                let sock_type = self.global.get_socket_type(&file)?;
-                let mut socket_addr = peer
-                    .is_some()
-                    .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
-                let accepted_file =
-                    self.global
-                        .accept(&self.wait_cx(), &file, &proxy, socket_addr.as_mut())?;
-                if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
-                    *peer = SocketAddress::Inet(socket_addr);
-                }
+                files.with_socket_fd(raw_fd, |fd| {
+                    let sock_type = self.global.get_socket_type(fd)?;
+                    let mut socket_addr = peer
+                        .is_some()
+                        .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+                    let accepted_file = self.global.accept(
+                        &self.wait_cx(),
+                        fd,
+                        &self.global.get_proxy(fd),
+                        socket_addr.as_mut(),
+                    )?;
+                    if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
+                        *peer = SocketAddress::Inet(socket_addr);
+                    }
 
-                let proxy = self
-                    .global
-                    .initialize_socket(&accepted_file, sock_type, flags);
-                proxy.set_state(SocketState::Connected);
-                Descriptor::Socket {
-                    file: Arc::new(accepted_file),
-                    proxy,
-                }
+                    let proxy = self
+                        .global
+                        .initialize_socket(&accepted_file, sock_type, flags);
+                    proxy.set_state(SocketState::Connected);
+                    Ok(Descriptor::LiteBoxRawFd(
+                        files
+                            .raw_descriptor_store
+                            .write()
+                            .fd_into_raw_integer(accepted_file),
+                    ))
+                })?
             }
             Descriptor::Unix { file, .. } => {
                 let file = file.clone();
@@ -1187,11 +1201,14 @@ impl Task {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
-            Descriptor::Socket { file, proxy } => {
-                let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
-                let (file, proxy) = (file.clone(), proxy.clone());
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                let raw_fd = *raw_fd;
                 drop(file_table); // Drop before possibly-blocking `connect`
-                self.global.connect(&self.wait_cx(), &file, &proxy, addr)
+                files.with_socket_fd(raw_fd, |fd| {
+                    let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
+                    let proxy = self.global.get_proxy(&fd);
+                    self.global.connect(&self.wait_cx(), &fd, &proxy, addr)
+                })
             }
             Descriptor::Unix { file, .. } => {
                 let addr = sockaddr.unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -1224,14 +1241,10 @@ impl Task {
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            // Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-            //     let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
-            //     self.global.bind(fd, addr)
-            // }),
-            Descriptor::Socket { file, .. } => {
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
-                self.global.bind(file, addr)
-            }
+                self.global.bind(fd, addr)
+            }),
             Descriptor::Unix { file, .. } => {
                 let addr = sockaddr.unix().ok_or(Errno::EAFNOSUPPORT)?;
                 file.bind(self, addr)
@@ -1255,10 +1268,9 @@ impl Task {
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            // Descriptor::LiteBoxRawFd(raw_fd) => {
-            //     files.with_socket_fd(*raw_fd, |fd| self.global.listen(fd, backlog))
-            // }
-            Descriptor::Socket { file, .. } => self.global.listen(file, backlog),
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                files.with_socket_fd(*raw_fd, |fd| self.global.listen(fd, backlog))
+            }
             Descriptor::Unix { file, .. } => file.listen(backlog, &self.global),
             _ => Err(Errno::ENOTSOCK),
         }
@@ -1295,22 +1307,22 @@ impl Task {
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
         match socket {
-            // Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-            //     let sockaddr = sockaddr
-            //         .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
-            //         .transpose()?;
-            //     drop(file_table); // Drop before possibly-blocking `sendto`
-            //     self.global
-            //         .sendto(&self.wait_cx(), fd, &buf, flags, sockaddr)
-            // }),
-            Descriptor::Socket { file, proxy } => {
-                let sockaddr = sockaddr
-                    .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
-                    .transpose()?;
-                let (file, proxy) = (file.clone(), proxy.clone());
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                let raw_fd = *raw_fd;
                 drop(file_table); // Drop before possibly-blocking `sendto`
-                self.global
-                    .sendto(&self.wait_cx(), &file, &proxy, &buf, flags, sockaddr)
+                files.with_socket_fd(raw_fd, |fd| {
+                    let sockaddr = sockaddr
+                        .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                        .transpose()?;
+                    self.global.sendto(
+                        &self.wait_cx(),
+                        &fd,
+                        &self.global.get_proxy(&fd),
+                        &buf,
+                        flags,
+                        sockaddr,
+                    )
+                })
             }
             Descriptor::Unix { file, .. } => {
                 let addr = sockaddr
@@ -1362,30 +1374,32 @@ impl Task {
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
         match socket {
-            Descriptor::Socket { file, proxy } => {
-                let sock_addr = sock_addr
-                    .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
-                    .transpose()?;
-                let (file, proxy) = (file.clone(), proxy.clone());
-                // drop file table as `sendto` may block
-                drop(file_table);
-                let mut total_sent = 0;
-                for iov in iovs.iter() {
-                    if iov.iov_len == 0 {
-                        continue;
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                let raw_fd = *raw_fd;
+                drop(file_table); // Drop before possibly-blocking `sendto`
+                files.with_socket_fd(raw_fd, |fd| {
+                    let sock_addr = sock_addr
+                        .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                        .transpose()?;
+                    let proxy = self.global.get_proxy(&fd);
+                    let mut total_sent = 0;
+                    for iov in iovs.iter() {
+                        if iov.iov_len == 0 {
+                            continue;
+                        }
+                        let buf = unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }
+                            .ok_or(Errno::EFAULT)?;
+                        total_sent += self.global.sendto(
+                            &self.wait_cx(),
+                            &fd,
+                            &proxy,
+                            &buf,
+                            flags,
+                            sock_addr,
+                        )?;
                     }
-                    let buf =
-                        unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
-                    total_sent += self.global.sendto(
-                        &self.wait_cx(),
-                        &file,
-                        &proxy,
-                        &buf,
-                        flags,
-                        sock_addr,
-                    )?;
-                }
-                Ok(total_sent)
+                    Ok(total_sent)
+                })
             }
             _ => Err(Errno::ENOTSOCK),
         }
@@ -1434,34 +1448,36 @@ impl Task {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         match file_table.get_fd(sockfd).ok_or(Errno::EBADF)? {
-            Descriptor::Socket { file, proxy } => {
-                const MAX_LEN: usize = 4096;
-                let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
-                let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
-                let mut addr = None;
-                let (file, proxy) = (file.clone(), proxy.clone());
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                let raw_fd = *raw_fd;
                 drop(file_table); // Drop before possibly-blocking `receive`
-                let size = self.global.receive(
-                    &self.wait_cx(),
-                    &file,
-                    &proxy,
-                    buffer,
-                    flags,
-                    if source_addr.is_some() {
-                        Some(&mut addr)
-                    } else {
-                        None
-                    },
-                )?;
-                if let Some(source_addr) = source_addr {
-                    *source_addr = addr.map(SocketAddress::Inet);
-                }
-                if !flags.contains(ReceiveFlags::TRUNC) {
-                    assert!(size <= len, "{size} should be smaller than {len}");
-                }
-                buf.copy_from_slice(0, &buffer[..size.min(buffer.len())])
-                    .ok_or(Errno::EFAULT)?;
-                Ok(size)
+                files.with_socket_fd(raw_fd, |fd| {
+                    const MAX_LEN: usize = 4096;
+                    let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
+                    let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
+                    let mut addr = None;
+                    let size = self.global.receive(
+                        &self.wait_cx(),
+                        &fd,
+                        &self.global.get_proxy(fd),
+                        buffer,
+                        flags,
+                        if source_addr.is_some() {
+                            Some(&mut addr)
+                        } else {
+                            None
+                        },
+                    )?;
+                    if let Some(source_addr) = source_addr {
+                        *source_addr = addr.map(SocketAddress::Inet);
+                    }
+                    if !flags.contains(ReceiveFlags::TRUNC) {
+                        assert!(size <= len, "{size} should be smaller than {len}");
+                    }
+                    buf.copy_from_slice(0, &buffer[..size.min(buffer.len())])
+                        .ok_or(Errno::EFAULT)?;
+                    Ok(size)
+                })
             }
             Descriptor::Unix { file, .. } => {
                 const MAX_LEN: usize = 4096;
@@ -1524,12 +1540,9 @@ impl Task {
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            // Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-            //     self.global.setsockopt(fd, optname, optval, optlen)
-            // }),
-            Descriptor::Socket { file, .. } => {
-                self.global.setsockopt(&file, optname, optval, optlen)
-            }
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+                self.global.setsockopt(fd, optname, optval, optlen)
+            }),
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1569,9 +1582,6 @@ impl Task {
             Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
                 self.global.getsockopt(fd, optname, optval, optlen)
             }),
-            Descriptor::Socket { file, .. } => {
-                self.global.getsockopt(&file, optname, optval, optlen)
-            }
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -1597,21 +1607,14 @@ impl Task {
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            // Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-            //     self.global
-            //         .net
-            //         .lock()
-            //         .get_local_addr(fd)
-            //         .map(SocketAddress::Inet)
-            //         .map_err(Errno::from)
-            // }),
-            Descriptor::Socket { file, .. } => self
-                .global
-                .net
-                .lock()
-                .get_local_addr(file)
-                .map(SocketAddress::Inet)
-                .map_err(Errno::from),
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+                self.global
+                    .net
+                    .lock()
+                    .get_local_addr(fd)
+                    .map(SocketAddress::Inet)
+                    .map_err(Errno::from)
+            }),
             Descriptor::Unix { file, .. } => Ok(SocketAddress::Unix(file.get_local_addr())),
             _ => Err(Errno::ENOTSOCK),
         }
@@ -1638,21 +1641,14 @@ impl Task {
             .get_fd(sockfd)
             .ok_or(Errno::EBADF)?
         {
-            // Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-            //     self.global
-            //         .net
-            //         .lock()
-            //         .get_remote_addr(fd)
-            //         .map(SocketAddress::Inet)
-            //         .map_err(Errno::from)
-            // }),
-            Descriptor::Socket { file, .. } => self
-                .global
-                .net
-                .lock()
-                .get_remote_addr(file)
-                .map(SocketAddress::Inet)
-                .map_err(Errno::from),
+            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+                self.global
+                    .net
+                    .lock()
+                    .get_remote_addr(fd)
+                    .map(SocketAddress::Inet)
+                    .map_err(Errno::from)
+            }),
             _ => Err(Errno::ENOTSOCK),
         }
     }

@@ -191,6 +191,7 @@ impl Task {
                         .truncate(fd, length, false)
                         .map_err(Errno::from)
                 },
+                |_fd| todo!("net"),
                 |_fd| todo!("pipes"),
             ),
             _ => Err(Errno::EINVAL),
@@ -251,6 +252,16 @@ impl Task {
                                 .map_err(Errno::from)
                         },
                         |fd| {
+                            self.global.receive(
+                                &self.wait_cx(),
+                                &fd,
+                                &self.global.get_proxy(&fd),
+                                &mut buf.borrow_mut(),
+                                litebox_common_linux::ReceiveFlags::empty(),
+                                None,
+                            )
+                        },
+                        |fd| {
                             self.global
                                 .pipes
                                 .read(&self.wait_cx(), fd, &mut buf.borrow_mut())
@@ -272,18 +283,6 @@ impl Task {
             }
             Descriptor::Unix { file, .. } => {
                 file.recvfrom(buf, litebox_common_linux::ReceiveFlags::empty(), None)
-            }
-            Descriptor::Socket { file, proxy } => {
-                let (file, proxy) = (file.clone(), proxy.clone());
-                drop(file_table);
-                self.global.receive(
-                    &self.wait_cx(),
-                    &file,
-                    &proxy,
-                    buf,
-                    litebox_common_linux::ReceiveFlags::empty(),
-                    None,
-                )
             }
         }
     }
@@ -308,6 +307,16 @@ impl Task {
                         raw_fd,
                         |fd| self.global.fs.write(fd, buf, offset).map_err(Errno::from),
                         |fd| {
+                            self.global.sendto(
+                                &self.wait_cx(),
+                                fd,
+                                &self.global.get_proxy(fd),
+                                buf,
+                                litebox_common_linux::SendFlags::empty(),
+                                None,
+                            )
+                        },
+                        |fd| {
                             self.global
                                 .pipes
                                 .write(&self.wait_cx(), fd, buf)
@@ -329,18 +338,6 @@ impl Task {
             }
             Descriptor::Unix { file, .. } => {
                 file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
-            }
-            Descriptor::Socket { file, proxy } => {
-                let (file, proxy) = (file.clone(), proxy.clone());
-                drop(file_table);
-                self.global.sendto(
-                    &self.wait_cx(),
-                    &file,
-                    &proxy,
-                    buf,
-                    litebox_common_linux::SendFlags::empty(),
-                    None,
-                )
             }
         };
         if let Err(Errno::EPIPE) = res {
@@ -390,12 +387,12 @@ impl Task {
                     *raw_fd,
                     |fd| self.global.fs.seek(fd, offset, whence).map_err(Errno::from),
                     |_| Err(Errno::ESPIPE),
+                    |_| Err(Errno::ESPIPE),
                 )
                 .flatten(),
-            Descriptor::Epoll { .. }
-            | Descriptor::Eventfd { .. }
-            | Descriptor::Unix { .. }
-            | Descriptor::Socket { .. } => Err(Errno::ESPIPE),
+            Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } | Descriptor::Unix { .. } => {
+                Err(Errno::ESPIPE)
+            }
         }
     }
 
@@ -417,7 +414,16 @@ impl Task {
                     }
                     Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                     Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                        match rds.fd_consume_raw_integer::<litebox::pipes::Pipes<litebox_platform_multiplex::Platform>>(raw_fd) {
+                        match rds
+                        .fd_consume_raw_integer::<litebox::net::Network<litebox_platform_multiplex::Platform>>(raw_fd)
+                    {
+                        Ok(fd) => {
+                            drop(rds);
+                            self.global.close_socket(&self.wait_cx(), fd)
+                        },
+                        Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
+                        Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
+                            match rds.fd_consume_raw_integer::<litebox::pipes::Pipes<litebox_platform_multiplex::Platform>>(raw_fd) {
                                 Ok(fd) => {
                                     drop(rds);
                                     self.global.pipes.close(&fd).map_err(Errno::from)
@@ -429,17 +435,13 @@ impl Task {
                                     unreachable!()
                                 }
                             }
+                        }
+                    }
                     }
                 }
             }
             Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
                 Ok(())
-            }
-            Descriptor::Socket { file, proxy } => {
-                // let (file, user) = (file.clone(), user.clone());
-                // drop(files);
-                // Close the underlying socket through the network subsystem
-                self.global.close_socket(&self.wait_cx(), file, proxy)
             }
         }
     }
@@ -504,13 +506,13 @@ impl Task {
                                 .read(fd, &mut kernel_buffer, None)
                                 .map_err(Errno::from)
                         },
+                        |_fd| todo!("net"),
                         |_fd| todo!("pipes"),
                     )
                     .flatten()?,
                 Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
                 Descriptor::Eventfd { .. } => todo!(),
                 Descriptor::Unix { .. } => todo!(),
-                Descriptor::Socket { .. } => todo!("readv for socket channel"),
             };
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
@@ -565,30 +567,37 @@ impl Task {
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         let res = match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => files
-                .run_on_raw_fd(
-                    *raw_fd,
-                    |fd| {
-                        write_to_iovec(iovs, |buf: &[u8]| {
-                            self.global.fs.write(fd, buf, None).map_err(Errno::from)
-                        })
-                    },
-                    |_fd| todo!("pipes"),
-                )
-                .flatten(),
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                let raw_fd = *raw_fd;
+                drop(locked_file_descriptors);
+                files
+                    .run_on_raw_fd(
+                        raw_fd,
+                        |fd| {
+                            write_to_iovec(iovs, |buf: &[u8]| {
+                                self.global.fs.write(fd, buf, None).map_err(Errno::from)
+                            })
+                        },
+                        |fd| {
+                            let proxy = self.global.get_proxy(fd);
+                            write_to_iovec(iovs, |buf| {
+                                self.global.sendto(
+                                    &self.wait_cx(),
+                                    fd,
+                                    &proxy,
+                                    buf,
+                                    litebox_common_linux::SendFlags::empty(),
+                                    None,
+                                )
+                            })
+                        },
+                        |_fd| todo!("pipes"),
+                    )
+                    .flatten()
+            }
             Descriptor::Epoll { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { .. } => todo!(),
             Descriptor::Unix { .. } => todo!(),
-            Descriptor::Socket { file, proxy } => write_to_iovec(iovs, |buf| {
-                self.global.sendto(
-                    &self.wait_cx(),
-                    file,
-                    proxy,
-                    buf,
-                    litebox_common_linux::SendFlags::empty(),
-                    None,
-                )
-            }),
         };
         if let Err(Errno::EPIPE) = res {
             unimplemented!("send SIGPIPE to the current task");
@@ -692,6 +701,24 @@ impl Descriptor {
                             .map(FileStat::from)
                             .map_err(Errno::from)
                     },
+                    |_fd| {
+                        Ok(FileStat {
+                            // TODO: give correct values
+                            st_dev: 0,
+                            st_ino: 0,
+                            st_nlink: 1,
+                            st_mode: (litebox_common_linux::InodeType::Socket as u32
+                                | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+                            .truncate(),
+                            st_uid: 0,
+                            st_gid: 0,
+                            st_rdev: 0,
+                            st_size: 0,
+                            st_blksize: 4096,
+                            st_blocks: 0,
+                            ..Default::default()
+                        })
+                    },
                     |fd| {
                         let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
                         let read_write_mode = match half_pipe_type {
@@ -761,22 +788,6 @@ impl Descriptor {
                 st_blocks: 0,
                 ..Default::default()
             },
-            Descriptor::Socket { .. } => FileStat {
-                // TODO: give correct values
-                st_dev: 0,
-                st_ino: 0,
-                st_nlink: 1,
-                st_mode: (litebox_common_linux::InodeType::Socket as u32
-                    | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
-                .truncate(),
-                st_uid: 0,
-                st_gid: 0,
-                st_rdev: 0,
-                st_size: 0,
-                st_blksize: 4096,
-                st_blocks: 0,
-                ..Default::default()
-            },
         };
         Ok(fstat)
     }
@@ -803,6 +814,7 @@ impl Descriptor {
                 *raw_fd,
                 |fd| get_flags(global, fd),
                 |fd| get_flags(global, fd),
+                |fd| get_flags(global, fd),
             ),
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
@@ -813,7 +825,6 @@ impl Descriptor {
                     FileDescriptorFlags::empty()
                 },
             ),
-            Descriptor::Socket { file, .. } => Ok(get_flags(global, file)),
         }
     }
 }
@@ -926,6 +937,13 @@ impl Task {
                                 .descriptor_table_mut()
                                 .set_fd_metadata(fd, flags);
                         },
+                        |fd| {
+                            let _old = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, flags);
+                        },
                     )?,
                     Descriptor::Eventfd { close_on_exec, .. }
                     | Descriptor::Epoll { close_on_exec, .. }
@@ -934,13 +952,6 @@ impl Task {
                             flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                             core::sync::atomic::Ordering::Relaxed,
                         );
-                    }
-                    Descriptor::Socket { file, .. } => {
-                        let _old = self
-                            .global
-                            .litebox
-                            .descriptor_table_mut()
-                            .set_fd_metadata(file.as_ref(), flags);
                     }
                 }
                 Ok(0)
@@ -960,6 +971,16 @@ impl Task {
                                 .unwrap_or(OFlags::empty()))
                         },
                         |fd| {
+                            Ok(self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .with_metadata(fd, |crate::syscalls::net::SocketOFlags(flags)| {
+                                    *flags & OFlags::STATUS_FLAGS_MASK
+                                })
+                                .unwrap_or(OFlags::empty()))
+                        },
+                        |fd| {
                             let pipes = &self.global.pipes;
                             let flags = OFlags::from(pipes.get_flags(fd).map_err(Errno::from)?);
                             let dirn = match pipes.half_pipe_type(fd)? {
@@ -974,18 +995,6 @@ impl Task {
                 Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Unix { file, .. } => Ok(file.get_status().bits()),
-                Descriptor::Socket { file, .. } => Ok(self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .with_metadata(
-                        file.as_ref(),
-                        |crate::syscalls::net::SocketOFlags(flags)| {
-                            *flags & OFlags::STATUS_FLAGS_MASK
-                        },
-                    )
-                    .unwrap_or(OFlags::empty())
-                    .bits()),
             },
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
@@ -1027,6 +1036,26 @@ impl Task {
                                 })
                         },
                         |fd| {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .with_metadata_mut(fd, |crate::syscalls::net::SocketOFlags(f)| {
+                                    let diff = *f ^ flags;
+                                    if diff.intersects(
+                                        OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME,
+                                    ) {
+                                        todo!("unsupported flags");
+                                    }
+                                    f.toggle(diff);
+                                })
+                                .map_err(|err| match err {
+                                    MetadataError::ClosedFd => Errno::EBADF,
+                                    MetadataError::NoSuchMetadata => {
+                                        unreachable!("all sockets have SocketOFlags when created")
+                                    }
+                                })
+                        },
+                        |fd| {
                             if flags.intersects(OFlags::NONBLOCK.complement()) {
                                 todo!("unsupported flags for pipes")
                             }
@@ -1046,29 +1075,6 @@ impl Task {
                     Descriptor::Epoll { .. } => todo!(),
                     Descriptor::Unix { file, .. } => {
                         toggle_flags!(file);
-                    }
-                    Descriptor::Socket { file, .. } => {
-                        self.global
-                            .litebox
-                            .descriptor_table_mut()
-                            .with_metadata_mut(
-                                file.as_ref(),
-                                |crate::syscalls::net::SocketOFlags(f)| {
-                                    let diff = *f ^ flags;
-                                    if diff.intersects(
-                                        OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME,
-                                    ) {
-                                        todo!("unsupported flags");
-                                    }
-                                    f.toggle(diff);
-                                },
-                            )
-                            .map_err(|err| match err {
-                                MetadataError::ClosedFd => Errno::EBADF,
-                                MetadataError::NoSuchMetadata => {
-                                    unreachable!("all sockets have SocketOFlags when created")
-                                }
-                            })?;
                     }
                 }
                 Ok(0)
@@ -1097,6 +1103,7 @@ impl Task {
                             unsafe { lock.write_at_offset(0, flock) }.ok_or(Errno::EFAULT)?;
                             Ok(0)
                         },
+                        |_fd| todo!("net"),
                         |_fd| todo!("pipes"),
                     )
                     .flatten()
@@ -1118,6 +1125,7 @@ impl Task {
                             // can always acquire the lock it owns, so we don't need to maintain anything.
                             Ok(0)
                         },
+                        |_fd| todo!("net"),
                         |_fd| todo!("pipes"),
                     )
                     .flatten()
@@ -1289,6 +1297,25 @@ impl Task {
                             Ok(())
                         },
                         |fd| {
+                                if let Err(e) = self
+                                    .global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .with_metadata_mut(
+                                        fd,
+                                        |crate::syscalls::net::SocketOFlags(flags)| {
+                                            flags.set(OFlags::NONBLOCK, val != 0);
+                                        },
+                                    )
+                                {
+                                    match e {
+                                        MetadataError::ClosedFd => return Err(Errno::EBADF),
+                                        MetadataError::NoSuchMetadata => unreachable!(),
+                                    }
+                                }
+                                Ok(())
+                        },
+                        |fd| {
 self.global.pipes                                .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
                                 .map_err(Errno::from)
                         },
@@ -1301,24 +1328,6 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                 }
                 Descriptor::Unix { file, .. } => {
                     file.set_status(OFlags::NONBLOCK, val != 0);
-                }
-                Descriptor::Socket { file, .. } => {
-                    if let Err(e) = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .with_metadata_mut(
-                            file.as_ref(),
-                            |crate::syscalls::net::SocketOFlags(flags)| {
-                                flags.set(OFlags::NONBLOCK, val != 0);
-                            },
-                        )
-                    {
-                        match e {
-                            MetadataError::ClosedFd => return Err(Errno::EBADF),
-                            MetadataError::NoSuchMetadata => unreachable!(),
-                        }
-                    }
                 }
             }
             return Ok(0);
@@ -1348,6 +1357,7 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                                             .descriptor_table_mut()
                                             .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                                     },
+                                    |_fd| todo!("net"),
                                     |_fd| todo!("pipes"),
                                 )?;
                                 Ok(0)
@@ -1373,6 +1383,7 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                         }
                     })
                 },
+                |_fd| todo!("net"),
                 |_fd| todo!("pipes"),
             )?,
             Descriptor::Eventfd {
@@ -1387,7 +1398,6 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                 file: _,
                 close_on_exec: _,
             } => todo!(),
-            Descriptor::Socket { .. } => todo!("ioctl for socket channel"),
         }
     }
 
@@ -1744,6 +1754,7 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                     *raw_fd,
                     |fd| dup(&self.global, &files, fd, close_on_exec),
                     |fd| dup(&self.global, &files, fd, close_on_exec),
+                    |fd| dup(&self.global, &files, fd, close_on_exec),
                 )?
             }
             Descriptor::Eventfd { file, .. } => Ok(Descriptor::Eventfd {
@@ -1758,18 +1769,6 @@ self.global.pipes                                .update_flags(fd, litebox::pipe
                 file: file.clone(),
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
             }),
-            Descriptor::Socket { file, proxy } => {
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                let new_fd: TypedFd<_> = dt.duplicate(file).ok_or(Errno::EBADF)?;
-                if close_on_exec {
-                    let old = dt.set_fd_metadata(&new_fd, FileDescriptorFlags::FD_CLOEXEC);
-                    assert!(old.is_none());
-                }
-                Ok(Descriptor::Socket {
-                    file: alloc::sync::Arc::new(new_fd),
-                    proxy: proxy.clone(),
-                })
-            }
         }
     }
 
@@ -1918,6 +1917,7 @@ impl Task {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
+            |_fd| todo!("net"),
             |_fd| todo!("pipes"),
         )?
     }

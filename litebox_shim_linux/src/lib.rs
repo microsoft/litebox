@@ -507,10 +507,6 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::unix::UnixSocket>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
-    Socket {
-        file: alloc::sync::Arc<TypedFd<Network<Platform>>>,
-        proxy: alloc::sync::Arc<litebox::net::socket_channel::NetworkProxy<Platform>>,
-    },
 }
 
 /// A strongly-typed FD.
@@ -519,6 +515,7 @@ enum Descriptor {
 /// alongside them (i.e., it is a trivial tagged union across the subsystems being used).
 enum StrongFd {
     FileSystem(Arc<TypedFd<LinuxFS>>),
+    Network(Arc<TypedFd<Network<Platform>>>),
     Pipes(Arc<TypedFd<Pipes<Platform>>>),
 }
 impl StrongFd {
@@ -526,7 +523,7 @@ impl StrongFd {
         match files
             .raw_descriptor_store
             .read()
-            .typed_fd_at_raw_2::<StrongFd, LinuxFS, Pipes<Platform>>(fd)
+            .typed_fd_at_raw_3::<StrongFd, LinuxFS, Network<Platform>, Pipes<Platform>>(fd)
         {
             Ok(r) => Ok(r),
             Err(ErrRawIntFd::InvalidSubsystem) => {
@@ -543,6 +540,11 @@ impl From<Arc<TypedFd<LinuxFS>>> for StrongFd {
         StrongFd::FileSystem(v)
     }
 }
+impl From<Arc<TypedFd<Network<Platform>>>> for StrongFd {
+    fn from(v: Arc<TypedFd<Network<Platform>>>) -> Self {
+        StrongFd::Network(v)
+    }
+}
 impl From<Arc<TypedFd<Pipes<Platform>>>> for StrongFd {
     fn from(v: Arc<TypedFd<Pipes<Platform>>>) -> Self {
         StrongFd::Pipes(v)
@@ -554,10 +556,12 @@ impl syscalls::file::FilesState {
         &self,
         fd: usize,
         fs: impl FnOnce(&TypedFd<LinuxFS>) -> R,
+        net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
         pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
     ) -> Result<R, Errno> {
         match StrongFd::from_raw(self, fd)? {
             StrongFd::FileSystem(fd) => Ok(fs(&fd)),
+            StrongFd::Network(fd) => Ok(net(&fd)),
             StrongFd::Pipes(fd) => Ok(pipes(&fd)),
         }
     }
