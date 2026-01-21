@@ -654,6 +654,39 @@ impl GlobalState {
     ) -> Result<usize, Errno> {
         use litebox::net::socket_channel::SocketChannelError;
 
+        let proxy = self.get_proxy(fd)?;
+
+        // Auto-bind UDP sockets if not already bound (Linux behavior: sendto() on an unbound
+        // UDP socket implicitly binds it to an ephemeral port before sending).
+        // This is mostly lock-free: we only take the network lock if we need to allocate a port.
+        if let Some(0) = proxy.datagram_local_port() {
+            // UDP socket is unbound - bind to an ephemeral port
+            let mut net = self.net.lock();
+            // Bind with port 0 to get an ephemeral port
+            if let Err(err) = net.bind(
+                fd,
+                &SocketAddr::V4(core::net::SocketAddrV4::new(
+                    core::net::Ipv4Addr::UNSPECIFIED,
+                    0,
+                )),
+            ) {
+                match err {
+                    litebox::net::errors::BindError::AlreadyBound => {
+                        // Another thread bound it in the meantime - that's fine
+                    }
+                    litebox::net::errors::BindError::InvalidFd => return Err(Errno::EBADF),
+                    litebox::net::errors::BindError::UnsupportedAddress(_)
+                    | litebox::net::errors::BindError::PortAlreadyInUse(_) => unreachable!(),
+                    _ => unimplemented!(),
+                }
+            }
+            // Get the assigned port
+            let local_addr = net.get_local_addr(fd).map_err(Errno::from)?;
+            // Set the port in the proxy atomically (CAS ensures only one thread wins)
+            // If another thread already set a port, that's fine - we'll use theirs
+            let _ = proxy.set_datagram_local_port(local_addr.port());
+        }
+
         // Convert `SendFlags` to `litebox::net::SendFlags`
         // `DONTWAIT` and `NOSIGNAL` are handled in this function so we don't convert them.
         let new_flags = convert_flags!(
@@ -671,7 +704,6 @@ impl GlobalState {
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
 
-        let proxy = self.get_proxy(fd)?;
         let ret = cx
             .with_timeout(timeout)
             .wait_on_events(
