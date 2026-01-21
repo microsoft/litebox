@@ -5,13 +5,14 @@
 
 use core::panic::PanicInfo;
 use litebox_platform_lvbs::{
-    arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
+    arch::{gdt, get_core_id, interrupts},
     debug_serial_println,
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
     mm::MemoryProvider,
     mshv::{
         hvcall,
-        vtl_switch::vtl_switch_loop_entry,
+        vsm_intercept::raise_vtl0_gp_fault,
+        vtl_switch::{jump_to_vtl_switch_loop_with_stack_cleanup, vtl_switch_loop_entry},
         vtl1_mem_layout::{
             PAGE_SIZE, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
             VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
@@ -105,5 +106,6 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("{}", info);
-    hlt_loop()
+    let _ = raise_vtl0_gp_fault();
+    jump_to_vtl_switch_loop_with_stack_cleanup();
 }
