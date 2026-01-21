@@ -652,8 +652,6 @@ impl GlobalState {
         flags: SendFlags,
         sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
-        use litebox::net::socket_channel::SocketChannelError;
-
         let proxy = self.get_proxy(fd)?;
 
         // Auto-bind UDP sockets if not already bound (Linux behavior: sendto() on an unbound
@@ -716,13 +714,7 @@ impl GlobalState {
                 || match proxy.try_write(buf, new_flags, sockaddr) {
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
-                    Err(SocketChannelError::WouldBlock | SocketChannelError::BufferFull) => {
-                        Err(TryOpError::TryAgain)
-                    }
-                    Err(SocketChannelError::Closed) => Err(TryOpError::Other(Errno::EPIPE)),
-                    Err(SocketChannelError::NotConnected) => {
-                        Err(TryOpError::Other(Errno::ENOTCONN))
-                    }
+                    Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
             .map_err(Errno::from);
@@ -746,8 +738,6 @@ impl GlobalState {
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
-        use litebox::net::socket_channel::SocketChannelError;
-
         let timeout = self.with_socket_options(fd, |opt| opt.recv_timeout);
         let is_nonblock = self.get_status(fd).contains(OFlags::NONBLOCK)
             || flags.contains(ReceiveFlags::DONTWAIT);
@@ -785,18 +775,9 @@ impl GlobalState {
                     Ok(())
                 },
                 || match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
-                    Ok(0) | Err(SocketChannelError::WouldBlock) => Err(TryOpError::TryAgain),
+                    Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
-                    Err(SocketChannelError::Closed) => {
-                        // Socket closed - return 0 to indicate EOF
-                        Ok(0)
-                    }
-                    Err(SocketChannelError::NotConnected) => {
-                        Err(TryOpError::Other(Errno::ENOTCONN))
-                    }
-                    Err(SocketChannelError::BufferFull) => {
-                        unreachable!("BufferFull should not happen on receive");
-                    }
+                    Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
             .map_err(Errno::from)

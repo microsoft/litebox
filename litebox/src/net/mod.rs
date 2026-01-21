@@ -632,10 +632,12 @@ where
                         let Some(remote_endpoint) = destination else {
                             continue;
                         };
-                        assert!(udp_socket.is_open());
+                        debug_assert!(udp_socket.is_open());
                         match udp_socket.send_slice(&data, remote_endpoint) {
-                            Ok(_) => {}
-                            Err(udp::SendError::BufferFull) => {}
+                            Ok(()) => {}
+                            Err(udp::SendError::BufferFull) => {
+                                todo!("handle UDP send buffer full properly");
+                            }
                             Err(udp::SendError::Unaddressable) => unreachable!(),
                         }
                     }
@@ -1361,7 +1363,18 @@ where
                     return Err(SendError::Unaddressable);
                 };
                 let udp_socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
-                assert!(udp_socket.is_open(), "Need to call `bind` before sending");
+                if !udp_socket.is_open() {
+                    let Ok(()) = udp_socket.bind(smoltcp::wire::IpListenEndpoint {
+                        addr: None,
+                        port: self
+                            .local_port_allocator
+                            .ephemeral_port()
+                            .map_err(SendError::PortAllocationFailure)?
+                            .port(),
+                    }) else {
+                        unreachable!("binding to a free port cannot fail")
+                    };
+                }
                 udp_socket
                     .send_slice(buf, remote_endpoint)
                     .map(|()| buf.len())

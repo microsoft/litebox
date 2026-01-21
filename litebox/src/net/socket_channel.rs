@@ -55,11 +55,14 @@ use ringbuf::{
     traits::{Consumer as _, Observer as _, Producer as _, Split as _},
 };
 
-use crate::platform::TimeProvider;
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use crate::{
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
     net::ReceiveFlags,
+};
+use crate::{
+    net::errors::{ReceiveError, SendError},
+    platform::TimeProvider,
 };
 
 /// Socket state flags stored atomically
@@ -122,7 +125,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         buf: &mut [u8],
         flags: super::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
-    ) -> Result<usize, SocketChannelError> {
+    ) -> Result<usize, ReceiveError> {
         match self {
             NetworkProxy::Stream(channel) => channel.try_read(buf, flags, source_addr),
             NetworkProxy::Datagram(channel) => channel.try_read(buf, flags, source_addr),
@@ -139,7 +142,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         buf: &[u8],
         flags: super::SendFlags,
         destination: Option<SocketAddr>,
-    ) -> Result<usize, SocketChannelError> {
+    ) -> Result<usize, SendError> {
         if !flags.is_empty() {
             unimplemented!()
         }
@@ -254,19 +257,6 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     pollee: Pollee<Platform>,
 }
 
-/// Error types for socket channel operations
-#[derive(Debug, Clone, Copy)]
-pub enum SocketChannelError {
-    /// The operation would block
-    WouldBlock,
-    /// The socket is not connected
-    NotConnected,
-    /// The socket is closed
-    Closed,
-    /// Buffer is full (for write operations)
-    BufferFull,
-}
-
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Platform> {
     /// Create a new stream channel with the specified RX and TX buffer capacities.
     fn new(rx_capacity: usize, tx_capacity: usize) -> Self {
@@ -314,15 +304,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         buf: &mut [u8],
         flags: super::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
-    ) -> Result<usize, SocketChannelError> {
+    ) -> Result<usize, ReceiveError> {
         if self.inner.read_shutdown.load(Ordering::Acquire) {
-            return Err(SocketChannelError::Closed);
+            return Err(ReceiveError::SocketInInvalidState);
         }
 
         match self.inner.state() {
             SocketState::Connected => {}
-            SocketState::Closed => return Err(SocketChannelError::Closed),
-            _ => return Err(SocketChannelError::NotConnected),
+            _ => return Err(ReceiveError::SocketInInvalidState),
         }
 
         let mut rx_cons = self.inner.rx_cons.lock();
@@ -353,15 +342,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     ///
     /// Returns the number of bytes written, or an error if the socket is closed,
     /// not connected, or the buffer is full.
-    pub fn try_write(&self, buf: &[u8]) -> Result<usize, SocketChannelError> {
+    pub fn try_write(&self, buf: &[u8]) -> Result<usize, SendError> {
         if self.inner.write_shutdown.load(Ordering::Acquire) {
-            return Err(SocketChannelError::Closed);
+            return Err(SendError::SocketInInvalidState);
         }
 
         match self.state() {
             SocketState::Connected => {}
-            SocketState::Closed => return Err(SocketChannelError::Closed),
-            _ => return Err(SocketChannelError::NotConnected),
+            _ => return Err(SendError::SocketInInvalidState),
         }
 
         let mut tx_prod = self.inner.tx_prod.lock();
@@ -372,7 +360,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
             self.inner.tx_available.fetch_sub(n, Ordering::Release);
             Ok(n)
         } else {
-            Err(SocketChannelError::BufferFull)
+            Err(SendError::BufferFull)
         }
     }
 
@@ -567,8 +555,7 @@ pub struct DatagramMessage {
 ///
 /// # Capacity
 ///
-/// The channel has a fixed queue size for datagrams. When the queue is full,
-/// send operations will fail with [`SocketChannelError::BufferFull`].
+/// The channel has a fixed queue size for datagrams.
 pub struct DatagramSocketChannel<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     inner: DatagramChannelInner<Platform>,
 }
@@ -635,7 +622,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         buf: &mut [u8],
         flags: super::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
-    ) -> Result<usize, SocketChannelError> {
+    ) -> Result<usize, ReceiveError> {
         let mut rx_cons = self.inner.rx_cons.lock();
 
         if let Some(msg) = rx_cons.try_pop() {
@@ -660,7 +647,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
             self.inner.pollee.notify_observers(Events::OUT);
             Ok(n)
         } else {
-            Err(SocketChannelError::WouldBlock)
+            Ok(0)
         }
     }
 
@@ -672,7 +659,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         &self,
         data: alloc::vec::Vec<u8>,
         addr: Option<SocketAddr>,
-    ) -> Result<usize, SocketChannelError> {
+    ) -> Result<usize, SendError> {
+        if let Some(addr) = addr {
+            if addr.port() == 0 {
+                return Err(SendError::Unaddressable);
+            }
+            if addr.ip().is_unspecified() {
+                return Err(SendError::Unaddressable);
+            }
+        }
+
         let size = data.len();
         let msg = DatagramMessage { data, addr };
         let mut tx_prod = self.inner.tx_prod.lock();
@@ -683,7 +679,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
                 self.inner.pollee.notify_observers(Events::IN);
                 Ok(size)
             }
-            Err(_) => Err(SocketChannelError::BufferFull),
+            Err(_) => Err(SendError::BufferFull),
         }
     }
 
@@ -902,12 +898,12 @@ mod tests {
         // Try to read while not connected
         let mut buf = [0u8; 32];
         let result = channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None);
-        assert!(matches!(result, Err(SocketChannelError::Closed)));
+        assert!(matches!(result, Err(ReceiveError::SocketInInvalidState)));
 
         // Try to write while not connected
         let data = b"test";
         let result = channel.try_write(data);
-        assert!(matches!(result, Err(SocketChannelError::Closed)));
+        assert!(matches!(result, Err(SendError::SocketInInvalidState)));
     }
 
     #[test]
@@ -924,7 +920,7 @@ mod tests {
         // Should fail to read
         let mut buf = [0u8; 32];
         let result = channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None);
-        assert!(matches!(result, Err(SocketChannelError::Closed)));
+        assert!(matches!(result, Err(ReceiveError::SocketInInvalidState)));
     }
 
     #[test]
@@ -937,7 +933,7 @@ mod tests {
 
         // Should fail to write
         let result = channel.try_write(b"data");
-        assert!(matches!(result, Err(SocketChannelError::Closed)));
+        assert!(matches!(result, Err(SendError::SocketInInvalidState)));
     }
 
     #[test]
@@ -1091,7 +1087,7 @@ mod tests {
         // Try to read when empty
         let mut buf = [0u8; 64];
         let result = channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None);
-        assert!(matches!(result, Err(SocketChannelError::WouldBlock)));
+        assert!(matches!(result, Ok(0)));
     }
 
     #[test]
@@ -1108,7 +1104,7 @@ mod tests {
 
         // Next send should fail
         let result = channel.send_to(alloc::vec![99], None);
-        assert!(matches!(result, Err(SocketChannelError::BufferFull)));
+        assert!(matches!(result, Err(SendError::BufferFull)));
     }
 
     #[test]
