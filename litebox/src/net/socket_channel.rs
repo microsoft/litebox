@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Lock-free socket channels using ringbuf for decoupling user I/O from network processing.
 //!
 //! This module provides a channel-based design for socket data transfer that eliminates
