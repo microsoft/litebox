@@ -540,11 +540,7 @@ where
     fn drain_all_socket_channel_buffers(&mut self) {
         let table = self.litebox.descriptor_table();
         for (_, entry) in table.iter::<Network<Platform>>() {
-            Self::drain_socket_channel_buffers(
-                &mut self.socket_set,
-                &entry.entry,
-                &mut self.local_port_allocator,
-            );
+            Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry);
         }
     }
 
@@ -557,7 +553,6 @@ where
     fn drain_socket_channel_buffers(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         socket_handle: &SocketHandle<Platform>,
-        port_allocator: &mut LocalPortAllocator,
     ) {
         let proxy = match &socket_handle.proxy {
             Some(proxy) => proxy.as_ref(),
@@ -623,20 +618,30 @@ where
                 }
             }
             (Protocol::Udp, NetworkProxy::Datagram(udp_proxy)) => {
+                let udp_socket = socket_set.get_mut::<udp::Socket>(socket_handle.handle);
                 // Drain TX queue: pop datagrams from channel, send via smoltcp
                 while udp_proxy.has_pending_tx() {
                     if let Some(datagram) = udp_proxy.pop_datagram() {
                         let DatagramMessage { data, addr } = datagram;
-                        if Network::do_send(socket_set, socket_handle, port_allocator, &data, addr)
-                            .is_err()
-                        {
-                            break;
+                        let destination = addr
+                            .map(|s| match s {
+                                SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::from(addr),
+                                SocketAddr::V6(_) => unimplemented!(),
+                            })
+                            .or_else(|| socket_handle.udp().remote_endpoint);
+                        let Some(remote_endpoint) = destination else {
+                            continue;
+                        };
+                        assert!(udp_socket.is_open());
+                        match udp_socket.send_slice(&data, remote_endpoint) {
+                            Ok(_) => {}
+                            Err(udp::SendError::BufferFull) => {}
+                            Err(udp::SendError::Unaddressable) => unreachable!(),
                         }
                     }
                 }
 
                 // Drain RX: receive from smoltcp, push to channel
-                let udp_socket = socket_set.get_mut::<udp::Socket>(socket_handle.handle);
                 while !udp_proxy.is_rx_full() {
                     match udp_socket.recv() {
                         Ok((data, meta)) => {
@@ -1314,58 +1319,6 @@ where
         }
     }
 
-    fn do_send(
-        socket_set: &mut smoltcp::iface::SocketSet,
-        socket_handle: &SocketHandle<Platform>,
-        port_allocator: &mut local_ports::LocalPortAllocator,
-        buf: &[u8],
-        destination: Option<SocketAddr>,
-    ) -> Result<usize, SendError> {
-        match socket_handle.protocol() {
-            Protocol::Tcp => {
-                if destination.is_some() {
-                    // TCP is connection-oriented, so no destination address should be provided
-                    return Err(SendError::UnnecessaryDestinationAddress);
-                }
-                socket_set
-                    .get_mut::<tcp::Socket>(socket_handle.handle)
-                    .send_slice(buf)
-                    .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState)
-            }
-            Protocol::Udp => {
-                let destination = destination
-                    .map(|s| match s {
-                        SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::from(addr),
-                        SocketAddr::V6(_) => unimplemented!(),
-                    })
-                    .or_else(|| socket_handle.udp().remote_endpoint);
-                let Some(remote_endpoint) = destination else {
-                    return Err(SendError::Unaddressable);
-                };
-                let udp_socket: &mut udp::Socket = socket_set.get_mut(socket_handle.handle);
-                if !udp_socket.is_open() {
-                    let Ok(()) = udp_socket.bind(smoltcp::wire::IpListenEndpoint {
-                        addr: None,
-                        port: port_allocator
-                            .ephemeral_port()
-                            .map_err(SendError::PortAllocationFailure)?
-                            .port(),
-                    }) else {
-                        unreachable!("binding to a free port cannot fail")
-                    };
-                }
-                udp_socket
-                    .send_slice(buf, remote_endpoint)
-                    .map(|()| buf.len())
-                    .map_err(|e| match e {
-                        udp::SendError::BufferFull => SendError::BufferFull,
-                        udp::SendError::Unaddressable => SendError::Unaddressable,
-                    })
-            }
-            Protocol::Icmp => unimplemented!(),
-            Protocol::Raw { protocol: _ } => unimplemented!(),
-        }
-    }
     /// Send data over a socket, optionally specifying the destination address.
     ///
     /// If the socket is connection-mode and the destination address is provided,
@@ -1386,13 +1339,40 @@ where
             unimplemented!()
         }
 
-        let ret = Self::do_send(
-            &mut self.socket_set,
-            socket_handle,
-            &mut self.local_port_allocator,
-            buf,
-            destination,
-        );
+        let ret = match socket_handle.protocol() {
+            Protocol::Tcp => {
+                if destination.is_some() {
+                    // TCP is connection-oriented, so no destination address should be provided
+                    return Err(SendError::UnnecessaryDestinationAddress);
+                }
+                self.socket_set
+                    .get_mut::<tcp::Socket>(socket_handle.handle)
+                    .send_slice(buf)
+                    .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState)
+            }
+            Protocol::Udp => {
+                let destination = destination
+                    .map(|s| match s {
+                        SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::from(addr),
+                        SocketAddr::V6(_) => unimplemented!(),
+                    })
+                    .or_else(|| socket_handle.udp().remote_endpoint);
+                let Some(remote_endpoint) = destination else {
+                    return Err(SendError::Unaddressable);
+                };
+                let udp_socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                assert!(udp_socket.is_open(), "Need to call `bind` before sending");
+                udp_socket
+                    .send_slice(buf, remote_endpoint)
+                    .map(|()| buf.len())
+                    .map_err(|e| match e {
+                        udp::SendError::BufferFull => SendError::BufferFull,
+                        udp::SendError::Unaddressable => SendError::Unaddressable,
+                    })
+            }
+            Protocol::Icmp => unimplemented!(),
+            Protocol::Raw { protocol: _ } => unimplemented!(),
+        };
 
         drop(table_entry);
         drop(descriptor_table);
