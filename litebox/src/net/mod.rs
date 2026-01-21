@@ -373,7 +373,7 @@ pub enum PlatformInteraction {
 
 /// Direction of polling for platform interaction
 #[derive(Clone, Copy)]
-pub enum PollDirection {
+enum PollDirection {
     /// Ingress (receiving) direction
     Ingress,
     /// Egress (sending) direction
@@ -455,7 +455,7 @@ where
     /// Return a _soft timeout_ (duration to wait) before calling [`Self::perform_platform_interaction`] again.
     ///
     /// Returns `None` if there is no pending timeout (i.e., no scheduled work requiring network operations).
-    pub fn poll_at(&mut self) -> Option<core::time::Duration> {
+    fn poll_at(&mut self) -> Option<core::time::Duration> {
         let timestamp = self.now();
         self.interface
             .poll_at(timestamp, &self.socket_set)
@@ -470,7 +470,7 @@ where
     }
 
     /// (Internal-only API) Actually perform the queued interactions with the outside world.
-    pub fn internal_perform_platform_interaction(&mut self) -> smoltcp::iface::PollResult {
+    fn internal_perform_platform_interaction(&mut self) -> smoltcp::iface::PollResult {
         self.attempt_to_close_queued();
         self.remove_dead_sockets();
         self.close_pending_sockets();

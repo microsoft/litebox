@@ -59,9 +59,6 @@ use crate::{
     net::ReceiveFlags,
 };
 
-/// Default buffer size for socket channels (256 KB)
-const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 256 * 1024;
-
 /// Socket state flags stored atomically
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -503,11 +500,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
 
 /// Create a new stream socket channel with default buffer sizes.
 ///
-/// The channel is created with default buffer sizes for both
+/// The channel is created with default buffer sizes [`super::SOCKET_BUFFER_SIZE`] for both
 /// RX and TX buffers.
 pub fn new_stream_channel<Platform: RawSyncPrimitivesProvider + TimeProvider>()
 -> StreamSocketChannel<Platform> {
-    new_stream_channel_with_capacity(DEFAULT_CHANNEL_BUFFER_SIZE, DEFAULT_CHANNEL_BUFFER_SIZE)
+    new_stream_channel_with_capacity(super::SOCKET_BUFFER_SIZE, super::SOCKET_BUFFER_SIZE)
 }
 
 /// Create a new stream socket channel with specified buffer capacities.
