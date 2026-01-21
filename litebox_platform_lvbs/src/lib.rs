@@ -825,15 +825,18 @@ macro_rules! RESTORE_CALLEE_SAVED_REGISTERS_ASM {
     };
 }
 
-/// Save user context to the memory area pointed by the current stack pointer (`rsp`).
+/// Save user context right after `syscall`-driven mode transition to the memory area
+/// pointed by the current stack pointer (`rsp`).
 ///
-/// `rsp` can point to a real stack or the *top address* of a memory area which
+/// `rsp` can point to the current CPU stack or the *top address* of a memory area which
 /// has enough space for storing the `PtRegs` structure using the `push` instructions
 /// (i.e., from high addresses down to low ones).
 ///
-/// Prerequisite: `r11` contains user `rsp`.
+/// Prerequisite:
+/// - Store user `rsp` in `r11` before calling this macro.
+/// - Store the userspace return address in `rcx` (`syscall` does this automatically).
 #[cfg(target_arch = "x86_64")]
-macro_rules! SAVE_USER_CONTEXT_ASM {
+macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
     () => {
         "
         push 0x2b       // pt_regs->ss = __USER_DS
@@ -866,7 +869,7 @@ macro_rules! SAVE_USER_CONTEXT_ASM {
 /// This macro uses the `pop` instructions (i.e., from low addresses up to high ones) such that
 /// it requires the start address of the memory area (not the top one).
 ///
-/// Prerequisite: The memory area has `PtRegs` structure saved by `SAVE_USER_CONTEXT_ASM`.
+/// Prerequisite: The memory area has `PtRegs` structure containing user context.
 #[cfg(target_arch = "x86_64")]
 macro_rules! RESTORE_USER_CONTEXT_ASM {
     () => {
@@ -912,9 +915,9 @@ unsafe extern "C" fn run_thread_arch(
         ".globl syscall_callback",
         "syscall_callback:",
         "swapgs",
-        "mov r11, rsp",
-        "mov rsp, gs:[{user_context_top_off}]",
-        SAVE_USER_CONTEXT_ASM!(),
+        "mov r11, rsp", // store user `rsp` in `r11`
+        "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
+        SAVE_SYSCALL_USER_CONTEXT_ASM!(),
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
         // Handle the syscall. This will jump back to the user but
