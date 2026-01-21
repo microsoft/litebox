@@ -15,13 +15,11 @@ use std::time::Duration;
 use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
-use litebox::platform::vmap::{
-    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
-};
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
+use litebox_common_optee::vmap::{PhysPageAddr, PhysPageMapInfo, VmapProvider};
 
 mod syscall_intercept;
 
@@ -2200,29 +2198,29 @@ impl<const ALIGN: usize> VmapProvider<ALIGN> for LinuxUserland {
 
     type PhysPageMapInfo = PhysPageMapInfo<ALIGN>;
 
-    unsafe fn vmap(
-        &self,
-        _pages: Self::PhysPageAddrArray,
-        _perms: PhysPageMapPermissions,
-    ) -> Result<Self::PhysPageMapInfo, PhysPointerError> {
-        Err(PhysPointerError::UnsupportedOperation)
-    }
+    // unsafe fn vmap(
+    //     &self,
+    //     _pages: Self::PhysPageAddrArray,
+    //     _perms: PhysPageMapPermissions,
+    // ) -> Result<Self::PhysPageMapInfo, PhysPointerError> {
+    //     Err(PhysPointerError::UnsupportedOperation)
+    // }
 
-    unsafe fn vunmap(&self, _vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError> {
-        Err(PhysPointerError::UnsupportedOperation)
-    }
+    // unsafe fn vunmap(&self, _vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError> {
+    //     Err(PhysPointerError::UnsupportedOperation)
+    // }
 
-    fn validate(&self, _pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError> {
-        Err(PhysPointerError::UnsupportedOperation)
-    }
+    // fn validate(&self, _pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError> {
+    //     Err(PhysPointerError::UnsupportedOperation)
+    // }
 
-    unsafe fn protect(
-        &self,
-        _pages: Self::PhysPageAddrArray,
-        _perms: PhysPageMapPermissions,
-    ) -> Result<(), PhysPointerError> {
-        Err(PhysPointerError::UnsupportedOperation)
-    }
+    // unsafe fn protect(
+    //     &self,
+    //     _pages: Self::PhysPageAddrArray,
+    //     _perms: PhysPageMapPermissions,
+    // ) -> Result<(), PhysPointerError> {
+    //     Err(PhysPointerError::UnsupportedOperation)
+    // }
 }
 
 #[cfg(test)]

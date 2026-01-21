@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::platform::page_mgmt::MemoryRegionPermissions;
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use thiserror::Error;
 
 /// A provider to map and unmap physical pages with virtually contiguous addresses.
@@ -34,9 +34,11 @@ pub trait VmapProvider<const ALIGN: usize> {
     /// physical pages, so the implementation should safely handle such cases.
     unsafe fn vmap(
         &self,
-        pages: Self::PhysPageAddrArray,
-        perms: PhysPageMapPermissions,
-    ) -> Result<Self::PhysPageMapInfo, PhysPointerError>;
+        _pages: Self::PhysPageAddrArray,
+        _perms: PhysPageMapPermissions,
+    ) -> Result<Self::PhysPageMapInfo, PhysPointerError> {
+        Err(PhysPointerError::UnsupportedOperation)
+    }
 
     /// Unmap the previously mapped virtually contiguous addresses ([`PhysPageMapInfo`]).
     /// Use `&self` to access and update the page table.
@@ -47,7 +49,9 @@ pub trait VmapProvider<const ALIGN: usize> {
     ///
     /// The caller should ensure that the virtual addresses in `vmap_info` are not in active
     /// use by other entities.
-    unsafe fn vunmap(&self, vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError>;
+    unsafe fn vunmap(&self, _vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError> {
+        Err(PhysPointerError::UnsupportedOperation)
+    }
 
     /// Validate that the given physical pages do not belong to LiteBox-owned memory.
     /// Use `&self` to get the memory layout of the platform (i.e., the physical memory
@@ -56,7 +60,9 @@ pub trait VmapProvider<const ALIGN: usize> {
     /// This function is a no-op if there is no other world or VM sharing the physical memory.
     ///
     /// Returns `Ok(())` if valid. If the pages are not valid, returns `Err(PhysPointerError)`.
-    fn validate(&self, pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError>;
+    fn validate(&self, _pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError> {
+        Ok(())
+    }
 
     /// Protect the given physical pages to ensure concurrent read or exclusive write access:
     /// - Read protection: prevent others from writing to the pages.
@@ -76,9 +82,11 @@ pub trait VmapProvider<const ALIGN: usize> {
     /// Also, the caller should unprotect the pages when they are no longer needed to be protected.
     unsafe fn protect(
         &self,
-        pages: Self::PhysPageAddrArray,
-        perms: PhysPageMapPermissions,
-    ) -> Result<(), PhysPointerError>;
+        _pages: Self::PhysPageAddrArray,
+        _perms: PhysPageMapPermissions,
+    ) -> Result<(), PhysPointerError> {
+        Ok(())
+    }
 }
 
 /// Data structure representing a physical address with page alignment.
@@ -87,7 +95,7 @@ pub trait VmapProvider<const ALIGN: usize> {
 /// we selectively conduct sanity checks based on whether an address is virtual or physical
 /// (e.g., whether a virtual address is canonical, whether a physical address is tagged with
 /// a valid key ID, etc.).
-pub type PhysPageAddr<const ALIGN: usize> = crate::mm::linux::NonZeroAddress<ALIGN>;
+pub type PhysPageAddr<const ALIGN: usize> = litebox::mm::linux::NonZeroAddress<ALIGN>;
 
 /// Data structure to maintain the mapping information returned by `vmap()`.
 ///

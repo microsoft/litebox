@@ -16,9 +16,6 @@ use core::{
     sync::atomic::{AtomicU32, AtomicU64},
 };
 use litebox::platform::page_mgmt::DeallocationError;
-use litebox::platform::vmap::{
-    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
-};
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
     Punchthrough, RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
@@ -28,6 +25,9 @@ use litebox::platform::{
 };
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
+use litebox_common_optee::vmap::{
+    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
+};
 use x86_64::structures::paging::{
     PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
     mapper::MapToError,

@@ -19,10 +19,9 @@ use crate::NormalWorldConstPtr;
 use alloc::{boxed::Box, vec::Vec};
 use hashbrown::HashMap;
 use litebox::mm::linux::PAGE_SIZE;
-use litebox::platform::vmap::PhysPageAddr;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArg, OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction,
-    OpteeSmcResult, OpteeSmcReturn,
+    OpteeSmcResult, OpteeSmcReturn, vmap::PhysPageAddr,
 };
 use once_cell::race::OnceBox;
 
