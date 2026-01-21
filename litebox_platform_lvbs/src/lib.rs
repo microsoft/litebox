@@ -787,6 +787,9 @@ fn run_thread_inner(
 ) {
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
+    // `thread_ctx` will be passed to `syscall_handler` later.
+    // `ctx_ptr` is to let `run_thread_arch` easily access `ctx` (i.e., not to deal with
+    // member variable offset calculation in assembly code).
     unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr) };
 }
 
@@ -822,41 +825,48 @@ macro_rules! RESTORE_CALLEE_SAVED_REGISTERS_ASM {
     };
 }
 
-/// Save user context onto the stack.
+/// Save user context to the memory area pointed by the current stack pointer (`rsp`).
 ///
-/// Prerequisite: The stack is reserved for `PtRegs` and `r11` contains user `rsp`.
+/// `rsp` can point to a real stack or the *top address* of a memory area which
+/// has enough space for storing the `PtRegs` structure using the `push` instructions
+/// (i.e., from high addresses down to low ones).
+///
+/// Prerequisite: `r11` contains user `rsp`.
 #[cfg(target_arch = "x86_64")]
 macro_rules! SAVE_USER_CONTEXT_ASM {
     () => {
         "
-        push 0x33 // USER_DS
-        push r11 // r11 has user rsp
-        pushfq
-        push 0x2b // USER_CS
-        push rcx // rip
-        push rax // orig_rax
-        push rdi
-        push rsi
-        push rdx
-        push rcx
-        push -38
-        push r8
-        push r9
-        push r10
-        push [rsp + 88]
-        push rbx
-        push rbp
-        push r12
-        push r13
-        push r14
-        push r15
+        push 0x2b       // pt_regs->ss = __USER_DS
+        push r11        // pt_regs->rsp
+        pushfq          // pt_regs->eflags
+        push 0x33       // pt_regs->cs = __USER_CS
+        push rcx        // pt_regs->rip
+        push rax        // pt_regs->orig_rax
+        push rdi        // pt_regs->rdi
+        push rsi        // pt_regs->rsi
+        push rdx        // pt_regs->rdx
+        push rcx        // pt_regs->rcx
+        push -38        // pt_regs->rax = -ENOSYS
+        push r8         // pt_regs->r8
+        push r9         // pt_regs->r9
+        push r10        // pt_regs->r10
+        push [rsp + 88] // pt_regs->r11 = rflags
+        push rbx        // pt_regs->rbx
+        push rbp        // pt_regs->rbp
+        push r12        // pt_regs->r12
+        push r13        // pt_regs->r13
+        push r14        // pt_regs->r14
+        push r15        // pt_regs->r15
         "
     };
 }
 
-/// Restore user context from the stack.
+/// Restore user context from the memory area pointed by the current `rsp`.
 ///
-/// Prerequisite: The stack has `PtRegs` structure saved by `SAVE_USER_CONTEXT_ASM`.
+/// This macro uses the `pop` instructions (i.e., from low addresses up to high ones) such that
+/// it requires the start address of the memory area (not the top one).
+///
+/// Prerequisite: The memory area has `PtRegs` structure saved by `SAVE_USER_CONTEXT_ASM`.
 #[cfg(target_arch = "x86_64")]
 macro_rules! RESTORE_USER_CONTEXT_ASM {
     () => {
@@ -876,7 +886,7 @@ macro_rules! RESTORE_USER_CONTEXT_ASM {
         pop rdx
         pop rsi
         pop rdi
-        add rsp, 8 // skip orig_rax
+        add rsp, 8 // skip pt_regs->orig_rax
         // Stack already has all the values needed for iretq (rip, cs, flags, rsp, ds)
         // from the `PtRegs` structure.
         "
@@ -891,8 +901,8 @@ unsafe extern "C" fn run_thread_arch(
 ) {
     core::arch::naked_asm!(
         SAVE_CALLEE_SAVED_REGISTERS_ASM!(),
-        "push rdi", // save thread context
-        // Save kernel rsp and rbp and user context top in TLS.
+        "push rdi", // save `thread_ctx`
+        // Save kernel rsp and rbp and user context top in PerCpuVariablesAsm.
         "mov gs:[{cur_kernel_sp_off}], rsp",
         "mov gs:[{cur_kernel_bp_off}], rbp",
         "lea r8, [rsi + {USER_CONTEXT_SIZE}]",
@@ -907,7 +917,9 @@ unsafe extern "C" fn run_thread_arch(
         SAVE_USER_CONTEXT_ASM!(),
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
-        "mov rdi, [rsp]", // pass thread context
+        // Handle the syscall. This will jump back to the user but
+        // will return if the thread is exiting.
+        "mov rdi, [rsp]", // pass `thread_ctx`
         "call {syscall_handler}",
         "jmp done",
         // Exception and interrupt callback placeholders
@@ -947,7 +959,6 @@ impl ThreadContext<'_> {
             &mut litebox_common_linux::PtRegs,
         ) -> ContinueOperation,
     ) {
-        // TODO: clear the interrupt flag before calling the shim
         let op = f(self.shim, self.ctx);
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_user(self.ctx) },
