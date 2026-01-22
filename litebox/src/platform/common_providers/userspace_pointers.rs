@@ -101,10 +101,7 @@ impl<V, T: Clone> core::fmt::Debug for UserConstPtr<V, T> {
 ///
 /// Note that this is fallible only if recovering from exceptions (e.g., page fault or SIGSEGV)
 /// is supported.
-unsafe fn read_at_offset<'a, V: ValidateAccess, T: Clone>(
-    ptr: *const T,
-    count: isize,
-) -> Option<alloc::borrow::Cow<'a, T>> {
+unsafe fn read_at_offset<V: ValidateAccess, T: Clone>(ptr: *const T, count: isize) -> Option<T> {
     let src = unsafe { ptr.add(usize::try_from(count).ok()?) };
     let src = V::validate(src.cast_mut())?.cast_const();
     // Match on the size of `T` to use the appropriate fallible read function to
@@ -139,18 +136,18 @@ unsafe fn read_at_offset<'a, V: ValidateAccess, T: Clone>(
             }
         }
     };
-    Some(alloc::borrow::Cow::Owned(val))
+    Some(val)
 }
 
-unsafe fn to_cow_slice<'a, V: ValidateAccess, T: Clone>(
+unsafe fn to_owned_slice<V: ValidateAccess, T: Clone>(
     ptr: *const T,
     len: usize,
-) -> Option<alloc::borrow::Cow<'a, [T]>> {
+) -> Option<alloc::boxed::Box<[T]>> {
     if len == 0 {
-        return Some(alloc::borrow::Cow::Owned(alloc::vec::Vec::new()));
+        return Some(alloc::boxed::Box::new([]));
     }
     let ptr = V::validate_slice(core::ptr::slice_from_raw_parts(ptr, len).cast_mut())?.cast_const();
-    let mut data = alloc::vec::Vec::<T>::with_capacity(len);
+    let mut data = alloc::boxed::Box::<[T]>::new_uninit_slice(len);
     unsafe {
         memcpy_fallible(
             data.as_mut_ptr().cast(),
@@ -158,18 +155,17 @@ unsafe fn to_cow_slice<'a, V: ValidateAccess, T: Clone>(
             len * core::mem::size_of::<T>(),
         )
         .ok()?;
-        data.set_len(len);
+        Some(data.assume_init())
     }
-    Some(alloc::borrow::Cow::Owned(data))
 }
 
 impl<V: ValidateAccess, T: Clone> RawConstPointer<T> for UserConstPtr<V, T> {
-    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
+    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
         unsafe { read_at_offset::<V, T>(self.inner, count) }
     }
 
-    unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
-        unsafe { to_cow_slice::<V, T>(self.inner, len) }
+    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
+        unsafe { to_owned_slice::<V, T>(self.inner, len) }
     }
 
     fn as_usize(&self) -> usize {
@@ -214,12 +210,12 @@ impl<V, T> Clone for UserMutPtr<V, T> {
 impl<V, T> Copy for UserMutPtr<V, T> {}
 
 impl<V: ValidateAccess, T: Clone> RawConstPointer<T> for UserMutPtr<V, T> {
-    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>> {
+    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
         unsafe { read_at_offset::<V, T>(self.inner.cast_const(), count) }
     }
 
-    unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>> {
-        unsafe { to_cow_slice::<V, T>(self.inner.cast_const(), len) }
+    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
+        unsafe { to_owned_slice::<V, T>(self.inner.cast_const(), len) }
     }
 
     fn as_usize(&self) -> usize {

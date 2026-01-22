@@ -2895,21 +2895,15 @@ impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
                 Duration::from_millis(s)
             }
             TimeParam::TimeVal(tv) => {
-                let tv = unsafe { tv.read_at_offset(0) }
-                    .ok_or(errno::Errno::EFAULT)?
-                    .into_owned();
+                let tv = unsafe { tv.read_at_offset(0) }.ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(tv).map_err(|_| errno::Errno::EINVAL)?
             }
             TimeParam::Timespec32(ts) => {
-                let ts = unsafe { ts.read_at_offset(0) }
-                    .ok_or(errno::Errno::EFAULT)?
-                    .into_owned();
+                let ts = unsafe { ts.read_at_offset(0) }.ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(ts).map_err(|_| errno::Errno::EINVAL)?
             }
             TimeParam::Timespec64(ts) => {
-                let ts = unsafe { ts.read_at_offset(0) }
-                    .ok_or(errno::Errno::EFAULT)?
-                    .into_owned();
+                let ts = unsafe { ts.read_at_offset(0) }.ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(ts).map_err(|_| errno::Errno::EINVAL)?
             }
         };

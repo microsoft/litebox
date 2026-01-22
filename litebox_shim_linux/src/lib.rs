@@ -690,10 +690,12 @@ impl Task {
                     })
                 }
             }
-            SyscallRequest::Write { fd, buf, count } => match unsafe { buf.to_cow_slice(count) } {
-                Some(buf) => self.sys_write(fd, &buf, None),
-                None => Err(Errno::EFAULT),
-            },
+            SyscallRequest::Write { fd, buf, count } => {
+                match unsafe { buf.to_owned_slice(count) } {
+                    Some(buf) => self.sys_write(fd, &buf, None),
+                    None => Err(Errno::EFAULT),
+                }
+            }
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
@@ -731,7 +733,7 @@ impl Task {
                 buf,
                 count,
                 offset,
-            } => match unsafe { buf.to_cow_slice(count) } {
+            } => match unsafe { buf.to_owned_slice(count) } {
                 Some(buf) => self.sys_pwrite64(fd, &buf, offset),
                 None => Err(Errno::EFAULT),
             },
@@ -1042,8 +1044,7 @@ impl Task {
                 {
                     unsafe { user_desc.read_at_offset(0) }
                         .ok_or(Errno::EFAULT)
-                        .and_then(|desc| {
-                            let mut desc = desc.into_owned();
+                        .and_then(|mut desc| {
                             let idx = desc.entry_number;
                             self.set_thread_area(&mut desc)?;
                             if idx == u32::MAX {

@@ -408,99 +408,48 @@ where
     ///
     /// # Safety
     ///
-    /// The pointer (and underlying memory for the value at the offset) should remain valid and
-    /// unchanged for the entirety of the lifetime that the borrow (if any) is made.
-    unsafe fn read_at_offset<'a>(self, count: isize) -> Option<alloc::borrow::Cow<'a, T>>;
+    /// The pointer (and underlying memory for the value at the offset) should be valid for T.
+    unsafe fn read_at_offset(self, count: isize) -> Option<T>;
 
-    /// Read the pointer as a slice of memory.
+    /// Read the pointer as an owned slice of memory.
     ///
     /// Returns `None` if the provided pointer is invalid, or such a slice is known (in advance) to
     /// be invalid.
     ///
-    /// This function returns a clone-on-write slice, which might be a borrow or an owned slice. Any
-    /// user of this function that better guarantees on safety (e.g., that the underlying data does
-    /// not change due to threading, and that the lifetimes are maintained well) should invoke the
-    /// safer [`to_owned_slice`](Self::to_owned_slice) instead (at the cost of a _guaranteed_
-    /// `memcpy`, unlike this function which can sometimes elide the cost of a `memcpy`).
-    ///
     /// # Safety
     ///
-    /// The pointer (and underlying memory for each element of the slice) should remain valid and
-    /// unchanged for the entirety of the lifetime that the borrow (if any) is made.
-    unsafe fn to_cow_slice<'a>(self, len: usize) -> Option<alloc::borrow::Cow<'a, [T]>>;
-
-    /// Read the pointer as an owned slice of memory.
-    ///
-    /// Safer variant of [`to_cow_slice`](Self::to_cow_slice), at the cost of a guaranteed `memcpy`.
-    fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        Some(unsafe { self.to_cow_slice(len) }?.into_owned().into())
-    }
-
-    /// Read the pointer as a C string.
-    ///
-    /// Returns `None` if the provided pointer is invalid, or such a string is known (in advance) to
-    /// be invalid.
-    ///
-    /// This function, similar to [`to_cow_slice`](Self::to_cow_slice) returns a clone-on-write
-    /// slice. Similarly, see the safer [`to_cstring`](Self::to_cstring).
-    ///
-    /// # Safety
-    ///
-    /// The pointer (and underlying memory for each element until the `\0` character) should remain
-    /// valid and unchanged for the entirety of the lifetime that the borrow (if any) is made.
-    unsafe fn to_cow_cstr<'a>(self) -> Option<alloc::borrow::Cow<'a, core::ffi::CStr>>
-    where
-        T: core::cmp::PartialEq<core::ffi::c_char>,
-        Self: RawConstPointer<core::ffi::c_char>,
-    {
-        use alloc::borrow::Cow;
-        use alloc::boxed::Box;
-        use alloc::vec::Vec;
-        use core::ffi::c_char;
-        let nul_position = {
-            let mut i = 0isize;
-            while *unsafe { <Self as RawConstPointer<T>>::read_at_offset(self, i) }? != 0 {
-                i = i.checked_add(1)?;
-            }
-            i
-        };
-        let len = nul_position.checked_add(1)?.try_into().ok()?;
-        let slice: Cow<[c_char]> = unsafe { self.to_cow_slice(len) }?;
-        match slice {
-            Cow::Borrowed(bytes) => {
-                // Since we know it is a `[c_char]` (which is guaranteed to be i8 or u8 on modern
-                // architectures, see https://doc.rust-lang.org/core/ffi/type.c_char.html), this is
-                // always safe to transmute into a `[u8]`.
-                let bytes = core::ptr::from_ref(bytes) as *const [u8];
-                core::ffi::CStr::from_bytes_with_nul(unsafe { &*bytes })
-                    .ok()
-                    .map(Cow::Borrowed)
-            }
-            Cow::Owned(bytes) => {
-                // Doing a direct transmut of `Vec<c_char>` to `Vec<u8>` may not be guaranteed to be
-                // safe (it probably is fine, but the following sequence of steps ensures we are
-                // staying in a very safe subset).
-                let bytes: Box<[c_char]> = bytes.into_boxed_slice();
-                let bytes: *mut [c_char] = Box::into_raw(bytes);
-                let bytes: *mut [u8] = bytes as *mut [u8];
-                let bytes: Box<[u8]> = unsafe { Box::from_raw(bytes) };
-                let bytes: Vec<u8> = Vec::from(bytes);
-                alloc::ffi::CString::from_vec_with_nul(bytes)
-                    .ok()
-                    .map(Cow::Owned)
-            }
-        }
-    }
+    /// The pointer (and underlying memory for `len` elements of type T) should be valid.
+    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>>;
 
     /// Read the pointer as an owned C string.
     ///
-    /// Safer variant of [`to_cow_cstr`](Self::to_cow_cstr), at the cost of a guaranteed `memcpy`.
+    /// Returns `None` if the provided pointer is invalid, or such a string is known (in advance) to
+    /// be invalid.
     fn to_cstring(self) -> Option<alloc::ffi::CString>
     where
         T: core::cmp::PartialEq<core::ffi::c_char>,
         Self: RawConstPointer<core::ffi::c_char>,
     {
-        Some(unsafe { <Self as RawConstPointer<T>>::to_cow_cstr(self) }?.into_owned())
+        use alloc::boxed::Box;
+        use alloc::vec::Vec;
+        use core::ffi::c_char;
+        let nul_position = {
+            let mut i = 0isize;
+            while unsafe { <Self as RawConstPointer<T>>::read_at_offset(self, i) }? != 0 {
+                i = i.checked_add(1)?;
+            }
+            i
+        };
+        let len = nul_position.checked_add(1)?.try_into().ok()?;
+        let bytes: Box<[c_char]> = unsafe { self.to_owned_slice(len) }?;
+        // Doing a direct transmute of `Box<[c_char]>` to `Box<[u8]>` may not be guaranteed to be
+        // safe (it probably is fine, but the following sequence of steps ensures we are
+        // staying in a very safe subset).
+        let bytes: *mut [c_char] = Box::into_raw(bytes);
+        let bytes: *mut [u8] = bytes as *mut [u8];
+        let bytes: Box<[u8]> = unsafe { Box::from_raw(bytes) };
+        let bytes: Vec<u8> = Vec::from(bytes);
+        alloc::ffi::CString::from_vec_with_nul(bytes).ok()
     }
 }
 

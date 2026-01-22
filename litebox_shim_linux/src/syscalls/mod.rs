@@ -65,7 +65,5 @@ fn read_from_user<T: Clone>(
         return Err(litebox_common_linux::errno::Errno::EINVAL);
     }
     let optval: crate::ConstPtr<T> = crate::ConstPtr::from_usize(optval.as_usize());
-    unsafe { optval.read_at_offset(0) }
-        .ok_or(litebox_common_linux::errno::Errno::EFAULT)
-        .map(alloc::borrow::Cow::into_owned)
+    unsafe { optval.read_at_offset(0) }.ok_or(litebox_common_linux::errno::Errno::EFAULT)
 }

@@ -477,7 +477,7 @@ impl Task {
             return Err(Errno::EBADF);
         };
         let iovs: &[IoReadVec<MutPtr<u8>>] =
-            unsafe { &iovec.to_cow_slice(iovcnt).ok_or(Errno::EFAULT)? };
+            &unsafe { iovec.to_owned_slice(iovcnt) }.ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         let locked_file_descriptors = files.file_descriptors.read();
         let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
@@ -540,7 +540,7 @@ where
         if iov.iov_len == 0 {
             continue;
         }
-        let slice = unsafe { iov.iov_base.to_cow_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
+        let slice = unsafe { iov.iov_base.to_owned_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
         let size = write_fn(&slice)?;
         total_written += size;
         if size < iov.iov_len {
@@ -563,7 +563,7 @@ impl Task {
             return Err(Errno::EBADF);
         };
         let iovs: &[IoWriteVec<ConstPtr<u8>>] =
-            unsafe { &iovec.to_cow_slice(iovcnt).ok_or(Errno::EFAULT)? };
+            &unsafe { iovec.to_owned_slice(iovcnt) }.ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         let locked_file_descriptors = files.file_descriptors.read();
         let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
@@ -1072,9 +1072,8 @@ impl Task {
                     .run_on_raw_fd(
                         *raw_fd,
                         |_fd| {
-                            let mut flock = unsafe { lock.read_at_offset(0) }
-                                .ok_or(Errno::EFAULT)?
-                                .into_owned();
+                            let mut flock =
+                                unsafe { lock.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
                             let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
                                 .map_err(|_| Errno::EINVAL)?;
                             if let litebox_common_linux::FlockType::Unlock = lock_type {
@@ -1301,9 +1300,7 @@ impl Task {
         let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
         match arg {
             IoctlArg::FIONBIO(arg) => {
-                let val = unsafe { arg.read_at_offset(0) }
-                    .ok_or(Errno::EFAULT)?
-                    .into_owned();
+                let val = unsafe { arg.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
                 match desc {
                     Descriptor::LiteBoxRawFd(raw_fd) => {
                         self.files.borrow().run_on_raw_fd(
@@ -1450,11 +1447,7 @@ impl Task {
         let event = if op == litebox_common_linux::EpollOp::EpollCtlDel {
             None
         } else {
-            Some(
-                unsafe { event.read_at_offset(0) }
-                    .ok_or(Errno::EFAULT)?
-                    .into_owned(),
-            )
+            Some(unsafe { event.read_at_offset(0) }.ok_or(Errno::EFAULT)?)
         };
         epoll.epoll_ctl(&self.global, op, fd, &file_descriptor, event)
     }
@@ -1534,9 +1527,7 @@ impl Task {
 
         let mut set = super::epoll::PollSet::with_capacity(nfds);
         for i in 0..nfds_signed {
-            let fd = unsafe { fds.read_at_offset(i) }
-                .ok_or(Errno::EFAULT)?
-                .into_owned();
+            let fd = unsafe { fds.read_at_offset(i) }.ok_or(Errno::EFAULT)?;
 
             let events = litebox::event::Events::from_bits_truncate(
                 fd.events.reinterpret_as_unsigned().into(),
@@ -1677,17 +1668,17 @@ impl Task {
         }
         let len = (nfds as usize).div_ceil(core::mem::size_of::<usize>() * 8);
         let mut kreadfds = readfds
-            .map(|fds| unsafe { fds.to_cow_slice(len) }.ok_or(Errno::EFAULT))
+            .map(|fds| unsafe { fds.to_owned_slice(len) }.ok_or(Errno::EFAULT))
             .transpose()?
-            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_owned()));
+            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
         let mut kwritefds = writefds
-            .map(|fds| unsafe { fds.to_cow_slice(len) }.ok_or(Errno::EFAULT))
+            .map(|fds| unsafe { fds.to_owned_slice(len) }.ok_or(Errno::EFAULT))
             .transpose()?
-            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_owned()));
+            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
         let mut kexceptfds = exceptfds
-            .map(|fds| unsafe { fds.to_cow_slice(len) }.ok_or(Errno::EFAULT))
+            .map(|fds| unsafe { fds.to_owned_slice(len) }.ok_or(Errno::EFAULT))
             .transpose()?
-            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_owned()));
+            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
 
         let count = self.do_pselect(
             nfds,
