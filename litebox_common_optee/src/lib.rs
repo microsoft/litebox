@@ -1129,7 +1129,9 @@ impl TryFrom<OpteeMessageCommand> for UteeEntryFunc {
     }
 }
 
-/// Temporary reference memory parameter
+/// Temporary memory reference parameter
+///
+/// `optee_msg_param_tmem` from `optee_os/core/include/optee_msg.h`
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct OpteeMsgParamTmem {
@@ -1142,6 +1144,8 @@ pub struct OpteeMsgParamTmem {
 }
 
 /// Registered memory reference parameter
+///
+/// `optee_msg_param_rmem` from `optee_os/core/include/optee_msg.h`
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct OpteeMsgParamRmem {
@@ -1154,6 +1158,11 @@ pub struct OpteeMsgParamRmem {
 }
 
 /// FF-A memory reference parameter
+///
+/// `optee_msg_param_fmem` from `optee_os/core/include/optee_msg.h`
+///
+/// Note: LiteBox doesn't currently support FF-A shared memory, so this struct is
+/// provided for completeness but is not used.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct OpteeMsgParamFmem {
@@ -1384,6 +1393,8 @@ impl OpteeMsgArg {
 /// exchange all arguments through that memory page.
 /// TODO: Since this is LVBS-specific structure to facilitate the translation between VTL call convention,
 /// we might want to move it to the `litebox_platform_lvbs` crate later.
+/// Also, we might need to document how to inteprete this structure by referencing `optee_smc.h` and
+/// Arm's SMCCC.
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
 #[repr(C)]

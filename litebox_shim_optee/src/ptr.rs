@@ -42,7 +42,7 @@
 //! This module should allow byte-level access while transparently handling page
 //! mapping and data access across page boundaries. This could become complicated
 //! when we consider multiple page sizes (e.g., 4 KiB, 2 MiB, 1 GiB). Also,
-//! unaligned access is matter to be considered.
+//! unaligned access is a matter to be considered.
 //!
 //! In addition, often times, this physical pointer abstraction is involved with
 //! a list of physical addresses (i.e., scatter-gather list). For example, in
@@ -53,7 +53,7 @@
 //!
 //! When this module needs to access data across physical page boundaries, it assumes
 //! that those physical pages are virtually contiguous in VTL0 or normal-world address
-//! space. Otherwise, this module could end up with accessing unrelated data. This is
+//! space. Otherwise, this module could end up with accessing misordered data. This is
 //! best-effort assumption and ensuring this is the caller's responsibility (e.g., even
 //! if this module always requires a list of physical addresses, the caller might
 //! provide a wrong list by mistake or intentionally).
@@ -77,7 +77,7 @@ fn align_up(len: usize, align: usize) -> usize {
 }
 
 /// Represent a physical pointer to an object with on-demand mapping.
-/// - `pages`: An array of page-aligned physical addresses. Physical addresses in this array should be
+/// - `pages`: An array of page-aligned physical addresses. We expect physical addresses in this array are
 ///   virtually contiguous.
 /// - `offset`: The offset within `pages[0]` where the object starts. It should be smaller than `ALIGN`.
 /// - `count`: The number of objects of type `T` that can be accessed from this pointer.
