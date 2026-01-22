@@ -151,10 +151,10 @@ unsafe extern "system" fn vectored_exception_handler(
         let rsp = exception_record_ptr as usize & !15;
 
         // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
-        let _ = run_thread_arch as usize;
+        let _ = run_thread_arch as *const () as usize;
 
         // Update the thread context to jump to the exception handler.
-        context.Rip = exception_callback as usize as u64;
+        context.Rip = exception_callback as *const () as usize as u64;
         context.Rsp = rsp as u64;
         context.Rbp = tls.host_bp.get() as u64;
         context.Rdx = exception_record_ptr as u64;
@@ -894,8 +894,8 @@ impl ThreadHandle {
             std::io::Error::last_os_error()
         );
 
-        let run_interrupt_callback = if (switch_to_guest_start as usize
-            ..switch_to_guest_end as usize)
+        let run_interrupt_callback = if (switch_to_guest_start as *const () as usize
+            ..switch_to_guest_end as *const () as usize)
             .contains(&(context.Rip.truncate()))
         {
             // Case 1: jump to interrupt callback without saving the guest
@@ -941,7 +941,7 @@ fn set_context_to_interrupt_callback(
     let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
         | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64;
     assert!(context.ContextFlags & required_flags == required_flags);
-    context.Rip = interrupt_callback as usize as u64;
+    context.Rip = interrupt_callback as *const () as usize as u64;
     context.Rsp = tls.host_sp.get().addr() as u64;
     context.Rbp = tls.host_bp.get().addr() as u64;
 }
@@ -1758,7 +1758,7 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        syscall_callback as usize
+        syscall_callback as *const () as usize
     }
 
     fn get_vdso_address(&self) -> Option<usize> {

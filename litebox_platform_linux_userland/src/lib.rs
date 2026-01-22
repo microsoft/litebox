@@ -1604,7 +1604,7 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        syscall_callback as usize
+        syscall_callback as *const () as usize
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -1684,7 +1684,7 @@ fn register_exception_handlers() {
 
             let mut sa: libc::sigaction = unsafe { core::mem::zeroed() };
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-            sa.sa_sigaction = interrupt_signal_handler as usize;
+            sa.sa_sigaction = interrupt_signal_handler as *const () as usize;
             let mut old_sa = unsafe { core::mem::zeroed() };
             sigaction(sig, Some(&sa), &mut old_sa);
             assert_eq!(
@@ -1707,7 +1707,7 @@ fn register_exception_handlers() {
             unsafe {
                 let mut sa: libc::sigaction = core::mem::zeroed();
                 sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-                sa.sa_sigaction = exception_signal_handler as usize;
+                sa.sa_sigaction = exception_signal_handler as *const () as usize;
                 // Block the interrupt signal while handling exceptions to avoid
                 // saving the exception signal handler state as guest state.
                 libc::sigaddset(&raw mut sa.sa_mask, interrupt_signal);
@@ -2036,7 +2036,7 @@ unsafe extern "C" fn exception_signal_handler(
     copy_signal_context(unsafe { &mut *regs }, context);
 
     // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
-    let _ = run_thread_arch as usize;
+    let _ = run_thread_arch as *const () as usize;
 
     // Jump to exception_callback.
     let sigctx = &context.uc_mcontext;
@@ -2154,7 +2154,7 @@ unsafe fn interrupt_signal_handler(
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
-    if ip == syscall_callback as usize {
+    if ip == syscall_callback as *const () as usize {
         // No need to clear `in_guest` or set interrupt; the syscall handler will
         // clear `in_guest` and call into the shim.
         return;
@@ -2168,8 +2168,9 @@ unsafe fn interrupt_signal_handler(
 
     // If the interrupt happened while returning to the guest, don't overwrite
     // the saved context.
-    let in_switch_to_guest =
-        (switch_to_guest_start as usize..switch_to_guest_end as usize).contains(&ip);
+    let in_switch_to_guest = (switch_to_guest_start as *const () as usize
+        ..switch_to_guest_end as *const () as usize)
+        .contains(&ip);
     if in_switch_to_guest {
         // Case 3: in the middle of restoring guest context. Don't overwrite it.
     } else {
