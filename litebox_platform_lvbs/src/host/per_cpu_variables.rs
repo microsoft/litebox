@@ -180,7 +180,6 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
         r13: 0,
         r14: 0,
         r15: 0,
-        _pad: 0,
     },
     vtl0_locked_regs: ControlRegMap {
         entries: [(0, 0); NUM_CONTROL_REGS],
@@ -192,6 +191,8 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 };
 
 /// Specify the layout of PerCpuVariables for Assembly area.
+///
+/// TODO: Consider unifying with `PerCpuVariables` if possible.
 #[non_exhaustive]
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
@@ -201,6 +202,7 @@ pub struct PerCpuVariablesAsm {
     interrupt_stack_ptr: Cell<usize>, // gs:[0x8]
     vtl_return_addr: Cell<usize>,     // gs:[0x10]
     scratch: Cell<usize>,             // gs:[0x18]
+    vtl0_state_top_addr: Cell<usize>, // gs:[0x20]
 }
 
 impl PerCpuVariablesAsm {
@@ -216,6 +218,9 @@ impl PerCpuVariablesAsm {
     pub fn set_vtl_return_addr(&self, addr: usize) {
         self.vtl_return_addr.set(addr);
     }
+    pub fn set_vtl0_state_top_addr(&self, addr: usize) {
+        self.vtl0_state_top_addr.set(addr);
+    }
 }
 
 /// PerCpuVariablesAsm offsets. Difference between the GS value and an offset is used to access
@@ -227,6 +232,7 @@ pub enum PerCpuVariablesAsmOffset {
     InterruptStackPtr = offset_of!(PerCpuVariablesAsm, interrupt_stack_ptr),
     VtlReturnAddr = offset_of!(PerCpuVariablesAsm, vtl_return_addr),
     Scratch = offset_of!(PerCpuVariablesAsm, scratch),
+    Vtl0StateTopAddr = offset_of!(PerCpuVariablesAsm, vtl0_state_top_addr),
 }
 
 /// Wrapper struct to maintain `RefCell` along with `PerCpuVariablesAsm`.
@@ -252,6 +258,7 @@ impl<T> RefCellWrapper<T> {
                 interrupt_stack_ptr: Cell::new(0),
                 vtl_return_addr: Cell::new(0),
                 scratch: Cell::new(0),
+                vtl0_state_top_addr: Cell::new(0),
             },
             inner: RefCell::new(value),
         }
@@ -457,9 +464,15 @@ pub fn init_per_cpu_variables() {
             usize::try_from(per_cpu_variables.kernel_stack_top()).unwrap() & !(STACK_ALIGNMENT - 1);
         let interrupt_sp = usize::try_from(per_cpu_variables.interrupt_stack_top()).unwrap()
             & !(STACK_ALIGNMENT - 1);
+        let vtl0_state_top_addr = usize::try_from(
+            &raw const per_cpu_variables.vtl0_state as u64
+                + core::mem::size_of::<VtlState>() as u64,
+        )
+        .unwrap();
         with_per_cpu_variables_asm_mut(|pcv_asm| {
             pcv_asm.set_kernel_stack_ptr(kernel_sp);
             pcv_asm.set_interrupt_stack_ptr(interrupt_sp);
+            pcv_asm.set_vtl0_state_top_addr(vtl0_state_top_addr);
         });
     });
 }

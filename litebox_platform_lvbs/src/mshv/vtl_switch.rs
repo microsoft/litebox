@@ -60,9 +60,6 @@ pub struct VtlState {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
-    // To ease the stack alignment, ensure this struct size is multiple of 16 bytes.
-    // (15 + 1) * 8 = 128. 128 % 16 == 0
-    pub _pad: u64,
     // CR2
     // DR[0-6]
     // We use a separeate buffer to save/register extended states
@@ -98,127 +95,60 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
     }
 }
 
-/// Assembly macro to save VTL state using the stack as temporary storage.
-/// `fn_save_state` is the function to save VTL state stored in the stack.
-/// `scratch_off` is the offset of the PerCpuVariablesAsm which holds the
-/// scratch space to save/restore the current stack pointer.
+/// Assembly macro to save VTL state to the memory area pointed by the current
+/// stack pointer (`rsp`).
+///
+/// `rsp` can point to the current CPU stack or the *top address* of a memory area which
+/// has enough space for storing the `VtlState` structure using the `push` instructions
+/// (i.e., from high addresses down to low ones).
 macro_rules! SAVE_VTL_STATE_ASM {
-    ($fn_save_state:tt, $scratch_off:tt) => {
-        concat!(
-            "mov gs:[",
-            stringify!($scratch_off),
-            "], rsp\n",
-            "push r15\n", // alignment
-            "push r15\n",
-            "push r14\n",
-            "push r13\n",
-            "push r12\n",
-            "push r11\n",
-            "push r10\n",
-            "push r9\n",
-            "push r8\n",
-            "push rdi\n",
-            "push rsi\n",
-            "push rdx\n",
-            "push rcx\n",
-            "push rbx\n",
-            "push rax\n",
-            "push rbp\n",
-            "lea rdi, [rsp]\n",
-            "call ",
-            stringify!($fn_save_state),
-            "\n",
-            "mov rsp, gs:[",
-            stringify!($scratch_off),
-            "]\n",
-        )
+    () => {
+        "
+        push r15
+        push r14
+        push r13
+        push r12
+        push r11
+        push r10
+        push r9
+        push r8
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push rbx
+        push rax
+        push rbp
+        "
     };
 }
 
-/// Assembly macro to load VTL state. It uses the stack as temporary storage.
-/// `fn_load_state` is the function to load VTL state to the stack.
-/// `state_size` is the size of `VtlState` structure.
-/// `scratch_off` is the offset of the PerCpuVariablesAsm which holds the scratch space to
-/// save/restore the current stack pointer.
+/// Assembly macro to restore VTL state from the memory area pointed by the current `rsp`.
+///
+/// This macro uses the `pop` instructions (i.e., from low addresses up to high ones) such that
+/// it requires the start address of the memory area (not the top one).
+///
+/// Prerequisite: The memory area has `VtlState` structure containing user context.
 macro_rules! LOAD_VTL_STATE_ASM {
-    ($fn_load_state:tt, $state_size:tt, $scratch_off:tt) => {
-        concat!(
-            "mov gs:[",
-            stringify!($scratch_off),
-            "], rsp\n",
-            "sub rsp, ",
-            stringify!($state_size),
-            "\n",
-            "lea rdi, [rsp]\n",
-            "call ",
-            stringify!($fn_load_state),
-            "\n",
-            "mov rsp, gs:[",
-            stringify!($scratch_off),
-            "]\n", // anchor
-            "sub rsp, ",
-            stringify!($state_size),
-            "\n",
-            "pop rbp\n",
-            "pop rax\n",
-            "pop rbx\n",
-            "pop rcx\n",
-            "pop rdx\n",
-            "pop rsi\n",
-            "pop rdi\n",
-            "pop r8\n",
-            "pop r9\n",
-            "pop r10\n",
-            "pop r11\n",
-            "pop r12\n",
-            "pop r13\n",
-            "pop r14\n",
-            "pop r15\n",
-            "mov rsp, gs:[",
-            stringify!($scratch_off),
-            "]\n",
-        )
+    () => {
+        "
+        pop rbp
+        pop rax
+        pop rbx
+        pop rcx
+        pop rdx
+        pop rsi
+        pop rdi
+        pop r8
+        pop r9
+        pop r10
+        pop r11
+        pop r12
+        pop r13
+        pop r14
+        pop r15
+        "
     };
-}
-
-/// Saves VTL0 state to per-CPU storage.
-///
-/// # Safety
-/// - `vtl_state` must be a valid pointer to a readable `VtlState` structure
-/// - Must be called from VTL1 context with valid per-CPU variables initialized
-unsafe extern "C" fn save_vtl0_state(vtl_state: *const VtlState) {
-    with_per_cpu_variables_mut(|pcv| {
-        let dst = &raw mut pcv.vtl0_state;
-        // SAFETY: vtl_state points to valid VtlState.
-        // dst points to per-CPU storage initialized during boot.
-        unsafe {
-            if vtl_state.is_aligned() {
-                core::ptr::copy_nonoverlapping(vtl_state, dst, 1);
-            } else {
-                core::ptr::write(dst, core::ptr::read_unaligned(vtl_state));
-            }
-        }
-    });
-}
-
-/// Loads VTL0 state from per-CPU storage.
-///
-/// # Safety
-/// - `vtl_state` must be a valid pointer to a writable `VtlState` structure
-/// - Must be called from VTL1 context with valid per-CPU variables initialized
-unsafe extern "C" fn load_vtl0_state(vtl_state: *mut VtlState) {
-    with_per_cpu_variables(|pcv| {
-        let src = &raw const pcv.vtl0_state;
-        // SAFETY: src points to per-CPU storage with valid VtlState.
-        // vtl_state points to valid VtlState space.
-        unsafe {
-            if vtl_state.is_aligned() {
-                core::ptr::copy_nonoverlapping(src, vtl_state, 1);
-            } else {
-                core::ptr::write_unaligned(vtl_state, core::ptr::read(src));
-            }
-        }
-    });
 }
 
 #[unsafe(naked)]
@@ -228,17 +158,25 @@ unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
         "mov rsp, gs:[{kernel_sp_off}]", // reset kernel stack pointer. Hyper-V saves/restores rsp and rip.
         VTL_RETURN_ASM!({vtl_ret_addr_off}),
         // *** VTL1 resumes here regardless of the entry reason (VTL switch or intercept) ***
-        SAVE_VTL_STATE_ASM!({save_vtl0_state}, {scratch_off}),
+        "mov gs:[{scratch_off}], rsp", // save VTL1's rsp to scratch
+        "mov rsp, gs:[{vtl0_state_top_addr_off}]", // point rsp to the top address of VtlState for VTL0
+        SAVE_VTL_STATE_ASM!(),
+        "mov rsp, gs:[{scratch_off}]", // restore VTL1's rsp from scratch
+        // TODO: XSAVE
         "mov rbp, rsp", // rbp contains VTL0's stack frame, so update it.
         "call {loop_body}",
-        LOAD_VTL_STATE_ASM!({load_vtl0_state}, {vtl_state_size}, {scratch_off}),
+        // TODO: XRSTOR
+        "mov r8, gs:[{vtl0_state_top_addr_off}]",
+        "lea rsp, [r8 - {VTL_STATE_SIZE}]", // point rsp to the start address of VtlState
+        LOAD_VTL_STATE_ASM!(),
+        // *** VTL0 state is recovered. Do not put any code tampering with them here ***
         "jmp 1b",
         kernel_sp_off = const { PerCpuVariablesAsmOffset::KernelStackPtr as usize },
         vtl_ret_addr_off = const { PerCpuVariablesAsmOffset::VtlReturnAddr as usize },
         scratch_off = const { PerCpuVariablesAsmOffset::Scratch as usize },
-        save_vtl0_state = sym save_vtl0_state,
-        load_vtl0_state = sym load_vtl0_state,
-        vtl_state_size = const core::mem::size_of::<VtlState>(),
+        vtl0_state_top_addr_off =
+            const { PerCpuVariablesAsmOffset::Vtl0StateTopAddr as usize },
+        VTL_STATE_SIZE = const core::mem::size_of::<VtlState>(),
         loop_body = sym vtl_switch_loop_body,
     )
 }
