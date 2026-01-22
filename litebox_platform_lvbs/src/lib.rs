@@ -789,28 +789,122 @@ impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKerne
     unsafe fn vmap(
         &self,
         pages: Self::PhysPageAddrArray,
-        _perms: PhysPageMapPermissions,
+        perms: PhysPageMapPermissions,
     ) -> Result<Self::PhysPageMapInfo, PhysPointerError> {
         // TODO: Remove this check once this platform supports virtually contiguous
         // non-contiguous physical page mapping.
         check_contiguity(&pages)?;
-        todo!("use map_vtl0_phys_range()")
+
+        if pages.is_empty() {
+            return Err(PhysPointerError::InvalidPhysicalAddress(0));
+        }
+        let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
+        let phys_end = x86_64::PhysAddr::new(
+            pages
+                .last()
+                .unwrap()
+                .as_usize()
+                .checked_add(ALIGN)
+                .ok_or(PhysPointerError::Overflow)? as u64,
+        );
+        let frame_range = if ALIGN == PAGE_SIZE {
+            PhysFrame::range(
+                PhysFrame::<Size4KiB>::containing_address(phys_start),
+                PhysFrame::<Size4KiB>::containing_address(phys_end),
+            )
+        } else {
+            unimplemented!("ALIGN other than 4KiB is not supported yet")
+        };
+
+        let mut flags = PageTableFlags::PRESENT;
+        if perms.contains(PhysPageMapPermissions::WRITE) {
+            flags |= PageTableFlags::WRITABLE;
+        }
+
+        if let Ok(page_addr) = self.page_table.map_phys_frame_range(frame_range, flags) {
+            Ok(Self::PhysPageMapInfo {
+                base: page_addr,
+                size: pages.len() * ALIGN,
+            })
+        } else {
+            Err(PhysPointerError::InvalidPhysicalAddress(
+                pages[0].as_usize(),
+            ))
+        }
     }
 
-    unsafe fn vunmap(&self, _vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError> {
-        todo!("use unmap_vtl0_pages()")
+    unsafe fn vunmap(&self, vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError> {
+        if ALIGN == PAGE_SIZE {
+            let Some(page_range) = PageRange::<PAGE_SIZE>::new(
+                vmap_info.base as usize,
+                vmap_info.base.wrapping_add(vmap_info.size) as usize,
+            ) else {
+                return Err(PhysPointerError::UnalignedPhysicalAddress(
+                    vmap_info.base as usize,
+                    ALIGN,
+                ));
+            };
+            unsafe {
+                self.page_table
+                    .unmap_pages(page_range, false)
+                    .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))
+            }
+        } else {
+            unimplemented!("ALIGN other than 4KiB is not supported yet")
+        }
     }
 
-    fn validate(&self, _pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError> {
-        todo!("use vtl1_phys_frame_range to validate")
+    fn validate(&self, pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let start_address = self.vtl1_phys_frame_range.start.start_address().as_u64();
+        let end_address = self.vtl1_phys_frame_range.end.start_address().as_u64();
+        for page in &pages {
+            let addr = page.as_usize() as u64;
+            // a physical page belonging to LiteBox (VTL1) should not be used for `vmap`
+            if addr >= start_address && addr < end_address {
+                return Err(PhysPointerError::InvalidPhysicalAddress(page.as_usize()));
+            }
+        }
+        Ok(())
     }
 
     unsafe fn protect(
         &self,
-        _pages: Self::PhysPageAddrArray,
-        _perms: PhysPageMapPermissions,
+        pages: Self::PhysPageAddrArray,
+        perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError> {
-        todo!("use hypercall to protect/unprotect physical pages")
+        let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
+        let phys_end = x86_64::PhysAddr::new(
+            pages
+                .last()
+                .unwrap()
+                .as_usize()
+                .checked_add(ALIGN)
+                .ok_or(PhysPointerError::Overflow)? as u64,
+        );
+        let frame_range = if ALIGN == PAGE_SIZE {
+            PhysFrame::range(
+                PhysFrame::<Size4KiB>::containing_address(phys_start),
+                PhysFrame::<Size4KiB>::containing_address(phys_end),
+            )
+        } else {
+            unimplemented!("ALIGN other than 4KiB is not supported yet")
+        };
+
+        let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
+            // VTL1 wants to write data to the pages, preventing VTL0 from reading/executing the pages.
+            crate::mshv::heki::MemAttr::empty()
+        } else if perms.contains(PhysPageMapPermissions::READ) {
+            // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
+            crate::mshv::heki::MemAttr::MEM_ATTR_READ | crate::mshv::heki::MemAttr::MEM_ATTR_EXEC
+        } else {
+            // VTL1 no longer protects the pages.
+            crate::mshv::heki::MemAttr::all()
+        };
+        crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
+            .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))
     }
 }
 
