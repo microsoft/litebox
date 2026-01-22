@@ -41,7 +41,7 @@ extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *m
         // to avoid traps again.
         let rip = &mut ucontext.uc_mcontext.gregs[libc::REG_RIP as usize];
         // Set the instruction pointer to the syscall dispatcher
-        *rip = i64::try_from(crate::syscall_callback as usize).unwrap();
+        *rip = i64::try_from(crate::syscall_callback as *const () as usize).unwrap();
     }
 }
 
@@ -52,7 +52,7 @@ fn register_sigsys_handler() {
     let mut sig_mask = core::mem::MaybeUninit::<libc::sigset_t>::uninit();
     unsafe { libc::sigemptyset(sig_mask.as_mut_ptr()) };
     let sig_action = libc::sigaction {
-        sa_sigaction: sigsys_handler as usize,
+        sa_sigaction: sigsys_handler as *const () as usize,
         sa_flags: litebox_common_linux::signal::SaFlags::SIGINFO
             .bits()
             .reinterpret_as_signed(),
