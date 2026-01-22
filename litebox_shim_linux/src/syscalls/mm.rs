@@ -238,10 +238,7 @@ mod tests {
             )
             .unwrap();
         unsafe { addr.write_slice_at_offset(0, &[0xff; 0x2000]).unwrap() };
-        assert_eq!(
-            unsafe { addr.read_at_offset(0x1000) }.unwrap().into_owned(),
-            0xff,
-        );
+        assert_eq!(unsafe { addr.read_at_offset(0x1000) }.unwrap(), 0xff,);
         task.sys_munmap(addr, 0x2000).unwrap();
     }
 
@@ -266,7 +263,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            unsafe { addr.to_cow_slice(content.len()).unwrap() },
+            unsafe { addr.to_owned_slice(content.len()) }
+                .unwrap()
+                .as_ref(),
             content.as_slice(),
         );
         task.sys_munmap(addr, 0x1000).unwrap();
@@ -439,11 +438,12 @@ mod tests {
             .is_ok()
         );
 
-        unsafe {
-            addr.to_cow_slice(0x10).unwrap().iter().for_each(|&x| {
+        unsafe { addr.to_owned_slice(0x10) }
+            .unwrap()
+            .iter()
+            .for_each(|&x| {
                 assert_eq!(x, 0); // Should be zeroed after MADV_DONTNEED
             });
-        }
 
         task.sys_munmap(addr, 0x2000).unwrap();
     }

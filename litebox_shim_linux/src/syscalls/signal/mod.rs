@@ -375,11 +375,7 @@ impl Task {
             return Err(Errno::EINVAL);
         }
         let set = if let Some(set_ptr) = set_ptr {
-            Some(
-                unsafe { set_ptr.read_at_offset(0) }
-                    .ok_or(Errno::EFAULT)?
-                    .into_owned(),
-            )
+            Some(unsafe { set_ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?)
         } else {
             None
         };
@@ -428,7 +424,7 @@ impl Task {
             if is_on_stack {
                 return Err(Errno::EPERM);
             }
-            let ss = unsafe { ss_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?.into_owned() };
+            let ss = unsafe { ss_ptr.read_at_offset(0).ok_or(Errno::EFAULT)? };
             self.signals.set_sigaltstack(ss)?;
         }
         Ok(0)
@@ -441,7 +437,6 @@ impl Task {
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);
         };
-        let uctx = uctx.into_owned();
 
         // Restore the alternate signal stack, ignoring errors.
         self.signals.set_sigaltstack(uctx.stack).ok();
@@ -465,11 +460,7 @@ impl Task {
             return Err(Errno::EINVAL);
         }
         let act = if let Some(act_ptr) = act_ptr {
-            Some(
-                unsafe { act_ptr.read_at_offset(0) }
-                    .ok_or(Errno::EFAULT)?
-                    .into_owned(),
-            )
+            Some(unsafe { act_ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?)
         } else {
             None
         };

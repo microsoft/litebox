@@ -38,7 +38,7 @@ impl Task {
             self.global.platform,
             "sys_map_zi: va {:#x} (addr {:#x}), num_bytes {}, flags {:#x}",
             va.as_usize(),
-            *addr,
+            addr,
             num_bytes,
             flags
         );
@@ -54,7 +54,7 @@ impl Task {
             .and_then(|t| t.checked_add(pad_end))
             .ok_or(TeeResult::BadParameters)?
             .next_multiple_of(PAGE_SIZE);
-        if (*addr).checked_add(total_size).is_none() {
+        if addr.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
         // `sys_map_zi` always creates read/writeable mapping
@@ -65,7 +65,7 @@ impl Task {
         // it targets systems with inefficient CPU and MMU. Instead of reproducing OP-TEE's behavior, we create
         // mappings with `PROT_NONE` for padded regions to prevent others from using them.
         let addr = self
-            .sys_mmap(*addr, total_size, ProtFlags::PROT_NONE, flags, -1, 0)
+            .sys_mmap(addr, total_size, ProtFlags::PROT_NONE, flags, -1, 0)
             .map_err(|_| TeeResult::OutOfMemory)?;
         let padded_start = addr.as_usize() + pad_begin;
         if self
@@ -141,7 +141,7 @@ impl Task {
             self.global.platform,
             "sys_map_bin: va {:#x} (addr {:#x}), num_bytes {}, handle {}, offs {}, pad_begin {}, pad_end {}, flags {:#x}",
             va.as_usize(),
-            *addr,
+            addr,
             num_bytes,
             handle,
             offs,
@@ -177,7 +177,7 @@ impl Task {
             .and_then(|t| t.checked_add(pad_end))
             .ok_or(TeeResult::BadParameters)?
             .next_multiple_of(PAGE_SIZE);
-        if (*addr).checked_add(total_size).is_none() {
+        if addr.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
         let flags_internal = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED;
@@ -187,7 +187,7 @@ impl Task {
         // the content of the TA binary into it.
         let addr = self
             .sys_mmap(
-                *addr,
+                addr,
                 total_size,
                 ProtFlags::PROT_NONE,
                 flags_internal,

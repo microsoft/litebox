@@ -610,7 +610,7 @@ pub trait AccessMemory {
 impl<Platform: RawPointerProvider> AccessMemory for &Platform {
     fn read(&mut self, address: usize, buf: &mut [u8]) -> Result<usize, Fault> {
         let addr = Platform::RawConstPointer::<u8>::from_usize(address);
-        buf.copy_from_slice(&addr.to_owned_slice(buf.len()).ok_or(Fault)?);
+        buf.copy_from_slice(&unsafe { addr.to_owned_slice(buf.len()) }.ok_or(Fault)?);
         Ok(buf.len())
     }
 

@@ -107,12 +107,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
 
         // Check the value once. Do this only after inserting into the list so
         // that we don't miss a wakeup.
-        let value = unsafe {
-            futex_addr
-                .read_at_offset(0)
-                .ok_or(FutexError::Fault)?
-                .into_owned()
-        };
+        let value = unsafe { futex_addr.read_at_offset(0).ok_or(FutexError::Fault)? };
         if value != expected_value {
             return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
         }

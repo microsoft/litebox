@@ -47,7 +47,6 @@ impl Task {
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);
         };
-        let lctx = lctx.into_owned();
 
         let mask = SigSet::from_u64(
             u64::from(lctx.sigcontext.oldmask) | (u64::from(lctx.extramask) << 32),

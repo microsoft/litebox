@@ -346,7 +346,7 @@ impl Task {
                 let mut name_buf = [0u8; litebox_common_linux::TASK_COMM_LEN - 1];
                 // strncpy
                 for (i, byte) in name_buf.iter_mut().enumerate() {
-                    let b = *unsafe { name.read_at_offset(isize::try_from(i).unwrap()) }
+                    let b = unsafe { name.read_at_offset(isize::try_from(i).unwrap()) }
                         .ok_or(Errno::EFAULT)?;
                     if b == 0 {
                         break;
@@ -589,9 +589,7 @@ impl Task {
         ctx: &litebox_common_linux::PtRegs,
         args: ConstPtr<litebox_common_linux::CloneArgs>,
     ) -> Result<usize, Errno> {
-        let args = unsafe { args.read_at_offset(0) }
-            .ok_or(Errno::EFAULT)?
-            .into_owned();
+        let args = unsafe { args.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
         self.do_clone(ctx, &args, true)
     }
 
@@ -681,8 +679,7 @@ impl Task {
                 let desc = unsafe {
                     MutPtr::<litebox_common_linux::UserDesc>::from_usize(addr).read_at_offset(0)
                 }
-                .ok_or(Errno::EFAULT)?
-                .into_owned();
+                .ok_or(Errno::EFAULT)?;
                 // Note that different from `set_thread_area` syscall that returns the allocated entry number
                 // when requested (i.e., `desc.entry_number` is -1), here we just read the descriptor to LiteBox and
                 // assume the entry number is properly set so that we don't need to write it back. This is because
@@ -918,9 +915,7 @@ impl Task {
         }
         let new_limit = match new_rlim {
             Some(rlim) => {
-                let rlim = unsafe { rlim.read_at_offset(0) }
-                    .ok_or(Errno::EINVAL)?
-                    .into_owned();
+                let rlim = unsafe { rlim.read_at_offset(0) }.ok_or(Errno::EINVAL)?;
                 Some(litebox_common_linux::rlimit64_to_rlimit(rlim))
             }
             None => None,
@@ -949,9 +944,7 @@ impl Task {
         resource: litebox_common_linux::RlimitResource,
         rlim: crate::ConstPtr<litebox_common_linux::Rlimit>,
     ) -> Result<(), Errno> {
-        let new_limit = unsafe { rlim.read_at_offset(0) }
-            .ok_or(Errno::EFAULT)?
-            .into_owned();
+        let new_limit = unsafe { rlim.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
         let _ = self.do_prlimit(resource, Some(new_limit))?;
         Ok(())
     }
@@ -1308,7 +1301,7 @@ impl Task {
                 let p: crate::ConstPtr<i8> = unsafe {
                     // read pointer-sized entries
                     match base.read_at_offset(0) {
-                        Some(ptr) => ptr.into_owned(),
+                        Some(ptr) => ptr,
                         None => return Err(Errno::EFAULT),
                     }
                 };

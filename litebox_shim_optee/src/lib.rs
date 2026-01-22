@@ -302,7 +302,7 @@ impl Task {
             return ContinueOperation::ExitThread;
         }
         let res: Result<(), TeeResult> = match request {
-            SyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
+            SyscallRequest::Log { buf, len } => match unsafe { buf.to_owned_slice(len) } {
                 Some(buf) => self.sys_log(&buf),
                 None => Err(TeeResult::BadParameters),
             },
@@ -316,9 +316,9 @@ impl Task {
                 prop_type,
             } => {
                 if let Some(buf_length) = unsafe { blen.read_at_offset(0) }
-                    && usize::try_from(*buf_length).unwrap() <= MAX_KERNEL_BUF_SIZE
+                    && usize::try_from(buf_length).unwrap() <= MAX_KERNEL_BUF_SIZE
                 {
-                    let mut prop_buf = vec![0u8; usize::try_from(*buf_length).unwrap()];
+                    let mut prop_buf = vec![0u8; usize::try_from(buf_length).unwrap()];
                     if name.as_usize() != 0 || name_len.as_usize() != 0 {
                         todo!("return the name of a given property index")
                     }
@@ -345,7 +345,7 @@ impl Task {
                 name,
                 name_len,
                 index,
-            } => match unsafe { name.to_cow_slice(name_len) } {
+            } => match unsafe { name.to_owned_slice(name_len) } {
                 Some(name) => Task::sys_get_property_name_to_index(prop_set, &name, index),
                 None => Err(TeeResult::BadParameters),
             },
@@ -360,9 +360,9 @@ impl Task {
                     && let Some(usr_params) = unsafe { usr_params.read_at_offset(0) }
                 {
                     Task::sys_open_ta_session(
-                        *ta_uuid,
+                        ta_uuid,
                         cancel_req_to,
-                        *usr_params,
+                        usr_params,
                         ta_sess_id,
                         ret_orig,
                     )
@@ -379,7 +379,7 @@ impl Task {
                 ret_orig,
             } => {
                 if let Some(params) = unsafe { params.read_at_offset(0) } {
-                    self.sys_invoke_ta_command(ta_sess_id, cancel_req_to, cmd_id, *params, ret_orig)
+                    self.sys_invoke_ta_command(ta_sess_id, cancel_req_to, cmd_id, params, ret_orig)
                 } else {
                     Err(TeeResult::BadParameters)
                 }
@@ -396,7 +396,7 @@ impl Task {
             } => self.sys_cryp_state_alloc(algo, op_mode, key1, key2, state),
             SyscallRequest::CrypStateFree { state } => self.sys_cryp_state_free(state),
             SyscallRequest::CipherInit { state, iv, iv_len } => {
-                match unsafe { iv.to_cow_slice(iv_len) } {
+                match unsafe { iv.to_owned_slice(iv_len) } {
                     Some(iv) => self.sys_cipher_init(state, &iv),
                     None => Err(TeeResult::BadParameters),
                 }
@@ -441,7 +441,7 @@ impl Task {
                 obj,
                 attrs,
                 attr_count,
-            } => match unsafe { attrs.to_cow_slice(attr_count) } {
+            } => match unsafe { attrs.to_owned_slice(attr_count) } {
                 Some(attrs) => self.sys_cryp_obj_populate(obj, &attrs),
                 None => Err(TeeResult::BadParameters),
             },
@@ -535,7 +535,7 @@ impl Task {
             return ContinueOperation::ExitThread;
         }
         let res: Result<(), TeeResult> = match request {
-            LdelfSyscallRequest::Log { buf, len } => match unsafe { buf.to_cow_slice(len) } {
+            LdelfSyscallRequest::Log { buf, len } => match unsafe { buf.to_owned_slice(len) } {
                 Some(buf) => self.sys_log(&buf),
                 None => Err(TeeResult::BadParameters),
             },
@@ -554,7 +554,7 @@ impl Task {
                 if uuid_size == core::mem::size_of::<TeeUuid>()
                     && let Some(ta_uuid) = unsafe { uuid.read_at_offset(0) }
                 {
-                    self.sys_open_bin(*ta_uuid, handle)
+                    self.sys_open_bin(ta_uuid, handle)
                 } else {
                     Err(TeeResult::BadParameters)
                 }
@@ -756,11 +756,11 @@ fn handle_cipher_update_or_final<F>(
 where
     F: Fn(&Task, TeeCrypStateHandle, &[u8], &mut [u8], &mut usize) -> Result<(), TeeResult>,
 {
-    if let Some(src_slice) = unsafe { src.to_cow_slice(src_len) }
+    if let Some(src_slice) = unsafe { src.to_owned_slice(src_len) }
         && let Some(length) = unsafe { dst_len.read_at_offset(0) }
-        && usize::try_from(*length).unwrap() <= MAX_KERNEL_BUF_SIZE
+        && usize::try_from(length).unwrap() <= MAX_KERNEL_BUF_SIZE
     {
-        let mut length = usize::try_from(*length).unwrap();
+        let mut length = usize::try_from(length).unwrap();
         let mut kernel_buf = vec![0u8; length];
         syscall_fn(task, state, &src_slice, &mut kernel_buf, &mut length).and_then(|()| {
             unsafe {
