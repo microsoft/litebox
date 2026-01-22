@@ -19,7 +19,7 @@ use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
-use litebox_common_optee::vmap::{PhysPageAddr, PhysPageMapInfo, VmapProvider};
+use litebox_common_optee::vmap::VmapProvider;
 
 mod syscall_intercept;
 
@@ -2193,35 +2193,7 @@ impl litebox::platform::CrngProvider for LinuxUserland {
 /// In general, userland platforms do not support `vmap` and `vunmap` (which are kernel functions).
 /// We might need to emulate these functions' behaviors using virtual addresses for development or
 /// testing, or use a kernel module to provide this functionality (if needed).
-impl<const ALIGN: usize> VmapProvider<ALIGN> for LinuxUserland {
-    type PhysPageAddrArray = alloc::boxed::Box<[PhysPageAddr<ALIGN>]>;
-
-    type PhysPageMapInfo = PhysPageMapInfo<ALIGN>;
-
-    // unsafe fn vmap(
-    //     &self,
-    //     _pages: Self::PhysPageAddrArray,
-    //     _perms: PhysPageMapPermissions,
-    // ) -> Result<Self::PhysPageMapInfo, PhysPointerError> {
-    //     Err(PhysPointerError::UnsupportedOperation)
-    // }
-
-    // unsafe fn vunmap(&self, _vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError> {
-    //     Err(PhysPointerError::UnsupportedOperation)
-    // }
-
-    // fn validate(&self, _pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError> {
-    //     Err(PhysPointerError::UnsupportedOperation)
-    // }
-
-    // unsafe fn protect(
-    //     &self,
-    //     _pages: Self::PhysPageAddrArray,
-    //     _perms: PhysPageMapPermissions,
-    // ) -> Result<(), PhysPointerError> {
-    //     Err(PhysPointerError::UnsupportedOperation)
-    // }
-}
+impl<const ALIGN: usize> VmapProvider<ALIGN> for LinuxUserland {}
 
 #[cfg(test)]
 mod tests {

@@ -26,7 +26,8 @@ use litebox::platform::{
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use litebox_common_optee::vmap::{
-    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
+    PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
+    VmapProvider,
 };
 use x86_64::structures::paging::{
     PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
@@ -782,18 +783,14 @@ fn check_contiguity<const ALIGN: usize>(
 }
 
 impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKernel<Host> {
-    type PhysPageAddrArray = alloc::boxed::Box<[PhysPageAddr<ALIGN>]>;
-
-    type PhysPageMapInfo = PhysPageMapInfo<ALIGN>;
-
     unsafe fn vmap(
         &self,
-        pages: Self::PhysPageAddrArray,
+        pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
-    ) -> Result<Self::PhysPageMapInfo, PhysPointerError> {
+    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
         // TODO: Remove this check once this platform supports virtually contiguous
         // non-contiguous physical page mapping.
-        check_contiguity(&pages)?;
+        check_contiguity(pages)?;
 
         if pages.is_empty() {
             return Err(PhysPointerError::InvalidPhysicalAddress(0));
@@ -822,7 +819,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKerne
         }
 
         if let Ok(page_addr) = self.page_table.map_phys_frame_range(frame_range, flags) {
-            Ok(Self::PhysPageMapInfo {
+            Ok(PhysPageMapInfo {
                 base: page_addr,
                 size: pages.len() * ALIGN,
             })
@@ -833,7 +830,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKerne
         }
     }
 
-    unsafe fn vunmap(&self, vmap_info: Self::PhysPageMapInfo) -> Result<(), PhysPointerError> {
+    unsafe fn vunmap(&self, vmap_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
         if ALIGN == PAGE_SIZE {
             let Some(page_range) = PageRange::<PAGE_SIZE>::new(
                 vmap_info.base as usize,
@@ -854,13 +851,13 @@ impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKerne
         }
     }
 
-    fn validate(&self, pages: Self::PhysPageAddrArray) -> Result<(), PhysPointerError> {
+    fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
         if pages.is_empty() {
             return Ok(());
         }
         let start_address = self.vtl1_phys_frame_range.start.start_address().as_u64();
         let end_address = self.vtl1_phys_frame_range.end.start_address().as_u64();
-        for page in &pages {
+        for page in pages {
             let addr = page.as_usize() as u64;
             // a physical page belonging to LiteBox (VTL1) should not be used for `vmap`
             if addr >= start_address && addr < end_address {
@@ -872,7 +869,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKerne
 
     unsafe fn protect(
         &self,
-        pages: Self::PhysPageAddrArray,
+        pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError> {
         let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);

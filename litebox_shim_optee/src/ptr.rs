@@ -120,7 +120,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 core::mem::size_of::<T>(),
             ));
         }
-        platform().validate(pages.into())?;
+        platform().validate_unowned(pages)?;
         Ok(Self {
             pages: pages.into(),
             offset,
@@ -420,7 +420,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         if self.map_info.is_none() {
             let sub_pages = &self.pages[start..end];
             unsafe {
-                platform().vmap(sub_pages.into(), perms).map(|info| {
+                platform().vmap(sub_pages, perms).map(|info| {
                     self.map_info = Some(info);
                 })?;
             }
