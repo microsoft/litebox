@@ -4,7 +4,7 @@ use crate::{
     host::{
         hv_hypercall_page_address,
         per_cpu_variables::{
-            PerCpuVariablesAsmOffset, with_per_cpu_variables, with_per_cpu_variables_asm_mut,
+            PerCpuVariablesAsm, with_per_cpu_variables, with_per_cpu_variables_asm_mut,
             with_per_cpu_variables_mut,
         },
     },
@@ -171,11 +171,11 @@ unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
         LOAD_VTL_STATE_ASM!(),
         // *** VTL0 state is recovered. Do not put any code tampering with them here ***
         "jmp 1b",
-        kernel_sp_off = const { PerCpuVariablesAsmOffset::KernelStackPtr as usize },
-        vtl_ret_addr_off = const { PerCpuVariablesAsmOffset::VtlReturnAddr as usize },
-        scratch_off = const { PerCpuVariablesAsmOffset::Scratch as usize },
+        kernel_sp_off = const { PerCpuVariablesAsm::kernel_stack_ptr_offset() },
+        vtl_ret_addr_off = const { PerCpuVariablesAsm::vtl_return_addr_offset() },
+        scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
         vtl0_state_top_addr_off =
-            const { PerCpuVariablesAsmOffset::Vtl0StateTopAddr as usize },
+            const { PerCpuVariablesAsm::vtl0_state_top_addr_offset() },
         VTL_STATE_SIZE = const core::mem::size_of::<VtlState>(),
         loop_body = sym vtl_switch_loop_body,
     )

@@ -192,17 +192,36 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 
 /// Specify the layout of PerCpuVariables for Assembly area.
 ///
+/// Unlike userland platforms, this kernel platform does't rely on the `tbss` section
+/// to specify Kernel TLS because there is no ELF loader that will set up TLS for it.
+///
+/// Note that kernel & host and user & guest are interchangeable in this context.
+/// We use "kernel" and "user" here to emphasize that there must be hardware-enforced
+/// mode transitions (i.e., ring transitions through iretq/syscall) unlike userland
+/// platforms.
+///
 /// TODO: Consider unifying with `PerCpuVariables` if possible.
 #[non_exhaustive]
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone)]
 pub struct PerCpuVariablesAsm {
-    kernel_stack_ptr: Cell<usize>,    // gs:[0x0]
+    /// Initial kernel stack pointer to reset the kernel stack on VTL switch
+    kernel_stack_ptr: Cell<usize>, // gs:[0x0]
+    /// Initial interrupt stack pointer for x86 IST
     interrupt_stack_ptr: Cell<usize>, // gs:[0x8]
-    vtl_return_addr: Cell<usize>,     // gs:[0x10]
-    scratch: Cell<usize>,             // gs:[0x18]
+    /// Return address for call-based VTL switching
+    vtl_return_addr: Cell<usize>, // gs:[0x10]
+    /// Scratch pad
+    scratch: Cell<usize>, // gs:[0x18]
+    /// Top address of VTL0 VTLState
     vtl0_state_top_addr: Cell<usize>, // gs:[0x20]
+    /// Current kernel stack pointer
+    cur_kernel_stack_ptr: Cell<usize>, // gs:[0x28]
+    /// Current kernel base pointer
+    cur_kernel_base_ptr: Cell<usize>, // gs:[0x30]
+    /// Top address of the user context area
+    user_context_top_addr: Cell<usize>, // gs:[0x38]
 }
 
 impl PerCpuVariablesAsm {
@@ -221,18 +240,30 @@ impl PerCpuVariablesAsm {
     pub fn set_vtl0_state_top_addr(&self, addr: usize) {
         self.vtl0_state_top_addr.set(addr);
     }
-}
-
-/// PerCpuVariablesAsm offsets. Difference between the GS value and an offset is used to access
-/// the corresponding variable.
-#[non_exhaustive]
-#[repr(usize)]
-pub enum PerCpuVariablesAsmOffset {
-    KernelStackPtr = offset_of!(PerCpuVariablesAsm, kernel_stack_ptr),
-    InterruptStackPtr = offset_of!(PerCpuVariablesAsm, interrupt_stack_ptr),
-    VtlReturnAddr = offset_of!(PerCpuVariablesAsm, vtl_return_addr),
-    Scratch = offset_of!(PerCpuVariablesAsm, scratch),
-    Vtl0StateTopAddr = offset_of!(PerCpuVariablesAsm, vtl0_state_top_addr),
+    pub const fn kernel_stack_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, kernel_stack_ptr)
+    }
+    pub const fn interrupt_stack_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, interrupt_stack_ptr)
+    }
+    pub const fn vtl_return_addr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, vtl_return_addr)
+    }
+    pub const fn scratch_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, scratch)
+    }
+    pub const fn vtl0_state_top_addr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, vtl0_state_top_addr)
+    }
+    pub const fn cur_kernel_stack_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, cur_kernel_stack_ptr)
+    }
+    pub const fn cur_kernel_base_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, cur_kernel_base_ptr)
+    }
+    pub const fn user_context_top_addr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, user_context_top_addr)
+    }
 }
 
 /// Wrapper struct to maintain `RefCell` along with `PerCpuVariablesAsm`.
@@ -259,6 +290,9 @@ impl<T> RefCellWrapper<T> {
                 vtl_return_addr: Cell::new(0),
                 scratch: Cell::new(0),
                 vtl0_state_top_addr: Cell::new(0),
+                cur_kernel_stack_ptr: Cell::new(0),
+                cur_kernel_base_ptr: Cell::new(0),
+                user_context_top_addr: Cell::new(0),
             },
             inner: RefCell::new(value),
         }
