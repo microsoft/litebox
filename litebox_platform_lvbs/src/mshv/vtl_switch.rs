@@ -4,7 +4,7 @@ use crate::{
     host::{
         hv_hypercall_page_address,
         per_cpu_variables::{
-            KernelTlsOffset, with_kernel_tls_mut, with_per_cpu_variables,
+            PerCpuVariablesAsmOffset, with_per_cpu_variables, with_per_cpu_variables_asm_mut,
             with_per_cpu_variables_mut,
         },
     },
@@ -21,8 +21,8 @@ use num_enum::TryFromPrimitive;
 
 /// Assembly macro to return to VTL0 using the Hyper-V hypercall stub.
 /// Although Hyper-V lets each core use the same VTL return address, this implementation
-/// uses per-TLS return address to avoid using a mutable global variable.
-/// `ret_off` is the offset of the kernel TLS which holds the VTL return address.
+/// uses per-CPU return address to avoid using a mutable global variable.
+/// `ret_off` is the offset of the PerCpuVariablesAsm which holds the VTL return address.
 macro_rules! VTL_RETURN_ASM {
     ($ret_off:tt) => {
         concat!(
@@ -100,8 +100,8 @@ pub fn vtl_switch_loop_entry(platform: Option<&'static crate::Platform>) -> ! {
 
 /// Assembly macro to save VTL state using the stack as temporary storage.
 /// `fn_save_state` is the function to save VTL state stored in the stack.
-/// `scratch_off` is the offset of the kernel TLS which holds the scratch space to
-/// save/restore the current stack pointer.
+/// `scratch_off` is the offset of the PerCpuVariablesAsm which holds the
+/// scratch space to save/restore the current stack pointer.
 macro_rules! SAVE_VTL_STATE_ASM {
     ($fn_save_state:tt, $scratch_off:tt) => {
         concat!(
@@ -138,7 +138,7 @@ macro_rules! SAVE_VTL_STATE_ASM {
 /// Assembly macro to load VTL state. It uses the stack as temporary storage.
 /// `fn_load_state` is the function to load VTL state to the stack.
 /// `state_size` is the size of `VtlState` structure.
-/// `scratch_off` is the offset of the kernel TLS which holds the scratch space to
+/// `scratch_off` is the offset of the PerCpuVariablesAsm which holds the scratch space to
 /// save/restore the current stack pointer.
 macro_rules! LOAD_VTL_STATE_ASM {
     ($fn_load_state:tt, $state_size:tt, $scratch_off:tt) => {
@@ -233,9 +233,9 @@ unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
         "call {loop_body}",
         LOAD_VTL_STATE_ASM!({load_vtl0_state}, {vtl_state_size}, {scratch_off}),
         "jmp 1b",
-        kernel_sp_off = const { KernelTlsOffset::KernelStackPtr as usize },
-        vtl_ret_addr_off = const { KernelTlsOffset::VtlReturnAddr as usize },
-        scratch_off = const { KernelTlsOffset::Scratch as usize },
+        kernel_sp_off = const { PerCpuVariablesAsmOffset::KernelStackPtr as usize },
+        vtl_ret_addr_off = const { PerCpuVariablesAsmOffset::VtlReturnAddr as usize },
+        scratch_off = const { PerCpuVariablesAsmOffset::Scratch as usize },
         save_vtl0_state = sym save_vtl0_state,
         load_vtl0_state = sym load_vtl0_state,
         vtl_state_size = const core::mem::size_of::<VtlState>(),
@@ -307,8 +307,8 @@ pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), Errno> {
     let vtl_return_address = hvcall_page
         .checked_add(usize::from(code_page_offsets.vtl_return_offset()))
         .ok_or(Errno::EOVERFLOW)?;
-    with_kernel_tls_mut(|ktls| {
-        ktls.set_vtl_return_addr(vtl_return_address);
+    with_per_cpu_variables_asm_mut(|pcv_asm| {
+        pcv_asm.set_vtl_return_addr(vtl_return_address);
     });
     Ok(())
 }

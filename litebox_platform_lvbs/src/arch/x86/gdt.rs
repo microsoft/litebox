@@ -1,6 +1,8 @@
 //! Global Descriptor Table (GDT) and Task State Segment (TSS)
 
-use crate::host::per_cpu_variables::{KernelTls, with_kernel_tls, with_per_cpu_variables_mut};
+use crate::host::per_cpu_variables::{
+    PerCpuVariablesAsm, with_per_cpu_variables_asm, with_per_cpu_variables_mut,
+};
 use alloc::boxed::Box;
 use x86_64::{
     PrivilegeLevel, VirtAddr,
@@ -77,7 +79,7 @@ impl Default for GdtWrapper {
 }
 
 fn setup_gdt_tss() {
-    let stack_top = with_kernel_tls(KernelTls::get_interrupt_stack_ptr);
+    let stack_top = with_per_cpu_variables_asm(PerCpuVariablesAsm::get_interrupt_stack_ptr);
     let stack_top = u64::try_from(stack_top).unwrap();
 
     let mut tss = Box::new(AlignedTss(TaskStateSegment::new()));
