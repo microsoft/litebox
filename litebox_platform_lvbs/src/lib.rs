@@ -917,18 +917,40 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
 
 /// Runs a user thread with the given initial context.
 ///
+/// This will run until the thread terminates or returns.
+///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn run_thread(
-    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &mut litebox_common_linux::PtRegs,
-) {
+pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs) -> T
+where
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+{
     // Currently, `litebox_platform_lvbs` uses `swapgs` to efficiently switch between
     // kernel and user GS base values during kernel-user mode transitions.
     // This `swapgs` usage can pontetially leak a kernel address to the user, so
     // we clear the `KernelGsBase` MSR before running the user thread.
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
-    run_thread_inner(&shim, ctx);
+    run_thread_inner(&shim, ctx, false);
+    shim
+}
+
+/// Re-enters a user thread using the provided shim and the given initial context.
+///
+/// This will run until the thread terminates or returns.
+///
+/// # Arguments
+/// * `shim` - The shim to use for handling syscalls and other events.
+/// * `ctx` - The initial execution context for the thread.
+///
+/// # Safety
+/// The context must be valid user context.
+pub unsafe fn reenter_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs) -> T
+where
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+{
+    crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
+    run_thread_inner(&shim, ctx, true);
+    shim
 }
 
 struct ThreadContext<'a> {
@@ -939,13 +961,14 @@ struct ThreadContext<'a> {
 fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
+    reenter: bool,
 ) {
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     // `thread_ctx` will be passed to `syscall_handler` later.
     // `ctx_ptr` is to let `run_thread_arch` easily access `ctx` (i.e., not to deal with
     // member variable offset calculation in assembly code).
-    unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr) };
+    unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter)) };
 }
 
 /// Save callee-saved registers onto the stack.
@@ -977,6 +1000,93 @@ macro_rules! RESTORE_CALLEE_SAVED_REGISTERS_ASM {
         pop rbx
         pop rbp
         "
+    };
+}
+
+// NOTE: VTL1 extended states are currently stored in per-CPU storage (PerCpuVariablesAsm).
+// In the future, we may need to use a global data structure for this because, if there is
+// an RPC from VTL1 to VTL0, the core resuming execution might be different from the core
+// that requested the RPC. In that case, we also need to save/restore general purpose
+// registers in that global data structure.
+
+// ============================================================================
+// VTL1 XSAVE/XRSTOR macros (with XSAVEOPT optimization for kernel-user switches)
+// ============================================================================
+// XSAVE/XRSTOR state tracking (xsaved flag values):
+//   0: never saved - use XSAVE, then set to 1
+//   1: saved but not yet restored - use XSAVE (XSAVEOPT not safe yet)
+//   2: restored at least once - XSAVEOPT is now safe
+//
+// XSAVEOPT requires that XRSTOR has established tracking for this buffer.
+// Only after an XRSTOR can we safely use XSAVEOPT for subsequent saves.
+// VTL1 xsaved flags are reset at each VTL1 entry since returning to VTL0 invalidates
+// the CPU's tracking (VTL0 does XRSTOR from VTL0's buffer, not VTL1's).
+
+/// Assembly macro to save VTL1 extended states (XSAVE/XSAVEOPT).
+/// Uses xsaveopt only after XRSTOR has established tracking (xsaved == 2).
+/// Clobbers: rax, rcx, rdx
+#[cfg(target_arch = "x86_64")]
+macro_rules! XSAVE_VTL1_ASM {
+    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
+        concat!(
+            "mov rcx, gs:[",
+            stringify!($xsave_area_off),
+            "]\n",
+            "mov eax, gs:[",
+            stringify!($mask_lo_off),
+            "]\n",
+            "mov edx, gs:[",
+            stringify!($mask_hi_off),
+            "]\n",
+            "cmp byte ptr gs:[",
+            stringify!($xsaved_off),
+            "], 2\n",
+            "jne 2f\n",
+            "xsaveopt [rcx]\n",
+            "jmp 3f\n",
+            "2:\n",
+            "xsave [rcx]\n",
+            // Set to 1 if it was 0 (first save). If already 1, keep it as 1.
+            "cmp byte ptr gs:[",
+            stringify!($xsaved_off),
+            "], 0\n",
+            "jne 3f\n",
+            "mov byte ptr gs:[",
+            stringify!($xsaved_off),
+            "], 1\n",
+            "3:\n",
+        )
+    };
+}
+
+/// Assembly macro to restore VTL1 extended states (XRSTOR).
+/// Skips restore if state was never saved (xsaved == 0).
+/// Sets xsaved to 2 after restore to enable XSAVEOPT optimization.
+/// Clobbers: rax, rcx, rdx
+#[cfg(target_arch = "x86_64")]
+macro_rules! XRSTOR_VTL1_ASM {
+    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
+        concat!(
+            "cmp byte ptr gs:[",
+            stringify!($xsaved_off),
+            "], 0\n",
+            "je 4f\n",
+            "mov rcx, gs:[",
+            stringify!($xsave_area_off),
+            "]\n",
+            "mov eax, gs:[",
+            stringify!($mask_lo_off),
+            "]\n",
+            "mov edx, gs:[",
+            stringify!($mask_hi_off),
+            "]\n",
+            "xrstor [rcx]\n",
+            // After XRSTOR, tracking is established - XSAVEOPT is now safe
+            "mov byte ptr gs:[",
+            stringify!($xsaved_off),
+            "], 2\n",
+            "4:\n",
+        )
     };
 }
 
@@ -1056,16 +1166,26 @@ macro_rules! RESTORE_USER_CONTEXT_ASM {
 unsafe extern "C" fn run_thread_arch(
     thread_ctx: &mut ThreadContext,
     ctx: *mut litebox_common_linux::PtRegs,
+    reenter: u8,
 ) {
     core::arch::naked_asm!(
         SAVE_CALLEE_SAVED_REGISTERS_ASM!(),
+        // Extended states are callee-saved. Save all extended states for now because
+        // we don't know whether the caller touched any of them.
+        XSAVE_VTL1_ASM!({vtl1_kernel_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_kernel_xsaved_off}),
         "push rdi", // save `thread_ctx`
         // Save kernel rsp and rbp and user context top in PerCpuVariablesAsm.
         "mov gs:[{cur_kernel_sp_off}], rsp",
         "mov gs:[{cur_kernel_bp_off}], rbp",
         "lea r8, [rsi + {USER_CONTEXT_SIZE}]",
         "mov gs:[{user_context_top_off}], r8",
+        // Call init_handler or reenter_handler based on reenter flag (in dl)
+        "test dl, dl",
+        "jnz 1f",
         "call {init_handler}",
+        "jmp done",
+        "1:",
+        "call {reenter_handler}",
         "jmp done",
         ".globl syscall_callback",
         "syscall_callback:",
@@ -1073,6 +1193,7 @@ unsafe extern "C" fn run_thread_arch(
         "mov r11, rsp", // store user `rsp` in `r11`
         "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
         SAVE_SYSCALL_USER_CONTEXT_ASM!(),
+        XSAVE_VTL1_ASM!({vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
         // Handle the syscall. This will jump back to the user but
@@ -1093,13 +1214,21 @@ unsafe extern "C" fn run_thread_arch(
         "done:",
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
+        XRSTOR_VTL1_ASM!({vtl1_kernel_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_kernel_xsaved_off}),
         RESTORE_CALLEE_SAVED_REGISTERS_ASM!(),
         "ret",
         cur_kernel_sp_off = const { PerCpuVariablesAsm::cur_kernel_stack_ptr_offset() },
         cur_kernel_bp_off = const { PerCpuVariablesAsm::cur_kernel_base_ptr_offset() },
         user_context_top_off = const { PerCpuVariablesAsm::user_context_top_addr_offset() },
+        vtl1_kernel_xsave_area_off = const { PerCpuVariablesAsm::vtl1_kernel_xsave_area_addr_offset() },
+        vtl1_user_xsave_area_off = const { PerCpuVariablesAsm::vtl1_user_xsave_area_addr_offset() },
+        vtl1_xsave_mask_lo_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_lo_offset() },
+        vtl1_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_hi_offset() },
+        vtl1_kernel_xsaved_off = const { PerCpuVariablesAsm::vtl1_kernel_xsaved_offset() },
+        vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
         USER_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
         init_handler = sym init_handler,
+        reenter_handler = sym reenter_handler,
         syscall_handler = sym syscall_handler,
     );
 }
@@ -1130,8 +1259,12 @@ unsafe extern "C" {
     fn syscall_callback() -> isize;
 }
 
-fn init_handler(thread_ctx: &mut ThreadContext) {
+unsafe extern "C" fn init_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.init(ctx));
+}
+
+unsafe extern "C" fn reenter_handler(thread_ctx: &mut ThreadContext) {
+    thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx));
 }
 
 // Switches to the provided user context with the user mode.
@@ -1141,12 +1274,17 @@ fn init_handler(thread_ctx: &mut ThreadContext) {
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
+    // rustfmt::skip is needed because rustfmt adds spaces inside braces in macro arguments,
+    // which breaks stringify! (e.g., "{ name }" instead of "{name}").
+    #[rustfmt::skip]
     core::arch::naked_asm!(
         "switch_to_user_start:",
         // Flush TLB by reloading CR3
         "mov rax, cr3",
         "mov cr3, rax",
+        // Clear rax to not leak CR3 value to user
         "xor eax, eax",
+        XRSTOR_VTL1_ASM!({vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
         // Restore user context from ctx.
         "mov rsp, rdi",
         RESTORE_USER_CONTEXT_ASM!(),
@@ -1155,6 +1293,10 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         "swapgs",
         "iretq",
         "switch_to_user_end:",
+        vtl1_user_xsave_area_off = const { PerCpuVariablesAsm::vtl1_user_xsave_area_addr_offset() },
+        vtl1_xsave_mask_lo_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_lo_offset() },
+        vtl1_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_hi_offset() },
+        vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
     );
 }
 

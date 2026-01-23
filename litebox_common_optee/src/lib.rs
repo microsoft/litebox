@@ -444,35 +444,15 @@ impl UteeParams {
 /// Each parameter for TA invocation with copied content/buffer for safer operations.
 /// This is our representation of `utee_params` and not for directly
 /// interacting with OP-TEE TAs and clients (which expect pointers/references).
-/// `out_address(es)`: VTL0 physical address(es) to write output data to. They are virtually
-/// contiguous but may not be physically contiguous.
 #[derive(Clone)]
 pub enum UteeParamOwned {
     None,
-    ValueInput {
-        value_a: u64,
-        value_b: u64,
-    },
-    ValueOutput {
-        out_address: Option<usize>,
-    },
-    ValueInout {
-        value_a: u64,
-        value_b: u64,
-        out_address: Option<usize>,
-    },
-    MemrefInput {
-        data: Box<[u8]>,
-    },
-    MemrefOutput {
-        buffer_size: usize,
-        out_addresses: Option<Box<[usize]>>,
-    },
-    MemrefInout {
-        data: Box<[u8]>,
-        buffer_size: usize,
-        out_addresses: Option<Box<[usize]>>,
-    },
+    ValueInput { value_a: u64, value_b: u64 },
+    ValueOutput,
+    ValueInout { value_a: u64, value_b: u64 },
+    MemrefInput { data: Box<[u8]> },
+    MemrefOutput { buffer_size: usize },
+    MemrefInout { data: Box<[u8]>, buffer_size: usize },
 }
 
 impl UteeParamOwned {
@@ -524,6 +504,56 @@ pub struct TeeUuid {
     pub time_mid: u16,
     pub time_hi_and_version: u16,
     pub clock_seq_and_node: [u8; 8],
+}
+
+impl TeeUuid {
+    /// Converts a UUID from a 16-byte array in RFC 4122 format (big-endian for numeric fields).
+    ///
+    /// The byte layout is:
+    /// - bytes[0..4]: `time_low` (big-endian u32)
+    /// - bytes[4..6]: `time_mid` (big-endian u16)
+    /// - bytes[6..8]: `time_hi_and_version` (big-endian u16)
+    /// - bytes[8..16]: `clock_seq_and_node` (8 bytes, direct copy)
+    #[allow(clippy::missing_panics_doc)]
+    pub fn from_bytes(data: [u8; 16]) -> Self {
+        let time_low = u32::from_be_bytes(data[0..4].try_into().unwrap());
+        let time_mid = u16::from_be_bytes(data[4..6].try_into().unwrap());
+        let time_hi_and_version = u16::from_be_bytes(data[6..8].try_into().unwrap());
+        let mut clock_seq_and_node = [0u8; 8];
+        clock_seq_and_node.copy_from_slice(&data[8..16]);
+        Self {
+            time_low,
+            time_mid,
+            time_hi_and_version,
+            clock_seq_and_node,
+        }
+    }
+
+    /// Converts a UUID from OP-TEE's u32 array representation.
+    ///
+    /// OP-TEE passes UUIDs in SMC calls as 4 u32 values where:
+    /// - `data[0]` = `time_low` (u32)
+    /// - `data[1]` = `(time_mid << 16) | time_hi_and_version`
+    /// - `data[2..3]` = `clock_seq_and_node` (8 bytes as 2 u32s, big-endian byte order)
+    ///
+    /// For example, UUID `384fb3e0-e7f8-11e3-af63-0002a5d5c51b` is represented as:
+    /// `[0x384fb3e0, 0xe7f811e3, 0xaf630002, 0xa5d5c51b]`
+    pub fn from_u32_array(data: [u32; 4]) -> Self {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&data[0].to_be_bytes());
+        bytes[4..8].copy_from_slice(&data[1].to_be_bytes());
+        bytes[8..12].copy_from_slice(&data[2].to_be_bytes());
+        bytes[12..16].copy_from_slice(&data[3].to_be_bytes());
+        Self::from_bytes(bytes)
+    }
+
+    /// Converts a UUID from OP-TEE's u64 array representation.
+    pub fn from_u64_array(data: [u64; 2]) -> Self {
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&data[0].to_be_bytes());
+        bytes[8..16].copy_from_slice(&data[1].to_be_bytes());
+        Self::from_bytes(bytes)
+    }
 }
 
 /// `TEE_Identity` from `optee_os/lib/libutee/include/tee_api_types.h`.
@@ -1380,6 +1410,18 @@ impl OpteeMsgArgs {
                 .ok_or(OpteeSmcReturnCode::EBadCmd)?)
         }
     }
+    pub fn set_param_value(
+        &mut self,
+        index: usize,
+        value: OpteeMsgParamValue,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].u.value = value;
+            Ok(())
+        }
+    }
 }
 
 /// A memory page to exchange OP-TEE SMC call arguments.
@@ -1454,7 +1496,7 @@ const OPTEE_SMC_FUNCID_CALLS_UID: usize = 0xff01;
 const OPTEE_SMC_FUNCID_CALLS_REVISION: usize = 0xff03;
 
 #[non_exhaustive]
-#[derive(PartialEq, TryFromPrimitive)]
+#[derive(Debug, PartialEq, TryFromPrimitive)]
 #[repr(usize)]
 pub enum OpteeSmcFunction {
     GetOsUuid = OPTEE_SMC_FUNCID_GET_OS_UUID,
@@ -1609,4 +1651,54 @@ pub enum OpteeSmcReturnCode {
     ENomem = OPTEE_SMC_RETURN_ENOMEM,
     ENotAvail = OPTEE_SMC_RETURN_ENOTAVAIL,
     UnknownFunction = OPTEE_SMC_RETURN_UNKNOWN_FUNCTION,
+}
+
+impl From<litebox_common_linux::vmap::PhysPointerError> for OpteeSmcReturnCode {
+    fn from(err: litebox_common_linux::vmap::PhysPointerError) -> Self {
+        use litebox_common_linux::vmap::PhysPointerError;
+        match err {
+            PhysPointerError::AlreadyMapped(_) => OpteeSmcReturnCode::EBusy,
+            PhysPointerError::NoMappingInfo => OpteeSmcReturnCode::ENomem,
+            _ => OpteeSmcReturnCode::EBadAddr,
+        }
+    }
+}
+
+impl From<OpteeSmcReturnCode> for litebox_common_linux::errno::Errno {
+    fn from(ret: OpteeSmcReturnCode) -> Self {
+        match ret {
+            OpteeSmcReturnCode::EBusy | OpteeSmcReturnCode::EThreadLimit => {
+                litebox_common_linux::errno::Errno::EBUSY
+            }
+            OpteeSmcReturnCode::EResume => litebox_common_linux::errno::Errno::EAGAIN,
+            OpteeSmcReturnCode::EBadAddr => litebox_common_linux::errno::Errno::EFAULT,
+            OpteeSmcReturnCode::ENomem => litebox_common_linux::errno::Errno::ENOMEM,
+            OpteeSmcReturnCode::ENotAvail => litebox_common_linux::errno::Errno::ENOENT,
+            _ => litebox_common_linux::errno::Errno::EINVAL,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tee_uuid_from_u32_array() {
+        // Test with OP-TEE's well-known UUID: 384fb3e0-e7f8-11e3-af63-0002a5d5c51b
+        // As documented in optee_msg.h:
+        // OPTEE_MSG_UID_0 = 0x384fb3e0
+        // OPTEE_MSG_UID_1 = 0xe7f811e3
+        // OPTEE_MSG_UID_2 = 0xaf630002
+        // OPTEE_MSG_UID_3 = 0xa5d5c51b
+        let uuid = TeeUuid::from_u32_array([0x384fb3e0, 0xe7f811e3, 0xaf630002, 0xa5d5c51b]);
+
+        assert_eq!(uuid.time_low, 0x384fb3e0);
+        assert_eq!(uuid.time_mid, 0xe7f8);
+        assert_eq!(uuid.time_hi_and_version, 0x11e3);
+        assert_eq!(
+            uuid.clock_seq_and_node,
+            [0xaf, 0x63, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b]
+        );
+    }
 }

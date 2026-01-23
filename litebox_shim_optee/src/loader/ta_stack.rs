@@ -59,6 +59,8 @@ pub struct TaStack {
     params: UteeParams,
     /// The number of parameters stored (<= 4)
     num_params: usize,
+    /// Position where LdelfArg was pushed (if any)
+    ldelf_arg_pos: Option<usize>,
 }
 
 impl TaStack {
@@ -80,6 +82,7 @@ impl TaStack {
             pos: len - core::mem::size_of::<UteeParams>(),
             params: UteeParams::new(),
             num_params: 0,
+            ldelf_arg_pos: None,
         })
     }
 
@@ -98,8 +101,17 @@ impl TaStack {
     }
 
     /// Get the address of `LdelfArg` on the stack.
+    ///
+    /// Returns the actual address where `LdelfArg` was pushed via `init_with_ldelf_arg`.
     pub(crate) fn get_ldelf_arg_address(&self) -> usize {
-        self.stack_top.as_usize() + self.len - core::mem::size_of::<LdelfArg>()
+        self.ldelf_arg_pos.map_or_else(
+            || {
+                // Fallback for compatibility - but this should not be reached
+                // if init_with_ldelf_arg was called properly
+                self.stack_top.as_usize() + self.len - core::mem::size_of::<LdelfArg>()
+            },
+            |pos| self.stack_top.as_usize() + pos,
+        )
     }
 
     /// Push `bytes` to the stack.
@@ -216,30 +228,19 @@ impl TaStack {
                 UteeParamOwned::ValueInput { value_a, value_b } => {
                     self.push_param_values(TeeParamType::ValueInput, Some((*value_a, *value_b)))?;
                 }
-                UteeParamOwned::ValueOutput { out_address: _ } => {
+                UteeParamOwned::ValueOutput => {
                     self.push_param_values(TeeParamType::ValueOutput, None)?;
                 }
-                UteeParamOwned::ValueInout {
-                    value_a,
-                    value_b,
-                    out_address: _,
-                } => {
+                UteeParamOwned::ValueInout { value_a, value_b } => {
                     self.push_param_values(TeeParamType::ValueInout, Some((*value_a, *value_b)))?;
                 }
                 UteeParamOwned::MemrefInput { data } => {
                     self.push_param_memref(TeeParamType::MemrefInput, Some(data), data.len())?;
                 }
-                UteeParamOwned::MemrefInout {
-                    data,
-                    buffer_size,
-                    out_addresses: _,
-                } => {
+                UteeParamOwned::MemrefInout { data, buffer_size } => {
                     self.push_param_memref(TeeParamType::MemrefInout, Some(data), *buffer_size)?;
                 }
-                UteeParamOwned::MemrefOutput {
-                    buffer_size,
-                    out_addresses: _,
-                } => {
+                UteeParamOwned::MemrefOutput { buffer_size } => {
                     self.push_param_memref(TeeParamType::MemrefOutput, None, *buffer_size)?;
                 }
                 UteeParamOwned::None => self.push_param_none()?,
@@ -268,6 +269,9 @@ impl TaStack {
             )
         })?;
 
+        // Track where LdelfArg was pushed so get_ldelf_arg_address returns the correct address
+        self.ldelf_arg_pos = Some(self.pos);
+
         self.pos = align_down(self.pos, Self::STACK_ALIGNMENT);
         assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
         Some(())
@@ -288,7 +292,13 @@ pub(crate) fn allocate_stack(task: &crate::Task, stack_base: Option<usize>) -> O
         unsafe {
             task.global
                 .pm
-                .create_stack_pages(None, length, CreatePagesFlags::empty())
+                .create_stack_pages(
+                    None,
+                    length,
+                    // Use POPULATE_PAGES_IMMEDIATELY since some platforms (e.g., LVBS)
+                    // do not support demand paging yet.
+                    CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                )
                 .ok()?
         }
     };

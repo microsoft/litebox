@@ -324,11 +324,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
 
-    unsafe {
+    let _ = unsafe {
         litebox_platform_linux_userland::run_thread(
             program.entrypoints,
             &mut litebox_common_linux::PtRegs::default(),
-        );
+        )
     };
 
     #[cfg(feature = "lock_tracing")]

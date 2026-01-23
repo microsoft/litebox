@@ -11,7 +11,6 @@ mod mem_integrity;
 pub(crate) mod ringbuffer;
 pub(crate) mod vsm;
 pub mod vsm_intercept;
-mod vsm_optee_smc;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
@@ -123,7 +122,7 @@ pub const VSM_VTL_CALL_FUNC_ID_PATCH_TEXT: u32 = 0x1_ffeb;
 pub const VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY: u32 = 0x1_ffec;
 
 // This VSM function ID for OP-TEE messages is subject to change
-pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1f_ffff;
+pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1_fff0;
 
 /// VSM Functions
 #[derive(Debug, PartialEq, TryFromPrimitive)]

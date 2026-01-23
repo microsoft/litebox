@@ -531,6 +531,10 @@ impl ElfParsedFile {
         mem: &mut impl AccessMemory,
         loaded_entry_point: usize,
     ) -> Result<(), ElfLoadError<M::Error>> {
+        // If there's no trampoline, nothing to do.
+        if self.trampoline.is_none() {
+            return Ok(());
+        }
         let base_addr = loaded_entry_point
             .checked_sub(self.header.e_entry.truncate())
             .ok_or(ElfLoadError::InvalidProgramHeader)?;

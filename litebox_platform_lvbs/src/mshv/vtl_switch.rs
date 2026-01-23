@@ -3,25 +3,66 @@
 
 //! VTL switch related functions
 
-use crate::{
-    host::{
-        hv_hypercall_page_address,
-        per_cpu_variables::{
-            PerCpuVariablesAsm, with_per_cpu_variables, with_per_cpu_variables_asm,
-            with_per_cpu_variables_mut,
-        },
+use crate::host::{
+    hv_hypercall_page_address,
+    per_cpu_variables::{
+        PerCpuVariablesAsm, with_per_cpu_variables, with_per_cpu_variables_asm,
+        with_per_cpu_variables_mut,
     },
-    mshv::{
-        HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS,
-        VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction,
-        hvcall_vp::hvcall_get_vp_registers, vsm::vsm_dispatch, vsm_intercept::vsm_handle_intercept,
-        vsm_optee_smc,
-    },
+};
+use crate::mshv::{
+    HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS,
+    VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VsmFunction,
+    hvcall_vp::hvcall_get_vp_registers, vsm::vsm_dispatch, vsm_intercept::vsm_handle_intercept,
 };
 use core::arch::{asm, naked_asm};
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
+
+// ============================================================================
+// VTL0 XSAVE/XRSTOR macros (simplified, always use plain XSAVE/XRSTOR)
+// ============================================================================
+// VTL0's kernel may do XRSTOR to different buffers during its execution (e.g., process
+// context switches), so we cannot rely on XSAVEOPT's tracking. Always use plain XSAVE.
+
+/// Assembly macro to save VTL0 extended states using plain XSAVE.
+/// Clobbers: rax, rcx, rdx
+macro_rules! XSAVE_VTL0_ASM {
+    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt) => {
+        concat!(
+            "mov rcx, gs:[",
+            stringify!($xsave_area_off),
+            "]\n",
+            "mov eax, gs:[",
+            stringify!($mask_lo_off),
+            "]\n",
+            "mov edx, gs:[",
+            stringify!($mask_hi_off),
+            "]\n",
+            "xsave [rcx]\n",
+        )
+    };
+}
+
+/// Assembly macro to restore VTL0 extended states using plain XRSTOR.
+/// Clobbers: rax, rcx, rdx
+macro_rules! XRSTOR_VTL0_ASM {
+    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt) => {
+        concat!(
+            "mov rcx, gs:[",
+            stringify!($xsave_area_off),
+            "]\n",
+            "mov eax, gs:[",
+            stringify!($mask_lo_off),
+            "]\n",
+            "mov edx, gs:[",
+            stringify!($mask_hi_off),
+            "]\n",
+            "xrstor [rcx]\n",
+        )
+    };
+}
 
 /// Assembly macro to return to VTL0 using the Hyper-V hypercall stub.
 /// Although Hyper-V lets each core use the same VTL return address, this implementation
@@ -170,64 +211,6 @@ macro_rules! LOAD_VTL_STATE_ASM {
     };
 }
 
-/// Assembly macro to save extended states (XSAVE/XSAVEOPT).
-///
-/// Uses xsaveopt for better performance after the first save.
-/// Clobbers: rax, rcx, rdx
-macro_rules! XSAVE_ASM {
-    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
-        concat!(
-            "mov rcx, gs:[",
-            stringify!($xsave_area_off),
-            "]\n",
-            "mov eax, gs:[",
-            stringify!($mask_lo_off),
-            "]\n",
-            "mov edx, gs:[",
-            stringify!($mask_hi_off),
-            "]\n",
-            "cmp byte ptr gs:[",
-            stringify!($xsaved_off),
-            "], 0\n",
-            "je 2f\n",
-            "xsaveopt [rcx]\n",
-            "jmp 3f\n",
-            "2:\n",
-            "xsave [rcx]\n",
-            "mov byte ptr gs:[",
-            stringify!($xsaved_off),
-            "], 1\n",
-            "3:\n",
-        )
-    };
-}
-
-/// Assembly macro to restore extended states (XRSTOR).
-///
-/// Skips restore if state was never saved.
-/// Clobbers: rax, rcx, rdx
-macro_rules! XRSTOR_ASM {
-    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
-        concat!(
-            "cmp byte ptr gs:[",
-            stringify!($xsaved_off),
-            "], 0\n",
-            "je 4f\n",
-            "mov rcx, gs:[",
-            stringify!($xsave_area_off),
-            "]\n",
-            "mov eax, gs:[",
-            stringify!($mask_lo_off),
-            "]\n",
-            "mov edx, gs:[",
-            stringify!($mask_hi_off),
-            "]\n",
-            "xrstor [rcx]\n",
-            "4:\n",
-        )
-    };
-}
-
 /// VTL switch loop implemented in assembly.
 ///
 /// # Register Assumptions
@@ -247,14 +230,14 @@ unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
         VTL_RETURN_ASM!({vtl_ret_addr_off}),
         // *** VTL1 resumes here regardless of the entry reason (VTL switch or intercept) ***
         SAVE_VTL_STATE_ASM!({scratch_off}, {vtl0_state_top_addr_off}),
-        XSAVE_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}, {vtl0_xsaved_off}),
+        XSAVE_VTL0_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}),
         "mov rbp, rsp", // rbp contains VTL0's stack frame, so update it.
         "sti", // enable VTL1 interrupts after saving VTL0 state
         // A pending SINT can be fired here. Our SINT handler only executes `iretq` so returns to here immediately.
         "call {loop_body}",
         ".globl panic_vtl_switch",
         "panic_vtl_switch:", // jump to here on panic to switch back to VTL0
-        XRSTOR_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}, {vtl0_xsaved_off}),
+        XRSTOR_VTL0_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}),
         LOAD_VTL_STATE_ASM!({vtl0_state_top_addr_off}, {VTL_STATE_SIZE}),
         // *** VTL0 state is recovered. Do not put any code tampering with them here ***
         "jmp 1b",
@@ -266,7 +249,6 @@ unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
         vtl0_xsave_area_off = const { PerCpuVariablesAsm::vtl0_xsave_area_addr_offset() },
         vtl0_xsave_mask_lo_off = const { PerCpuVariablesAsm::vtl0_xsave_mask_lo_offset() },
         vtl0_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl0_xsave_mask_hi_offset() },
-        vtl0_xsaved_off = const { PerCpuVariablesAsm::vtl0_xsaved_offset() },
         VTL_STATE_SIZE = const core::mem::size_of::<VtlState>(),
         loop_body = sym vtl_switch_loop_body,
     )
@@ -317,7 +299,38 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         .unwrap_or(VsmFunction::Unknown);
     match func_id {
         VsmFunction::Unknown => Errno::EINVAL.as_neg().into(),
-        VsmFunction::OpteeMessage => vsm_optee_smc::optee_smc_dispatch(params[1]),
+        VsmFunction::OpteeMessage => {
+            // Reset VTL1 xsaved flags before calling the OP-TEE SMC handler. The CPU's XSAVEOPT
+            // tracking is global - it only tracks one buffer at a time. At this point, the CPU's
+            // tracking might rely on VTL0's buffer (if VTL0 called XRSTOR). Thus, we shouldn't
+            // use XSAVEOPT until XRSTOR re-establishes tracking for VTL1's buffer.
+            // This is only needed for OpteeMessage which does VTL1 kernel/user xsave/xrstor in
+            // run_thread_with_reenter.
+            with_per_cpu_variables_asm(PerCpuVariablesAsm::reset_vtl1_xsaved);
+
+            let smc_args_pfn = params[1];
+            let result: i64;
+            // Call optee_smc_handler_entry defined in litebox_runner_lvbs.
+            // *** This is just a workaround until we have a proper callback/upcall interface or
+            // move the vtl switch loop into litebox_runner_lvbs. ***
+            //
+            // SAFETY: The function uses the C calling convention (first arg in rdi, return in rax).
+            // We must ensure 16-byte stack alignment before the call per System V AMD64 ABI.
+            unsafe {
+                asm!(
+                    "push rbp",             // save rbp (callee-saved)
+                    "mov rbp, rsp",         // save current rsp
+                    "and rsp, -16",         // 16-byte align the stack
+                    "call optee_smc_handler_entry",
+                    "mov rsp, rbp",         // restore rsp
+                    "pop rbp",              // restore rbp
+                    in("rdi") smc_args_pfn,
+                    lateout("rax") result,
+                    clobber_abi("C"),
+                );
+            }
+            result
+        }
         _ => vsm_dispatch(func_id, &params[1..]),
     }
 }

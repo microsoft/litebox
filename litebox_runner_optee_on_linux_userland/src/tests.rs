@@ -53,14 +53,14 @@ pub fn run_ta_with_test_commands(
                 })
                 .unwrap();
             ta_info = Some(loaded);
-            let ta_info = ta_info.as_mut().unwrap();
+            let info = ta_info.as_mut().unwrap();
             let mut ctx = litebox_common_linux::PtRegs::default();
-            unsafe {
-                litebox_platform_linux_userland::run_thread_with_shim_ref(
-                    &ta_info.entrypoints,
+            info.entrypoints = Some(unsafe {
+                litebox_platform_linux_userland::run_thread(
+                    info.entrypoints.take().unwrap(),
                     &mut ctx,
-                );
-            };
+                )
+            });
             assert!(
                 ctx.rax == 0,
                 "ldelf exits with error: return_code={:#x}",
@@ -74,34 +74,44 @@ pub fn run_ta_with_test_commands(
                     value_b: _,
                 } = params[0]
             {
-                *value_a = u64::from(ta_info.entrypoints.get_session_id());
+                *value_a = u64::from(
+                    ta_info
+                        .as_ref()
+                        .unwrap()
+                        .entrypoints
+                        .as_ref()
+                        .unwrap()
+                        .get_session_id(),
+                );
             }
         }
 
-        if let Some(ta_info) = &mut ta_info {
+        if let Some(info) = ta_info.as_mut() {
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
-            let _ = ta_info
+            let _ = info
                 .entrypoints
+                .as_ref()
+                .unwrap()
                 .load_ta_context(params.as_slice(), None, func_id as u32, Some(cmd.cmd_id))
                 .map_err(|_| {
                     panic!("Failed to load TA context");
                 });
             let mut ctx = litebox_common_linux::PtRegs::default();
-            unsafe {
-                litebox_platform_linux_userland::run_thread_with_shim_ref(
-                    &ta_info.entrypoints,
+            info.entrypoints = Some(unsafe {
+                litebox_platform_linux_userland::reenter_thread(
+                    info.entrypoints.take().unwrap(),
                     &mut ctx,
-                );
-            };
+                )
+            });
             assert!(
                 ctx.rax == 0,
                 "TA exits with error: return_code={:#x}",
                 ctx.rax
             );
             // TA stores results in the `UteeParams` structure and/or buffers it refers to.
-            if let Some(params_address) = ta_info.params_address {
+            if let Some(params_address) = info.params_address {
                 let ptr = UserConstPtr::<UteeParams>::from_usize(params_address);
                 let params = unsafe { ptr.read_at_offset(0) }.expect("Failed to read UteeParams");
                 handle_ta_command_output(&params);
@@ -223,20 +233,16 @@ impl TaCommandParamsBase64 {
                 value_a: *value_a,
                 value_b: *value_b,
             },
-            TaCommandParamsBase64::ValueOutput {} => {
-                UteeParamOwned::ValueOutput { out_address: None }
-            }
+            TaCommandParamsBase64::ValueOutput {} => UteeParamOwned::ValueOutput,
             TaCommandParamsBase64::ValueInout { value_a, value_b } => UteeParamOwned::ValueInout {
                 value_a: *value_a,
                 value_b: *value_b,
-                out_address: None,
             },
             TaCommandParamsBase64::MemrefInput { data_base64 } => UteeParamOwned::MemrefInput {
                 data: Self::decode_base64(data_base64).into_boxed_slice(),
             },
             TaCommandParamsBase64::MemrefOutput { buffer_size } => UteeParamOwned::MemrefOutput {
                 buffer_size: usize::try_from(*buffer_size).unwrap(),
-                out_addresses: None,
             },
             TaCommandParamsBase64::MemrefInout {
                 data_base64,
@@ -251,7 +257,6 @@ impl TaCommandParamsBase64 {
                 UteeParamOwned::MemrefInout {
                     data: decoded_data.into_boxed_slice(),
                     buffer_size,
-                    out_addresses: None,
                 }
             }
         }
