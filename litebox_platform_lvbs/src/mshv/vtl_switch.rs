@@ -239,6 +239,8 @@ unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
         XSAVE_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}, {vtl0_xsaved_off}),
         "mov rbp, rsp", // rbp contains VTL0's stack frame, so update it.
         "call {loop_body}",
+        ".globl panic_vtl_switch",
+        "panic_vtl_switch:", // jump to here on panic to switch back to VTL0
         XRSTOR_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}, {vtl0_xsaved_off}),
         LOAD_VTL_STATE_ASM!({vtl0_state_top_addr_off}, {VTL_STATE_SIZE}),
         // *** VTL0 state is recovered. Do not put any code tampering with them here ***

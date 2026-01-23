@@ -261,7 +261,7 @@ pub struct PerCpuVariablesAsm {
     vtl_return_addr: Cell<usize>,
     /// Scratch pad
     scratch: Cell<usize>,
-    /// Top address of VTL0 VTLState
+    /// Top address of VTL0 VtlState
     vtl0_state_top_addr: Cell<usize>,
     /// Current kernel stack pointer
     cur_kernel_stack_ptr: Cell<usize>,
@@ -359,7 +359,7 @@ pub struct RefCellWrapper<T> {
 }
 impl<T> RefCellWrapper<T> {
     pub const fn new(value: T) -> Self {
-        RefCellWrapper {
+        Self {
             pcv_asm: PerCpuVariablesAsm {
                 kernel_stack_ptr: Cell::new(0),
                 interrupt_stack_ptr: Cell::new(0),
@@ -551,7 +551,8 @@ pub fn allocate_per_cpu_variables() {
 
 /// Initialize PerCpuVariable and PerCpuVariableAsm for the current core.
 ///
-/// Currently, it initializes the kernel and interrupt stack pointers in the PerCpuVariablesAsm area.
+/// Currently, it initializes the kernel and interrupt stack pointers and the top address of VTL0 VtlState
+/// in the PerCpuVariablesAsm area.
 ///
 /// # Panics
 /// Panics if the per-CPU variables are not properly initialized.
