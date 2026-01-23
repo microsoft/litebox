@@ -2,6 +2,10 @@
 
 use core::panic::PanicInfo;
 use litebox::{mm::linux::PAGE_SIZE, utils::TruncateExt};
+use litebox_common_optee::{
+    LdelfArg, OpteeMessageCommand, OpteeMsgArg, OpteeSmcArgs, OpteeSmcReturn, TeeIdentity,
+    TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
+};
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
     debug_serial_println,
@@ -21,6 +25,14 @@ use litebox_platform_lvbs::{
     serial_println,
 };
 use litebox_platform_multiplex::Platform;
+use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
+use litebox_shim_optee::{
+    loader::ElfLoadInfo,
+    msg_handler::{
+        decode_ta_request, handle_optee_msg_arg, handle_optee_smc_args,
+        prepare_for_return_to_normal_world,
+    },
+};
 
 /// # Panics
 ///
@@ -65,6 +77,7 @@ pub fn init() -> Option<&'static Platform> {
             let pml4_table_addr = vtl1_start + u64::try_from(PAGE_SIZE * VTL1_PML4E_PAGE).unwrap();
             let platform = Platform::new(pml4_table_addr, vtl1_start, vtl1_end);
             ret = Some(platform);
+            litebox_platform_multiplex::set_platform(platform);
 
             // Add the rest of the VTL1 memory to the global allocator once they are mapped to the kernel page table.
             let mem_fill_start = mem_fill_start + mem_fill_size;
@@ -103,28 +116,13 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
     vtl_switch_loop_entry(platform)
 }
 
-// Tentative OP-TEE message handler upcall implementation.
-// This will be revised once the upcall interface is finalized.
-// NOTE: This function doesn't work because `run_thread` is not ready.
-// It is okay to remove this function in this PR and add it in a follow-up PR.
-use litebox_common_optee::{
-    LdelfArg, OpteeMessageCommand, OpteeMsgArg, OpteeSmcArgs, OpteeSmcReturn, TeeIdentity,
-    TeeLogin, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
-};
-use litebox_shim_optee::loader::ElfLoadInfo;
-use litebox_shim_optee::msg_handler::{
-    decode_ta_request, handle_optee_msg_arg, handle_optee_smc_args,
-    prepare_for_return_to_normal_world,
-};
-use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
-
-/// An entry point function for OP-TEE message handler upcall/callback.
+/// A tentative entry point function for OP-TEE message handler upcall/callback.
 ///
 /// This entry point function is intended to be called from the LVBS platform which is unware of
 /// OP-TEE semantics. Thus, we align this function's signature with other VSM/HVCI functions (i.e.,
 /// up to three u64 arguments and returning Result<i64, Errno>).
 #[expect(dead_code)]
-fn optee_msg_handler_upcall_entry(
+fn optee_smc_handler_upcall_entry(
     smc_args_addr: u64,
 ) -> Result<i64, litebox_common_linux::errno::Errno> {
     let smc_args_addr: usize = smc_args_addr.truncate();

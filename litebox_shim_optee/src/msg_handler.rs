@@ -55,12 +55,12 @@ const MAX_NOTIF_VALUE: usize = 0;
 const NUM_RPC_PARMS: usize = 4;
 
 #[inline]
-fn page_align_down_u64(address: u64) -> u64 {
+fn page_align_down(address: u64) -> u64 {
     address & !(PAGE_SIZE as u64 - 1)
 }
 
 #[inline]
-fn page_align_up_u64(len: u64) -> u64 {
+fn page_align_up(len: u64) -> u64 {
     len.next_multiple_of(PAGE_SIZE as u64)
 }
 
@@ -181,9 +181,9 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), OpteeSmcReturn>
             // `tmem.buf_ptr` encodes two different information:
             // - The physical page address of the first `ShmRefPagesData`
             // - The page offset of the first shared memory page (`pages_list[0]`)
-            let shm_ref_pages_data_phys_addr = page_align_down_u64(tmem.buf_ptr);
+            let shm_ref_pages_data_phys_addr = page_align_down(tmem.buf_ptr);
             let page_offset = tmem.buf_ptr - shm_ref_pages_data_phys_addr;
-            let aligned_size = page_align_up_u64(page_offset + tmem.size);
+            let aligned_size = page_align_up(page_offset + tmem.size);
             shm_ref_map().register_shm(
                 shm_ref_pages_data_phys_addr,
                 page_offset,
@@ -243,6 +243,7 @@ pub fn decode_ta_request(
         data[1] = (msg_arg.get_param_value(0)?.b).truncate();
         data[2] = (msg_arg.get_param_value(1)?.a).truncate();
         data[3] = (msg_arg.get_param_value(1)?.b).truncate();
+        // Skip the first two parameters as they convey the TA UUID
         (Some(TeeUuid::from_u32_array(data)), 2)
     } else {
         (None, 0)
@@ -282,67 +283,58 @@ pub fn decode_ta_request(
                     value_b: value.b,
                 }
             }
-            OpteeMsgAttrType::TmemInput | OpteeMsgAttrType::RmemInput => {
-                let (shm_info, data_size) = match param.attr_type() {
-                    OpteeMsgAttrType::TmemInput => {
-                        let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        (
-                            get_shm_info_from_optee_msg_param_tmem(tmem)?,
-                            tmem.size.truncate(),
-                        )
-                    }
-                    OpteeMsgAttrType::RmemInput => {
-                        let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        (
-                            get_shm_info_from_optee_msg_param_rmem(rmem)?,
-                            rmem.size.truncate(),
-                        )
-                    }
-                    _ => unreachable!(),
-                };
+            OpteeMsgAttrType::TmemInput => {
+                let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
+                let data_size = tmem.size.truncate();
+
                 let mut data = alloc::vec![0u8; data_size];
                 read_data_from_shm(&shm_info, &mut data)?;
                 UteeParamOwned::MemrefInput { data: data.into() }
             }
-            OpteeMsgAttrType::TmemOutput | OpteeMsgAttrType::RmemOutput => {
-                let (shm_info, buffer_size) = match param.attr_type() {
-                    OpteeMsgAttrType::TmemOutput => {
-                        let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        (
-                            get_shm_info_from_optee_msg_param_tmem(tmem)?,
-                            tmem.size.truncate(),
-                        )
-                    }
-                    OpteeMsgAttrType::RmemOutput => {
-                        let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        (
-                            get_shm_info_from_optee_msg_param_rmem(rmem)?,
-                            rmem.size.truncate(),
-                        )
-                    }
-                    _ => unreachable!(),
-                };
+            OpteeMsgAttrType::RmemInput => {
+                let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
+                let data_size = rmem.size.truncate();
+
+                let mut data = alloc::vec![0u8; data_size];
+                read_data_from_shm(&shm_info, &mut data)?;
+                UteeParamOwned::MemrefInput { data: data.into() }
+            }
+            OpteeMsgAttrType::TmemOutput => {
+                let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
+                let buffer_size = tmem.size.truncate();
+
                 ta_req_info.out_shm_info[i] = Some(shm_info);
                 UteeParamOwned::MemrefOutput { buffer_size }
             }
-            OpteeMsgAttrType::TmemInout | OpteeMsgAttrType::RmemInout => {
-                let (shm_info, buffer_size) = match param.attr_type() {
-                    OpteeMsgAttrType::TmemInout => {
-                        let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        (
-                            get_shm_info_from_optee_msg_param_tmem(tmem)?,
-                            tmem.size.truncate(),
-                        )
-                    }
-                    OpteeMsgAttrType::RmemInout => {
-                        let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
-                        (
-                            get_shm_info_from_optee_msg_param_rmem(rmem)?,
-                            rmem.size.truncate(),
-                        )
-                    }
-                    _ => unreachable!(),
-                };
+            OpteeMsgAttrType::RmemOutput => {
+                let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
+                let buffer_size = rmem.size.truncate();
+
+                ta_req_info.out_shm_info[i] = Some(shm_info);
+                UteeParamOwned::MemrefOutput { buffer_size }
+            }
+            OpteeMsgAttrType::TmemInout => {
+                let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
+                let buffer_size = tmem.size.truncate();
+
+                let mut buffer = alloc::vec![0u8; buffer_size];
+                read_data_from_shm(&shm_info, &mut buffer)?;
+                ta_req_info.out_shm_info[i] = Some(shm_info);
+                UteeParamOwned::MemrefInout {
+                    data: buffer.into(),
+                    buffer_size,
+                }
+            }
+            OpteeMsgAttrType::RmemInout => {
+                let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
+                let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
+                let buffer_size = rmem.size.truncate();
+
                 let mut buffer = alloc::vec![0u8; buffer_size];
                 read_data_from_shm(&shm_info, &mut buffer)?;
                 ta_req_info.out_shm_info[i] = Some(shm_info);
@@ -570,7 +562,7 @@ fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {
 /// Note that we use this function for handing TA requests and in this context
 /// `OpteeMsgParamTmem` and `OpteeMsgParamRmem` are equivalent because every shared memory
 /// reference accessible by TAs must be registered in advance.
-/// `OpteeMsgParamTmem` is matter for the registration of shared memory regions.
+/// `OpteeMsgParamTmem` is needed when we register shared memory regions (rmem is not allowed for this purpose).
 fn get_shm_info_from_optee_msg_param_tmem(
     tmem: OpteeMsgParamTmem,
 ) -> Result<ShmInfo<PAGE_SIZE>, OpteeSmcReturn> {
@@ -586,8 +578,6 @@ fn get_shm_info_from_optee_msg_param_tmem(
 ///
 /// `rmem.offs` must be an offset within the shared memory region registered with `rmem.shm_ref` before
 /// and `rmem.offs + rmem.size` must not exceed the size of the registered shared memory region.
-/// All addresses this function returns are page aligned and virtually contiguous within the normal world but
-/// not necessarily physically contiguous.
 fn get_shm_info_from_optee_msg_param_rmem(
     rmem: OpteeMsgParamRmem,
 ) -> Result<ShmInfo<PAGE_SIZE>, OpteeSmcReturn> {
