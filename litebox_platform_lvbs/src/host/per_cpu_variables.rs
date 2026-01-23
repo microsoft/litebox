@@ -7,7 +7,7 @@ use crate::{
     arch::{MAX_CORES, gdt, get_core_id},
     host::bootparam::get_num_possible_cpus,
     mshv::{
-        HV_VTL_NORMAL, HV_VTL_SECURE, HvMessagePage, HvVpAssistPage,
+        HvMessagePage, HvVpAssistPage,
         vsm::{ControlRegMap, NUM_CONTROL_REGS},
         vtl_switch::VtlState,
         vtl1_mem_layout::PAGE_SIZE,
@@ -38,10 +38,7 @@ pub struct PerCpuVariables {
     pub vtl0_state: VtlState,
     pub vtl0_locked_regs: ControlRegMap,
     pub gdt: Option<&'static gdt::GdtWrapper>,
-    vtl0_xsave_area_addr: VirtAddr,
     vtl1_xsave_area_addr: VirtAddr,
-    vtl0_xsave_mask: u64,
-    vtl0_xsaved: bool,
     vtl1_xsaved: bool,
     pub tls: VirtAddr,
 }
@@ -95,9 +92,12 @@ impl PerCpuVariables {
 
     /// Allocate XSAVE areas for saving/restoring the extended states of each core.
     /// These buffers are allocated once and never deallocated.
-    pub(crate) fn allocate_xsave_area(&mut self) {
+    ///
+    /// VTL0 xsave area address and mask are stored directly in the provided `PerCpuVariablesAsm`
+    /// for assembly access. VTL1 xsave area address is stored in `PerCpuVariables` for Rust code.
+    pub(crate) fn allocate_xsave_area(&mut self, pcv_asm: &PerCpuVariablesAsm) {
         assert!(
-            self.vtl0_xsave_area_addr.is_null() && self.vtl1_xsave_area_addr.is_null(),
+            self.vtl1_xsave_area_addr.is_null(),
             "XSAVE areas are already allocated"
         );
         // We should use VTL0's XSAVE mask (XCR0) to save and restore VTL0's extended states
@@ -106,9 +106,9 @@ impl PerCpuVariables {
         // Here, we cache VTL0's XSAVE mask for better performance. This is safe because
         // Linux kernel (VTL0) initializes XCR0 during boot and does not expands it to
         // cover other extended states (which require nontrivial per-CPU xsave buffer changes).
-        self.vtl0_xsave_mask = xgetbv0();
+        let vtl0_xsave_mask = xgetbv0();
         assert_eq!(
-            Self::VTL1_XSAVE_MASK & !self.vtl0_xsave_mask,
+            Self::VTL1_XSAVE_MASK & !vtl0_xsave_mask,
             0,
             "VTL1 cannot have extended states that VTL0 does not enable"
         );
@@ -126,99 +126,77 @@ impl PerCpuVariables {
                 .into_boxed_slice()
                 .into(),
         );
-        self.vtl0_xsave_area_addr = VirtAddr::new(vtl0_xsave_area.as_ptr() as u64);
+        // Store VTL0 xsave values directly in PerCpuVariablesAsm for assembly access
+        pcv_asm.set_vtl0_xsave_area_addr(vtl0_xsave_area.as_ptr() as usize);
+        pcv_asm.set_vtl0_xsave_mask(vtl0_xsave_mask);
         self.vtl1_xsave_area_addr = VirtAddr::new(vtl1_xsave_area.as_ptr() as u64);
     }
 
-    /// Save the extended states of each core (VTL0 or VTL1).
+    /// Save VTL1 extended states (x87, SSE).
+    ///
+    /// NOTE: VTL0 extended states are saved/restored in assembly (`vtl_switch_loop_asm`).
     ///
     /// NOTE: We use standard XSAVE format (not compacted XSAVES) because XSAVES causes GP fault
     /// in VTL1. This may be due to Hyper-V not virtualizing XSAVES/XRSTORS for VTL1 or requiring
     /// specific IA32_XSS MSR configuration.
-    pub(crate) fn save_extended_states(&mut self, vtl: u8) {
-        if self.vtl0_xsave_area_addr.is_null()
-            || self.vtl1_xsave_area_addr.is_null()
-            || self.vtl0_xsave_mask == 0
-        {
-            panic!("XSAVE areas are not allocated");
-        } else {
-            let (xsave_area_addr, mask, xsaved) = match vtl {
-                HV_VTL_NORMAL => (
-                    self.vtl0_xsave_area_addr.as_u64(),
-                    self.vtl0_xsave_mask,
-                    &mut self.vtl0_xsaved,
-                ),
-                HV_VTL_SECURE => (
-                    self.vtl1_xsave_area_addr.as_u64(),
-                    Self::VTL1_XSAVE_MASK,
-                    &mut self.vtl1_xsaved,
-                ),
-                _ => panic!("Invalid VTL value: {}", vtl),
-            };
-            // The first instruction to save the extended states must be XSAVE,
-            // and subsequent instructions can use XSAVEOPT for better performance.
-            // Safety: xsave_area_addr is valid and properly aligned
-            unsafe {
-                if *xsaved {
-                    core::arch::asm!(
-                        "xsaveopt [{}]",
-                        in(reg) xsave_area_addr,
-                        in("eax") mask & 0xffff_ffff,
-                        in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
-                        options(nostack, preserves_flags)
-                    );
-                } else {
-                    core::arch::asm!(
-                        "xsave [{}]",
-                        in(reg) xsave_area_addr,
-                        in("eax") mask & 0xffff_ffff,
-                        in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
-                        options(nostack, preserves_flags)
-                    );
-                    *xsaved = true;
-                }
-            }
-        }
-    }
-
-    /// Restore the extended states of each core (VTL0 or VTL1).
-    ///
-    /// This function is a no-op if the state was never saved.
-    pub(crate) fn restore_extended_states(&self, vtl: u8) {
-        if self.vtl0_xsave_area_addr.is_null()
-            || self.vtl1_xsave_area_addr.is_null()
-            || self.vtl0_xsave_mask == 0
-        {
-            panic!("XSAVE areas are not allocated");
-        } else {
-            let (xsave_area_addr, mask, xsaved) = match vtl {
-                HV_VTL_NORMAL => (
-                    self.vtl0_xsave_area_addr.as_u64(),
-                    self.vtl0_xsave_mask,
-                    self.vtl0_xsaved,
-                ),
-                HV_VTL_SECURE => (
-                    self.vtl1_xsave_area_addr.as_u64(),
-                    Self::VTL1_XSAVE_MASK,
-                    self.vtl1_xsaved,
-                ),
-                _ => panic!("Invalid VTL value: {}", vtl),
-            };
-            // Skip restore if state was never saved
-            if !xsaved {
-                return;
-            }
-            // Safety: xsave_area_addr is valid, properly aligned, and contains
-            // valid XSAVE data from a previous save_extended_states() call.
-            unsafe {
+    pub(crate) fn save_vtl1_extended_states(&mut self) {
+        assert!(
+            !self.vtl1_xsave_area_addr.is_null(),
+            "VTL1 XSAVE area is not allocated"
+        );
+        let xsave_area_addr = self.vtl1_xsave_area_addr.as_u64();
+        let mask = Self::VTL1_XSAVE_MASK;
+        // The first instruction to save the extended states must be XSAVE,
+        // and subsequent instructions can use XSAVEOPT for better performance.
+        // Safety: xsave_area_addr is valid and properly aligned
+        unsafe {
+            if self.vtl1_xsaved {
                 core::arch::asm!(
-                    "xrstor [{}]",
+                    "xsaveopt [{}]",
                     in(reg) xsave_area_addr,
                     in("eax") mask & 0xffff_ffff,
                     in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
                     options(nostack, preserves_flags)
                 );
+            } else {
+                core::arch::asm!(
+                    "xsave [{}]",
+                    in(reg) xsave_area_addr,
+                    in("eax") mask & 0xffff_ffff,
+                    in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
+                    options(nostack, preserves_flags)
+                );
+                self.vtl1_xsaved = true;
             }
+        }
+    }
+
+    /// Restore VTL1 extended states (x87, SSE).
+    ///
+    /// NOTE: VTL0 extended states are saved/restored in assembly (`vtl_switch_loop_asm`).
+    ///
+    /// This function is a no-op if the state was never saved.
+    pub(crate) fn restore_vtl1_extended_states(&self) {
+        assert!(
+            !self.vtl1_xsave_area_addr.is_null(),
+            "VTL1 XSAVE area is not allocated"
+        );
+        // Skip restore if state was never saved
+        if !self.vtl1_xsaved {
+            return;
+        }
+        let xsave_area_addr = self.vtl1_xsave_area_addr.as_u64();
+        let mask = Self::VTL1_XSAVE_MASK;
+        // Safety: xsave_area_addr is valid, properly aligned, and contains
+        // valid XSAVE data from a previous save_vtl1_extended_states() call.
+        unsafe {
+            core::arch::asm!(
+                "xrstor [{}]",
+                in(reg) xsave_area_addr,
+                in("eax") mask & 0xffff_ffff,
+                in("edx") (mask & 0xffff_ffff_0000_0000) >> 32,
+                options(nostack, preserves_flags)
+            );
         }
     }
 }
@@ -254,10 +232,7 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
         entries: [(0, 0); NUM_CONTROL_REGS],
     },
     gdt: const { None },
-    vtl0_xsave_area_addr: VirtAddr::zero(),
     vtl1_xsave_area_addr: VirtAddr::zero(),
-    vtl0_xsave_mask: 0,
-    vtl0_xsaved: false,
     vtl1_xsaved: false,
     tls: VirtAddr::zero(),
 };
@@ -294,6 +269,14 @@ pub struct PerCpuVariablesAsm {
     cur_kernel_base_ptr: Cell<usize>,
     /// Top address of the user context area
     user_context_top_addr: Cell<usize>,
+    /// Address of the VTL0 XSAVE area
+    vtl0_xsave_area_addr: Cell<usize>,
+    /// Lower 32 bits of VTL0 XSAVE mask (for eax in xsave/xrstor)
+    vtl0_xsave_mask_lo: Cell<u32>,
+    /// Upper 32 bits of VTL0 XSAVE mask (for edx in xsave/xrstor)
+    vtl0_xsave_mask_hi: Cell<u32>,
+    /// Flag indicating if VTL0 extended states have been saved at least once (0 = no, 1 = yes)
+    vtl0_xsaved: Cell<u8>,
 }
 
 impl PerCpuVariablesAsm {
@@ -311,6 +294,14 @@ impl PerCpuVariablesAsm {
     }
     pub fn set_vtl0_state_top_addr(&self, addr: usize) {
         self.vtl0_state_top_addr.set(addr);
+    }
+    pub fn set_vtl0_xsave_area_addr(&self, addr: usize) {
+        self.vtl0_xsave_area_addr.set(addr);
+    }
+    pub fn set_vtl0_xsave_mask(&self, mask: u64) {
+        self.vtl0_xsave_mask_lo.set((mask & 0xffff_ffff) as u32);
+        self.vtl0_xsave_mask_hi
+            .set(((mask >> 32) & 0xffff_ffff) as u32);
     }
     pub const fn kernel_stack_ptr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, kernel_stack_ptr)
@@ -335,6 +326,18 @@ impl PerCpuVariablesAsm {
     }
     pub const fn user_context_top_addr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, user_context_top_addr)
+    }
+    pub const fn vtl0_xsave_area_addr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, vtl0_xsave_area_addr)
+    }
+    pub const fn vtl0_xsave_mask_lo_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, vtl0_xsave_mask_lo)
+    }
+    pub const fn vtl0_xsave_mask_hi_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, vtl0_xsave_mask_hi)
+    }
+    pub const fn vtl0_xsaved_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, vtl0_xsaved)
     }
 }
 
@@ -366,6 +369,10 @@ impl<T> RefCellWrapper<T> {
                 cur_kernel_stack_ptr: Cell::new(0),
                 cur_kernel_base_ptr: Cell::new(0),
                 user_context_top_addr: Cell::new(0),
+                vtl0_xsave_area_addr: Cell::new(0),
+                vtl0_xsave_mask_lo: Cell::new(0),
+                vtl0_xsave_mask_hi: Cell::new(0),
+                vtl0_xsaved: Cell::new(0),
             },
             inner: RefCell::new(value),
         }
@@ -455,27 +462,6 @@ where
     f(pcv_asm)
 }
 
-/// Execute a closure with a mutable reference to the current PerCpuVariablesAsm.
-///
-/// # Panics
-/// Panics if GSBASE is not set or it contains a non-canonical address.
-pub fn with_per_cpu_variables_asm_mut<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut PerCpuVariablesAsm) -> R,
-    R: Sized + 'static,
-{
-    let pcv_asm_addr: *mut PerCpuVariablesAsm = unsafe {
-        let gsbase = rdgsbase();
-        let addr = VirtAddr::try_new(u64::try_from(gsbase).unwrap())
-            .expect("GS contains a non-canonical address");
-        addr.as_mut_ptr::<RefCellWrapper<*mut PerCpuVariables>>()
-            .cast::<PerCpuVariablesAsm>()
-    };
-    let pcv_asm = unsafe { &mut *pcv_asm_addr };
-
-    f(pcv_asm)
-}
-
 /// Get or initialize a `RefCell` that contains a pointer to the current core's per-CPU variables.
 /// This `RefCell` is expected to be stored in the GS register.
 fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut PerCpuVariables>> {
@@ -535,8 +521,11 @@ pub fn allocate_per_cpu_variables() {
         "# of possible CPUs ({num_cores}) exceeds MAX_CORES",
     );
 
-    with_per_cpu_variables_mut(|per_cpu_variables| {
-        per_cpu_variables.allocate_xsave_area();
+    // Allocate xsave area for BSP (core 0)
+    with_per_cpu_variables_asm(|pcv_asm| {
+        with_per_cpu_variables_mut(|per_cpu_variables| {
+            per_cpu_variables.allocate_xsave_area(pcv_asm);
+        });
     });
 
     // TODO: use `cpu_online_mask` to selectively allocate per-CPU variables only for online CPUs.
@@ -549,11 +538,13 @@ pub fn allocate_per_cpu_variables() {
         let per_cpu_variables = unsafe {
             let ptr = per_cpu_variables.as_mut_ptr();
             ptr.write_bytes(0, 1);
-            (*ptr).allocate_xsave_area();
             per_cpu_variables.assume_init()
         };
         unsafe {
             PER_CPU_VARIABLE_ADDRESSES[i] = RefCellWrapper::new(Box::into_raw(per_cpu_variables));
+            // Allocate xsave area for this core, writing directly to its PerCpuVariablesAsm
+            let pcv_asm = &PER_CPU_VARIABLE_ADDRESSES[i].pcv_asm;
+            (*(*PER_CPU_VARIABLE_ADDRESSES[i].inner.as_ptr())).allocate_xsave_area(pcv_asm);
         }
     }
 }
@@ -576,7 +567,7 @@ pub fn init_per_cpu_variables() {
                 + core::mem::size_of::<VtlState>() as u64,
         )
         .unwrap();
-        with_per_cpu_variables_asm_mut(|pcv_asm| {
+        with_per_cpu_variables_asm(|pcv_asm| {
             pcv_asm.set_kernel_stack_ptr(kernel_sp);
             pcv_asm.set_interrupt_stack_ptr(interrupt_sp);
             pcv_asm.set_vtl0_state_top_addr(vtl0_state_top_addr);
