@@ -749,6 +749,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         }
     }
 
+    /// Peek at the length of the next datagram in the TX queue without removing it.
+    ///
+    /// Returns `None` if the queue is empty.
+    pub(super) fn peek_datagram_len(&self) -> Option<usize> {
+        let tx_cons = self.inner.tx_cons.lock();
+        tx_cons.iter().next().map(|msg| msg.data.len())
+    }
+
     /// Check if the RX queue is full (cannot accept more datagrams).
     pub(super) fn is_rx_full(&self) -> bool {
         let rx_prod = self.inner.rx_prod.lock();

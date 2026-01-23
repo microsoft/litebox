@@ -620,26 +620,38 @@ where
             (Protocol::Udp, NetworkProxy::Datagram(udp_proxy)) => {
                 let udp_socket = socket_set.get_mut::<udp::Socket>(socket_handle.handle);
                 // Drain TX queue: pop datagrams from channel, send via smoltcp
-                while udp_proxy.has_pending_tx() {
-                    if let Some(datagram) = udp_proxy.pop_datagram() {
-                        let DatagramMessage { data, addr } = datagram;
-                        let destination = addr
-                            .map(|s| match s {
-                                SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::from(addr),
-                                SocketAddr::V6(_) => unimplemented!(),
-                            })
-                            .or_else(|| socket_handle.udp().remote_endpoint);
-                        let Some(remote_endpoint) = destination else {
-                            continue;
-                        };
-                        debug_assert!(udp_socket.is_open());
-                        match udp_socket.send_slice(&data, remote_endpoint) {
-                            Ok(()) => {}
-                            Err(udp::SendError::BufferFull) => {
-                                todo!("handle UDP send buffer full properly");
-                            }
-                            Err(udp::SendError::Unaddressable) => unreachable!(),
+                // Only proceed if socket is bound and has capacity for the next datagram
+                let send_capacity = udp_socket.payload_send_capacity();
+                while udp_socket.is_open() && udp_socket.can_send() {
+                    // Peek at next datagram size to check if socket has enough buffer space
+                    let Some(datagram_len) = udp_proxy.peek_datagram_len() else {
+                        break; // No more datagrams to send
+                    };
+                    // Check if smoltcp has enough buffer space for this datagram
+                    let available = send_capacity - udp_socket.send_queue();
+                    if available < datagram_len {
+                        break; // Not enough space, wait for next poll cycle
+                    }
+                    // Now safe to pop - we've verified there's enough space
+                    let Some(datagram) = udp_proxy.pop_datagram() else {
+                        break; // No more datagrams to send
+                    };
+                    let DatagramMessage { data, addr } = datagram;
+                    let destination = addr
+                        .map(|s| match s {
+                            SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::from(addr),
+                            SocketAddr::V6(_) => unimplemented!(),
+                        })
+                        .or_else(|| socket_handle.udp().remote_endpoint);
+                    let Some(remote_endpoint) = destination else {
+                        continue;
+                    };
+                    match udp_socket.send_slice(&data, remote_endpoint) {
+                        Ok(()) => {}
+                        Err(udp::SendError::BufferFull) => {
+                            unreachable!("we checked payload_send_capacity before popping")
                         }
+                        Err(udp::SendError::Unaddressable) => unreachable!(),
                     }
                 }
 
