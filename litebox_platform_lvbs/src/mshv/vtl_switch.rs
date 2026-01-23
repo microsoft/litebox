@@ -19,6 +19,7 @@ use crate::{
     },
 };
 use core::arch::{asm, naked_asm};
+use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 
@@ -44,7 +45,6 @@ macro_rules! VTL_RETURN_ASM {
 // we should save/restore VTL0 registers. For now, we conservatively save/restore all
 // VTL0/VTL1 registers (results in performance degradation) but we can optimize it later.
 /// Struct to save VTL state (general-purpose registers)
-#[allow(clippy::pub_underscore_fields)]
 #[derive(Default, Clone, Copy)]
 #[repr(C)]
 pub struct VtlState {
@@ -202,7 +202,6 @@ unsafe extern "C" fn vtl_switch_loop_body() {
         (*per_cpu_variables.hv_vp_assist_page_as_ptr()).vtl_entry_reason
     });
     match VtlEntryReason::try_from(reason).unwrap_or(VtlEntryReason::Unknown) {
-        #[allow(clippy::cast_sign_loss)]
         VtlEntryReason::VtlCall => {
             let params = with_per_cpu_variables(|per_cpu_variables| {
                 per_cpu_variables.vtl0_state.get_vtlcall_params()
@@ -215,7 +214,7 @@ unsafe extern "C" fn vtl_switch_loop_body() {
             } else {
                 let result = vtlcall_dispatch(&params);
                 with_per_cpu_variables_mut(|per_cpu_variables| {
-                    per_cpu_variables.set_vtl_return_value(result as u64);
+                    per_cpu_variables.set_vtl_return_value(result.reinterpret_as_unsigned());
                 });
             }
         }
@@ -244,7 +243,7 @@ pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), Errno> {
     let value =
         hvcall_get_vp_registers(HV_REGISTER_VSM_CODEPAGE_OFFSETS).map_err(|_| Errno::EIO)?;
     let code_page_offsets = HvRegisterVsmCodePageOffsets::from_u64(value);
-    let hvcall_page = usize::try_from(hv_hypercall_page_address()).unwrap();
+    let hvcall_page: usize = hv_hypercall_page_address().truncate();
     let vtl_return_address = hvcall_page
         .checked_add(usize::from(code_page_offsets.vtl_return_offset()))
         .ok_or(Errno::EOVERFLOW)?;

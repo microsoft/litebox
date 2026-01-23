@@ -279,21 +279,21 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 #[derive(Clone)]
 pub struct PerCpuVariablesAsm {
     /// Initial kernel stack pointer to reset the kernel stack on VTL switch
-    kernel_stack_ptr: Cell<usize>, // gs:[0x0]
+    kernel_stack_ptr: Cell<usize>,
     /// Initial interrupt stack pointer for x86 IST
-    interrupt_stack_ptr: Cell<usize>, // gs:[0x8]
+    interrupt_stack_ptr: Cell<usize>,
     /// Return address for call-based VTL switching
-    vtl_return_addr: Cell<usize>, // gs:[0x10]
+    vtl_return_addr: Cell<usize>,
     /// Scratch pad
-    scratch: Cell<usize>, // gs:[0x18]
+    scratch: Cell<usize>,
     /// Top address of VTL0 VTLState
-    vtl0_state_top_addr: Cell<usize>, // gs:[0x20]
+    vtl0_state_top_addr: Cell<usize>,
     /// Current kernel stack pointer
-    cur_kernel_stack_ptr: Cell<usize>, // gs:[0x28]
+    cur_kernel_stack_ptr: Cell<usize>,
     /// Current kernel base pointer
-    cur_kernel_base_ptr: Cell<usize>, // gs:[0x30]
+    cur_kernel_base_ptr: Cell<usize>,
     /// Top address of the user context area
-    user_context_top_addr: Cell<usize>, // gs:[0x38]
+    user_context_top_addr: Cell<usize>,
 }
 
 impl PerCpuVariablesAsm {
@@ -342,6 +342,7 @@ impl PerCpuVariablesAsm {
 /// This struct allows assembly code to read/write some PerCpuVariables area via the GS register (e.g., to
 /// save/restore RIP/RSP). Currently, `PerCpuVariables` is protected by `RefCell` such that
 /// assembly code cannot easily access it.
+///
 /// TODO: Let's consider whether we should maintain these two types of TLS areas (for Rust and
 /// assembly, respectively). This design secures Rust-side access to `PerCpuVariables` with `RefCell`,
 /// but it might be unnecessarily complex. Instead, we could use assembly code in all cases, but

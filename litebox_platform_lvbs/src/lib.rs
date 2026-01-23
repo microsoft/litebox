@@ -764,7 +764,7 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
 
 impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
     fn get_syscall_entry_point(&self) -> usize {
-        todo!("PR 566 should be merged to implement this function");
+        syscall_callback as *const () as usize
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -1103,7 +1103,6 @@ unsafe extern "C" fn run_thread_arch(
     );
 }
 
-#[allow(clippy::cast_sign_loss)]
 unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
@@ -1123,6 +1122,11 @@ impl ThreadContext<'_> {
             ContinueOperation::ExitThread => {}
         }
     }
+}
+
+unsafe extern "C" {
+    // Defined in asm blocks above
+    fn syscall_callback() -> isize;
 }
 
 fn init_handler(thread_ctx: &mut ThreadContext) {
