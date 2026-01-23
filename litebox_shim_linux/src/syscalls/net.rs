@@ -72,6 +72,38 @@ impl super::file::FilesState {
             Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => Err(Errno::ENOTSOCK),
         }
     }
+
+    /// Helper to dispatch socket operations based on socket type (INET vs Unix).
+    ///
+    /// This method handles the common pattern of:
+    /// 1. Looking up the file descriptor
+    /// 2. Matching on descriptor type
+    /// 3. Dropping the file table lock before potentially-blocking operations
+    /// 4. Dispatching to the appropriate handler
+    ///
+    /// For `LiteBoxRawFd` sockets, the `inet_op` closure is called with the socket fd.
+    /// For Unix sockets, the `unix_op` closure is called with a cloned Arc to the socket.
+    fn with_socket<R>(
+        &self,
+        sockfd: u32,
+        inet_op: impl FnOnce(&SocketFd) -> Result<R, Errno>,
+        unix_op: impl FnOnce(Arc<UnixSocket>) -> Result<R, Errno>,
+    ) -> Result<R, Errno> {
+        let file_table = self.file_descriptors.read();
+        match file_table.get_fd(sockfd).ok_or(Errno::EBADF)? {
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                let raw_fd = *raw_fd;
+                drop(file_table);
+                self.with_socket_fd(raw_fd, inet_op)
+            }
+            Descriptor::Unix { file, .. } => {
+                let file = file.clone();
+                drop(file_table);
+                unix_op(file)
+            }
+            _ => Err(Errno::ENOTSOCK),
+        }
+    }
 }
 
 #[derive(Clone, Copy, FromBytes, IntoBytes)]
@@ -1160,51 +1192,50 @@ impl Task {
         flags: SockFlags,
     ) -> Result<u32, Errno> {
         let files = self.files.borrow();
-        let file_table = files.file_descriptors.read();
-        let socket = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
-        let file = match socket {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                let raw_fd = *raw_fd;
-                drop(file_table); // Drop before possibly-blocking `accept`
-                files.with_socket_fd(raw_fd, |fd| {
-                    let sock_type = self.global.get_socket_type(fd)?;
-                    let mut socket_addr = peer
-                        .is_some()
-                        .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
-                    let accepted_file =
-                        self.global
-                            .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
-                    if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
-                        *peer = SocketAddress::Inet(socket_addr);
-                    }
+        let want_peer = peer.is_some();
+        let (file, peer_addr) = files.with_socket(
+            sockfd,
+            |fd| {
+                let sock_type = self.global.get_socket_type(fd)?;
+                let mut socket_addr =
+                    want_peer.then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+                let accepted_file =
+                    self.global
+                        .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
+                let peer_addr = socket_addr.map(SocketAddress::Inet);
 
-                    let proxy = self
-                        .global
-                        .initialize_socket(&accepted_file, sock_type, flags);
-                    proxy.set_state(SocketState::Connected);
-                    Ok(Descriptor::LiteBoxRawFd(
+                let proxy = self
+                    .global
+                    .initialize_socket(&accepted_file, sock_type, flags);
+                proxy.set_state(SocketState::Connected);
+                Ok((
+                    Descriptor::LiteBoxRawFd(
                         files
                             .raw_descriptor_store
                             .write()
                             .fd_into_raw_integer(accepted_file),
-                    ))
-                })?
-            }
-            Descriptor::Unix { file, .. } => {
-                let file = file.clone();
-                drop(file_table); // Drop before possibly-blocking `accept`
-                let mut socket_addr = peer.is_some().then_some(UnixSocketAddr::Unnamed);
+                    ),
+                    peer_addr,
+                ))
+            },
+            |file| {
+                let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);
                 let accepted_file = file.accept(&self.wait_cx(), flags, socket_addr.as_mut())?;
-                if let (Some(peer), Some(socket_addr)) = (peer, socket_addr) {
-                    *peer = SocketAddress::Unix(socket_addr);
-                }
-                Descriptor::Unix {
-                    file: Arc::new(accepted_file),
-                    close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
-                }
-            }
-            _ => return Err(Errno::ENOTSOCK),
-        };
+                let peer_addr = socket_addr.map(SocketAddress::Unix);
+                Ok((
+                    Descriptor::Unix {
+                        file: Arc::new(accepted_file),
+                        close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
+                    },
+                    peer_addr,
+                ))
+            },
+        )?;
+
+        if let (Some(peer), Some(addr)) = (peer, peer_addr) {
+            *peer = addr;
+        }
+
         files
             .file_descriptors
             .write()
@@ -1229,26 +1260,18 @@ impl Task {
         let sockaddr = read_sockaddr_from_user(sockaddr, addrlen)?;
         self.do_connect(fd, sockaddr)
     }
-    fn do_connect(&self, fd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
-        let files = self.files.borrow();
-        let file_table = files.file_descriptors.read();
-        match file_table.get_fd(fd).ok_or(Errno::EBADF)? {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                let raw_fd = *raw_fd;
-                drop(file_table); // Drop before possibly-blocking `connect`
-                files.with_socket_fd(raw_fd, |fd| {
-                    let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
-                    self.global.connect(&self.wait_cx(), fd, addr)
-                })
-            }
-            Descriptor::Unix { file, .. } => {
-                let addr = sockaddr.unix().ok_or(Errno::EAFNOSUPPORT)?;
-                let file = file.clone();
-                drop(file_table); // Drop before possibly-blocking `connect`
+    fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| {
+                let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
+                self.global.connect(&self.wait_cx(), fd, addr)
+            },
+            |file| {
+                let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
                 file.connect(self, addr)
-            }
-            _ => Err(Errno::ENOTSOCK),
-        }
+            },
+        )
     }
 
     /// Handle syscall `bind`
@@ -1265,23 +1288,17 @@ impl Task {
         self.do_bind(sockfd, sockaddr)
     }
     fn do_bind(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
-        let files = self.files.borrow();
-        match files
-            .file_descriptors
-            .read()
-            .get_fd(sockfd)
-            .ok_or(Errno::EBADF)?
-        {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                let addr = sockaddr.inet().ok_or(Errno::EAFNOSUPPORT)?;
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| {
+                let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
                 self.global.bind(fd, addr)
-            }),
-            Descriptor::Unix { file, .. } => {
-                let addr = sockaddr.unix().ok_or(Errno::EAFNOSUPPORT)?;
+            },
+            |file| {
+                let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
                 file.bind(self, addr)
-            }
-            _ => Err(Errno::ENOTSOCK),
-        }
+            },
+        )
     }
 
     /// Handle syscall `listen`
@@ -1292,19 +1309,11 @@ impl Task {
         self.do_listen(sockfd, backlog)
     }
     fn do_listen(&self, sockfd: u32, backlog: u16) -> Result<(), Errno> {
-        let files = self.files.borrow();
-        match files
-            .file_descriptors
-            .read()
-            .get_fd(sockfd)
-            .ok_or(Errno::EBADF)?
-        {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                files.with_socket_fd(*raw_fd, |fd| self.global.listen(fd, backlog))
-            }
-            Descriptor::Unix { file, .. } => file.listen(backlog, &self.global),
-            _ => Err(Errno::ENOTSOCK),
-        }
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| self.global.listen(fd, backlog),
+            |file| file.listen(backlog, &self.global),
+        )
     }
 
     /// Handle syscall `sendto`
@@ -1327,38 +1336,31 @@ impl Task {
     }
     fn do_sendto(
         &self,
-        fd: u32,
+        sockfd: u32,
         buf: ConstPtr<u8>,
         len: usize,
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
         let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
-        let files = self.files.borrow();
-        let file_table = files.file_descriptors.read();
-        let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-        match socket {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                let raw_fd = *raw_fd;
-                drop(file_table); // Drop before possibly-blocking `sendto`
-                files.with_socket_fd(raw_fd, |fd| {
-                    let sockaddr = sockaddr
-                        .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
-                        .transpose()?;
-                    self.global
-                        .sendto(&self.wait_cx(), fd, &buf, flags, sockaddr)
-                })
-            }
-            Descriptor::Unix { file, .. } => {
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| {
+                let sockaddr = sockaddr
+                    .clone()
+                    .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                    .transpose()?;
+                self.global
+                    .sendto(&self.wait_cx(), fd, &buf, flags, sockaddr)
+            },
+            |file| {
                 let addr = sockaddr
+                    .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                let file = file.clone();
-                drop(file_table); // Drop before possibly-blocking `sendto`
                 file.sendto(self, &buf, flags, addr)
-            }
-            _ => Err(Errno::ENOTSOCK),
-        }
+            },
+        )
     }
 
     /// Handle syscall `sendmsg`
@@ -1376,7 +1378,7 @@ impl Task {
     }
     fn do_sendmsg(
         &self,
-        fd: u32,
+        sockfd: u32,
         msg: &litebox_common_linux::UserMsgHdr<Platform>,
         flags: SendFlags,
     ) -> Result<usize, Errno> {
@@ -1399,35 +1401,30 @@ impl Task {
             .msg_iov
             .to_owned_slice(msg.msg_iovlen)
             .ok_or(Errno::EFAULT)?;
-        let files = self.files.borrow();
-        let file_table = files.file_descriptors.read();
-        let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-        match socket {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                let raw_fd = *raw_fd;
-                drop(file_table); // Drop before possibly-blocking `sendto`
-                files.with_socket_fd(raw_fd, |fd| {
-                    let sock_addr = sock_addr
-                        .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
-                        .transpose()?;
-                    let mut total_sent = 0;
-                    for iov in &iovs {
-                        if iov.iov_len == 0 {
-                            continue;
-                        }
-                        let buf = iov
-                            .iov_base
-                            .to_owned_slice(iov.iov_len)
-                            .ok_or(Errno::EFAULT)?;
-                        total_sent +=
-                            self.global
-                                .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)?;
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| {
+                let sock_addr = sock_addr
+                    .clone()
+                    .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                    .transpose()?;
+                let mut total_sent = 0;
+                for iov in iovs.iter() {
+                    if iov.iov_len == 0 {
+                        continue;
                     }
-                    Ok(total_sent)
-                })
-            }
-            _ => Err(Errno::ENOTSOCK),
-        }
+                    let buf = iov
+                        .iov_base
+                        .to_owned_slice(iov.iov_len)
+                        .ok_or(Errno::EFAULT)?;
+                    total_sent +=
+                        self.global
+                            .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)?;
+                }
+                Ok(total_sent)
+            },
+            |_file| Err(Errno::ENOTSOCK),
+        )
     }
 
     /// Handle syscall `recvfrom`
@@ -1470,43 +1467,31 @@ impl Task {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
-        let files = self.files.borrow();
-        let file_table = files.file_descriptors.read();
-        match file_table.get_fd(sockfd).ok_or(Errno::EBADF)? {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                let raw_fd = *raw_fd;
-                drop(file_table); // Drop before possibly-blocking `receive`
-                files.with_socket_fd(raw_fd, |fd| {
-                    const MAX_LEN: usize = 4096;
-                    let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
-                    let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
-                    let mut addr = None;
-                    let size = self.global.receive(
-                        &self.wait_cx(),
-                        fd,
-                        buffer,
-                        flags,
-                        if source_addr.is_some() {
-                            Some(&mut addr)
-                        } else {
-                            None
-                        },
-                    )?;
-                    if let Some(source_addr) = source_addr {
-                        *source_addr = addr.map(SocketAddress::Inet);
-                    }
-                    if !flags.contains(ReceiveFlags::TRUNC) {
-                        assert!(size <= len, "{size} should be smaller than {len}");
-                    }
-                    buf.copy_from_slice(0, &buffer[..size.min(buffer.len())])
-                        .ok_or(Errno::EFAULT)?;
-                    Ok(size)
-                })
-            }
-            Descriptor::Unix { file, .. } => {
+        let want_source = source_addr.is_some();
+        let (size, addr) = self.files.borrow().with_socket(
+            sockfd,
+            |fd| {
                 const MAX_LEN: usize = 4096;
-                let file = file.clone();
-                drop(file_table); // Drop before possibly-blocking `receive`
+                let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
+                let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
+                let mut addr = None;
+                let size = self.global.receive(
+                    &self.wait_cx(),
+                    fd,
+                    buffer,
+                    flags,
+                    if want_source { Some(&mut addr) } else { None },
+                )?;
+                let src_addr = addr.map(SocketAddress::Inet);
+                if !flags.contains(ReceiveFlags::TRUNC) {
+                    assert!(size <= len, "{size} should be smaller than {len}");
+                }
+                buf.copy_from_slice(0, &buffer[..size.min(buffer.len())])
+                    .ok_or(Errno::EFAULT)?;
+                Ok((size, src_addr))
+            },
+            |file| {
+                const MAX_LEN: usize = 4096;
                 let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
                 let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
                 let mut addr = None;
@@ -1514,24 +1499,22 @@ impl Task {
                     &self.wait_cx(),
                     buffer,
                     flags,
-                    if source_addr.is_some() {
-                        Some(&mut addr)
-                    } else {
-                        None
-                    },
+                    if want_source { Some(&mut addr) } else { None },
                 )?;
-                if let Some(source_addr) = source_addr {
-                    *source_addr = addr.map(SocketAddress::Unix);
-                }
+                let src_addr = addr.map(SocketAddress::Unix);
                 if !flags.contains(ReceiveFlags::TRUNC) {
                     assert!(size <= len, "{size} should be smaller than {len}");
                 }
                 buf.copy_from_slice(0, &buffer[..size.min(buffer.len())])
                     .ok_or(Errno::EFAULT)?;
-                Ok(size)
-            }
-            _ => Err(Errno::ENOTSOCK),
+                Ok((size, src_addr))
+            },
+        )?;
+
+        if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
+            *source_addr = Some(addr);
         }
+        Ok(size)
     }
 
     pub(crate) fn sys_setsockopt(
@@ -1558,19 +1541,11 @@ impl Task {
         optval: ConstPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
-        let files = self.files.borrow();
-        match files
-            .file_descriptors
-            .read()
-            .get_fd(sockfd)
-            .ok_or(Errno::EBADF)?
-        {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                self.global.setsockopt(fd, optname, optval, optlen)
-            }),
-            Descriptor::Unix { file, .. } => file.setsockopt(&self.global, optname, optval, optlen),
-            _ => Err(Errno::ENOTSOCK),
-        }
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| self.global.setsockopt(fd, optname, optval, optlen),
+            |file| file.setsockopt(&self.global, optname, optval, optlen),
+        )
     }
 
     /// Handle syscall `getsockopt`
@@ -1609,19 +1584,11 @@ impl Task {
         optval: MutPtr<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
-        let files = self.files.borrow();
-        match files
-            .file_descriptors
-            .read()
-            .get_fd(sockfd)
-            .ok_or(Errno::EBADF)?
-        {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
-                self.global.getsockopt(fd, optname, optval, len)
-            }),
-            Descriptor::Unix { file, .. } => file.getsockopt(&self.global, optname, optval, len),
-            _ => Err(Errno::ENOTSOCK),
-        }
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| self.global.getsockopt(fd, optname, optval, len),
+            |file| file.getsockopt(&self.global, optname, optval, len),
+        )
     }
 
     /// Handle syscall `getsockname`
@@ -1638,24 +1605,18 @@ impl Task {
         write_sockaddr_to_user(sockaddr, addr, addrlen)
     }
     fn do_getsockname(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
-        let files = self.files.borrow();
-        match files
-            .file_descriptors
-            .read()
-            .get_fd(sockfd)
-            .ok_or(Errno::EBADF)?
-        {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| {
                 self.global
                     .net
                     .lock()
                     .get_local_addr(fd)
                     .map(SocketAddress::Inet)
                     .map_err(Errno::from)
-            }),
-            Descriptor::Unix { file, .. } => Ok(SocketAddress::Unix(file.get_local_addr())),
-            _ => Err(Errno::ENOTSOCK),
-        }
+            },
+            |file| Ok(SocketAddress::Unix(file.get_local_addr())),
+        )
     }
 
     /// Handle syscall `getpeername`
@@ -1672,27 +1633,22 @@ impl Task {
         write_sockaddr_to_user(sockaddr, addr, addrlen)
     }
     fn do_getpeername(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
-        let files = self.files.borrow();
-        match files
-            .file_descriptors
-            .read()
-            .get_fd(sockfd)
-            .ok_or(Errno::EBADF)?
-        {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.with_socket_fd(*raw_fd, |fd| {
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| {
                 self.global
                     .net
                     .lock()
                     .get_remote_addr(fd)
                     .map(SocketAddress::Inet)
                     .map_err(Errno::from)
-            }),
-            Descriptor::Unix { file, .. } => file
-                .get_peer_addr()
-                .ok_or(Errno::ENOTCONN)
-                .map(SocketAddress::Unix),
-            _ => Err(Errno::ENOTSOCK),
-        }
+            },
+            |file| {
+                file.get_peer_addr()
+                    .ok_or(Errno::ENOTCONN)
+                    .map(SocketAddress::Unix)
+            },
+        )
     }
 }
 
