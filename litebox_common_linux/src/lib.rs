@@ -14,6 +14,7 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, TruncateExt},
 };
 use syscalls::Sysno;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::signal::SigSet;
 
@@ -279,7 +280,7 @@ impl From<litebox::fs::FileType> for DirentType {
 /// Linux's `stat` struct
 #[cfg(target_arch = "x86_64")]
 #[repr(C, packed)]
-#[derive(Clone, Default, PartialEq, Debug)]
+#[derive(Clone, Default, PartialEq, Debug, FromBytes, IntoBytes)]
 pub struct FileStat {
     pub st_dev: u64,
     pub st_ino: u64,
@@ -306,7 +307,7 @@ pub struct FileStat {
 /// Linux's `stat` struct
 #[cfg(target_arch = "x86")]
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Debug)]
+#[derive(Clone, Default, PartialEq, Debug, FromBytes, IntoBytes)]
 pub struct FileStat {
     pub st_dev: u32,
     pub st_ino: u32,
@@ -486,18 +487,24 @@ pub enum FlockType {
 }
 
 #[repr(C)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
 pub struct Flock {
     /// Type of lock: F_RDLCK, F_WRLCK, or F_UNLCK
     pub type_: i16,
     /// Where `start' is relative to
     pub whence: i16,
+    #[cfg(target_pointer_width = "64")]
+    #[doc(hidden)]
+    pub __pad0: u32,
     /// Offset where the lock begins
     pub start: usize,
     /// Size of the locked area, 0 means until EOF
     pub len: isize,
     /// Process holding the lock
     pub pid: i32,
+    #[cfg(target_pointer_width = "64")]
+    #[doc(hidden)]
+    pub __pad1: u32,
 }
 
 const F_DUPFD: i32 = 0;
@@ -557,7 +564,7 @@ bitflags::bitflags! {
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, FromBytes, IntoBytes)]
 pub struct Termios {
     pub c_iflag: tcflag_t,
     pub c_oflag: tcflag_t,
@@ -567,7 +574,7 @@ pub struct Termios {
     pub c_cc: [cc_t; 19usize],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Winsize {
     pub row: u16,
@@ -771,7 +778,7 @@ cfg_if::cfg_if! {
 }
 
 /// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L7)
-#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Timespec {
     /// Seconds.
@@ -808,7 +815,7 @@ impl From<Duration> for Timespec {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
 pub struct Timespec32 {
     pub tv_sec: i32,
     pub tv_nsec: u32,
@@ -842,13 +849,13 @@ impl From<Duration> for Timespec32 {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, FromBytes, IntoBytes)]
 pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
 }
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct ItimerVal {
     /// Timer interval
     interval: TimeVal,
@@ -883,7 +890,7 @@ impl From<Duration> for TimeVal {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
 pub struct TimeZone {
     tz_minuteswest: i32,
     tz_dsttime: i32,
@@ -1043,7 +1050,7 @@ pub unsafe fn wrfss(fs_selector: u16) {
 
 /// Linux's `user_desc` struct used by the `set_thread_area` syscall.
 #[repr(C, packed)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, FromBytes, IntoBytes)]
 pub struct UserDesc {
     pub entry_number: u32,
     pub base_addr: u32,
@@ -1053,7 +1060,8 @@ pub struct UserDesc {
 
 bitfield::bitfield! {
     /// Flags for the `user_desc` struct.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, FromBytes, IntoBytes)]
+    #[repr(transparent)]
     pub struct UserDescFlags(u32);
     impl Debug;
     /// 1 if the segment is 32-bit
@@ -1072,10 +1080,13 @@ bitfield::bitfield! {
     pub lm, set_lm: 7;
 }
 
+/// Flags for the clone3 system call as defined in `/usr/include/linux/sched.h`.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct CloneFlags(u64);
+
 bitflags::bitflags! {
-    /// Flags for the clone3 system call as defined in `/usr/include/linux/sched.h`.
-    #[derive(Clone, Copy, Debug)]
-    pub struct CloneFlags: u64 {
+    impl CloneFlags: u64 {
         /// Set if VM shared between processes
         const VM      = 0x00000100;
         /// Set if fs info shared between processes
@@ -1140,7 +1151,7 @@ bitflags::bitflags! {
 
 /// Arguments for the `clone3` syscall.
 #[repr(C, align(8))]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
 pub struct CloneArgs {
     pub flags: CloneFlags,
     pub pidfd: u64,
@@ -1174,7 +1185,7 @@ pub struct TaskParams {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Utsname {
     pub sysname: [u8; 65],
     pub nodename: [u8; 65],
@@ -1204,7 +1215,7 @@ pub type rlim_t = usize;
 
 /// Used by getrlimit and setrlimit syscalls
 #[repr(C)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
 pub struct Rlimit {
     pub rlim_cur: rlim_t,
     pub rlim_max: rlim_t,
@@ -1212,7 +1223,7 @@ pub struct Rlimit {
 
 /// Used by prlimit64 syscall
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Rlimit64 {
     pub rlim_cur: u64,
     pub rlim_max: u64,
@@ -1347,14 +1358,14 @@ pub enum EpollOp {
     EpollCtlMod = 3,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
 #[repr(C, packed)]
 pub struct EpollEvent {
     pub events: u32,
     pub data: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Pollfd {
     pub fd: i32,
@@ -1424,7 +1435,7 @@ pub enum MadviseBehavior {
     DontNeedLocked = 24,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, FromBytes, IntoBytes)]
 pub struct Sysinfo {
     /// Seconds since boot
     pub uptime: usize,
@@ -1509,7 +1520,7 @@ bitflags::bitflags! {
 
 /// Header structure used for the `capget` and `capset` syscalls.
 #[repr(C)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
 pub struct CapHeader {
     pub version: u32,
     pub pid: u32,
@@ -1517,7 +1528,7 @@ pub struct CapHeader {
 
 /// Data structure used for the `capget` and `capset` syscalls.
 #[repr(C)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
 pub struct CapData {
     pub effective: u32,
     pub permitted: u32,
@@ -1731,7 +1742,8 @@ bitflags::bitflags! {
 }
 
 /// Packaged sigset with its size, used by `pselect` syscall
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+#[repr(C)]
 pub struct SigSetPack {
     pub sigset: SigSet,
     pub size: usize,
