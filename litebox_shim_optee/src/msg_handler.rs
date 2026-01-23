@@ -287,19 +287,13 @@ pub fn decode_ta_request(
                 let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
                 let data_size = tmem.size.truncate();
-
-                let mut data = alloc::vec![0u8; data_size];
-                read_data_from_shm(&shm_info, &mut data)?;
-                UteeParamOwned::MemrefInput { data: data.into() }
+                build_memref_input(&shm_info, data_size)?
             }
             OpteeMsgAttrType::RmemInput => {
                 let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
                 let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
                 let data_size = rmem.size.truncate();
-
-                let mut data = alloc::vec![0u8; data_size];
-                read_data_from_shm(&shm_info, &mut data)?;
-                UteeParamOwned::MemrefInput { data: data.into() }
+                build_memref_input(&shm_info, data_size)?
             }
             OpteeMsgAttrType::TmemOutput => {
                 let tmem = param.get_param_tmem().ok_or(OpteeSmcReturn::EBadCmd)?;
@@ -322,32 +316,45 @@ pub fn decode_ta_request(
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
                 let buffer_size = tmem.size.truncate();
 
-                let mut buffer = alloc::vec![0u8; buffer_size];
-                read_data_from_shm(&shm_info, &mut buffer)?;
-                ta_req_info.out_shm_info[i] = Some(shm_info);
-                UteeParamOwned::MemrefInout {
-                    data: buffer.into(),
-                    buffer_size,
-                }
+                ta_req_info.out_shm_info[i] = Some(shm_info.clone());
+                build_memref_inout(&shm_info, buffer_size)?
             }
             OpteeMsgAttrType::RmemInout => {
                 let rmem = param.get_param_rmem().ok_or(OpteeSmcReturn::EBadCmd)?;
                 let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
                 let buffer_size = rmem.size.truncate();
 
-                let mut buffer = alloc::vec![0u8; buffer_size];
-                read_data_from_shm(&shm_info, &mut buffer)?;
-                ta_req_info.out_shm_info[i] = Some(shm_info);
-                UteeParamOwned::MemrefInout {
-                    data: buffer.into(),
-                    buffer_size,
-                }
+                ta_req_info.out_shm_info[i] = Some(shm_info.clone());
+                build_memref_inout(&shm_info, buffer_size)?
             }
             _ => return Err(OpteeSmcReturn::EBadCmd),
         };
     }
 
     Ok(ta_req_info)
+}
+
+#[inline]
+fn build_memref_input(
+    shm_info: &ShmInfo<PAGE_SIZE>,
+    data_size: usize,
+) -> Result<UteeParamOwned, OpteeSmcReturn> {
+    let mut data = alloc::vec![0u8; data_size];
+    read_data_from_shm(shm_info, &mut data)?;
+    Ok(UteeParamOwned::MemrefInput { data: data.into() })
+}
+
+#[inline]
+fn build_memref_inout(
+    shm_info: &ShmInfo<PAGE_SIZE>,
+    buffer_size: usize,
+) -> Result<UteeParamOwned, OpteeSmcReturn> {
+    let mut buffer = alloc::vec![0u8; buffer_size];
+    read_data_from_shm(shm_info, &mut buffer)?;
+    Ok(UteeParamOwned::MemrefInout {
+        data: buffer.into(),
+        buffer_size,
+    })
 }
 
 /// This function prepares for returning from OP-TEE secure world to the normal world.
