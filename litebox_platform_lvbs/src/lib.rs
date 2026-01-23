@@ -25,13 +25,15 @@ use litebox::platform::{
 };
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
-use litebox_common_optee::vmap::{
-    PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
-    VmapProvider,
-};
 use x86_64::structures::paging::{
     PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
     mapper::MapToError,
+};
+
+#[cfg(feature = "optee_syscall")]
+use litebox_common_optee::vmap::{
+    PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
+    VmapProvider,
 };
 
 extern crate alloc;
@@ -769,6 +771,7 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
 /// Note: This is a temporary check to let `VmapProvider` work with this platform
 /// which does not yet support virtually contiguous mapping of non-contiguous physical pages
 /// (for now, it maps physical pages with a fixed offset).
+#[cfg(feature = "optee_syscall")]
 fn check_contiguity<const ALIGN: usize>(
     addrs: &[PhysPageAddr<ALIGN>],
 ) -> Result<(), PhysPointerError> {
@@ -782,6 +785,7 @@ fn check_contiguity<const ALIGN: usize>(
     Ok(())
 }
 
+#[cfg(feature = "optee_syscall")]
 impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKernel<Host> {
     unsafe fn vmap(
         &self,
