@@ -1118,13 +1118,13 @@ pub enum OpteeMessageCommand {
 }
 
 impl TryFrom<OpteeMessageCommand> for UteeEntryFunc {
-    type Error = OpteeSmcReturn;
+    type Error = OpteeSmcReturnCode;
     fn try_from(cmd: OpteeMessageCommand) -> Result<Self, Self::Error> {
         match cmd {
             OpteeMessageCommand::OpenSession => Ok(UteeEntryFunc::OpenSession),
             OpteeMessageCommand::CloseSession => Ok(UteeEntryFunc::CloseSession),
             OpteeMessageCommand::InvokeCommand => Ok(UteeEntryFunc::InvokeCommand),
-            _ => Err(OpteeSmcReturn::EBadCmd),
+            _ => Err(OpteeSmcReturnCode::EBadCmd),
         }
     }
 }
@@ -1333,52 +1333,52 @@ pub struct OpteeMsgArg {
 
 impl OpteeMsgArg {
     /// Validate the message argument structure.
-    pub fn validate(&self) -> Result<(), OpteeSmcReturn> {
-        let _ =
-            OpteeMessageCommand::try_from(self.cmd as u32).map_err(|_| OpteeSmcReturn::EBadCmd)?;
+    pub fn validate(&self) -> Result<(), OpteeSmcReturnCode> {
+        let _ = OpteeMessageCommand::try_from(self.cmd as u32)
+            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
         if self.cmd == OpteeMessageCommand::OpenSession && self.num_params < 2 {
-            return Err(OpteeSmcReturn::EBadCmd);
+            return Err(OpteeSmcReturnCode::EBadCmd);
         }
         if self.num_params as usize > self.params.len() {
-            Err(OpteeSmcReturn::EBadCmd)
+            Err(OpteeSmcReturnCode::EBadCmd)
         } else {
             Ok(())
         }
     }
-    pub fn get_param_tmem(&self, index: usize) -> Result<OpteeMsgParamTmem, OpteeSmcReturn> {
+    pub fn get_param_tmem(&self, index: usize) -> Result<OpteeMsgParamTmem, OpteeSmcReturnCode> {
         if index >= self.num_params as usize {
-            Err(OpteeSmcReturn::ENotAvail)
+            Err(OpteeSmcReturnCode::ENotAvail)
         } else {
             Ok(self.params[index]
                 .get_param_tmem()
-                .ok_or(OpteeSmcReturn::EBadCmd)?)
+                .ok_or(OpteeSmcReturnCode::EBadCmd)?)
         }
     }
-    pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, OpteeSmcReturn> {
+    pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, OpteeSmcReturnCode> {
         if index >= self.num_params as usize {
-            Err(OpteeSmcReturn::ENotAvail)
+            Err(OpteeSmcReturnCode::ENotAvail)
         } else {
             Ok(self.params[index]
                 .get_param_rmem()
-                .ok_or(OpteeSmcReturn::EBadCmd)?)
+                .ok_or(OpteeSmcReturnCode::EBadCmd)?)
         }
     }
-    pub fn get_param_fmem(&self, index: usize) -> Result<OpteeMsgParamFmem, OpteeSmcReturn> {
+    pub fn get_param_fmem(&self, index: usize) -> Result<OpteeMsgParamFmem, OpteeSmcReturnCode> {
         if index >= self.num_params as usize {
-            Err(OpteeSmcReturn::ENotAvail)
+            Err(OpteeSmcReturnCode::ENotAvail)
         } else {
             Ok(self.params[index]
                 .get_param_fmem()
-                .ok_or(OpteeSmcReturn::EBadCmd)?)
+                .ok_or(OpteeSmcReturnCode::EBadCmd)?)
         }
     }
-    pub fn get_param_value(&self, index: usize) -> Result<OpteeMsgParamValue, OpteeSmcReturn> {
+    pub fn get_param_value(&self, index: usize) -> Result<OpteeMsgParamValue, OpteeSmcReturnCode> {
         if index >= self.num_params as usize {
-            Err(OpteeSmcReturn::ENotAvail)
+            Err(OpteeSmcReturnCode::ENotAvail)
         } else {
             Ok(self.params[index]
                 .get_param_value()
-                .ok_or(OpteeSmcReturn::EBadCmd)?)
+                .ok_or(OpteeSmcReturnCode::EBadCmd)?)
         }
     }
 }
@@ -1423,21 +1423,21 @@ impl OpteeSmcArgs {
     const NUM_OPTEE_SMC_ARGS: usize = 9;
 
     /// Get the function ID of an OP-TEE SMC call
-    pub fn func_id(&self) -> Result<OpteeSmcFunction, OpteeSmcReturn> {
+    pub fn func_id(&self) -> Result<OpteeSmcFunction, OpteeSmcReturnCode> {
         OpteeSmcFunction::try_from(self.args[0] & OpteeSmcFunction::MASK)
-            .map_err(|_| OpteeSmcReturn::EBadCmd)
+            .map_err(|_| OpteeSmcReturnCode::EBadCmd)
     }
 
     /// Get the physical address of `OpteeMsgArg`. The secure world is expected to map and copy
     /// this structure.
-    pub fn optee_msg_arg_phys_addr(&self) -> Result<u64, OpteeSmcReturn> {
+    pub fn optee_msg_arg_phys_addr(&self) -> Result<u64, OpteeSmcReturnCode> {
         // To avoid potential sign extension and overflow issues, OP-TEE stores the low and
         // high 32 bits of a 64-bit address in `args[2]` and `args[1]`, respectively.
         if self.args[1] & 0xffff_ffff_0000_0000 == 0 && self.args[2] & 0xffff_ffff_0000_0000 == 0 {
             let addr = (self.args[1] << 32) | self.args[2];
             Ok(addr as u64)
         } else {
-            Err(OpteeSmcReturn::EBadAddr)
+            Err(OpteeSmcReturnCode::EBadAddr)
         }
     }
 }
@@ -1479,10 +1479,10 @@ impl OpteeSmcFunction {
 #[non_exhaustive]
 pub enum OpteeSmcResult<'a> {
     Generic {
-        status: OpteeSmcReturn,
+        status: OpteeSmcReturnCode,
     },
     ExchangeCapabilities {
-        status: OpteeSmcReturn,
+        status: OpteeSmcReturnCode,
         capabilities: OpteeSecureWorldCapabilities,
         max_notif_value: usize,
         data: usize,
@@ -1500,9 +1500,12 @@ pub enum OpteeSmcResult<'a> {
         build_id: usize,
     },
     DisableShmCache {
-        status: OpteeSmcReturn,
+        status: OpteeSmcReturnCode,
         shm_upper32: usize,
         shm_lower32: usize,
+    },
+    CallWithArg {
+        msg_arg: Box<OpteeMsgArg>,
     },
 }
 
@@ -1562,6 +1565,11 @@ impl From<OpteeSmcResult<'_>> for OpteeSmcArgs {
                 smc.args[2] = shm_lower32;
                 smc
             }
+            OpteeSmcResult::CallWithArg { .. } => {
+                panic!(
+                    "OpteeSmcResult::CallWithArg cannot be converted to OpteeSmcArgs directly. Handle the incorporate OpteeMsgArg."
+                );
+            }
         }
     }
 }
@@ -1592,7 +1600,7 @@ const OPTEE_SMC_RETURN_UNKNOWN_FUNCTION: usize = 0xffff_ffff;
 #[non_exhaustive]
 #[derive(Copy, Clone, PartialEq, TryFromPrimitive)]
 #[repr(usize)]
-pub enum OpteeSmcReturn {
+pub enum OpteeSmcReturnCode {
     Ok = OPTEE_SMC_RETURN_OK,
     EThreadLimit = OPTEE_SMC_RETURN_ETHREAD_LIMIT,
     EBusy = OPTEE_SMC_RETURN_EBUSY,
