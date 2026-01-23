@@ -17,7 +17,6 @@ use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
 
 pub mod syscall_nr;
-pub mod vmap;
 
 // Based on `optee_os/lib/libutee/include/utee_syscalls.h`
 #[non_exhaustive]

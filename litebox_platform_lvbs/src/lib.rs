@@ -24,16 +24,17 @@ use litebox::platform::{
     PunchthroughProvider, PunchthroughToken, RawMutex as _, RawPointerProvider,
 };
 use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
-use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
+use litebox_common_linux::{
+    PunchthroughSyscall,
+    errno::Errno,
+    vmap::{
+        PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
+        VmapProvider,
+    },
+};
 use x86_64::structures::paging::{
     PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
     mapper::MapToError,
-};
-
-#[cfg(feature = "optee_syscall")]
-use litebox_common_optee::vmap::{
-    PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
-    VmapProvider,
 };
 
 extern crate alloc;

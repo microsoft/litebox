@@ -21,6 +21,7 @@ pub mod errno;
 pub mod loader;
 pub mod mm;
 pub mod signal;
+pub mod vmap;
 
 extern crate alloc;
 

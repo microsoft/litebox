@@ -61,7 +61,7 @@
 // TODO: Since the below `PhysMutPtr` and `PhysConstPtr` are not OP-TEE specific,
 // we can move them to a different crate (e.g., `litebox`) if needed.
 
-use litebox_common_optee::vmap::{
+use litebox_common_linux::vmap::{
     PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
 };
 use litebox_platform_multiplex::platform;

@@ -18,10 +18,9 @@ use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
-
-#[cfg(feature = "optee_syscall")]
-use litebox_common_optee::vmap::VmapProvider;
+use litebox_common_linux::{
+    MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall, vmap::VmapProvider,
+};
 
 mod syscall_intercept;
 
@@ -2195,7 +2194,6 @@ impl litebox::platform::CrngProvider for LinuxUserland {
 /// In general, userland platforms do not support `vmap` and `vunmap` (which are kernel functions).
 /// We might need to emulate these functions' behaviors using virtual addresses for development or
 /// testing, or use a kernel module to provide this functionality (if needed).
-#[cfg(feature = "optee_syscall")]
 impl<const ALIGN: usize> VmapProvider<ALIGN> for LinuxUserland {}
 
 #[cfg(test)]
