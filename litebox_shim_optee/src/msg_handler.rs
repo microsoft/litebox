@@ -10,8 +10,8 @@
 //! up to nine register values. By checking the SMC function ID, the shim determines whether
 //! it is for passing an OP-TEE message or a pure SMC function call (e.g., get OP-TEE OS
 //! version). If it is for passing an OP-TEE message/command, the shim accesses a normal world
-//! physical address containing `OpteeMsgArg` structure (the address is contained in
-//! the SMC call arguments). This `OpteeMsgArg` structure may contain references to normal
+//! physical address containing `OpteeMsgArgs` structure (the address is contained in
+//! the SMC call arguments). This `OpteeMsgArgs` structure may contain references to normal
 //! world physical addresses to exchange a large amount of data. Also, like the OP-TEE
 //! SMC call, some OP-TEE messages/commands target OP-TEE shim not TAs (e.g., register
 //! shared memory).
@@ -21,8 +21,8 @@ use hashbrown::HashMap;
 use litebox::{mm::linux::PAGE_SIZE, utils::TruncateExt};
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArg, OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction,
-    OpteeSmcResult, OpteeSmcReturnCode,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeSecureWorldCapabilities, OpteeSmcArgs,
+    OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode,
 };
 use once_cell::race::OnceBox;
 
@@ -61,7 +61,7 @@ fn page_align_up(len: u64) -> u64 {
 }
 
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
-/// It returns an `OpteeSmcResult` representing the result of the SMC call or `OpteeMsgArg` it contains
+/// It returns an `OpteeSmcResult` representing the result of the SMC call or `OpteeMsgArgs` it contains
 /// if the SMC call involves with an OP-TEE message which should be handled by
 /// `handle_optee_msg_arg` or `handle_ta_request`.
 pub fn handle_optee_smc_args(
@@ -74,7 +74,7 @@ pub fn handle_optee_smc_args(
         | OpteeSmcFunction::CallWithRegdArg => {
             let msg_arg_addr = smc.optee_msg_arg_phys_addr()?;
             let msg_arg_addr: usize = msg_arg_addr.truncate();
-            let mut ptr = NormalWorldConstPtr::<OpteeMsgArg, PAGE_SIZE>::with_usize(msg_arg_addr)
+            let mut ptr = NormalWorldConstPtr::<OpteeMsgArgs, PAGE_SIZE>::with_usize(msg_arg_addr)
                 .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
             let msg_arg =
                 unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
@@ -131,12 +131,12 @@ pub fn handle_optee_smc_args(
     }
 }
 
-/// This function handles an OP-TEE message contained in `OpteeMsgArg`.
+/// This function handles an OP-TEE message contained in `OpteeMsgArgs`.
 /// Currently, it only handles shared memory registration and unregistration.
 /// If an OP-TEE message involves with a TA request, it simply returns
 /// `Err(OpteeSmcReturnCode::Ok)` while expecting that the caller will handle
 /// the message with `handle_ta_request`.
-pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), OpteeSmcReturnCode> {
+pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArgs) -> Result<(), OpteeSmcReturnCode> {
     msg_arg.validate()?;
     match msg_arg.cmd {
         OpteeMessageCommand::RegisterShm => {
@@ -176,8 +176,8 @@ pub fn handle_optee_msg_arg(msg_arg: &OpteeMsgArg) -> Result<(), OpteeSmcReturnC
     Ok(())
 }
 
-/// This function handles a TA request contained in `OpteeMsgArg`
-pub fn handle_ta_request(_msg_arg: &OpteeMsgArg) -> Result<OpteeMsgArg, OpteeSmcReturnCode> {
+/// This function handles a TA request contained in `OpteeMsgArgs`
+pub fn handle_ta_request(_msg_arg: &OpteeMsgArgs) -> Result<OpteeMsgArgs, OpteeSmcReturnCode> {
     todo!()
 }
 

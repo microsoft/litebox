@@ -11,7 +11,7 @@ use thiserror::Error;
 /// This provider exists to service `litebox_shim_optee::ptr::PhysMutPtr` and
 /// `litebox_shim_optee::ptr::PhysConstPtr`. It can benefit other modules which need
 /// Linux kernel's `vmap()` and `vunmap()` functionalities (e.g., HVCI/HEKI, drivers).
-pub trait VmapProvider<const ALIGN: usize> {
+pub trait VmapManager<const ALIGN: usize> {
     /// Map the given `PhysPageAddrArray` into virtually contiguous addresses with the given
     /// [`PhysPageMapPermissions`] while returning [`PhysPageMapInfo`].
     ///
@@ -140,7 +140,7 @@ impl From<PhysPageMapPermissions> for MemoryRegionPermissions {
     }
 }
 
-/// Possible errors for physical pointer access with `VmapProvider`
+/// Possible errors for physical pointer access with `VmapManager`
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum PhysPointerError {

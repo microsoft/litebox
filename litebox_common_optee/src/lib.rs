@@ -1187,7 +1187,7 @@ pub struct OpteeMsgParamValue {
     pub c: u64,
 }
 
-/// Parameter used together with `OpteeMsgArg`
+/// Parameter used together with `OpteeMsgArgs`
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub union OpteeMsgParamUnion {
@@ -1305,7 +1305,7 @@ impl OpteeMsgParam {
 /// exchange messages.
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct OpteeMsgArg {
+pub struct OpteeMsgArgs {
     /// OP-TEE message command. This is a superset of `UteeEntryFunc`.
     pub cmd: OpteeMessageCommand,
     /// TA function ID which is used if `cmd == InvokeCommand`. Note that the meaning of `cmd` and `func`
@@ -1330,7 +1330,7 @@ pub struct OpteeMsgArg {
     pub params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
 }
 
-impl OpteeMsgArg {
+impl OpteeMsgArgs {
     /// Validate the message argument structure.
     pub fn validate(&self) -> Result<(), OpteeSmcReturnCode> {
         let _ = OpteeMessageCommand::try_from(self.cmd as u32)
@@ -1427,7 +1427,7 @@ impl OpteeSmcArgs {
             .map_err(|_| OpteeSmcReturnCode::EBadCmd)
     }
 
-    /// Get the physical address of `OpteeMsgArg`. The secure world is expected to map and copy
+    /// Get the physical address of `OpteeMsgArgs`. The secure world is expected to map and copy
     /// this structure.
     pub fn optee_msg_arg_phys_addr(&self) -> Result<u64, OpteeSmcReturnCode> {
         // To avoid potential sign extension and overflow issues, OP-TEE stores the low and
@@ -1504,7 +1504,7 @@ pub enum OpteeSmcResult<'a> {
         shm_lower32: usize,
     },
     CallWithArg {
-        msg_arg: Box<OpteeMsgArg>,
+        msg_arg: Box<OpteeMsgArgs>,
     },
 }
 
@@ -1566,7 +1566,7 @@ impl From<OpteeSmcResult<'_>> for OpteeSmcArgs {
             }
             OpteeSmcResult::CallWithArg { .. } => {
                 panic!(
-                    "OpteeSmcResult::CallWithArg cannot be converted to OpteeSmcArgs directly. Handle the incorporate OpteeMsgArg."
+                    "OpteeSmcResult::CallWithArg cannot be converted to OpteeSmcArgs directly. Handle the incorporate OpteeMsgArgs."
                 );
             }
         }

@@ -62,7 +62,7 @@
 // we can move them to a different crate (e.g., `litebox`) if needed.
 
 use litebox_common_linux::vmap::{
-    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapProvider,
+    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
 use litebox_platform_multiplex::platform;
 

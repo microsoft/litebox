@@ -29,7 +29,7 @@ use litebox_common_linux::{
     errno::Errno,
     vmap::{
         PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
-        VmapProvider,
+        VmapManager,
     },
 };
 use x86_64::structures::paging::{
@@ -769,7 +769,7 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
 
 /// Checks whether the given physical addresses are contiguous with respect to ALIGN.
 ///
-/// Note: This is a temporary check to let `VmapProvider` work with this platform
+/// Note: This is a temporary check to let `VmapManager` work with this platform
 /// which does not yet support virtually contiguous mapping of non-contiguous physical pages
 /// (for now, it maps physical pages with a fixed offset).
 #[cfg(feature = "optee_syscall")]
@@ -787,7 +787,7 @@ fn check_contiguity<const ALIGN: usize>(
 }
 
 #[cfg(feature = "optee_syscall")]
-impl<Host: HostInterface, const ALIGN: usize> VmapProvider<ALIGN> for LinuxKernel<Host> {
+impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel<Host> {
     unsafe fn vmap(
         &self,
         pages: &PhysPageAddrArray<ALIGN>,
