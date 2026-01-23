@@ -1214,6 +1214,9 @@ impl Default for SessionIdPool {
     }
 }
 
+pub type NormalWorldConstPtr<T, const ALIGN: usize> = crate::ptr::PhysConstPtr<T, ALIGN>;
+pub type NormalWorldMutPtr<T, const ALIGN: usize> = crate::ptr::PhysMutPtr<T, ALIGN>;
+
 #[cfg(test)]
 mod test_utils {
     use super::*;
@@ -1240,6 +1243,3 @@ mod test_utils {
         }
     }
 }
-
-pub type NormalWorldConstPtr<T, const ALIGN: usize> = crate::ptr::PhysConstPtr<T, ALIGN>;
-pub type NormalWorldMutPtr<T, const ALIGN: usize> = crate::ptr::PhysMutPtr<T, ALIGN>;
