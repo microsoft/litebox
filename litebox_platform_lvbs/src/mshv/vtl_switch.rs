@@ -233,11 +233,14 @@ unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
     naked_asm!(
         "1:",
         "mov rsp, gs:[{kernel_sp_off}]", // reset kernel stack pointer. Hyper-V saves/restores rsp and rip.
+        "cli", // disable VTL1 interrupts before returning to VTL0
         VTL_RETURN_ASM!({vtl_ret_addr_off}),
         // *** VTL1 resumes here regardless of the entry reason (VTL switch or intercept) ***
         SAVE_VTL_STATE_ASM!({scratch_off}, {vtl0_state_top_addr_off}),
         XSAVE_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}, {vtl0_xsaved_off}),
         "mov rbp, rsp", // rbp contains VTL0's stack frame, so update it.
+        "sti", // enable VTL1 interrupts after saving VTL0 state
+        // A pending SINT can be fired here. Our SINT handler only executes `iretq` so returns to here immediately.
         "call {loop_body}",
         ".globl panic_vtl_switch",
         "panic_vtl_switch:", // jump to here on panic to switch back to VTL0
