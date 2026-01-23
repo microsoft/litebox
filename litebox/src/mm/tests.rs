@@ -14,6 +14,7 @@ use crate::{
         trivial_providers::{TransparentConstPtr, TransparentMutPtr},
     },
 };
+use zerocopy::{FromBytes, IntoBytes};
 
 use super::linux::{
     NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
@@ -23,8 +24,8 @@ use super::linux::{
 struct DummyVmemBackend;
 
 impl crate::platform::RawPointerProvider for DummyVmemBackend {
-    type RawConstPointer<T: Clone> = TransparentConstPtr<T>;
-    type RawMutPointer<T: Clone> = TransparentMutPtr<T>;
+    type RawConstPointer<T: Clone + FromBytes> = TransparentConstPtr<T>;
+    type RawMutPointer<T: Clone + FromBytes + IntoBytes> = TransparentMutPtr<T>;
 }
 
 #[expect(unused_variables, reason = "dummy/mock backend")]

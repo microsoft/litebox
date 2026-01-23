@@ -16,6 +16,7 @@ pub(crate) mod mock;
 
 use either::Either;
 use thiserror::Error;
+use zerocopy::{FromBytes, IntoBytes};
 
 pub use page_mgmt::PageManagementProvider;
 
@@ -376,8 +377,8 @@ pub trait DebugLogProvider {
 /// should define their own `repr(C)` newtype wrappers that perform relevant copying between user
 /// and kernel.
 pub trait RawPointerProvider {
-    type RawConstPointer<T: Clone>: RawConstPointer<T>;
-    type RawMutPointer<T: Clone>: RawMutPointer<T>;
+    type RawConstPointer<T: Clone + FromBytes>: RawConstPointer<T>;
+    type RawMutPointer<T: Clone + FromBytes + IntoBytes>: RawMutPointer<T>;
 }
 
 /// A read-only raw pointer, morally equivalent to `*const T`.
@@ -385,7 +386,7 @@ pub trait RawPointerProvider {
 /// See [`RawPointerProvider`] for details.
 pub trait RawConstPointer<T>: Copy + core::fmt::Debug
 where
-    T: Clone,
+    T: Clone + FromBytes,
 {
     /// Get the address of the pointer as a `usize`.
     fn as_usize(&self) -> usize;
@@ -405,21 +406,13 @@ where
     /// If `T` is of size 1, 2, 4, or (on 64-bit platforms) 8 bytes, and the pointer is aligned,
     /// then this function will perform a relaxed atomic load of the value. Otherwise, the
     /// access pattern is unspecified.
-    ///
-    /// # Safety
-    ///
-    /// The pointer (and underlying memory for the value at the offset) should be valid for T.
-    unsafe fn read_at_offset(self, count: isize) -> Option<T>;
+    fn read_at_offset(self, count: isize) -> Option<T>;
 
     /// Read the pointer as an owned slice of memory.
     ///
     /// Returns `None` if the provided pointer is invalid, or such a slice is known (in advance) to
     /// be invalid.
-    ///
-    /// # Safety
-    ///
-    /// The pointer (and underlying memory for `len` elements of type T) should be valid.
-    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>>;
+    fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>>;
 
     /// Read the pointer as an owned C string.
     ///
@@ -435,13 +428,13 @@ where
         use core::ffi::c_char;
         let nul_position = {
             let mut i = 0isize;
-            while unsafe { <Self as RawConstPointer<T>>::read_at_offset(self, i) }? != 0 {
+            while <Self as RawConstPointer<c_char>>::read_at_offset(self, i)? != 0 {
                 i = i.checked_add(1)?;
             }
             i
         };
         let len = nul_position.checked_add(1)?.try_into().ok()?;
-        let bytes: Box<[c_char]> = unsafe { self.to_owned_slice(len) }?;
+        let bytes: Box<[c_char]> = self.to_owned_slice(len)?;
         // Doing a direct transmute of `Box<[c_char]>` to `Box<[u8]>` may not be guaranteed to be
         // safe (it probably is fine, but the following sequence of steps ensures we are
         // staying in a very safe subset).
@@ -461,34 +454,24 @@ where
 /// on the pointer in addition to the writing-related functionality defined by this trait.
 pub trait RawMutPointer<T>: Copy + RawConstPointer<T>
 where
-    T: Clone,
+    T: Clone + FromBytes + IntoBytes,
 {
     /// Write the value of the pointer at signed offset from it.
     ///
     /// Returns `None` if the provided pointer is invalid, or such an offset is known (in advance)
     /// to be invalid.
-    ///
-    /// # Safety
-    ///
-    /// The offset must be valid location for the pointer.
     #[must_use]
-    unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()>;
+    fn write_at_offset(self, count: isize, value: T) -> Option<()>;
 
     /// Write a slice of values at the given offset.
     ///
     /// Returns `None` if the provided pointer is invalid, or if the specified offset is known (in
     /// advance) to be invalid; in that case there are no guarantees about how many values — if any —
     /// have been written.
-    ///
-    /// # Safety
-    ///
-    /// All `values.len()` positions starting from the specified offset must be valid memory
-    /// locations for the pointer.
     #[must_use]
-    unsafe fn write_slice_at_offset(self, count: isize, values: &[T]) -> Option<()> {
+    fn write_slice_at_offset(self, count: isize, values: &[T]) -> Option<()> {
         for (offset, v) in (count..).zip(values) {
-            // SAFETY: from the requirements of this function.
-            unsafe { self.write_at_offset(offset, v.clone()) }?;
+            self.write_at_offset(offset, v.clone())?;
         }
         Some(())
     }

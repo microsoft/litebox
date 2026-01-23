@@ -855,6 +855,7 @@ dependencies = [
  "tar-no-std",
  "thiserror",
  "windows-sys 0.60.2",
+ "zerocopy",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@ use super::{
     Punchthrough, PunchthroughError, PunchthroughProvider, PunchthroughToken, RawConstPointer,
     RawMutPointer,
 };
+use zerocopy::{FromBytes, IntoBytes};
 
 /// A trivial provider, useful when no punchthrough is necessary.
 pub struct ImpossiblePunchthroughProvider {}
@@ -118,11 +119,14 @@ impl<T: Clone> core::fmt::Debug for TransparentConstPtr<T> {
     }
 }
 impl<T: Clone> Copy for TransparentConstPtr<T> {}
-impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
-    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
+impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
+    fn read_at_offset(self, count: isize) -> Option<T> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
+        // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
+        // on T guarantees that any byte pattern is valid for T, so reading from valid
+        // memory is safe.
         Some(match size_of::<T>() {
             // Try to ensure a single access for primitive types. The use of
             // volatile here is dubious--this should really use inline asm or
@@ -131,10 +135,12 @@ impl<T: Clone> RawConstPointer<T> for TransparentConstPtr<T> {
             _ => unsafe { (*self.inner.offset(count)).clone() },
         })
     }
-    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
+    fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
+        // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
+        // on T guarantees that any byte pattern is valid for T.
         Some(
             unsafe { core::slice::from_raw_parts(self.inner, len) }
                 .to_vec()
@@ -166,11 +172,14 @@ impl<T: Clone> core::fmt::Debug for TransparentMutPtr<T> {
     }
 }
 impl<T: Clone> Copy for TransparentMutPtr<T> {}
-impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
-    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
+impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentMutPtr<T> {
+    fn read_at_offset(self, count: isize) -> Option<T> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
+        // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
+        // on T guarantees that any byte pattern is valid for T, so reading from valid
+        // memory is safe.
         Some(match size_of::<T>() {
             // Try to ensure a single access for primitive types. The use of
             // volatile here is dubious--this should really use inline asm or
@@ -179,10 +188,12 @@ impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
             _ => unsafe { (*self.inner.offset(count)).clone() },
         })
     }
-    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
+    fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
+        // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
+        // on T guarantees that any byte pattern is valid for T.
         Some(
             unsafe { core::slice::from_raw_parts(self.inner, len) }
                 .to_vec()
@@ -199,11 +210,13 @@ impl<T: Clone> RawConstPointer<T> for TransparentMutPtr<T> {
         }
     }
 }
-impl<T: Clone> RawMutPointer<T> for TransparentMutPtr<T> {
-    unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()> {
+impl<T: Clone + FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T> {
+    fn write_at_offset(self, count: isize, value: T) -> Option<()> {
         if self.inner.is_null() || !self.inner.is_aligned() {
             return None;
         }
+        // SAFETY: We checked the pointer is non-null and aligned. The IntoBytes bound
+        // on T guarantees that T can be safely written as bytes.
         unsafe {
             *self.inner.offset(count) = value;
         }

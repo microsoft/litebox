@@ -136,13 +136,12 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         while offset < total_len {
             let old_ptr =
                 <Self as RawPointerProvider>::RawConstPointer::from_usize(old_range.start + offset);
-            unsafe {
-                new_ptr.write_slice_at_offset(
+            new_ptr
+                .write_slice_at_offset(
                     isize::try_from(offset).unwrap(),
                     &old_ptr.to_owned_slice(old_range.len()).unwrap(),
                 )
-            }
-            .unwrap();
+                .unwrap();
             offset += ALIGN;
         }
 

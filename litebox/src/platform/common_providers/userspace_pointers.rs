@@ -33,6 +33,7 @@
 
 use crate::mm::exception_table::memcpy_fallible;
 use crate::platform::{RawConstPointer, RawMutPointer};
+use zerocopy::{FromBytes, IntoBytes};
 
 /// Trait to validate that a pointer is a userspace pointer.
 ///
@@ -101,13 +102,20 @@ impl<V, T: Clone> core::fmt::Debug for UserConstPtr<V, T> {
 ///
 /// Note that this is fallible only if recovering from exceptions (e.g., page fault or SIGSEGV)
 /// is supported.
-unsafe fn read_at_offset<V: ValidateAccess, T: Clone>(ptr: *const T, count: isize) -> Option<T> {
+fn read_at_offset<V: ValidateAccess, T: Clone + FromBytes>(
+    ptr: *const T,
+    count: isize,
+) -> Option<T> {
     let src = unsafe { ptr.add(usize::try_from(count).ok()?) };
     let src = V::validate(src.cast_mut())?.cast_const();
     // Match on the size of `T` to use the appropriate fallible read function to
     // ensure that small aligned reads are atomic (and faster than a full
     // memcpy). This match will be evaluated at compile time, so there is no
     // runtime overhead.
+    //
+    // SAFETY: The FromBytes bound on T guarantees that any byte pattern is valid for T,
+    // so transmute_copy is safe. The memory access itself is fallible and returns None
+    // on invalid memory access.
     let val = unsafe {
         match size_of::<T>() {
             1 => core::mem::transmute_copy(
@@ -139,7 +147,7 @@ unsafe fn read_at_offset<V: ValidateAccess, T: Clone>(ptr: *const T, count: isiz
     Some(val)
 }
 
-unsafe fn to_owned_slice<V: ValidateAccess, T: Clone>(
+fn to_owned_slice<V: ValidateAccess, T: Clone + FromBytes>(
     ptr: *const T,
     len: usize,
 ) -> Option<alloc::boxed::Box<[T]>> {
@@ -148,6 +156,8 @@ unsafe fn to_owned_slice<V: ValidateAccess, T: Clone>(
     }
     let ptr = V::validate_slice(core::ptr::slice_from_raw_parts(ptr, len).cast_mut())?.cast_const();
     let mut data = alloc::boxed::Box::<[T]>::new_uninit_slice(len);
+    // SAFETY: The FromBytes bound on T guarantees that any byte pattern is valid for T.
+    // The memcpy_fallible operation returns None on invalid memory access.
     unsafe {
         memcpy_fallible(
             data.as_mut_ptr().cast(),
@@ -159,13 +169,13 @@ unsafe fn to_owned_slice<V: ValidateAccess, T: Clone>(
     }
 }
 
-impl<V: ValidateAccess, T: Clone> RawConstPointer<T> for UserConstPtr<V, T> {
-    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
-        unsafe { read_at_offset::<V, T>(self.inner, count) }
+impl<V: ValidateAccess, T: Clone + FromBytes> RawConstPointer<T> for UserConstPtr<V, T> {
+    fn read_at_offset(self, count: isize) -> Option<T> {
+        read_at_offset::<V, T>(self.inner, count)
     }
 
-    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        unsafe { to_owned_slice::<V, T>(self.inner, len) }
+    fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
+        to_owned_slice::<V, T>(self.inner, len)
     }
 
     fn as_usize(&self) -> usize {
@@ -209,13 +219,13 @@ impl<V, T> Clone for UserMutPtr<V, T> {
 
 impl<V, T> Copy for UserMutPtr<V, T> {}
 
-impl<V: ValidateAccess, T: Clone> RawConstPointer<T> for UserMutPtr<V, T> {
-    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
-        unsafe { read_at_offset::<V, T>(self.inner.cast_const(), count) }
+impl<V: ValidateAccess, T: Clone + FromBytes> RawConstPointer<T> for UserMutPtr<V, T> {
+    fn read_at_offset(self, count: isize) -> Option<T> {
+        read_at_offset::<V, T>(self.inner.cast_const(), count)
     }
 
-    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        unsafe { to_owned_slice::<V, T>(self.inner.cast_const(), len) }
+    fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
+        to_owned_slice::<V, T>(self.inner.cast_const(), len)
     }
 
     fn as_usize(&self) -> usize {
@@ -226,14 +236,18 @@ impl<V: ValidateAccess, T: Clone> RawConstPointer<T> for UserMutPtr<V, T> {
     }
 }
 
-impl<V: ValidateAccess, T: Clone> RawMutPointer<T> for UserMutPtr<V, T> {
-    unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()> {
+impl<V: ValidateAccess, T: Clone + FromBytes + IntoBytes> RawMutPointer<T> for UserMutPtr<V, T> {
+    fn write_at_offset(self, count: isize, value: T) -> Option<()> {
         let dst = unsafe { self.inner.add(usize::try_from(count).ok()?) };
         let dst = V::validate(dst)?;
         // Match on the size of `T` to use the appropriate fallible write function to
         // ensure that small aligned writes are atomic (and faster than a full
         // memcpy). This match will be evaluated at compile time, so there is no
         // runtime overhead.
+        //
+        // SAFETY: The IntoBytes bound on T guarantees that T can be safely written as bytes.
+        // The transmute_copy is safe because T implements IntoBytes. The memory access
+        // itself is fallible and returns None on invalid memory access.
         unsafe {
             match size_of::<T>() {
                 1 => crate::mm::exception_table::write_u8_fallible(
