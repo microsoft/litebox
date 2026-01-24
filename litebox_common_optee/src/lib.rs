@@ -1566,7 +1566,7 @@ impl From<OpteeSmcResult<'_>> for OpteeSmcArgs {
             }
             OpteeSmcResult::CallWithArg { .. } => {
                 panic!(
-                    "OpteeSmcResult::CallWithArg cannot be converted to OpteeSmcArgs directly. Handle the incorporate OpteeMsgArgs."
+                    "OpteeSmcResult::CallWithArg cannot be converted to OpteeSmcArgs directly. Handle the incorporated OpteeMsgArgs."
                 );
             }
         }
