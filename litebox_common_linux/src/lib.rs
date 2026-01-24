@@ -14,7 +14,7 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, TruncateExt},
 };
 use syscalls::Sysno;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::signal::SigSet;
 
@@ -386,14 +386,16 @@ impl From<FileStat> for FileStat64 {
 }
 
 /// Linux's `iovec` struct for `writev`
-#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+#[repr(C, packed)]
 pub struct IoWriteVec<P: RawConstPointer<u8>> {
     pub iov_base: P,
     pub iov_len: usize,
 }
 
 /// Linux's `iovec` struct for `readv`
-#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+#[repr(C, packed)]
 pub struct IoReadVec<P: RawMutPointer<u8>> {
     pub iov_base: P,
     pub iov_len: usize,
@@ -1301,6 +1303,7 @@ impl RlimitResource {
 }
 
 #[repr(C)]
+#[derive(FromBytes, IntoBytes)]
 pub struct RobustList<Platform: litebox::platform::RawPointerProvider> {
     pub next: Platform::RawConstPointer<RobustList<Platform>>,
 }
@@ -1695,10 +1698,13 @@ pub enum IntervalTimer {
     Prof = 2,
 }
 
+/// Flags for the `receive` function.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct ReceiveFlags(u32);
+
 bitflags::bitflags! {
-    /// Flags for the `receive` function.
-    #[derive(Clone, Copy, Debug)]
-    pub struct ReceiveFlags: u32 {
+    impl ReceiveFlags: u32 {
         /// `MSG_CMSG_CLOEXEC`: close-on-exec for the associated file descriptor
         const CMSG_CLOEXEC = 0x40000000;
         /// `MSG_DONTWAIT`: non-blocking operation
@@ -1718,10 +1724,13 @@ bitflags::bitflags! {
     }
 }
 
+/// Flags for the `send` function.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[repr(C)]
+pub struct SendFlags(u32);
+
 bitflags::bitflags! {
-    /// Flags for the `send` function.
-    #[derive(Clone, Copy, Debug)]
-    pub struct SendFlags: u32 {
+    impl SendFlags: u32 {
         /// `MSG_CONFIRM`: requests confirmation of the message delivery.
         const CONFIRM = 0x800;
         /// `MSG_DONTROUTE`: send the message directly to the interface, bypassing routing.
@@ -1749,8 +1758,8 @@ pub struct SigSetPack {
     pub size: usize,
 }
 
-#[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, FromBytes, IntoBytes)]
+#[repr(C, packed)]
 pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     /// ptr to socket address structure
     pub msg_name: Platform::RawConstPointer<u8>,
@@ -2791,7 +2800,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
         Ok(dispatcher)
     }
 
-    fn parse_futex<T: Clone>(
+    fn parse_futex<T: Clone + FromBytes + IntoBytes>(
         ctx: &PtRegs,
         time_param: impl FnOnce(Option<Platform::RawMutPointer<T>>) -> TimeParam<Platform>,
         unsupported_einval: impl Fn(core::fmt::Arguments<'_>) -> errno::Errno,
@@ -2907,15 +2916,15 @@ impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
                 Duration::from_millis(s)
             }
             TimeParam::TimeVal(tv) => {
-                let tv = unsafe { tv.read_at_offset(0) }.ok_or(errno::Errno::EFAULT)?;
+                let tv = tv.read_at_offset(0).ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(tv).map_err(|_| errno::Errno::EINVAL)?
             }
             TimeParam::Timespec32(ts) => {
-                let ts = unsafe { ts.read_at_offset(0) }.ok_or(errno::Errno::EFAULT)?;
+                let ts = ts.read_at_offset(0).ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(ts).map_err(|_| errno::Errno::EINVAL)?
             }
             TimeParam::Timespec64(ts) => {
-                let ts = unsafe { ts.read_at_offset(0) }.ok_or(errno::Errno::EFAULT)?;
+                let ts = ts.read_at_offset(0).ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(ts).map_err(|_| errno::Errno::EINVAL)?
             }
         };
@@ -2927,17 +2936,20 @@ impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
         match *self {
             TimeParam::None | TimeParam::Milliseconds(_) => Ok(()),
             TimeParam::TimeVal(tv_ptr) => {
-                unsafe { tv_ptr.write_at_offset(0, duration.into()) }
+                tv_ptr
+                    .write_at_offset(0, duration.into())
                     .ok_or(errno::Errno::EFAULT)?;
                 Ok(())
             }
             TimeParam::Timespec32(ts_ptr) => {
-                unsafe { ts_ptr.write_at_offset(0, duration.into()) }
+                ts_ptr
+                    .write_at_offset(0, duration.into())
                     .ok_or(errno::Errno::EFAULT)?;
                 Ok(())
             }
             TimeParam::Timespec64(ts_ptr) => {
-                unsafe { ts_ptr.write_at_offset(0, duration.into()) }
+                ts_ptr
+                    .write_at_offset(0, duration.into())
                     .ok_or(errno::Errno::EFAULT)?;
                 Ok(())
             }
@@ -3180,15 +3192,15 @@ reinterpret_truncated_from_usize_for! {
 pub trait ReinterpretUsizeAsPtr<T>: Sized {
     fn reinterpret_usize_as_ptr(v: usize) -> Self;
 }
-impl<T: Clone, P: RawConstPointer<T>> ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>>
-    for P
+impl<T: Clone + FromBytes, P: RawConstPointer<T>>
+    ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>> for P
 {
     fn reinterpret_usize_as_ptr(v: usize) -> Self {
         P::from_usize(v)
     }
 }
-impl<T: Clone, P: RawConstPointer<T>> ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>>
-    for Option<P>
+impl<T: Clone + FromBytes, P: RawConstPointer<T>>
+    ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<P>
 {
     fn reinterpret_usize_as_ptr(v: usize) -> Self {
         if v == 0 { None } else { Some(P::from_usize(v)) }

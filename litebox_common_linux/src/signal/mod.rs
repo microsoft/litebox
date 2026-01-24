@@ -13,7 +13,7 @@ use x86_64::Sigcontext;
 
 use int_enum::IntEnum;
 use litebox::utils::ReinterpretSignedExt as _;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::errno::Errno;
 
