@@ -91,8 +91,8 @@ type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::Us
 >;
 
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
-    type RawConstPointer<T: Clone> = UserConstPtr<T>;
-    type RawMutPointer<T: Clone> = UserMutPtr<T>;
+    type RawConstPointer<T: Clone + zerocopy::FromBytes> = UserConstPtr<T>;
+    type RawMutPointer<T: Clone + zerocopy::FromBytes + zerocopy::IntoBytes> = UserMutPtr<T>;
 }
 
 impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
