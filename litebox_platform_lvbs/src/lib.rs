@@ -1083,6 +1083,7 @@ unsafe extern "C" fn run_thread_arch(
         // Exception and interrupt callback placeholders
         // IDT handler functions will jump to these labels to
         // handle user-mode exceptions/interrupts.
+        // Note that these two callbacks are not yet implemented and no code path jumps to them.
         ".globl exception_callback",
         "exception_callback:",
         "jmp done",

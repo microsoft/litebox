@@ -239,8 +239,9 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 
 /// Specify the layout of PerCpuVariables for Assembly area.
 ///
-/// Unlike userland platforms, this kernel platform does't rely on the `tbss` section
-/// to specify Kernel TLS because there is no ELF loader that will set up TLS for it.
+/// Unlike `litebox_platform_linux_userland`, this kernel platform does't rely on
+/// the `tbss` section to specify FS/GS offsets for per CPU variables because
+/// there is no ELF loader that will set up it.
 ///
 /// Note that kernel & host and user & guest are interchangeable in this context.
 /// We use "kernel" and "user" here to emphasize that there must be hardware-enforced
@@ -346,7 +347,7 @@ impl PerCpuVariablesAsm {
 /// save/restore RIP/RSP). Currently, `PerCpuVariables` is protected by `RefCell` such that
 /// assembly code cannot easily access it.
 ///
-/// TODO: Let's consider whether we should maintain these two types of TLS areas (for Rust and
+/// TODO: Let's consider whether we should maintain these two types of Per CPU variable areas (for Rust and
 /// assembly, respectively). This design secures Rust-side access to `PerCpuVariables` with `RefCell`,
 /// but it might be unnecessarily complex. Instead, we could use assembly code in all cases, but
 /// this might be unsafe.
