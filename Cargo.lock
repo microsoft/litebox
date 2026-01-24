@@ -882,6 +882,7 @@ dependencies = [
  "litebox_common_linux",
  "modular-bitfield",
  "num_enum",
+ "zerocopy",
 ]
 
 [[package]]
@@ -899,6 +900,7 @@ dependencies = [
  "syscalls",
  "thiserror",
  "x86_64",
+ "zerocopy",
 ]
 
 [[package]]
