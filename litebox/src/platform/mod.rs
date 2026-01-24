@@ -385,6 +385,7 @@ pub trait RawPointerProvider {
 ///
 /// See [`RawPointerProvider`] for details.
 pub trait RawConstPointer<T>: Copy + core::fmt::Debug
+// + FromBytes + IntoBytes
 where
     T: Clone + FromBytes,
 {
