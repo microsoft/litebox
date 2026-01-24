@@ -216,6 +216,7 @@ impl<const ALIGN: usize> core::ops::Add<usize> for NonZeroPageSize<ALIGN> {
 }
 
 /// A non-zero address that is `ALIGN`-aligned.
+#[derive(Clone, Copy)]
 pub struct NonZeroAddress<const ALIGN: usize>(usize);
 
 impl<const ALIGN: usize> NonZeroAddress<ALIGN> {

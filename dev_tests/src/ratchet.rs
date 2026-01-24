@@ -39,7 +39,7 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_runner_lvbs/", 3),
             ("litebox_runner_snp/", 1),
             ("litebox_shim_linux/", 1),
-            ("litebox_shim_optee/", 1),
+            ("litebox_shim_optee/", 2),
         ],
         |file| {
             Ok(file
@@ -69,6 +69,7 @@ fn ratchet_maybe_uninit() -> Result<()> {
             ("litebox_platform_linux_userland/", 3),
             ("litebox_platform_lvbs/", 5),
             ("litebox_shim_linux/", 5),
+            ("litebox_shim_optee/", 1),
         ],
         |file| {
             Ok(file

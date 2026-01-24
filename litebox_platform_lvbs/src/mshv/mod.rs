@@ -3,7 +3,7 @@
 
 //! Hyper-V-specific code
 
-mod heki;
+pub(crate) mod heki;
 pub mod hvcall;
 mod hvcall_mm;
 mod hvcall_vp;
