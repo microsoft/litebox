@@ -108,20 +108,41 @@ impl core::error::Error for Underspecified {}
 /// A trivial [`RawConstPointer`] that is literally just `*const T`.
 ///
 /// Useful for purely-userland contexts.
-#[repr(C)]
-#[derive(Clone)]
-pub struct TransparentConstPtr<T> {
-    pub inner: *const T,
+// NOTE: We explicitly write the `T: Sized` bound to explicitly document that
+// these need to be "thin" pointers, and that "fat" pointers (i.e., pointers to
+// DSTs) are unsupported.
+#[derive(FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct TransparentConstPtr<T: Sized> {
+    /// An exposed-provenance address of the pointer. See [`Self::as_ptr`] for
+    /// more details.
+    inner: usize,
+    _phantom_ptr: core::marker::PhantomData<*const T>,
 }
+
+impl<T> TransparentConstPtr<T> {
+    /// Explicitly-private function.  See
+    /// [`super::common_providers::userspace_pointers::UserConstPtr::as_ptr`]
+    /// for more details.
+    fn as_ptr(&self) -> *const T {
+        core::ptr::with_exposed_provenance(self.inner)
+    }
+}
+impl<T> Clone for TransparentConstPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for TransparentConstPtr<T> {}
 impl<T: Clone> core::fmt::Debug for TransparentConstPtr<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("ConstPtr").field(&self.inner).finish()
     }
 }
-impl<T: Clone> Copy for TransparentConstPtr<T> {}
 impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
     fn read_at_offset(self, count: isize) -> Option<T> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
             return None;
         }
         // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
@@ -131,29 +152,31 @@ impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
             // Try to ensure a single access for primitive types. The use of
             // volatile here is dubious--this should really use inline asm or
             // perhaps atomic loads.
-            1 | 2 | 4 | 8 => unsafe { self.inner.offset(count).read_volatile() },
-            _ => unsafe { (*self.inner.offset(count)).clone() },
+            1 | 2 | 4 | 8 => unsafe { ptr.offset(count).read_volatile() },
+            _ => unsafe { (*ptr.offset(count)).clone() },
         })
     }
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
             return None;
         }
         // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
         // on T guarantees that any byte pattern is valid for T.
         Some(
-            unsafe { core::slice::from_raw_parts(self.inner, len) }
+            unsafe { core::slice::from_raw_parts(ptr, len) }
                 .to_vec()
                 .into_boxed_slice(),
         )
     }
 
     fn as_usize(&self) -> usize {
-        self.inner.expose_provenance()
+        self.inner
     }
     fn from_usize(addr: usize) -> Self {
         Self {
-            inner: core::ptr::with_exposed_provenance(addr),
+            inner: addr,
+            _phantom_ptr: core::marker::PhantomData,
         }
     }
 }
@@ -161,20 +184,41 @@ impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
 /// A trivial [`RawMutPointer`] that is literally just `*mut T`.
 ///
 /// Useful for purely-userland contexts.
-#[repr(C)]
-#[derive(Clone)]
-pub struct TransparentMutPtr<T> {
-    pub inner: *mut T,
+// NOTE: We explicitly write the `T: Sized` bound to explicitly document that
+// these need to be "thin" pointers, and that "fat" pointers (i.e., pointers to
+// DSTs) are unsupported.
+#[derive(FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct TransparentMutPtr<T: Sized> {
+    /// An exposed-provenance address of the pointer. See [`Self::as_ptr`] for
+    /// more details.
+    inner: usize,
+    _phantom_ptr: core::marker::PhantomData<*mut T>,
 }
+
+impl<T: Clone> TransparentMutPtr<T> {
+    /// Explicitly-private function.  See
+    /// [`super::common_providers::userspace_pointers::UserConstPtr::as_ptr`]
+    /// for more details.
+    fn as_ptr(&self) -> *mut T {
+        core::ptr::with_exposed_provenance_mut(self.inner)
+    }
+}
+impl<T> Clone for TransparentMutPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for TransparentMutPtr<T> {}
 impl<T: Clone> core::fmt::Debug for TransparentMutPtr<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("MutPtr").field(&self.inner).finish()
     }
 }
-impl<T: Clone> Copy for TransparentMutPtr<T> {}
 impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentMutPtr<T> {
     fn read_at_offset(self, count: isize) -> Option<T> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
             return None;
         }
         // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
@@ -184,41 +228,44 @@ impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentMutPtr<T> {
             // Try to ensure a single access for primitive types. The use of
             // volatile here is dubious--this should really use inline asm or
             // perhaps atomic loads.
-            1 | 2 | 4 | 8 => unsafe { self.inner.offset(count).read_volatile() },
-            _ => unsafe { (*self.inner.offset(count)).clone() },
+            1 | 2 | 4 | 8 => unsafe { ptr.offset(count).read_volatile() },
+            _ => unsafe { (*ptr.offset(count)).clone() },
         })
     }
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
             return None;
         }
         // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
         // on T guarantees that any byte pattern is valid for T.
         Some(
-            unsafe { core::slice::from_raw_parts(self.inner, len) }
+            unsafe { core::slice::from_raw_parts(ptr, len) }
                 .to_vec()
                 .into_boxed_slice(),
         )
     }
 
     fn as_usize(&self) -> usize {
-        self.inner.expose_provenance()
+        self.inner
     }
     fn from_usize(addr: usize) -> Self {
         Self {
-            inner: core::ptr::with_exposed_provenance_mut(addr),
+            inner: addr,
+            _phantom_ptr: core::marker::PhantomData,
         }
     }
 }
 impl<T: Clone + FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T> {
     fn write_at_offset(self, count: isize, value: T) -> Option<()> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
             return None;
         }
         // SAFETY: We checked the pointer is non-null and aligned. The IntoBytes bound
         // on T guarantees that T can be safely written as bytes.
         unsafe {
-            *self.inner.offset(count) = value;
+            *ptr.offset(count) = value;
         }
         Some(())
     }
@@ -227,7 +274,8 @@ impl<T: Clone + FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T>
         range: impl core::ops::RangeBounds<isize>,
         f: impl FnOnce(&mut [T]) -> R,
     ) -> Option<R> {
-        if self.inner.is_null() || !self.inner.is_aligned() {
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
             return None;
         }
         let start = match range.start_bound() {
@@ -248,7 +296,7 @@ impl<T: Clone + FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T>
             return None;
         };
         let _ = start.checked_mul(size_of::<T>().try_into().ok()?)?;
-        let data = unsafe { self.inner.offset(start) };
+        let data = unsafe { ptr.offset(start) };
         let _ = isize::try_from(len.checked_mul(size_of::<T>())?).ok()?;
         let slice = unsafe { core::slice::from_raw_parts_mut(data, len) };
         Some(f(slice))

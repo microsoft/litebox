@@ -384,8 +384,7 @@ pub trait RawPointerProvider {
 /// A read-only raw pointer, morally equivalent to `*const T`.
 ///
 /// See [`RawPointerProvider`] for details.
-pub trait RawConstPointer<T>: Copy + core::fmt::Debug
-// + FromBytes + IntoBytes
+pub trait RawConstPointer<T>: Copy + core::fmt::Debug + FromBytes + IntoBytes
 where
     T: Clone + FromBytes,
 {
