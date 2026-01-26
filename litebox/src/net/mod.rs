@@ -474,8 +474,48 @@ where
         self.attempt_to_close_queued();
         self.remove_dead_sockets();
         self.close_pending_sockets();
-        self.interface
-            .poll(self.now(), &mut self.device, &mut self.socket_set)
+        // Process ingress.
+        let mut res = smoltcp::iface::PollResult::None;
+        let timestamp = self.now();
+        let mut n = 1000;
+        while n > 0 {
+            match self.interface.poll_ingress_single(
+                timestamp,
+                &mut self.device,
+                &mut self.socket_set,
+            ) {
+                smoltcp::iface::PollIngressSingleResult::None => {
+                    break;
+                }
+                smoltcp::iface::PollIngressSingleResult::PacketProcessed => {}
+                smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                    res = smoltcp::iface::PollResult::SocketStateChanged;
+                }
+            }
+            n -= 1;
+
+            if n % 100 == 0 {
+                // Drain buffers periodically to avoid excessive latency
+                self.drain_all_socket_channel_buffers();
+            }
+        }
+        if n == 0 {
+            // We processed the maximum number of packets; there may be more pending
+            res = smoltcp::iface::PollResult::SocketStateChanged;
+        }
+
+        // Process egress.
+        match self
+            .interface
+            .poll_egress(timestamp, &mut self.device, &mut self.socket_set)
+        {
+            smoltcp::iface::PollResult::SocketStateChanged => {
+                res = smoltcp::iface::PollResult::SocketStateChanged;
+            }
+            smoltcp::iface::PollResult::None => {}
+        }
+
+        res
     }
 
     /// (Internal-only API) Perform the queued interactions.
