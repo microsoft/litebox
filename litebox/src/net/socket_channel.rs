@@ -414,6 +414,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Called by the network worker when data arrives from smoltcp.
     /// Returns the number of bytes actually pushed (may be less than `data.len()`
     /// if the buffer is full).
+    #[allow(dead_code)]
     pub(super) fn push_rx_data(&self, data: &[u8]) -> usize {
         let mut rx_prod = self.inner.rx_prod.lock();
         let n = rx_prod.push_slice(data);
@@ -426,10 +427,59 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         n
     }
 
+    /// Push received data from the network into the RX buffer using zero-copy access.
+    ///
+    /// The closure receives mutable slices directly into the ring buffer.
+    /// Returns the total number of bytes written.
+    ///
+    /// The closure should return how many bytes it wrote to each slice.
+    pub(super) fn push_rx_data_with<F>(&self, mut f: F) -> usize
+    where
+        F: FnMut(&mut [u8]) -> usize,
+    {
+        let mut rx_prod = self.inner.rx_prod.lock();
+        let (first, second) = (*rx_prod).vacant_slices_mut();
+
+        // SAFETY: We're treating MaybeUninit<u8> slices as &mut [u8].
+        // This is safe because:
+        // 1. u8 has no drop implementation or invalid bit patterns
+        // 2. The closure will write to these bytes before we advance the write index
+        // 3. We only advance by the number of bytes actually written
+        let first: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(first.as_mut_ptr().cast::<u8>(), first.len())
+        };
+        let second: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(second.as_mut_ptr().cast::<u8>(), second.len())
+        };
+
+        let mut total = 0;
+
+        // Fill first slice
+        if !first.is_empty() {
+            let written = f(first);
+            total += written;
+        }
+
+        // Fill second slice if we have filled all of the first
+        if total == first.len() && !second.is_empty() {
+            let written = f(second);
+            total += written;
+        }
+
+        if total > 0 {
+            unsafe { (*rx_prod).advance_write_index(total) };
+            self.inner.rx_available.fetch_add(total, Ordering::Release);
+            self.inner.pollee.notify_observers(Events::IN);
+        }
+
+        total
+    }
+
     /// Pop data from the TX buffer to send over the network.
     ///
     /// Called by the network worker when smoltcp is ready to send.
     /// Returns the number of bytes popped into `buf`.
+    #[cfg(test)]
     pub(super) fn pop_tx_data(&self, buf: &mut [u8]) -> usize {
         let mut tx_cons = self.inner.tx_cons.lock();
         let n = tx_cons.pop_slice(buf);
@@ -440,6 +490,43 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         }
 
         n
+    }
+
+    /// Pop data from the TX buffer using zero-copy access.
+    ///
+    /// The closure receives slices of data directly from the ring buffer.
+    /// Returns the total number of bytes consumed.
+    ///
+    /// The closure should return how many bytes it consumed from each slice.
+    /// This allows partial consumption (e.g., if smoltcp's send buffer is full).
+    pub(super) fn pop_tx_data_with<F>(&self, mut f: F) -> usize
+    where
+        F: FnMut(&[u8]) -> usize,
+    {
+        let tx_cons = self.inner.tx_cons.lock();
+        let (first, second) = tx_cons.as_slices();
+
+        let mut total = 0;
+
+        // Process first slice
+        if !first.is_empty() {
+            let consumed = f(first);
+            total += consumed;
+        }
+
+        // Process second slice if we have consumed all of the first
+        if total == first.len() && !second.is_empty() {
+            let consumed = f(second);
+            total += consumed;
+        }
+
+        if total > 0 {
+            unsafe { tx_cons.advance_read_index(total) };
+            self.inner.tx_available.fetch_add(total, Ordering::Release);
+            self.inner.pollee.notify_observers(Events::OUT);
+        }
+
+        total
     }
 
     /// Check if the socket has data available for reading.
@@ -467,6 +554,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Get the available space in the RX buffer.
     ///
     /// This indicates how many bytes can be pushed before the buffer is full.
+    #[cfg(test)]
     pub(super) fn rx_space(&self) -> usize {
         let rx_prod = self.inner.rx_prod.lock();
         rx_prod.vacant_len()

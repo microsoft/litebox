@@ -601,33 +601,22 @@ where
         match (socket_handle.protocol(), proxy) {
             (Protocol::Tcp, NetworkProxy::Stream(proxy)) => {
                 let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
-                let mut buf = [0u8; 4096];
 
-                // Drain TX buffer: pop from channel, push to smoltcp
-                let send_capacity = tcp_socket.send_capacity();
+                // Drain TX buffer: from ring buffer directly to smoltcp
                 while tcp_socket.can_send() {
-                    let to_send = 4096.min(send_capacity - tcp_socket.send_queue());
-                    let n = proxy.pop_tx_data(&mut buf[..to_send]);
-                    if n == 0 {
+                    let sent = proxy
+                        .pop_tx_data_with(|data| tcp_socket.send_slice(data).unwrap_or_default());
+                    if sent == 0 {
                         break;
-                    }
-                    match tcp_socket.send_slice(&buf[..n]) {
-                        Ok(sent) => {
-                            assert_eq!(sent, n, "we already checked send vacancy {to_send}");
-                        }
-                        Err(_) => break,
                     }
                 }
 
-                // Drain RX buffer: pop from smoltcp, push to channel
+                // Drain RX buffer: from smoltcp directly to ring buffer
                 while tcp_socket.can_recv() {
-                    let rx_space = proxy.rx_space();
-                    match tcp_socket.recv_slice(&mut buf[..4096.min(rx_space)]) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let pushed = proxy.push_rx_data(&buf[..n]);
-                            assert_eq!(pushed, n, "we already checked rx_space {rx_space}");
-                        }
+                    let received = proxy
+                        .push_rx_data_with(|buf| tcp_socket.recv_slice(buf).unwrap_or_default());
+                    if received == 0 {
+                        break;
                     }
                 }
 
