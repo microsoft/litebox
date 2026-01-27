@@ -48,7 +48,7 @@ pub(crate) struct ThreadState {
     /// terminating or calling execve(2), another thread that is waiting on that futex is notified that the former owner
     /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
     /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
-    robust_list: Cell<Option<ConstPtr<litebox_common_linux::RobustListHead<Platform>>>>,
+    robust_list: Cell<Option<ConstPtr<litebox_common_linux::RobustListHead>>>,
 }
 
 // TODO: remove once we figure out how to handle Send/Sync for raw pointers.
@@ -453,33 +453,25 @@ fn handle_futex_death(
 }
 
 fn fetch_robust_entry(
-    head: crate::ConstPtr<litebox_common_linux::RobustList<litebox_platform_multiplex::Platform>>,
-) -> (
-    crate::ConstPtr<litebox_common_linux::RobustList<litebox_platform_multiplex::Platform>>,
-    bool,
-) {
+    head: crate::ConstPtr<litebox_common_linux::RobustList>,
+) -> (crate::ConstPtr<litebox_common_linux::RobustList>, bool) {
     let next = head.as_usize();
     (crate::ConstPtr::from_usize(next & !1), next & 1 != 0)
 }
 
 fn wake_robust_list(
-    head: crate::ConstPtr<
-        litebox_common_linux::RobustListHead<litebox_platform_multiplex::Platform>,
-    >,
+    head: crate::ConstPtr<litebox_common_linux::RobustListHead>,
 ) -> Result<(), Errno> {
     let mut limit = ROBUST_LIST_LIMIT;
     let head_ptr = head.as_usize();
     let head = unsafe { head.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
-    let (mut entry, mut pi) = fetch_robust_entry(head.list.next);
-    let (pending, ppi) = fetch_robust_entry(head.list_op_pending);
+    let (mut entry, mut pi) = fetch_robust_entry(crate::ConstPtr::from_usize(head.list.next));
+    let (pending, ppi) = fetch_robust_entry(crate::ConstPtr::from_usize(head.list_op_pending));
     let futex_offset = head.futex_offset;
-    let entry_head = head_ptr
-        + offset_of!(
-            litebox_common_linux::RobustListHead<litebox_platform_multiplex::Platform>,
-            list
-        );
+    let entry_head = head_ptr + offset_of!(litebox_common_linux::RobustListHead, list);
     while entry.as_usize() != entry_head && limit > 0 {
-        let nxt = unsafe { entry.read_at_offset(0) }.map(|e| fetch_robust_entry(e.next));
+        let nxt = unsafe { entry.read_at_offset(0) }
+            .map(|e| fetch_robust_entry(crate::ConstPtr::from_usize(e.next)));
         if entry.as_usize() != pending.as_usize() {
             handle_futex_death(
                 crate::ConstPtr::from_usize(entry.as_usize() + futex_offset),

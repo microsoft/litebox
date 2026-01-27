@@ -1302,22 +1302,43 @@ impl RlimitResource {
     pub const RLIM_NLIMITS: usize = RlimitResource::RTTIME as usize + 1;
 }
 
+// FUTURE: The rust compiler is currently confused (in the shim, where a pointer
+// to this is taken) by the overly recursive nature of the trait bounds if we
+// actually set the types up for this the way they are in the comments, rather
+// than the `usize`s (Note: the separate issue of `Unaligned` when using that
+// variant is fixed simply by using `zerocopy::Usize`, and is not the issue
+// being referred to here).  Using the RobustList based types here causes a
+// E0275 (see `rustc --explain E0275`) on `Sized` and `FromBytes`. There is some
+// belief that minor restructuring should allow rustc to properly discover that
+// all the requirements are satisfied, but currently, that is considered beyond
+// the scope of the changes in the PR that introduced the
+// `FromBytes`/`IntoBytes` implementation here.
+/// XXX: The types in this struct might be changed to stronger types in the
+/// future.
 #[repr(C)]
-#[derive(FromBytes, IntoBytes)]
-pub struct RobustList<Platform: litebox::platform::RawPointerProvider> {
-    pub next: Platform::RawConstPointer<RobustList<Platform>>,
+#[derive(Clone, FromBytes, IntoBytes)]
+pub struct RobustList {
+    pub next: usize, // Platform::RawConstPointer<RobustList<Platform>>,
 }
 
-impl<Platform: litebox::platform::RawPointerProvider> Clone for RobustList<Platform> {
-    fn clone(&self) -> Self {
-        Self { next: self.next }
-    }
-}
-
 #[repr(C)]
-pub struct RobustListHead<Platform: litebox::platform::RawPointerProvider> {
+#[derive(Clone, FromBytes, IntoBytes)]
+// FUTURE: The rust compiler is currently confused (in the shim, where a pointer
+// to this is taken) by the overly recursive nature of the trait bounds if we
+// actually set the types up for this the way they are in the comments, rather
+// than the `usize`s (Note: the separate issue of `Unaligned` when using that
+// variant is fixed simply by using `zerocopy::Usize`, and is not the issue
+// being referred to here).  Using the RobustList based types here causes a
+// E0275 (see `rustc --explain E0275`) on `Sized` and `FromBytes`. There is some
+// belief that minor restructuring should allow rustc to properly discover that
+// all the requirements are satisfied, but currently, that is considered beyond
+// the scope of the changes in the PR that introduced the
+// `FromBytes`/`IntoBytes` implementation here.
+/// XXX: The types in this struct might be changed to stronger types in the
+/// future.
+pub struct RobustListHead {
     /// The head of the list. Points back to itself if empty.
-    pub list: RobustList<Platform>,
+    pub list: RobustList, // RobustList<Platform>,
     /// This relative offset is set by user-space, it gives the kernel
     /// the relative position of the futex field to examine. This way
     /// we keep userspace flexible, to freely shape its data-structure,
@@ -1331,17 +1352,7 @@ pub struct RobustListHead<Platform: litebox::platform::RawPointerProvider> {
     /// always have full knowledge of all locks that the thread
     /// _might_ have taken. We check the owner TID in any case,
     /// so only truly owned locks will be handled.
-    pub list_op_pending: Platform::RawConstPointer<RobustList<Platform>>,
-}
-
-impl<Platform: litebox::platform::RawPointerProvider> Clone for RobustListHead<Platform> {
-    fn clone(&self) -> Self {
-        Self {
-            list: self.list.clone(),
-            futex_offset: self.futex_offset,
-            list_op_pending: self.list_op_pending,
-        }
-    }
+    pub list_op_pending: usize, // Platform::RawConstPointer<RobustList<Platform>>,
 }
 
 bitflags::bitflags! {
@@ -2753,7 +2764,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::set_robust_list => {
-                if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead<Platform>>() {
+                if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead>() {
                     sys_req!(SetRobustList { head })
                 } else {
                     return Err(errno::Errno::EINVAL);
