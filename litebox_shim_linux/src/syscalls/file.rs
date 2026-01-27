@@ -1688,21 +1688,21 @@ impl Task {
 
         if let Some(fds) = kreadfds {
             readfds
-                    .unwrap()
-                    .write_slice_at_offset(0, fds.as_raw_slice())
-            .ok_or(Errno::EFAULT)?;
+                .unwrap()
+                .write_slice_at_offset(0, fds.as_raw_slice())
+                .ok_or(Errno::EFAULT)?;
         }
         if let Some(fds) = kwritefds {
             writefds
-                    .unwrap()
-                    .write_slice_at_offset(0, fds.as_raw_slice())
-            .ok_or(Errno::EFAULT)?;
+                .unwrap()
+                .write_slice_at_offset(0, fds.as_raw_slice())
+                .ok_or(Errno::EFAULT)?;
         }
         if let Some(fds) = kexceptfds {
             exceptfds
-                    .unwrap()
-                    .write_slice_at_offset(0, fds.as_raw_slice())
-            .ok_or(Errno::EFAULT)?;
+                .unwrap()
+                .write_slice_at_offset(0, fds.as_raw_slice())
+                .ok_or(Errno::EFAULT)?;
         }
 
         Ok(count)
@@ -1875,14 +1875,17 @@ impl Task {
                     let name_ptr = crate::MutPtr::from_usize(
                         hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME,
                     );
-                    name_ptr.write_slice_at_offset(0, entry.name.as_bytes())
+                    name_ptr
+                        .write_slice_at_offset(0, entry.name.as_bytes())
                         .ok_or(Errno::EFAULT)?;
                     // set the null terminator and padding
                     let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
-                    name_ptr.write_slice_at_offset(
-                            isize::try_from(entry.name.len()).unwrap(), &vec![0; zeros_len],
+                    name_ptr
+                        .write_slice_at_offset(
+                            isize::try_from(entry.name.len()).unwrap(),
+                            &vec![0; zeros_len],
                         )
-                    .ok_or(Errno::EFAULT)?;
+                        .ok_or(Errno::EFAULT)?;
                     nbytes += len;
                     dir_off += 1;
                 }

@@ -263,9 +263,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            addr.to_owned_slice(content.len())
-                .unwrap()
-                .as_ref(),
+            addr.to_owned_slice(content.len()).unwrap().as_ref(),
             content.as_slice(),
         );
         task.sys_munmap(addr, 0x1000).unwrap();
@@ -438,12 +436,9 @@ mod tests {
             .is_ok()
         );
 
-        addr.to_owned_slice(0x10)
-            .unwrap()
-            .iter()
-            .for_each(|&x| {
-                assert_eq!(x, 0); // Should be zeroed after MADV_DONTNEED
-            });
+        addr.to_owned_slice(0x10).unwrap().iter().for_each(|&x| {
+            assert_eq!(x, 0); // Should be zeroed after MADV_DONTNEED
+        });
 
         task.sys_munmap(addr, 0x2000).unwrap();
     }

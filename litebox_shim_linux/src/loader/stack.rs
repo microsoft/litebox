@@ -168,7 +168,7 @@ impl UserStack {
         // end markers
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
         self.stack_top
-                .write_at_offset(isize::try_from(self.pos).ok()?, 0)?;
+            .write_at_offset(isize::try_from(self.pos).ok()?, 0)?;
 
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;

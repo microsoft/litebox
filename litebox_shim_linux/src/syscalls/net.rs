@@ -332,9 +332,9 @@ impl GlobalState {
             SocketOptionName::TCP(to) => match to {
                 TcpOption::CONGESTION => {
                     const TCP_CONGESTION_NAME_MAX: usize = 16;
-                    let data =
-                        optval.to_owned_slice(TCP_CONGESTION_NAME_MAX.min(optlen))
-                            .ok_or(Errno::EFAULT)?;
+                    let data = optval
+                        .to_owned_slice(TCP_CONGESTION_NAME_MAX.min(optlen))
+                        .ok_or(Errno::EFAULT)?;
                     let name = core::str::from_utf8(&data).map_err(|_| Errno::EINVAL)?;
                     self.net.lock().set_tcp_option(
                         fd,
@@ -500,7 +500,8 @@ impl GlobalState {
                             _ => unimplemented!(),
                         };
                         let len = name.len().min(len as usize);
-                        optval.write_slice_at_offset(0, &name.as_bytes()[..len])
+                        optval
+                            .write_slice_at_offset(0, &name.as_bytes()[..len])
                             .ok_or(Errno::EFAULT)?;
                         return Ok(len);
                     }
@@ -1008,12 +1009,14 @@ pub(crate) fn write_sockaddr_to_user(
                     size_of::<CSockInetAddr>(),
                 )
             };
-            addr.write_slice_at_offset(0, &bytes[..addrlen_val]).ok_or(Errno::EFAULT)?;
+            addr.write_slice_at_offset(0, &bytes[..addrlen_val])
+                .ok_or(Errno::EFAULT)?;
             size_of::<CSockInetAddr>()
         }
         SocketAddress::Unix(v) => {
             let family_ptr = MutPtr::<u16>::from_usize(addr.as_usize());
-            family_ptr.write_at_offset(0, AddressFamily::UNIX as u16)
+            family_ptr
+                .write_at_offset(0, AddressFamily::UNIX as u16)
                 .ok_or(Errno::EFAULT)?;
             match v {
                 UnixSocketAddr::Unnamed => {
@@ -1027,8 +1030,9 @@ pub(crate) fn write_sockaddr_to_user(
                             .ok_or(Errno::EFAULT)?;
                         let max_len = addrlen_val as usize - offset - 1;
                         addr.write_slice_at_offset(
-                                isize::try_from(offset + 1).unwrap(), &name[..name.len().min(max_len)],
-                            )
+                            isize::try_from(offset + 1).unwrap(),
+                            &name[..name.len().min(max_len)],
+                        )
                         .ok_or(Errno::EFAULT)?;
                     }
                     offset + 1 + name.len()
@@ -1313,7 +1317,10 @@ impl Task {
         if msg.msg_iovlen == 0 || msg.msg_iovlen > 1024 {
             return Err(Errno::EINVAL);
         }
-        let iovs = msg.msg_iov.to_owned_slice(msg.msg_iovlen).ok_or(Errno::EFAULT)?;
+        let iovs = msg
+            .msg_iov
+            .to_owned_slice(msg.msg_iovlen)
+            .ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
@@ -1329,8 +1336,10 @@ impl Task {
                     if iov.iov_len == 0 {
                         continue;
                     }
-                    let buf =
-                        iov.iov_base.to_owned_slice(iov.iov_len).ok_or(Errno::EFAULT)?;
+                    let buf = iov
+                        .iov_base
+                        .to_owned_slice(iov.iov_len)
+                        .ok_or(Errno::EFAULT)?;
                     total_sent +=
                         self.global
                             .sendto(&self.wait_cx(), socket, &buf, flags, sock_addr)?;
@@ -1502,7 +1511,9 @@ impl Task {
             return Err(Errno::EINVAL);
         }
         let new_len = self.do_getsockopt(sockfd, optname, optval, len)?;
-        optlen.write_at_offset(0, new_len.truncate()).ok_or(Errno::EFAULT)?;
+        optlen
+            .write_at_offset(0, new_len.truncate())
+            .ok_or(Errno::EFAULT)?;
         Ok(())
     }
     /// Actual implementation of `getsockopt`

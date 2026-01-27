@@ -137,19 +137,23 @@ impl Task {
                         permitted: 0,
                         inheritable: 0,
                     };
-                    data_ptr.write_at_offset(0, cap.clone()).ok_or(Errno::EFAULT)?;
+                    data_ptr
+                        .write_at_offset(0, cap.clone())
+                        .ok_or(Errno::EFAULT)?;
                     data_ptr.write_at_offset(1, cap).ok_or(Errno::EFAULT)?;
                 }
                 Ok(())
             }
             _ => {
-                header.write_at_offset(
-                        0, litebox_common_linux::CapHeader {
+                header
+                    .write_at_offset(
+                        0,
+                        litebox_common_linux::CapHeader {
                             version: _LINUX_CAPABILITY_VERSION_3,
                             pid: hdr.pid,
                         },
                     )
-                .ok_or(Errno::EFAULT)?;
+                    .ok_or(Errno::EFAULT)?;
                 if data.is_none() {
                     Ok(())
                 } else {

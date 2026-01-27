@@ -690,12 +690,10 @@ impl Task {
                     })
                 }
             }
-            SyscallRequest::Write { fd, buf, count } => {
-                match buf.to_owned_slice(count) {
-                    Some(buf) => self.sys_write(fd, &buf, None),
-                    None => Err(Errno::EFAULT),
-                }
-            }
+            SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice(count) {
+                Some(buf) => self.sys_write(fd, &buf, None),
+                None => Err(Errno::EFAULT),
+            },
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
@@ -1042,7 +1040,8 @@ impl Task {
                 }
                 #[cfg(target_arch = "x86")]
                 {
-                    user_desc.read_at_offset(0)
+                    user_desc
+                        .read_at_offset(0)
                         .ok_or(Errno::EFAULT)
                         .and_then(|mut desc| {
                             let idx = desc.entry_number;
@@ -1051,8 +1050,7 @@ impl Task {
                                 // index -1 means the kernel should try to find and
                                 // allocate an empty descriptor.
                                 // return the allocated entry number
-                                user_desc.write_at_offset(0, desc)
-                                    .ok_or(Errno::EFAULT)?;
+                                user_desc.write_at_offset(0, desc).ok_or(Errno::EFAULT)?;
                             }
                             Ok(0)
                         })
@@ -1082,7 +1080,7 @@ impl Task {
                 .sys_get_robust_list(pid, head)
                 .and_then(|()| {
                     len.write_at_offset(0, size_of::<litebox_common_linux::RobustListHead>())
-                    .ok_or(Errno::EFAULT)
+                        .ok_or(Errno::EFAULT)
                 })
                 .map(|()| 0),
             SyscallRequest::GetRandom { buf, count, flags } => {

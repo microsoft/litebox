@@ -339,14 +339,16 @@ impl Task {
         arg: PrctlArg<litebox_platform_multiplex::Platform>,
     ) -> Result<usize, Errno> {
         match arg {
-            PrctlArg::GetName(name) => name.write_slice_at_offset(0, &self.comm.get())
+            PrctlArg::GetName(name) => name
+                .write_slice_at_offset(0, &self.comm.get())
                 .ok_or(Errno::EFAULT)
                 .map(|()| 0),
             PrctlArg::SetName(name) => {
                 let mut name_buf = [0u8; litebox_common_linux::TASK_COMM_LEN - 1];
                 // strncpy
                 for (i, byte) in name_buf.iter_mut().enumerate() {
-                    let b = name.read_at_offset(isize::try_from(i).unwrap())
+                    let b = name
+                        .read_at_offset(isize::try_from(i).unwrap())
                         .ok_or(Errno::EFAULT)?;
                     if b == 0 {
                         break;
@@ -468,7 +470,8 @@ fn wake_robust_list(
     let futex_offset = head.futex_offset;
     let entry_head = head_ptr + offset_of!(litebox_common_linux::RobustListHead, list);
     while entry.as_usize() != entry_head && limit > 0 {
-        let nxt = entry.read_at_offset(0)
+        let nxt = entry
+            .read_at_offset(0)
             .map(|e| fetch_robust_entry(crate::ConstPtr::from_usize(e.next)));
         if entry.as_usize() != pending.as_usize() {
             handle_futex_death(
@@ -666,8 +669,9 @@ impl Task {
             let desc = MutPtr::from_usize(addr);
             #[cfg(target_arch = "x86")]
             let desc = {
-                let desc = MutPtr::<litebox_common_linux::UserDesc>::from_usize(addr).read_at_offset(0)
-                .ok_or(Errno::EFAULT)?;
+                let desc = MutPtr::<litebox_common_linux::UserDesc>::from_usize(addr)
+                    .read_at_offset(0)
+                    .ok_or(Errno::EFAULT)?;
                 // Note that different from `set_thread_area` syscall that returns the allocated entry number
                 // when requested (i.e., `desc.entry_number` is -1), here we just read the descriptor to LiteBox and
                 // assume the entry number is properly set so that we don't need to write it back. This is because
@@ -911,7 +915,9 @@ impl Task {
         let old_limit =
             litebox_common_linux::rlimit_to_rlimit64(self.do_prlimit(resource, new_limit)?);
         if let Some(old_rlim) = old_rlim {
-            old_rlim.write_at_offset(0, old_limit).ok_or(Errno::EINVAL)?;
+            old_rlim
+                .write_at_offset(0, old_limit)
+                .ok_or(Errno::EINVAL)?;
         }
         Ok(())
     }
