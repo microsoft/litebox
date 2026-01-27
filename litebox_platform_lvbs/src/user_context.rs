@@ -19,7 +19,7 @@ use x86_64::{
 
 /// UserSpace management trait for creating and managing a separate address space for a user process, task, or session.
 /// Define it as a trait because it might need to work for various configurations like different page sizes.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub trait UserSpaceManagement {
     /// Create a new user address space (i.e., a new user page table) and context, and returns `userspace_id` for it.
     /// The page table also maps the kernel address space (the entire physical space for now, a portion of it in the future)
@@ -62,6 +62,7 @@ pub trait UserSpaceManagement {
 /// (pointed by `rsp`) and restored by the system call or interrupt handler.
 /// TODO: Since the user stack might have no space to store all registers, we can extend this structure in
 /// the future to store these registers.
+#[expect(dead_code)]
 pub struct UserContext {
     pub page_table: crate::mm::PageTable<PAGE_SIZE>,
     pub rip: VirtAddr,
@@ -83,6 +84,7 @@ impl UserContext {
 }
 
 /// Data structure to hold a map of user contexts indexed by their ID.
+#[expect(dead_code)]
 pub struct UserContextMap {
     inner: spin::mutex::SpinMutex<HashMap<usize, UserContext>>,
 }
