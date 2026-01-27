@@ -555,6 +555,13 @@ where
         {
             let socket_handle = &mut handle.entry;
             if socket_handle.consider_closed {
+                // check if there is pending data to be sent
+                if let Some(proxy) = &socket_handle.proxy
+                    && proxy.has_pending_tx()
+                {
+                    continue;
+                }
+
                 let closed = socket_handle.with_socket_mut(
                     &mut self.socket_set,
                     |tcp_socket| {
