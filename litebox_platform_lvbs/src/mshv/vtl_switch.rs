@@ -308,6 +308,10 @@ unsafe extern "C" fn vtl_switch_loop_body() {
     }
 }
 
+unsafe extern "C" {
+    pub fn panic_vtl_switch() -> !;
+}
+
 fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
     let func_id = VsmFunction::try_from(u32::try_from(params[0]).unwrap_or(u32::MAX))
         .unwrap_or(VsmFunction::Unknown);

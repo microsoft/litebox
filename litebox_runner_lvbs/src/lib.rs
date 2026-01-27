@@ -12,7 +12,7 @@ use litebox_platform_lvbs::{
     mshv::{
         hvcall,
         vsm_intercept::raise_vtl0_gp_fault,
-        vtl_switch::{jump_to_vtl_switch_loop_with_stack_cleanup, vtl_switch_loop_entry},
+        vtl_switch::{panic_vtl_switch, vtl_switch_loop_entry},
         vtl1_mem_layout::{
             PAGE_SIZE, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
             VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
@@ -107,5 +107,5 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("{}", info);
     let _ = raise_vtl0_gp_fault();
-    jump_to_vtl_switch_loop_with_stack_cleanup();
+    unsafe { panic_vtl_switch() }
 }
