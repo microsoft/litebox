@@ -13,6 +13,7 @@ use litebox_common_linux::signal::SignalDisposition;
 use x86 as arch;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
+use zerocopy::FromZeros;
 
 use crate::syscalls::process::ExitStatus;
 use crate::{ConstPtr, MutPtr, Task};
@@ -267,6 +268,7 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_KERNEL,
+        __pad: 0,
         data: SiginfoData::new_addr(fault_address),
     }
 }
@@ -278,7 +280,8 @@ fn siginfo_kill(signal: Signal) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_USER,
-        data: SiginfoData { pad: [0; 29] },
+        __pad: 0,
+        data: SiginfoData::new_zeroed(),
     }
 }
 
@@ -588,7 +591,8 @@ impl Task {
             signo: signal.as_i32(),
             errno: 0,
             code: SI_KERNEL,
-            data: SiginfoData { pad: [0; 29] },
+            __pad: 0,
+            data: SiginfoData::new_zeroed(),
         };
         self.force_signal_with_info(signal, force_exit, siginfo);
     }

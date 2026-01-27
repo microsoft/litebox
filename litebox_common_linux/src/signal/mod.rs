@@ -301,18 +301,20 @@ pub struct Siginfo {
     pub signo: i32,
     pub errno: i32,
     pub code: i32,
+    #[doc(hidden)]
+    pub __pad: u32,
     pub data: SiginfoData,
 }
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, FromBytes, IntoBytes)]
 pub struct SiginfoData {
-    pub pad: [u32; 29],
+    pub pad: [u32; 28],
 }
 
 impl SiginfoData {
     pub fn new_addr(addr: usize) -> Self {
-        let mut pad = [0u32; 29];
+        let mut pad = [0u32; 28];
         pad.as_mut_bytes()[..core::mem::size_of::<usize>()].copy_from_slice(&addr.to_ne_bytes());
         Self { pad }
     }
