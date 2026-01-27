@@ -3,6 +3,7 @@
 
 //! I/O Port-based serial communication
 
+use crate::mshv::ringbuffer::ringbuffer;
 use core::{arch::asm, fmt};
 use spin::{Mutex, Once};
 
@@ -152,6 +153,9 @@ impl fmt::Write for ComPort {
 pub fn print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
     let _ = com().lock().write_fmt(args);
+    if let Some(rb) = ringbuffer() {
+        let _ = rb.lock().write_fmt(args);
+    }
 }
 
 #[macro_export]
