@@ -409,24 +409,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Platform> {
-    /// Push received data from the network into the RX buffer.
-    ///
-    /// Called by the network worker when data arrives from smoltcp.
-    /// Returns the number of bytes actually pushed (may be less than `data.len()`
-    /// if the buffer is full).
-    #[allow(dead_code)]
-    pub(super) fn push_rx_data(&self, data: &[u8]) -> usize {
-        let mut rx_prod = self.inner.rx_prod.lock();
-        let n = rx_prod.push_slice(data);
-
-        if n > 0 {
-            self.inner.rx_available.fetch_add(n, Ordering::Release);
-            self.inner.pollee.notify_observers(Events::IN);
-        }
-
-        n
-    }
-
     /// Push received data from the network into the RX buffer using zero-copy access.
     ///
     /// The closure receives mutable slices directly into the ring buffer.
@@ -440,7 +422,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         let mut rx_prod = self.inner.rx_prod.lock();
         let (first, second) = (*rx_prod).vacant_slices_mut();
 
-        // SAFETY: We're treating MaybeUninit<u8> slices as &mut [u8].
+        // SAFETY: We're treating maybe_uninit<u8> slices as &mut [u8].
         // This is safe because:
         // 1. u8 has no drop implementation or invalid bit patterns
         // 2. The closure will write to these bytes before we advance the write index
@@ -805,47 +787,75 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<Platform> {
-    /// Push a received datagram into the RX queue.
+    /// Try to receive a datagram using a closure that provides the data.
     ///
-    /// Called by the network worker when a datagram arrives from smoltcp.
-    /// Returns the message back if the queue is full.
-    pub(super) fn push_datagram(&self, msg: DatagramMessage) -> Result<(), DatagramMessage> {
+    /// The closure should return `Some((data, source_addr))` if a datagram was received,
+    /// or `None` if no datagram is available. The datagram is pushed to the RX queue
+    /// only if the queue has space.
+    ///
+    /// Returns:
+    /// - `Some(len)` if a datagram was received and pushed (len is data length)
+    /// - `None` if the closure returned `None` or the queue is full
+    pub(super) fn try_recv_datagram_with<F>(&self, f: F) -> Option<usize>
+    where
+        F: FnOnce() -> Option<(alloc::vec::Vec<u8>, SocketAddr)>,
+    {
         let mut rx_prod = self.inner.rx_prod.lock();
+
+        if rx_prod.is_full() {
+            return None;
+        }
+
+        let (data, source_addr) = f()?;
+        let len = data.len();
+
+        let msg = DatagramMessage {
+            data,
+            addr: Some(source_addr),
+        };
 
         match rx_prod.try_push(msg) {
             Ok(()) => {
                 self.inner.rx_count.fetch_add(1, Ordering::Release);
                 self.inner.pollee.notify_observers(Events::IN);
-                Ok(())
+                Some(len)
             }
-            Err(msg) => Err(msg),
+            Err(_) => None,
         }
     }
 
-    /// Pop a datagram from the TX queue to send via the network.
+    /// Try to send the next datagram using a closure, consuming it only on success.
     ///
-    /// Called by the network worker when smoltcp is ready to send.
-    pub(super) fn pop_datagram(&self) -> Option<DatagramMessage> {
+    /// The closure receives the data slice and optional destination address, and should
+    /// return `true` if the send succeeded (datagram will be consumed) or `false` if
+    /// the send failed (datagram remains in queue for retry).
+    ///
+    /// Returns:
+    /// - `Some(true)` if a datagram was sent and consumed
+    /// - `Some(false)` if a datagram was peeked but send failed (still in queue)
+    /// - `None` if the queue is empty
+    pub(super) fn try_send_datagram_with<F>(&self, f: F) -> Option<bool>
+    where
+        F: FnOnce(&[u8], Option<SocketAddr>) -> bool,
+    {
         let mut tx_cons = self.inner.tx_cons.lock();
 
-        if let Some(msg) = tx_cons.try_pop() {
+        let msg = tx_cons.iter().next()?;
+        let success = f(&msg.data, msg.addr);
+
+        if success {
+            // Send succeeded, consume the datagram
+            let consumed = tx_cons.try_pop();
+            assert!(consumed.is_some());
             self.inner.tx_space.fetch_add(1, Ordering::Release);
             self.inner.pollee.notify_observers(Events::OUT);
-            Some(msg)
-        } else {
-            None
         }
-    }
 
-    /// Peek at the length of the next datagram in the TX queue without removing it.
-    ///
-    /// Returns `None` if the queue is empty.
-    pub(super) fn peek_datagram_len(&self) -> Option<usize> {
-        let tx_cons = self.inner.tx_cons.lock();
-        tx_cons.iter().next().map(|msg| msg.data.len())
+        Some(success)
     }
 
     /// Check if the RX queue is full (cannot accept more datagrams).
+    #[cfg(test)]
     pub(super) fn is_rx_full(&self) -> bool {
         let rx_prod = self.inner.rx_prod.lock();
         rx_prod.is_full()
@@ -946,7 +956,11 @@ mod tests {
 
         // Push data from "network" side
         let data = b"Hello, World!";
-        let pushed = channel.push_rx_data(data);
+        let pushed = channel.push_rx_data_with(|buf| {
+            let to_copy = core::cmp::min(buf.len(), data.len());
+            buf[..to_copy].copy_from_slice(&data[..to_copy]);
+            to_copy
+        });
         assert_eq!(pushed, data.len());
 
         // Should now be readable
@@ -1008,7 +1022,12 @@ mod tests {
         channel.set_state(SocketState::Connected);
 
         // Push some data
-        channel.push_rx_data(b"data");
+        let data = b"data";
+        channel.push_rx_data_with(|buf| {
+            let to_copy = core::cmp::min(buf.len(), data.len());
+            buf[..to_copy].copy_from_slice(&data[..to_copy]);
+            to_copy
+        });
 
         // Shutdown read side
         channel.shutdown_read();
@@ -1043,8 +1062,12 @@ mod tests {
         assert_eq!(channel.rx_space(), capacity);
 
         // Push some data
-        let data = [0u8; 100];
-        channel.push_rx_data(&data);
+        let pushed = channel.push_rx_data_with(|buf| {
+            let to_write = core::cmp::min(buf.len(), 100);
+            buf[..to_write].fill(0);
+            to_write
+        });
+        assert_eq!(pushed, 100);
 
         // Space should decrease
         assert_eq!(channel.rx_space(), capacity - 100);
@@ -1056,8 +1079,12 @@ mod tests {
         channel.set_state(SocketState::Connected);
 
         // Push 100 bytes
-        let data = [42u8; 100];
-        channel.push_rx_data(&data);
+        let pushed = channel.push_rx_data_with(|buf| {
+            let to_write = core::cmp::min(buf.len(), 100);
+            buf[..to_write].fill(42);
+            to_write
+        });
+        assert_eq!(pushed, 100);
 
         // Read only 50 bytes
         let mut buf = [0u8; 50];
@@ -1092,13 +1119,18 @@ mod tests {
         assert!(events.contains(Events::OUT)); // Can write
 
         // Push data to RX
-        channel.push_rx_data(b"data");
+        let data = b"data";
+        channel.push_rx_data_with(|buf| {
+            let to_copy = core::cmp::min(buf.len(), data.len());
+            buf[..to_copy].copy_from_slice(&data[..to_copy]);
+            to_copy
+        });
         let events = channel.check_io_events();
         assert!(events.contains(Events::IN)); // Data available
         assert!(events.contains(Events::OUT)); // Can still write
     }
 
-    // ==================== DatagramSocketChannel Tests ====================
+    // ==================== DatagramSocketChannel Tests ======================================
 
     #[test]
     fn datagram_channel_initial_state() {
@@ -1133,10 +1165,17 @@ mod tests {
         // Should have pending TX
         assert!(channel.has_pending_tx());
 
-        // Pop from network side
-        let msg = channel.pop_datagram().unwrap();
-        assert_eq!(msg.data, b"Hello, UDP!");
-        assert_eq!(msg.addr, addr);
+        // Pop from network side using try_send_datagram_with
+        let mut received_data = None;
+        let mut received_addr = None;
+        let result = channel.try_send_datagram_with(|data, dest| {
+            received_data = Some(data.to_vec());
+            received_addr = Some(dest);
+            true // consume the datagram
+        });
+        assert_eq!(result, Some(true));
+        assert_eq!(received_data.unwrap(), b"Hello, UDP!");
+        assert_eq!(received_addr.unwrap(), addr);
 
         // No more pending TX
         assert!(!channel.has_pending_tx());
@@ -1146,17 +1185,13 @@ mod tests {
     fn datagram_channel_push_and_read() {
         let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
 
-        // Push a datagram (network side)
-        let addr = Some(core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+        // Push a datagram (network side) using try_recv_datagram_with
+        let addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::new(192, 168, 1, 1),
             1234,
-        )));
-        let msg = DatagramMessage {
-            data: b"Incoming packet".to_vec(),
-            addr,
-        };
-        let result = channel.push_datagram(msg);
-        assert!(result.is_ok());
+        ));
+        let result = channel.try_recv_datagram_with(|| Some((b"Incoming packet".to_vec(), addr)));
+        assert_eq!(result, Some(15));
 
         // Should be readable
         assert!(channel.is_readable());
@@ -1173,7 +1208,7 @@ mod tests {
             .unwrap();
         assert_eq!(read, 15);
         assert_eq!(&buf[..read], b"Incoming packet");
-        assert_eq!(source, addr);
+        assert_eq!(source, Some(addr));
     }
 
     #[test]
@@ -1209,39 +1244,40 @@ mod tests {
         let channel: DatagramSocketChannel<TestPlatform> =
             new_datagram_channel_with_capacity(queue_size);
 
+        let dummy_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::LOCALHOST,
+            1234,
+        ));
+
         // Fill the RX queue
         for i in 0..queue_size {
-            let msg = DatagramMessage {
-                data: alloc::vec![0; i],
-                addr: None,
-            };
-            let result = channel.push_datagram(msg);
-            assert!(result.is_ok());
+            let data = alloc::vec![0; i];
+            let result = channel.try_recv_datagram_with(|| Some((data, dummy_addr)));
+            assert!(result.is_some());
         }
 
         // Queue should be full
         assert!(channel.is_rx_full());
 
-        // Next push should fail
-        let msg = DatagramMessage {
-            data: alloc::vec![99],
-            addr: None,
-        };
-        let result = channel.push_datagram(msg);
-        assert!(result.is_err());
+        // Next push should fail (returns None when full)
+        let result = channel.try_recv_datagram_with(|| Some((alloc::vec![99], dummy_addr)));
+        assert!(result.is_none());
     }
 
     #[test]
     fn datagram_channel_truncation() {
         let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
 
+        let dummy_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::LOCALHOST,
+            1234,
+        ));
+
         // Push a large datagram
         let data = alloc::vec![42u8; 100];
-        let msg = DatagramMessage {
-            data: data.clone(),
-            addr: None,
-        };
-        channel.push_datagram(msg).unwrap();
+        channel
+            .try_recv_datagram_with(|| Some((data.clone(), dummy_addr)))
+            .unwrap();
 
         // Read with a small buffer (no TRUNC flag)
         let mut buf = [0u8; 10];
@@ -1255,13 +1291,16 @@ mod tests {
     fn datagram_channel_trunc_flag() {
         let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
 
+        let dummy_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::LOCALHOST,
+            1234,
+        ));
+
         // Push a large datagram
         let data = alloc::vec![42u8; 100];
-        let msg = DatagramMessage {
-            data: data.clone(),
-            addr: None,
-        };
-        channel.push_datagram(msg).unwrap();
+        channel
+            .try_recv_datagram_with(|| Some((data.clone(), dummy_addr)))
+            .unwrap();
 
         // Read with TRUNC flag - should return actual packet size
         let mut buf = [0u8; 10];
@@ -1275,21 +1314,68 @@ mod tests {
     fn datagram_channel_io_events() {
         let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
 
+        let dummy_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::LOCALHOST,
+            1234,
+        ));
+
         // Initially: no IN, has OUT
         let events = channel.check_io_events();
         assert!(!events.contains(Events::IN));
         assert!(events.contains(Events::OUT));
 
-        // Push a datagram
-        let msg = DatagramMessage {
-            data: b"test".to_vec(),
-            addr: None,
-        };
-        channel.push_datagram(msg).unwrap();
+        // Push a datagram using try_recv_datagram_with
+        channel
+            .try_recv_datagram_with(|| Some((b"test".to_vec(), dummy_addr)))
+            .unwrap();
 
         // Now has IN
         let events = channel.check_io_events();
         assert!(events.contains(Events::IN));
         assert!(events.contains(Events::OUT));
+    }
+
+    #[test]
+    fn datagram_channel_try_send_failure() {
+        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+
+        // Send a datagram (user side)
+        let addr = Some(core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::new(10, 0, 0, 1),
+            8080,
+        )));
+        channel.send_to(b"Hello!".to_vec(), addr).unwrap();
+
+        // Try to send but fail (return false)
+        let result = channel.try_send_datagram_with(|_data, _dest| {
+            false // simulate send failure
+        });
+        assert_eq!(result, Some(false));
+
+        // Datagram should still be in queue
+        assert!(channel.has_pending_tx());
+
+        // Try again and succeed
+        let result = channel.try_send_datagram_with(|data, dest| {
+            assert_eq!(data, b"Hello!");
+            assert_eq!(dest, addr);
+            true
+        });
+        assert_eq!(result, Some(true));
+
+        // No more pending TX
+        assert!(!channel.has_pending_tx());
+    }
+
+    #[test]
+    fn datagram_channel_try_recv_none() {
+        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+
+        // Closure returns None - nothing should be pushed
+        let result = channel.try_recv_datagram_with(|| None);
+        assert!(result.is_none());
+
+        // Should still not be readable
+        assert!(!channel.is_readable());
     }
 }

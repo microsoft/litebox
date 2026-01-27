@@ -9,7 +9,7 @@ use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::event::Events;
-use crate::net::socket_channel::{DatagramMessage, NetworkProxy};
+use crate::net::socket_channel::NetworkProxy;
 use crate::platform::{Instant, TimeProvider};
 use crate::sync::RawSyncPrimitivesProvider;
 use crate::{LiteBox, platform, sync};
@@ -648,63 +648,44 @@ where
             }
             (Protocol::Udp, NetworkProxy::Datagram(udp_proxy)) => {
                 let udp_socket = socket_set.get_mut::<udp::Socket>(socket_handle.handle);
-                // Drain TX queue: pop datagrams from channel, send via smoltcp
-                // Only proceed if socket is bound and has capacity for the next datagram
-                let send_capacity = udp_socket.payload_send_capacity();
-                while udp_socket.is_open() && udp_socket.can_send() {
-                    // Peek at next datagram size to check if socket has enough buffer space
-                    let Some(datagram_len) = udp_proxy.peek_datagram_len() else {
-                        break; // No more datagrams to send
-                    };
-                    // Check if smoltcp has enough buffer space for this datagram
-                    let available = send_capacity - udp_socket.send_queue();
-                    if available < datagram_len {
-                        break; // Not enough space, wait for next poll cycle
-                    }
-                    // Now safe to pop - we've verified there's enough space
-                    let Some(datagram) = udp_proxy.pop_datagram() else {
-                        break; // No more datagrams to send
-                    };
-                    let DatagramMessage { data, addr } = datagram;
-                    let destination = addr
-                        .map(|s| match s {
-                            SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::from(addr),
-                            SocketAddr::V6(_) => unimplemented!(),
-                        })
-                        .or_else(|| socket_handle.udp().remote_endpoint);
-                    let Some(remote_endpoint) = destination else {
-                        continue;
-                    };
-                    match udp_socket.send_slice(&data, remote_endpoint) {
-                        Ok(()) => {}
-                        Err(udp::SendError::BufferFull) => {
-                            unreachable!("we checked payload_send_capacity before popping")
+                let remote_endpoint = socket_handle.udp().remote_endpoint;
+
+                // Drain TX queue: try to send datagrams, consume only on success
+                while udp_socket.can_send() {
+                    // Try to send - consumes datagram only if closure returns true
+                    let result = udp_proxy.try_send_datagram_with(|data, addr| {
+                        let destination = addr
+                            .map(|s| match s {
+                                SocketAddr::V4(addr) => smoltcp::wire::IpEndpoint::from(addr),
+                                SocketAddr::V6(_) => unimplemented!(),
+                            })
+                            .or(remote_endpoint);
+                        if let Some(endpoint) = destination {
+                            udp_socket.send_slice(data, endpoint).is_ok()
+                        } else {
+                            // No destination - discard
+                            true
                         }
-                        Err(udp::SendError::Unaddressable) => unreachable!(),
+                    });
+                    if result != Some(true) {
+                        // Either queue empty or send failed
+                        break;
                     }
                 }
 
                 // Drain RX: receive from smoltcp, push to channel
-                while !udp_proxy.is_rx_full() {
-                    match udp_socket.recv() {
-                        Ok((data, meta)) => {
-                            let source_addr = match meta.endpoint.addr {
-                                smoltcp::wire::IpAddress::Ipv4(ipv4) => SocketAddr::V4(
-                                    core::net::SocketAddrV4::new(ipv4, meta.endpoint.port),
-                                ),
-                            };
-                            if udp_proxy
-                                .push_datagram(DatagramMessage {
-                                    data: data.to_vec(),
-                                    addr: Some(source_addr),
-                                })
-                                .is_err()
-                            {
-                                // Channel buffer full
-                                unreachable!("we already checked is_rx_full");
-                            }
-                        }
-                        Err(_) => break,
+                while udp_socket.can_recv() {
+                    let received = udp_proxy.try_recv_datagram_with(|| {
+                        let (data, meta) = udp_socket.recv().ok()?;
+                        let source_addr = match meta.endpoint.addr {
+                            smoltcp::wire::IpAddress::Ipv4(ipv4) => SocketAddr::V4(
+                                core::net::SocketAddrV4::new(ipv4, meta.endpoint.port),
+                            ),
+                        };
+                        Some((data.to_vec(), source_addr))
+                    });
+                    if received.is_none() {
+                        break;
                     }
                 }
             }
