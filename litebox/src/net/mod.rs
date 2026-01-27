@@ -440,7 +440,6 @@ where
             matches!(self.platform_interaction, PlatformInteraction::Manual),
             "Requires manual-mode interactions"
         );
-        self.drain_all_socket_channel_buffers();
         match self.internal_perform_platform_interaction() {
             smoltcp::iface::PollResult::SocketStateChanged => {
                 PlatformInteractionReinvocationAdvice::CallAgainImmediately
@@ -474,6 +473,8 @@ where
         self.attempt_to_close_queued();
         self.remove_dead_sockets();
         self.close_pending_sockets();
+
+        self.drain_all_socket_channel_buffers();
         // Process ingress.
         let mut res = smoltcp::iface::PollResult::None;
         let timestamp = self.now();
