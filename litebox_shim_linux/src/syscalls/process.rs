@@ -339,14 +339,14 @@ impl Task {
         arg: PrctlArg<litebox_platform_multiplex::Platform>,
     ) -> Result<usize, Errno> {
         match arg {
-            PrctlArg::GetName(name) => unsafe { name.write_slice_at_offset(0, &self.comm.get()) }
+            PrctlArg::GetName(name) => name.write_slice_at_offset(0, &self.comm.get())
                 .ok_or(Errno::EFAULT)
                 .map(|()| 0),
             PrctlArg::SetName(name) => {
                 let mut name_buf = [0u8; litebox_common_linux::TASK_COMM_LEN - 1];
                 // strncpy
                 for (i, byte) in name_buf.iter_mut().enumerate() {
-                    let b = unsafe { name.read_at_offset(isize::try_from(i).unwrap()) }
+                    let b = name.read_at_offset(isize::try_from(i).unwrap())
                         .ok_or(Errno::EFAULT)?;
                     if b == 0 {
                         break;
@@ -404,9 +404,7 @@ impl Task {
                     litebox::platform::PunchthroughError::Failure(errno) => errno,
                     _ => unimplemented!("Unsupported punchthrough error {:?}", e),
                 })?;
-                unsafe {
-                    addr.write_at_offset(0, fsbase).ok_or(Errno::EFAULT)?;
-                }
+                addr.write_at_offset(0, fsbase).ok_or(Errno::EFAULT)?;
                 Ok(())
             }
             ArchPrctlArg::CETStatus | ArchPrctlArg::CETDisable | ArchPrctlArg::CETLock => {
@@ -464,13 +462,13 @@ fn wake_robust_list(
 ) -> Result<(), Errno> {
     let mut limit = ROBUST_LIST_LIMIT;
     let head_ptr = head.as_usize();
-    let head = unsafe { head.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+    let head = head.read_at_offset(0).ok_or(Errno::EFAULT)?;
     let (mut entry, mut pi) = fetch_robust_entry(crate::ConstPtr::from_usize(head.list.next));
     let (pending, ppi) = fetch_robust_entry(crate::ConstPtr::from_usize(head.list_op_pending));
     let futex_offset = head.futex_offset;
     let entry_head = head_ptr + offset_of!(litebox_common_linux::RobustListHead, list);
     while entry.as_usize() != entry_head && limit > 0 {
-        let nxt = unsafe { entry.read_at_offset(0) }
+        let nxt = entry.read_at_offset(0)
             .map(|e| fetch_robust_entry(crate::ConstPtr::from_usize(e.next)));
         if entry.as_usize() != pending.as_usize() {
             handle_futex_death(
@@ -506,7 +504,7 @@ impl Task {
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
-            let _ = unsafe { clear_child_tid.write_at_offset(0, 0) };
+            let _ = clear_child_tid.write_at_offset(0, 0);
             // Cast from *i32 to *u32
             let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
             let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
@@ -581,7 +579,7 @@ impl Task {
         ctx: &litebox_common_linux::PtRegs,
         args: ConstPtr<litebox_common_linux::CloneArgs>,
     ) -> Result<usize, Errno> {
-        let args = unsafe { args.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+        let args = args.read_at_offset(0).ok_or(Errno::EFAULT)?;
         self.do_clone(ctx, &args, true)
     }
 
@@ -668,9 +666,7 @@ impl Task {
             let desc = MutPtr::from_usize(addr);
             #[cfg(target_arch = "x86")]
             let desc = {
-                let desc = unsafe {
-                    MutPtr::<litebox_common_linux::UserDesc>::from_usize(addr).read_at_offset(0)
-                }
+                let desc = MutPtr::<litebox_common_linux::UserDesc>::from_usize(addr).read_at_offset(0)
                 .ok_or(Errno::EFAULT)?;
                 // Note that different from `set_thread_area` syscall that returns the allocated entry number
                 // when requested (i.e., `desc.entry_number` is -1), here we just read the descriptor to LiteBox and
@@ -720,7 +716,7 @@ impl Task {
 
         let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         if let Some(parent_tid_ptr) = set_parent_tid {
-            let _ = unsafe { parent_tid_ptr.write_at_offset(0, child_tid) };
+            let _ = parent_tid_ptr.write_at_offset(0, child_tid);
         }
 
         if (stack == 0 && stack_size != 0) || (stack != 0 && clone3 && stack_size == 0) {
@@ -907,7 +903,7 @@ impl Task {
         }
         let new_limit = match new_rlim {
             Some(rlim) => {
-                let rlim = unsafe { rlim.read_at_offset(0) }.ok_or(Errno::EINVAL)?;
+                let rlim = rlim.read_at_offset(0).ok_or(Errno::EINVAL)?;
                 Some(litebox_common_linux::rlimit64_to_rlimit(rlim))
             }
             None => None,
@@ -915,7 +911,7 @@ impl Task {
         let old_limit =
             litebox_common_linux::rlimit_to_rlimit64(self.do_prlimit(resource, new_limit)?);
         if let Some(old_rlim) = old_rlim {
-            unsafe { old_rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)?;
+            old_rlim.write_at_offset(0, old_limit).ok_or(Errno::EINVAL)?;
         }
         Ok(())
     }
@@ -927,7 +923,7 @@ impl Task {
         rlim: crate::MutPtr<litebox_common_linux::Rlimit>,
     ) -> Result<(), Errno> {
         let old_limit = self.do_prlimit(resource, None)?;
-        unsafe { rlim.write_at_offset(0, old_limit) }.ok_or(Errno::EINVAL)
+        rlim.write_at_offset(0, old_limit).ok_or(Errno::EINVAL)
     }
 
     /// Handle syscall `setrlimit`.
@@ -936,7 +932,7 @@ impl Task {
         resource: litebox_common_linux::RlimitResource,
         rlim: crate::ConstPtr<litebox_common_linux::Rlimit>,
     ) -> Result<(), Errno> {
-        let new_limit = unsafe { rlim.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+        let new_limit = rlim.read_at_offset(0).ok_or(Errno::EFAULT)?;
         let _ = self.do_prlimit(resource, Some(new_limit))?;
         Ok(())
     }
@@ -961,7 +957,7 @@ impl Task {
             .robust_list
             .get()
             .map_or(0, |ptr| ptr.as_usize());
-        unsafe { head_ptr.write_at_offset(0, head) }.ok_or(Errno::EFAULT)
+        head_ptr.write_at_offset(0, head).ok_or(Errno::EFAULT)
     }
 
     fn real_time_as_duration_since_epoch(&self) -> core::time::Duration {
@@ -1121,7 +1117,7 @@ impl Task {
             unimplemented!()
         }
         if let Some(tv) = tv {
-            unsafe { tv.write_at_offset(0, self.real_time_as_duration_since_epoch().into()) }
+            tv.write_at_offset(0, self.real_time_as_duration_since_epoch().into())
                 .ok_or(Errno::EFAULT)?;
         }
         Ok(())
@@ -1136,7 +1132,7 @@ impl Task {
         let seconds: u64 = time.as_secs();
         let seconds: litebox_common_linux::time_t = seconds.try_into().or(Err(Errno::EOVERFLOW))?;
         if let Some(tloc) = tloc {
-            unsafe { tloc.write_at_offset(0, seconds) }.ok_or(Errno::EFAULT)?;
+            tloc.write_at_offset(0, seconds).ok_or(Errno::EFAULT)?;
         }
         Ok(seconds)
     }
@@ -1290,7 +1286,7 @@ impl Task {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
             for _ in 0..MAX_VEC {
-                let p: crate::ConstPtr<i8> = unsafe {
+                let p: crate::ConstPtr<i8> = {
                     // read pointer-sized entries
                     match base.read_at_offset(0) {
                         Some(ptr) => ptr,
@@ -1497,7 +1493,7 @@ impl Task {
 
                 if let Some(child_tid_ptr) = set_child_tid {
                     // Set the child TID if requested.
-                    let _ = unsafe { child_tid_ptr.write_at_offset(0, self.tid) };
+                    let _ = child_tid_ptr.write_at_offset(0, self.tid);
                 }
             }
         }

@@ -99,9 +99,7 @@ impl SignalState {
         };
 
         let frame_ptr = MutPtr::from_usize(frame_addr);
-        unsafe {
-            frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)?;
-        }
+        frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)?;
 
         ctx.rsp = frame_addr;
         ctx.rip = action.sigaction;

@@ -51,7 +51,7 @@ fn write_to_user<T: FromBytes + IntoBytes>(
     use litebox::platform::RawMutPointer as _;
     let length = core::mem::size_of::<T>().min(len as usize);
     let data = unsafe { core::slice::from_raw_parts((&raw const val).cast::<u8>(), length) };
-    unsafe { optval.write_slice_at_offset(0, data) }
+    optval.write_slice_at_offset(0, data)
         .ok_or(litebox_common_linux::errno::Errno::EFAULT)?;
     Ok(length)
 }
@@ -66,5 +66,5 @@ fn read_from_user<T: Clone + FromBytes>(
         return Err(litebox_common_linux::errno::Errno::EINVAL);
     }
     let optval: crate::ConstPtr<T> = crate::ConstPtr::from_usize(optval.as_usize());
-    unsafe { optval.read_at_offset(0) }.ok_or(litebox_common_linux::errno::Errno::EFAULT)
+    optval.read_at_offset(0).ok_or(litebox_common_linux::errno::Errno::EFAULT)
 }

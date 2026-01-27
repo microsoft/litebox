@@ -73,7 +73,7 @@ impl Task {
         &self,
         buf: crate::MutPtr<litebox_common_linux::Utsname>,
     ) -> Result<(), Errno> {
-        unsafe { buf.write_at_offset(0, SYS_INFO) }.ok_or(Errno::EFAULT)
+        buf.write_at_offset(0, SYS_INFO).ok_or(Errno::EFAULT)
     }
 
     /// Handle syscall `sysinfo`.
@@ -117,7 +117,7 @@ impl Task {
         header: crate::MutPtr<litebox_common_linux::CapHeader>,
         data: Option<crate::MutPtr<litebox_common_linux::CapData>>,
     ) -> Result<(), Errno> {
-        let hdr = unsafe { header.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+        let hdr = header.read_at_offset(0).ok_or(Errno::EFAULT)?;
         match hdr.version {
             _LINUX_CAPABILITY_VERSION_1 => {
                 if let Some(data_ptr) = data {
@@ -126,7 +126,7 @@ impl Task {
                         permitted: 0,
                         inheritable: 0,
                     };
-                    unsafe { data_ptr.write_at_offset(0, cap) }.ok_or(Errno::EFAULT)?;
+                    data_ptr.write_at_offset(0, cap).ok_or(Errno::EFAULT)?;
                 }
                 Ok(())
             }
@@ -137,21 +137,18 @@ impl Task {
                         permitted: 0,
                         inheritable: 0,
                     };
-                    unsafe { data_ptr.write_at_offset(0, cap.clone()) }.ok_or(Errno::EFAULT)?;
-                    unsafe { data_ptr.write_at_offset(1, cap) }.ok_or(Errno::EFAULT)?;
+                    data_ptr.write_at_offset(0, cap.clone()).ok_or(Errno::EFAULT)?;
+                    data_ptr.write_at_offset(1, cap).ok_or(Errno::EFAULT)?;
                 }
                 Ok(())
             }
             _ => {
-                unsafe {
-                    header.write_at_offset(
-                        0,
-                        litebox_common_linux::CapHeader {
+                header.write_at_offset(
+                        0, litebox_common_linux::CapHeader {
                             version: _LINUX_CAPABILITY_VERSION_3,
                             pid: hdr.pid,
                         },
                     )
-                }
                 .ok_or(Errno::EFAULT)?;
                 if data.is_none() {
                     Ok(())

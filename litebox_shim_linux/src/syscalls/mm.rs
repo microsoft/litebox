@@ -237,8 +237,8 @@ mod tests {
                 0,
             )
             .unwrap();
-        unsafe { addr.write_slice_at_offset(0, &[0xff; 0x2000]).unwrap() };
-        assert_eq!(unsafe { addr.read_at_offset(0x1000) }.unwrap(), 0xff,);
+        addr.write_slice_at_offset(0, &[0xff; 0x2000]).unwrap();
+        assert_eq!(addr.read_at_offset(0x1000).unwrap(), 0xff,);
         task.sys_munmap(addr, 0x2000).unwrap();
     }
 
@@ -263,7 +263,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            unsafe { addr.to_owned_slice(content.len()) }
+            addr.to_owned_slice(content.len())
                 .unwrap()
                 .as_ref(),
             content.as_slice(),
@@ -420,7 +420,7 @@ mod tests {
             )
             .unwrap();
 
-        unsafe { addr.write_slice_at_offset(0, &[0xff; 0x10]).unwrap() };
+        addr.write_slice_at_offset(0, &[0xff; 0x10]).unwrap();
 
         // Test MADV_NORMAL
         assert!(
@@ -438,7 +438,7 @@ mod tests {
             .is_ok()
         );
 
-        unsafe { addr.to_owned_slice(0x10) }
+        addr.to_owned_slice(0x10)
             .unwrap()
             .iter()
             .for_each(|&x| {
@@ -455,7 +455,7 @@ mod tests {
         let _ = init_platform(None);
 
         let ptr = crate::MutPtr::<u8>::from_usize(0xdeadbeef);
-        let result = unsafe { ptr.read_at_offset(0) };
+        let result = ptr.read_at_offset(0);
         assert!(result.is_none());
     }
 }

@@ -43,7 +43,7 @@ impl Task {
     pub(crate) fn sys_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
         let lctx_addr = ctx.esp.wrapping_sub(8);
         let lctx_ptr = ConstPtr::<LegacyContext>::from_usize(lctx_addr);
-        let Some(lctx) = (unsafe { lctx_ptr.read_at_offset(0) }) else {
+        let Some(lctx) = (lctx_ptr.read_at_offset(0)) else {
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);
         };

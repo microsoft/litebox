@@ -379,16 +379,14 @@ impl Task {
             return Err(Errno::EINVAL);
         }
         let set = if let Some(set_ptr) = set_ptr {
-            Some(unsafe { set_ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?)
+            Some(set_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
         } else {
             None
         };
 
         if let Some(oldset_ptr) = oldset_ptr {
             let oldset = self.signals.blocked.get();
-            unsafe {
-                oldset_ptr.write_at_offset(0, oldset).ok_or(Errno::EFAULT)?;
-            };
+            oldset_ptr.write_at_offset(0, oldset).ok_or(Errno::EFAULT)?;
         }
 
         if let Some(set) = set {
@@ -422,13 +420,13 @@ impl Task {
             if is_on_stack {
                 old_ss.flags |= SsFlags::ONSTACK;
             }
-            unsafe { old_ss_ptr.write_at_offset(0, old_ss).ok_or(Errno::EFAULT)? };
+            old_ss_ptr.write_at_offset(0, old_ss).ok_or(Errno::EFAULT)?;
         }
         if let Some(ss_ptr) = ss_ptr {
             if is_on_stack {
                 return Err(Errno::EPERM);
             }
-            let ss = unsafe { ss_ptr.read_at_offset(0).ok_or(Errno::EFAULT)? };
+            let ss = ss_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
             self.signals.set_sigaltstack(ss)?;
         }
         Ok(0)
@@ -437,7 +435,7 @@ impl Task {
     pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
         let uctx_addr = arch::uctx_addr(ctx);
         let uctx_ptr = ConstPtr::<Ucontext>::from_usize(uctx_addr);
-        let Some(uctx) = (unsafe { uctx_ptr.read_at_offset(0) }) else {
+        let Some(uctx) = uctx_ptr.read_at_offset(0) else {
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);
         };
@@ -464,7 +462,7 @@ impl Task {
             return Err(Errno::EINVAL);
         }
         let act = if let Some(act_ptr) = act_ptr {
-            Some(unsafe { act_ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?)
+            Some(act_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
         } else {
             None
         };
@@ -484,11 +482,9 @@ impl Task {
         };
 
         if let Some(oldact_ptr) = oldact_ptr {
-            unsafe {
-                oldact_ptr
-                    .write_at_offset(0, old_act)
-                    .ok_or(Errno::EFAULT)?;
-            };
+            oldact_ptr
+                .write_at_offset(0, old_act)
+                .ok_or(Errno::EFAULT)?;
         }
 
         Ok(0)
