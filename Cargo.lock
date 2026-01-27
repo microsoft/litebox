@@ -882,6 +882,7 @@ dependencies = [
  "litebox_common_linux",
  "modular-bitfield",
  "num_enum",
+ "thiserror",
  "zerocopy",
 ]
 

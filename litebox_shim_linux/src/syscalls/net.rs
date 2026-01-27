@@ -1604,6 +1604,10 @@ impl Task {
                     .map(SocketAddress::Inet)
                     .map_err(Errno::from)
             }),
+            Descriptor::Unix { file, .. } => file
+                .get_peer_addr()
+                .ok_or(Errno::ENOTCONN)
+                .map(SocketAddress::Unix),
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -2992,5 +2996,156 @@ mod unix_tests {
     fn test_unix_socket_recv_timeout() {
         unix_socket_recv_timeout(SockType::Stream);
         unix_socket_recv_timeout(SockType::Datagram);
+    }
+
+    #[test]
+    fn test_unix_stream_addr() {
+        let task = init_platform(None);
+        let server_path = "/unix_stream_sockname.sock";
+        let server_fd = create_unix_server_socket(&task, server_path, SockFlags::empty()).unwrap();
+
+        // Server socket should have its bound address
+        let server_addr = task.do_getsockname(server_fd).unwrap();
+        assert_eq!(
+            server_addr,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string()))
+        );
+
+        // Create client and connect
+        let client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+
+        // Before connect, client should have unnamed address
+        let client_addr = task.do_getsockname(client_fd).unwrap();
+        assert!(matches!(
+            client_addr,
+            SocketAddress::Unix(UnixSocketAddr::Unnamed)
+        ));
+
+        // Connect client to server
+        task.do_connect(
+            client_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
+        )
+        .unwrap();
+
+        // After connect, client's getsockname should still be unnamed
+        let client_local_addr = task.do_getsockname(client_fd).unwrap();
+        assert!(matches!(
+            client_local_addr,
+            SocketAddress::Unix(UnixSocketAddr::Unnamed)
+        ));
+
+        // Client's getpeername should return server's address
+        let client_peer_addr = task.do_getpeername(client_fd).unwrap();
+        assert_eq!(
+            client_peer_addr,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string()))
+        );
+
+        // Accept connection on server
+        let server_conn = task.do_accept(server_fd, None, SockFlags::empty()).unwrap();
+
+        // Server connection's local address should be the server's bound address
+        let server_conn_local = task.do_getsockname(server_conn).unwrap();
+        assert_eq!(
+            server_conn_local,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string()))
+        );
+
+        // Server connection's peer address should be unnamed (client didn't bind)
+        let server_conn_peer = task.do_getpeername(server_conn).unwrap();
+        assert!(matches!(
+            server_conn_peer,
+            SocketAddress::Unix(UnixSocketAddr::Unnamed)
+        ));
+
+        close_socket(&task, client_fd);
+        close_socket(&task, server_conn);
+        close_socket(&task, server_fd);
+        task.sys_unlinkat(-1, server_path, AtFlags::empty())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_unix_datagram_addr() {
+        let task = init_platform(None);
+        let server_path = "/unix_datagram_sockname_server.sock";
+        let client_path = "/unix_datagram_sockname_client.sock";
+
+        let server_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+        let client_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+
+        // Before bind, both should have unnamed addresses
+        let server_addr = task.do_getsockname(server_fd).unwrap();
+        assert!(matches!(
+            server_addr,
+            SocketAddress::Unix(UnixSocketAddr::Unnamed)
+        ));
+
+        let client_addr = task.do_getsockname(client_fd).unwrap();
+        assert!(matches!(
+            client_addr,
+            SocketAddress::Unix(UnixSocketAddr::Unnamed)
+        ));
+
+        // Bind server
+        task.do_bind(
+            server_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
+        )
+        .unwrap();
+
+        // After bind, server should have its bound address
+        let server_local = task.do_getsockname(server_fd).unwrap();
+        assert_eq!(
+            server_local,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string()))
+        );
+
+        // Bind client
+        task.do_bind(
+            client_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(client_path.to_string())),
+        )
+        .unwrap();
+
+        // After bind, client should have its bound address
+        let client_local = task.do_getsockname(client_fd).unwrap();
+        assert_eq!(
+            client_local,
+            SocketAddress::Unix(UnixSocketAddr::Path(client_path.to_string()))
+        );
+
+        // Connect client to server
+        task.do_connect(
+            client_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
+        )
+        .unwrap();
+
+        // After connect, getsockname should still return client's bound address
+        let client_local_after_connect = task.do_getsockname(client_fd).unwrap();
+        assert_eq!(
+            client_local_after_connect,
+            SocketAddress::Unix(UnixSocketAddr::Path(client_path.to_string()))
+        );
+
+        // getpeername should return server's address
+        let client_peer = task.do_getpeername(client_fd).unwrap();
+        assert_eq!(
+            client_peer,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string()))
+        );
+
+        // Server hasn't connected, so getpeername should fail with ENOTCONN
+        let server_peer_result = task.do_getpeername(server_fd);
+        assert_eq!(server_peer_result.unwrap_err(), Errno::ENOTCONN);
+
+        close_socket(&task, server_fd);
+        close_socket(&task, client_fd);
+        task.sys_unlinkat(-1, server_path, AtFlags::empty())
+            .unwrap();
+        task.sys_unlinkat(-1, client_path, AtFlags::empty())
+            .unwrap();
     }
 }

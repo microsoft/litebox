@@ -3,11 +3,12 @@
 
 //! Hyper-V-specific code
 
-mod heki;
+pub(crate) mod heki;
 pub mod hvcall;
 mod hvcall_mm;
 mod hvcall_vp;
 mod mem_integrity;
+pub(crate) mod ringbuffer;
 pub(crate) mod vsm;
 mod vsm_intercept;
 mod vsm_optee_smc;
@@ -119,6 +120,7 @@ pub const VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE: u32 = 0x1_ffe8;
 pub const VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY: u32 = 0x1_ffe9;
 pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
 pub const VSM_VTL_CALL_FUNC_ID_PATCH_TEXT: u32 = 0x1_ffeb;
+pub const VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY: u32 = 0x1_ffec;
 
 // This VSM function ID for OP-TEE messages is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1f_ffff;
@@ -141,6 +143,7 @@ pub enum VsmFunction {
     KexecValidate = VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
     PatchText = VSM_VTL_CALL_FUNC_ID_PATCH_TEXT,
     OpteeMessage = VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
+    AllocateRingbufferMemory = VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY,
     Unknown = 0xffff_ffff,
 }
 

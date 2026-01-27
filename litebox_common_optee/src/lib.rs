@@ -1136,47 +1136,67 @@ pub enum OpteeMessageCommand {
     UnregisterShm = OPTEE_MSG_CMD_UNREGISTER_SHM,
     DoBottomHalf = OPTEE_MSG_CMD_DO_BOTTOM_HALF,
     StopAsyncNotif = OPTEE_MSG_CMD_STOP_ASYNC_NOTIF,
-    Unknown = 0xffff_ffff,
 }
 
-/// Temporary reference memory parameter
+impl TryFrom<OpteeMessageCommand> for UteeEntryFunc {
+    type Error = OpteeSmcReturnCode;
+    fn try_from(cmd: OpteeMessageCommand) -> Result<Self, Self::Error> {
+        match cmd {
+            OpteeMessageCommand::OpenSession => Ok(UteeEntryFunc::OpenSession),
+            OpteeMessageCommand::CloseSession => Ok(UteeEntryFunc::CloseSession),
+            OpteeMessageCommand::InvokeCommand => Ok(UteeEntryFunc::InvokeCommand),
+            _ => Err(OpteeSmcReturnCode::EBadCmd),
+        }
+    }
+}
+
+/// Temporary memory reference parameter
+///
+/// `optee_msg_param_tmem` from `optee_os/core/include/optee_msg.h`
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct OpteeMsgParamTmem {
     /// Physical address of the buffer
-    buf_ptr: u64,
+    pub buf_ptr: u64,
     /// Size of the buffer
-    size: u64,
+    pub size: u64,
     /// Temporary shared memory reference or identifier
-    shm_ref: u64,
+    pub shm_ref: u64,
 }
 
 /// Registered memory reference parameter
+///
+/// `optee_msg_param_rmem` from `optee_os/core/include/optee_msg.h`
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct OpteeMsgParamRmem {
     /// Offset into shared memory reference
-    offs: u64,
+    pub offs: u64,
     /// Size of the buffer
-    size: u64,
+    pub size: u64,
     /// Shared memory reference or identifier
-    shm_ref: u64,
+    pub shm_ref: u64,
 }
 
 /// FF-A memory reference parameter
+///
+/// `optee_msg_param_fmem` from `optee_os/core/include/optee_msg.h`
+///
+/// Note: LiteBox doesn't currently support FF-A shared memory, so this struct is
+/// provided for completeness but is not used.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct OpteeMsgParamFmem {
     /// Lower bits of offset into shared memory reference
-    offs_low: u32,
+    pub offs_low: u32,
     /// Higher bits of offset into shared memory reference
-    offs_high: u32,
+    pub offs_high: u32,
     /// Internal offset into the first page of shared memory reference
-    internal_offs: u16,
+    pub internal_offs: u16,
     /// Size of the buffer
-    size: u64,
+    pub size: u64,
     /// Global identifier of the shared memory
-    global_id: u64,
+    pub global_id: u64,
 }
 
 /// Opaque value parameter
@@ -1184,12 +1204,12 @@ pub struct OpteeMsgParamFmem {
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct OpteeMsgParamValue {
-    a: u64,
-    b: u64,
-    c: u64,
+    pub a: u64,
+    pub b: u64,
+    pub c: u64,
 }
 
-/// Parameter used together with `OpteeMsgArg`
+/// Parameter used together with `OpteeMsgArgs`
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub union OpteeMsgParamUnion {
@@ -1252,6 +1272,54 @@ impl OpteeMsgParam {
     pub fn attr_type(&self) -> OpteeMsgAttrType {
         OpteeMsgAttrType::try_from(self.attr.typ()).unwrap_or(OpteeMsgAttrType::None)
     }
+    pub fn get_param_tmem(&self) -> Option<OpteeMsgParamTmem> {
+        if matches!(
+            self.attr.typ(),
+            OPTEE_MSG_ATTR_TYPE_TMEM_INPUT
+                | OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT
+                | OPTEE_MSG_ATTR_TYPE_TMEM_INOUT
+        ) {
+            Some(unsafe { self.u.tmem })
+        } else {
+            None
+        }
+    }
+    pub fn get_param_rmem(&self) -> Option<OpteeMsgParamRmem> {
+        if matches!(
+            self.attr.typ(),
+            OPTEE_MSG_ATTR_TYPE_RMEM_INPUT
+                | OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT
+                | OPTEE_MSG_ATTR_TYPE_RMEM_INOUT
+        ) {
+            Some(unsafe { self.u.rmem })
+        } else {
+            None
+        }
+    }
+    pub fn get_param_fmem(&self) -> Option<OpteeMsgParamFmem> {
+        if matches!(
+            self.attr.typ(),
+            OPTEE_MSG_ATTR_TYPE_RMEM_INPUT
+                | OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT
+                | OPTEE_MSG_ATTR_TYPE_RMEM_INOUT
+        ) {
+            Some(unsafe { self.u.fmem })
+        } else {
+            None
+        }
+    }
+    pub fn get_param_value(&self) -> Option<OpteeMsgParamValue> {
+        if matches!(
+            self.attr.typ(),
+            OPTEE_MSG_ATTR_TYPE_VALUE_INPUT
+                | OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT
+                | OPTEE_MSG_ATTR_TYPE_VALUE_INOUT
+        ) {
+            Some(unsafe { self.u.value })
+        } else {
+            None
+        }
+    }
 }
 
 /// `optee_msg_arg` from `optee_os/core/include/optee_msg.h`
@@ -1259,32 +1327,84 @@ impl OpteeMsgParam {
 /// exchange messages.
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct OpteeMsgArg {
+pub struct OpteeMsgArgs {
     /// OP-TEE message command. This is a superset of `UteeEntryFunc`.
-    cmd: OpteeMessageCommand,
+    pub cmd: OpteeMessageCommand,
     /// TA function ID which is used if `cmd == InvokeCommand`. Note that the meaning of `cmd` and `func`
     /// is swapped compared to TAs.
-    func: u32,
+    pub func: u32,
     /// Session ID. This is "IN" parameter most of the time except for `cmd == OpenSession` where
     /// the secure world generates and returns a session ID.
-    session: u32,
+    pub session: u32,
     /// Cancellation ID. This is a unique value to identify this request.
-    cancel_id: u32,
+    pub cancel_id: u32,
     pad: u32,
     /// Return value from the secure world
-    ret: u32,
+    pub ret: u32,
     /// Origin of the return value
-    ret_origin: TeeOrigin,
+    pub ret_origin: TeeOrigin,
     /// Number of parameters contained in `params`
-    num_params: u32,
+    pub num_params: u32,
     /// Parameters to be passed to the secure world. If `cmd == OpenSession`, the first two params contain
     /// a TA UUID and they are not delivered to the TA.
     /// Note that, originally, the length of this array is variable. We fix it to `TEE_NUM_PARAMS + 2` to
     /// simplify the implementation (our OP-TEE Shim supports up to four parameters as well).
-    params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
+    pub params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
 }
 
-/// OP-TEE SMC call arguments.
+impl OpteeMsgArgs {
+    /// Validate the message argument structure.
+    pub fn validate(&self) -> Result<(), OpteeSmcReturnCode> {
+        let _ = OpteeMessageCommand::try_from(self.cmd as u32)
+            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+        if self.cmd == OpteeMessageCommand::OpenSession && self.num_params < 2 {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        if self.num_params as usize > self.params.len() {
+            Err(OpteeSmcReturnCode::EBadCmd)
+        } else {
+            Ok(())
+        }
+    }
+    pub fn get_param_tmem(&self, index: usize) -> Result<OpteeMsgParamTmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            Ok(self.params[index]
+                .get_param_tmem()
+                .ok_or(OpteeSmcReturnCode::EBadCmd)?)
+        }
+    }
+    pub fn get_param_rmem(&self, index: usize) -> Result<OpteeMsgParamRmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            Ok(self.params[index]
+                .get_param_rmem()
+                .ok_or(OpteeSmcReturnCode::EBadCmd)?)
+        }
+    }
+    pub fn get_param_fmem(&self, index: usize) -> Result<OpteeMsgParamFmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            Ok(self.params[index]
+                .get_param_fmem()
+                .ok_or(OpteeSmcReturnCode::EBadCmd)?)
+        }
+    }
+    pub fn get_param_value(&self, index: usize) -> Result<OpteeMsgParamValue, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            Ok(self.params[index]
+                .get_param_value()
+                .ok_or(OpteeSmcReturnCode::EBadCmd)?)
+        }
+    }
+}
+
+/// A memory page to exchange OP-TEE SMC call arguments.
 /// OP-TEE assumes that the underlying architecture is Arm with TrustZone and
 /// thus it uses Secure Monitor Call (SMC) calling convention (SMCCC).
 /// Since we currently rely on the existing OP-TEE driver which assumes SMCCC, we translate it into
@@ -1292,9 +1412,30 @@ pub struct OpteeMsgArg {
 /// Specifically, OP-TEE SMC call uses up to nine CPU registers to pass arguments.
 /// However, since VTL call only supports up to four parameters, we allocate a VTL0 memory page and
 /// exchange all arguments through that memory page.
+/// TODO: Since this is LVBS-specific structure to facilitate the translation between VTL call convention,
+/// we might want to move it to the `litebox_platform_lvbs` crate later.
+/// Also, we might need to document how to inteprete this structure by referencing `optee_smc.h` and
+/// Arm's SMCCC.
 #[repr(align(4096))]
 #[derive(Clone, Copy)]
 #[repr(C)]
+pub struct OpteeSmcArgsPage {
+    pub args: [usize; Self::NUM_OPTEE_SMC_ARGS],
+}
+impl OpteeSmcArgsPage {
+    const NUM_OPTEE_SMC_ARGS: usize = 9;
+}
+
+impl From<&OpteeSmcArgsPage> for OpteeSmcArgs {
+    fn from(page: &OpteeSmcArgsPage) -> Self {
+        let mut smc = OpteeSmcArgs::default();
+        smc.args.copy_from_slice(&page.args);
+        smc
+    }
+}
+
+/// OP-TEE SMC call arguments.
+#[derive(Clone, Copy, Default)]
 pub struct OpteeSmcArgs {
     args: [usize; Self::NUM_OPTEE_SMC_ARGS],
 }
@@ -1302,35 +1443,29 @@ pub struct OpteeSmcArgs {
 impl OpteeSmcArgs {
     const NUM_OPTEE_SMC_ARGS: usize = 9;
 
-    pub fn arg_index(&self, index: usize) -> Option<usize> {
-        if index < Self::NUM_OPTEE_SMC_ARGS {
-            Some(self.args[index])
-        } else {
-            None
-        }
-    }
-
     /// Get the function ID of an OP-TEE SMC call
-    pub fn func_id(&self) -> Result<OpteeSmcFunction, Errno> {
-        OpteeSmcFunction::try_from(self.args[0] & OpteeSmcFunction::MASK).map_err(|_| Errno::EINVAL)
+    pub fn func_id(&self) -> Result<OpteeSmcFunction, OpteeSmcReturnCode> {
+        OpteeSmcFunction::try_from(self.args[0] & OpteeSmcFunction::MASK)
+            .map_err(|_| OpteeSmcReturnCode::EBadCmd)
     }
 
-    /// Get the physical address of `OpteeMsgArg`. The secure world is expected to map and copy
+    /// Get the physical address of `OpteeMsgArgs`. The secure world is expected to map and copy
     /// this structure.
-    pub fn optee_msg_arg_phys_addr(&self) -> Result<usize, Errno> {
+    pub fn optee_msg_arg_phys_addr(&self) -> Result<u64, OpteeSmcReturnCode> {
         // To avoid potential sign extension and overflow issues, OP-TEE stores the low and
         // high 32 bits of a 64-bit address in `args[2]` and `args[1]`, respectively.
         if self.args[1] & 0xffff_ffff_0000_0000 == 0 && self.args[2] & 0xffff_ffff_0000_0000 == 0 {
             let addr = (self.args[1] << 32) | self.args[2];
-            Ok(addr)
+            Ok(addr as u64)
         } else {
-            Err(Errno::EINVAL)
+            Err(OpteeSmcReturnCode::EBadAddr)
         }
     }
 }
 
 /// `OPTEE_SMC_FUNCID_*` from `core/arch/arm/include/sm/optee_smc.h`
 /// TODO: Add stuffs based on the OP-TEE driver that LVBS is using.
+const OPTEE_SMC_FUNCID_GET_OS_UUID: usize = 0x0;
 const OPTEE_SMC_FUNCID_GET_OS_REVISION: usize = 0x1;
 const OPTEE_SMC_FUNCID_CALL_WITH_ARG: usize = 0x4;
 const OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES: usize = 0x9;
@@ -1344,6 +1479,7 @@ const OPTEE_SMC_FUNCID_CALLS_REVISION: usize = 0xff03;
 #[derive(PartialEq, TryFromPrimitive)]
 #[repr(usize)]
 pub enum OpteeSmcFunction {
+    GetOsUuid = OPTEE_SMC_FUNCID_GET_OS_UUID,
     GetOsRevision = OPTEE_SMC_FUNCID_GET_OS_REVISION,
     CallWithArg = OPTEE_SMC_FUNCID_CALL_WITH_ARG,
     ExchangeCapabilities = OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES,
@@ -1360,64 +1496,102 @@ impl OpteeSmcFunction {
 
 /// OP-TEE SMC call result.
 /// OP-TEE SMC call uses CPU registers to pass input and output values.
-/// Thus, this structure is technically equivalent to `OpteeSmcArgs`, but we separate them for clarity.
-#[repr(align(4096))]
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct OpteeSmcResult {
-    args: [usize; Self::NUM_OPTEE_SMC_ARGS],
-}
-
-impl OpteeSmcResult {
-    const NUM_OPTEE_SMC_ARGS: usize = 9;
-
-    pub fn return_status(&mut self, status: OpteeSmcReturn) {
-        self.args[0] = status as usize;
-    }
-
-    pub fn exchange_capabilities(
-        &mut self,
-        status: OpteeSmcReturn,
+/// Thus, we convert this into `OpteeSmcArgs` later.
+#[non_exhaustive]
+pub enum OpteeSmcResult<'a> {
+    Generic {
+        status: OpteeSmcReturnCode,
+    },
+    ExchangeCapabilities {
+        status: OpteeSmcReturnCode,
         capabilities: OpteeSecureWorldCapabilities,
         max_notif_value: usize,
         data: usize,
-    ) {
-        self.return_status(status);
-        self.args[1] = capabilities.bits();
-        self.args[2] = max_notif_value;
-        self.args[3] = data;
-    }
-
-    /// # Panics
-    /// panics if any element of `data` cannot be converted to `usize`.
-    pub fn uuid(&mut self, data: [u32; 4]) {
-        // OP-TEE doesn't use the high 32 bit of each argument to avoid sign extension and overflow issues.
-        self.args[0] = usize::try_from(data[0]).unwrap();
-        self.args[1] = usize::try_from(data[1]).unwrap();
-        self.args[2] = usize::try_from(data[2]).unwrap();
-        self.args[3] = usize::try_from(data[3]).unwrap();
-    }
-
-    pub fn revision(&mut self, major: usize, minor: usize) {
-        self.args[0] = major;
-        self.args[1] = minor;
-    }
-
-    pub fn os_revision(&mut self, major: usize, minor: usize, build_id: usize) {
-        self.args[0] = major;
-        self.args[1] = minor;
-        self.args[2] = build_id;
-    }
-
-    pub fn disable_shm_cache(
-        &mut self,
-        status: OpteeSmcReturn,
+    },
+    Uuid {
+        data: &'a [u32; 4],
+    },
+    Revision {
+        major: usize,
+        minor: usize,
+    },
+    OsRevision {
+        major: usize,
+        minor: usize,
+        build_id: usize,
+    },
+    DisableShmCache {
+        status: OpteeSmcReturnCode,
         shm_upper32: usize,
         shm_lower32: usize,
-    ) {
-        self.args[0] = status as usize;
-        self.args[1] = shm_upper32;
-        self.args[2] = shm_lower32;
+    },
+    CallWithArg {
+        msg_arg: Box<OpteeMsgArgs>,
+    },
+}
+
+impl From<OpteeSmcResult<'_>> for OpteeSmcArgs {
+    fn from(value: OpteeSmcResult) -> Self {
+        match value {
+            OpteeSmcResult::Generic { status } => {
+                let mut smc = OpteeSmcArgs::default();
+                smc.args[0] = status as usize;
+                smc
+            }
+            OpteeSmcResult::ExchangeCapabilities {
+                status,
+                capabilities,
+                max_notif_value,
+                data,
+            } => {
+                let mut smc = OpteeSmcArgs::default();
+                smc.args[0] = status as usize;
+                smc.args[1] = capabilities.bits();
+                smc.args[2] = max_notif_value;
+                smc.args[3] = data;
+                smc
+            }
+            OpteeSmcResult::Uuid { data } => {
+                let mut smc = OpteeSmcArgs::default();
+                for (i, arg) in smc.args.iter_mut().enumerate().take(4) {
+                    *arg = data[i] as usize;
+                }
+                smc
+            }
+            OpteeSmcResult::Revision { major, minor } => {
+                let mut smc = OpteeSmcArgs::default();
+                smc.args[0] = major;
+                smc.args[1] = minor;
+                smc
+            }
+            OpteeSmcResult::OsRevision {
+                major,
+                minor,
+                build_id,
+            } => {
+                let mut smc = OpteeSmcArgs::default();
+                smc.args[0] = major;
+                smc.args[1] = minor;
+                smc.args[2] = build_id;
+                smc
+            }
+            OpteeSmcResult::DisableShmCache {
+                status,
+                shm_upper32,
+                shm_lower32,
+            } => {
+                let mut smc = OpteeSmcArgs::default();
+                smc.args[0] = status as usize;
+                smc.args[1] = shm_upper32;
+                smc.args[2] = shm_lower32;
+                smc
+            }
+            OpteeSmcResult::CallWithArg { .. } => {
+                panic!(
+                    "OpteeSmcResult::CallWithArg cannot be converted to OpteeSmcArgs directly. Handle the incorporated OpteeMsgArgs."
+                );
+            }
+        }
     }
 }
 
@@ -1447,7 +1621,7 @@ const OPTEE_SMC_RETURN_UNKNOWN_FUNCTION: usize = 0xffff_ffff;
 #[non_exhaustive]
 #[derive(Copy, Clone, PartialEq, TryFromPrimitive)]
 #[repr(usize)]
-pub enum OpteeSmcReturn {
+pub enum OpteeSmcReturnCode {
     Ok = OPTEE_SMC_RETURN_OK,
     EThreadLimit = OPTEE_SMC_RETURN_ETHREAD_LIMIT,
     EBusy = OPTEE_SMC_RETURN_EBUSY,

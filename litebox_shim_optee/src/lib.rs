@@ -33,6 +33,9 @@ use litebox_platform_multiplex::Platform;
 pub mod loader;
 pub(crate) mod syscalls;
 
+pub mod msg_handler;
+pub mod ptr;
+
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
 pub struct OpteeShimEntrypoints {
@@ -1209,6 +1212,9 @@ impl Default for SessionIdPool {
         Self::new()
     }
 }
+
+pub type NormalWorldConstPtr<T, const ALIGN: usize> = crate::ptr::PhysConstPtr<T, ALIGN>;
+pub type NormalWorldMutPtr<T, const ALIGN: usize> = crate::ptr::PhysMutPtr<T, ALIGN>;
 
 #[cfg(test)]
 mod test_utils {

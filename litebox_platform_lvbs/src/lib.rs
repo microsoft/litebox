@@ -7,27 +7,38 @@
 #![no_std]
 
 use crate::{
-    mshv::{vsm::Vtl0KernelInfo, vtl1_mem_layout::PAGE_SIZE},
+    host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo,
     user_context::UserContextMap,
 };
-
 use core::{
     arch::asm,
     sync::atomic::{AtomicU32, AtomicU64},
 };
-use litebox::platform::page_mgmt::DeallocationError;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
-    Punchthrough, RawMutexProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
+    Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutex as _, RawMutexProvider,
+    RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
+    page_mgmt::DeallocationError,
 };
-use litebox::platform::{
-    PunchthroughProvider, PunchthroughToken, RawMutex as _, RawPointerProvider,
+use litebox::{
+    mm::linux::{PAGE_SIZE, PageRange},
+    platform::page_mgmt::FixedAddressBehavior,
+    shim::ContinueOperation,
 };
-use litebox::{mm::linux::PageRange, platform::page_mgmt::FixedAddressBehavior};
-use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
-use x86_64::structures::paging::{
-    PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
-    mapper::MapToError,
+use litebox_common_linux::{
+    PunchthroughSyscall,
+    errno::Errno,
+    vmap::{
+        PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
+        VmapManager,
+    },
+};
+use x86_64::{
+    VirtAddr,
+    structures::paging::{
+        PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
+        mapper::MapToError,
+    },
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -50,6 +61,7 @@ pub struct LinuxKernel<Host: HostInterface> {
     page_table: mm::PageTable<PAGE_SIZE>,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
     vtl0_kernel_info: Vtl0KernelInfo,
+    #[expect(dead_code)]
     user_contexts: UserContextMap,
 }
 
@@ -753,13 +765,406 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
 
 impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
     fn get_syscall_entry_point(&self) -> usize {
-        todo!("PR 566 should be merged to implement this function");
+        syscall_callback as *const () as usize
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
         unimplemented!()
     }
 }
+
+/// Checks whether the given physical addresses are contiguous with respect to ALIGN.
+///
+/// Note: This is a temporary check to let `VmapManager` work with this platform
+/// which does not yet support virtually contiguous mapping of non-contiguous physical pages
+/// (for now, it maps physical pages with a fixed offset).
+#[cfg(feature = "optee_syscall")]
+fn check_contiguity<const ALIGN: usize>(
+    addrs: &[PhysPageAddr<ALIGN>],
+) -> Result<(), PhysPointerError> {
+    for window in addrs.windows(2) {
+        let first = window[0].as_usize();
+        let second = window[1].as_usize();
+        if second != first.checked_add(ALIGN).ok_or(PhysPointerError::Overflow)? {
+            return Err(PhysPointerError::NonContiguousPages);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "optee_syscall")]
+impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel<Host> {
+    unsafe fn vmap(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+        perms: PhysPageMapPermissions,
+    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
+        // TODO: Remove this check once this platform supports virtually contiguous
+        // non-contiguous physical page mapping.
+        check_contiguity(pages)?;
+
+        if pages.is_empty() {
+            return Err(PhysPointerError::InvalidPhysicalAddress(0));
+        }
+        let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
+        let phys_end = x86_64::PhysAddr::new(
+            pages
+                .last()
+                .unwrap()
+                .as_usize()
+                .checked_add(ALIGN)
+                .ok_or(PhysPointerError::Overflow)? as u64,
+        );
+        let frame_range = if ALIGN == PAGE_SIZE {
+            PhysFrame::range(
+                PhysFrame::<Size4KiB>::containing_address(phys_start),
+                PhysFrame::<Size4KiB>::containing_address(phys_end),
+            )
+        } else {
+            unimplemented!("ALIGN other than 4KiB is not supported yet")
+        };
+
+        let mut flags = PageTableFlags::PRESENT;
+        if perms.contains(PhysPageMapPermissions::WRITE) {
+            flags |= PageTableFlags::WRITABLE;
+        }
+
+        if let Ok(page_addr) = self.page_table.map_phys_frame_range(frame_range, flags) {
+            Ok(PhysPageMapInfo {
+                base: page_addr,
+                size: pages.len() * ALIGN,
+            })
+        } else {
+            Err(PhysPointerError::InvalidPhysicalAddress(
+                pages[0].as_usize(),
+            ))
+        }
+    }
+
+    unsafe fn vunmap(&self, vmap_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
+        if ALIGN == PAGE_SIZE {
+            let Some(page_range) = PageRange::<PAGE_SIZE>::new(
+                vmap_info.base as usize,
+                vmap_info.base.wrapping_add(vmap_info.size) as usize,
+            ) else {
+                return Err(PhysPointerError::UnalignedPhysicalAddress(
+                    vmap_info.base as usize,
+                    ALIGN,
+                ));
+            };
+            unsafe {
+                self.page_table
+                    .unmap_pages(page_range, false)
+                    .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))
+            }
+        } else {
+            unimplemented!("ALIGN other than 4KiB is not supported yet")
+        }
+    }
+
+    fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let start_address = self.vtl1_phys_frame_range.start.start_address().as_u64();
+        let end_address = self.vtl1_phys_frame_range.end.start_address().as_u64();
+        for page in pages {
+            let addr = page.as_usize() as u64;
+            // a physical page belonging to LiteBox (VTL1) should not be used for `vmap`
+            if addr >= start_address && addr < end_address {
+                return Err(PhysPointerError::InvalidPhysicalAddress(page.as_usize()));
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn protect(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+        perms: PhysPageMapPermissions,
+    ) -> Result<(), PhysPointerError> {
+        let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
+        let phys_end = x86_64::PhysAddr::new(
+            pages
+                .last()
+                .unwrap()
+                .as_usize()
+                .checked_add(ALIGN)
+                .ok_or(PhysPointerError::Overflow)? as u64,
+        );
+        let frame_range = if ALIGN == PAGE_SIZE {
+            PhysFrame::range(
+                PhysFrame::<Size4KiB>::containing_address(phys_start),
+                PhysFrame::<Size4KiB>::containing_address(phys_end),
+            )
+        } else {
+            unimplemented!("ALIGN other than 4KiB is not supported yet")
+        };
+
+        let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
+            // VTL1 wants to write data to the pages, preventing VTL0 from reading/executing the pages.
+            crate::mshv::heki::MemAttr::empty()
+        } else if perms.contains(PhysPageMapPermissions::READ) {
+            // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
+            crate::mshv::heki::MemAttr::MEM_ATTR_READ | crate::mshv::heki::MemAttr::MEM_ATTR_EXEC
+        } else {
+            // VTL1 no longer protects the pages.
+            crate::mshv::heki::MemAttr::all()
+        };
+        crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
+            .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))
+    }
+}
+
+/// Runs a user thread with the given initial context.
+///
+/// # Safety
+/// The context must be valid user context.
+pub unsafe fn run_thread(
+    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    // Currently, `litebox_platform_lvbs` uses `swapgs` to efficiently switch between
+    // kernel and user GS base values during kernel-user mode transitions.
+    // This `swapgs` usage can pontetially leak a kernel address to the user, so
+    // we clear the `KernelGsBase` MSR before running the user thread.
+    crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
+    run_thread_inner(&shim, ctx);
+}
+
+struct ThreadContext<'a> {
+    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &'a mut litebox_common_linux::PtRegs,
+}
+
+fn run_thread_inner(
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    let ctx_ptr = core::ptr::from_mut(ctx);
+    let mut thread_ctx = ThreadContext { shim, ctx };
+    // `thread_ctx` will be passed to `syscall_handler` later.
+    // `ctx_ptr` is to let `run_thread_arch` easily access `ctx` (i.e., not to deal with
+    // member variable offset calculation in assembly code).
+    unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr) };
+}
+
+/// Save callee-saved registers onto the stack.
+#[cfg(target_arch = "x86_64")]
+macro_rules! SAVE_CALLEE_SAVED_REGISTERS_ASM {
+    () => {
+        "
+        push rbp
+        mov rbp, rsp
+        push rbx
+        push r12
+        push r13
+        push r14
+        push r15
+        "
+    };
+}
+
+/// Restore callee-saved registers from the stack.
+#[cfg(target_arch = "x86_64")]
+macro_rules! RESTORE_CALLEE_SAVED_REGISTERS_ASM {
+    () => {
+        "
+        lea rsp, [rbp - 5 * 8]
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop rbx
+        pop rbp
+        "
+    };
+}
+
+/// Save user context right after `syscall`-driven mode transition to the memory area
+/// pointed by the current stack pointer (`rsp`).
+///
+/// `rsp` can point to the current CPU stack or the *top address* of a memory area which
+/// has enough space for storing the `PtRegs` structure using the `push` instructions
+/// (i.e., from high addresses down to low ones).
+///
+/// Prerequisite:
+/// - Store user `rsp` in `r11` before calling this macro.
+/// - Store the userspace return address in `rcx` (`syscall` does this automatically).
+#[cfg(target_arch = "x86_64")]
+macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
+    () => {
+        "
+        push 0x2b       // pt_regs->ss = __USER_DS
+        push r11        // pt_regs->rsp
+        pushfq          // pt_regs->eflags
+        push 0x33       // pt_regs->cs = __USER_CS
+        push rcx        // pt_regs->rip
+        push rax        // pt_regs->orig_rax
+        push rdi        // pt_regs->rdi
+        push rsi        // pt_regs->rsi
+        push rdx        // pt_regs->rdx
+        push rcx        // pt_regs->rcx
+        push -38        // pt_regs->rax = -ENOSYS
+        push r8         // pt_regs->r8
+        push r9         // pt_regs->r9
+        push r10        // pt_regs->r10
+        push [rsp + 88] // pt_regs->r11 = rflags
+        push rbx        // pt_regs->rbx
+        push rbp        // pt_regs->rbp
+        push r12        // pt_regs->r12
+        push r13        // pt_regs->r13
+        push r14        // pt_regs->r14
+        push r15        // pt_regs->r15
+        "
+    };
+}
+
+/// Restore user context from the memory area pointed by the current `rsp`.
+///
+/// This macro uses the `pop` instructions (i.e., from low addresses up to high ones) such that
+/// it requires the start address of the memory area (not the top one).
+///
+/// Prerequisite: The memory area has `PtRegs` structure containing user context.
+#[cfg(target_arch = "x86_64")]
+macro_rules! RESTORE_USER_CONTEXT_ASM {
+    () => {
+        "
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop rbp
+        pop rbx
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rax
+        pop rcx
+        pop rdx
+        pop rsi
+        pop rdi
+        add rsp, 8 // skip pt_regs->orig_rax
+        // Stack already has all the values needed for iretq (rip, cs, flags, rsp, ds)
+        // from the `PtRegs` structure.
+        "
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn run_thread_arch(
+    thread_ctx: &mut ThreadContext,
+    ctx: *mut litebox_common_linux::PtRegs,
+) {
+    core::arch::naked_asm!(
+        SAVE_CALLEE_SAVED_REGISTERS_ASM!(),
+        "push rdi", // save `thread_ctx`
+        // Save kernel rsp and rbp and user context top in PerCpuVariablesAsm.
+        "mov gs:[{cur_kernel_sp_off}], rsp",
+        "mov gs:[{cur_kernel_bp_off}], rbp",
+        "lea r8, [rsi + {USER_CONTEXT_SIZE}]",
+        "mov gs:[{user_context_top_off}], r8",
+        "call {init_handler}",
+        "jmp done",
+        ".globl syscall_callback",
+        "syscall_callback:",
+        "swapgs",
+        "mov r11, rsp", // store user `rsp` in `r11`
+        "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
+        SAVE_SYSCALL_USER_CONTEXT_ASM!(),
+        "mov rbp, gs:[{cur_kernel_bp_off}]",
+        "mov rsp, gs:[{cur_kernel_sp_off}]",
+        // Handle the syscall. This will jump back to the user but
+        // will return if the thread is exiting.
+        "mov rdi, [rsp]", // pass `thread_ctx`
+        "call {syscall_handler}",
+        "jmp done",
+        // Exception and interrupt callback placeholders
+        // IDT handler functions will jump to these labels to
+        // handle user-mode exceptions/interrupts.
+        // Note that these two callbacks are not yet implemented and no code path jumps to them.
+        ".globl exception_callback",
+        "exception_callback:",
+        "jmp done",
+        ".globl interrupt_callback",
+        "interrupt_callback:",
+        "jmp done",
+        "done:",
+        "mov rbp, gs:[{cur_kernel_bp_off}]",
+        "mov rsp, gs:[{cur_kernel_sp_off}]",
+        RESTORE_CALLEE_SAVED_REGISTERS_ASM!(),
+        "ret",
+        cur_kernel_sp_off = const { PerCpuVariablesAsm::cur_kernel_stack_ptr_offset() },
+        cur_kernel_bp_off = const { PerCpuVariablesAsm::cur_kernel_base_ptr_offset() },
+        user_context_top_off = const { PerCpuVariablesAsm::user_context_top_addr_offset() },
+        USER_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+        init_handler = sym init_handler,
+        syscall_handler = sym syscall_handler,
+    );
+}
+
+unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
+}
+
+/// Calls `f` in order to call into a shim entrypoint.
+impl ThreadContext<'_> {
+    fn call_shim(
+        &mut self,
+        f: impl FnOnce(
+            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+            &mut litebox_common_linux::PtRegs,
+        ) -> ContinueOperation,
+    ) {
+        let op = f(self.shim, self.ctx);
+        match op {
+            ContinueOperation::ResumeGuest => unsafe { switch_to_user(self.ctx) },
+            ContinueOperation::ExitThread => {}
+        }
+    }
+}
+
+unsafe extern "C" {
+    // Defined in asm blocks above
+    fn syscall_callback() -> isize;
+}
+
+fn init_handler(thread_ctx: &mut ThreadContext) {
+    thread_ctx.call_shim(|shim, ctx| shim.init(ctx));
+}
+
+// Switches to the provided user context with the user mode.
+///
+/// # Safety
+/// The context must be valid user context.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
+    core::arch::naked_asm!(
+        "switch_to_user_start:",
+        // Flush TLB by reloading CR3
+        "mov rax, cr3",
+        "mov cr3, rax",
+        "xor eax, eax",
+        // Restore user context from ctx.
+        "mov rsp, rdi",
+        RESTORE_USER_CONTEXT_ASM!(),
+        // clear the GS base register (as the `KernelGsBase` MSR contains 0)
+        // while writing the current GS base value to `KernelGsBase`.
+        "swapgs",
+        "iretq",
+        "switch_to_user_end:",
+    );
+}
+
+// Note on user page table management:
+// The legacy platform code creates a new page table to load a program in a separate
+// address space and destroys it when the program terminates. This is why the old syscall
+// handler invokes `change_address_space()`. Previously, the platform does all these because
+// it is the one running the event loop. Once we have an `upcall` mechanism, the runner
+// should be the one manage all these.
 
 // NOTE: The below code is a naive workaround to let LVBS code to access the platform.
 // Rather than doing this, we should implement LVBS interface/provider for the platform.

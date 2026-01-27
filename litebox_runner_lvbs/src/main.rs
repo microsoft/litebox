@@ -8,7 +8,10 @@
 use core::arch::asm;
 use litebox_platform_lvbs::{
     arch::{enable_extended_states, enable_fsgsbase, get_core_id, instrs::hlt_loop},
-    host::{bootparam::parse_boot_info, per_cpu_variables::with_per_cpu_variables},
+    host::{
+        bootparam::parse_boot_info,
+        per_cpu_variables::{PerCpuVariablesAsm, init_per_cpu_variables},
+    },
     mm::MemoryProvider,
     serial_println,
 };
@@ -125,16 +128,14 @@ pub unsafe extern "C" fn _start() -> ! {
 
     enable_fsgsbase();
     enable_extended_states();
-    let stack_top = with_per_cpu_variables(
-        litebox_platform_lvbs::host::per_cpu_variables::PerCpuVariables::kernel_stack_top,
-    );
+    init_per_cpu_variables();
 
     unsafe {
         asm!(
-            "mov rsp, rax",
-            "and rsp, -16",
+            "mov rsp, gs:[{kernel_sp_off}]",
             "call {kernel_main}",
-            in("rax") stack_top, kernel_main = sym kernel_main
+            kernel_sp_off = const { PerCpuVariablesAsm::kernel_stack_ptr_offset() },
+            kernel_main = sym kernel_main
         );
     }
 

@@ -5,6 +5,7 @@
 
 #[cfg(debug_assertions)]
 use crate::mshv::mem_integrity::parse_modinfo;
+use crate::mshv::ringbuffer::set_ringbuffer;
 use crate::{
     arch::get_core_id,
     debug_serial_print, debug_serial_println,
@@ -70,7 +71,7 @@ pub(crate) fn init() {
     );
 
     assert!(
-        !(get_core_id() == 0 && mshv_vsm_get_code_page_offsets().is_err()),
+        mshv_vsm_get_code_page_offsets().is_ok(),
         "Failed to retrieve Hypercall page offsets to execute VTL returns"
     );
 
@@ -945,6 +946,19 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), Errno> {
     Ok(())
 }
 
+fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i64, Errno> {
+    set_ringbuffer(PhysAddr::new(phys_addr), size);
+    protect_physical_memory_range(
+        PhysFrame::range(
+            PhysFrame::containing_address(PhysAddr::new(phys_addr)),
+            PhysFrame::containing_address(PhysAddr::new(phys_addr + (size as u64))),
+        ),
+        MemAttr::MEM_ATTR_READ,
+    )?;
+    serial_println!("VSM: Ring buffer allocated");
+    Ok(0)
+}
+
 /// VSM function dispatcher
 pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
     let result = match func_id {
@@ -964,6 +978,9 @@ pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
         VsmFunction::CopySecondaryKey => mshv_vsm_copy_secondary_key(params[0], params[1]),
         VsmFunction::KexecValidate => mshv_vsm_kexec_validate(params[0], params[1], params[2]),
         VsmFunction::PatchText => mshv_vsm_patch_text(params[0], params[1]),
+        VsmFunction::AllocateRingbufferMemory => {
+            mshv_vsm_allocate_ringbuffer_memory(params[0], params[1].try_into().unwrap())
+        }
         _ => {
             serial_println!("VSM: Unknown function ID {:?}", func_id);
             Err(Errno::EINVAL)
@@ -1320,7 +1337,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
 /// `phys_frame_range` specifies the physical frame range to protect
 /// `mem_attr` specifies the memory attributes to be applied to the range
 #[inline]
-fn protect_physical_memory_range(
+pub(crate) fn protect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
     mem_attr: MemAttr,
 ) -> Result<(), Errno> {
