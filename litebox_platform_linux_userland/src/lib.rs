@@ -20,6 +20,8 @@ use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall};
 
+use zerocopy::{FromBytes, IntoBytes};
+
 mod syscall_intercept;
 
 extern crate alloc;
@@ -1205,8 +1207,8 @@ type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::
     T,
 >;
 impl litebox::platform::RawPointerProvider for LinuxUserland {
-    type RawConstPointer<T: Clone> = UserConstPtr<T>;
-    type RawMutPointer<T: Clone> = UserMutPtr<T>;
+    type RawConstPointer<T: Clone + FromBytes> = UserConstPtr<T>;
+    type RawMutPointer<T: Clone + FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
 /// Operations currently supported by the safer variants of the Linux futex syscall

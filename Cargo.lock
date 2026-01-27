@@ -916,6 +916,7 @@ dependencies = [
  "seccompiler",
  "spin 0.9.8",
  "syscalls",
+ "zerocopy",
 ]
 
 [[package]]
@@ -951,6 +952,7 @@ dependencies = [
  "thiserror",
  "x509-cert",
  "x86_64",
+ "zerocopy",
 ]
 
 [[package]]
