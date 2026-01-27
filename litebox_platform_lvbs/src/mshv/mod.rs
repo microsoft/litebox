@@ -8,6 +8,7 @@ pub mod hvcall;
 mod hvcall_mm;
 mod hvcall_vp;
 mod mem_integrity;
+pub(crate) mod ringbuffer;
 pub(crate) mod vsm;
 mod vsm_intercept;
 mod vsm_optee_smc;

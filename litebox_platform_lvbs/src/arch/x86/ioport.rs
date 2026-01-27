@@ -3,14 +3,9 @@
 
 //! I/O Port-based serial communication
 
+use crate::mshv::ringbuffer::ringbuffer;
 use core::{arch::asm, fmt};
 use spin::{Mutex, Once};
-
-//ringbuffer imports
-extern crate alloc;
-use crate::mshv::vsm::{get_ringbuffer_phys_addr, get_ringbuffer_size, is_ringbuffer_allocated};
-use alloc::{boxed::Box, slice};
-use x86_64::structures::paging::PageTableFlags;
 
 // LVBS uses COM PORT 2 for printing out debug messages
 const COM_PORT_2: u16 = 0x2F8;
@@ -71,65 +66,6 @@ fn modem_control(port: u16, value: u8) {
 #[inline(always)]
 fn line_status(port: u16) -> u8 {
     inb(port + IN_LINE_STATUS_OFFSET)
-}
-
-pub struct RingBuffer {
-    data: Box<[u8]>,
-    head_lpos: usize,
-}
-
-impl RingBuffer {
-    /// Create a new RingBuffer mapped to the given physical address and size
-    ///
-    /// # Panics
-    ///
-    /// Panics if the mapped size is less than the requested size
-    pub fn new(phys_addr: x86_64::PhysAddr, size: usize) -> Self {
-        let platform = crate::platform_low();
-
-        // Map the physical memory to virtual space
-        let core::prelude::v1::Ok((virt_ptr, mapped_size)) = platform.map_vtl0_phys_range(
-            phys_addr,
-            phys_addr + size as u64,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-        ) else {
-            todo!()
-        };
-
-        // Ensure we have enough space
-        assert!(mapped_size >= size);
-
-        // Create slice from mapped memory
-        let slice = unsafe { slice::from_raw_parts_mut(virt_ptr, size) };
-        slice.fill(0);
-
-        // Convert to boxed slice
-        let data = unsafe { Box::from_raw(slice) };
-
-        Self { data, head_lpos: 0 }
-    }
-
-    // #[inline]
-    pub fn size(&self) -> usize {
-        self.data.len()
-    }
-
-    #[inline]
-    fn mask(&self) -> usize {
-        self.size() - 1
-    }
-
-    pub fn write(&mut self, buf: &[u8]) -> usize {
-        let mut written = 0;
-        while written < buf.len() {
-            let index = self.head_lpos & self.mask();
-            self.data[index] = buf[written];
-            self.head_lpos += 1;
-            written += 1;
-        }
-
-        written
-    }
 }
 
 pub struct ComPort {
@@ -206,27 +142,9 @@ fn com() -> &'static Mutex<ComPort> {
     })
 }
 
-fn ringbuffer() -> &'static Mutex<RingBuffer> {
-    static RINGBUFFER_ONCE: Once<Mutex<RingBuffer>> = Once::new();
-    RINGBUFFER_ONCE.call_once(|| {
-        let ring_buffer = RingBuffer::new(
-            get_ringbuffer_phys_addr().unwrap(),
-            get_ringbuffer_size().unwrap(),
-        );
-        Mutex::new(ring_buffer)
-    })
-}
-
 impl fmt::Write for ComPort {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.write_string(s);
-        Ok(())
-    }
-}
-
-impl fmt::Write for RingBuffer {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.write(s.as_bytes());
         Ok(())
     }
 }
@@ -235,8 +153,8 @@ impl fmt::Write for RingBuffer {
 pub fn print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
     let _ = com().lock().write_fmt(args);
-    if is_ringbuffer_allocated() {
-        let _ring_buffer = ringbuffer().lock().write_fmt(args);
+    if let Some(rb) = ringbuffer() {
+        let _ = rb.lock().write_fmt(args);
     }
 }
 
