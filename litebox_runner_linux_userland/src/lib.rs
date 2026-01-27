@@ -272,7 +272,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let shim = shim.clone();
         let shutdown_clone = shutdown.clone();
         let child = std::thread::spawn(move || {
-            const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(50);
+            const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(5);
             pin_thread_to_cpu(0);
 
             while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
