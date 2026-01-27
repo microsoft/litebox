@@ -74,20 +74,20 @@ impl Task {
             .map_err(|_| TeeResult::OutOfMemory)?;
         let padded_start = addr.as_usize() + pad_begin;
 
-        // Protect the padding regions with PROT_NONE to prevent accidental access.
+        // Unmap the padding regions to free physical memory.
+        // Using munmap instead of mprotect(PROT_NONE) actually deallocates the frames.
         // pad_begin region: [addr, align_down(padded_start, PAGE_SIZE))
         let pad_begin_end = align_down(padded_start, PAGE_SIZE);
         if addr.as_usize() < pad_begin_end {
-            let _ = self.sys_mprotect(addr, pad_begin_end - addr.as_usize(), ProtFlags::PROT_NONE);
+            let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
         // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
         let pad_end_start = (padded_start + num_bytes).next_multiple_of(PAGE_SIZE);
         let region_end = addr.as_usize() + total_size;
         if pad_end_start < region_end {
-            let _ = self.sys_mprotect(
+            let _ = self.sys_munmap(
                 UserMutPtr::from_usize(pad_end_start),
                 region_end - pad_end_start,
-                ProtFlags::PROT_NONE,
             );
         }
 
@@ -252,20 +252,20 @@ impl Task {
             return Err(TeeResult::AccessDenied);
         }
 
-        // Protect the padding regions with PROT_NONE to prevent accidental access.
+        // Unmap the padding regions to free physical memory.
+        // Using munmap instead of mprotect(PROT_NONE) actually deallocates the frames.
         // pad_begin region: [addr, align_down(padded_start, PAGE_SIZE))
         let pad_begin_end = align_down(padded_start, PAGE_SIZE);
         if addr.as_usize() < pad_begin_end {
-            let _ = self.sys_mprotect(addr, pad_begin_end - addr.as_usize(), ProtFlags::PROT_NONE);
+            let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
         // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
         let pad_end_start = (padded_start + num_bytes).next_multiple_of(PAGE_SIZE);
         let region_end = addr.as_usize() + total_size;
         if pad_end_start < region_end {
-            let _ = self.sys_mprotect(
+            let _ = self.sys_munmap(
                 UserMutPtr::from_usize(pad_end_start),
                 region_end - pad_end_start,
-                ProtFlags::PROT_NONE,
             );
         }
 

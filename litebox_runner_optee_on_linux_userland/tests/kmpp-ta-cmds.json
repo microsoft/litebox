@@ -4,7 +4,7 @@
     "args": [
       {
         "param_type": "value_input",
-        "value_a": 0,
+        "value_a": 1,
         "value_b": 0
       },
       {
@@ -14,43 +14,45 @@
   },
   {
     "func_id": "invoke_command",
-    "cmd_id": 4,
+    "cmd_id": 7,
     "args": [
       {
         "param_type": "memref_input",
-        "data_base64": "AwAAAAMAAABKiCTN5GFOs6a+FgXARp22AAgAAAMAAAA="
+        "data_base64": "BAAAAAcAAADVbVcST7pTWSUYE/EyKlH1AQAAAEVDQzIDAAAAnwEAACAAAAAgAAAAIAAAAHjsdNQqqPaLXw1P1Fnhati6/oDk3OPVM1uT6COvFUuobePYUFdU1OfH/75ZPEcDPBZIT7RWxk3/AHuh05/4XHkEwt+usEI4oY93yjyBRXHzzf3BGOhEvsvXZr5XTYv4Yg=="
       },
       {
         "param_type": "memref_output",
-        "buffer_size": 1024
+        "buffer_size": 300
+      }
+    ]
+  },
+  {
+    "func_id": "close_session"
+  },
+  {
+    "func_id": "open_session",
+    "args": [
+      {
+        "param_type": "value_input",
+        "value_a": 1,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_output"
       }
     ]
   },
   {
     "func_id": "invoke_command",
-    "cmd_id": 0,
+    "cmd_id": 7,
     "args": [
       {
         "param_type": "memref_input",
-        "data_base64": "AwAAAAAAAABKiCTN5GFOs6a+FgXARp22MC5XVmxXSHpkY2g3OHdzZHhXTUs3V3BpL29VV2s9AAADAAAACAAAABAAAAAgAAAAMAIAAOBmqUlcVsCEWrNU+JMkIeY/Q2sQ797Eu8l116gVkhsxLk2JpoE1ZU5KF9y+SFvipbe0/YPI4EOgK/Y7JhxCIfQq4L2reIxNzkIu434rYw6zzeXGAyM1PXprU3BjLzpWJz68f302oWfiIXxx/uRgC9gKLB9KmuiFG8vI0TW+otyIgDxHAc1cUJZzdoCWWCHHBdqfXivVVx0DxB2+21BwQ6OqCO0wZQZMZ9AT/ZtbHdn5ZFIYZS9lwfPcthh7qyao/kauiwoxI+WKkm08kUnkdf5IsdNvO6zFybNRCZPcrq9w9zVDmk8+Lgq9TR30BmLf0c2NVNkgMRZLphC+7OWYgQpOgEfl7qgn2pl0s6xvaRnoHPyhKPyECSgI8A63gUlFiP1So8Gw0GHsSjm+S8tLo9HGrZsYSlhmK4XybqkDWk97wl4R3JJPjBykEj9+WaWu29I6zrakzn6zCqhNREW/K5lXujD88CUdsyP1kHDkYaFZu9uqgLl9CHLtlkLdC0iflb3TXfwDa/ur09QPuOwiLg3k0D42emYFx9Ags+qGhGESgcDl0oG7zPizgmNOckWFfq8wQFz9JATR+WSx/0AHrkEVAJwaaWtFyhg5i7SBKcsJKqdyiHOkn55sNV+Ci/J8SgfzGqs5bK+h1PdxbLCOl6eNy2j29dVMB2d1anyAJlcVKVfu5LdI4dnNUdvj4bzhbmOhRd1RfJCq18qr1/xyakfgBvNSvo39WsxQhP5Oa8bAVI6WwoiYRm/gSgnRG868KjzddAqO1DJypVJLWLjHiL3xt4ZkjiasKkdCspfCdgzoYBh+kIcFnIA="
+        "data_base64": "BAAAAAcAAABYkP8laTYwxsaa2kIarydqAQAAAEVDQzIDAAAAnwEAACAAAAAgAAAAIAAAAHjsdNQqqPaLXw1P1Fnhati6/oDk3OPVM1uT6COvFUuobePYUFdU1OfH/75ZPEcDPBZIT7RWxk3/AHuh05/4XHkEwt+usEI4oY93yjyBRXHzzf3BGOhEvsvXZr5XTYv4Yg=="
       },
       {
         "param_type": "memref_output",
-        "buffer_size": 1024
-      }
-    ]
-  },
-  {
-    "func_id": "invoke_command",
-    "cmd_id": 3,
-    "args": [
-      {
-        "param_type": "memref_input",
-        "data_base64": "AwAAAAMAAABKiCTN5GFOs6a+FgXARp22AAAAAOWEw4MCAAAABgAAAAADAAAoAAAAAAAAAKACAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      },
-      {
-        "param_type": "memref_output",
-        "buffer_size": 1024
+        "buffer_size": 300
       }
     ]
   },

@@ -314,30 +314,39 @@ impl litebox::platform::Provider for LinuxUserland {}
 ///
 /// # Safety
 /// The context must be valid guest context.
-pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs) -> T
+pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
     run_thread_inner(&shim, ctx, false);
-    shim
 }
 
-/// Re-enters a guest thread using the provided shim and the given initial context.
+/// Run a guest thread using a reference to the shim.
 ///
-/// This will run until the thread terminates or returns.
-///
-/// # Arguments
-/// * `shim` - The shim to use for handling syscalls and other events.
-/// * `ctx` - The initial execution context for the thread.
+/// Unlike `run_thread`, this version takes a reference instead of ownership,
+/// avoiding struct moves that could invalidate internal state.
 ///
 /// # Safety
 /// The context must be valid guest context.
-pub unsafe fn reenter_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs) -> T
+pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
-    run_thread_inner(&shim, ctx, true);
-    shim
+    run_thread_inner(shim, ctx, false);
+}
+
+/// Re-enter a guest thread using a reference to the shim.
+///
+/// This version takes a reference instead of ownership, avoiding struct moves
+/// that could invalidate internal state.
+///
+/// # Safety
+/// The context must be valid guest context.
+pub unsafe fn reenter_thread<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
+where
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+{
+    run_thread_inner(shim, ctx, true);
 }
 
 struct ThreadContext<'a> {

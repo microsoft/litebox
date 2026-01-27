@@ -82,7 +82,6 @@ impl Task {
     }
 
     /// Handle syscall `munmap`
-    #[allow(dead_code)]
     pub(crate) fn sys_munmap(&self, addr: UserMutPtr<u8>, len: usize) -> Result<(), Errno> {
         let pm = &self.global.pm;
         litebox_common_linux::mm::sys_munmap(pm, addr, len)

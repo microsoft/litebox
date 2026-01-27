@@ -75,33 +75,47 @@
 /*
  * ISR stub for interrupts WITHOUT an error code.
  * The CPU does not push an error code, so we push a dummy 0.
+ *
+ * Stack alignment: CPU aligns RSP to 16 bytes before pushing interrupt frame.
+ * Without error code, CPU pushes 5 values (40 bytes), so at entry RSP % 16 == 8.
+ * After push 0 + push_regs (16 pushes = 128 bytes), RSP % 16 == 8.
+ * We need RSP % 16 == 0 before call so callee sees RSP % 16 == 8.
  */
 .macro isr_no_err_code name:req handler:req
 .global \name
 \name:
     cld
-    push    0           /* Push dummy error code */
+    push    0                   /* Push dummy error code */
     push_regs
-    mov     rdi, rsp    /* Pass pointer to saved registers as first arg */
+    sub     rsp, 8              /* Align stack for call (RSP % 16 == 0) */
+    lea     rdi, [rsp + 8]      /* Pass pointer to saved registers as first arg */
     call    \handler
+    add     rsp, 8              /* Remove alignment padding */
     pop_regs
-    add     rsp, 8      /* Skip error code */
+    add     rsp, 8              /* Skip error code */
     iretq
 .endm
 
 /*
  * ISR stub for interrupts WITH an error code.
  * The CPU pushes the error code automatically.
+ *
+ * Stack alignment: CPU aligns RSP to 16 bytes before pushing interrupt frame.
+ * With error code, CPU pushes 6 values (48 bytes), so at entry RSP % 16 == 0.
+ * After push_regs (15 pushes = 120 bytes), RSP % 16 == 8.
+ * We need RSP % 16 == 0 before call so callee sees RSP % 16 == 8.
  */
 .macro isr_with_err_code name:req handler:req
 .global \name
 \name:
     cld
     push_regs
-    mov     rdi, rsp    /* Pass pointer to saved registers as first arg */
+    sub     rsp, 8              /* Align stack for call (RSP % 16 == 0) */
+    lea     rdi, [rsp + 8]      /* Pass pointer to saved registers as first arg */
     call    \handler
+    add     rsp, 8              /* Remove alignment padding */
     pop_regs
-    add     rsp, 8      /* Skip error code */
+    add     rsp, 8              /* Skip error code */
     iretq
 .endm
 

@@ -41,10 +41,14 @@ impl Task {
     }
 
     /// A system call that a TA calls when it panics.
+    ///
+    /// Per OP-TEE OS behavior: when a TA panics, the kernel returns `TEE_ERROR_TARGET_DEAD`
+    /// to the caller, regardless of the panic code. The panic code is logged for debugging.
     pub fn sys_panic(&self, code: usize) -> usize {
-        litebox::log_println!(self.global.platform, "panic with code {}", code,);
+        litebox::log_println!(self.global.platform, "TA panic with code {:#x}", code,);
 
-        code
+        // Return TARGET_DEAD to match OP-TEE OS behavior
+        litebox_common_optee::TeeResult::TargetDead as usize
     }
 
     /// A system call to print out a message.

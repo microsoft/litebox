@@ -13,6 +13,5 @@ pub const REWRITER_VERSION_NUMBER: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
 pub(crate) const DEFAULT_STACK_SIZE: usize = 1024 * 1024; // 1 MB
 
-/// A default low address is used for the binary (which grows upwards) to avoid
-/// conflicts with the kernel's memory mappings (which grows downwards).
-pub(crate) const DEFAULT_LOW_ADDR: usize = 0x1000_0000;
+// Re-export from litebox_common_optee for convenience
+pub(crate) use litebox_common_optee::TA_DEFAULT_LOW_ADDR as DEFAULT_LOW_ADDR;

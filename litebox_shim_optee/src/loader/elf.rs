@@ -257,6 +257,8 @@ pub enum ElfLoaderError {
     InvalidStackAddr,
     #[error("failed to mmap")]
     MappingError(#[from] MappingError),
+    #[error("TA binary UUID does not match expected UUID")]
+    InvalidUuid,
 }
 
 impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
@@ -268,6 +270,7 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
                 litebox_common_linux::errno::Errno::ENOMEM
             }
             ElfLoaderError::LoadError(e) => e.into(),
+            ElfLoaderError::InvalidUuid => litebox_common_linux::errno::Errno::EINVAL,
         }
     }
 }
