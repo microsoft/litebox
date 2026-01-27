@@ -302,7 +302,7 @@ impl Task {
             return ContinueOperation::ExitThread;
         }
         let res: Result<(), TeeResult> = match request {
-            SyscallRequest::Log { buf, len } => match unsafe { buf.to_owned_slice(len) } {
+            SyscallRequest::Log { buf, len } => match buf.to_owned_slice(len) {
                 Some(buf) => self.sys_log(&buf),
                 None => Err(TeeResult::BadParameters),
             },
@@ -315,7 +315,7 @@ impl Task {
                 blen,
                 prop_type,
             } => {
-                if let Some(buf_length) = unsafe { blen.read_at_offset(0) }
+                if let Some(buf_length) = blen.read_at_offset(0)
                     && usize::try_from(buf_length).unwrap() <= MAX_KERNEL_BUF_SIZE
                 {
                     let mut prop_buf = vec![0u8; usize::try_from(buf_length).unwrap()];
@@ -345,7 +345,7 @@ impl Task {
                 name,
                 name_len,
                 index,
-            } => match unsafe { name.to_owned_slice(name_len) } {
+            } => match name.to_owned_slice(name_len) {
                 Some(name) => Task::sys_get_property_name_to_index(prop_set, &name, index),
                 None => Err(TeeResult::BadParameters),
             },
@@ -356,8 +356,8 @@ impl Task {
                 ta_sess_id,
                 ret_orig,
             } => {
-                if let Some(ta_uuid) = unsafe { ta_uuid.read_at_offset(0) }
-                    && let Some(usr_params) = unsafe { usr_params.read_at_offset(0) }
+                if let Some(ta_uuid) = ta_uuid.read_at_offset(0)
+                    && let Some(usr_params) = usr_params.read_at_offset(0)
                 {
                     Task::sys_open_ta_session(
                         ta_uuid,
@@ -378,7 +378,7 @@ impl Task {
                 params,
                 ret_orig,
             } => {
-                if let Some(params) = unsafe { params.read_at_offset(0) } {
+                if let Some(params) = params.read_at_offset(0) {
                     self.sys_invoke_ta_command(ta_sess_id, cancel_req_to, cmd_id, params, ret_orig)
                 } else {
                     Err(TeeResult::BadParameters)
@@ -395,12 +395,10 @@ impl Task {
                 state,
             } => self.sys_cryp_state_alloc(algo, op_mode, key1, key2, state),
             SyscallRequest::CrypStateFree { state } => self.sys_cryp_state_free(state),
-            SyscallRequest::CipherInit { state, iv, iv_len } => {
-                match unsafe { iv.to_owned_slice(iv_len) } {
-                    Some(iv) => self.sys_cipher_init(state, &iv),
-                    None => Err(TeeResult::BadParameters),
-                }
-            }
+            SyscallRequest::CipherInit { state, iv, iv_len } => match iv.to_owned_slice(iv_len) {
+                Some(iv) => self.sys_cipher_init(state, &iv),
+                None => Err(TeeResult::BadParameters),
+            },
             SyscallRequest::CipherUpdate {
                 state,
                 src,
@@ -441,7 +439,7 @@ impl Task {
                 obj,
                 attrs,
                 attr_count,
-            } => match unsafe { attrs.to_owned_slice(attr_count) } {
+            } => match attrs.to_owned_slice(attr_count) {
                 Some(attrs) => self.sys_cryp_obj_populate(obj, &attrs),
                 None => Err(TeeResult::BadParameters),
             },
@@ -535,7 +533,7 @@ impl Task {
             return ContinueOperation::ExitThread;
         }
         let res: Result<(), TeeResult> = match request {
-            LdelfSyscallRequest::Log { buf, len } => match unsafe { buf.to_owned_slice(len) } {
+            LdelfSyscallRequest::Log { buf, len } => match buf.to_owned_slice(len) {
                 Some(buf) => self.sys_log(&buf),
                 None => Err(TeeResult::BadParameters),
             },
@@ -552,7 +550,7 @@ impl Task {
                 handle,
             } => {
                 if uuid_size == core::mem::size_of::<TeeUuid>()
-                    && let Some(ta_uuid) = unsafe { uuid.read_at_offset(0) }
+                    && let Some(ta_uuid) = uuid.read_at_offset(0)
                 {
                     self.sys_open_bin(ta_uuid, handle)
                 } else {
@@ -701,7 +699,7 @@ impl Task {
         };
         if let Some(ldelf_arg_address) = ldelf_arg_address {
             let ldelf_arg_ptr = UserConstPtr::<LdelfArg>::from_usize(ldelf_arg_address);
-            if let Some(ldef_arg) = unsafe { ldelf_arg_ptr.read_at_offset(0) } {
+            if let Some(ldef_arg) = ldelf_arg_ptr.read_at_offset(0) {
                 let entry_func = usize::try_from(ldef_arg.entry_func).unwrap();
                 // If `ldelf` has been successfully executed, it loads the given TA and stores the TA's entry
                 // point into `ldelf_arg.entry_func`.
@@ -732,7 +730,7 @@ impl Task {
     /// the given `addr` is within the user space.
     pub(crate) fn set_ta_entry_point(&self, addr: usize) {
         let ptr = UserConstPtr::<u8>::from_usize(addr);
-        if unsafe { ptr.read_at_offset(0) }.is_some() {
+        if ptr.read_at_offset(0).is_some() {
             self.ta_entry_point.set(addr);
         }
     }
@@ -756,16 +754,14 @@ fn handle_cipher_update_or_final<F>(
 where
     F: Fn(&Task, TeeCrypStateHandle, &[u8], &mut [u8], &mut usize) -> Result<(), TeeResult>,
 {
-    if let Some(src_slice) = unsafe { src.to_owned_slice(src_len) }
-        && let Some(length) = unsafe { dst_len.read_at_offset(0) }
+    if let Some(src_slice) = src.to_owned_slice(src_len)
+        && let Some(length) = dst_len.read_at_offset(0)
         && usize::try_from(length).unwrap() <= MAX_KERNEL_BUF_SIZE
     {
         let mut length = usize::try_from(length).unwrap();
         let mut kernel_buf = vec![0u8; length];
         syscall_fn(task, state, &src_slice, &mut kernel_buf, &mut length).and_then(|()| {
-            unsafe {
-                let _ = dst_len.write_at_offset(0, u64::try_from(length).unwrap());
-            }
+            let _ = dst_len.write_at_offset(0, u64::try_from(length).unwrap());
             dst.copy_from_slice(0, &kernel_buf[..length])
                 .ok_or(TeeResult::OutOfMemory)
         })
@@ -878,7 +874,10 @@ impl TeeObjMap {
                     let key_slice = unsafe { core::slice::from_raw_parts(key_addr, key_len) };
                     tee_obj.set_key(key_slice);
                 }
-                _ => todo!("handle attribute ID: {}", user_attrs[0].attribute_id as u32),
+                _ => todo!(
+                    "handle attribute ID: {}",
+                    user_attrs[0].attribute_id.value()
+                ),
             }
 
             Ok(())
