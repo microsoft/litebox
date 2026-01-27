@@ -45,6 +45,7 @@
 //! - **Improved throughput**: Network worker can process packets continuously without
 //!   being blocked by user operations.
 
+use alloc::boxed::Box;
 use core::{
     net::SocketAddr,
     sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering},
@@ -148,7 +149,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         }
         match self {
             NetworkProxy::Stream(channel) => channel.try_write(buf),
-            NetworkProxy::Datagram(channel) => channel.send_to(buf.to_vec(), destination),
+            NetworkProxy::Datagram(channel) => channel.send_to(buf, destination),
             NetworkProxy::Raw => unimplemented!(),
         }
     }
@@ -184,8 +185,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
     }
 
     /// Check if there is data pending in the TX buffer to be sent.
-    ///
-    /// Used by the network worker to determine if it needs to drain data to smoltcp.
     pub(super) fn has_pending_tx(&self) -> bool {
         match self {
             NetworkProxy::Stream(channel) => channel.has_pending_tx(),
@@ -612,7 +611,7 @@ pub fn new_stream_channel_with_capacity<Platform: RawSyncPrimitivesProvider + Ti
 #[derive(Clone, Debug)]
 pub struct DatagramMessage {
     /// The data payload
-    pub data: alloc::vec::Vec<u8>,
+    pub data: Box<[u8]>,
     /// Source address (for RX) or destination address (for TX)
     pub addr: Option<core::net::SocketAddr>,
 }
@@ -725,11 +724,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     ///
     /// The datagram is queued for transmission by the network worker.
     /// Returns the number of bytes queued (always `data.len()` on success).
-    pub fn send_to(
-        &self,
-        data: alloc::vec::Vec<u8>,
-        addr: Option<SocketAddr>,
-    ) -> Result<usize, SendError> {
+    pub fn send_to(&self, data: &[u8], addr: Option<SocketAddr>) -> Result<usize, SendError> {
         if let Some(addr) = addr {
             if addr.port() == 0 {
                 return Err(SendError::Unaddressable);
@@ -740,7 +735,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         }
 
         let size = data.len();
-        let msg = DatagramMessage { data, addr };
+        let msg = DatagramMessage {
+            data: data.into(),
+            addr,
+        };
         let mut tx_prod = self.inner.tx_prod.lock();
 
         match tx_prod.try_push(msg) {
@@ -798,7 +796,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     /// - `None` if the closure returned `None` or the queue is full
     pub(super) fn try_recv_datagram_with<F>(&self, f: F) -> Option<usize>
     where
-        F: FnOnce() -> Option<(alloc::vec::Vec<u8>, SocketAddr)>,
+        F: FnOnce() -> Option<(Box<[u8]>, SocketAddr)>,
     {
         let mut rx_prod = self.inner.rx_prod.lock();
 
@@ -1158,7 +1156,7 @@ mod tests {
             core::net::Ipv4Addr::new(10, 0, 0, 1),
             8080,
         )));
-        let result = channel.send_to(b"Hello, UDP!".to_vec(), addr);
+        let result = channel.send_to(b"Hello, UDP!", addr);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 11);
 
@@ -1190,7 +1188,8 @@ mod tests {
             core::net::Ipv4Addr::new(192, 168, 1, 1),
             1234,
         ));
-        let result = channel.try_recv_datagram_with(|| Some((b"Incoming packet".to_vec(), addr)));
+        let result =
+            channel.try_recv_datagram_with(|| Some((Box::from(*b"Incoming packet"), addr)));
         assert_eq!(result, Some(15));
 
         // Should be readable
@@ -1229,12 +1228,12 @@ mod tests {
 
         // Fill the TX queue
         for i in 0..queue_size {
-            let result = channel.send_to(alloc::vec![0; i], None);
+            let result = channel.send_to(&alloc::vec![0; i], None);
             assert!(result.is_ok());
         }
 
         // Next send should fail
-        let result = channel.send_to(alloc::vec![99], None);
+        let result = channel.send_to(&[99], None);
         assert!(matches!(result, Err(SendError::BufferFull)));
     }
 
@@ -1251,7 +1250,7 @@ mod tests {
 
         // Fill the RX queue
         for i in 0..queue_size {
-            let data = alloc::vec![0; i];
+            let data: Box<[u8]> = alloc::vec![0; i].into_boxed_slice();
             let result = channel.try_recv_datagram_with(|| Some((data, dummy_addr)));
             assert!(result.is_some());
         }
@@ -1260,7 +1259,7 @@ mod tests {
         assert!(channel.is_rx_full());
 
         // Next push should fail (returns None when full)
-        let result = channel.try_recv_datagram_with(|| Some((alloc::vec![99], dummy_addr)));
+        let result = channel.try_recv_datagram_with(|| Some((Box::from([99u8]), dummy_addr)));
         assert!(result.is_none());
     }
 
@@ -1274,7 +1273,7 @@ mod tests {
         ));
 
         // Push a large datagram
-        let data = alloc::vec![42u8; 100];
+        let data: Box<[u8]> = alloc::vec![42u8; 100].into_boxed_slice();
         channel
             .try_recv_datagram_with(|| Some((data.clone(), dummy_addr)))
             .unwrap();
@@ -1297,7 +1296,7 @@ mod tests {
         ));
 
         // Push a large datagram
-        let data = alloc::vec![42u8; 100];
+        let data: Box<[u8]> = alloc::vec![42u8; 100].into_boxed_slice();
         channel
             .try_recv_datagram_with(|| Some((data.clone(), dummy_addr)))
             .unwrap();
@@ -1326,7 +1325,7 @@ mod tests {
 
         // Push a datagram using try_recv_datagram_with
         channel
-            .try_recv_datagram_with(|| Some((b"test".to_vec(), dummy_addr)))
+            .try_recv_datagram_with(|| Some((Box::from(*b"test"), dummy_addr)))
             .unwrap();
 
         // Now has IN
@@ -1344,7 +1343,7 @@ mod tests {
             core::net::Ipv4Addr::new(10, 0, 0, 1),
             8080,
         )));
-        channel.send_to(b"Hello!".to_vec(), addr).unwrap();
+        channel.send_to(b"Hello!", addr).unwrap();
 
         // Try to send but fail (return false)
         let result = channel.try_send_datagram_with(|_data, _dest| {

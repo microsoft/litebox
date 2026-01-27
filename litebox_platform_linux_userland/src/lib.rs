@@ -1093,7 +1093,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant {
     inner: Duration,
 }

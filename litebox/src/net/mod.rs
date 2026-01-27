@@ -134,6 +134,8 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
     specific: ProtocolSpecific,
+    /// The proxy associated with this socket to enable lock-free data transfer
+    /// and event notification
     proxy: Option<alloc::sync::Arc<NetworkProxy<Platform>>>,
 }
 
@@ -683,7 +685,7 @@ where
                                 core::net::SocketAddrV4::new(ipv4, meta.endpoint.port),
                             ),
                         };
-                        Some((data.to_vec(), source_addr))
+                        Some((data.into(), source_addr))
                     });
                     if received.is_none() {
                         break;
@@ -873,7 +875,7 @@ where
 
     /// Attempt to close as many queued-to-close FDs as possible. Returns `true` iff any of them
     /// were closed.
-    pub fn attempt_to_close_queued(&mut self) -> bool {
+    fn attempt_to_close_queued(&mut self) -> bool {
         if self.queued_for_closure.is_empty() {
             // fast path
             return false;
@@ -1300,11 +1302,8 @@ where
                     }
                     return Err(AcceptError::NoConnectionsReady);
                 };
-                // reset the accept state so that [`PollableSocketHandle::check_socket_events`] can send
-                // one [`Events::In`] per accepted connection.
-                // handle.previously_acceptable.store(false, Ordering::Relaxed);
                 if let Some(proxy) = &socket_handle.proxy {
-                    // No connections are ready; make sure the readable flag is cleared
+                    // reset the readable flag so that we send one [`Events::In`] event per accepted connection
                     proxy.set_readable(false);
                 }
                 // Pull that position out of the listening handles

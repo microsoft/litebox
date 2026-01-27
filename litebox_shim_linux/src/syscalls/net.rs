@@ -712,7 +712,6 @@ impl GlobalState {
             }
             // Get the assigned port
             let local_addr = net.get_local_addr(fd).map_err(Errno::from)?;
-            // Set the port in the proxy atomically (CAS ensures only one thread wins)
             // If another thread already set a port, that's fine - we'll use theirs
             let _ = proxy.set_datagram_local_port(local_addr.port());
         }
@@ -1409,7 +1408,7 @@ impl Task {
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 let mut total_sent = 0;
-                for iov in iovs.iter() {
+                for iov in &iovs {
                     if iov.iov_len == 0 {
                         continue;
                     }
