@@ -228,6 +228,16 @@ macro_rules! XRSTOR_ASM {
     };
 }
 
+/// VTL switch loop implemented in assembly.
+///
+/// # Register Assumptions
+///
+/// At each iteration start, this code only relies on `rip`, `rsp`, and `gs` which Hyper-V
+/// saves/restores across VTL switches. All other registers may contain VTL0 state and must
+/// be saved before use and restored before returning to VTL0.
+///
+/// VTL1 registers can be freely clobbered since this loop is stateless -- `rsp` is reset to
+/// the kernel stack each iteration and all state lives in per-CPU variables via `gs`.
 #[unsafe(naked)]
 unsafe extern "C" fn vtl_switch_loop_asm() -> ! {
     naked_asm!(
