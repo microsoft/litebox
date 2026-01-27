@@ -271,9 +271,9 @@ macro_rules! open_enum {
         $variant:ident = $value:literal,
     )+ }) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, FromBytes, IntoBytes)]
+        #[derive(Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes)]
         #[repr(transparent)]
-        $pub struct $name($pub $ty);
+        $pub struct $name($ty);
         #[allow(non_upper_case_globals)]
         impl $name {
             $($pub const $variant: $name = $name($value);)*
@@ -282,6 +282,10 @@ macro_rules! open_enum {
                     $($value => Self::$variant,)*
                     _ => return Err(Errno::EINVAL),
                 })
+            }
+            /// Get the underlying value for `self`.
+            $pub fn value(&self) -> &$ty {
+                &self.0
             }
         }
     };
@@ -1087,7 +1091,7 @@ bitflags::bitflags! {
 }
 
 /// `ldef_arg` from `optee_os/ldelf/include/ldelf.h`
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct LdelfArg {
     pub uuid: TeeUuid,
