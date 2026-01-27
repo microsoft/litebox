@@ -223,6 +223,7 @@ impl LinuxUserland {
         assert!(total_read < buf.len(), "buffer too small");
 
         let mut reserved_pages = alloc::vec::Vec::new();
+        #[cfg_attr(not(feature = "systrap_backend"), expect(unused_mut))]
         let mut vdso_address = None;
         let s = core::str::from_utf8(&buf[..total_read]).expect("invalid UTF-8");
         for line in s.lines() {
