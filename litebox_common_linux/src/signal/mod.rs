@@ -286,17 +286,17 @@ pub const SI_DETHREAD: i32 = -7;
 pub const SI_ASYNCNL: i32 = -60;
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Ucontext {
     pub flags: usize,
-    pub link: *mut Ucontext,
+    pub link: usize, // *mut Ucontext,
     pub stack: SigAltStack,
     pub mcontext: Sigcontext,
     pub sigmask: SigSet,
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Siginfo {
     pub signo: i32,
     pub errno: i32,
@@ -304,9 +304,16 @@ pub struct Siginfo {
     pub data: SiginfoData,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union SiginfoData {
+#[repr(C, packed)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+pub struct SiginfoData {
     pub pad: [u32; 29],
-    pub addr: usize,
+}
+
+impl SiginfoData {
+    pub fn new_addr(addr: usize) -> Self {
+        let mut pad = [0u32; 29];
+        pad.as_mut_bytes()[..core::mem::size_of::<usize>()].copy_from_slice(&addr.to_ne_bytes());
+        Self { pad }
+    }
 }

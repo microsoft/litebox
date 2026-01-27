@@ -55,6 +55,7 @@ impl SignalState {
                 sp: 0,
                 flags: SsFlags::DISABLE,
                 size: 0,
+                __pad: 0,
             }),
             last_exception: Cell::new(litebox::shim::ExceptionInfo {
                 exception: litebox::shim::Exception(0),
@@ -77,6 +78,7 @@ impl SignalState {
                 flags: SsFlags::DISABLE,
                 sp: 0,
                 size: 0,
+                __pad: 0,
             }
             .into(),
             // Preserve last exception
@@ -100,6 +102,7 @@ impl SignalState {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
+                __pad: 0,
             };
         }
         self.clear_sigaltstack();
@@ -153,6 +156,7 @@ impl SignalHandlers {
                         restorer: 0,
                         flags: SaFlags::empty(),
                         mask: SigSet::empty(),
+                        __pad: 0,
                     },
                     immutable: i == SignalHandlersInner::sig_index(Signal::SIGKILL)
                         || i == SignalHandlersInner::sig_index(Signal::SIGSTOP),
@@ -263,9 +267,7 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_KERNEL,
-        data: SiginfoData {
-            addr: fault_address,
-        },
+        data: SiginfoData::new_addr(fault_address),
     }
 }
 
@@ -306,6 +308,7 @@ impl SignalState {
                 sp: ss.sp,
                 flags: ss.flags & SsFlags::AUTODISARM,
                 size: ss.size,
+                __pad: 0,
             });
             Ok(())
         }
@@ -317,6 +320,7 @@ impl SignalState {
             sp: 0,
             flags: SsFlags::DISABLE,
             size: 0,
+            __pad: 0,
         });
     }
 
@@ -617,6 +621,7 @@ impl Task {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
+                __pad: 0,
             };
             // Don't allow further changes to this action.
             handler.immutable = true;

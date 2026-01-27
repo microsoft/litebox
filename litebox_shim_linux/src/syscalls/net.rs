@@ -27,6 +27,7 @@ use litebox_common_linux::{
     AddressFamily, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
     SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
 };
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{ConstPtr, Descriptor, MutPtr};
 use crate::{GlobalState, Task};
@@ -69,7 +70,7 @@ impl super::file::FilesState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C, packed)]
 struct CSockInetAddr {
     family: i16,
@@ -1300,7 +1301,8 @@ impl Task {
         msg: &litebox_common_linux::UserMsgHdr<Platform>,
         flags: SendFlags,
     ) -> Result<usize, Errno> {
-        let sock_addr = if msg.msg_name.as_usize() != 0 {
+        let msg_name = msg.msg_name;
+        let sock_addr = if msg_name.as_usize() != 0 {
             Some(read_sockaddr_from_user(
                 msg.msg_name,
                 msg.msg_namelen as usize,

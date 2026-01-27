@@ -661,7 +661,7 @@ bitflags::bitflags! {
 
 /// struct for SO_LINGER option
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Linger {
     pub onoff: u32,  /* Linger active		*/
     pub linger: u32, /* How long to linger for	*/
@@ -755,7 +755,7 @@ impl SocketOptionName {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Ucred {
     pub pid: u32,
@@ -1549,8 +1549,8 @@ pub struct CapData {
     pub inheritable: u32,
 }
 
-#[repr(C)]
-#[derive(Clone)]
+#[repr(C, packed)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct LinuxDirent64 {
     /// Inode number
     pub ino: u64,

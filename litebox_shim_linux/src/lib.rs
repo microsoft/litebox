@@ -1082,14 +1082,7 @@ impl Task {
                 .sys_get_robust_list(pid, head)
                 .and_then(|()| {
                     unsafe {
-                        len.write_at_offset(
-                            0,
-                            size_of::<
-                                litebox_common_linux::RobustListHead<
-                                    litebox_platform_multiplex::Platform,
-                                >,
-                            >(),
-                        )
+                        len.write_at_offset(0, size_of::<litebox_common_linux::RobustListHead>())
                     }
                     .ok_or(Errno::EFAULT)
                 })

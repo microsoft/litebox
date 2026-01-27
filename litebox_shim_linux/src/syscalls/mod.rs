@@ -39,10 +39,11 @@ macro_rules! common_functions_for_file_status {
 }
 
 pub(crate) use common_functions_for_file_status;
+use zerocopy::{FromBytes, IntoBytes};
 
 /// Helper function to write a value of type T to user memory.
 /// If the buffer size (i.e., provided `len`) is smaller than `size_of::<T>()`, only write up to `len` bytes.
-fn write_to_user<T>(
+fn write_to_user<T: FromBytes + IntoBytes>(
     val: T,
     optval: crate::MutPtr<u8>,
     len: u32,
@@ -56,7 +57,7 @@ fn write_to_user<T>(
 }
 /// Helper function to read a value of type T from user memory.
 /// If the buffer size (i.e., provided `optlen`) is smaller than `size_of::<T>()`, return EINVAL.
-fn read_from_user<T: Clone>(
+fn read_from_user<T: Clone + FromBytes>(
     optval: crate::ConstPtr<u8>,
     optlen: usize,
 ) -> Result<T, litebox_common_linux::errno::Errno> {
