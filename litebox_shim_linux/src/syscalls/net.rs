@@ -225,6 +225,9 @@ impl GlobalState {
             SockType::Raw => NetworkProxy::Raw,
             _ => unimplemented!(),
         };
+        // Save the proxy in both the descriptor table and the network subsystem so that the shim layer
+        // can access it without holding the network lock and the network subsystem can access it without
+        // involving the descriptor table (for both performance and convenience).
         let proxy = Arc::new(proxy);
         let old = dt.set_entry_metadata(fd, SocketProxy(proxy.clone()));
         assert!(old.is_none());
