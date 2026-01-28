@@ -1210,8 +1210,8 @@ type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::
     T,
 >;
 impl litebox::platform::RawPointerProvider for LinuxUserland {
-    type RawConstPointer<T: Clone + FromBytes> = UserConstPtr<T>;
-    type RawMutPointer<T: Clone + FromBytes + IntoBytes> = UserMutPtr<T>;
+    type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
 /// Operations currently supported by the safer variants of the Linux futex syscall

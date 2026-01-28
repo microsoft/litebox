@@ -58,7 +58,7 @@ fn write_to_user<T: FromBytes + IntoBytes>(
 }
 /// Helper function to read a value of type T from user memory.
 /// If the buffer size (i.e., provided `optlen`) is smaller than `size_of::<T>()`, return EINVAL.
-fn read_from_user<T: Clone + FromBytes>(
+fn read_from_user<T: FromBytes>(
     optval: crate::ConstPtr<u8>,
     optlen: usize,
 ) -> Result<T, litebox_common_linux::errno::Errno> {

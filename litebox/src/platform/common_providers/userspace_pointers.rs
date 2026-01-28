@@ -82,7 +82,7 @@ pub struct UserConstPtr<V, T: Sized> {
     _validator: core::marker::PhantomData<V>,
 }
 
-impl<V: ValidateAccess, T: Clone> UserConstPtr<V, T> {
+impl<V: ValidateAccess, T> UserConstPtr<V, T> {
     pub fn from_ptr(ptr: *const T) -> Self {
         Self {
             inner: ptr.expose_provenance(),
@@ -118,7 +118,7 @@ impl<V, T> Clone for UserConstPtr<V, T> {
 
 impl<V, T> Copy for UserConstPtr<V, T> {}
 
-impl<V, T: Clone> core::fmt::Debug for UserConstPtr<V, T> {
+impl<V, T> core::fmt::Debug for UserConstPtr<V, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("UserConstPtr").field(&self.inner).finish()
     }
@@ -128,10 +128,7 @@ impl<V, T: Clone> core::fmt::Debug for UserConstPtr<V, T> {
 ///
 /// Note that this is fallible only if recovering from exceptions (e.g., page fault or SIGSEGV)
 /// is supported.
-fn read_at_offset<V: ValidateAccess, T: Clone + FromBytes>(
-    ptr: *const T,
-    count: isize,
-) -> Option<T> {
+fn read_at_offset<V: ValidateAccess, T: FromBytes>(ptr: *const T, count: isize) -> Option<T> {
     let src = ptr.wrapping_add(usize::try_from(count).ok()?);
     let src = V::validate(src.cast_mut())?.cast_const();
     // Match on the size of `T` to use the appropriate fallible read function to
@@ -173,7 +170,7 @@ fn read_at_offset<V: ValidateAccess, T: Clone + FromBytes>(
     Some(val)
 }
 
-fn to_owned_slice<V: ValidateAccess, T: Clone + FromBytes>(
+fn to_owned_slice<V: ValidateAccess, T: FromBytes>(
     ptr: *const T,
     len: usize,
 ) -> Option<alloc::boxed::Box<[T]>> {
@@ -195,7 +192,7 @@ fn to_owned_slice<V: ValidateAccess, T: Clone + FromBytes>(
     }
 }
 
-impl<V: ValidateAccess, T: Clone + FromBytes> RawConstPointer<T> for UserConstPtr<V, T> {
+impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserConstPtr<V, T> {
     fn read_at_offset(self, count: isize) -> Option<T> {
         read_at_offset::<V, T>(self.as_ptr(), count)
     }
@@ -230,7 +227,7 @@ pub struct UserMutPtr<V, T: Sized> {
     _validator: core::marker::PhantomData<V>,
 }
 
-impl<V: ValidateAccess, T: Clone> UserMutPtr<V, T> {
+impl<V: ValidateAccess, T> UserMutPtr<V, T> {
     pub fn from_ptr(ptr: *mut T) -> Self {
         Self {
             inner: ptr.expose_provenance(),
@@ -260,7 +257,7 @@ impl<V, T> Clone for UserMutPtr<V, T> {
 
 impl<V, T> Copy for UserMutPtr<V, T> {}
 
-impl<V: ValidateAccess, T: Clone + FromBytes> RawConstPointer<T> for UserMutPtr<V, T> {
+impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserMutPtr<V, T> {
     fn read_at_offset(self, count: isize) -> Option<T> {
         read_at_offset::<V, T>(self.as_ptr().cast_const(), count)
     }
@@ -281,7 +278,7 @@ impl<V: ValidateAccess, T: Clone + FromBytes> RawConstPointer<T> for UserMutPtr<
     }
 }
 
-impl<V: ValidateAccess, T: Clone + FromBytes + IntoBytes> RawMutPointer<T> for UserMutPtr<V, T> {
+impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPtr<V, T> {
     fn write_at_offset(self, count: isize, value: T) -> Option<()> {
         let dst = self.as_ptr().wrapping_add(usize::try_from(count).ok()?);
         let dst = V::validate(dst)?;

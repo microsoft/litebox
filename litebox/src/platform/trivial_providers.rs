@@ -134,12 +134,12 @@ impl<T> Clone for TransparentConstPtr<T> {
     }
 }
 impl<T> Copy for TransparentConstPtr<T> {}
-impl<T: Clone> core::fmt::Debug for TransparentConstPtr<T> {
+impl<T> core::fmt::Debug for TransparentConstPtr<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("ConstPtr").field(&self.inner).finish()
     }
 }
-impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
+impl<T: FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
     fn read_at_offset(self, count: isize) -> Option<T> {
         let ptr = self.as_ptr();
         if ptr.is_null() || !ptr.is_aligned() {
@@ -154,7 +154,7 @@ impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
             // volatile here is dubious--this should really use inline asm or
             // perhaps atomic loads.
             1 | 2 | 4 | 8 => unsafe { p.read_volatile() },
-            _ => unsafe { (*p).clone() },
+            _ => unsafe { p.read() },
         })
     }
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
@@ -164,11 +164,11 @@ impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
         }
         // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
         // on T guarantees that any byte pattern is valid for T.
-        Some(
-            unsafe { core::slice::from_raw_parts(ptr, len) }
-                .to_vec()
-                .into_boxed_slice(),
-        )
+        let mut boxed = alloc::boxed::Box::<[T]>::new_uninit_slice(len);
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr, boxed.as_mut_ptr().cast(), len);
+            Some(boxed.assume_init())
+        }
     }
 
     fn as_usize(&self) -> usize {
@@ -197,7 +197,7 @@ pub struct TransparentMutPtr<T: Sized> {
     _phantom_ptr: core::marker::PhantomData<*mut T>,
 }
 
-impl<T: Clone> TransparentMutPtr<T> {
+impl<T> TransparentMutPtr<T> {
     /// Explicitly-private function.  See
     /// [`super::common_providers::userspace_pointers::UserConstPtr::as_ptr`]
     /// for more details.
@@ -211,12 +211,12 @@ impl<T> Clone for TransparentMutPtr<T> {
     }
 }
 impl<T> Copy for TransparentMutPtr<T> {}
-impl<T: Clone> core::fmt::Debug for TransparentMutPtr<T> {
+impl<T> core::fmt::Debug for TransparentMutPtr<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("MutPtr").field(&self.inner).finish()
     }
 }
-impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentMutPtr<T> {
+impl<T: FromBytes> RawConstPointer<T> for TransparentMutPtr<T> {
     fn read_at_offset(self, count: isize) -> Option<T> {
         let ptr = self.as_ptr();
         if ptr.is_null() || !ptr.is_aligned() {
@@ -230,7 +230,7 @@ impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentMutPtr<T> {
             // volatile here is dubious--this should really use inline asm or
             // perhaps atomic loads.
             1 | 2 | 4 | 8 => unsafe { ptr.offset(count).read_volatile() },
-            _ => unsafe { (*ptr.offset(count)).clone() },
+            _ => unsafe { ptr.offset(count).read() },
         })
     }
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
@@ -240,11 +240,11 @@ impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentMutPtr<T> {
         }
         // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
         // on T guarantees that any byte pattern is valid for T.
-        Some(
-            unsafe { core::slice::from_raw_parts(ptr, len) }
-                .to_vec()
-                .into_boxed_slice(),
-        )
+        let mut boxed = alloc::boxed::Box::<[T]>::new_uninit_slice(len);
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr, boxed.as_mut_ptr().cast(), len);
+            Some(boxed.assume_init())
+        }
     }
 
     fn as_usize(&self) -> usize {
@@ -257,7 +257,7 @@ impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentMutPtr<T> {
         }
     }
 }
-impl<T: Clone + FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T> {
+impl<T: FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T> {
     fn write_at_offset(self, count: isize, value: T) -> Option<()> {
         let ptr = self.as_ptr();
         if ptr.is_null() || !ptr.is_aligned() {

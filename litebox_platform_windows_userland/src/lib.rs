@@ -1254,8 +1254,8 @@ type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::Us
 >;
 
 impl litebox::platform::RawPointerProvider for WindowsUserland {
-    type RawConstPointer<T: Clone + FromBytes> = UserConstPtr<T>;
-    type RawMutPointer<T: Clone + FromBytes + IntoBytes> = UserMutPtr<T>;
+    type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
 #[allow(

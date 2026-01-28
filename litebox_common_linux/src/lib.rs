@@ -2812,7 +2812,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
         Ok(dispatcher)
     }
 
-    fn parse_futex<T: Clone + FromBytes + IntoBytes>(
+    fn parse_futex<T: FromBytes + IntoBytes>(
         ctx: &PtRegs,
         time_param: impl FnOnce(Option<Platform::RawMutPointer<T>>) -> TimeParam<Platform>,
         unsupported_einval: impl Fn(core::fmt::Arguments<'_>) -> errno::Errno,
@@ -3204,14 +3204,14 @@ reinterpret_truncated_from_usize_for! {
 pub trait ReinterpretUsizeAsPtr<T>: Sized {
     fn reinterpret_usize_as_ptr(v: usize) -> Self;
 }
-impl<T: Clone + FromBytes, P: RawConstPointer<T>>
-    ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>> for P
+impl<T: FromBytes, P: RawConstPointer<T>> ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>>
+    for P
 {
     fn reinterpret_usize_as_ptr(v: usize) -> Self {
         P::from_usize(v)
     }
 }
-impl<T: Clone + FromBytes, P: RawConstPointer<T>>
+impl<T: FromBytes, P: RawConstPointer<T>>
     ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<P>
 {
     fn reinterpret_usize_as_ptr(v: usize) -> Self {

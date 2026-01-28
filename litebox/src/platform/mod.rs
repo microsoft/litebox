@@ -377,8 +377,8 @@ pub trait DebugLogProvider {
 /// should define their own `repr(C)` newtype wrappers that perform relevant copying between user
 /// and kernel.
 pub trait RawPointerProvider {
-    type RawConstPointer<T: Clone + FromBytes>: RawConstPointer<T>;
-    type RawMutPointer<T: Clone + FromBytes + IntoBytes>: RawMutPointer<T>;
+    type RawConstPointer<T: FromBytes>: RawConstPointer<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes>: RawMutPointer<T>;
 }
 
 /// A read-only raw pointer, morally equivalent to `*const T`.
@@ -386,7 +386,7 @@ pub trait RawPointerProvider {
 /// See [`RawPointerProvider`] for details.
 pub trait RawConstPointer<T>: Copy + core::fmt::Debug + FromBytes + IntoBytes
 where
-    T: Clone + FromBytes,
+    T: FromBytes,
 {
     /// Get the address of the pointer as a `usize`.
     fn as_usize(&self) -> usize;
@@ -454,7 +454,7 @@ where
 /// on the pointer in addition to the writing-related functionality defined by this trait.
 pub trait RawMutPointer<T>: Copy + RawConstPointer<T>
 where
-    T: Clone + FromBytes + IntoBytes,
+    T: FromBytes + IntoBytes,
 {
     /// Write the value of the pointer at signed offset from it.
     ///
@@ -469,7 +469,10 @@ where
     /// advance) to be invalid; in that case there are no guarantees about how many values — if any —
     /// have been written.
     #[must_use]
-    fn write_slice_at_offset(self, count: isize, values: &[T]) -> Option<()> {
+    fn write_slice_at_offset(self, count: isize, values: &[T]) -> Option<()>
+    where
+        T: Clone,
+    {
         for (offset, v) in (count..).zip(values) {
             self.write_at_offset(offset, v.clone())?;
         }

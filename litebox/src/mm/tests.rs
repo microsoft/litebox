@@ -24,8 +24,8 @@ use super::linux::{
 struct DummyVmemBackend;
 
 impl crate::platform::RawPointerProvider for DummyVmemBackend {
-    type RawConstPointer<T: Clone + FromBytes> = TransparentConstPtr<T>;
-    type RawMutPointer<T: Clone + FromBytes + IntoBytes> = TransparentMutPtr<T>;
+    type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
 }
 
 #[expect(unused_variables, reason = "dummy/mock backend")]
