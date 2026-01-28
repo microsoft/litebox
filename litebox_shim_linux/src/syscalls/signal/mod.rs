@@ -272,6 +272,7 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_KERNEL,
+        #[cfg(target_arch = "x86_64")]
         __pad: 0,
         data: SiginfoData::new_addr(fault_address),
     }
@@ -284,6 +285,7 @@ fn siginfo_kill(signal: Signal) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_USER,
+        #[cfg(target_arch = "x86_64")]
         __pad: 0,
         data: SiginfoData::new_zeroed(),
     }
@@ -597,6 +599,7 @@ impl Task {
             signo: signal.as_i32(),
             errno: 0,
             code: SI_KERNEL,
+            #[cfg(target_arch = "x86_64")]
             __pad: 0,
             data: SiginfoData::new_zeroed(),
         };

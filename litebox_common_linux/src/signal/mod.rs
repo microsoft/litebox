@@ -301,6 +301,7 @@ pub struct Siginfo {
     pub signo: i32,
     pub errno: i32,
     pub code: i32,
+    #[cfg(target_pointer_width = "64")]
     #[doc(hidden)]
     pub __pad: u32,
     pub data: SiginfoData,
