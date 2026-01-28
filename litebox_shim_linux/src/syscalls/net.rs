@@ -215,11 +215,11 @@ impl GlobalState {
 
         let proxy = match sock_type {
             SockType::Stream => {
-                let proxy = litebox::net::socket_channel::new_stream_channel();
+                let proxy = litebox::net::socket_channel::StreamSocketChannel::new();
                 NetworkProxy::Stream(proxy)
             }
             SockType::Datagram => {
-                let proxy = litebox::net::socket_channel::new_datagram_channel();
+                let proxy = litebox::net::socket_channel::DatagramSocketChannel::new();
                 NetworkProxy::Datagram(proxy)
             }
             SockType::Raw => NetworkProxy::Raw,

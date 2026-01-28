@@ -303,7 +303,32 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
     }
 }
 
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Default for StreamSocketChannel<Platform> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Platform> {
+    /// Create a new stream socket channel with default buffer sizes.
+    ///
+    /// The channel is created with default buffer sizes [`super::SOCKET_BUFFER_SIZE`] for both
+    /// RX and TX buffers.
+    pub fn new() -> Self {
+        Self::new_with_capacity(super::SOCKET_BUFFER_SIZE, super::SOCKET_BUFFER_SIZE)
+    }
+
+    /// Create a new stream socket channel with specified buffer capacities.
+    ///
+    /// # Arguments
+    ///
+    /// * `rx_capacity` - Size of the receive buffer in bytes
+    /// * `tx_capacity` - Size of the transmit buffer in bytes
+    pub fn new_with_capacity(rx_capacity: usize, tx_capacity: usize) -> Self {
+        let inner = StreamChannelInner::new(rx_capacity, tx_capacity);
+        StreamSocketChannel { inner }
+    }
+
     /// Read data from the socket into the provided buffer.
     ///
     /// This reads from the RX ring buffer without blocking.
@@ -591,29 +616,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     }
 }
 
-/// Create a new stream socket channel with default buffer sizes.
-///
-/// The channel is created with default buffer sizes [`super::SOCKET_BUFFER_SIZE`] for both
-/// RX and TX buffers.
-pub fn new_stream_channel<Platform: RawSyncPrimitivesProvider + TimeProvider>()
--> StreamSocketChannel<Platform> {
-    new_stream_channel_with_capacity(super::SOCKET_BUFFER_SIZE, super::SOCKET_BUFFER_SIZE)
-}
-
-/// Create a new stream socket channel with specified buffer capacities.
-///
-/// # Arguments
-///
-/// * `rx_capacity` - Size of the receive buffer in bytes
-/// * `tx_capacity` - Size of the transmit buffer in bytes
-pub fn new_stream_channel_with_capacity<Platform: RawSyncPrimitivesProvider + TimeProvider>(
-    rx_capacity: usize,
-    tx_capacity: usize,
-) -> StreamSocketChannel<Platform> {
-    let inner = StreamChannelInner::new(rx_capacity, tx_capacity);
-    StreamSocketChannel { inner }
-}
-
 /// A datagram message for UDP-like sockets.
 ///
 /// Each datagram carries its payload and an optional address:
@@ -698,7 +700,32 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramChannelInner<Pl
     }
 }
 
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Default
+    for DatagramSocketChannel<Platform>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<Platform> {
+    /// Create a new datagram socket channel with default queue size.
+    ///
+    /// The channel is created with default queue size (64 messages).
+    pub fn new() -> Self {
+        Self::new_with_capacity(DEFAULT_DATAGRAM_QUEUE_SIZE)
+    }
+
+    /// Create a new datagram socket channel with specified queue size.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_size` - Maximum number of datagrams that can be queued
+    pub fn new_with_capacity(queue_size: usize) -> Self {
+        let inner = DatagramChannelInner::new(queue_size);
+        DatagramSocketChannel { inner }
+    }
+
     /// Receive a datagram from the socket.
     ///
     /// Copies the datagram payload into `buf` and optionally returns the source address.
@@ -917,26 +944,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     }
 }
 
-/// Create a new datagram socket channel with default queue size.
-///
-/// The channel is created with default queue size (64 messages).
-pub fn new_datagram_channel<Platform: RawSyncPrimitivesProvider + TimeProvider>()
--> DatagramSocketChannel<Platform> {
-    new_datagram_channel_with_capacity(DEFAULT_DATAGRAM_QUEUE_SIZE)
-}
-
-/// Create a new datagram socket channel with specified queue size.
-///
-/// # Arguments
-///
-/// * `queue_size` - Maximum number of datagrams that can be queued
-pub fn new_datagram_channel_with_capacity<Platform: RawSyncPrimitivesProvider + TimeProvider>(
-    queue_size: usize,
-) -> DatagramSocketChannel<Platform> {
-    let inner = DatagramChannelInner::new(queue_size);
-    DatagramSocketChannel { inner }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,7 +955,7 @@ mod tests {
 
     #[test]
     fn stream_channel_initial_state() {
-        let channel: StreamSocketChannel<TestPlatform> = new_stream_channel();
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
 
         // Initial state should be Closed
         assert_eq!(channel.state(), SocketState::Closed);
@@ -965,12 +972,12 @@ mod tests {
 
     #[test]
     fn stream_channel_push_rx_and_read() {
-        let channel: StreamSocketChannel<TestPlatform> = new_stream_channel();
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
         channel.set_state(SocketState::Connected);
 
         // Push data from "network" side
         let data = b"Hello, World!";
-        let pushed = channel.push_rx_data_with(|buf| {
+        let pushed = channel.push_rx_data_with(|buf: &mut [u8]| {
             let to_copy = core::cmp::min(buf.len(), data.len());
             buf[..to_copy].copy_from_slice(&data[..to_copy]);
             to_copy
@@ -994,7 +1001,7 @@ mod tests {
 
     #[test]
     fn stream_channel_write_and_pop_tx() {
-        let channel: StreamSocketChannel<TestPlatform> = new_stream_channel();
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
         channel.set_state(SocketState::Connected);
 
         // Write from "user" side
@@ -1017,7 +1024,7 @@ mod tests {
 
     #[test]
     fn stream_channel_not_connected() {
-        let channel: StreamSocketChannel<TestPlatform> = new_stream_channel();
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
 
         // Try to read while not connected
         let mut buf = [0u8; 32];
@@ -1032,12 +1039,12 @@ mod tests {
 
     #[test]
     fn stream_channel_shutdown_read() {
-        let channel: StreamSocketChannel<TestPlatform> = new_stream_channel();
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
         channel.set_state(SocketState::Connected);
 
         // Push some data
         let data = b"data";
-        channel.push_rx_data_with(|buf| {
+        channel.push_rx_data_with(|buf: &mut [u8]| {
             let to_copy = core::cmp::min(buf.len(), data.len());
             buf[..to_copy].copy_from_slice(&data[..to_copy]);
             to_copy
@@ -1054,7 +1061,7 @@ mod tests {
 
     #[test]
     fn stream_channel_shutdown_write() {
-        let channel: StreamSocketChannel<TestPlatform> = new_stream_channel();
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
         channel.set_state(SocketState::Connected);
 
         // Shutdown write side
@@ -1069,14 +1076,14 @@ mod tests {
     fn stream_channel_rx_space() {
         let capacity = 1024;
         let channel: StreamSocketChannel<TestPlatform> =
-            new_stream_channel_with_capacity(capacity, capacity);
+            StreamSocketChannel::new_with_capacity(capacity, capacity);
         channel.set_state(SocketState::Connected);
 
         // Initially all space is available
         assert_eq!(channel.rx_space(), capacity);
 
         // Push some data
-        let pushed = channel.push_rx_data_with(|buf| {
+        let pushed = channel.push_rx_data_with(|buf: &mut [u8]| {
             let to_write = core::cmp::min(buf.len(), 100);
             buf[..to_write].fill(0);
             to_write
@@ -1089,11 +1096,11 @@ mod tests {
 
     #[test]
     fn stream_channel_partial_read() {
-        let channel: StreamSocketChannel<TestPlatform> = new_stream_channel();
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
         channel.set_state(SocketState::Connected);
 
         // Push 100 bytes
-        let pushed = channel.push_rx_data_with(|buf| {
+        let pushed = channel.push_rx_data_with(|buf: &mut [u8]| {
             let to_write = core::cmp::min(buf.len(), 100);
             buf[..to_write].fill(42);
             to_write
@@ -1120,7 +1127,7 @@ mod tests {
 
     #[test]
     fn stream_channel_io_events() {
-        let channel: StreamSocketChannel<TestPlatform> = new_stream_channel();
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
 
         // Closed state should have HUP
         let events = channel.check_io_events();
@@ -1134,7 +1141,7 @@ mod tests {
 
         // Push data to RX
         let data = b"data";
-        channel.push_rx_data_with(|buf| {
+        channel.push_rx_data_with(|buf: &mut [u8]| {
             let to_copy = core::cmp::min(buf.len(), data.len());
             buf[..to_copy].copy_from_slice(&data[..to_copy]);
             to_copy
@@ -1152,7 +1159,7 @@ mod tests {
 
     #[test]
     fn datagram_channel_initial_state() {
-        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
 
         // Should not be readable initially
         assert!(!channel.is_readable());
@@ -1169,7 +1176,7 @@ mod tests {
 
     #[test]
     fn datagram_channel_send_and_receive() {
-        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
 
         // Send a datagram (user side)
         let addr = Some(core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
@@ -1201,7 +1208,7 @@ mod tests {
 
     #[test]
     fn datagram_channel_push_and_read() {
-        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
 
         // Push a datagram (network side) using try_recv_datagram_with
         let addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
@@ -1232,7 +1239,7 @@ mod tests {
 
     #[test]
     fn datagram_channel_read_empty() {
-        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
 
         // Try to read when empty
         let mut buf = [0u8; 64];
@@ -1244,7 +1251,7 @@ mod tests {
     fn datagram_channel_queue_full() {
         let queue_size = 4;
         let channel: DatagramSocketChannel<TestPlatform> =
-            new_datagram_channel_with_capacity(queue_size);
+            DatagramSocketChannel::new_with_capacity(queue_size);
 
         // Fill the TX queue
         for i in 0..queue_size {
@@ -1259,7 +1266,7 @@ mod tests {
 
     #[test]
     fn datagram_channel_unconnected_send_without_address() {
-        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
 
         // Sending without an address on an unconnected socket should fail
         let result = channel.send_to(&[1, 2, 3], None);
@@ -1270,7 +1277,7 @@ mod tests {
     fn datagram_channel_rx_full() {
         let queue_size = 4;
         let channel: DatagramSocketChannel<TestPlatform> =
-            new_datagram_channel_with_capacity(queue_size);
+            DatagramSocketChannel::new_with_capacity(queue_size);
 
         // Fill the RX queue
         for i in 0..queue_size {
@@ -1289,7 +1296,7 @@ mod tests {
 
     #[test]
     fn datagram_channel_truncation() {
-        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
 
         // Push a large datagram
         let data: Box<[u8]> = alloc::vec![42u8; 100].into_boxed_slice();
@@ -1307,7 +1314,7 @@ mod tests {
 
     #[test]
     fn datagram_channel_trunc_flag() {
-        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
 
         let dummy_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::LOCALHOST,
@@ -1330,7 +1337,7 @@ mod tests {
 
     #[test]
     fn datagram_channel_io_events() {
-        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
 
         let dummy_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::LOCALHOST,
@@ -1355,7 +1362,7 @@ mod tests {
 
     #[test]
     fn datagram_channel_try_send_failure() {
-        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
 
         // Send a datagram (user side)
         let addr = Some(core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
@@ -1387,7 +1394,7 @@ mod tests {
 
     #[test]
     fn datagram_channel_try_recv_none() {
-        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
 
         // Closure returns None - nothing should be pushed
         let result = channel.try_recv_datagram_with(|| None);
