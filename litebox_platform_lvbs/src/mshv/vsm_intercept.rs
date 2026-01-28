@@ -48,6 +48,12 @@ pub enum InterceptedRegisterName {
     Unknown = 0xffff_ffff,
 }
 
+/// # Panics
+///
+/// Panics if:
+/// - Failed to get intercept message type
+/// - Failed to raise VTL0 GP fault
+/// - Intercepted write to unknown MSR/register
 pub fn vsm_handle_intercept() {
     let simp_page = with_per_cpu_variables_mut(|per_cpu_variables| unsafe {
         &mut *per_cpu_variables.hv_simp_page_as_mut_ptr()
@@ -147,7 +153,7 @@ fn advance_vtl0_rip(int_msg_hdr: &HvInterceptMessageHeader) -> Result<u64, Hyper
 }
 
 #[inline]
-fn raise_vtl0_gp_fault() -> Result<u64, HypervCallError> {
+pub fn raise_vtl0_gp_fault() -> Result<u64, HypervCallError> {
     let mut exception = HvPendingExceptionEvent::new();
     exception.set_event_pending(true);
     exception.set_event_type(0_u8);
