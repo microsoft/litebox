@@ -39,6 +39,7 @@ use windows_sys::Win32::{
     System::Threading::{self as Win32_Threading, GetCurrentProcess},
     System::WindowsProgramming::QueryUnbiasedInterruptTimePrecise,
 };
+use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
@@ -1253,8 +1254,8 @@ type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::Us
 >;
 
 impl litebox::platform::RawPointerProvider for WindowsUserland {
-    type RawConstPointer<T: Clone> = UserConstPtr<T>;
-    type RawMutPointer<T: Clone> = UserMutPtr<T>;
+    type RawConstPointer<T: Clone + FromBytes> = UserConstPtr<T>;
+    type RawMutPointer<T: Clone + FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
 #[allow(

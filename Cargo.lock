@@ -977,6 +977,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "windows-sys 0.60.2",
+ "zerocopy",
 ]
 
 [[package]]
