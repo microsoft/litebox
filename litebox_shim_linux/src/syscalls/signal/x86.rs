@@ -10,9 +10,10 @@ use litebox_common_linux::{
     PtRegs,
     signal::{SaFlags, SigAction, SigSet, Siginfo, Signal, Ucontext, x86::Sigcontext},
 };
+use zerocopy::{FromBytes, IntoBytes};
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 struct SignalFrame {
     return_address: usize,
     signal: i32,
@@ -20,7 +21,7 @@ struct SignalFrame {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 struct LegacyContext {
     sigcontext: Sigcontext,
     unused: [u32; 136],
@@ -28,7 +29,7 @@ struct LegacyContext {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 struct SignalFrameRt {
     return_address: usize,
     signal: i32,
@@ -43,7 +44,7 @@ impl Task {
     pub(crate) fn sys_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
         let lctx_addr = ctx.esp.wrapping_sub(8);
         let lctx_ptr = ConstPtr::<LegacyContext>::from_usize(lctx_addr);
-        let Some(lctx) = (lctx_ptr.read_at_offset(0)) else {
+        let Some(lctx) = lctx_ptr.read_at_offset(0) else {
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);
         };
@@ -144,14 +145,14 @@ impl SignalState {
                 ucontext_ptr: frame_addr + core::mem::offset_of!(SignalFrameRt, ucontext),
                 ucontext: Ucontext {
                     flags: 0,
-                    link: core::ptr::null_mut(),
+                    link: 0,
                     stack: self.altstack.get(),
                     mcontext: sigcontext,
                     sigmask: self.blocked.get(),
                 },
                 siginfo: siginfo.clone(),
             };
-            unsafe { frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)? };
+            frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)?;
         } else {
             let frame_ptr = MutPtr::from_usize(frame_addr);
             let frame = SignalFrame {
@@ -163,7 +164,7 @@ impl SignalState {
                     extramask,
                 },
             };
-            unsafe { frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)? };
+            frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)?;
         }
 
         ctx.esp = frame_addr;

@@ -333,7 +333,7 @@ pub struct FileStat {
 /// Linux's `stat64` struct
 #[cfg(target_arch = "x86")]
 #[repr(C, packed)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct FileStat64 {
     pub st_dev: u64,
     #[expect(clippy::pub_underscore_fields)]

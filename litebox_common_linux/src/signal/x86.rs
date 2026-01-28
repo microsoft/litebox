@@ -3,8 +3,10 @@
 
 //! Definitions for x86 signal context structures.
 
+use zerocopy::{FromBytes, IntoBytes};
+
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Sigcontext {
     pub gs: u32,
     pub fs: u32,

@@ -56,6 +56,7 @@ impl SignalState {
                 sp: 0,
                 flags: SsFlags::DISABLE,
                 size: 0,
+                #[cfg(target_arch = "x86_64")]
                 __pad: 0,
             }),
             last_exception: Cell::new(litebox::shim::ExceptionInfo {
@@ -79,6 +80,7 @@ impl SignalState {
                 flags: SsFlags::DISABLE,
                 sp: 0,
                 size: 0,
+                #[cfg(target_arch = "x86_64")]
                 __pad: 0,
             }
             .into(),
@@ -103,6 +105,7 @@ impl SignalState {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
+                #[cfg(target_arch = "x86_64")]
                 __pad: 0,
             };
         }
@@ -157,6 +160,7 @@ impl SignalHandlers {
                         restorer: 0,
                         flags: SaFlags::empty(),
                         mask: SigSet::empty(),
+                        #[cfg(target_arch = "x86_64")]
                         __pad: 0,
                     },
                     immutable: i == SignalHandlersInner::sig_index(Signal::SIGKILL)
@@ -311,6 +315,7 @@ impl SignalState {
                 sp: ss.sp,
                 flags: ss.flags & SsFlags::AUTODISARM,
                 size: ss.size,
+                #[cfg(target_arch = "x86_64")]
                 __pad: 0,
             });
             Ok(())
@@ -323,6 +328,7 @@ impl SignalState {
             sp: 0,
             flags: SsFlags::DISABLE,
             size: 0,
+            #[cfg(target_arch = "x86_64")]
             __pad: 0,
         });
     }
@@ -621,6 +627,7 @@ impl Task {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
+                #[cfg(target_arch = "x86_64")]
                 __pad: 0,
             };
             // Don't allow further changes to this action.
