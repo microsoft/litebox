@@ -145,6 +145,7 @@ impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
         if ptr.is_null() || !ptr.is_aligned() {
             return None;
         }
+        let p = ptr.wrapping_offset(count);
         // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
         // on T guarantees that any byte pattern is valid for T, so reading from valid
         // memory is safe.
@@ -152,8 +153,8 @@ impl<T: Clone + FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
             // Try to ensure a single access for primitive types. The use of
             // volatile here is dubious--this should really use inline asm or
             // perhaps atomic loads.
-            1 | 2 | 4 | 8 => unsafe { ptr.offset(count).read_volatile() },
-            _ => unsafe { (*ptr.offset(count)).clone() },
+            1 | 2 | 4 | 8 => unsafe { p.read_volatile() },
+            _ => unsafe { (*p).clone() },
         })
     }
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
@@ -262,10 +263,11 @@ impl<T: Clone + FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T>
         if ptr.is_null() || !ptr.is_aligned() {
             return None;
         }
+        let p = ptr.wrapping_offset(count);
         // SAFETY: We checked the pointer is non-null and aligned. The IntoBytes bound
         // on T guarantees that T can be safely written as bytes.
         unsafe {
-            *ptr.offset(count) = value;
+            *p = value;
         }
         Some(())
     }
@@ -296,7 +298,7 @@ impl<T: Clone + FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T>
             return None;
         };
         let _ = start.checked_mul(size_of::<T>().try_into().ok()?)?;
-        let data = unsafe { ptr.offset(start) };
+        let data = ptr.wrapping_offset(start);
         let _ = isize::try_from(len.checked_mul(size_of::<T>())?).ok()?;
         let slice = unsafe { core::slice::from_raw_parts_mut(data, len) };
         Some(f(slice))

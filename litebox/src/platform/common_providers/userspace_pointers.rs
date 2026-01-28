@@ -132,7 +132,7 @@ fn read_at_offset<V: ValidateAccess, T: Clone + FromBytes>(
     ptr: *const T,
     count: isize,
 ) -> Option<T> {
-    let src = unsafe { ptr.add(usize::try_from(count).ok()?) };
+    let src = ptr.wrapping_add(usize::try_from(count).ok()?);
     let src = V::validate(src.cast_mut())?.cast_const();
     // Match on the size of `T` to use the appropriate fallible read function to
     // ensure that small aligned reads are atomic (and faster than a full
@@ -283,7 +283,7 @@ impl<V: ValidateAccess, T: Clone + FromBytes> RawConstPointer<T> for UserMutPtr<
 
 impl<V: ValidateAccess, T: Clone + FromBytes + IntoBytes> RawMutPointer<T> for UserMutPtr<V, T> {
     fn write_at_offset(self, count: isize, value: T) -> Option<()> {
-        let dst = unsafe { self.as_ptr().add(usize::try_from(count).ok()?) };
+        let dst = self.as_ptr().wrapping_add(usize::try_from(count).ok()?);
         let dst = V::validate(dst)?;
         // Match on the size of `T` to use the appropriate fallible write function to
         // ensure that small aligned writes are atomic (and faster than a full
@@ -337,7 +337,7 @@ impl<V: ValidateAccess, T: Clone + FromBytes + IntoBytes> RawMutPointer<T> for U
         if buf.is_empty() {
             return Some(());
         }
-        let dst = unsafe { self.as_ptr().add(start_offset) };
+        let dst = self.as_ptr().wrapping_add(start_offset);
         let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(dst, buf.len()))?;
         unsafe { memcpy_fallible(dst.cast(), buf.as_ptr().cast(), size_of_val(buf)).ok() }
     }
