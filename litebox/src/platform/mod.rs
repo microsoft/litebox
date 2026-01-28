@@ -488,6 +488,7 @@ where
     ///
     /// Note: if `f` panics, there is no guarantee that the memory is left unchanged.
     #[must_use]
+    #[deprecated = "will be removed in the future, do not use this"]
     fn mutate_subslice_with<R>(
         self,
         range: impl core::ops::RangeBounds<isize>,
@@ -509,6 +510,7 @@ where
     {
         let start: isize = start_offset.try_into().ok()?;
         let end = start.checked_add_unsigned(buf.len())?;
+        #[allow(deprecated)]
         self.mutate_subslice_with(start..end, |x| {
             debug_assert_eq!(x.len(), buf.len());
             x.copy_from_slice(buf);
