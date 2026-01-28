@@ -644,6 +644,9 @@ impl GlobalState {
         fd: &SocketFd,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
+        if sockaddr.port() == 0 || sockaddr.ip().is_unspecified() {
+            return Err(Errno::ECONNREFUSED);
+        }
         let mut check_progress = false;
         cx.wait_on_events::<_, Errno>(
             self.get_status(fd).contains(OFlags::NONBLOCK),

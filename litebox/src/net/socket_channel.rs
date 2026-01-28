@@ -4,46 +4,45 @@
 //! Lock-free socket channels using ringbuf for decoupling user I/O from network processing.
 //!
 //! This module provides a channel-based design for socket data transfer that eliminates
-//! lock contention between user threads (performing read/pselect) and the network worker
+//! lock contention between user threads (performing read/write) and the network worker
 //! (processing packets via smoltcp).
 //!
 //! # Architecture
 //!
 //! ```text
-//! ┌─────────────────┐                          ┌─────────────────┐
-//! │   User Thread   │                          │  Network Worker │
-//! │  (read/write)   │                          │   (smoltcp)     │
-//! └────────┬────────┘                          └────────┬────────┘
-//!          │                                            │
-//!          ▼                                            ▼
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                    SocketChannel                            │
-//! │  ┌─────────────────┐          ┌─────────────────────────┐   │
-//! │  │   RX Channel    │◄─────────│  Network Worker writes  │   │
-//! │  │  (lock-free)    │          │  data from smoltcp      │   │
-//! │  │  User reads ────┼──────────►                         │   │
-//! │  └─────────────────┘          └─────────────────────────┘   │
-//! │                                                             │
-//! │  ┌─────────────────┐          ┌─────────────────────────┐   │
-//! │  │   TX Channel    │──────────►  Network Worker reads   │   │
-//! │  │  (lock-free)    │          │  and sends via smoltcp  │   │
-//! │  │  User writes ───┼──────────►                         │   │
-//! │  └─────────────────┘          └─────────────────────────┘   │
-//! │                                                             │
-//! │  ┌─────────────────┐                                        │
-//! │  │   State flags   │  (atomic: ready, closed, error, etc.)  │
-//! │  └─────────────────┘                                        │
-//! └─────────────────────────────────────────────────────────────┘
+//!                    SocketChannel
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │                                                              │
+//! │  ┌────────────────────────────────────────────────────────┐  │
+//! │  │                  RX Ring Buffer                        │  │
+//! │  │                   (lock-free)                          │  │
+//! │  └────────────────────────────────────────────────────────┘  │
+//! │        ▲                                       │             │
+//! │        │ push                                  │ pop         │
+//! │        │                                       ▼             │
+//! │  Network Worker                           User Thread        │
+//! │   (smoltcp)                               (read)             │
+//! │                                                              │
+//! │  ┌────────────────────────────────────────────────────────┐  │
+//! │  │                  TX Ring Buffer                        │  │
+//! │  │                   (lock-free)                          │  │
+//! │  └────────────────────────────────────────────────────────┘  │
+//! │        │                                       ▲             │
+//! │        │ pop                                   │ push        │
+//! │        ▼                                       │             │
+//! │  Network Worker                           User Thread        │
+//! │   (smoltcp)                               (write)            │
+//! │                                                              │
+//! │  ┌────────────────────────────────────────────────────────┐  │
+//! │  │   State flags (atomic: ready, closed, error, etc.)     │  │
+//! │  └────────────────────────────────────────────────────────┘  │
+//! └──────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! # Benefits
 //!
 //! - **No lock contention**: User read/write operations and network processing can proceed
 //!   concurrently without blocking each other.
-//! - **Better latency**: User operations complete faster as they don't need to wait for
-//!   the network worker to release locks.
-//! - **Improved throughput**: Network worker can process packets continuously without
-//!   being blocked by user operations.
 
 use alloc::boxed::Box;
 use core::{
@@ -109,11 +108,18 @@ pub enum NetworkProxy<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> {
-    /// Set the socket state (only applicable to stream sockets).
+    /// Set the socket state.
+    ///
+    /// For stream sockets, this sets the connection state.
+    /// For datagram sockets, setting state to `Connected` marks the socket as connected.
     pub fn set_state(&self, state: SocketState) {
         match self {
             NetworkProxy::Stream(channel) => channel.set_state(state),
-            NetworkProxy::Datagram(_) | NetworkProxy::Raw => {}
+            NetworkProxy::Datagram(channel) => {
+                // For datagram sockets, track connected state
+                channel.set_connected(state == SocketState::Connected);
+            }
+            NetworkProxy::Raw => {}
         }
     }
 
@@ -146,6 +152,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
     ) -> Result<usize, SendError> {
         if !flags.is_empty() {
             unimplemented!()
+        }
+        if let Some(addr) = destination
+            && (addr.port() == 0 || addr.ip().is_unspecified())
+        {
+            return Err(SendError::Unaddressable);
         }
         match self {
             NetworkProxy::Stream(channel) => channel.try_write(buf),
@@ -389,11 +400,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
 
-        if self.inner.rx_available.load(Ordering::Acquire) > 0 {
+        if self.is_readable() {
             events |= Events::IN;
         }
 
-        if self.inner.tx_available.load(Ordering::Acquire) > 0 {
+        if self.is_writable() {
             events |= Events::OUT;
         }
 
@@ -424,7 +435,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         // SAFETY: We're treating maybe_uninit<u8> slices as &mut [u8].
         // This is safe because:
         // 1. u8 has no drop implementation or invalid bit patterns
-        // 2. The closure will write to these bytes before we advance the write index
+        // 2. The closure will write to the slices before we advance the write index
         // 3. We only advance by the number of bytes actually written
         let first: &mut [u8] = unsafe {
             core::slice::from_raw_parts_mut(first.as_mut_ptr().cast::<u8>(), first.len())
@@ -630,6 +641,7 @@ pub struct DatagramSocketChannel<Platform: RawSyncPrimitivesProvider + TimeProvi
 }
 
 /// Internal state for a datagram socket channel.
+/// TODO: seperate `data` and `addr` into two ring buffers to avoid memory allocation?
 struct DatagramChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// RX producer (network worker writes here)
     rx_prod: Mutex<Platform, HeapProd<DatagramMessage>>,
@@ -648,6 +660,10 @@ struct DatagramChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     /// Local port the socket is bound to (0 if unbound).
     /// This is set atomically when auto-binding during sendto.
     local_port: AtomicU16,
+
+    /// Whether the socket is connected to a remote endpoint.
+    /// For UDP, this indicates that a default destination has been set via connect().
+    is_connected: AtomicBool,
 
     /// Event notification
     pollee: Pollee<Platform>,
@@ -675,6 +691,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramChannelInner<Pl
             tx_space: AtomicUsize::new(queue_size),
 
             local_port: AtomicU16::new(0),
+            is_connected: AtomicBool::new(false),
 
             pollee: Pollee::new(),
         }
@@ -713,7 +730,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
                 }
             };
             self.inner.rx_count.fetch_sub(1, Ordering::Release);
-            self.inner.pollee.notify_observers(Events::OUT);
             Ok(n)
         } else {
             Ok(0)
@@ -725,13 +741,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     /// The datagram is queued for transmission by the network worker.
     /// Returns the number of bytes queued (always `data.len()` on success).
     pub fn send_to(&self, data: &[u8], addr: Option<SocketAddr>) -> Result<usize, SendError> {
-        if let Some(addr) = addr {
-            if addr.port() == 0 {
-                return Err(SendError::Unaddressable);
-            }
-            if addr.ip().is_unspecified() {
-                return Err(SendError::Unaddressable);
-            }
+        if addr.is_none() && !self.inner.is_connected.load(Ordering::Acquire) {
+            // No destination specified and socket is not connected
+            return Err(SendError::DestinationAddressRequired);
         }
 
         let size = data.len();
@@ -744,7 +756,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         match tx_prod.try_push(msg) {
             Ok(()) => {
                 self.inner.tx_space.fetch_sub(1, Ordering::Release);
-                self.inner.pollee.notify_observers(Events::IN);
                 Ok(size)
             }
             Err(_) => Err(SendError::BufferFull),
@@ -878,7 +889,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     ///
     /// Returns 0 if the socket is not yet bound.
     /// This is a lock-free operation.
-    pub fn local_port(&self) -> u16 {
+    fn local_port(&self) -> u16 {
         self.inner.local_port.load(Ordering::Acquire)
     }
 
@@ -889,7 +900,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     ///
     /// Returns `Ok(())` if the port was set successfully, or `Err(current_port)` if
     /// a port was already set.
-    pub fn set_local_port(&self, port: u16) -> Result<(), u16> {
+    fn set_local_port(&self, port: u16) -> Result<(), u16> {
         match self
             .inner
             .local_port
@@ -898,6 +909,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
             Ok(_) => Ok(()),
             Err(current) => Err(current),
         }
+    }
+
+    /// Set the connected state of the datagram socket.
+    fn set_connected(&self, connected: bool) {
+        self.inner.is_connected.store(connected, Ordering::Release);
     }
 }
 
@@ -1130,6 +1146,10 @@ mod tests {
 
     // ==================== DatagramSocketChannel Tests ======================================
 
+    const DUMMY_ADDR: core::net::SocketAddr = core::net::SocketAddr::V4(
+        core::net::SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, 1234),
+    );
+
     #[test]
     fn datagram_channel_initial_state() {
         let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
@@ -1228,13 +1248,22 @@ mod tests {
 
         // Fill the TX queue
         for i in 0..queue_size {
-            let result = channel.send_to(&alloc::vec![0; i], None);
+            let result = channel.send_to(&alloc::vec![0; i], Some(DUMMY_ADDR));
             assert!(result.is_ok());
         }
 
         // Next send should fail
-        let result = channel.send_to(&[99], None);
+        let result = channel.send_to(&[99], Some(DUMMY_ADDR));
         assert!(matches!(result, Err(SendError::BufferFull)));
+    }
+
+    #[test]
+    fn datagram_channel_unconnected_send_without_address() {
+        let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
+
+        // Sending without an address on an unconnected socket should fail
+        let result = channel.send_to(&[1, 2, 3], None);
+        assert!(matches!(result, Err(SendError::DestinationAddressRequired)));
     }
 
     #[test]
@@ -1243,15 +1272,10 @@ mod tests {
         let channel: DatagramSocketChannel<TestPlatform> =
             new_datagram_channel_with_capacity(queue_size);
 
-        let dummy_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
-            core::net::Ipv4Addr::LOCALHOST,
-            1234,
-        ));
-
         // Fill the RX queue
         for i in 0..queue_size {
             let data: Box<[u8]> = alloc::vec![0; i].into_boxed_slice();
-            let result = channel.try_recv_datagram_with(|| Some((data, dummy_addr)));
+            let result = channel.try_recv_datagram_with(|| Some((data, DUMMY_ADDR)));
             assert!(result.is_some());
         }
 
@@ -1259,7 +1283,7 @@ mod tests {
         assert!(channel.is_rx_full());
 
         // Next push should fail (returns None when full)
-        let result = channel.try_recv_datagram_with(|| Some((Box::from([99u8]), dummy_addr)));
+        let result = channel.try_recv_datagram_with(|| Some((Box::from([99u8]), DUMMY_ADDR)));
         assert!(result.is_none());
     }
 
@@ -1267,15 +1291,10 @@ mod tests {
     fn datagram_channel_truncation() {
         let channel: DatagramSocketChannel<TestPlatform> = new_datagram_channel();
 
-        let dummy_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
-            core::net::Ipv4Addr::LOCALHOST,
-            1234,
-        ));
-
         // Push a large datagram
         let data: Box<[u8]> = alloc::vec![42u8; 100].into_boxed_slice();
         channel
-            .try_recv_datagram_with(|| Some((data.clone(), dummy_addr)))
+            .try_recv_datagram_with(|| Some((data.clone(), DUMMY_ADDR)))
             .unwrap();
 
         // Read with a small buffer (no TRUNC flag)

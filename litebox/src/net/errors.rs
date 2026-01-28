@@ -125,6 +125,8 @@ pub enum SendError {
     PortAllocationFailure(#[from] LocalPortAllocationError),
     #[error("unnecessary destination address provided")]
     UnnecessaryDestinationAddress,
+    #[error("destination address required but not provided")]
+    DestinationAddressRequired,
 }
 
 /// Possible errors from [`Network::receive`]

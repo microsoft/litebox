@@ -575,7 +575,7 @@ impl Task {
         let res = match desc {
             Descriptor::LiteBoxRawFd(raw_fd) => {
                 let raw_fd = *raw_fd;
-                drop(locked_file_descriptors);
+                drop(locked_file_descriptors); // drop before potentially blocking write
                 files
                     .run_on_raw_fd(
                         raw_fd,

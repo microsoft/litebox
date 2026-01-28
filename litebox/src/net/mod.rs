@@ -476,49 +476,10 @@ where
         self.remove_dead_sockets();
         self.close_pending_sockets();
 
+        // Drain all socket channel buffers before polling to ensure data flows
         self.drain_all_socket_channel_buffers();
-        // Process ingress.
-        let mut res = smoltcp::iface::PollResult::None;
-        let timestamp = self.now();
-        let mut n = 1000;
-        while n > 0 {
-            match self.interface.poll_ingress_single(
-                timestamp,
-                &mut self.device,
-                &mut self.socket_set,
-            ) {
-                smoltcp::iface::PollIngressSingleResult::None => {
-                    break;
-                }
-                smoltcp::iface::PollIngressSingleResult::PacketProcessed => {}
-                smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
-                    res = smoltcp::iface::PollResult::SocketStateChanged;
-                }
-            }
-            n -= 1;
-
-            if n % 100 == 0 {
-                // Drain buffers periodically to avoid excessive latency
-                self.drain_all_socket_channel_buffers();
-            }
-        }
-        if n == 0 {
-            // We processed the maximum number of packets; there may be more pending
-            res = smoltcp::iface::PollResult::SocketStateChanged;
-        }
-
-        // Process egress.
-        match self
-            .interface
-            .poll_egress(timestamp, &mut self.device, &mut self.socket_set)
-        {
-            smoltcp::iface::PollResult::SocketStateChanged => {
-                res = smoltcp::iface::PollResult::SocketStateChanged;
-            }
-            smoltcp::iface::PollResult::None => {}
-        }
-
-        res
+        self.interface
+            .poll(self.now(), &mut self.device, &mut self.socket_set)
     }
 
     /// (Internal-only API) Perform the queued interactions.
@@ -1203,9 +1164,11 @@ where
         // similar silent-cap behavior since Linux 5.4 (earlier versions capped even smaller, at
         // 128, but we use the larger value to be more flexible).
         //
-        // We don't actively depend on this specific value, and it can be changed out at any time
-        // without any significant issue.
-        let backlog = backlog.min(4096);
+        // TODO: smoltcp performs a linear search through SocketSet when dispatching an incoming
+        // packet to the socket it belongs to, so having a large backlog can cause performance issues
+        // (see https://github.com/smoltcp-rs/smoltcp/issues/973). Restricting the backlog to a smaller
+        // value for now until we have a better solution.
+        let backlog = backlog.min(8);
 
         match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {
@@ -1389,7 +1352,7 @@ where
                     })
                     .or_else(|| socket_handle.udp().remote_endpoint);
                 let Some(remote_endpoint) = destination else {
-                    return Err(SendError::Unaddressable);
+                    return Err(SendError::DestinationAddressRequired);
                 };
                 let udp_socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
                 if !udp_socket.is_open() {
