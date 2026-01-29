@@ -69,6 +69,24 @@ pub trait EnterShim {
     /// the thread is interrupted, the platform may just call the corresponding
     /// handler instead of this one.
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation;
+
+    /// Re-enter a thread of a guest program or library that is already loaded
+    /// in memory.
+    ///
+    /// Unlike [`init`](Self::init), which must be called exactly once before
+    /// running the thread in the guest for the first time, `reenter` allows
+    /// the platform to enter the loaded program or library repeatedly until
+    /// it is torn down.
+    ///
+    /// This is useful for scenarios such as OP-TEE trusted applications where
+    /// the same TA may be invoked multiple times during its lifetime or dynamically
+    /// loaded libraries like cryptographic libraries.
+    ///
+    /// By default, this implementation just exits the thread because `reenter` is
+    /// not supported by all shims.
+    fn reenter(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        ContinueOperation::ExitThread
+    }
 }
 
 /// The operation to perform after returning from a shim handler

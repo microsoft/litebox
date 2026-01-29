@@ -47,6 +47,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicI64, Ordering},
 };
 use hashbrown::HashMap;
+use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
 use spin::Once;
 use x86_64::{
@@ -58,6 +59,11 @@ use x509_cert::{Certificate, der::Decode};
 #[derive(Copy, Clone)]
 #[repr(align(4096))]
 struct AlignedPage([u8; PAGE_SIZE]);
+
+// TODO: Improve error handling
+// - Minimize panic as much as possible
+// - Define proper error types and convert them into Errno
+// - Print out useful debug information on errors in a systematic manner
 
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
@@ -111,9 +117,6 @@ pub fn mshv_vsm_enable_aps(_cpu_present_mask_pfn: u64) -> Result<i64, Errno> {
 /// VSM function for enabling VTL and booting APs
 /// `cpu_online_mask_pfn` indicates the page containing the VTL0's CPU online mask.
 /// `boot_signal_pfn` indicates the boot signal page to let VTL0 know that VTL1 is ready.
-///
-/// # Panics
-/// Panics if hypercall for initializing VTL for any AP fails
 pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i64, Errno> {
     debug_serial_println!("VSM: Boot APs");
     let cpu_online_mask_page_addr =
@@ -142,7 +145,12 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
 
         // Initialize VTL for each online CPU and update its boot signal byte
         cpu_mask.for_each_cpu(|cpu_id| {
-            if let Err(e) = init_vtl_ap(u32::try_from(cpu_id).expect("cpu_id exceeds u32 range")) {
+            if cpu_id > boot_signal_page_buf.0.len() - 1 {
+                error = Some(HypervCallError::InvalidInput);
+                return;
+            }
+            let cpu_id_u32: u32 = cpu_id.truncate();
+            if let Err(e) = init_vtl_ap(cpu_id_u32) {
                 error = Some(e);
             }
             boot_signal_page_buf.0[cpu_id] = HV_SECURE_VTL_BOOT_TOKEN;
@@ -496,6 +504,13 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         nranges,
     );
 
+    let Some(certs) = crate::platform_low()
+        .vtl0_kernel_info
+        .get_system_certificates()
+    else {
+        serial_println!("VSM: No system certificates loaded");
+        return Err(Errno::EFAULT);
+    };
     // collect and maintain the memory ranges of a module locally until the module is validated and its metadata is registered in the global map
     // we don't maintain this content in the global map due to memory overhead. Instead, we could add its hash value to the global map to check the integrity.
     let mut module_memory_metadata = ModuleMemoryMetadata::new();
@@ -543,23 +558,17 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         .map_err(|_| Errno::EINVAL)?;
 
     let elf_size = (module_as_elf[..]).len();
-    assert!(
-        elf_size <= MODULE_VALIDATION_MAX_SIZE,
-        "Module ELF size exceeds the maximum allowed size"
-    );
+    if elf_size > MODULE_VALIDATION_MAX_SIZE {
+        serial_println!("VSM: Module ELF size exceeds the maximum allowed size");
+        return Err(Errno::ENOTSUP);
+    }
 
     let original_elf_data = &module_as_elf[..];
 
     #[cfg(debug_assertions)]
     parse_modinfo(original_elf_data).map_err(|_| Errno::EINVAL)?;
 
-    if let Err(result) = verify_kernel_module_signature(
-        original_elf_data,
-        crate::platform_low()
-            .vtl0_kernel_info
-            .get_system_certificates()
-            .expect("No system certificates loaded"),
-    ) {
+    if let Err(result) = verify_kernel_module_signature(original_elf_data, certs) {
         serial_println!("VSM: Failed to verify the module signature");
         return Err(result.into());
     }
@@ -708,6 +717,14 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
         crash
     );
 
+    let Some(certs) = crate::platform_low()
+        .vtl0_kernel_info
+        .get_system_certificates()
+    else {
+        serial_println!("VSM: No system certificates loaded");
+        return Err(Errno::EFAULT);
+    };
+
     let is_crash = crash != 0;
     let kexec_metadata_ref = if is_crash {
         &crate::platform_low().vtl0_kernel_info.crash_kexec_metadata
@@ -777,7 +794,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
         };
         kimage_slice.copy_from_slice(&kexec_image[..core::mem::size_of::<Kimage>()]);
         let kimage = unsafe { kimage.assume_init() };
-        if kimage.nr_segments > u64::try_from(KEXEC_SEGMENT_MAX).unwrap() {
+        if kimage.nr_segments > KEXEC_SEGMENT_MAX as u64 {
             serial_println!("VSM: Invalid kexec image segments");
             return Err(Errno::EINVAL);
         }
@@ -801,13 +818,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
     // verify the signature of kexec blob
     let kexec_kernel_blob_data = &kexec_kernel_blob[..];
 
-    if let Err(result) = verify_kernel_pe_signature(
-        kexec_kernel_blob_data,
-        crate::platform_low()
-            .vtl0_kernel_info
-            .get_system_certificates()
-            .expect("No system certificates loaded"),
-    ) {
+    if let Err(result) = verify_kernel_pe_signature(kexec_kernel_blob_data, certs) {
         serial_println!("VSM: Failed to verify the signature of kexec kernel blob");
         for kexec_mem_range in &kexec_memory_metadata {
             protect_physical_memory_range(
@@ -979,10 +990,11 @@ pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
         VsmFunction::KexecValidate => mshv_vsm_kexec_validate(params[0], params[1], params[2]),
         VsmFunction::PatchText => mshv_vsm_patch_text(params[0], params[1]),
         VsmFunction::AllocateRingbufferMemory => {
-            mshv_vsm_allocate_ringbuffer_memory(params[0], params[1].try_into().unwrap())
+            let size: usize = params[1].truncate();
+            mshv_vsm_allocate_ringbuffer_memory(params[0], size)
         }
-        _ => {
-            serial_println!("VSM: Unknown function ID {:?}", func_id);
+        VsmFunction::OpteeMessage => {
+            debug_serial_println!("VSM: vsm_dispatch doesn't handle OP-TEE message function");
             Err(Errno::EINVAL)
         }
     };
@@ -1081,6 +1093,12 @@ pub struct Vtl0KernelInfo {
     symbols: SymbolTable,
     gpl_symbols: SymbolTable,
     // TODO: revocation cert, blocklist, etc.
+}
+
+impl Default for Vtl0KernelInfo {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Vtl0KernelInfo {
@@ -1189,6 +1207,13 @@ impl ModuleMemoryMetadata {
 impl Default for ModuleMemoryMetadata {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ModuleMemoryMetadata {
+    /// Returns an iterator over the memory ranges.
+    pub fn iter(&self) -> core::slice::Iter<'_, ModuleMemoryRange> {
+        self.ranges.iter()
     }
 }
 
@@ -1302,6 +1327,11 @@ pub struct ModuleMemoryMetadataIters<'a> {
 }
 
 impl<'a> ModuleMemoryMetadataIters<'a> {
+    /// Returns an iterator over the memory ranges.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key is not found in the guard.
     pub fn iter_mem_ranges(&'a self) -> impl Iterator<Item = &'a ModuleMemoryRange> {
         self.guard.get(&self.key).unwrap().ranges.iter()
     }
@@ -1356,6 +1386,12 @@ pub struct ModuleMemory {
     text: MemoryContainer,
     init_text: MemoryContainer,
     init_rodata: MemoryContainer,
+}
+
+impl Default for ModuleMemory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ModuleMemory {
@@ -1417,6 +1453,12 @@ struct MemoryRange {
 pub struct MemoryContainer {
     range: Vec<MemoryRange>,
     buf: Vec<u8>,
+}
+
+impl Default for MemoryContainer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryContainer {
@@ -1531,6 +1573,12 @@ pub struct KexecMemoryMetadataWrapper {
     inner: spin::mutex::SpinMutex<KexecMemoryMetadata>,
 }
 
+impl Default for KexecMemoryMetadataWrapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KexecMemoryMetadataWrapper {
     pub fn new() -> Self {
         Self {
@@ -1591,6 +1639,13 @@ impl Default for KexecMemoryMetadata {
     }
 }
 
+impl KexecMemoryMetadata {
+    /// Returns an iterator over the memory ranges.
+    pub fn iter(&self) -> core::slice::Iter<'_, KexecMemoryRange> {
+        self.ranges.iter()
+    }
+}
+
 impl<'a> IntoIterator for &'a KexecMemoryMetadata {
     type Item = &'a KexecMemoryRange;
     type IntoIter = core::slice::Iter<'a, KexecMemoryRange>;
@@ -1639,6 +1694,12 @@ pub struct PatchDataMap {
     inner: spin::rwlock::RwLock<HashMap<PhysAddr, HekiPatch>>,
 }
 
+impl Default for PatchDataMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PatchDataMap {
     pub fn new() -> Self {
         Self {
@@ -1660,9 +1721,9 @@ impl PatchDataMap {
         inner.get(&addr).copied()
     }
 
-    // Add patch data from a buffer containing `HekiPatchInfo` and `HekiPatch` structures.
-    // If this patch data is from a module (`module_memory_metadata` is `Some`), this function
-    // denies any patch target addresses not within the module's executable memory ranges.
+    /// Add patch data from a buffer containing `HekiPatchInfo` and `HekiPatch` structures.
+    /// If this patch data is from a module (`module_memory_metadata` is `Some`), this function
+    /// denies any patch target addresses not within the module's executable memory ranges.
     pub fn insert_patch_data_from_bytes(
         &self,
         patch_info_buf: &[u8],
@@ -1683,11 +1744,10 @@ impl PatchDataMap {
             )
             .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
 
-            let Some(total_patch_size) = core::mem::size_of::<HekiPatch>()
-                .checked_mul(usize::try_from(patch_info.patch_index).unwrap())
-            else {
-                return Err(PatchDataMapError::InvalidHekiPatchInfo);
-            };
+            let patch_index: usize = patch_info.patch_index.truncate();
+            let total_patch_size = core::mem::size_of::<HekiPatch>()
+                .checked_mul(patch_index)
+                .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
             index = index
                 .checked_add(core::mem::size_of::<HekiPatchInfo>() + total_patch_size)
                 .filter(|&x| x <= patch_info_buf.len())
@@ -1757,6 +1817,7 @@ pub struct Symbol {
 }
 
 impl Symbol {
+    /// Parse a symbol from a byte buffer.
     pub fn from_bytes(
         kinfo_start: usize,
         start: VirtAddr,
@@ -1794,8 +1855,9 @@ impl Symbol {
             let name_ptr = bytes.as_ptr().add(name_offset).cast::<c_char>();
             CStr::from_ptr(name_ptr)
         };
-        let name = CString::new(name_str.to_str().unwrap()).unwrap();
-        let name = name.into_string().unwrap();
+        let name = CString::new(name_str.to_str().map_err(|_| Errno::EINVAL)?)
+            .map_err(|_| Errno::EINVAL)?;
+        let name = name.into_string().map_err(|_| Errno::EINVAL)?;
         Ok((name, Symbol { _value: value }))
     }
 }
@@ -1804,12 +1866,20 @@ pub struct SymbolTable {
 }
 use core::ffi::{CStr, c_char};
 
+impl Default for SymbolTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SymbolTable {
     pub fn new() -> Self {
         Self {
             inner: spin::rwlock::RwLock::new(HashMap::new()),
         }
     }
+
+    /// Build a symbol table from a memory container.
     pub fn build_from_container(
         &self,
         start: VirtAddr,
@@ -1829,19 +1899,25 @@ impl SymbolTable {
             return Err(Errno::EINVAL);
         }
 
-        let kinfo_len = usize::try_from(end - start).unwrap();
-        if kinfo_len % HekiKernelSymbol::KSYM_LEN != 0 {
+        let kinfo_len: usize = (end - start).truncate();
+        if !kinfo_len.is_multiple_of(HekiKernelSymbol::KSYM_LEN) {
+            serial_println!(
+                "VSM: Symbol table data length {kinfo_len:#x} is not multiple of symbol size",
+            );
             return Err(Errno::EINVAL);
         }
 
-        let mut kinfo_offset = usize::try_from(start - range.start).unwrap();
+        let mut kinfo_offset: usize = (start - range.start).truncate();
         let mut kinfo_addr = start;
         let ksym_count = kinfo_len / HekiKernelSymbol::KSYM_LEN;
         let mut inner = self.inner.write();
         inner.reserve(ksym_count);
 
         for _ in 0..ksym_count {
-            let (name, sym) = Symbol::from_bytes(kinfo_offset, kinfo_addr, buf).unwrap();
+            let Ok((name, sym)) = Symbol::from_bytes(kinfo_offset, kinfo_addr, buf) else {
+                serial_println!("VSM: Failed to parse symbol at offset {kinfo_offset:#x}");
+                return Err(Errno::EINVAL);
+            };
             inner.insert(name, sym);
             kinfo_offset += HekiKernelSymbol::KSYM_LEN;
             kinfo_addr += HekiKernelSymbol::KSYM_LEN as u64;

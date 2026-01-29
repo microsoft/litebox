@@ -123,36 +123,36 @@ fn run_ta_with_default_commands(
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
         if func_id == UteeEntryFunc::OpenSession {
-            let loaded_program = shim
+            let mut loaded_program = shim
                 .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin), None)
                 .map_err(|_| {
                     panic!("Failed to load ldelf");
                 })
                 .unwrap();
-            let entrypoints = &loaded_program.entrypoints;
-            unsafe {
-                litebox_platform_linux_userland::run_thread_with_shim_ref(
-                    entrypoints,
+            loaded_program.entrypoints = Some(unsafe {
+                litebox_platform_linux_userland::run_thread(
+                    loaded_program.entrypoints.take().unwrap(),
                     &mut litebox_common_linux::PtRegs::default(),
-                );
-            };
+                )
+            });
 
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
-            let _ = entrypoints
+            let _ = loaded_program
+                .entrypoints
+                .as_ref()
+                .unwrap()
                 .load_ta_context(params.as_slice(), None, func_id as u32, None)
                 .map_err(|_| {
                     panic!("Failed to load TA context");
                 });
-            // TODO: instead of using `run_thread_with_shim_ref`, we might be able to use interrupts to enter the TA.
-            // This requires better interrupt handling in `litebox_shim_optee` and `litebox_platform_lvbs`.
-            unsafe {
-                litebox_platform_linux_userland::run_thread_with_shim_ref(
-                    entrypoints,
+            loaded_program.entrypoints = Some(unsafe {
+                litebox_platform_linux_userland::reenter_thread(
+                    loaded_program.entrypoints.take().unwrap(),
                     &mut litebox_common_linux::PtRegs::default(),
-                );
-            };
+                )
+            });
         } else if func_id == UteeEntryFunc::CloseSession {
         }
     }
