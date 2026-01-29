@@ -9,7 +9,7 @@ mod hvcall_mm;
 mod hvcall_vp;
 mod mem_integrity;
 pub(crate) mod ringbuffer;
-pub(crate) mod vsm;
+pub mod vsm;
 pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
@@ -68,6 +68,7 @@ pub const HV_VTL_NORMAL: u8 = 0x0;
 pub const HV_VTL_SECURE: u8 = 0x1;
 pub const HV_VTL_MGMT: u8 = 0x2;
 
+pub const VTL_ENTRY_REASON_RESERVED: u32 = 0x0;
 pub const VTL_ENTRY_REASON_LOWER_VTL_CALL: u32 = 0x1;
 pub const VTL_ENTRY_REASON_INTERRUPT: u32 = 0x2;
 
@@ -143,7 +144,6 @@ pub enum VsmFunction {
     PatchText = VSM_VTL_CALL_FUNC_ID_PATCH_TEXT,
     OpteeMessage = VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
     AllocateRingbufferMemory = VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY,
-    Unknown = 0xffff_ffff,
 }
 
 pub const MSR_EFER: u32 = 0xc000_0080;

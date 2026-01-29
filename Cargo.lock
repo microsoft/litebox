@@ -1019,6 +1019,7 @@ dependencies = [
  "litebox_platform_lvbs",
  "litebox_platform_multiplex",
  "litebox_shim_optee",
+ "num_enum",
  "once_cell",
  "spin 0.10.0",
  "x86_64",

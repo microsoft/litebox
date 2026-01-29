@@ -13,6 +13,7 @@ litebox_shim_optee = { path = "../litebox_shim_optee/", version = "0.1.0" }
 spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
 hashbrown = "0.15.2"
 once_cell = { version = "1.21.3", default-features = false, features = ["race", "alloc"] }
+num_enum = { version = "0.7.4", default-features = false }
 
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
