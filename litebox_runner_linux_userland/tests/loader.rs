@@ -95,11 +95,11 @@ impl TestLauncher {
         let program = shim
             .load_program(self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
-        unsafe {
+        let _ = unsafe {
             litebox_platform_linux_userland::run_thread(
                 program.entrypoints,
                 &mut litebox_common_linux::PtRegs::default(),
-            );
+            )
         };
         assert_eq!(
             program.process.wait(),

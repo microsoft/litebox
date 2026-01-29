@@ -52,6 +52,10 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
         self.enter_shim(true, ctx, Task::handle_init_request)
     }
 
+    fn reenter(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.enter_shim(false, ctx, Task::handle_reenter_request)
+    }
+
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         self.enter_shim(false, ctx, Task::handle_syscall_request)
     }
@@ -231,7 +235,7 @@ impl OpteeShim {
             None
         };
         Ok(LoadedProgram {
-            entrypoints,
+            entrypoints: Some(entrypoints),
             params_address,
         })
     }
@@ -243,7 +247,7 @@ impl OpteeShim {
 }
 
 impl OpteeShimEntrypoints {
-    /// Load the CPU context to (re)run the loaded TA.
+    /// Load the CPU context to (re)enter the loaded TA.
     pub fn load_ta_context(
         &self,
         params: &[litebox_common_optee::UteeParamOwned],
@@ -264,7 +268,7 @@ impl OpteeShimEntrypoints {
 }
 
 pub struct LoadedProgram {
-    pub entrypoints: OpteeShimEntrypoints,
+    pub entrypoints: Option<OpteeShimEntrypoints>,
     pub params_address: Option<usize>,
 }
 
@@ -475,8 +479,13 @@ impl Task {
     }
 
     fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+        // Ensure handle_init_request is invoked at most once.
+        if self.thread.initialized.replace(true) {
+            return ContinueOperation::ExitThread;
+        }
+
         match self.thread.init_state.get() {
-            ThreadInitState::None => ContinueOperation::ExitThread,
+            ThreadInitState::None | ThreadInitState::Ta { .. } => ContinueOperation::ExitThread,
             ThreadInitState::Ldelf {
                 ldelf_arg_address,
                 entry_point,
@@ -487,9 +496,24 @@ impl Task {
                     ctx.rdi = ldelf_arg_address;
                     ctx.rip = entry_point;
                     ctx.rsp = stack_top;
+                    ctx.cs = 0x33; // __USER_CS
+                    ctx.ss = 0x2b; // __USER_DS
                 }
                 ContinueOperation::ResumeGuest
             }
+        }
+    }
+
+    /// Handle a reentry request for an already loaded TA.
+    ///
+    /// Unlike `handle_init_request`, this function is used to re-enter
+    /// a program or library that is already loaded in memory.
+    ///
+    /// TODO: We can re-enter `ldelf` as well to use its extra functions
+    /// such as ftrace. Let's revisit this later.
+    fn handle_reenter_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+        match self.thread.init_state.get() {
+            ThreadInitState::None | ThreadInitState::Ldelf { .. } => ContinueOperation::ExitThread,
             ThreadInitState::Ta {
                 cmd_id,
                 params_address,
@@ -506,6 +530,8 @@ impl Task {
                     ctx.rcx = cmd_id;
                     ctx.rip = entry_point;
                     ctx.rsp = stack_top;
+                    ctx.cs = 0x33; // __USER_CS
+                    ctx.ss = 0x2b; // __USER_DS
                 }
                 ContinueOperation::ResumeGuest
             }
@@ -613,7 +639,7 @@ impl Task {
         Ok(())
     }
 
-    /// Load the CPU context to (re)run the loaded TA.
+    /// Load the CPU context to (re)enter the loaded TA.
     fn load_ta_context(
         &self,
         params: &[litebox_common_optee::UteeParamOwned],
@@ -1140,12 +1166,16 @@ impl Drop for Task {
 
 struct ThreadState {
     init_state: Cell<ThreadInitState>,
+    /// Whether init has been called. This is used to ensure `handle_init_request`
+    /// is invoked at most once.
+    initialized: Cell<bool>,
 }
 
 impl ThreadState {
     pub fn new() -> Self {
         Self {
             init_state: Cell::new(ThreadInitState::None),
+            initialized: Cell::new(false),
         }
     }
 }

@@ -310,37 +310,34 @@ impl litebox::platform::Provider for LinuxUserland {}
 
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
-/// This will run until the thread terminates.
+/// This will run until the thread terminates or returns.
 ///
 /// # Safety
 /// The context must be valid guest context.
-pub unsafe fn run_thread(
-    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &mut litebox_common_linux::PtRegs,
-) {
-    run_thread_inner(&shim, ctx);
+pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs) -> T
+where
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+{
+    run_thread_inner(&shim, ctx, false);
+    shim
 }
 
-/// Runs a guest thread using the provided shim reference and the given initial context.
+/// Re-enters a guest thread using the provided shim and the given initial context.
 ///
-/// This will run until the thread terminates.
+/// This will run until the thread terminates or returns.
 ///
-/// Unlike `run_thread`, `run_thread_with_shim_ref` is expected to be executed multiple
-/// times on the same shim instance. `run_thread` does not support this because the given
-/// shim instance is *moved* to `run_thread`.
-///
-/// CAUTION: This function doesn't work for multi-threaded processes, so it is only for
-/// OP-TEE use cases.
-///
+/// # Arguments
+/// * `shim` - The shim to use for handling syscalls and other events.
+/// * `ctx` - The initial execution context for the thread.
 ///
 /// # Safety
 /// The context must be valid guest context.
-#[cfg(feature = "optee_syscall")]
-pub unsafe fn run_thread_with_shim_ref(
-    shim: &impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &mut litebox_common_linux::PtRegs,
-) {
-    run_thread_inner(shim, ctx);
+pub unsafe fn reenter_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs) -> T
+where
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+{
+    run_thread_inner(&shim, ctx, true);
+    shim
 }
 
 struct ThreadContext<'a> {
@@ -351,11 +348,14 @@ struct ThreadContext<'a> {
 fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
+    reenter: bool,
 ) {
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     ThreadHandle::run_with_handle(|| {
-        with_signal_alt_stack(|| unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr) });
+        with_signal_alt_stack(|| unsafe {
+            run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
+        });
     });
 }
 
@@ -422,6 +422,7 @@ fn get_guest_fsbase() -> usize {
 unsafe extern "C-unwind" fn run_thread_arch(
     thread_ctx: &mut ThreadContext,
     ctx: *mut litebox_common_linux::PtRegs,
+    reenter: u8,
 ) {
     core::arch::naked_asm!(
     "
@@ -448,8 +449,13 @@ unsafe extern "C-unwind" fn run_thread_arch(
     rdfsbase r8
     wrgsbase r8
 
-    // Initialize this thread in the shim.
+    // Call init_handler or reenter_handler based on reenter flag (in dl).
+    test dl, dl
+    jnz 1f
     call {init_handler}
+    jmp .Ldone
+1:
+    call {reenter_handler}
     jmp .Ldone
 
     // This entry point is called from the guest when it issues a syscall
@@ -542,6 +548,7 @@ interrupt_callback:
 ",
     GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
     init_handler = sym init_handler,
+    reenter_handler = sym reenter_handler,
     syscall_handler = sym syscall_handler,
     exception_handler = sym exception_handler,
     interrupt_handler = sym interrupt_handler,
@@ -563,6 +570,7 @@ interrupt_callback:
 unsafe extern "fastcall-unwind" fn run_thread_arch(
     thread_ctx: &mut ThreadContext,
     ctx: *mut litebox_common_linux::PtRegs,
+    reenter: u8,
 ) {
     core::arch::naked_asm!(
     "
@@ -586,9 +594,16 @@ unsafe extern "fastcall-unwind" fn run_thread_arch(
     mov ax, gs
     mov fs, ax
 
+    // Call init_handler or reenter_handler based on reenter flag (on stack at [ebp+8])
     sub esp, 12 // align
     push ecx
+    mov al, [ebp + 8]  // reenter is 3rd arg, first stack arg for fastcall
+    test al, al
+    jnz 1f
     call {init_handler}
+    jmp .Ldone
+1:
+    call {reenter_handler}
     jmp .Ldone
 
     // This entry point is called from the guest when it issues a syscall
@@ -682,11 +697,12 @@ interrupt_callback:
     pop  ebx
     pop  ebp
     .cfi_def_cfa esp, 4
-    ret
+    ret 4  // pop the reenter argument (fastcall callee cleanup)
     .cfi_endproc
 ",
     GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
     init_handler = sym init_handler,
+    reenter_handler = sym reenter_handler,
     syscall_handler_fast = sym syscall_handler_fast,
     exception_handler = sym exception_handler,
     interrupt_handler = sym interrupt_handler,
@@ -821,7 +837,7 @@ fn thread_start(
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
-    run_thread_inner(shim.as_ref(), &mut ctx);
+    run_thread_inner(shim.as_ref(), &mut ctx, false);
     // TODO: have syscall_callback return if we need to terminate the process.
     // We should return this value to the caller so load_program can return it
     // to the user.
@@ -1536,6 +1552,10 @@ unsafe extern "C" {
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.init(ctx));
+}
+
+unsafe extern "C-unwind" fn reenter_handler(thread_ctx: &mut ThreadContext) {
+    thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx));
 }
 
 /// Handles Linux syscalls and dispatches them to LiteBox implementations.
