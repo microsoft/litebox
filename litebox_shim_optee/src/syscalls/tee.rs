@@ -84,17 +84,15 @@ impl Task {
                         core::mem::size_of::<TeeIdentity>(),
                     )
                 });
-                unsafe {
-                    prop_len
-                        .write_at_offset(
-                            0,
-                            u32::try_from(core::mem::size_of::<TeeIdentity>()).unwrap(),
-                        )
-                        .ok_or(TeeResult::AccessDenied)?;
-                    prop_type
-                        .write_at_offset(0, UserTaPropType::Identity as u32)
-                        .ok_or(TeeResult::AccessDenied)?;
-                }
+                prop_len
+                    .write_at_offset(
+                        0,
+                        u32::try_from(core::mem::size_of::<TeeIdentity>()).unwrap(),
+                    )
+                    .ok_or(TeeResult::AccessDenied)?;
+                prop_type
+                    .write_at_offset(0, UserTaPropType::Identity as u32)
+                    .ok_or(TeeResult::AccessDenied)?;
                 Ok(())
             }
             GpdPropertyIndex::CurrentTaUuid => {
@@ -111,14 +109,12 @@ impl Task {
                         core::mem::size_of::<TeeUuid>(),
                     )
                 });
-                unsafe {
-                    prop_len
-                        .write_at_offset(0, u32::try_from(core::mem::size_of::<TeeUuid>()).unwrap())
-                        .ok_or(TeeResult::AccessDenied)?;
-                    prop_type
-                        .write_at_offset(0, UserTaPropType::Uuid as u32)
-                        .ok_or(TeeResult::AccessDenied)?;
-                }
+                prop_len
+                    .write_at_offset(0, u32::try_from(core::mem::size_of::<TeeUuid>()).unwrap())
+                    .ok_or(TeeResult::AccessDenied)?;
+                prop_type
+                    .write_at_offset(0, UserTaPropType::Uuid as u32)
+                    .ok_or(TeeResult::AccessDenied)?;
                 Ok(())
             }
             GpdPropertyIndex::None => Err(TeeResult::BadParameters),
@@ -139,11 +135,9 @@ impl Task {
         {
             "gpd.client.identity" => {
                 if prop_set == TeePropSet::CurrentClient {
-                    unsafe {
-                        index
-                            .write_at_offset(0, GpdPropertyIndex::ClientIdentity as u32)
-                            .ok_or(TeeResult::AccessDenied)?;
-                    }
+                    index
+                        .write_at_offset(0, GpdPropertyIndex::ClientIdentity as u32)
+                        .ok_or(TeeResult::AccessDenied)?;
                     Ok(())
                 } else {
                     Err(TeeResult::BadParameters)
@@ -151,11 +145,9 @@ impl Task {
             }
             "gpd.ta.appID" => {
                 if prop_set == TeePropSet::CurrentTa {
-                    unsafe {
-                        index
-                            .write_at_offset(0, GpdPropertyIndex::CurrentTaUuid as u32)
-                            .ok_or(TeeResult::AccessDenied)?;
-                    }
+                    index
+                        .write_at_offset(0, GpdPropertyIndex::CurrentTaUuid as u32)
+                        .ok_or(TeeResult::AccessDenied)?;
                     Ok(())
                 } else {
                     Err(TeeResult::BadParameters)
@@ -174,19 +166,15 @@ impl Task {
         ret_orig: UserMutPtr<TeeOrigin>,
     ) -> Result<(), TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
-        unsafe {
-            ret_orig
-                .write_at_offset(0, TeeOrigin::Tee)
-                .ok_or(TeeResult::AccessDenied)?;
-        }
+        ret_orig
+            .write_at_offset(0, TeeOrigin::Tee)
+            .ok_or(TeeResult::AccessDenied)?;
         if is_pta(&ta_uuid, &usr_params) {
             // `open_ta_session` syscall lets a user-mode TA open a session to a PTA which provides
             // several import services (it works as a proxy for extra system calls).
-            unsafe {
-                ta_sess_id
-                    .write_at_offset(0, crate::SessionIdPool::get_pta_session_id())
-                    .ok_or(TeeResult::AccessDenied)?;
-            }
+            ta_sess_id
+                .write_at_offset(0, crate::SessionIdPool::get_pta_session_id())
+                .ok_or(TeeResult::AccessDenied)?;
             Ok(())
         } else {
             // `open_ta_session` syscall lets a user-mode TA open a session to another user-mode TA
@@ -218,11 +206,9 @@ impl Task {
         ret_orig: UserMutPtr<TeeOrigin>,
     ) -> Result<(), TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
-        unsafe {
-            ret_orig
-                .write_at_offset(0, TeeOrigin::Tee)
-                .ok_or(TeeResult::AccessDenied)?;
-        }
+        ret_orig
+            .write_at_offset(0, TeeOrigin::Tee)
+            .ok_or(TeeResult::AccessDenied)?;
         if is_pta_session(ta_sess_id) {
             // TODO: check whether `ta_sess_id` is associated with the system PTA.
             self.handle_system_pta_command(cmd_id, &params)

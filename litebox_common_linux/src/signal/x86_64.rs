@@ -3,10 +3,12 @@
 
 //! Definitions for x86_64 signal context structures.
 
+use zerocopy::{FromBytes, IntoBytes};
+
 use crate::signal::x86::FpxSwBytes;
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Sigcontext {
     pub r8: u64,
     pub r9: u64,

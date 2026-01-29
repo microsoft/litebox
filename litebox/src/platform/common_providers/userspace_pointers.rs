@@ -33,6 +33,7 @@
 
 use crate::mm::exception_table::memcpy_fallible;
 use crate::platform::{RawConstPointer, RawMutPointer};
+use zerocopy::{FromBytes, IntoBytes};
 
 /// Trait to validate that a pointer is a userspace pointer.
 ///
@@ -68,18 +69,44 @@ impl ValidateAccess for NoValidation {
 }
 
 /// Represent a user space pointer to a read-only object
-#[repr(C)]
-pub struct UserConstPtr<V, T> {
-    inner: *const T,
+// NOTE: We explicitly write the `T: Sized` bound to explicitly document that
+// these need to be "thin" pointers, and that "fat" pointers (i.e., pointers to
+// DSTs) are unsupported.
+#[derive(FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct UserConstPtr<V, T: Sized> {
+    /// An exposed-provenance address of the pointer. See [`Self::as_ptr`] for
+    /// more details.
+    inner: usize,
+    _phantom_ptr: core::marker::PhantomData<*const T>,
     _validator: core::marker::PhantomData<V>,
 }
 
-impl<V: ValidateAccess, T: Clone> UserConstPtr<V, T> {
+impl<V: ValidateAccess, T> UserConstPtr<V, T> {
     pub fn from_ptr(ptr: *const T) -> Self {
         Self {
-            inner: ptr,
+            inner: ptr.expose_provenance(),
+            _phantom_ptr: core::marker::PhantomData,
             _validator: core::marker::PhantomData,
         }
+    }
+
+    /// Explicitly-private function.  This particular function exists because we
+    /// store the `*const T` that would be stored in this struct instead as a
+    /// `usize`.  We store `inner` as a `usize` to support
+    /// `zerocopy::{FromBytes, IntoBytes}`.  Both of these _are_ sound to
+    /// implement on `*const T`, but `zerocopy` currently chooses not to
+    /// implement these, due to potential provenance footguns (see
+    /// <https://github.com/google/zerocopy/blob/dce155c9b6004af2bdfeefc547abbcae3661909e/src/impls.rs#L955-L958>,
+    /// or for a lot more details, see
+    /// <https://github.com/google/zerocopy/issues/170>).  Our usage of these
+    /// pointers is always through exposed provenance (see more details on
+    /// [`RawConstPointer`]), and thus our provenance story is intimately linked
+    /// to the design of that trait.  We are thus opting into the sound (but
+    /// footgun-controlled) approach of storing a `usize` and converting it over
+    /// here.
+    fn as_ptr(&self) -> *const T {
+        core::ptr::with_exposed_provenance(self.inner)
     }
 }
 
@@ -91,7 +118,7 @@ impl<V, T> Clone for UserConstPtr<V, T> {
 
 impl<V, T> Copy for UserConstPtr<V, T> {}
 
-impl<V, T: Clone> core::fmt::Debug for UserConstPtr<V, T> {
+impl<V, T> core::fmt::Debug for UserConstPtr<V, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("UserConstPtr").field(&self.inner).finish()
     }
@@ -101,13 +128,17 @@ impl<V, T: Clone> core::fmt::Debug for UserConstPtr<V, T> {
 ///
 /// Note that this is fallible only if recovering from exceptions (e.g., page fault or SIGSEGV)
 /// is supported.
-unsafe fn read_at_offset<V: ValidateAccess, T: Clone>(ptr: *const T, count: isize) -> Option<T> {
-    let src = unsafe { ptr.add(usize::try_from(count).ok()?) };
+fn read_at_offset<V: ValidateAccess, T: FromBytes>(ptr: *const T, count: isize) -> Option<T> {
+    let src = ptr.wrapping_add(usize::try_from(count).ok()?);
     let src = V::validate(src.cast_mut())?.cast_const();
     // Match on the size of `T` to use the appropriate fallible read function to
     // ensure that small aligned reads are atomic (and faster than a full
     // memcpy). This match will be evaluated at compile time, so there is no
     // runtime overhead.
+    //
+    // SAFETY: The FromBytes bound on T guarantees that any byte pattern is valid for T,
+    // so transmute_copy is safe. The memory access itself is fallible and returns None
+    // on invalid memory access.
     let val = unsafe {
         match size_of::<T>() {
             1 => core::mem::transmute_copy(
@@ -139,7 +170,7 @@ unsafe fn read_at_offset<V: ValidateAccess, T: Clone>(ptr: *const T, count: isiz
     Some(val)
 }
 
-unsafe fn to_owned_slice<V: ValidateAccess, T: Clone>(
+fn to_owned_slice<V: ValidateAccess, T: FromBytes>(
     ptr: *const T,
     len: usize,
 ) -> Option<alloc::boxed::Box<[T]>> {
@@ -148,6 +179,8 @@ unsafe fn to_owned_slice<V: ValidateAccess, T: Clone>(
     }
     let ptr = V::validate_slice(core::ptr::slice_from_raw_parts(ptr, len).cast_mut())?.cast_const();
     let mut data = alloc::boxed::Box::<[T]>::new_uninit_slice(len);
+    // SAFETY: The FromBytes bound on T guarantees that any byte pattern is valid for T.
+    // The memcpy_fallible operation returns None on invalid memory access.
     unsafe {
         memcpy_fallible(
             data.as_mut_ptr().cast(),
@@ -159,43 +192,58 @@ unsafe fn to_owned_slice<V: ValidateAccess, T: Clone>(
     }
 }
 
-impl<V: ValidateAccess, T: Clone> RawConstPointer<T> for UserConstPtr<V, T> {
-    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
-        unsafe { read_at_offset::<V, T>(self.inner, count) }
+impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserConstPtr<V, T> {
+    fn read_at_offset(self, count: isize) -> Option<T> {
+        read_at_offset::<V, T>(self.as_ptr(), count)
     }
 
-    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        unsafe { to_owned_slice::<V, T>(self.inner, len) }
+    fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
+        to_owned_slice::<V, T>(self.as_ptr(), len)
     }
 
     fn as_usize(&self) -> usize {
-        self.inner.expose_provenance()
+        self.inner
     }
     fn from_usize(addr: usize) -> Self {
         Self {
-            inner: core::ptr::with_exposed_provenance(addr),
+            inner: addr,
+            _phantom_ptr: core::marker::PhantomData,
             _validator: core::marker::PhantomData,
         }
     }
 }
 
 /// Represent a user space pointer to a mutable object
-#[repr(C)]
-pub struct UserMutPtr<V, T> {
-    inner: *mut T,
+// NOTE: We explicitly write the `T: Sized` bound to explicitly document that
+// these need to be "thin" pointers, and that "fat" pointers (i.e., pointers to
+// DSTs) are unsupported.
+#[derive(FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct UserMutPtr<V, T: Sized> {
+    /// An exposed-provenance address of the pointer. See [`Self::as_ptr`] for
+    /// more details.
+    inner: usize,
+    _phantom_ptr: core::marker::PhantomData<*mut T>,
     _validator: core::marker::PhantomData<V>,
 }
 
-impl<V: ValidateAccess, T: Clone> UserMutPtr<V, T> {
+impl<V: ValidateAccess, T> UserMutPtr<V, T> {
     pub fn from_ptr(ptr: *mut T) -> Self {
         Self {
-            inner: ptr,
+            inner: ptr.expose_provenance(),
+            _phantom_ptr: core::marker::PhantomData,
             _validator: core::marker::PhantomData,
         }
     }
+
+    /// Explicitly-private function.  See equivalent [`UserConstPtr::as_ptr`]
+    /// for more details.
+    fn as_ptr(&self) -> *mut T {
+        core::ptr::with_exposed_provenance_mut(self.inner)
+    }
 }
 
-impl<V, T: Clone> core::fmt::Debug for UserMutPtr<V, T> {
+impl<V, T> core::fmt::Debug for UserMutPtr<V, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("UserMutPtr").field(&self.inner).finish()
     }
@@ -209,31 +257,39 @@ impl<V, T> Clone for UserMutPtr<V, T> {
 
 impl<V, T> Copy for UserMutPtr<V, T> {}
 
-impl<V: ValidateAccess, T: Clone> RawConstPointer<T> for UserMutPtr<V, T> {
-    unsafe fn read_at_offset(self, count: isize) -> Option<T> {
-        unsafe { read_at_offset::<V, T>(self.inner.cast_const(), count) }
+impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserMutPtr<V, T> {
+    fn read_at_offset(self, count: isize) -> Option<T> {
+        read_at_offset::<V, T>(self.as_ptr().cast_const(), count)
     }
 
-    unsafe fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
-        unsafe { to_owned_slice::<V, T>(self.inner.cast_const(), len) }
+    fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
+        to_owned_slice::<V, T>(self.as_ptr().cast_const(), len)
     }
 
     fn as_usize(&self) -> usize {
-        self.inner.expose_provenance()
+        self.inner
     }
     fn from_usize(addr: usize) -> Self {
-        Self::from_ptr(core::ptr::with_exposed_provenance_mut(addr))
+        Self {
+            inner: addr,
+            _phantom_ptr: core::marker::PhantomData,
+            _validator: core::marker::PhantomData,
+        }
     }
 }
 
-impl<V: ValidateAccess, T: Clone> RawMutPointer<T> for UserMutPtr<V, T> {
-    unsafe fn write_at_offset(self, count: isize, value: T) -> Option<()> {
-        let dst = unsafe { self.inner.add(usize::try_from(count).ok()?) };
+impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPtr<V, T> {
+    fn write_at_offset(self, count: isize, value: T) -> Option<()> {
+        let dst = self.as_ptr().wrapping_add(usize::try_from(count).ok()?);
         let dst = V::validate(dst)?;
         // Match on the size of `T` to use the appropriate fallible write function to
         // ensure that small aligned writes are atomic (and faster than a full
         // memcpy). This match will be evaluated at compile time, so there is no
         // runtime overhead.
+        //
+        // SAFETY: The IntoBytes bound on T guarantees that T can be safely written as bytes.
+        // The transmute_copy is safe because T implements IntoBytes. The memory access
+        // itself is fallible and returns None on invalid memory access.
         unsafe {
             match size_of::<T>() {
                 1 => crate::mm::exception_table::write_u8_fallible(
@@ -278,7 +334,7 @@ impl<V: ValidateAccess, T: Clone> RawMutPointer<T> for UserMutPtr<V, T> {
         if buf.is_empty() {
             return Some(());
         }
-        let dst = unsafe { self.inner.add(start_offset) };
+        let dst = self.as_ptr().wrapping_add(start_offset);
         let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(dst, buf.len()))?;
         unsafe { memcpy_fallible(dst.cast(), buf.as_ptr().cast(), size_of_val(buf)).ok() }
     }

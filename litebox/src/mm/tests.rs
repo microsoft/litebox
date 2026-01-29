@@ -14,6 +14,7 @@ use crate::{
         trivial_providers::{TransparentConstPtr, TransparentMutPtr},
     },
 };
+use zerocopy::{FromBytes, IntoBytes};
 
 use super::linux::{
     NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
@@ -23,8 +24,8 @@ use super::linux::{
 struct DummyVmemBackend;
 
 impl crate::platform::RawPointerProvider for DummyVmemBackend {
-    type RawConstPointer<T: Clone> = TransparentConstPtr<T>;
-    type RawMutPointer<T: Clone> = TransparentMutPtr<T>;
+    type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
 }
 
 #[expect(unused_variables, reason = "dummy/mock backend")]
@@ -44,9 +45,7 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
         populate_pages_immediately: bool,
         fixed_address_behavior: crate::platform::page_mgmt::FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::AllocationError> {
-        Ok(TransparentMutPtr {
-            inner: suggested_range.start as *mut u8,
-        })
+        Ok(TransparentMutPtr::from_usize(suggested_range.start))
     }
 
     unsafe fn deallocate_pages(
@@ -62,9 +61,7 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
         new_range: Range<usize>,
         permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::RemapError> {
-        Ok(TransparentMutPtr {
-            inner: new_range.start as *mut u8,
-        })
+        Ok(TransparentMutPtr::from_usize(new_range.start))
     }
 
     unsafe fn update_permissions(

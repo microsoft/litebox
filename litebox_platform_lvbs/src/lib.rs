@@ -40,6 +40,7 @@ use x86_64::{
         mapper::MapToError,
     },
 };
+use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
@@ -80,8 +81,8 @@ type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::Us
 >;
 
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
-    type RawConstPointer<T: Clone> = UserConstPtr<T>;
-    type RawMutPointer<T: Clone> = UserMutPtr<T>;
+    type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
 impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, Host> {

@@ -855,6 +855,7 @@ dependencies = [
  "tar-no-std",
  "thiserror",
  "windows-sys 0.60.2",
+ "zerocopy",
 ]
 
 [[package]]
@@ -882,6 +883,7 @@ dependencies = [
  "modular-bitfield",
  "num_enum",
  "thiserror",
+ "zerocopy",
 ]
 
 [[package]]
@@ -899,6 +901,7 @@ dependencies = [
  "syscalls",
  "thiserror",
  "x86_64",
+ "zerocopy",
 ]
 
 [[package]]
@@ -914,6 +917,7 @@ dependencies = [
  "seccompiler",
  "spin 0.9.8",
  "syscalls",
+ "zerocopy",
 ]
 
 [[package]]
@@ -949,6 +953,7 @@ dependencies = [
  "thiserror",
  "x509-cert",
  "x86_64",
+ "zerocopy",
 ]
 
 [[package]]
@@ -972,6 +977,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "windows-sys 0.60.2",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1074,6 +1080,7 @@ dependencies = [
  "spin 0.9.8",
  "syscalls",
  "thiserror",
+ "zerocopy",
 ]
 
 [[package]]

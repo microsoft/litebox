@@ -22,6 +22,8 @@ use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall, vmap::VmapManager,
 };
 
+use zerocopy::{FromBytes, IntoBytes};
+
 mod syscall_intercept;
 
 extern crate alloc;
@@ -223,6 +225,7 @@ impl LinuxUserland {
         assert!(total_read < buf.len(), "buffer too small");
 
         let mut reserved_pages = alloc::vec::Vec::new();
+        #[cfg_attr(not(feature = "systrap_backend"), expect(unused_mut))]
         let mut vdso_address = None;
         let s = core::str::from_utf8(&buf[..total_read]).expect("invalid UTF-8");
         for line in s.lines() {
@@ -1223,8 +1226,8 @@ type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::
     T,
 >;
 impl litebox::platform::RawPointerProvider for LinuxUserland {
-    type RawConstPointer<T: Clone> = UserConstPtr<T>;
-    type RawMutPointer<T: Clone> = UserMutPtr<T>;
+    type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
 /// Operations currently supported by the safer variants of the Linux futex syscall

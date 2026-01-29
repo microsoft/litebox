@@ -27,6 +27,7 @@ use litebox_common_linux::{
     AddressFamily, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
     SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
 };
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{ConstPtr, Descriptor, MutPtr};
 use crate::{GlobalState, Task};
@@ -69,7 +70,7 @@ impl super::file::FilesState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C, packed)]
 struct CSockInetAddr {
     family: i16,
@@ -331,9 +332,9 @@ impl GlobalState {
             SocketOptionName::TCP(to) => match to {
                 TcpOption::CONGESTION => {
                     const TCP_CONGESTION_NAME_MAX: usize = 16;
-                    let data =
-                        unsafe { optval.to_owned_slice(TCP_CONGESTION_NAME_MAX.min(optlen)) }
-                            .ok_or(Errno::EFAULT)?;
+                    let data = optval
+                        .to_owned_slice(TCP_CONGESTION_NAME_MAX.min(optlen))
+                        .ok_or(Errno::EFAULT)?;
                     let name = core::str::from_utf8(&data).map_err(|_| Errno::EINVAL)?;
                     self.net.lock().set_tcp_option(
                         fd,
@@ -499,7 +500,8 @@ impl GlobalState {
                             _ => unimplemented!(),
                         };
                         let len = name.len().min(len as usize);
-                        unsafe { optval.write_slice_at_offset(0, &name.as_bytes()[..len]) }
+                        optval
+                            .write_slice_at_offset(0, &name.as_bytes()[..len])
                             .ok_or(Errno::EFAULT)?;
                         return Ok(len);
                     }
@@ -879,8 +881,8 @@ impl Task {
             Errno::EINVAL
         })?;
         let (sock1, sock2) = self.do_socketpair(domain, ty, flags, protocol)?;
-        unsafe { sockvec.write_at_offset(0, sock1) }.ok_or(Errno::EFAULT)?;
-        unsafe { sockvec.write_at_offset(1, sock2) }.ok_or(Errno::EFAULT)?;
+        sockvec.write_at_offset(0, sock1).ok_or(Errno::EFAULT)?;
+        sockvec.write_at_offset(1, sock2).ok_or(Errno::EFAULT)?;
         Ok(())
     }
     fn do_socketpair(
@@ -952,7 +954,7 @@ pub(crate) fn read_sockaddr_from_user(
     }
 
     let ptr: ConstPtr<u16> = ConstPtr::from_usize(sockaddr.as_usize());
-    let family = unsafe { ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+    let family = ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
     let family = AddressFamily::try_from(u32::from(family)).map_err(|_| Errno::EAFNOSUPPORT)?;
     match family {
         AddressFamily::INET => {
@@ -962,13 +964,13 @@ pub(crate) fn read_sockaddr_from_user(
             let ptr: ConstPtr<CSockInetAddr> = ConstPtr::from_usize(sockaddr.as_usize());
             // Note it reads the first 2 bytes (i.e., sa_family) again, but it is not used.
             // SocketAddrV4 only needs the port and addr.
-            let inet_addr = unsafe { ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+            let inet_addr = ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
             Ok(SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::from(
                 inet_addr,
             ))))
         }
         AddressFamily::UNIX => {
-            let path = unsafe { sockaddr.to_owned_slice(addrlen) }.ok_or(Errno::EFAULT)?;
+            let path = sockaddr.to_owned_slice(addrlen).ok_or(Errno::EFAULT)?;
             // skip the first two bytes (sa_family)
             let path = &path[offset_of!(CSockUnixAddr, path)..];
             if path.is_empty() {
@@ -993,7 +995,7 @@ pub(crate) fn write_sockaddr_to_user(
     addr: crate::MutPtr<u8>,
     addrlen: crate::MutPtr<u32>,
 ) -> Result<(), Errno> {
-    let addrlen_val = unsafe { addrlen.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+    let addrlen_val = addrlen.read_at_offset(0).ok_or(Errno::EFAULT)?;
     if addrlen_val >= i32::MAX as u32 {
         return Err(Errno::EINVAL);
     }
@@ -1007,12 +1009,14 @@ pub(crate) fn write_sockaddr_to_user(
                     size_of::<CSockInetAddr>(),
                 )
             };
-            unsafe { addr.write_slice_at_offset(0, &bytes[..addrlen_val]) }.ok_or(Errno::EFAULT)?;
+            addr.write_slice_at_offset(0, &bytes[..addrlen_val])
+                .ok_or(Errno::EFAULT)?;
             size_of::<CSockInetAddr>()
         }
         SocketAddress::Unix(v) => {
             let family_ptr = MutPtr::<u16>::from_usize(addr.as_usize());
-            unsafe { family_ptr.write_at_offset(0, AddressFamily::UNIX as u16) }
+            family_ptr
+                .write_at_offset(0, AddressFamily::UNIX as u16)
                 .ok_or(Errno::EFAULT)?;
             match v {
                 UnixSocketAddr::Unnamed => {
@@ -1022,15 +1026,13 @@ pub(crate) fn write_sockaddr_to_user(
                 UnixSocketAddr::Abstract(name) => {
                     let offset = offset_of!(CSockUnixAddr, path);
                     if addrlen_val as usize > offset {
-                        unsafe { addr.write_at_offset(isize::try_from(offset).unwrap(), 0) }
+                        addr.write_at_offset(isize::try_from(offset).unwrap(), 0)
                             .ok_or(Errno::EFAULT)?;
                         let max_len = addrlen_val as usize - offset - 1;
-                        unsafe {
-                            addr.write_slice_at_offset(
-                                isize::try_from(offset + 1).unwrap(),
-                                &name[..name.len().min(max_len)],
-                            )
-                        }
+                        addr.write_slice_at_offset(
+                            isize::try_from(offset + 1).unwrap(),
+                            &name[..name.len().min(max_len)],
+                        )
                         .ok_or(Errno::EFAULT)?;
                     }
                     offset + 1 + name.len()
@@ -1039,12 +1041,12 @@ pub(crate) fn write_sockaddr_to_user(
                     let offset = offset_of!(CSockUnixAddr, path);
                     let max_len = addrlen_val as usize - offset;
                     let name = &path.as_bytes()[..path.len().min(max_len)];
-                    unsafe { addr.write_slice_at_offset(isize::try_from(offset).unwrap(), name) }
+                    addr.write_slice_at_offset(isize::try_from(offset).unwrap(), name)
                         .ok_or(Errno::EFAULT)?;
                     let null_offset = offset + name.len();
                     // write null terminator if there is space
                     if addrlen_val as usize > null_offset {
-                        unsafe { addr.write_at_offset(isize::try_from(null_offset).unwrap(), 0) }
+                        addr.write_at_offset(isize::try_from(null_offset).unwrap(), 0)
                             .ok_or(Errno::EFAULT)?;
                     }
                     offset + path.len() + 1
@@ -1054,7 +1056,7 @@ pub(crate) fn write_sockaddr_to_user(
         SocketAddress::Inet(SocketAddr::V6(_)) => todo!("copy_sockaddr_to_user for IPv6"),
     }
     .truncate();
-    unsafe { addrlen.write_at_offset(0, len) }.ok_or(Errno::EFAULT)
+    addrlen.write_at_offset(0, len).ok_or(Errno::EFAULT)
 }
 
 impl Task {
@@ -1256,7 +1258,7 @@ impl Task {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
-        let buf = unsafe { buf.to_owned_slice(len) }.ok_or(Errno::EFAULT)?;
+        let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
@@ -1291,7 +1293,7 @@ impl Task {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-        let msg = unsafe { msg.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+        let msg = msg.read_at_offset(0).ok_or(Errno::EFAULT)?;
         self.do_sendmsg(fd, &msg, flags)
     }
     fn do_sendmsg(
@@ -1300,7 +1302,8 @@ impl Task {
         msg: &litebox_common_linux::UserMsgHdr<Platform>,
         flags: SendFlags,
     ) -> Result<usize, Errno> {
-        let sock_addr = if msg.msg_name.as_usize() != 0 {
+        let msg_name = msg.msg_name;
+        let sock_addr = if msg_name.as_usize() != 0 {
             Some(read_sockaddr_from_user(
                 msg.msg_name,
                 msg.msg_namelen as usize,
@@ -1314,7 +1317,10 @@ impl Task {
         if msg.msg_iovlen == 0 || msg.msg_iovlen > 1024 {
             return Err(Errno::EINVAL);
         }
-        let iovs = unsafe { msg.msg_iov.to_owned_slice(msg.msg_iovlen) }.ok_or(Errno::EFAULT)?;
+        let iovs = msg
+            .msg_iov
+            .to_owned_slice(msg.msg_iovlen)
+            .ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         let socket = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
@@ -1330,8 +1336,10 @@ impl Task {
                     if iov.iov_len == 0 {
                         continue;
                     }
-                    let buf =
-                        unsafe { iov.iov_base.to_owned_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
+                    let buf = iov
+                        .iov_base
+                        .to_owned_slice(iov.iov_len)
+                        .ok_or(Errno::EFAULT)?;
                     total_sent +=
                         self.global
                             .sendto(&self.wait_cx(), socket, &buf, flags, sock_addr)?;
@@ -1498,12 +1506,14 @@ impl Task {
             log_unsupported!("setsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
         })?;
-        let len = unsafe { optlen.read_at_offset(0).ok_or(Errno::EFAULT) }?;
+        let len = optlen.read_at_offset(0).ok_or(Errno::EFAULT)?;
         if len > i32::MAX as u32 {
             return Err(Errno::EINVAL);
         }
         let new_len = self.do_getsockopt(sockfd, optname, optval, len)?;
-        unsafe { optlen.write_at_offset(0, new_len.truncate()) }.ok_or(Errno::EFAULT)?;
+        optlen
+            .write_at_offset(0, new_len.truncate())
+            .ok_or(Errno::EFAULT)?;
         Ok(())
     }
     /// Actual implementation of `getsockopt`
@@ -1610,7 +1620,7 @@ impl Task {
         use litebox_common_linux::SocketcallType;
         macro_rules! parse_socketcall_args {
             ($nargs:literal => $func:ident { $($field:ident: $tt:tt),* $(,)? }) => {{
-                let args = unsafe { args.to_owned_slice($nargs) }.ok_or(Errno::EFAULT)?;
+                let args = args.to_owned_slice($nargs).ok_or(Errno::EFAULT)?;
                 self.$func (
                     $(parse_socketcall_args!(@convert args $tt )),*
                 ).to_syscall_result()

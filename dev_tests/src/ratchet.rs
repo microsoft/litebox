@@ -12,13 +12,18 @@ fn ratchet_transmutes() -> Result<()> {
     ratchet(
         &[
             ("dev_tests/", 2),
-            ("litebox/", 9),
+            ("litebox/", 8),
             ("litebox_platform_linux_userland/", 2),
         ],
         |file| {
             Ok(file
                 .lines()
-                .filter(|line| line.as_ref().unwrap().contains("transmute"))
+                .filter(|line| {
+                    let line = line.as_ref().unwrap();
+                    // Only check the code portion (before any // comment)
+                    let code_part = line.split("//").next().unwrap_or(line);
+                    code_part.contains("transmute")
+                })
                 .count())
         },
     )

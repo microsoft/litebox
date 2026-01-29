@@ -283,8 +283,9 @@ impl DebugLogProvider for MockPlatform {
 }
 
 impl RawPointerProvider for MockPlatform {
-    type RawConstPointer<T: Clone> = super::trivial_providers::TransparentConstPtr<T>;
-    type RawMutPointer<T: Clone> = super::trivial_providers::TransparentMutPtr<T>;
+    type RawConstPointer<T: zerocopy::FromBytes> = super::trivial_providers::TransparentConstPtr<T>;
+    type RawMutPointer<T: zerocopy::FromBytes + zerocopy::IntoBytes> =
+        super::trivial_providers::TransparentMutPtr<T>;
 }
 
 impl StdioProvider for MockPlatform {

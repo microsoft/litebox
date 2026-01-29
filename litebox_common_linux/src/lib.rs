@@ -14,6 +14,7 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, TruncateExt},
 };
 use syscalls::Sysno;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::signal::SigSet;
 
@@ -280,7 +281,7 @@ impl From<litebox::fs::FileType> for DirentType {
 /// Linux's `stat` struct
 #[cfg(target_arch = "x86_64")]
 #[repr(C, packed)]
-#[derive(Clone, Default, PartialEq, Debug)]
+#[derive(Clone, Default, PartialEq, Debug, FromBytes, IntoBytes)]
 pub struct FileStat {
     pub st_dev: u64,
     pub st_ino: u64,
@@ -307,7 +308,7 @@ pub struct FileStat {
 /// Linux's `stat` struct
 #[cfg(target_arch = "x86")]
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Debug)]
+#[derive(Clone, Default, PartialEq, Debug, FromBytes, IntoBytes)]
 pub struct FileStat {
     pub st_dev: u32,
     pub st_ino: u32,
@@ -332,7 +333,7 @@ pub struct FileStat {
 /// Linux's `stat64` struct
 #[cfg(target_arch = "x86")]
 #[repr(C, packed)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct FileStat64 {
     pub st_dev: u64,
     #[expect(clippy::pub_underscore_fields)]
@@ -386,14 +387,16 @@ impl From<FileStat> for FileStat64 {
 }
 
 /// Linux's `iovec` struct for `writev`
-#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+#[repr(C, packed)]
 pub struct IoWriteVec<P: RawConstPointer<u8>> {
     pub iov_base: P,
     pub iov_len: usize,
 }
 
 /// Linux's `iovec` struct for `readv`
-#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+#[repr(C, packed)]
 pub struct IoReadVec<P: RawMutPointer<u8>> {
     pub iov_base: P,
     pub iov_len: usize,
@@ -487,18 +490,24 @@ pub enum FlockType {
 }
 
 #[repr(C)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
 pub struct Flock {
     /// Type of lock: F_RDLCK, F_WRLCK, or F_UNLCK
     pub type_: i16,
     /// Where `start' is relative to
     pub whence: i16,
+    #[cfg(target_pointer_width = "64")]
+    #[doc(hidden)]
+    pub __pad0: u32,
     /// Offset where the lock begins
     pub start: usize,
     /// Size of the locked area, 0 means until EOF
     pub len: isize,
     /// Process holding the lock
     pub pid: i32,
+    #[cfg(target_pointer_width = "64")]
+    #[doc(hidden)]
+    pub __pad1: u32,
 }
 
 const F_DUPFD: i32 = 0;
@@ -558,7 +567,7 @@ bitflags::bitflags! {
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, FromBytes, IntoBytes)]
 pub struct Termios {
     pub c_iflag: tcflag_t,
     pub c_oflag: tcflag_t,
@@ -568,7 +577,7 @@ pub struct Termios {
     pub c_cc: [cc_t; 19usize],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Winsize {
     pub row: u16,
@@ -653,7 +662,7 @@ bitflags::bitflags! {
 
 /// struct for SO_LINGER option
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Linger {
     pub onoff: u32,  /* Linger active		*/
     pub linger: u32, /* How long to linger for	*/
@@ -747,7 +756,7 @@ impl SocketOptionName {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Ucred {
     pub pid: u32,
@@ -772,7 +781,7 @@ cfg_if::cfg_if! {
 }
 
 /// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L7)
-#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Timespec {
     /// Seconds.
@@ -809,7 +818,7 @@ impl From<Duration> for Timespec {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
 pub struct Timespec32 {
     pub tv_sec: i32,
     pub tv_nsec: u32,
@@ -843,13 +852,13 @@ impl From<Duration> for Timespec32 {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, FromBytes, IntoBytes)]
 pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
 }
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct ItimerVal {
     /// Timer interval
     interval: TimeVal,
@@ -884,7 +893,7 @@ impl From<Duration> for TimeVal {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
 pub struct TimeZone {
     tz_minuteswest: i32,
     tz_dsttime: i32,
@@ -1044,7 +1053,7 @@ pub unsafe fn wrfss(fs_selector: u16) {
 
 /// Linux's `user_desc` struct used by the `set_thread_area` syscall.
 #[repr(C, packed)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, FromBytes, IntoBytes)]
 pub struct UserDesc {
     pub entry_number: u32,
     pub base_addr: u32,
@@ -1054,7 +1063,8 @@ pub struct UserDesc {
 
 bitfield::bitfield! {
     /// Flags for the `user_desc` struct.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, FromBytes, IntoBytes)]
+    #[repr(transparent)]
     pub struct UserDescFlags(u32);
     impl Debug;
     /// 1 if the segment is 32-bit
@@ -1073,10 +1083,13 @@ bitfield::bitfield! {
     pub lm, set_lm: 7;
 }
 
+/// Flags for the clone3 system call as defined in `/usr/include/linux/sched.h`.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct CloneFlags(u64);
+
 bitflags::bitflags! {
-    /// Flags for the clone3 system call as defined in `/usr/include/linux/sched.h`.
-    #[derive(Clone, Copy, Debug)]
-    pub struct CloneFlags: u64 {
+    impl CloneFlags: u64 {
         /// Set if VM shared between processes
         const VM      = 0x00000100;
         /// Set if fs info shared between processes
@@ -1141,7 +1154,7 @@ bitflags::bitflags! {
 
 /// Arguments for the `clone3` syscall.
 #[repr(C, align(8))]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
 pub struct CloneArgs {
     pub flags: CloneFlags,
     pub pidfd: u64,
@@ -1175,7 +1188,7 @@ pub struct TaskParams {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Utsname {
     pub sysname: [u8; 65],
     pub nodename: [u8; 65],
@@ -1205,7 +1218,7 @@ pub type rlim_t = usize;
 
 /// Used by getrlimit and setrlimit syscalls
 #[repr(C)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
 pub struct Rlimit {
     pub rlim_cur: rlim_t,
     pub rlim_max: rlim_t,
@@ -1213,7 +1226,7 @@ pub struct Rlimit {
 
 /// Used by prlimit64 syscall
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Rlimit64 {
     pub rlim_cur: u64,
     pub rlim_max: u64,
@@ -1290,21 +1303,43 @@ impl RlimitResource {
     pub const RLIM_NLIMITS: usize = RlimitResource::RTTIME as usize + 1;
 }
 
+// FUTURE: The rust compiler is currently confused (in the shim, where a pointer
+// to this is taken) by the overly recursive nature of the trait bounds if we
+// actually set the types up for this the way they are in the comments, rather
+// than the `usize`s (Note: the separate issue of `Unaligned` when using that
+// variant is fixed simply by using `zerocopy::Usize`, and is not the issue
+// being referred to here).  Using the RobustList based types here causes a
+// E0275 (see `rustc --explain E0275`) on `Sized` and `FromBytes`. There is some
+// belief that minor restructuring should allow rustc to properly discover that
+// all the requirements are satisfied, but currently, that is considered beyond
+// the scope of the changes in the PR that introduced the
+// `FromBytes`/`IntoBytes` implementation here.
+/// XXX: The types in this struct might be changed to stronger types in the
+/// future.
 #[repr(C)]
-pub struct RobustList<Platform: litebox::platform::RawPointerProvider> {
-    pub next: Platform::RawConstPointer<RobustList<Platform>>,
+#[derive(Clone, FromBytes, IntoBytes)]
+pub struct RobustList {
+    pub next: usize, // Platform::RawConstPointer<RobustList<Platform>>,
 }
 
-impl<Platform: litebox::platform::RawPointerProvider> Clone for RobustList<Platform> {
-    fn clone(&self) -> Self {
-        Self { next: self.next }
-    }
-}
-
 #[repr(C)]
-pub struct RobustListHead<Platform: litebox::platform::RawPointerProvider> {
+#[derive(Clone, FromBytes, IntoBytes)]
+// FUTURE: The rust compiler is currently confused (in the shim, where a pointer
+// to this is taken) by the overly recursive nature of the trait bounds if we
+// actually set the types up for this the way they are in the comments, rather
+// than the `usize`s (Note: the separate issue of `Unaligned` when using that
+// variant is fixed simply by using `zerocopy::Usize`, and is not the issue
+// being referred to here).  Using the RobustList based types here causes a
+// E0275 (see `rustc --explain E0275`) on `Sized` and `FromBytes`. There is some
+// belief that minor restructuring should allow rustc to properly discover that
+// all the requirements are satisfied, but currently, that is considered beyond
+// the scope of the changes in the PR that introduced the
+// `FromBytes`/`IntoBytes` implementation here.
+/// XXX: The types in this struct might be changed to stronger types in the
+/// future.
+pub struct RobustListHead {
     /// The head of the list. Points back to itself if empty.
-    pub list: RobustList<Platform>,
+    pub list: RobustList, // RobustList<Platform>,
     /// This relative offset is set by user-space, it gives the kernel
     /// the relative position of the futex field to examine. This way
     /// we keep userspace flexible, to freely shape its data-structure,
@@ -1318,17 +1353,7 @@ pub struct RobustListHead<Platform: litebox::platform::RawPointerProvider> {
     /// always have full knowledge of all locks that the thread
     /// _might_ have taken. We check the owner TID in any case,
     /// so only truly owned locks will be handled.
-    pub list_op_pending: Platform::RawConstPointer<RobustList<Platform>>,
-}
-
-impl<Platform: litebox::platform::RawPointerProvider> Clone for RobustListHead<Platform> {
-    fn clone(&self) -> Self {
-        Self {
-            list: self.list.clone(),
-            futex_offset: self.futex_offset,
-            list_op_pending: self.list_op_pending,
-        }
-    }
+    pub list_op_pending: usize, // Platform::RawConstPointer<RobustList<Platform>>,
 }
 
 bitflags::bitflags! {
@@ -1348,14 +1373,14 @@ pub enum EpollOp {
     EpollCtlMod = 3,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
 #[repr(C, packed)]
 pub struct EpollEvent {
     pub events: u32,
     pub data: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Pollfd {
     pub fd: i32,
@@ -1425,7 +1450,7 @@ pub enum MadviseBehavior {
     DontNeedLocked = 24,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, FromBytes, IntoBytes)]
 pub struct Sysinfo {
     /// Seconds since boot
     pub uptime: usize,
@@ -1510,7 +1535,7 @@ bitflags::bitflags! {
 
 /// Header structure used for the `capget` and `capset` syscalls.
 #[repr(C)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
 pub struct CapHeader {
     pub version: u32,
     pub pid: u32,
@@ -1518,15 +1543,15 @@ pub struct CapHeader {
 
 /// Data structure used for the `capget` and `capset` syscalls.
 #[repr(C)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
 pub struct CapData {
     pub effective: u32,
     pub permitted: u32,
     pub inheritable: u32,
 }
 
-#[repr(C)]
-#[derive(Clone)]
+#[repr(C, packed)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct LinuxDirent64 {
     /// Inode number
     pub ino: u64,
@@ -1685,10 +1710,13 @@ pub enum IntervalTimer {
     Prof = 2,
 }
 
+/// Flags for the `receive` function.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct ReceiveFlags(u32);
+
 bitflags::bitflags! {
-    /// Flags for the `receive` function.
-    #[derive(Clone, Copy, Debug)]
-    pub struct ReceiveFlags: u32 {
+    impl ReceiveFlags: u32 {
         /// `MSG_CMSG_CLOEXEC`: close-on-exec for the associated file descriptor
         const CMSG_CLOEXEC = 0x40000000;
         /// `MSG_DONTWAIT`: non-blocking operation
@@ -1708,10 +1736,13 @@ bitflags::bitflags! {
     }
 }
 
+/// Flags for the `send` function.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[repr(C)]
+pub struct SendFlags(u32);
+
 bitflags::bitflags! {
-    /// Flags for the `send` function.
-    #[derive(Clone, Copy, Debug)]
-    pub struct SendFlags: u32 {
+    impl SendFlags: u32 {
         /// `MSG_CONFIRM`: requests confirmation of the message delivery.
         const CONFIRM = 0x800;
         /// `MSG_DONTROUTE`: send the message directly to the interface, bypassing routing.
@@ -1732,14 +1763,15 @@ bitflags::bitflags! {
 }
 
 /// Packaged sigset with its size, used by `pselect` syscall
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+#[repr(C)]
 pub struct SigSetPack {
     pub sigset: SigSet,
     pub size: usize,
 }
 
-#[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, FromBytes, IntoBytes)]
+#[repr(C, packed)]
 pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     /// ptr to socket address structure
     pub msg_name: Platform::RawConstPointer<u8>,
@@ -2733,7 +2765,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::set_robust_list => {
-                if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead<Platform>>() {
+                if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead>() {
                     sys_req!(SetRobustList { head })
                 } else {
                     return Err(errno::Errno::EINVAL);
@@ -2780,7 +2812,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
         Ok(dispatcher)
     }
 
-    fn parse_futex<T: Clone>(
+    fn parse_futex<T: FromBytes + IntoBytes>(
         ctx: &PtRegs,
         time_param: impl FnOnce(Option<Platform::RawMutPointer<T>>) -> TimeParam<Platform>,
         unsupported_einval: impl Fn(core::fmt::Arguments<'_>) -> errno::Errno,
@@ -2896,15 +2928,15 @@ impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
                 Duration::from_millis(s)
             }
             TimeParam::TimeVal(tv) => {
-                let tv = unsafe { tv.read_at_offset(0) }.ok_or(errno::Errno::EFAULT)?;
+                let tv = tv.read_at_offset(0).ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(tv).map_err(|_| errno::Errno::EINVAL)?
             }
             TimeParam::Timespec32(ts) => {
-                let ts = unsafe { ts.read_at_offset(0) }.ok_or(errno::Errno::EFAULT)?;
+                let ts = ts.read_at_offset(0).ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(ts).map_err(|_| errno::Errno::EINVAL)?
             }
             TimeParam::Timespec64(ts) => {
-                let ts = unsafe { ts.read_at_offset(0) }.ok_or(errno::Errno::EFAULT)?;
+                let ts = ts.read_at_offset(0).ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(ts).map_err(|_| errno::Errno::EINVAL)?
             }
         };
@@ -2916,17 +2948,20 @@ impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
         match *self {
             TimeParam::None | TimeParam::Milliseconds(_) => Ok(()),
             TimeParam::TimeVal(tv_ptr) => {
-                unsafe { tv_ptr.write_at_offset(0, duration.into()) }
+                tv_ptr
+                    .write_at_offset(0, duration.into())
                     .ok_or(errno::Errno::EFAULT)?;
                 Ok(())
             }
             TimeParam::Timespec32(ts_ptr) => {
-                unsafe { ts_ptr.write_at_offset(0, duration.into()) }
+                ts_ptr
+                    .write_at_offset(0, duration.into())
                     .ok_or(errno::Errno::EFAULT)?;
                 Ok(())
             }
             TimeParam::Timespec64(ts_ptr) => {
-                unsafe { ts_ptr.write_at_offset(0, duration.into()) }
+                ts_ptr
+                    .write_at_offset(0, duration.into())
                     .ok_or(errno::Errno::EFAULT)?;
                 Ok(())
             }
@@ -3169,15 +3204,15 @@ reinterpret_truncated_from_usize_for! {
 pub trait ReinterpretUsizeAsPtr<T>: Sized {
     fn reinterpret_usize_as_ptr(v: usize) -> Self;
 }
-impl<T: Clone, P: RawConstPointer<T>> ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>>
+impl<T: FromBytes, P: RawConstPointer<T>> ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>>
     for P
 {
     fn reinterpret_usize_as_ptr(v: usize) -> Self {
         P::from_usize(v)
     }
 }
-impl<T: Clone, P: RawConstPointer<T>> ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>>
-    for Option<P>
+impl<T: FromBytes, P: RawConstPointer<T>>
+    ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<P>
 {
     fn reinterpret_usize_as_ptr(v: usize) -> Self {
         if v == 0 { None } else { Some(P::from_usize(v)) }
