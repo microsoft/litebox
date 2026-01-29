@@ -5,8 +5,12 @@
 
 extern crate alloc;
 
-use core::panic::PanicInfo;
-use litebox::{mm::linux::PAGE_SIZE, utils::TruncateExt};
+use core::{ops::Neg, panic::PanicInfo};
+use litebox::{
+    mm::linux::PAGE_SIZE,
+    utils::{ReinterpretSignedExt, TruncateExt},
+};
+use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeSmcArgs, OpteeSmcReturnCode, UteeParams,
 };
@@ -16,9 +20,10 @@ use litebox_platform_lvbs::{
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
     mm::MemoryProvider,
     mshv::{
-        hvcall,
+        NUM_VTLCALL_PARAMS, VsmFunction, hvcall,
+        vsm::vsm_dispatch,
         vsm_intercept::raise_vtl0_gp_fault,
-        vtl_switch::{panic_vtl_switch, vtl_switch_loop_entry},
+        vtl_switch::{vtl_switch, vtl_switch_init},
         vtl1_mem_layout::{
             VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
             VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
@@ -113,18 +118,40 @@ pub fn init() -> Option<&'static Platform> {
 }
 
 pub fn run(platform: Option<&'static Platform>) -> ! {
-    vtl_switch_loop_entry(platform)
+    vtl_switch_init(platform);
+
+    let mut return_value: Option<i64> = None;
+    loop {
+        let params = vtl_switch(return_value);
+        return_value = Some(vtlcall_dispatch(&params));
+    }
 }
 
-/// A tentative entry point function to handle OP-TEE SMC call.
+/// Dispatch VTL call based on the function ID in params[0] and return the result.
 ///
-/// This entry point function is intended to be called from the LVBS platform which is unware of
-/// OP-TEE semantics.
+/// VTL call is with up to four u64 parameters and returns an i64 result.
+/// The first parameter (params[0]) is the VSM function ID to identify the requested service.
+/// The remaining parameters (params[1] to params[3]) are function-specific arguments.
 ///
-/// *** This is just a workaround until we have a proper callback/upcall interface or
-/// move the vtl switch loop into litebox_runner_lvbs. ***
-#[unsafe(no_mangle)]
-pub extern "C" fn optee_smc_handler_entry(smc_args_pfn: u64) -> i64 {
+/// TODO: Consider unified interface signature and naming
+/// VTL call is Hyper-V specific. However, in general, there is no fundamental difference
+/// between VTL call and TrustZone SMC call, TDX TDCALL, etc.
+fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
+    let func_id: u32 = params[0].truncate();
+    let Ok(func_id) = VsmFunction::try_from(func_id) else {
+        return Errno::EINVAL.as_neg().into();
+    };
+    match func_id {
+        VsmFunction::OpteeMessage => {
+            let smc_args_pfn = params[1];
+            optee_smc_handler_entry(smc_args_pfn)
+        }
+        _ => vsm_dispatch(func_id, &params[1..]),
+    }
+}
+
+/// An entry point function to handle OP-TEE SMC call.
+fn optee_smc_handler_entry(smc_args_pfn: u64) -> i64 {
     match optee_smc_handler_entry_inner(smc_args_pfn) {
         Ok(res) => res,
         Err(e) => e.as_neg().into(),
@@ -434,6 +461,9 @@ const TA_BINARY: &[u8] = &[0u8; 0];
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("{}", info);
-    let _ = raise_vtl0_gp_fault();
-    unsafe { panic_vtl_switch() }
+    match raise_vtl0_gp_fault() {
+        Ok(result) => vtl_switch(Some(result.reinterpret_as_signed())),
+        Err(err) => vtl_switch(Some((err as u32).reinterpret_as_signed().neg().into())),
+    };
+    unreachable!()
 }
