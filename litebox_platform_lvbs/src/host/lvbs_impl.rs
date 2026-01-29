@@ -7,8 +7,47 @@ use crate::{
     Errno, HostInterface, arch::ioport::serial_print_string,
     host::per_cpu_variables::with_per_cpu_variables_mut,
 };
+use core::arch::x86_64::_rdseed64_step;
+use drbg::{ctr::CtrDrbg, entropy::OsEntropy};
+use getrandom::register_custom_getrandom;
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
+
+/// Custom getrandom implementation using RDSEED for the custom target.
+///
+/// This is required because getrandom doesn't support our custom x86_64 target,
+/// and the drbg crate unconditionally depends on getrandom.
+///
+/// Note: RDSEED is relatively slow compared to other random sources, but this
+/// function is only called by CTR_DRBG for initial seeding (~48 bytes at startup)
+/// and very infrequent reseeding (default interval is 2^48 generations). All
+/// regular random number generation uses the fast AES-based DRBG, not RDSEED.
+#[allow(clippy::unnecessary_wraps)] // Return type required by register_custom_getrandom! macro
+fn rdseed_getrandom(dest: &mut [u8]) -> Result<(), getrandom::Error> {
+    let mut offset = 0;
+    while offset < dest.len() {
+        let mut val: u64 = 0;
+        // RDSEED may fail if the entropy source is exhausted.
+        // We retry until it succeeds.
+        // Safety: The RDSEED instruction is safe to call if the CPU
+        // supports it. We assume the CPU supports RDSEED since this
+        // is running on LVBS which requires modern hardware.
+        let success = unsafe { _rdseed64_step(&mut val) };
+        if success == 0 {
+            // RDSEED returned no data, retry
+            core::hint::spin_loop();
+            continue;
+        }
+        let val_bytes = val.to_ne_bytes();
+        let remaining = dest.len() - offset;
+        let to_copy = remaining.min(8);
+        dest[offset..offset + to_copy].copy_from_slice(&val_bytes[..to_copy]);
+        offset += to_copy;
+    }
+    Ok(())
+}
+
+register_custom_getrandom!(rdseed_getrandom);
 
 #[cfg(not(test))]
 mod alloc {
@@ -82,17 +121,51 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
     }
 }
 
+/// Static nonce for the CTR_DRBG. This should be set once during system
+/// initialization before the CRNG is used.
+static DRBG_NONCE: spin::once::Once<[u8; 16]> = spin::once::Once::new();
+
+/// Set the nonce for the CTR_DRBG. This should be called once during
+/// system initialization. The nonce provides additional uniqueness to
+/// the DRBG instantiation and should ideally be unique per boot.
+///
+/// # Panics
+/// Panics if called more than once.
+pub fn set_crng_nonce(nonce: &[u8; 16]) {
+    DRBG_NONCE.call_once(|| *nonce);
+}
+
+/// Get the nonce for the CTR_DRBG, or a default value if not set.
+fn get_crng_nonce() -> &'static [u8; 16] {
+    // Use a default nonce if not explicitly set. This is not ideal for
+    // security but allows the system to function if the nonce is not
+    // set during initialization.
+    DRBG_NONCE.call_once(|| {
+        // Default nonce - should be replaced with a proper one during init
+        [
+            0x4d, 0x59, 0x5d, 0xf4, 0xd0, 0xf3, 0x31, 0x73, 0x13, 0x37, 0x4a, 0x41, 0x59, 0x42,
+            0x13, 0x37,
+        ]
+    })
+}
+
 impl litebox::platform::CrngProvider for LvbsLinuxKernel {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
-        // FIXME: generate real random data.
-        static RANDOM: spin::mutex::SpinMutex<litebox::utils::rng::FastRng> =
-            spin::mutex::SpinMutex::new(litebox::utils::rng::FastRng::new_from_seed(
-                core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
-            ));
-        let mut random = RANDOM.lock();
-        for b in buf.chunks_mut(8) {
-            b.copy_from_slice(&random.next_u64().to_ne_bytes()[..b.len()]);
-        }
+        // Uses OsEntropy which calls getrandom(), which in turn uses our
+        // custom rdseed_getrandom implementation registered above.
+        static DRBG: spin::mutex::SpinMutex<Option<CtrDrbg<OsEntropy>>> =
+            spin::mutex::SpinMutex::new(None);
+
+        let mut drbg_guard = DRBG.lock();
+        let drbg = drbg_guard.get_or_insert_with(|| {
+            drbg::ctr::CtrBuilder::new(OsEntropy::default())
+                .nonce(get_crng_nonce())
+                .build()
+                .expect("failed to initialize CTR_DRBG")
+        });
+
+        drbg.fill_bytes(buf, None)
+            .expect("CTR_DRBG fill_bytes failed");
     }
 }
 

@@ -7,7 +7,7 @@ pub mod linux;
 pub mod lvbs_impl;
 pub mod per_cpu_variables;
 
-pub use lvbs_impl::LvbsLinuxKernel;
+pub use lvbs_impl::{LvbsLinuxKernel, set_crng_nonce};
 
 #[cfg(test)]
 pub mod mock;
