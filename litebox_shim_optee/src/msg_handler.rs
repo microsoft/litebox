@@ -377,7 +377,8 @@ pub fn prepare_for_return_to_normal_world(
                     // exceed the TA's memory region.
                     use litebox::platform::RawConstPointer;
                     let ptr = crate::UserConstPtr::<u8>::from_usize(addr.truncate());
-                    let slice = unsafe { ptr.to_owned_slice(len.truncate()) }
+                    let slice = ptr
+                        .to_owned_slice(len.truncate())
                         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
                     if slice.is_empty() {

@@ -65,11 +65,9 @@ impl Task {
         );
 
         let handle = tee_cryp_state_map.allocate(&cryp_state);
-        unsafe {
-            state
-                .write_at_offset(0, handle)
-                .ok_or(TeeResult::BadParameters)?;
-        }
+        state
+            .write_at_offset(0, handle)
+            .ok_or(TeeResult::BadParameters)?;
 
         if key1 != TeeObjHandle::NULL {
             tee_obj_map.set_busy(key1, true);
@@ -199,10 +197,8 @@ impl Task {
         let tee_obj_map = &self.tee_obj_map;
         if tee_obj_map.exists(obj) {
             let tee_obj = tee_obj_map.get_copy(obj).ok_or(TeeResult::ItemNotFound)?;
-            unsafe {
-                info.write_at_offset(0, tee_obj.info)
-                    .ok_or(TeeResult::AccessDenied)
-            }
+            info.write_at_offset(0, tee_obj.info)
+                .ok_or(TeeResult::AccessDenied)
         } else {
             Err(TeeResult::BadState)
         }
@@ -217,7 +213,7 @@ impl Task {
         let tee_obj_map = &self.tee_obj_map;
         let tee_obj = TeeObj::new(typ, max_size);
         let handle = tee_obj_map.allocate(&tee_obj);
-        if let Some(()) = unsafe { obj.write_at_offset(0, handle) } {
+        if let Some(()) = obj.write_at_offset(0, handle) {
             Ok(())
         } else {
             tee_obj_map.remove(handle);

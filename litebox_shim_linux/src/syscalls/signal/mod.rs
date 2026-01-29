@@ -13,6 +13,7 @@ use litebox_common_linux::signal::SignalDisposition;
 use x86 as arch;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
+use zerocopy::FromZeros;
 
 use crate::syscalls::process::ExitStatus;
 use crate::{ConstPtr, MutPtr, Task};
@@ -55,6 +56,8 @@ impl SignalState {
                 sp: 0,
                 flags: SsFlags::DISABLE,
                 size: 0,
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
             }),
             last_exception: Cell::new(litebox::shim::ExceptionInfo {
                 exception: litebox::shim::Exception(0),
@@ -77,6 +80,8 @@ impl SignalState {
                 flags: SsFlags::DISABLE,
                 sp: 0,
                 size: 0,
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
             }
             .into(),
             // Preserve last exception
@@ -100,6 +105,8 @@ impl SignalState {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
             };
         }
         self.clear_sigaltstack();
@@ -153,6 +160,8 @@ impl SignalHandlers {
                         restorer: 0,
                         flags: SaFlags::empty(),
                         mask: SigSet::empty(),
+                        #[cfg(target_arch = "x86_64")]
+                        __pad: 0,
                     },
                     immutable: i == SignalHandlersInner::sig_index(Signal::SIGKILL)
                         || i == SignalHandlersInner::sig_index(Signal::SIGSTOP),
@@ -263,9 +272,9 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_KERNEL,
-        data: SiginfoData {
-            addr: fault_address,
-        },
+        #[cfg(target_arch = "x86_64")]
+        __pad: 0,
+        data: SiginfoData::new_addr(fault_address),
     }
 }
 
@@ -276,7 +285,9 @@ fn siginfo_kill(signal: Signal) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_USER,
-        data: SiginfoData { pad: [0; 29] },
+        #[cfg(target_arch = "x86_64")]
+        __pad: 0,
+        data: SiginfoData::new_zeroed(),
     }
 }
 
@@ -306,6 +317,8 @@ impl SignalState {
                 sp: ss.sp,
                 flags: ss.flags & SsFlags::AUTODISARM,
                 size: ss.size,
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
             });
             Ok(())
         }
@@ -317,6 +330,8 @@ impl SignalState {
             sp: 0,
             flags: SsFlags::DISABLE,
             size: 0,
+            #[cfg(target_arch = "x86_64")]
+            __pad: 0,
         });
     }
 
@@ -375,16 +390,14 @@ impl Task {
             return Err(Errno::EINVAL);
         }
         let set = if let Some(set_ptr) = set_ptr {
-            Some(unsafe { set_ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?)
+            Some(set_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
         } else {
             None
         };
 
         if let Some(oldset_ptr) = oldset_ptr {
             let oldset = self.signals.blocked.get();
-            unsafe {
-                oldset_ptr.write_at_offset(0, oldset).ok_or(Errno::EFAULT)?;
-            };
+            oldset_ptr.write_at_offset(0, oldset).ok_or(Errno::EFAULT)?;
         }
 
         if let Some(set) = set {
@@ -418,13 +431,13 @@ impl Task {
             if is_on_stack {
                 old_ss.flags |= SsFlags::ONSTACK;
             }
-            unsafe { old_ss_ptr.write_at_offset(0, old_ss).ok_or(Errno::EFAULT)? };
+            old_ss_ptr.write_at_offset(0, old_ss).ok_or(Errno::EFAULT)?;
         }
         if let Some(ss_ptr) = ss_ptr {
             if is_on_stack {
                 return Err(Errno::EPERM);
             }
-            let ss = unsafe { ss_ptr.read_at_offset(0).ok_or(Errno::EFAULT)? };
+            let ss = ss_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
             self.signals.set_sigaltstack(ss)?;
         }
         Ok(0)
@@ -433,7 +446,7 @@ impl Task {
     pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
         let uctx_addr = arch::uctx_addr(ctx);
         let uctx_ptr = ConstPtr::<Ucontext>::from_usize(uctx_addr);
-        let Some(uctx) = (unsafe { uctx_ptr.read_at_offset(0) }) else {
+        let Some(uctx) = uctx_ptr.read_at_offset(0) else {
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);
         };
@@ -460,7 +473,7 @@ impl Task {
             return Err(Errno::EINVAL);
         }
         let act = if let Some(act_ptr) = act_ptr {
-            Some(unsafe { act_ptr.read_at_offset(0) }.ok_or(Errno::EFAULT)?)
+            Some(act_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
         } else {
             None
         };
@@ -480,11 +493,9 @@ impl Task {
         };
 
         if let Some(oldact_ptr) = oldact_ptr {
-            unsafe {
-                oldact_ptr
-                    .write_at_offset(0, old_act)
-                    .ok_or(Errno::EFAULT)?;
-            };
+            oldact_ptr
+                .write_at_offset(0, old_act)
+                .ok_or(Errno::EFAULT)?;
         }
 
         Ok(0)
@@ -588,7 +599,9 @@ impl Task {
             signo: signal.as_i32(),
             errno: 0,
             code: SI_KERNEL,
-            data: SiginfoData { pad: [0; 29] },
+            #[cfg(target_arch = "x86_64")]
+            __pad: 0,
+            data: SiginfoData::new_zeroed(),
         };
         self.force_signal_with_info(signal, force_exit, siginfo);
     }
@@ -617,6 +630,8 @@ impl Task {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
             };
             // Don't allow further changes to this action.
             handler.immutable = true;

@@ -29,7 +29,7 @@ impl Task {
         pad_end: usize,
         flags: LdelfMapFlags,
     ) -> Result<(), TeeResult> {
-        let Some(addr) = (unsafe { va.read_at_offset(0) }) else {
+        let Some(addr) = va.read_at_offset(0) else {
             return Err(TeeResult::BadParameters);
         };
 
@@ -91,9 +91,7 @@ impl Task {
             );
         }
 
-        unsafe {
-            let _ = va.write_at_offset(0, padded_start);
-        }
+        let _ = va.write_at_offset(0, padded_start);
         Ok(())
     }
 
@@ -111,9 +109,7 @@ impl Task {
             return Err(TeeResult::ItemNotFound);
         }
         let new_handle = self.ta_handle_map.insert(ta_uuid);
-        unsafe {
-            let _ = handle.write_at_offset(0, new_handle);
-        }
+        let _ = handle.write_at_offset(0, new_handle);
 
         Ok(())
     }
@@ -143,7 +139,7 @@ impl Task {
         pad_end: usize,
         flags: LdelfMapFlags,
     ) -> Result<(), TeeResult> {
-        let Some(addr) = (unsafe { va.read_at_offset(0) }) else {
+        let Some(addr) = va.read_at_offset(0) else {
             return Err(TeeResult::BadParameters);
         };
 
@@ -221,18 +217,19 @@ impl Task {
             return Err(TeeResult::BadFormat);
         }
 
-        unsafe {
-            if self
-                .read_ta_bin(
-                    handle,
-                    UserMutPtr::from_usize(padded_start),
-                    offs,
-                    num_bytes,
-                )
-                .is_none()
-            {
-                return Err(TeeResult::ShortBuffer);
-            }
+        // SAFETY: `read_ta_bin` writes to a valid, properly-sized memory region
+        // that was just mmap'd above with PROT_READ_WRITE permissions.
+        if unsafe {
+            self.read_ta_bin(
+                handle,
+                UserMutPtr::from_usize(padded_start),
+                offs,
+                num_bytes,
+            )
+        }
+        .is_none()
+        {
+            return Err(TeeResult::ShortBuffer);
         }
 
         // Set final permissions for the usable region
@@ -272,9 +269,7 @@ impl Task {
             );
         }
 
-        unsafe {
-            let _ = va.write_at_offset(0, padded_start);
-        }
+        let _ = va.write_at_offset(0, padded_start);
 
         Ok(())
     }

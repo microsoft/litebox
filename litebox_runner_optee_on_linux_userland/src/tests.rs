@@ -113,7 +113,7 @@ pub fn run_ta_with_test_commands(
             // TA stores results in the `UteeParams` structure and/or buffers it refers to.
             if let Some(params_address) = info.params_address {
                 let ptr = UserConstPtr::<UteeParams>::from_usize(params_address);
-                let params = unsafe { ptr.read_at_offset(0) }.expect("Failed to read UteeParams");
+                let params = ptr.read_at_offset(0).expect("Failed to read UteeParams");
                 handle_ta_command_output(&params);
             }
         }

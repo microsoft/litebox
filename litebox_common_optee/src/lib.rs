@@ -12,9 +12,10 @@ use alloc::boxed::Box;
 use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{PtRegs, errno::Errno};
 use modular_bitfield::prelude::*;
-use modular_bitfield::specifiers::{B4, B8, B48, B54};
+use modular_bitfield::specifiers::{B8, B54};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
+use zerocopy::{FromBytes, IntoBytes};
 
 pub mod syscall_nr;
 
@@ -249,6 +250,47 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
     }
 }
 
+/// Helper macro to define open enumerations, which it expands to structs with
+/// constants, such that the type supports exhaustive storage of all values of
+/// the underlying type.
+///
+/// E.g., the following enum expands to a value that stores any possible `u32`.
+///
+/// ```ignore
+/// open_enum! {
+///   /// Some documentation
+///   enum ExampleEnum: u32 {
+///     VariantOne = 1,
+///     VariantTwo = 2,
+///   }
+/// }
+/// ```
+// FUTURE(jayb): consider moving this to `litebox` or a helper crate
+macro_rules! open_enum {
+    ($(#[$meta:meta])* $pub:vis enum $name:ident : $ty:ty { $(
+        $variant:ident = $value:literal,
+    )+ }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes)]
+        #[repr(transparent)]
+        $pub struct $name($ty);
+        #[allow(non_upper_case_globals)]
+        impl $name {
+            $($pub const $variant: $name = $name($value);)*
+            $pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+                Ok(match <$ty>::try_from(value).map_err(|_| Errno::EINVAL)? {
+                    $($value => Self::$variant,)*
+                    _ => return Err(Errno::EINVAL),
+                })
+            }
+            /// Get the underlying value for `self`.
+            $pub fn value(&self) -> &$ty {
+                &self.0
+            }
+        }
+    };
+}
+
 /// A data structure for containing syscall arguments.
 #[derive(Clone, Copy)]
 pub struct SyscallContext {
@@ -291,7 +333,7 @@ impl SyscallContext {
 /// A handle for `TeeObj`. OP-TEE kernel creates secret objects (e.g., via `CrypObjAlloc`)
 /// and provides handles for them to TAs in the user space. This lets them refer to
 /// the objects in subsequent syscalls.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct TeeObjHandle(pub u32);
 
@@ -308,7 +350,7 @@ impl TeeObjHandle {
 /// A handle for `TeeCrypState`. Like `TeeObjHandle`, this is a handle for
 /// the cryptographic state (e.g., created through `CrypStateAlloc`) to be provided to
 /// a TA in the user space.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct TeeCrypStateHandle(pub u32);
 
@@ -352,7 +394,7 @@ impl CommandId {
 /// `utee_params` from `optee_os/lib/libutee/include/utee_types.h`
 /// It contains up to 4 parameters where each of them is a collection of
 /// type (4 bits) and two 8-byte data (values or addresses).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct UteeParams {
     pub types: UteeParamsTypes,
@@ -360,17 +402,27 @@ pub struct UteeParams {
 }
 const TEE_NUM_PARAMS: usize = 4;
 
-#[bitfield]
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct UteeParamsTypes {
-    pub type_0: B4,
-    pub type_1: B4,
-    pub type_2: B4,
-    pub type_3: B4,
-    #[skip]
-    __: B48,
+#[expect(
+    clippy::identity_op,
+    reason = "the macro auto-generates this, but some issue causes it to still bubble up; this suppresses it the hard way"
+)]
+mod workaround_identity_op_suppression {
+    use modular_bitfield::prelude::*;
+    use modular_bitfield::specifiers::{B4, B48};
+    use zerocopy::{FromBytes, IntoBytes};
+    #[bitfield]
+    #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+    #[repr(C)]
+    pub struct UteeParamsTypes {
+        pub type_0: B4,
+        pub type_1: B4,
+        pub type_2: B4,
+        pub type_3: B4,
+        #[skip]
+        __: B48,
+    }
 }
+pub use workaround_identity_op_suppression::UteeParamsTypes;
 
 const TEE_PARAM_TYPE_NONE: u8 = 0;
 const TEE_PARAM_TYPE_VALUE_INPUT: u8 = 1;
@@ -460,44 +512,34 @@ impl UteeParamOwned {
 }
 
 /// `utee_attribute` from `optee_os/lib/libutee/include/utee_types.h`
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct UteeAttribute {
     pub a: u64,
     pub b: u64,
     pub attribute_id: TeeAttributeType,
+    #[doc(hidden)]
+    __pad: u32,
 }
 
-const TEE_ATTR_SECRET_VALUE: u32 = 0xc000_0000;
-const TEE_ATTR_RSA_MODULUS: u32 = 0xd000_0130;
-const TEE_ATTR_RSA_PUBLIC_EXPONENT: u32 = 0xd000_0230;
-const TEE_ATTR_RSA_PRIVATE_EXPONENT: u32 = 0xc000_0330;
-const TEE_ATTR_RSA_PRIME1: u32 = 0xc000_0430;
-const TEE_ATTR_RSA_PRIME2: u32 = 0xc000_0530;
-const TEE_ATTR_RSA_EXPONENT1: u32 = 0xc000_0630;
-const TEE_ATTR_RSA_EXPONENT2: u32 = 0xc000_0730;
-const TEE_ATTR_RSA_COEFFICIENT: u32 = 0xc000_0830;
-
-/// `TEE_OperationMode` from `optee_os/lib/libutee/include/tee_api_defines.h`
-#[non_exhaustive]
-#[derive(Clone, Copy, TryFromPrimitive)]
-#[repr(u32)]
-pub enum TeeAttributeType {
-    SecretValue = TEE_ATTR_SECRET_VALUE,
-    RsaModulus = TEE_ATTR_RSA_MODULUS,
-    RsaPublicExponent = TEE_ATTR_RSA_PUBLIC_EXPONENT,
-    RsaPrivateExponent = TEE_ATTR_RSA_PRIVATE_EXPONENT,
-    RsaPrime1 = TEE_ATTR_RSA_PRIME1,
-    RsaPrime2 = TEE_ATTR_RSA_PRIME2,
-    RsaExponent1 = TEE_ATTR_RSA_EXPONENT1,
-    RsaExponent2 = TEE_ATTR_RSA_EXPONENT2,
-    RsaCoefficient = TEE_ATTR_RSA_COEFFICIENT,
-    Unknown = 0xffff_ffff,
+open_enum! {
+    /// `TEE_ATTR_*` from `optee_os/lib/libutee/include/tee_api_defines.h`
+    pub enum TeeAttributeType: u32 {
+        SecretValue = 0xc000_0000,
+        RsaModulus = 0xd000_0130,
+        RsaPublicExponent = 0xd000_0230,
+        RsaPrivateExponent = 0xc000_0330,
+        RsaPrime1 = 0xc000_0430,
+        RsaPrime2 = 0xc000_0530,
+        RsaExponent1 = 0xc000_0630,
+        RsaExponent2 = 0xc000_0730,
+        RsaCoefficient = 0xc000_0830,
+    }
 }
 
 /// `TEE_UUID` from `optee_os/lib/libutee/include/tee_api_types.h`. It uniquely identifies
 /// TAs, cryptographic keys, and more.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct TeeUuid {
     pub time_low: u32,
@@ -565,7 +607,7 @@ pub struct TeeIdentity {
 }
 
 /// `TEE_ObjectInfo` from `optee_os/lib/libutee/include/tee_api_types.h`
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct TeeObjectInfo {
     pub object_type: TeeObjectType,
@@ -577,10 +619,13 @@ pub struct TeeObjectInfo {
     pub handle_flags: TeeHandleFlag,
 }
 
+/// `TEE_USAGE_*` from `optee_os/lib/libutee/include/tee_api_defines.h`
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct TeeUsage(u32);
+
 bitflags::bitflags! {
-    /// `TEE_USAGE_*` from `optee_os/lib/libutee/include/tee_api_defines.h`
-    #[derive(Clone, Copy)]
-    pub struct TeeUsage: u32 {
+    impl TeeUsage: u32 {
         const TEE_USAGE_EXTRACTABLE = 0x0000_0001;
         const TEE_USAGE_ENCRYPT = 0x0000_0002;
         const TEE_USAGE_DECRYPT = 0x0000_0004;
@@ -591,10 +636,13 @@ bitflags::bitflags! {
     }
 }
 
+/// Memory access rights constants from `optee_os/lib/libutee/include/tee_api_defines.h`
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct TeeHandleFlag(u32);
+
 bitflags::bitflags! {
-    /// Memory access rights constants from `optee_os/lib/libutee/include/tee_api_defines.h`
-    #[derive(Clone, Copy)]
-    pub struct TeeHandleFlag: u32 {
+    impl TeeHandleFlag: u32 {
         const TEE_HANDLE_FLAG_PERSISTENT = 0x0001_0000;
         const TEE_HANDLE_FLAG_INITIALIZED = 0x0002_0000;
         const TEE_HANDLE_FLAG_KEY_SET = 0x0004_0000;
@@ -605,7 +653,7 @@ bitflags::bitflags! {
 impl Default for TeeObjectInfo {
     fn default() -> Self {
         TeeObjectInfo {
-            object_type: TeeObjectType::Unknown,
+            object_type: TeeObjectType::UNKNOWN,
             object_size: 0,
             max_object_size: 0,
             object_usage: TeeUsage::all(),
@@ -676,26 +724,13 @@ impl TeeOperationMode {
     }
 }
 
-const TEE_ORIGIN_API: u32 = 0;
-const TEE_ORIGIN_COMMS: u32 = 1;
-const TEE_ORIGIN_TEE: u32 = 2;
-const TEE_ORIGIN_TRUTED_APP: u32 = 3;
-
-/// Origin code constants from `optee_os/lib/libutee/include/tee_api_defines.h`
-#[derive(Clone, Copy, TryFromPrimitive)]
-#[repr(u32)]
-pub enum TeeOrigin {
-    Api = TEE_ORIGIN_API,
-    Comms = TEE_ORIGIN_COMMS,
-    Tee = TEE_ORIGIN_TEE,
-    TrustedApp = TEE_ORIGIN_TRUTED_APP,
-}
-
-impl TeeOrigin {
-    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
-        u32::try_from(value)
-            .map_err(|_| Errno::EINVAL)
-            .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+open_enum! {
+    /// Origin code constants from `optee_os/lib/libutee/include/tee_api_defines.h`
+    pub enum TeeOrigin: u32 {
+        Api = 0,
+        Comms = 1,
+        Tee = 2,
+        TrustedApp = 3,
     }
 }
 
@@ -808,38 +843,25 @@ impl From<TeeAlgorithm> for TeeAlgorithmClass {
     }
 }
 
-const TEE_TYPE_AES: u32 = 0xa000_0010;
-const TEE_TYPE_HMAC_SHA256: u32 = 0xa000_0004;
-const TEE_TYPE_HMAC_SHA512: u32 = 0xa000_0006;
-const TEE_TYPE_RSA_PUBLIC_KEY: u32 = 0xa000_0030;
-const TEE_TYPE_RSA_KEYPAIR: u32 = 0xa100_0030;
-const TEE_TYPE_GENERIC_SECRET: u32 = 0xa000_0000;
-const TEE_TYPE_CORRUPTED_OBJECT: u32 = 0xa000_00be;
-const TEE_TYPE_DATA: u32 = 0xa000_00bf;
-
-/// Object types `optee_os/lib/libutee/include/tee_api_defines.h`
-/// TODO: add more object types as needed
-#[non_exhaustive]
-#[derive(Clone, Copy, TryFromPrimitive)]
-#[repr(u32)]
-pub enum TeeObjectType {
-    Aes = TEE_TYPE_AES,
-    HmacSha256 = TEE_TYPE_HMAC_SHA256,
-    HmacSha512 = TEE_TYPE_HMAC_SHA512,
-    RsaPublicKey = TEE_TYPE_RSA_PUBLIC_KEY,
-    RsaKeypair = TEE_TYPE_RSA_KEYPAIR,
-    GenericSecret = TEE_TYPE_GENERIC_SECRET,
-    CorruptedObject = TEE_TYPE_CORRUPTED_OBJECT,
-    Data = TEE_TYPE_DATA,
-    Unknown = 0xffff_ffff,
-}
-
-impl TeeObjectType {
-    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
-        u32::try_from(value)
-            .map_err(|_| Errno::EINVAL)
-            .and_then(|v| Self::try_from(v).map_err(|_| Errno::EINVAL))
+open_enum! {
+    /// Object types `optee_os/lib/libutee/include/tee_api_defines.h`
+    /// TEE_TYPE_*
+    /// TODO: add more object types as needed
+    pub enum TeeObjectType: u32 {
+        Aes = 0xa000_0010,
+        HmacSha256 = 0xa000_0004,
+        HmacSha512 = 0xa000_0006,
+        RsaPublicKey = 0xa000_0030,
+        RsaKeypair = 0xa100_0030,
+        GenericSecret = 0xa000_0000,
+        CorruptedObject = 0xa000_00be,
+        Data = 0xa000_00bf,
     }
+}
+impl TeeObjectType {
+    // Not explicitly defined in OP-TEE, but we define it for convenience _within_ this module. We
+    // don't define it in the open_enum! macro to avoid exposing it outside this module.
+    const UNKNOWN: Self = TeeObjectType(0xffff_ffff);
 }
 
 const TEE_SUCCESS: u32 = 0x0000_0000;
@@ -1099,7 +1121,7 @@ bitflags::bitflags! {
 }
 
 /// `ldef_arg` from `optee_os/ldelf/include/ldelf.h`
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct LdelfArg {
     pub uuid: TeeUuid,

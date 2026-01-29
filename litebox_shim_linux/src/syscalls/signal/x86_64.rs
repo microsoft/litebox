@@ -10,9 +10,10 @@ use litebox_common_linux::{
     PtRegs,
     signal::{SaFlags, SigAction, Siginfo, Ucontext, x86_64::Sigcontext},
 };
+use zerocopy::{FromBytes, IntoBytes};
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 struct SignalFrame {
     return_address: usize,
     ucontext: Ucontext,
@@ -60,7 +61,7 @@ impl SignalState {
             return_address: action.restorer,
             ucontext: Ucontext {
                 flags: 0,
-                link: core::ptr::null_mut(),
+                link: 0, // core::ptr::null_mut(),
                 stack: self.altstack.get(),
                 mcontext: Sigcontext {
                     r8: ctx.r8 as u64,
@@ -98,9 +99,7 @@ impl SignalState {
         };
 
         let frame_ptr = MutPtr::from_usize(frame_addr);
-        unsafe {
-            frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)?;
-        }
+        frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)?;
 
         ctx.rsp = frame_addr;
         ctx.rip = action.sigaction;

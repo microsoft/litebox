@@ -39,10 +39,11 @@ macro_rules! common_functions_for_file_status {
 }
 
 pub(crate) use common_functions_for_file_status;
+use zerocopy::{FromBytes, IntoBytes};
 
 /// Helper function to write a value of type T to user memory.
 /// If the buffer size (i.e., provided `len`) is smaller than `size_of::<T>()`, only write up to `len` bytes.
-fn write_to_user<T>(
+fn write_to_user<T: FromBytes + IntoBytes>(
     val: T,
     optval: crate::MutPtr<u8>,
     len: u32,
@@ -50,13 +51,14 @@ fn write_to_user<T>(
     use litebox::platform::RawMutPointer as _;
     let length = core::mem::size_of::<T>().min(len as usize);
     let data = unsafe { core::slice::from_raw_parts((&raw const val).cast::<u8>(), length) };
-    unsafe { optval.write_slice_at_offset(0, data) }
+    optval
+        .write_slice_at_offset(0, data)
         .ok_or(litebox_common_linux::errno::Errno::EFAULT)?;
     Ok(length)
 }
 /// Helper function to read a value of type T from user memory.
 /// If the buffer size (i.e., provided `optlen`) is smaller than `size_of::<T>()`, return EINVAL.
-fn read_from_user<T: Clone>(
+fn read_from_user<T: FromBytes>(
     optval: crate::ConstPtr<u8>,
     optlen: usize,
 ) -> Result<T, litebox_common_linux::errno::Errno> {
@@ -65,5 +67,7 @@ fn read_from_user<T: Clone>(
         return Err(litebox_common_linux::errno::Errno::EINVAL);
     }
     let optval: crate::ConstPtr<T> = crate::ConstPtr::from_usize(optval.as_usize());
-    unsafe { optval.read_at_offset(0) }.ok_or(litebox_common_linux::errno::Errno::EFAULT)
+    optval
+        .read_at_offset(0)
+        .ok_or(litebox_common_linux::errno::Errno::EFAULT)
 }

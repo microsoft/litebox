@@ -139,7 +139,7 @@ impl UserStack {
         let ptr: MutPtr<usize> = MutPtr::from_usize(self.stack_top.as_usize() + self.pos);
         for (i, p) in offsets.iter().enumerate() {
             let addr: usize = self.stack_top.as_usize() + *p;
-            unsafe { ptr.write_at_offset(i.reinterpret_as_signed(), addr) }?;
+            ptr.write_at_offset(i.reinterpret_as_signed(), addr)?;
         }
         Some(())
     }
@@ -167,10 +167,8 @@ impl UserStack {
     ) -> Option<()> {
         // end markers
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
-        unsafe {
-            self.stack_top
-                .write_at_offset(isize::try_from(self.pos).ok()?, 0)?;
-        }
+        self.stack_top
+            .write_at_offset(isize::try_from(self.pos).ok()?, 0)?;
 
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;

@@ -13,6 +13,7 @@ use x86_64::Sigcontext;
 
 use int_enum::IntEnum;
 use litebox::utils::ReinterpretSignedExt as _;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::errno::Errno;
 
@@ -116,7 +117,7 @@ pub enum SignalDisposition {
     Continue,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(transparent)]
 pub struct SigSet(u64);
 
@@ -192,9 +193,13 @@ impl core::ops::Not for SigSet {
     }
 }
 
+/// Signal action flags for `rt_sigaction` syscall.
+#[derive(Copy, Clone, FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct SaFlags(u32);
+
 bitflags::bitflags! {
-    #[derive(Copy, Clone)]
-    pub struct SaFlags: u32 {
+    impl SaFlags: u32 {
         const NOCLDSTOP = 1;
         const NOCLDWAIT = 2;
         const SIGINFO = 4;
@@ -203,15 +208,20 @@ bitflags::bitflags! {
         const RESTART   = 0x10000000;
         const NODEFER   = 0x40000000;
         const RESETHAND = 0x80000000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
     }
 }
 
 /// Linux's `sigaction` struct used by the `rt_sigaction` syscall.
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, FromBytes, IntoBytes)]
 pub struct SigAction {
     pub sigaction: usize,
     pub flags: SaFlags,
+    #[cfg(target_pointer_width = "64")]
+    #[doc(hidden)]
+    pub __pad: u32, // NOTE: Maybe `SaFlags` and `SigSet` need to be `usize`-backed too?
     pub restorer: usize,
     pub mask: SigSet,
 }
@@ -228,22 +238,31 @@ pub enum SigmaskHow {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, FromBytes, IntoBytes)]
 pub struct SigAltStack {
     pub sp: usize,
     pub flags: SsFlags,
+    #[cfg(target_pointer_width = "64")]
+    #[doc(hidden)]
+    pub __pad: u32,
     pub size: usize,
 }
 
+/// Signal stack flags.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct SsFlags(u32);
+
 bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy)]
-    pub struct SsFlags: u32 {
+    impl SsFlags: u32 {
         /// Stack on signal stack
         const ONSTACK = 1;
         /// Stack disabled
         const DISABLE = 2;
         /// Automatically disarm the stack
         const AUTODISARM = 0x8000_0000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
     }
 }
 
@@ -267,27 +286,37 @@ pub const SI_DETHREAD: i32 = -7;
 pub const SI_ASYNCNL: i32 = -60;
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Ucontext {
     pub flags: usize,
-    pub link: *mut Ucontext,
+    pub link: usize, // *mut Ucontext,
     pub stack: SigAltStack,
     pub mcontext: Sigcontext,
     pub sigmask: SigSet,
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Siginfo {
     pub signo: i32,
     pub errno: i32,
     pub code: i32,
+    #[cfg(target_pointer_width = "64")]
+    #[doc(hidden)]
+    pub __pad: u32,
     pub data: SiginfoData,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union SiginfoData {
-    pub pad: [u32; 29],
-    pub addr: usize,
+#[repr(C, packed)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+pub struct SiginfoData {
+    pub pad: [u32; 28],
+}
+
+impl SiginfoData {
+    pub fn new_addr(addr: usize) -> Self {
+        let mut pad = [0u32; 28];
+        pad.as_mut_bytes()[..core::mem::size_of::<usize>()].copy_from_slice(&addr.to_ne_bytes());
+        Self { pad }
+    }
 }

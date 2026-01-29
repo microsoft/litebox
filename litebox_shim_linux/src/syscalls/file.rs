@@ -476,8 +476,7 @@ impl Task {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-        let iovs: &[IoReadVec<MutPtr<u8>>] =
-            &unsafe { iovec.to_owned_slice(iovcnt) }.ok_or(Errno::EFAULT)?;
+        let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         let locked_file_descriptors = files.file_descriptors.read();
         let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
@@ -540,7 +539,10 @@ where
         if iov.iov_len == 0 {
             continue;
         }
-        let slice = unsafe { iov.iov_base.to_owned_slice(iov.iov_len) }.ok_or(Errno::EFAULT)?;
+        let slice = iov
+            .iov_base
+            .to_owned_slice(iov.iov_len)
+            .ok_or(Errno::EFAULT)?;
         let size = write_fn(&slice)?;
         total_written += size;
         if size < iov.iov_len {
@@ -563,7 +565,7 @@ impl Task {
             return Err(Errno::EBADF);
         };
         let iovs: &[IoWriteVec<ConstPtr<u8>>] =
-            &unsafe { iovec.to_owned_slice(iovcnt) }.ok_or(Errno::EFAULT)?;
+            &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         let locked_file_descriptors = files.file_descriptors.read();
         let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
@@ -1072,8 +1074,7 @@ impl Task {
                     .run_on_raw_fd(
                         *raw_fd,
                         |_fd| {
-                            let mut flock =
-                                unsafe { lock.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+                            let mut flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
                             let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
                                 .map_err(|_| Errno::EINVAL)?;
                             if let litebox_common_linux::FlockType::Unlock = lock_type {
@@ -1083,7 +1084,7 @@ impl Task {
                             // Note LiteBox does not support multiple processes yet, and one process
                             // can always acquire the lock it owns, so return `Unlock` unconditionally.
                             flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
-                            unsafe { lock.write_at_offset(0, flock) }.ok_or(Errno::EFAULT)?;
+                            lock.write_at_offset(0, flock).ok_or(Errno::EFAULT)?;
                             Ok(0)
                         },
                         |_fd| todo!("net"),
@@ -1100,7 +1101,7 @@ impl Task {
                     .run_on_raw_fd(
                         *raw_fd,
                         |_fd| {
-                            let flock = unsafe { lock.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+                            let flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
                             let _ = litebox_common_linux::FlockType::try_from(flock.type_)
                                 .map_err(|_| Errno::EINVAL)?;
 
@@ -1237,8 +1238,8 @@ impl Task {
     ) -> Result<u32, Errno> {
         match arg {
             IoctlArg::TCGETS(termios) => {
-                unsafe {
-                    termios.write_at_offset(
+                termios
+                    .write_at_offset(
                         0,
                         litebox_common_linux::Termios {
                             c_iflag: 0,
@@ -1249,12 +1250,11 @@ impl Task {
                             c_cc: [0; 19],
                         },
                     )
-                }
-                .ok_or(Errno::EFAULT)?;
+                    .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
             IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
-            IoctlArg::TIOCGWINSZ(ws) => unsafe {
+            IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset(
                     0,
                     litebox_common_linux::Winsize {
@@ -1266,7 +1266,7 @@ impl Task {
                 )
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
-            },
+            }
             IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
             _ => todo!(),
         }
@@ -1300,7 +1300,7 @@ impl Task {
         let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
         match arg {
             IoctlArg::FIONBIO(arg) => {
-                let val = unsafe { arg.read_at_offset(0) }.ok_or(Errno::EFAULT)?;
+                let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
                 match desc {
                     Descriptor::LiteBoxRawFd(raw_fd) => {
                         self.files.borrow().run_on_raw_fd(
@@ -1447,7 +1447,7 @@ impl Task {
         let event = if op == litebox_common_linux::EpollOp::EpollCtlDel {
             None
         } else {
-            Some(unsafe { event.read_at_offset(0) }.ok_or(Errno::EFAULT)?)
+            Some(event.read_at_offset(0).ok_or(Errno::EFAULT)?)
         };
         epoll.epoll_ctl(&self.global, op, fd, &file_descriptor, event)
     }
@@ -1527,7 +1527,7 @@ impl Task {
 
         let mut set = super::epoll::PollSet::with_capacity(nfds);
         for i in 0..nfds_signed {
-            let fd = unsafe { fds.read_at_offset(i) }.ok_or(Errno::EFAULT)?;
+            let fd = fds.read_at_offset(i).ok_or(Errno::EFAULT)?;
 
             let events = litebox::event::Events::from_bits_truncate(
                 fd.events.reinterpret_as_unsigned().into(),
@@ -1562,11 +1562,9 @@ impl Task {
                 fd_addr + core::mem::offset_of!(litebox_common_linux::Pollfd, revents),
             );
             let revents: u16 = revents.bits().truncate();
-            unsafe {
-                revents_ptr
-                    .write_at_offset(0, revents.reinterpret_as_signed())
-                    .ok_or(Errno::EFAULT)
-            }?;
+            revents_ptr
+                .write_at_offset(0, revents.reinterpret_as_signed())
+                .ok_or(Errno::EFAULT)?;
             if revents != 0 {
                 ready_count += 1;
             }
@@ -1668,15 +1666,15 @@ impl Task {
         }
         let len = (nfds as usize).div_ceil(core::mem::size_of::<usize>() * 8);
         let mut kreadfds = readfds
-            .map(|fds| unsafe { fds.to_owned_slice(len) }.ok_or(Errno::EFAULT))
+            .map(|fds| fds.to_owned_slice(len).ok_or(Errno::EFAULT))
             .transpose()?
             .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
         let mut kwritefds = writefds
-            .map(|fds| unsafe { fds.to_owned_slice(len) }.ok_or(Errno::EFAULT))
+            .map(|fds| fds.to_owned_slice(len).ok_or(Errno::EFAULT))
             .transpose()?
             .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
         let mut kexceptfds = exceptfds
-            .map(|fds| unsafe { fds.to_owned_slice(len) }.ok_or(Errno::EFAULT))
+            .map(|fds| fds.to_owned_slice(len).ok_or(Errno::EFAULT))
             .transpose()?
             .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
 
@@ -1689,28 +1687,22 @@ impl Task {
         )?;
 
         if let Some(fds) = kreadfds {
-            unsafe {
-                readfds
-                    .unwrap()
-                    .write_slice_at_offset(0, fds.as_raw_slice())
-            }
-            .ok_or(Errno::EFAULT)?;
+            readfds
+                .unwrap()
+                .write_slice_at_offset(0, fds.as_raw_slice())
+                .ok_or(Errno::EFAULT)?;
         }
         if let Some(fds) = kwritefds {
-            unsafe {
-                writefds
-                    .unwrap()
-                    .write_slice_at_offset(0, fds.as_raw_slice())
-            }
-            .ok_or(Errno::EFAULT)?;
+            writefds
+                .unwrap()
+                .write_slice_at_offset(0, fds.as_raw_slice())
+                .ok_or(Errno::EFAULT)?;
         }
         if let Some(fds) = kexceptfds {
-            unsafe {
-                exceptfds
-                    .unwrap()
-                    .write_slice_at_offset(0, fds.as_raw_slice())
-            }
-            .ok_or(Errno::EFAULT)?;
+            exceptfds
+                .unwrap()
+                .write_slice_at_offset(0, fds.as_raw_slice())
+                .ok_or(Errno::EFAULT)?;
         }
 
         Ok(count)
@@ -1879,21 +1871,21 @@ impl Task {
                         __name: [0; 0],
                     };
                     let hdr_ptr = crate::MutPtr::from_usize(dirp.as_usize() + nbytes);
-                    unsafe { hdr_ptr.write_at_offset(0, dirent64) }.ok_or(Errno::EFAULT)?;
+                    hdr_ptr.write_at_offset(0, dirent64).ok_or(Errno::EFAULT)?;
                     let name_ptr = crate::MutPtr::from_usize(
                         hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME,
                     );
-                    unsafe { name_ptr.write_slice_at_offset(0, entry.name.as_bytes()) }
+                    name_ptr
+                        .write_slice_at_offset(0, entry.name.as_bytes())
                         .ok_or(Errno::EFAULT)?;
                     // set the null terminator and padding
                     let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
-                    unsafe {
-                        name_ptr.write_slice_at_offset(
+                    name_ptr
+                        .write_slice_at_offset(
                             isize::try_from(entry.name.len()).unwrap(),
                             &vec![0; zeros_len],
                         )
-                    }
-                    .ok_or(Errno::EFAULT)?;
+                        .ok_or(Errno::EFAULT)?;
                     nbytes += len;
                     dir_off += 1;
                 }

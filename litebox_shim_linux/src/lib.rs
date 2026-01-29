@@ -690,12 +690,10 @@ impl Task {
                     })
                 }
             }
-            SyscallRequest::Write { fd, buf, count } => {
-                match unsafe { buf.to_owned_slice(count) } {
-                    Some(buf) => self.sys_write(fd, &buf, None),
-                    None => Err(Errno::EFAULT),
-                }
-            }
+            SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice(count) {
+                Some(buf) => self.sys_write(fd, &buf, None),
+                None => Err(Errno::EFAULT),
+            },
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
@@ -733,7 +731,7 @@ impl Task {
                 buf,
                 count,
                 offset,
-            } => match unsafe { buf.to_owned_slice(count) } {
+            } => match buf.to_owned_slice(count) {
                 Some(buf) => self.sys_pwrite64(fd, &buf, offset),
                 None => Err(Errno::EFAULT),
             },
@@ -976,7 +974,7 @@ impl Task {
             SyscallRequest::Stat { pathname, buf } => {
                 pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                     self.sys_stat(path).and_then(|stat| {
-                        unsafe { buf.write_at_offset(0, stat) }
+                        buf.write_at_offset(0, stat)
                             .ok_or(Errno::EFAULT)
                             .map(|()| 0)
                     })
@@ -985,14 +983,14 @@ impl Task {
             SyscallRequest::Lstat { pathname, buf } => {
                 pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                     self.sys_lstat(path).and_then(|stat| {
-                        unsafe { buf.write_at_offset(0, stat) }
+                        buf.write_at_offset(0, stat)
                             .ok_or(Errno::EFAULT)
                             .map(|()| 0)
                     })
                 })
             }
             SyscallRequest::Fstat { fd, buf } => self.sys_fstat(fd).and_then(|stat| {
-                unsafe { buf.write_at_offset(0, stat) }
+                buf.write_at_offset(0, stat)
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }),
@@ -1004,7 +1002,7 @@ impl Task {
                 flags,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
-                    unsafe { buf.write_at_offset(0, stat) }
+                    buf.write_at_offset(0, stat)
                         .ok_or(Errno::EFAULT)
                         .map(|()| 0)
                 })
@@ -1017,7 +1015,7 @@ impl Task {
                 flags,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
-                    unsafe { buf.write_at_offset(0, stat.into()) }
+                    buf.write_at_offset(0, stat.into())
                         .ok_or(Errno::EFAULT)
                         .map(|()| 0)
                 })
@@ -1027,8 +1025,8 @@ impl Task {
             }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
-                    unsafe { pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT) }?;
-                    unsafe { pipefd.write_at_offset(1, write_fd).ok_or(Errno::EFAULT) }?;
+                    pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT)?;
+                    pipefd.write_at_offset(1, write_fd).ok_or(Errno::EFAULT)?;
                     Ok(0)
                 })
             }
@@ -1042,7 +1040,8 @@ impl Task {
                 }
                 #[cfg(target_arch = "x86")]
                 {
-                    unsafe { user_desc.read_at_offset(0) }
+                    user_desc
+                        .read_at_offset(0)
                         .ok_or(Errno::EFAULT)
                         .and_then(|mut desc| {
                             let idx = desc.entry_number;
@@ -1051,8 +1050,7 @@ impl Task {
                                 // index -1 means the kernel should try to find and
                                 // allocate an empty descriptor.
                                 // return the allocated entry number
-                                unsafe { user_desc.write_at_offset(0, desc) }
-                                    .ok_or(Errno::EFAULT)?;
+                                user_desc.write_at_offset(0, desc).ok_or(Errno::EFAULT)?;
                             }
                             Ok(0)
                         })
@@ -1081,17 +1079,8 @@ impl Task {
             SyscallRequest::GetRobustList { pid, head, len } => self
                 .sys_get_robust_list(pid, head)
                 .and_then(|()| {
-                    unsafe {
-                        len.write_at_offset(
-                            0,
-                            size_of::<
-                                litebox_common_linux::RobustListHead<
-                                    litebox_platform_multiplex::Platform,
-                                >,
-                            >(),
-                        )
-                    }
-                    .ok_or(Errno::EFAULT)
+                    len.write_at_offset(0, size_of::<litebox_common_linux::RobustListHead>())
+                        .ok_or(Errno::EFAULT)
                 })
                 .map(|()| 0),
             SyscallRequest::GetRandom { buf, count, flags } => {
@@ -1105,7 +1094,7 @@ impl Task {
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
-                unsafe { buf.write_at_offset(0, sysinfo) }
+                buf.write_at_offset(0, sysinfo)
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }
