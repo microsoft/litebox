@@ -465,5 +465,8 @@ fn panic(info: &PanicInfo) -> ! {
         Ok(result) => vtl_switch(Some(result.reinterpret_as_signed())),
         Err(err) => vtl_switch(Some((err as u32).reinterpret_as_signed().neg().into())),
     };
+    // We assume that once this VTL1 kernel panics, we don't try to resume its execution.
+    // This is because, after the panic, the kernel is in an undefined state.
+    // Switch back to VTL0, do crash dump, and reboot the machine.
     unreachable!()
 }

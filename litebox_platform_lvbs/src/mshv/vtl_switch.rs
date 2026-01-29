@@ -213,52 +213,6 @@ macro_rules! LOAD_VTL_STATE_ASM {
     };
 }
 
-/// Restore VTL0 state, return to VTL0, and save VTL0 state when VTL1 resumes.
-///
-/// This function:
-/// 1. Restores VTL0 extended states (XRSTOR) and general-purpose registers
-/// 2. Disables interrupts and returns to VTL0
-/// 3. When VTL1 resumes, saves VTL0 general-purpose registers and extended states
-/// 4. Re-enables interrupts and returns to the caller
-///
-/// # Safety
-///
-/// Must be called in a loop to perform VTL switching. The caller must save/restore
-/// VTL1's callee-saved registers around this call.
-///
-/// TODO: We must save/restore VTL1's state when there is RPC from VTL1 to VTL0 (e.g., dynamically
-/// loading OP-TEE TAs). This should use global data structures since the core which makes the RPC
-/// can be different from the core where the VTL1 is running.
-///
-/// TODO: Even if we don't have RPC from VTL1 to VTL0, we may still need to save VTL1's state for
-/// debugging purposes.
-#[unsafe(naked)]
-#[rustfmt::skip]
-pub unsafe extern "C" fn vtl_switch_asm() {
-    #[cfg(target_arch = "x86_64")]
-    core::arch::naked_asm!(
-        XRSTOR_VTL0_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}),
-        LOAD_VTL_STATE_ASM!({scratch_off}, {vtl0_state_top_addr_off}, {VTL_STATE_SIZE}),
-        // *** VTL0 state is restored. Return to VTL0 immediately ***
-        "cli", // disable VTL1 interrupts before returning to VTL0
-        VTL_RETURN_ASM!({vtl_ret_addr_off}),
-        // *** VTL1 resumes here regardless of the entry reason (VTL switch or intercept) ***
-        // Hyper-V restored VTL1's rip and rsp, so we're back on the original stack.
-        SAVE_VTL_STATE_ASM!({scratch_off}, {vtl0_state_top_addr_off}),
-        XSAVE_VTL0_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}),
-        "sti", // enable VTL1 interrupts after saving VTL0 state
-        // A pending SINT can be fired here. Our SINT handler only executes `iretq` so returns to here immediately.
-        "ret",
-        vtl_ret_addr_off = const { PerCpuVariablesAsm::vtl_return_addr_offset() },
-        scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
-        vtl0_state_top_addr_off = const { PerCpuVariablesAsm::vtl0_state_top_addr_offset() },
-        vtl0_xsave_area_off = const { PerCpuVariablesAsm::vtl0_xsave_area_addr_offset() },
-        vtl0_xsave_mask_lo_off = const { PerCpuVariablesAsm::vtl0_xsave_mask_lo_offset() },
-        vtl0_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl0_xsave_mask_hi_offset() },
-        VTL_STATE_SIZE = const core::mem::size_of::<VtlState>(),
-    )
-}
-
 /// Handle a VTL entry event.
 ///
 /// This function processes one VTL entry (VtlCall or Intercept) and returns.
@@ -278,6 +232,10 @@ fn handle_vtl_entry() -> Option<[u64; NUM_VTLCALL_PARAMS]> {
     match reason {
         VtlEntryReason::VtlCall => Some(get_vtlcall_params()),
         VtlEntryReason::Interrupt => {
+            // TODO: Consider whether to handle VTL interrupts/intercepts here or
+            // in the runner. Unlike other HVCI/HEKI and OP-TEE functions, this
+            // function relies on many host/platform-specific features to control
+            // VTL0's architecture state like injecting GP or advancing RIP.
             vsm_handle_intercept();
             None
         }
@@ -288,6 +246,7 @@ fn handle_vtl_entry() -> Option<[u64; NUM_VTLCALL_PARAMS]> {
 /// Get the VTL entry reason from the per-CPU VP assist page.
 ///
 /// Returns `None` if the entry reason is not a valid `VtlEntryReason`.
+#[inline]
 fn get_vtl_entry_reason() -> Option<VtlEntryReason> {
     let reason = with_per_cpu_variables(|per_cpu_variables| unsafe {
         (*per_cpu_variables.hv_vp_assist_page_as_ptr()).vtl_entry_reason
@@ -296,11 +255,13 @@ fn get_vtl_entry_reason() -> Option<VtlEntryReason> {
 }
 
 /// Get the VTL call parameters from the saved VTL0 state.
+#[inline]
 fn get_vtlcall_params() -> [u64; NUM_VTLCALL_PARAMS] {
     with_per_cpu_variables(|per_cpu_variables| per_cpu_variables.vtl0_state.get_vtlcall_params())
 }
 
 /// Set the VTL return value that will be returned to VTL0.
+#[inline]
 fn set_vtl_return_value(value: i64) {
     with_per_cpu_variables_mut(|per_cpu_variables| {
         per_cpu_variables.set_vtl_return_value(value.reinterpret_as_unsigned());
@@ -330,47 +291,63 @@ pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), Errno> {
     Ok(())
 }
 
-/// This function performs a VTL switch
+/// This function performs a VTL switch.
 ///
-/// 1. Set the VTL return value (0 if a return value is not provided)
-/// 2. Restore VTL0 state
-/// 3. Return to VTL0
-/// 4. Save VTL0 state when resuming
-/// 5. Return the VTL call parameters
+/// It sets a VTL return value (0 if `None` is provided) before the VTL switch.
+/// It handles VTL entries for intercepts/interrupts internally and loops until
+/// a VtlCall entry.
 ///
-/// This function handles VTL entries for intercepts/interrupts internally and
-/// loops until a VtlCall entry.
+/// TODO: We must save/restore VTL1's state when there is RPC from VTL1 to VTL0 (e.g., dynamically
+/// loading OP-TEE TAs). This should use global data structures since the core which makes the RPC
+/// can be different from the core where the VTL1 is running.
+///
+/// TODO: Even if we don't have RPC from VTL1 to VTL0, we may still need to save VTL1's state for
+/// debugging purposes.
 pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
     let value = return_value.unwrap_or(0);
     set_vtl_return_value(value);
 
     loop {
-        // Use inline asm to call the naked vtl_switch_asm function.
-        // After vtl_switch_asm, all GP registers except rsp have VTL0's values
-        // (Hyper-V preserves VTL1's rsp across VTL switch).
-        // We must save/restore VTL1's callee-saved registers (rbx, rbp, r12-r15).
+        // Inline asm performs the VTL switch:
+        // 1. Restore VTL0 state (XRSTOR + load GP registers)
+        // 2. Return to VTL0 (cli + hypercall)
+        // 3. Save VTL0 state when VTL1 resumes (save GP registers + XSAVE)
+        //
+        // All GP registers are clobbered by loading VTL0's state.
+        // - rbx and rbp cannot be in clobber list (LLVM restriction), so we manually save/restore
+        // - r12-r15: use out() clobbers so compiler saves only if needed
+        // - caller-saved registers: clobber_abi("C")
         unsafe {
             #[cfg(target_arch = "x86_64")]
+            #[rustfmt::skip]
             core::arch::asm!(
-                // Save VTL1's callee-saved registers (only relies on rsp)
                 "push rbx",
                 "push rbp",
-                "push r12",
-                "push r13",
-                "push r14",
-                "push r15",
-                "sub rsp, 8",      // align stack to 16 bytes before call
-                "call {vtl_switch_asm}",
-                "add rsp, 8",
-                // Restore VTL1's callee-saved registers (rsp is valid, rbp is not)
-                "pop r15",
-                "pop r14",
-                "pop r13",
-                "pop r12",
+                XRSTOR_VTL0_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}),
+                LOAD_VTL_STATE_ASM!({scratch_off}, {vtl0_state_top_addr_off}, {VTL_STATE_SIZE}),
+                // *** VTL0 state is restored. Return to VTL0 immediately ***
+                "cli", // disable VTL1 interrupts before returning to VTL0
+                VTL_RETURN_ASM!({vtl_ret_addr_off}),
+                // *** VTL1 resumes here regardless of the entry reason (VTL switch or intercept) ***
+                // Hyper-V restored VTL1's rip and rsp, so we're back on the original stack.
+                SAVE_VTL_STATE_ASM!({scratch_off}, {vtl0_state_top_addr_off}),
+                XSAVE_VTL0_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}),
+                "sti", // enable VTL1 interrupts after saving VTL0 state
+                // A pending SINT can be fired here. Our SINT handler only executes `iretq` so returns to here immediately.
                 "pop rbp",
                 "pop rbx",
-                vtl_switch_asm = sym vtl_switch_asm,
+                vtl_ret_addr_off = const { PerCpuVariablesAsm::vtl_return_addr_offset() },
+                scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
+                vtl0_state_top_addr_off = const { PerCpuVariablesAsm::vtl0_state_top_addr_offset() },
+                vtl0_xsave_area_off = const { PerCpuVariablesAsm::vtl0_xsave_area_addr_offset() },
+                vtl0_xsave_mask_lo_off = const { PerCpuVariablesAsm::vtl0_xsave_mask_lo_offset() },
+                vtl0_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl0_xsave_mask_hi_offset() },
+                VTL_STATE_SIZE = const core::mem::size_of::<VtlState>(),
                 clobber_abi("C"),
+                out("r12") _,
+                out("r13") _,
+                out("r14") _,
+                out("r15") _,
             );
         }
         if let Some(params) = handle_vtl_entry() {
