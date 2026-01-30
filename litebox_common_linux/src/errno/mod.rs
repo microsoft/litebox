@@ -431,10 +431,11 @@ impl From<litebox::net::errors::SendError> for Errno {
         match value {
             litebox::net::errors::SendError::InvalidFd => Errno::EBADF,
             litebox::net::errors::SendError::SocketInInvalidState => Errno::EPIPE,
-            litebox::net::errors::SendError::Unaddressable => Errno::EDESTADDRREQ,
+            litebox::net::errors::SendError::Unaddressable => Errno::EINVAL,
             litebox::net::errors::SendError::BufferFull => Errno::EAGAIN,
             litebox::net::errors::SendError::PortAllocationFailure(e) => e.into(),
             litebox::net::errors::SendError::UnnecessaryDestinationAddress => Errno::EISCONN,
+            litebox::net::errors::SendError::DestinationAddressRequired => Errno::EDESTADDRREQ,
             _ => unimplemented!(),
         }
     }
