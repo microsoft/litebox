@@ -52,8 +52,8 @@ const MAX_PACKET_COUNT: usize = 32;
 /// An important decision that must be made by a user of a `Network` is decided by
 /// [`set_platform_interaction`](Self::set_platform_interaction), whose docs explain this further.
 ///
-/// A user of `Network` who does not care about [events](crate::event) can choose to have a trivial
-/// provider for [`platform::RawMutexProvider`] that panics on all calls except `underlying_atomic`.
+/// A user of `Network` who care about [events](crate::event) should call [set_socket_proxy](Self::set_socket_proxy)
+/// to set up a proxy for each socket created, so that events can be notified properly.
 pub struct Network<Platform>
 where
     Platform:
@@ -396,9 +396,11 @@ pub enum PlatformInteractionReinvocationAdvice {
     /// control back to you to prevent unbounded length waits (crucial to prevent in
     /// non-pre-emptible environments), but otherwise has more work it anticipates it can do.
     CallAgainImmediately,
-    /// You don't need to call again until more packets arrive on the device's receive side or
-    /// the given timeout expires.
-    WaitOnDeviceOrSocketInteraction(Option<core::time::Duration>),
+    /// You don't need to call again until more packets arrive on the device's receive side (i.e., `timeout` is `None`),
+    /// or the given `timeout` expires.
+    WaitOnDeviceOrSocketInteraction {
+        timeout: Option<core::time::Duration>,
+    },
 }
 impl PlatformInteractionReinvocationAdvice {
     /// Convenience function to match against [`Self::CallAgainImmediately`]
@@ -448,7 +450,9 @@ where
             }
             smoltcp::iface::PollResult::None => {
                 let poll_at = self.poll_at();
-                PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(poll_at)
+                PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction {
+                    timeout: poll_at,
+                }
             }
         }
     }
@@ -690,6 +694,9 @@ where
     }
 
     /// Creates a socket.
+    ///
+    /// By default, the created socket has no associated proxy; to set a proxy, use
+    /// [`set_socket_proxy`](Self::set_socket_proxy).
     pub fn socket(&mut self, protocol: Protocol) -> Result<SocketFd<Platform>, SocketError> {
         let handle = match protocol {
             Protocol::Tcp => self.socket_set.add(tcp::Socket::new(
@@ -766,18 +773,27 @@ where
     }
 
     /// Set the network proxy for the socket at `fd`
+    ///
+    /// Associating a proxy enables event notification and sending/receiving data without accessing
+    /// [`Network`] (which may help avoid lock contention but still requires a periodic call to
+    /// [`perform_platform_interaction`](Self::perform_platform_interaction) to move data between smoltcp
+    /// and the socket channels though).
+    ///
+    /// If no proxy is set, then the socket can still be used for sending/receiving data via [`Network`]
+    /// interfaces like [`send`](Self::send)/[`receive`](Self::receive), but no events will be notified.
+    #[must_use]
     pub fn set_socket_proxy(
         &mut self,
         fd: &SocketFd<Platform>,
         proxy: alloc::sync::Arc<NetworkProxy<Platform>>,
-    ) -> Result<(), alloc::sync::Arc<NetworkProxy<Platform>>> {
+    ) -> bool {
         let descriptor_table = self.litebox.descriptor_table();
         let Some(mut table_entry) = descriptor_table.get_entry_mut(fd) else {
-            return Err(proxy);
+            return false;
         };
         let socket_handle = &mut table_entry.entry;
         socket_handle.proxy = Some(proxy);
-        Ok(())
+        true
     }
 
     /// Close the socket at `fd`
@@ -1235,6 +1251,9 @@ where
     /// Accept a new incoming connection on a listening socket.
     ///
     /// If `peer` is provided, it is filled with the remote address of the accepted connection.
+    ///
+    /// Note that the returned new socket has no associated proxy; to set a proxy, use
+    /// [`set_socket_proxy`](Self::set_socket_proxy).
     pub fn accept(
         &mut self,
         fd: &SocketFd<Platform>,

@@ -233,8 +233,8 @@ impl GlobalState {
         assert!(old.is_none());
         drop(dt);
 
-        if self.net.lock().set_socket_proxy(fd, proxy.clone()).is_err() {
-            unreachable!("failed to set socket proxy for initialized socket");
+        if !self.net.lock().set_socket_proxy(fd, proxy.clone()) {
+            unreachable!("failed to set socket proxy for a newly-created socket");
         }
         proxy
     }
@@ -695,7 +695,9 @@ impl GlobalState {
         // Auto-bind UDP sockets if not already bound (Linux behavior: sendto() on an unbound
         // UDP socket implicitly binds it to an ephemeral port before sending).
         // This is mostly lock-free: we only take the network lock if we need to allocate a port.
-        if let Some(0) = proxy.datagram_local_port() {
+        if let NetworkProxy::Datagram(proxy) = proxy.as_ref()
+            && proxy.local_port() == 0
+        {
             // UDP socket is unbound - bind to an ephemeral port
             let mut net = self.net.lock();
             // Bind with port 0 to get an ephemeral port
@@ -719,7 +721,7 @@ impl GlobalState {
             // Get the assigned port
             let local_addr = net.get_local_addr(fd).map_err(Errno::from)?;
             // If another thread already set a port, that's fine - we'll use theirs
-            let _ = proxy.set_datagram_local_port(local_addr.port());
+            let _ = proxy.set_local_port(local_addr.port());
         }
 
         // Convert `SendFlags` to `litebox::net::SendFlags`

@@ -203,28 +203,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Raw => false,
         }
     }
-
-    /// Get the local port for datagram sockets (lock-free).
-    ///
-    /// Returns `Some(port)` for datagram sockets (0 if unbound), `None` for other socket types.
-    pub fn datagram_local_port(&self) -> Option<u16> {
-        match self {
-            NetworkProxy::Datagram(channel) => Some(channel.local_port()),
-            _ => None,
-        }
-    }
-
-    /// Set the local port for datagram sockets (lock-free, one-time operation).
-    ///
-    /// Uses compare-and-swap to ensure only one thread sets the port.
-    /// Returns `Ok(())` if set successfully, `Err(current_port)` if already set.
-    /// Returns `Ok(())` for non-datagram sockets (no-op).
-    pub fn set_datagram_local_port(&self, port: u16) -> Result<(), u16> {
-        match self {
-            NetworkProxy::Datagram(channel) => channel.set_local_port(port),
-            _ => Ok(()),
-        }
-    }
 }
 
 /// A channel for stream (TCP) socket communication.
@@ -232,11 +210,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
 /// This channel provides lock-free data transfer between user threads and the network
 /// worker. User threads write to the TX buffer and read from the RX buffer, while
 /// the network worker drains TX to smoltcp and fills RX from smoltcp.
-///
-/// # Thread Safety
-///
-/// The channel uses lock-free ring buffers for data transfer, with atomic counters
-/// for tracking buffer availability. This allows concurrent access without blocking.
 pub struct StreamSocketChannel<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     inner: StreamChannelInner<Platform>,
 }
@@ -798,6 +771,32 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     pub fn is_writable(&self) -> bool {
         self.inner.tx_space.load(Ordering::Acquire) > 0
     }
+
+    /// Get the local port the socket is bound to.
+    ///
+    /// Returns 0 if the socket is not yet bound.
+    pub fn local_port(&self) -> u16 {
+        self.inner.local_port.load(Ordering::Acquire)
+    }
+
+    /// Set the local port the socket is bound to.
+    ///
+    /// This should be called when the socket is bound (either explicitly or via auto-binding).
+    /// Uses compare-and-swap to ensure only one thread can set the port.
+    ///
+    /// Returns `Ok(())` if the port was set successfully, or `Err(current_port)` if
+    /// a port was already set.
+    pub fn set_local_port(&self, port: u16) -> Result<(), u16> {
+        debug_assert!(port != 0, "Port 0 is not a valid bound port");
+        match self
+            .inner
+            .local_port
+            .compare_exchange(0, port, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(()),
+            Err(current) => Err(current),
+        }
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
@@ -909,32 +908,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
             self.inner.rx_count.store(1, Ordering::Release);
         } else {
             self.inner.rx_count.store(0, Ordering::Release);
-        }
-    }
-
-    /// Get the local port the socket is bound to.
-    ///
-    /// Returns 0 if the socket is not yet bound.
-    /// This is a lock-free operation.
-    fn local_port(&self) -> u16 {
-        self.inner.local_port.load(Ordering::Acquire)
-    }
-
-    /// Set the local port the socket is bound to.
-    ///
-    /// This should be called when the socket is bound (either explicitly or via auto-binding).
-    /// Uses compare-and-swap to ensure only one thread can set the port.
-    ///
-    /// Returns `Ok(())` if the port was set successfully, or `Err(current_port)` if
-    /// a port was already set.
-    fn set_local_port(&self, port: u16) -> Result<(), u16> {
-        match self
-            .inner
-            .local_port
-            .compare_exchange(0, port, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => Ok(()),
-            Err(current) => Err(current),
         }
     }
 

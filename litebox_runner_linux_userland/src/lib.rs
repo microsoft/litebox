@@ -279,7 +279,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 let timeout = loop {
                     match shim.perform_network_interaction() {
                         litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
-                        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction(timeout) => {
+                        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction{ timeout } => {
                             break timeout;
                         }
                     }
