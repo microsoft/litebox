@@ -281,8 +281,7 @@ mod tests {
         fs::create_dir_all(dir)?;
 
         let skill_md = format!(
-            "---\nname: {}\ndescription: {}\n---\n\n# Test Skill\n\nThis is a test skill.",
-            name, description
+            "---\nname: {name}\ndescription: {description}\n---\n\n# Test Skill\n\nThis is a test skill."
         );
 
         let skill_md_path = dir.join("SKILL.md");
