@@ -220,16 +220,16 @@ fn run_skill_script(args: &CliArgs, skill: &Skill, tar_path: &Path) -> Result<()
     // Determine the interpreter and arguments based on file extension
     let script_path_str = script_rel_path.to_string_lossy();
 
-    if args.script.ends_with(".py") {
+    if args.script.to_lowercase().ends_with(".py") {
         // Python script
-        cmd.arg(&args.python_path).arg(&script_path_str.to_string());
-    } else if args.script.ends_with(".sh") {
+        cmd.arg(&args.python_path).arg(script_path_str.to_string());
+    } else if args.script.to_lowercase().ends_with(".sh") {
         // Shell script - note: this may not work due to shell limitation
         eprintln!("Warning: Shell scripts may not work due to litebox's lack of shell support");
-        cmd.arg("/bin/sh").arg(&script_path_str.to_string());
+        cmd.arg("/bin/sh").arg(script_path_str.to_string());
     } else {
         // Try to execute directly
-        cmd.arg(&script_path_str.to_string());
+        cmd.arg(script_path_str.to_string());
     }
 
     // Add script arguments
@@ -237,13 +237,13 @@ fn run_skill_script(args: &CliArgs, skill: &Skill, tar_path: &Path) -> Result<()
         cmd.arg(arg);
     }
 
-    println!("Executing: {:?}", cmd);
+    println!("Executing: {cmd:?}");
 
     // Execute the command
     let status = cmd.status().context("Failed to execute litebox runner")?;
 
     if !status.success() {
-        bail!("Script execution failed with status: {}", status);
+        bail!("Script execution failed with status: {status}");
     }
 
     Ok(())

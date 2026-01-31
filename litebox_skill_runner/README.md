@@ -4,27 +4,37 @@ A tool for executing [Agent Skills](https://agentskills.io) within LiteBox sandb
 
 ## Overview
 
-Agent Skills are modular packages that extend AI capabilities by providing specialized knowledge, workflows, and tools. This tool enables running skill scripts within a LiteBox sandbox on Ubuntu/x86 Linux systems.
+Agent Skills are modular packages that extend AI capabilities by providing specialized knowledge, workflows, and tools. This tool enables the architectural framework for running skill scripts within a LiteBox sandbox on Ubuntu/x86 Linux systems.
 
-## Features
+## Current Status
 
-- Parse and extract `.skill` files (zip archives containing SKILL.md and bundled resources)
-- Execute skill scripts within LiteBox sandbox
-- Support for Python scripts (with limitations noted below)
+This is a **proof-of-concept implementation** that demonstrates the architecture for running Agent Skills in LiteBox. The tool successfully:
+
+✅ Parses `.skill` files (zip archives) and skill directories  
+✅ Extracts SKILL.md metadata (name, description)  
+✅ Creates tar archives with skill resources  
+✅ Integrates with litebox_runner_linux_userland  
+✅ Demonstrates the execution architecture  
 
 ## Known Limitations
 
-1. **No Shell Support**: LiteBox currently does not support running a shell (`/bin/sh`, `/bin/bash`). This means:
-   - Shell scripts (`.sh` files) cannot be executed directly
-   - Skills that rely on shell features will not work
-   - Only direct binary execution (e.g., Python interpreter) is supported
+### 1. No Shell Support
+LiteBox currently does not support running a shell (`/bin/sh`, `/bin/bash`). This means:
+- Shell scripts (`.sh` files) cannot be executed directly
+- Skills that rely on shell features will not work
+- Only direct binary execution (e.g., Python interpreter) is supported
 
-2. **Python Library Packaging**: Running Python scripts requires:
-   - Packaging Python standard libraries into the tar filesystem
-   - Setting `PYTHONHOME` and `PYTHONPATH` environment variables
-   - Rewriting syscalls in Python binary and shared libraries (`.so` files)
-   
-3. **Stateless Assumption**: Skills are assumed to be stateless for now
+### 2. Python Execution Complexity
+Running Python scripts requires extensive setup:
+- Python binary must be included in the tar filesystem
+- Python standard libraries must be packaged
+- All Python shared libraries (`.so` files) must have syscalls rewritten
+- Environment variables must be set: `PYTHONHOME`, `PYTHONPATH`, `PYTHONDONTWRITEBYTECODE`
+
+**See** `litebox_runner_linux_userland/tests/run.rs:test_runner_with_python` for a reference implementation showing the full Python setup process.
+
+### 3. Stateless Assumption
+Skills are assumed to be stateless for now (no persistent storage between runs).
 
 ## Usage
 
@@ -42,20 +52,20 @@ litebox_skill_runner <skill-path> --script <script-path> [script-args...]
 - `--python-path`: Python interpreter path (default: `/usr/bin/python3`)
 - `[script-args...]`: Additional arguments to pass to the script
 
-### Example: Running skill-creator
+### Example: Testing Skill Structure
 
-The `skill-creator` skill provides tools for creating new agent skills. Here's how to run it:
+The skill runner can parse and validate skill structures:
 
 ```bash
-# Assuming you have the skills repository cloned
-cd /path/to/skills
+# Clone the skills repository
+git clone https://github.com/anthropics/skills.git /tmp/skills
 
-# Run the init_skill.py script
-litebox_skill_runner \
-    skills/skill-creator \
-    --script scripts/init_skill.py \
-    my-new-skill --path /tmp/output
+# Test skill structure parsing
+cd /path/to/aw-litebox
+./litebox_skill_runner/examples/run_skill_creator.sh
 ```
+
+This demonstrates successful skill parsing and tar packaging, but notes that full Python execution requires additional setup.
 
 ## Building
 
@@ -64,6 +74,14 @@ cargo build --release -p litebox_skill_runner
 ```
 
 The binary will be available at `target/release/litebox_skill_runner`.
+
+## Examples
+
+The `examples/` directory contains demonstration scripts:
+
+- `run_skill_creator.sh`: Shows skill structure validation
+- `prepare_python_skill.py`: Helper to package Python libraries
+- `run_python_skill_full.sh`: Demonstrates Python execution attempt (with expected limitations)
 
 ## Implementation Details
 
@@ -75,15 +93,16 @@ A skill consists of:
 - `references/`: Optional reference documentation
 - `assets/`: Optional asset files (templates, images, etc.)
 
-### Execution Flow
+### Execution Architecture
 
-1. Load and parse skill (from .skill zip or directory)
-2. Extract SKILL.md metadata (name, description)
-3. Create tar archive containing all skill resources
-4. Execute script via litebox_runner_linux_userland with:
-   - `--initial-files` pointing to the tar archive
-   - `--interception-backend seccomp` for syscall interception
-   - Appropriate interpreter (Python for .py files)
+1. **Load and Parse**: Read skill from .skill zip or directory
+2. **Extract Metadata**: Parse YAML frontmatter from SKILL.md
+3. **Create Tar**: Package all skill resources into a tar archive
+4. **Execute via LiteBox**: Run with litebox_runner_linux_userland using:
+   - `--initial-files` (tar archive path)
+   - `--interception-backend seccomp` or `rewriter`
+   - `--rewrite-syscalls` (for rewriter backend)
+   - Environment variables as needed
 
 ### Filesystem Layout
 
@@ -100,25 +119,35 @@ Scripts are executed with paths relative to the skill root (e.g., `/skill/script
 
 ## Future Work
 
-- Add shell support in LiteBox to enable running shell scripts
-- Simplify Python library packaging
-- Support for other interpreters (Node.js, Ruby, etc.)
-- Interactive skill execution with stdin/stdout
-- Better error handling and diagnostics
-- Package manager integration for skill dependencies
+The following enhancements would enable full Python and shell script execution:
+
+- [ ] Add shell support in LiteBox core
+- [ ] Automate Python binary and library packaging
+- [ ] Implement syscall rewriting for .so files in tar archives
+- [ ] Support for other interpreters (Node.js, Ruby, etc.)
+- [ ] Interactive skill execution with stdin/stdout
+- [ ] Better error handling and diagnostics
+- [ ] Integration tests for full skill execution
+- [ ] Persistent storage support for stateful skills
 
 ## Example Skills
 
 See the [Anthropic Skills Repository](https://github.com/anthropics/skills) for examples:
-- `skill-creator`: Create new skills
-- `pdf-editor`: PDF manipulation
-- `docx-editor`: Document editing
-- Many more...
+- `skill-creator`: Tools for creating new skills
+- `pdf-editor`: PDF manipulation utilities
+- `docx-editor`: Document editing capabilities
+- And many more...
+
+## References
+
+- [Agent Skills Specification](https://agentskills.io)
+- [Anthropic Skills Repository](https://github.com/anthropics/skills)
+- [LiteBox Documentation](../README.md)
 
 ## Contributing
 
-Contributions are welcome! Please see the main LiteBox CONTRIBUTING.md for guidelines.
+Contributions are welcome! Please see the main LiteBox [CONTRIBUTING.md](../CONTRIBUTING.md) for guidelines.
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT License - see [LICENSE](../LICENSE) file for details.
