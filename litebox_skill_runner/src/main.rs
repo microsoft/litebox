@@ -56,6 +56,7 @@ struct SkillMetadata {
 }
 
 /// Represents an unpacked or extracted skill
+#[derive(Debug)]
 struct Skill {
     /// Root directory of the skill
     root: PathBuf,
@@ -268,4 +269,220 @@ fn main() -> Result<()> {
     run_skill_script(&args, &skill, &tar_path).context("Failed to run skill script")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Create a test skill directory with SKILL.md
+    fn create_test_skill(dir: &Path, name: &str, description: &str) -> Result<()> {
+        fs::create_dir_all(dir)?;
+
+        let skill_md = format!(
+            "---\nname: {}\ndescription: {}\n---\n\n# Test Skill\n\nThis is a test skill.",
+            name, description
+        );
+
+        let skill_md_path = dir.join("SKILL.md");
+        let mut file = File::create(skill_md_path)?;
+        file.write_all(skill_md.as_bytes())?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_frontmatter_valid() {
+        let content = "---\nname: test-skill\ndescription: A test skill\n---\n\n# Content";
+        let result = Skill::extract_frontmatter(content);
+        assert!(result.is_ok());
+        let frontmatter = result.unwrap();
+        assert!(frontmatter.contains("name: test-skill"));
+        assert!(frontmatter.contains("description: A test skill"));
+        assert!(!frontmatter.contains("---"));
+    }
+
+    #[test]
+    fn test_extract_frontmatter_missing_start() {
+        let content = "name: test-skill\ndescription: A test skill\n---\n\n# Content";
+        let result = Skill::extract_frontmatter(content);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must start with YAML frontmatter")
+        );
+    }
+
+    #[test]
+    fn test_extract_frontmatter_missing_end() {
+        let content = "---\nname: test-skill\ndescription: A test skill\n\n# Content";
+        let result = Skill::extract_frontmatter(content);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must end with ---")
+        );
+    }
+
+    #[test]
+    fn test_load_skill_from_directory() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let skill_dir = temp_dir.path().join("test-skill");
+
+        create_test_skill(&skill_dir, "test-skill", "A test skill for unit testing")?;
+
+        let skill = Skill::from_directory(&skill_dir)?;
+        assert_eq!(skill.metadata.name, "test-skill");
+        assert_eq!(skill.metadata.description, "A test skill for unit testing");
+        assert!(!skill.needs_cleanup);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_skill_metadata_parsing() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let skill_dir = temp_dir.path().join("metadata-test");
+
+        create_test_skill(&skill_dir, "metadata-skill", "Testing metadata extraction")?;
+
+        let metadata = Skill::read_metadata(&skill_dir)?;
+        assert_eq!(metadata.name, "metadata-skill");
+        assert_eq!(metadata.description, "Testing metadata extraction");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_skill_with_optional_resources() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let skill_dir = temp_dir.path().join("resource-test");
+
+        create_test_skill(&skill_dir, "resource-skill", "Testing with resources")?;
+
+        // Add optional directories
+        fs::create_dir(skill_dir.join("scripts"))?;
+        fs::create_dir(skill_dir.join("references"))?;
+        fs::create_dir(skill_dir.join("assets"))?;
+
+        // Add test files
+        File::create(skill_dir.join("scripts/test.py"))?.write_all(b"print('test')")?;
+        File::create(skill_dir.join("references/doc.md"))?.write_all(b"# Documentation")?;
+        File::create(skill_dir.join("assets/file.txt"))?.write_all(b"asset content")?;
+
+        let skill = Skill::from_directory(&skill_dir)?;
+        assert_eq!(skill.metadata.name, "resource-skill");
+
+        // Verify tar creation works with resources
+        let tar_dir = tempfile::tempdir()?;
+        let tar_path = tar_dir.path().join("test.tar");
+        create_skill_tar(&skill, &tar_path)?;
+
+        assert!(tar_path.exists());
+        assert!(tar_path.metadata()?.len() > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_skill_tar() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let skill_dir = temp_dir.path().join("tar-test");
+
+        create_test_skill(&skill_dir, "tar-skill", "Testing tar creation")?;
+
+        let skill = Skill::from_directory(&skill_dir)?;
+
+        let tar_dir = tempfile::tempdir()?;
+        let tar_path = tar_dir.path().join("skill.tar");
+
+        create_skill_tar(&skill, &tar_path)?;
+
+        assert!(tar_path.exists());
+        let metadata = tar_path.metadata()?;
+        assert!(metadata.len() > 0);
+        assert!(metadata.is_file());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_skill_cleanup_on_drop() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let skill_dir = temp_dir.path().join("cleanup-test");
+
+        create_test_skill(&skill_dir, "cleanup-skill", "Testing cleanup")?;
+
+        let skill_path = {
+            let skill = Skill::from_directory(&skill_dir)?;
+            skill.root.clone()
+        };
+
+        // Skill should still exist after drop (needs_cleanup = false)
+        assert!(skill_path.exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_skill_missing_skill_md() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let skill_dir = temp_dir.path().join("invalid-skill");
+        fs::create_dir(&skill_dir).unwrap();
+
+        let result = Skill::from_directory(&skill_dir);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to open SKILL.md")
+        );
+    }
+
+    #[test]
+    fn test_invalid_yaml_frontmatter() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let skill_dir = temp_dir.path().join("invalid-yaml");
+        fs::create_dir(&skill_dir)?;
+
+        let skill_md_path = skill_dir.join("SKILL.md");
+        let mut file = File::create(skill_md_path)?;
+        file.write_all(b"---\ninvalid: yaml: content:\n---\n\n# Test")?;
+
+        let result = Skill::from_directory(&skill_dir);
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_skill_with_multiline_description() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let skill_dir = temp_dir.path().join("multiline-test");
+        fs::create_dir_all(&skill_dir)?;
+
+        let skill_md = "---\n\
+            name: multiline-skill\n\
+            description: |\n  \
+              This is a multiline description.\n  \
+              It spans multiple lines.\n\
+            ---\n\n\
+            # Test Skill";
+
+        let skill_md_path = skill_dir.join("SKILL.md");
+        let mut file = File::create(skill_md_path)?;
+        file.write_all(skill_md.as_bytes())?;
+
+        let skill = Skill::from_directory(&skill_dir)?;
+        assert_eq!(skill.metadata.name, "multiline-skill");
+        assert!(skill.metadata.description.contains("multiline description"));
+
+        Ok(())
+    }
 }

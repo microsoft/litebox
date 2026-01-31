@@ -110,11 +110,86 @@ LiteBox does not support running `/bin/sh` or `/bin/bash`:
 - This is an architectural limitation of LiteBox
 
 ### 2. Python Execution Complexity
+
+#### Version and Module Handling
+
+**Python Version Management:**
+- Uses system Python interpreter (default: `/usr/bin/python3`)
+- Version-specific library paths (e.g., `/usr/lib/python3.12/`)
+- No virtual environment support
+- Only one Python version per execution
+- Detection: `python3 --version` or `sys.version_info`
+
+**Module Resolution Strategy:**
+1. Python searches `PYTHONPATH` environment variable
+2. Falls back to `PYTHONHOME` locations
+3. All paths must exist in tar filesystem
+4. Import fails if module not found or incompatible
+
+**Standard Library Modules:**
+- Location: `/usr/lib/python3.X/`
+- Must be completely packaged into tar
+- Version-specific (3.10 ≠ 3.11 ≠ 3.12)
+- Typical size: 50-100 MB
+
+**Third-Party Module Handling:**
+```
+System packages (apt):     /usr/lib/python3/dist-packages/
+User packages (pip):       /usr/local/lib/python3.X/dist-packages/
+Development packages:      /usr/local/lib/python3.X/site-packages/
+```
+
+**Binary Extension Modules (.so files):**
+- Critical modules: `_ssl`, `_json`, `_socket`, `math`, `_datetime`
+- Scientific: `numpy`, `pandas`, `scipy` (if installed)
+- Each `.so` file must be rewritten individually with `litebox_syscall_rewriter`
+- File naming: `module.cpython-3XX-ARCH-linux-gnu.so`
+- Must preserve permissions and paths
+
+**Module Compatibility Matrix:**
+| Module Type | Status | Notes |
+|-------------|--------|-------|
+| Pure Python | ✅ Works | No syscall rewriting needed |
+| Stdlib with .so | ⚠️ Requires rewriting | Must rewrite all .so files |
+| Third-party pure | ✅ Works | If properly packaged |
+| Third-party binary | ⚠️ Requires rewriting | Complex dependencies |
+| Write-dependent | ❌ Fails | Tar filesystem is read-only |
+| Kernel-dependent | ❌ Fails | LiteBox limitations |
+
+#### Complete Setup Requirements
+
 Running Python scripts requires:
-- Python binary included in tar filesystem
-- All Python standard libraries packaged
-- All `.so` files with syscalls rewritten
-- Environment variables: `PYTHONHOME`, `PYTHONPATH`, `PYTHONDONTWRITEBYTECODE`
+- ✅ Python binary included in tar filesystem
+- ✅ Python standard library packaged (version-matched)
+- ✅ All `.so` files (binary + extensions) rewritten individually
+- ✅ Environment variables set correctly:
+  - `PYTHONHOME=/usr` - Python installation prefix
+  - `PYTHONPATH=/usr/lib/python3.12:...` - Module search paths
+  - `PYTHONDONTWRITEBYTECODE=1` - Prevent .pyc creation (read-only fs)
+- ✅ All third-party modules packaged with dependencies
+- ✅ Binary extension modules rewritten per-file
+
+**Example Python Environment Setup:**
+```bash
+# Detect version
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+
+# Collect paths
+STDLIB=/usr/lib/python${PYTHON_VERSION}
+DYNLOAD=/usr/lib/python${PYTHON_VERSION}/lib-dynload
+DISTPKG=/usr/lib/python3/dist-packages
+
+# Package all paths into tar
+# Rewrite each .so file:
+for so_file in $(find $STDLIB $DYNLOAD $DISTPKG -name "*.so" 2>/dev/null); do
+    litebox_syscall_rewriter "$so_file" "$tar_staging/$so_file"
+done
+
+# Set environment
+export PYTHONHOME=/usr
+export PYTHONPATH=$STDLIB:$DYNLOAD:$DISTPKG
+export PYTHONDONTWRITEBYTECODE=1
+```
 
 **Reference Implementation:** See `litebox_runner_linux_userland/tests/run.rs:test_runner_with_python` for the complete setup process.
 
