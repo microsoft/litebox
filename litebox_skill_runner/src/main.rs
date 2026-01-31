@@ -168,7 +168,7 @@ impl Skill {
             .position(|line| line.trim().starts_with("---"))
             .context("YAML frontmatter must end with ---")?;
 
-        Ok(lines[1..end + 1].join("\n"))
+        Ok(lines[1..=end].join("\n"))
     }
 }
 
