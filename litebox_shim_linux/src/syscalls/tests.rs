@@ -946,6 +946,10 @@ fn test_setitimer_subsecond_precision() {
     task.sys_alarm(0);
 }
 
+// These EFAULT tests verify that bad pointers are caught before dereferencing.
+// On Windows, the platform doesn't have the same memory protection semantics,
+// so invalid pointer access causes an access violation rather than EFAULT.
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn test_setitimer_efault_bad_new_value() {
     let task = init_platform(None);
@@ -962,6 +966,7 @@ fn test_setitimer_efault_bad_new_value() {
     );
 }
 
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn test_getitimer_efault_bad_curr_value() {
     let task = init_platform(None);
