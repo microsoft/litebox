@@ -180,10 +180,7 @@ impl EpollFile {
     ) -> Result<(), Errno> {
         match op {
             EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap()),
-            EpollOp::EpollCtlMod => {
-                log_unsupported!("epoll_ctl mod");
-                Err(Errno::EINVAL)
-            }
+            EpollOp::EpollCtlMod => self.mod_interest(global, fd, file, event.unwrap()),
             EpollOp::EpollCtlDel => {
                 let mut interests = self.interests.lock();
                 let _ = interests
@@ -230,7 +227,6 @@ impl EpollFile {
         Ok(())
     }
 
-    #[expect(dead_code, reason = "currently unused, but might want to use soon")]
     fn mod_interest(
         &self,
         global: &GlobalState,
@@ -682,6 +678,133 @@ mod test {
             .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
             .unwrap();
         assert_eq!(buf, [1, 2]);
+    }
+
+    #[test]
+    fn test_epoll_ctl_mod_basic() {
+        use litebox_common_linux::EpollOp;
+
+        let (task, epoll) = setup_epoll();
+        let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
+            0,
+            EfdFlags::CLOEXEC,
+        ));
+        let descriptor = super::EpollDescriptor::Eventfd(eventfd.clone());
+
+        // Add with EPOLLIN
+        epoll
+            .epoll_ctl(
+                &task.global,
+                EpollOp::EpollCtlAdd,
+                10,
+                &descriptor,
+                Some(EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 42,
+                }),
+            )
+            .expect("add should succeed");
+
+        // Modify to EPOLLOUT with different data
+        epoll
+            .epoll_ctl(
+                &task.global,
+                EpollOp::EpollCtlMod,
+                10,
+                &descriptor,
+                Some(EpollEvent {
+                    events: Events::OUT.bits(),
+                    data: 99,
+                }),
+            )
+            .expect("mod should succeed");
+
+        // Verify the modification by checking that we get EPOLLOUT events
+        // (eventfd is always writable when counter < max)
+        let events = epoll
+            .wait(
+                &task.global,
+                &WaitState::new(platform())
+                    .context()
+                    .with_timeout(core::time::Duration::from_millis(100)),
+                1024,
+            )
+            .expect("wait should succeed");
+
+        assert_eq!(events.len(), 1);
+        assert!(Events::from_bits_truncate(events[0].events).contains(Events::OUT));
+        // Copy data to local variable to avoid unaligned reference (EpollEvent is packed)
+        let data = { events[0].data };
+        assert_eq!(data, 99);
+    }
+
+    #[test]
+    fn test_epoll_ctl_mod_not_found() {
+        use litebox_common_linux::EpollOp;
+        use litebox_common_linux::errno::Errno;
+
+        let (task, epoll) = setup_epoll();
+        let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
+            0,
+            EfdFlags::CLOEXEC,
+        ));
+        let descriptor = super::EpollDescriptor::Eventfd(eventfd.clone());
+
+        // Try to modify without adding first - should fail with ENOENT
+        let result = epoll.epoll_ctl(
+            &task.global,
+            EpollOp::EpollCtlMod,
+            10,
+            &descriptor,
+            Some(EpollEvent {
+                events: Events::OUT.bits(),
+                data: 42,
+            }),
+        );
+
+        assert_eq!(result, Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn test_epoll_ctl_mod_exclusive_not_allowed() {
+        use litebox_common_linux::EpollOp;
+        use litebox_common_linux::errno::Errno;
+
+        let (task, epoll) = setup_epoll();
+        let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
+            0,
+            EfdFlags::CLOEXEC,
+        ));
+        let descriptor = super::EpollDescriptor::Eventfd(eventfd.clone());
+
+        // Add normally first
+        epoll
+            .epoll_ctl(
+                &task.global,
+                EpollOp::EpollCtlAdd,
+                10,
+                &descriptor,
+                Some(EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 42,
+                }),
+            )
+            .expect("add should succeed");
+
+        // Try to modify with EPOLLEXCLUSIVE - should fail with EINVAL
+        let exclusive_flag = 1 << 28; // EPOLLEXCLUSIVE
+        let result = epoll.epoll_ctl(
+            &task.global,
+            EpollOp::EpollCtlMod,
+            10,
+            &descriptor,
+            Some(EpollEvent {
+                events: Events::IN.bits() | exclusive_flag,
+                data: 42,
+            }),
+        );
+
+        assert_eq!(result, Err(Errno::EINVAL));
     }
 
     #[test]
