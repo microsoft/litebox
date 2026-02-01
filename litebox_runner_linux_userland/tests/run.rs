@@ -545,7 +545,7 @@ fn test_runner_with_shell() {
         .output();
 
     let output_str = String::from_utf8_lossy(&output);
-    println!("Shell output: {}", output_str);
+    println!("Shell output: {output_str}");
     assert!(output_str.contains("Hello from shell in litebox!"));
 }
 
@@ -576,7 +576,7 @@ fn test_runner_with_shell_script() {
         .output();
 
     let output_str = String::from_utf8_lossy(&output);
-    println!("Shell script output:\n{}", output_str);
+    println!("Shell script output:\n{output_str}");
 
     assert!(output_str.contains("Welcome to LiteBox"));
     assert!(output_str.contains("Testing shell features"));
@@ -606,7 +606,7 @@ fn test_runner_with_bash() {
         .output();
 
     let output_str = String::from_utf8_lossy(&output);
-    println!("Bash script output:\n{}", output_str);
+    println!("Bash script output:\n{output_str}");
 
     assert!(output_str.contains("Hello from bash in LiteBox"));
 }
@@ -625,14 +625,14 @@ fn test_runner_with_node() {
     println!("Testing Node.js execution with: {}", node_path.display());
 
     // Test Node.js with a simple script
-    let script = r#"console.log('Hello from Node.js in LiteBox!');"#;
+    let script = r"console.log('Hello from Node.js in LiteBox!');";
 
     let output = Runner::new(Backend::Rewriter, &node_path, "node_rewriter")
         .args(["-e", script])
         .output();
 
     let output_str = String::from_utf8_lossy(&output);
-    println!("Node.js script output:\n{}", output_str);
+    println!("Node.js script output:\n{output_str}");
 
     assert!(output_str.contains("Hello from Node.js in LiteBox!"));
 }
