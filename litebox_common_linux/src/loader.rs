@@ -9,14 +9,13 @@
 //! * Loading LiteBox trampoline code for syscall handling.
 
 use alloc::vec::Vec;
-use elf::{file::FileHeader, parse::ParseAt};
+use elf::file::FileHeader;
 use litebox::{
     mm::linux::PAGE_SIZE,
     platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
     utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };
 use thiserror::Error;
-use zerocopy::IntoBytes as _;
 
 use crate::errno::Errno;
 
@@ -69,14 +68,8 @@ struct TrampolineInfo {
     syscall_entry_point: usize,
 }
 
-/// The magic number used to identify the LiteBox rewriter and where we should
-/// update the syscall callback pointer.
-const REWRITER_MAGIC_NUMBER: u32 = u32::from_le_bytes(*b"LTBX");
-const REWRITER_VERSION_NUMBER: u64 = u64::from_le_bytes(*b"LITEBOX0");
-
-/// The expected section name for the trampoline section.
-/// This must match `TRAMPOLINE_SECTION_NAME` in `litebox_syscall_rewriter`.
-const TRAMPOLINE_SECTION_NAME: &[u8] = b".trampolineLB0";
+/// The magic number used to identify the LiteBox rewriter trampoline header.
+const REWRITER_MAGIC: [u8; 8] = *b"LITEBOX0";
 
 const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
     elf::file::Class::ELF64
@@ -200,108 +193,92 @@ impl ElfParsedFile {
         })
     }
 
-    /// Parse the LiteBox trampoline section, if any.
+    /// Parse the LiteBox trampoline data, if any.
+    ///
+    /// The trampoline data is appended at a page-aligned offset at the end of
+    /// the file. It starts with a header:
+    /// - 8 bytes: Magic "LITEBOX0"
+    /// - 8 bytes: Total size of trampoline data (including header)
+    /// - 4/8 bytes: Handler function pointer (arch-dependent)
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
     /// into the trampoline at map time.
+    #[expect(clippy::missing_panics_doc, reason = "cannot panic")]
     pub fn parse_trampoline<F: ReadAt>(
         &mut self,
         file: &mut F,
         syscall_entry_point: usize,
     ) -> Result<(), ElfParseError<F::Error>> {
-        let shent_size = if cfg!(target_pointer_width = "64") {
-            size_of::<elf::section::Elf64_Shdr>()
-        } else {
-            size_of::<elf::section::Elf32_Shdr>()
+        const MIN_HEADER_SIZE: u64 = 16; // magic (8) + size (8)
+
+        let file_size = file.size().map_err(ElfParseError::Io)?;
+
+        // The trampoline is at a page-aligned offset at the end of the file.
+        // Scan backwards from the end to find the magic header.
+        if file_size < PAGE_SIZE as u64 {
+            return Ok(());
+        }
+
+        // Start at last page boundary at or before file end
+        let mut offset = file_size & !(PAGE_SIZE as u64 - 1);
+        // If file size is page-aligned, start one page back
+        if offset == file_size {
+            offset = offset.saturating_sub(PAGE_SIZE as u64);
+        }
+
+        let mut tramp_file_offset = None;
+        let mut tramp_size = 0u64;
+
+        // Check up to 16 pages back (covers trampolines up to 64KB)
+        for _ in 0..16 {
+            if offset == 0 || file_size - offset < MIN_HEADER_SIZE {
+                break;
+            }
+
+            let mut header = [0u8; 16];
+            if file.read_at(offset, &mut header).is_err() {
+                offset = offset.saturating_sub(PAGE_SIZE as u64);
+                continue;
+            }
+
+            if header[..8] != REWRITER_MAGIC {
+                offset = offset.saturating_sub(PAGE_SIZE as u64);
+                continue;
+            }
+
+            let size = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            if size != 0 && offset + size == file_size {
+                tramp_file_offset = Some(offset);
+                tramp_size = size;
+                break;
+            }
+
+            offset = offset.saturating_sub(PAGE_SIZE as u64);
+        }
+
+        let Some(file_offset) = tramp_file_offset else {
+            return Ok(());
         };
 
-        if self.header.e_shnum == 0 || usize::from(self.header.e_shentsize) != shent_size {
-            // No section headers or invalid size.
-            return Ok(());
+        // Calculate the virtual address for the trampoline.
+        let mut max_vaddr = 0u64;
+        for ph in self.program_headers() {
+            if ph.p_type == elf::abi::PT_LOAD {
+                let end = ph.p_vaddr.saturating_add(ph.p_memsz);
+                max_vaddr = max_vaddr.max(end);
+            }
         }
-
-        // Read the last section header (where our trampoline section should be).
-        let offset = self
-            .header
-            .e_shoff
-            .checked_add(u64::from(self.header.e_shentsize) * u64::from(self.header.e_shnum - 1))
-            .ok_or(ElfParseError::BadFormat)?;
-        let mut buf = [0u8; size_of::<elf::section::Elf64_Shdr>()];
-        file.read_at(offset, &mut buf).map_err(ElfParseError::Io)?;
-        let shdr = elf::section::SectionHeader::parse_at(
-            self.header.endianness,
-            self.header.class,
-            &mut 0,
-            &buf,
-        )?;
-
-        // Note these fields are repurposed to store our trampoline info.
-        // See litebox_syscall_rewriter for details.
-        let magic_number = shdr.sh_addr;
-        let tramp_offset = shdr.sh_offset;
-        let tramp_size = shdr.sh_entsize;
-        // Quick check using the magic number stored in sh_addr.
-        // This avoids reading the string table for non-trampoline sections.
-        if magic_number != REWRITER_MAGIC_NUMBER.into() || shdr.sh_size != 0 {
-            // Not a trampoline section.
-            return Ok(());
-        }
-
-        // Read the section header string table header to get its offset.
-        let shstrtab_index = self.header.e_shstrndx;
-        if shstrtab_index == 0 || shstrtab_index >= self.header.e_shnum {
-            // No section header string table.
-            return Ok(());
-        }
-        let shstrtab_offset = self
-            .header
-            .e_shoff
-            .checked_add(u64::from(self.header.e_shentsize) * u64::from(shstrtab_index))
-            .ok_or(ElfParseError::BadFormat)?;
-        let mut shstrtab_hdr_buf = [0u8; size_of::<elf::section::Elf64_Shdr>()];
-        file.read_at(shstrtab_offset, &mut shstrtab_hdr_buf)
-            .map_err(ElfParseError::Io)?;
-        let shstrtab_hdr = elf::section::SectionHeader::parse_at(
-            self.header.endianness,
-            self.header.class,
-            &mut 0,
-            &shstrtab_hdr_buf,
-        )?;
-
-        // Verify the section name from the string table.
-        let name_offset = shstrtab_hdr
-            .sh_offset
-            .checked_add(u64::from(shdr.sh_name))
-            .ok_or(ElfParseError::BadFormat)?;
-        let mut name_buf = [0u8; 32]; // Enough for ".trampolineLB0" and similar names
-        file.read_at(name_offset, &mut name_buf)
-            .map_err(ElfParseError::Io)?;
-        let name_end = name_buf
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(name_buf.len());
-        let section_name = &name_buf[..name_end];
-
-        // Verify this is our trampoline section by checking the section name.
-        if section_name != TRAMPOLINE_SECTION_NAME {
-            // Not a trampoline section.
-            return Ok(());
-        }
+        let tramp_vaddr: usize = max_vaddr
+            .try_into()
+            .map_err(|_| ElfParseError::BadTrampoline)?;
+        let tramp_vaddr = page_align_up(tramp_vaddr);
 
         let size: usize = tramp_size
             .try_into()
             .map_err(|_| ElfParseError::BadTrampoline)?;
-        // The trampoline is located at the end of the file.
-        let file_offset = file
-            .size()
-            .map_err(ElfParseError::Io)?
-            .checked_sub(tramp_size)
-            .ok_or(ElfParseError::BadTrampoline)?;
 
         self.trampoline = Some(TrampolineInfo {
-            vaddr: tramp_offset
-                .try_into()
-                .map_err(|_| ElfParseError::BadTrampoline)?,
+            vaddr: tramp_vaddr,
             size,
             file_offset,
             syscall_entry_point,
@@ -491,16 +468,17 @@ impl ElfParsedFile {
             )
             .map_err(ElfLoadError::Map)?;
 
-        // Validate the trampoline version number.
-        let mut version = 0u64;
-        mem.read(trampoline_start, version.as_mut_bytes())?;
-        if version != REWRITER_VERSION_NUMBER {
+        // Validate the trampoline magic header.
+        let mut magic = [0u8; 8];
+        mem.read(trampoline_start, &mut magic)?;
+        if magic != REWRITER_MAGIC {
             return Err(ElfLoadError::InvalidTrampolineVersion);
         }
 
         // Write the trampoline entry point.
+        // Header format: magic (8) + size (8) + handler pointer
         mem.write(
-            trampoline_start + 8,
+            trampoline_start + 16,
             &trampoline.syscall_entry_point.to_ne_bytes(),
         )?;
 

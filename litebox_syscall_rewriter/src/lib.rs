@@ -44,36 +44,26 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-/// The prefix for any trampolines inserted by any version of this crate.
+/// The magic header for the trampoline data.
 ///
-/// Downstream users might wish to check for (case-insensitive) comparison against this to see if
-/// there might be a trampoline, if the exact [`TRAMPOLINE_SECTION_NAME`] does not match, in order
-/// to provide more useful error messages.
-///
-/// ```rust
-/// # use litebox_syscall_rewriter::TRAMPOLINE_SECTION_NAME;
-/// # use litebox_syscall_rewriter::TRAMPOLINE_SECTION_NAME_PREFIX;
-/// assert!(TRAMPOLINE_SECTION_NAME.starts_with(TRAMPOLINE_SECTION_NAME_PREFIX));
-/// ```
-pub const TRAMPOLINE_SECTION_NAME_PREFIX: &str = ".trampolineLB";
+/// This is used to identify and validate the trampoline section at the end of the file.
+pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 
-/// The name of the section for the trampoline.
-///
-/// This contains both [`TRAMPOLINE_SECTION_NAME_PREFIX`] as well as a version number, that might be
-/// incremented if its design changes significantly enough that downstream users might need to care
-/// about it.
-///
-/// Downstream users are exepcted to check for this exact section name (including case sensitivity)
-/// to know that they have a trampoline that satisfies the expected version.
-pub const TRAMPOLINE_SECTION_NAME: &str = ".trampolineLB0";
+/// Offset of the handler pointer in the trampoline header.
+/// Header layout: magic (8) + size (8) + handler (4 or 8)
+const HANDLER_OFFSET: usize = 16;
 
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
 ///
 /// The `trampoline` must be an absolute address if specified; if unspecified, it will be set to
 /// zeros, and it is the caller's decision to overwrite it at loading time.
 ///
-/// If it succeeds, it produces an executable with a [`TRAMPOLINE_SECTION_NAME`] section whose first
-/// 8 bytes point to the `trampoline` address.
+/// If it succeeds, it produces an executable with trampoline data appended at the end of the file
+/// (page-aligned). The trampoline data starts with a header:
+/// - 8 bytes: Magic "LITEBOX0"
+/// - 8 bytes: Total size of trampoline data (including header)
+/// - 4/8 bytes: Handler function pointer (arch-dependent)
+/// - Remaining bytes: Trampoline code entries
 #[expect(
     clippy::missing_panics_doc,
     reason = "any panics in here are not part of the public contract and should be fixed within this module"
@@ -122,17 +112,25 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     };
 
     let text_sections = text_sections(&builder)?;
-    let trampoline_section = setup_trampoline_section(&mut builder)?;
+
+    // Check if already hooked by looking for magic at the end of the file
+    if is_already_hooked(input_binary) {
+        return Err(Error::AlreadyHooked);
+    }
 
     // Get control transfer targets
     let control_transfer_targets = get_control_transfer_targets(arch, &builder, &text_sections);
 
     let trampoline_base_addr = find_addr_for_trampoline_code(&builder);
     let mut trampoline_data = vec![];
-    // The magic prefix for the trampoline section
-    // This constant should be consistent with the definitions in the shim
-    // (litebox_shim_linux/src/loader/mod.rs)
-    trampoline_data.extend_from_slice("LITEBOX0".as_bytes());
+    // Header format:
+    // - 8 bytes: Magic "LITEBOX0"
+    // - 8 bytes: Total size of trampoline data (placeholder, filled in at the end)
+    // - 4/8 bytes: Handler function pointer (arch-dependent)
+    trampoline_data.extend_from_slice(TRAMPOLINE_MAGIC);
+    // Placeholder for size (will be filled in after we know the total size)
+    let size_offset = trampoline_data.len();
+    trampoline_data.extend_from_slice(&0u64.to_le_bytes());
     // The placeholder for the address of the new syscall entry point
     let trampoline = trampoline.unwrap_or(0);
     if arch == Arch::X86_64 {
@@ -169,12 +167,9 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         return Err(Error::NoSyscallInstructionsFound);
     }
 
-    // Repurpose the section header fields to store trampoline info
-    // This constant should be consistent with the definitions in the shim
-    // (litebox_shim_linux/src/loader/mod.rs)
-    builder.sections.get_mut(trampoline_section).sh_addr = u32::from_le_bytes(*b"LTBX").into();
-    builder.sections.get_mut(trampoline_section).sh_offset = trampoline_base_addr;
-    builder.sections.get_mut(trampoline_section).sh_entsize = trampoline_data.len() as u64;
+    // Fill in the trampoline size in the header
+    let trampoline_size = trampoline_data.len() as u64;
+    trampoline_data[size_offset..size_offset + 8].copy_from_slice(&trampoline_size.to_le_bytes());
 
     let mut out = vec![];
     builder
@@ -207,23 +202,28 @@ fn text_sections(
     Ok(text_sections)
 }
 
-// (private) Sets up the trampoline section
-fn setup_trampoline_section(
-    builder: &mut object::build::elf::Builder<'_>,
-) -> Result<object::build::elf::SectionId> {
-    if builder
-        .sections
-        .iter()
-        .any(|s| s.name == TRAMPOLINE_SECTION_NAME.into())
-    {
-        return Err(Error::AlreadyHooked);
+/// Check if the binary is already hooked by looking for the magic header.
+fn is_already_hooked(input_binary: &[u8]) -> bool {
+    if input_binary.len() < 0x1000 + TRAMPOLINE_MAGIC.len() {
+        return false;
     }
-    let s = builder.sections.add();
-    *s.name.to_mut() = TRAMPOLINE_SECTION_NAME.into();
-    s.sh_type = object::elf::SHT_PROGBITS;
-    s.sh_flags = object::elf::SHF_ALLOC.into();
-    s.sh_addralign = 8;
-    Ok(s.id())
+    // Start at last page boundary at or before file end
+    let file_len = input_binary.len();
+    let mut offset = file_len & !0xFFF;
+    if offset == file_len && offset >= 0x1000 {
+        offset -= 0x1000;
+    }
+    // Check up to 16 pages back
+    for _ in 0..16 {
+        if offset == 0 {
+            break;
+        }
+        if &input_binary[offset..offset + TRAMPOLINE_MAGIC.len()] == TRAMPOLINE_MAGIC {
+            return true;
+        }
+        offset = offset.saturating_sub(0x1000);
+    }
+    false
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
@@ -337,7 +337,12 @@ fn hook_syscalls_in_section(
 
             // Add jmp [rip + offset_to_shared_target]
             trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 4);
+            // disp32 points back to handler at HANDLER_OFFSET
+            // After FF 25, RIP = current_offset + 6. We need: handler_addr = RIP + disp32
+            // disp32 = HANDLER_OFFSET - (trampoline_data.len() + 4) = HANDLER_OFFSET - trampoline_data.len() - 4
+            let disp32 = i32::try_from(HANDLER_OFFSET).unwrap()
+                - i32::try_from(trampoline_data.len()).unwrap()
+                - 4;
             trampoline_data.extend_from_slice(&disp32.to_le_bytes());
         } else {
             // Add call [rip + offset_to_shared_target]
@@ -346,7 +351,11 @@ fn hook_syscalls_in_section(
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 11);
+            // EAX points to POP EAX instruction (offset 6 from sequence start)
+            // disp32 = HANDLER_OFFSET - (sequence_start + 6) = HANDLER_OFFSET - trampoline_data.len() + 9 - 6
+            let disp32 = i32::try_from(HANDLER_OFFSET).unwrap()
+                - i32::try_from(trampoline_data.len()).unwrap()
+                + 3;
             trampoline_data.extend_from_slice(&disp32.to_le_bytes());
             // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
             // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
@@ -496,7 +505,10 @@ fn hook_syscall_and_after(
         trampoline_data.extend_from_slice(&6u32.to_le_bytes());
         // Add jmp [rip + offset_to_shared_target]
         trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 4);
+        // disp32 points back to handler at HANDLER_OFFSET
+        let disp32 = i32::try_from(HANDLER_OFFSET).unwrap()
+            - i32::try_from(trampoline_data.len()).unwrap()
+            - 4;
         trampoline_data.extend_from_slice(&disp32.to_le_bytes());
     } else {
         // Add call [rip + offset_to_shared_target]
@@ -505,7 +517,10 @@ fn hook_syscall_and_after(
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 11);
+        // EAX points to POP EAX instruction (offset 6 from sequence start)
+        let disp32 = i32::try_from(HANDLER_OFFSET).unwrap()
+            - i32::try_from(trampoline_data.len()).unwrap()
+            + 3;
         trampoline_data.extend_from_slice(&disp32.to_le_bytes());
         // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
         // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
@@ -624,7 +639,9 @@ fn hook_syscall_before_and_after(
     trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
     trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
     trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-    let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 11);
+    // EAX points to POP EAX instruction (offset 6 from sequence start)
+    let disp32 =
+        i32::try_from(HANDLER_OFFSET).unwrap() - i32::try_from(trampoline_data.len()).unwrap() + 3;
     trampoline_data.extend_from_slice(&disp32.to_le_bytes());
     // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
     // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
