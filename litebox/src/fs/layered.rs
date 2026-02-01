@@ -15,8 +15,9 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, LinkError, MkdirError, OpenError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError,
+    WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -1037,6 +1038,68 @@ impl<
             .entries
             .insert(path, Arc::new(EntryX::Tombstone));
         Ok(())
+    }
+
+    fn link(
+        &self,
+        oldpath: impl crate::path::Arg,
+        newpath: impl crate::path::Arg,
+    ) -> Result<(), LinkError> {
+        let oldpath = self.absolute_path(oldpath)?;
+        let newpath = self.absolute_path(newpath)?;
+
+        // Hard links across filesystems are not allowed.
+        // In a layered filesystem, we only support links within the upper layer.
+        // If oldpath is only in the lower layer, we need to migrate it first.
+
+        // Check if oldpath exists and is a file (not a directory)
+        match self.upper.file_status(oldpath.as_str()) {
+            Ok(status) => {
+                if status.file_type == FileType::Directory {
+                    return Err(LinkError::IsADirectory);
+                }
+                // File exists in upper layer, delegate to upper
+            }
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                // Check if it exists in lower layer
+                match self.ensure_lower_contains(&oldpath)? {
+                    FileType::Directory => return Err(LinkError::IsADirectory),
+                    FileType::RegularFile => {
+                        // Need to migrate the file to upper layer first.
+                        // We must copy the data (true) to preserve file contents for the hard link.
+                        match self.migrate_file_up(&oldpath, true) {
+                            Ok(()) => {}
+                            Err(MigrationError::NoReadPerms) => {
+                                return Err(LinkError::PathError(PathError::NoSearchPerms {
+                                    #[cfg(debug_assertions)]
+                                    dir: oldpath.clone(),
+                                    #[cfg(debug_assertions)]
+                                    perms: Mode::empty(),
+                                }));
+                            }
+                            Err(MigrationError::NotAFile) => return Err(LinkError::IsADirectory),
+                            Err(MigrationError::PathError(e)) => {
+                                return Err(LinkError::PathError(e));
+                            }
+                        }
+                    }
+                    FileType::CharacterDevice => return Err(LinkError::CrossDeviceLink),
+                }
+            }
+            Err(FileStatusError::PathError(e)) => return Err(LinkError::PathError(e)),
+            Err(FileStatusError::ClosedFd) => unreachable!(),
+        }
+
+        // Check that newpath doesn't already exist (in either layer)
+        if self.upper.file_status(newpath.as_str()).is_ok() {
+            return Err(LinkError::AlreadyExists);
+        }
+        if self.ensure_lower_contains(&newpath).is_ok() {
+            return Err(LinkError::AlreadyExists);
+        }
+
+        // Delegate to upper layer
+        self.upper.link(oldpath.as_str(), newpath.as_str())
     }
 
     fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {

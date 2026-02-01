@@ -148,6 +148,21 @@ impl From<litebox::fs::errors::UnlinkError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::LinkError> for Errno {
+    fn from(value: litebox::fs::errors::LinkError) -> Self {
+        match value {
+            litebox::fs::errors::LinkError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::LinkError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::LinkError::IsADirectory => Errno::EPERM,
+            litebox::fs::errors::LinkError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::LinkError::CrossDeviceLink => Errno::EXDEV,
+            litebox::fs::errors::LinkError::TooManyLinks => Errno::EMLINK,
+            litebox::fs::errors::LinkError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::RmdirError> for Errno {
     fn from(value: litebox::fs::errors::RmdirError) -> Self {
         match value {

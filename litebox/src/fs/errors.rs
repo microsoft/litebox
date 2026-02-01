@@ -183,6 +183,26 @@ pub enum FileStatusError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::link`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum LinkError {
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("newpath already exists")]
+    AlreadyExists,
+    #[error("oldpath is a directory")]
+    IsADirectory,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("oldpath and newpath are not on the same mounted filesystem")]
+    CrossDeviceLink,
+    #[error("too many links to the file")]
+    TooManyLinks,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {

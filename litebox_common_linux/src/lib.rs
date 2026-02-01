@@ -2125,6 +2125,14 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         flags: AtFlags,
     },
+    /// Create a hard link to an existing file
+    Linkat {
+        olddirfd: i32,
+        oldpath: Platform::RawConstPointer<i8>,
+        newdirfd: i32,
+        newpath: Platform::RawConstPointer<i8>,
+        flags: AtFlags,
+    },
     #[cfg(target_arch = "x86_64")]
     Newfstatat {
         dirfd: i32,
@@ -2712,6 +2720,23 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 SyscallRequest::Unlinkat {
                     dirfd: AT_FDCWD,
                     pathname: ctx.sys_req_ptr(0),
+                    flags: AtFlags::empty(),
+                }
+            }
+            Sysno::linkat => SyscallRequest::Linkat {
+                olddirfd: ctx.sys_req_arg(0),
+                oldpath: ctx.sys_req_ptr(1),
+                newdirfd: ctx.sys_req_arg(2),
+                newpath: ctx.sys_req_ptr(3),
+                flags: ctx.sys_req_arg(4),
+            },
+            Sysno::link => {
+                // link is equivalent to linkat with olddirfd/newdirfd AT_FDCWD and flags 0
+                SyscallRequest::Linkat {
+                    olddirfd: AT_FDCWD,
+                    oldpath: ctx.sys_req_ptr(0),
+                    newdirfd: AT_FDCWD,
+                    newpath: ctx.sys_req_ptr(1),
                     flags: AtFlags::empty(),
                 }
             }

@@ -39,8 +39,8 @@ use crate::{
 use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
-        ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+        ChmodError, ChownError, CloseError, LinkError, MkdirError, OpenError, PathError,
+        ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
     },
 };
 
@@ -392,6 +392,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             Some(_) => Err(UnlinkError::ReadOnlyFileSystem),
         }
+    }
+
+    fn link(
+        &self,
+        _oldpath: impl crate::path::Arg,
+        _newpath: impl crate::path::Arg,
+    ) -> Result<(), LinkError> {
+        Err(LinkError::ReadOnlyFileSystem)
     }
 
     fn mkdir(&self, _path: impl crate::path::Arg, _mode: Mode) -> Result<(), MkdirError> {

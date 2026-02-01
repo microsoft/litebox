@@ -23,8 +23,8 @@ pub mod tar_ro;
 mod tests;
 
 use errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, LinkError, MkdirError, OpenError,
+    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -119,6 +119,20 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
 
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
+
+    /// Create a hard link to an existing file
+    ///
+    /// Creates a new directory entry `newpath` that refers to the same file as `oldpath`.
+    /// After a successful call, both paths refer to the same file and the link count is
+    /// incremented.
+    ///
+    /// # Errors
+    /// - `LinkError::IsADirectory` if `oldpath` is a directory
+    /// - `LinkError::AlreadyExists` if `newpath` already exists
+    /// - `LinkError::NoWritePerms` if the directory containing `newpath` is not writable
+    /// - `LinkError::CrossDeviceLink` if `oldpath` and `newpath` are on different filesystems
+    /// - `LinkError::TooManyLinks` if the maximum number of links to `oldpath` would be exceeded
+    fn link(&self, oldpath: impl path::Arg, newpath: impl path::Arg) -> Result<(), LinkError>;
 
     /// Create a new directory
     fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;

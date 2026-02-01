@@ -12,8 +12,9 @@ use crate::{
     fs::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
-            ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+            ChmodError, ChownError, CloseError, FileStatusError, LinkError, MkdirError, OpenError,
+            PathError, ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError,
+            WriteError,
         },
     },
     path::Arg,
@@ -344,6 +345,12 @@ impl<
 
     #[expect(unused_variables, reason = "unimplemented")]
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
+        unimplemented!()
+    }
+
+    #[expect(unused_variables, reason = "unimplemented")]
+    fn link(&self, oldpath: impl Arg, newpath: impl Arg) -> Result<(), LinkError> {
+        // Device files cannot have hard links created
         unimplemented!()
     }
 

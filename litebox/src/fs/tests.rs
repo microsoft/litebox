@@ -623,6 +623,190 @@ mod in_mem {
 
         fs.close(&fd).expect("close failed");
     }
+
+    #[test]
+    fn link_basic() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("chmod / failed");
+        });
+
+        // Create a file and write some data
+        let fd = fs
+            .open("/original", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        fs.write(&fd, b"hello", None)
+            .expect("Failed to write to file");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Create a hard link
+        fs.link("/original", "/linked")
+            .expect("Failed to create link");
+
+        // Verify both paths read the same data
+        let fd = fs
+            .open("/original", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open original");
+        let mut buf = [0u8; 16];
+        let n = fs.read(&fd, &mut buf, None).expect("read original failed");
+        assert_eq!(&buf[..n], b"hello");
+        fs.close(&fd).expect("close original failed");
+
+        let fd = fs
+            .open("/linked", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open linked");
+        let mut buf = [0u8; 16];
+        let n = fs.read(&fd, &mut buf, None).expect("read linked failed");
+        assert_eq!(&buf[..n], b"hello");
+        fs.close(&fd).expect("close linked failed");
+    }
+
+    #[test]
+    fn link_shared_data() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("chmod / failed");
+        });
+
+        // Create a file
+        let fd = fs
+            .open("/original", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        fs.write(&fd, b"original data", None)
+            .expect("Failed to write");
+        fs.close(&fd).expect("Failed to close");
+
+        // Create a hard link
+        fs.link("/original", "/linked")
+            .expect("Failed to create link");
+
+        // Write through the link
+        let fd = fs
+            .open("/linked", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open linked for write");
+        fs.write(&fd, b"modified", None)
+            .expect("Failed to write via link");
+        fs.close(&fd).expect("Failed to close linked");
+
+        // Read through original - should see the modified data
+        let fd = fs
+            .open("/original", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open original");
+        let mut buf = [0u8; 32];
+        let n = fs.read(&fd, &mut buf, None).expect("read failed");
+        assert_eq!(&buf[..n], b"modified data");
+        fs.close(&fd).expect("close failed");
+    }
+
+    #[test]
+    fn link_unlink_original_preserves_data() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("chmod / failed");
+        });
+
+        // Create a file
+        let fd = fs
+            .open("/original", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        fs.write(&fd, b"preserved", None).expect("Failed to write");
+        fs.close(&fd).expect("Failed to close");
+
+        // Create a hard link
+        fs.link("/original", "/linked")
+            .expect("Failed to create link");
+
+        // Unlink the original
+        fs.unlink("/original").expect("Failed to unlink original");
+
+        // The linked file should still exist and have the data
+        let fd = fs
+            .open("/linked", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open linked after unlink original");
+        let mut buf = [0u8; 16];
+        let n = fs.read(&fd, &mut buf, None).expect("read failed");
+        assert_eq!(&buf[..n], b"preserved");
+        fs.close(&fd).expect("close failed");
+
+        // Original should no longer exist
+        assert!(matches!(
+            fs.open("/original", OFlags::RDONLY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            ))
+        ));
+    }
+
+    #[test]
+    fn link_directory_fails() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("chmod / failed");
+        });
+
+        // Create a directory
+        fs.mkdir("/mydir", Mode::RWXU)
+            .expect("Failed to create directory");
+
+        // Attempt to create hard link to directory - should fail
+        assert!(matches!(
+            fs.link("/mydir", "/linked_dir"),
+            Err(crate::fs::errors::LinkError::IsADirectory)
+        ));
+    }
+
+    #[test]
+    fn link_already_exists_fails() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("chmod / failed");
+        });
+
+        // Create two files
+        let fd = fs
+            .open("/file1", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file1");
+        fs.close(&fd).expect("close file1 failed");
+
+        let fd = fs
+            .open("/file2", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file2");
+        fs.close(&fd).expect("close file2 failed");
+
+        // Attempt to link to existing file - should fail
+        assert!(matches!(
+            fs.link("/file1", "/file2"),
+            Err(crate::fs::errors::LinkError::AlreadyExists)
+        ));
+    }
+
+    #[test]
+    fn link_nonexistent_fails() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("chmod / failed");
+        });
+
+        // Attempt to link to nonexistent file - should fail
+        assert!(matches!(
+            fs.link("/nonexistent", "/linked"),
+            Err(crate::fs::errors::LinkError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            ))
+        ));
+    }
 }
 
 mod tar_ro {

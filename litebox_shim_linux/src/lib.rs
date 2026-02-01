@@ -971,6 +971,17 @@ impl Task {
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 syscall!(sys_unlinkat(dirfd, path, flags))
             }),
+            SyscallRequest::Linkat {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            } => {
+                let oldpath = oldpath.to_cstring().ok_or(Errno::EFAULT)?;
+                let newpath = newpath.to_cstring().ok_or(Errno::EFAULT)?;
+                syscall!(sys_linkat(olddirfd, oldpath, newdirfd, newpath, flags))
+            }
             SyscallRequest::Stat { pathname, buf } => {
                 pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                     self.sys_stat(path).and_then(|stat| {

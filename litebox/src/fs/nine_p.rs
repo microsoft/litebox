@@ -101,6 +101,14 @@ impl<Platform: platform::Provider + Sync> super::FileSystem for FileSystem<Platf
         todo!()
     }
 
+    fn link(
+        &self,
+        oldpath: impl crate::path::Arg,
+        newpath: impl crate::path::Arg,
+    ) -> Result<(), super::errors::LinkError> {
+        todo!()
+    }
+
     fn mkdir(
         &self,
         path: impl crate::path::Arg,

@@ -227,6 +227,48 @@ impl Task {
         }
     }
 
+    /// Handle syscall `linkat`
+    ///
+    /// Creates a new hard link to an existing file.
+    pub(crate) fn sys_linkat(
+        &self,
+        olddirfd: i32,
+        oldpath: impl path::Arg,
+        newdirfd: i32,
+        newpath: impl path::Arg,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        // Only AT_SYMLINK_FOLLOW is a valid flag for linkat
+        // AT_EMPTY_PATH is not supported
+        if flags.intersects((AtFlags::AT_SYMLINK_FOLLOW | AtFlags::AT_EMPTY_PATH).complement()) {
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(AtFlags::AT_EMPTY_PATH) {
+            // AT_EMPTY_PATH requires CAP_DAC_READ_SEARCH capability
+            // Not supported for now
+            return Err(Errno::EINVAL);
+        }
+
+        let old_fs_path = FsPath::new(olddirfd, oldpath)?;
+        let new_fs_path = FsPath::new(newdirfd, newpath)?;
+
+        let oldpath_str = match old_fs_path {
+            FsPath::Absolute { path } | FsPath::CwdRelative { path } => path,
+            FsPath::Cwd | FsPath::Fd(_) | FsPath::FdRelative { .. } => return Err(Errno::ENOENT),
+        };
+
+        let newpath_str = match new_fs_path {
+            FsPath::Absolute { path } | FsPath::CwdRelative { path } => path,
+            FsPath::Cwd => return Err(Errno::EEXIST),
+            FsPath::Fd(_) | FsPath::FdRelative { .. } => return Err(Errno::EINVAL),
+        };
+
+        self.global
+            .fs
+            .link(oldpath_str, newpath_str)
+            .map_err(Errno::from)
+    }
+
     /// Handle syscall `read`
     ///
     /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.
