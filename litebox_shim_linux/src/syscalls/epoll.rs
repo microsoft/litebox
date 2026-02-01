@@ -261,6 +261,9 @@ impl EpollFile {
         inner.flags = flags;
         inner.data = event.data;
 
+        // Re-enable the entry unconditionally. This is correct behavior per Linux semantics:
+        // EPOLL_CTL_MOD re-arms a disabled EPOLLONESHOT entry, allowing it to fire again.
+        // This is the standard pattern for applications using EPOLLONESHOT.
         entry
             .is_enabled
             .store(true, core::sync::atomic::Ordering::Relaxed);
@@ -805,6 +808,199 @@ mod test {
         );
 
         assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_epoll_ctl_mod_existing_exclusive() {
+        use litebox_common_linux::EpollOp;
+        use litebox_common_linux::errno::Errno;
+
+        let (task, epoll) = setup_epoll();
+        let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
+            0,
+            EfdFlags::CLOEXEC,
+        ));
+        let descriptor = super::EpollDescriptor::Eventfd(eventfd.clone());
+
+        // Add with EPOLLEXCLUSIVE flag
+        let exclusive_flag = 1 << 28; // EPOLLEXCLUSIVE
+        epoll
+            .epoll_ctl(
+                &task.global,
+                EpollOp::EpollCtlAdd,
+                10,
+                &descriptor,
+                Some(EpollEvent {
+                    events: Events::IN.bits() | exclusive_flag,
+                    data: 42,
+                }),
+            )
+            .expect("add with exclusive should succeed");
+
+        // Try to modify an entry that was added with EPOLLEXCLUSIVE - should fail with EINVAL
+        let result = epoll.epoll_ctl(
+            &task.global,
+            EpollOp::EpollCtlMod,
+            10,
+            &descriptor,
+            Some(EpollEvent {
+                events: Events::OUT.bits(), // No EPOLLEXCLUSIVE in new flags
+                data: 99,
+            }),
+        );
+
+        assert_eq!(result, Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_epoll_ctl_mod_oneshot_rearm() {
+        use litebox_common_linux::EpollOp;
+
+        let (task, epoll) = setup_epoll();
+        let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
+            0,
+            EfdFlags::CLOEXEC,
+        ));
+        let descriptor = super::EpollDescriptor::Eventfd(eventfd.clone());
+
+        // Add with EPOLLONESHOT flag - eventfd is always writable initially
+        let oneshot_flag = 1 << 30; // EPOLLONESHOT
+        epoll
+            .epoll_ctl(
+                &task.global,
+                EpollOp::EpollCtlAdd,
+                10,
+                &descriptor,
+                Some(EpollEvent {
+                    events: Events::OUT.bits() | oneshot_flag,
+                    data: 42,
+                }),
+            )
+            .expect("add with oneshot should succeed");
+
+        // First wait should return the event (eventfd is writable)
+        let events = epoll
+            .wait(
+                &task.global,
+                &WaitState::new(platform())
+                    .context()
+                    .with_timeout(core::time::Duration::from_millis(100)),
+                1024,
+            )
+            .expect("first wait should succeed");
+        assert_eq!(events.len(), 1);
+        assert!(Events::from_bits_truncate(events[0].events).contains(Events::OUT));
+
+        // Second wait should timeout because ONESHOT disabled the entry
+        let result = epoll.wait(
+            &task.global,
+            &WaitState::new(platform())
+                .context()
+                .with_timeout(core::time::Duration::from_millis(50)),
+            1024,
+        );
+        assert!(
+            result.is_err(),
+            "second wait should timeout (entry disabled)"
+        );
+
+        // Re-arm the entry using EPOLL_CTL_MOD
+        epoll
+            .epoll_ctl(
+                &task.global,
+                EpollOp::EpollCtlMod,
+                10,
+                &descriptor,
+                Some(EpollEvent {
+                    events: Events::OUT.bits() | oneshot_flag,
+                    data: 99,
+                }),
+            )
+            .expect("mod to re-arm should succeed");
+
+        // Third wait should return the event again (re-armed)
+        let events = epoll
+            .wait(
+                &task.global,
+                &WaitState::new(platform())
+                    .context()
+                    .with_timeout(core::time::Duration::from_millis(100)),
+                1024,
+            )
+            .expect("third wait should succeed after re-arm");
+        assert_eq!(events.len(), 1);
+        // Copy data to local variable to avoid unaligned reference (EpollEvent is packed)
+        let data = { events[0].data };
+        assert_eq!(data, 99);
+    }
+
+    #[test]
+    fn test_epoll_ctl_mod_edge_triggered() {
+        use litebox_common_linux::EpollOp;
+
+        let (task, epoll) = setup_epoll();
+        let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
+            0,
+            EfdFlags::CLOEXEC,
+        ));
+        let descriptor = super::EpollDescriptor::Eventfd(eventfd.clone());
+
+        // Add with level-triggered (default)
+        epoll
+            .epoll_ctl(
+                &task.global,
+                EpollOp::EpollCtlAdd,
+                10,
+                &descriptor,
+                Some(EpollEvent {
+                    events: Events::OUT.bits(),
+                    data: 42,
+                }),
+            )
+            .expect("add should succeed");
+
+        // Modify to edge-triggered
+        let edge_triggered_flag = 1 << 31; // EPOLLET
+        epoll
+            .epoll_ctl(
+                &task.global,
+                EpollOp::EpollCtlMod,
+                10,
+                &descriptor,
+                Some(EpollEvent {
+                    events: Events::OUT.bits() | edge_triggered_flag,
+                    data: 99,
+                }),
+            )
+            .expect("mod to edge-triggered should succeed");
+
+        // First wait should return the event
+        let events = epoll
+            .wait(
+                &task.global,
+                &WaitState::new(platform())
+                    .context()
+                    .with_timeout(core::time::Duration::from_millis(100)),
+                1024,
+            )
+            .expect("wait should succeed");
+        assert_eq!(events.len(), 1);
+        // Copy data to local variable to avoid unaligned reference (EpollEvent is packed)
+        let data = { events[0].data };
+        assert_eq!(data, 99);
+
+        // With edge-triggered, second wait should timeout (no new edge)
+        let result = epoll.wait(
+            &task.global,
+            &WaitState::new(platform())
+                .context()
+                .with_timeout(core::time::Duration::from_millis(50)),
+            1024,
+        );
+        assert!(
+            result.is_err(),
+            "second wait should timeout (edge-triggered, no new edge)"
+        );
     }
 
     #[test]
