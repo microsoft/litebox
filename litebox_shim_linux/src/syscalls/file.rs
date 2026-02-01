@@ -945,14 +945,14 @@ impl Task {
     /// Since LiteBox uses a virtual filesystem, we return fixed/synthetic values
     /// that indicate a healthy filesystem with plenty of space.
     fn make_statfs(&self) -> Statfs {
-        // TMPFS_MAGIC = 0x01021994
-        const TMPFS_MAGIC: i64 = 0x0102_1994;
-        const BLOCK_SIZE: i64 = 4096;
-        const MAX_FILENAME_LEN: i64 = 255;
-
         // Synthetic large values to indicate plenty of space
         #[cfg(target_arch = "x86_64")]
         {
+            // TMPFS_MAGIC = 0x01021994
+            const TMPFS_MAGIC: i64 = 0x0102_1994;
+            const BLOCK_SIZE: i64 = 4096;
+            const MAX_FILENAME_LEN: i64 = 255;
+
             Statfs {
                 f_type: TMPFS_MAGIC,
                 f_bsize: BLOCK_SIZE,
@@ -970,21 +970,21 @@ impl Task {
         }
         #[cfg(target_arch = "x86")]
         {
-            const TMPFS_MAGIC_U32: u32 = 0x0102_1994;
-            const BLOCK_SIZE_U32: u32 = 4096;
-            const MAX_FILENAME_LEN_U32: u32 = 255;
+            const TMPFS_MAGIC: u32 = 0x0102_1994;
+            const BLOCK_SIZE: u32 = 4096;
+            const MAX_FILENAME_LEN: u32 = 255;
 
             Statfs {
-                f_type: TMPFS_MAGIC_U32,
-                f_bsize: BLOCK_SIZE_U32,
+                f_type: TMPFS_MAGIC,
+                f_bsize: BLOCK_SIZE,
                 f_blocks: 1024 * 1024, // ~4 TB total (smaller for 32-bit)
                 f_bfree: 1024 * 1024,
                 f_bavail: 1024 * 1024,
                 f_files: 1024 * 1024,
                 f_ffree: 1024 * 1024,
                 f_fsid: FsId { val: [1, 0] },
-                f_namelen: MAX_FILENAME_LEN_U32,
-                f_frsize: BLOCK_SIZE_U32,
+                f_namelen: MAX_FILENAME_LEN,
+                f_frsize: BLOCK_SIZE,
                 f_flags: 0,
                 f_spare: [0; 4],
             }
