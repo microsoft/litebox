@@ -510,6 +510,21 @@ pub struct Flock {
     pub __pad1: u32,
 }
 
+bitflags::bitflags! {
+    /// Flags for the flock() syscall
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FlockOperation: i32 {
+        /// Place a shared lock
+        const LOCK_SH = 1;
+        /// Place an exclusive lock
+        const LOCK_EX = 2;
+        /// Remove an existing lock
+        const LOCK_UN = 8;
+        /// Don't block when locking (can be OR'd with above)
+        const LOCK_NB = 4;
+    }
+}
+
 const F_DUPFD: i32 = 0;
 const F_DUPFD_CLOEXEC: i32 = 1030;
 const F_GETFD: i32 = 1;
@@ -781,7 +796,7 @@ cfg_if::cfg_if! {
 }
 
 /// timespec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L7)
-#[derive(Debug, Clone, Copy, PartialOrd, PartialEq, Eq, FromBytes, IntoBytes)]
+#[derive(Debug, Clone, Copy, Default, PartialOrd, PartialEq, Eq, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Timespec {
     /// Seconds.
@@ -818,7 +833,7 @@ impl From<Duration> for Timespec {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes)]
 pub struct Timespec32 {
     pub tv_sec: i32,
     pub tv_nsec: u32,
@@ -864,6 +879,75 @@ pub struct ItimerVal {
     interval: TimeVal,
     /// Current value
     value: TimeVal,
+}
+
+/// itimerspec from Linux - used by timerfd
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes)]
+pub struct Itimerspec {
+    /// Timer interval (for periodic timers)
+    pub it_interval: Timespec,
+    /// Initial expiration time
+    pub it_value: Timespec,
+}
+
+/// 32-bit version of itimerspec
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes)]
+pub struct Itimerspec32 {
+    /// Timer interval (for periodic timers)
+    pub it_interval: Timespec32,
+    /// Initial expiration time
+    pub it_value: Timespec32,
+}
+
+impl From<Itimerspec32> for Itimerspec {
+    fn from(value: Itimerspec32) -> Self {
+        Itimerspec {
+            it_interval: value.it_interval.into(),
+            it_value: value.it_value.into(),
+        }
+    }
+}
+
+impl From<Itimerspec> for Itimerspec32 {
+    fn from(value: Itimerspec) -> Self {
+        Itimerspec32 {
+            it_interval: value.it_interval.into(),
+            it_value: value.it_value.into(),
+        }
+    }
+}
+
+impl From<Timespec> for Timespec32 {
+    fn from(value: Timespec) -> Self {
+        Timespec32 {
+            tv_sec: value.tv_sec.truncate(),
+            tv_nsec: value.tv_nsec.truncate(),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// Flags for timerfd_create
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TfdFlags: i32 {
+        /// Set the close-on-exec flag
+        const TFD_CLOEXEC = 0o2000000; // O_CLOEXEC
+        /// Set non-blocking mode
+        const TFD_NONBLOCK = 0o4000;   // O_NONBLOCK
+    }
+}
+
+bitflags::bitflags! {
+    /// Flags for timerfd_settime
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TfdSetTimeFlags: i32 {
+        /// Use absolute time
+        const TFD_TIMER_ABSTIME = 0x1;
+        /// Cancel when clock is set (for CLOCK_REALTIME)
+        const TFD_TIMER_CANCEL_ON_SET = 0x2;
+    }
 }
 
 impl TryFrom<TimeVal> for Duration {
@@ -1872,6 +1956,19 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         mode: u32,
     },
+    Chmod {
+        pathname: Platform::RawConstPointer<i8>,
+        mode: u32,
+    },
+    Chown {
+        pathname: Platform::RawConstPointer<i8>,
+        owner: u32,
+        group: u32,
+    },
+    Rename {
+        oldpath: Platform::RawConstPointer<i8>,
+        newpath: Platform::RawConstPointer<i8>,
+    },
     Mmap {
         addr: usize,
         length: usize,
@@ -1961,6 +2058,17 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         mode: AccessFlags,
     },
+    Faccessat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        mode: AccessFlags,
+        flags: AtFlags,
+    },
+    Fsync {
+        fd: i32,
+        datasync: bool,
+    },
+    Sync, // Global filesystem sync - no-op in LiteBox
     Madvise {
         addr: Platform::RawMutPointer<u8>,
         length: usize,
@@ -2120,6 +2228,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         length: usize,
     },
+    Truncate {
+        pathname: Platform::RawConstPointer<i8>,
+        length: usize,
+    },
     Unlinkat {
         dirfd: i32,
         pathname: Platform::RawConstPointer<i8>,
@@ -2217,6 +2329,17 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Getpid,
     Getppid,
+    Getpgid {
+        pid: i32,
+    },
+    Setpgid {
+        pid: i32,
+        pgid: i32,
+    },
+    Getsid {
+        pid: i32,
+    },
+    Setsid,
     Getuid,
     Geteuid,
     Getgid,
@@ -2260,6 +2383,27 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         which: IntervalTimer,
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
+    },
+    TimerfdCreate {
+        clockid: i32,
+        flags: TfdFlags,
+    },
+    TimerfdSettime {
+        fd: i32,
+        flags: TfdSetTimeFlags,
+        new_value: Platform::RawConstPointer<Itimerspec>,
+        old_value: Option<Platform::RawMutPointer<Itimerspec>>,
+    },
+    TimerfdGettime {
+        fd: i32,
+        curr_value: Platform::RawMutPointer<Itimerspec>,
+    },
+    Flock {
+        fd: i32,
+        operation: FlockOperation,
+    },
+    Chdir {
+        path: Platform::RawConstPointer<i8>,
     },
 }
 
@@ -2360,6 +2504,73 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
             Sysno::mkdir => sys_req!(Mkdir { pathname:*, mode }),
+            Sysno::mkdirat => {
+                // mkdirat(dirfd, pathname, mode) - handle AT_FDCWD case
+                let dirfd: i32 = ctx.sys_req_arg(0);
+                let pathname = ctx.sys_req_ptr(1);
+                let mode: u32 = ctx.sys_req_arg(2);
+                if dirfd != AT_FDCWD {
+                    // Non-cwd dirfd not fully supported yet, but allow absolute paths
+                }
+                SyscallRequest::Mkdir { pathname, mode }
+            }
+            Sysno::chmod => sys_req!(Chmod { pathname:*, mode }),
+            Sysno::fchmodat => {
+                // fchmodat(dirfd, pathname, mode, flags)
+                let dirfd: i32 = ctx.sys_req_arg(0);
+                let pathname = ctx.sys_req_ptr(1);
+                let mode: u32 = ctx.sys_req_arg(2);
+                // flags arg is ignored for now (AT_SYMLINK_NOFOLLOW)
+                if dirfd != AT_FDCWD {
+                    // Non-cwd dirfd not fully supported yet
+                }
+                SyscallRequest::Chmod { pathname, mode }
+            }
+            Sysno::chown => sys_req!(Chown { pathname:*, owner, group }),
+            Sysno::lchown => sys_req!(Chown { pathname:*, owner, group }), // lchown same as chown for now
+            Sysno::fchownat => {
+                // fchownat(dirfd, pathname, owner, group, flags)
+                // For now, only handle AT_FDCWD with absolute paths
+                let dirfd: i32 = ctx.sys_req_arg(0);
+                let pathname = ctx.sys_req_ptr(1);
+                let owner: u32 = ctx.sys_req_arg(2);
+                let group: u32 = ctx.sys_req_arg(3);
+                // Ignore flags for now
+                if dirfd != AT_FDCWD {
+                    // Check if it's an absolute path
+                    // If not, we don't support it yet
+                }
+                SyscallRequest::Chown {
+                    pathname,
+                    owner,
+                    group,
+                }
+            }
+            Sysno::rename => sys_req!(Rename { oldpath:*, newpath:* }),
+            Sysno::renameat => {
+                // renameat(olddirfd, oldpath, newdirfd, newpath)
+                let olddirfd: i32 = ctx.sys_req_arg(0);
+                let oldpath = ctx.sys_req_ptr(1);
+                let newdirfd: i32 = ctx.sys_req_arg(2);
+                let newpath = ctx.sys_req_ptr(3);
+                // For now only support AT_FDCWD
+                if olddirfd != AT_FDCWD || newdirfd != AT_FDCWD {
+                    // Non-cwd dirfd not fully supported yet
+                }
+                SyscallRequest::Rename { oldpath, newpath }
+            }
+            Sysno::renameat2 => {
+                // renameat2 has flags - ignore for now
+                let olddirfd: i32 = ctx.sys_req_arg(0);
+                let oldpath = ctx.sys_req_ptr(1);
+                let newdirfd: i32 = ctx.sys_req_arg(2);
+                let newpath = ctx.sys_req_ptr(3);
+                // flags at arg 4 ignored
+                if olddirfd != AT_FDCWD || newdirfd != AT_FDCWD {
+                    // Non-cwd dirfd not fully supported yet
+                }
+                SyscallRequest::Rename { oldpath, newpath }
+            }
             #[cfg(target_arch = "x86_64")]
             Sysno::mmap => sys_req!(Mmap {
                 addr,
@@ -2450,6 +2661,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::readv => sys_req!(Readv { fd, iovec:*, iovcnt }),
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
             Sysno::access => sys_req!(Access { pathname:*, mode }),
+            Sysno::faccessat => SyscallRequest::Faccessat {
+                dirfd: ctx.sys_req_arg(0),
+                pathname: ctx.sys_req_ptr(1),
+                mode: ctx.sys_req_arg(2),
+                flags: AtFlags::empty(),
+            },
+            Sysno::faccessat2 => sys_req!(Faccessat { dirfd, pathname:*, mode, flags }),
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
@@ -2587,6 +2805,11 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
+            Sysno::getpgid => sys_req!(Getpgid { pid }),
+            Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
+            Sysno::getsid => sys_req!(Getsid { pid }),
+            Sysno::setsid => SyscallRequest::Setsid,
+            Sysno::getpgrp => SyscallRequest::Getpgid { pid: 0 }, // getpgrp() = getpgid(0)
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
@@ -2715,6 +2938,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     flags: AtFlags::empty(),
                 }
             }
+            Sysno::rmdir => {
+                // rmdir is equivalent to unlinkat with dirfd AT_FDCWD and AT_REMOVEDIR flag
+                SyscallRequest::Unlinkat {
+                    dirfd: AT_FDCWD,
+                    pathname: ctx.sys_req_ptr(0),
+                    flags: AtFlags::AT_REMOVEDIR,
+                }
+            }
             Sysno::creat => {
                 // creat is equivalent to open with flags O_CREAT|O_WRONLY|O_TRUNC
                 SyscallRequest::Openat {
@@ -2727,6 +2958,17 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
+            Sysno::truncate => sys_req!(Truncate { pathname:*, length }),
+            Sysno::fsync => SyscallRequest::Fsync {
+                fd: ctx.sys_req_arg(0),
+                datasync: false,
+            },
+            Sysno::fdatasync => SyscallRequest::Fsync {
+                fd: ctx.sys_req_arg(0),
+                datasync: true,
+            },
+            Sysno::sync => SyscallRequest::Sync,
+            Sysno::syncfs => SyscallRequest::Sync, // syncfs(fd) is also a no-op
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "x86")]
@@ -2736,6 +2978,37 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            Sysno::timerfd_create => {
+                let clockid: i32 = ctx.sys_req_arg(0);
+                let flags: i32 = ctx.sys_req_arg(1);
+                let flags = TfdFlags::from_bits(flags).ok_or_else(|| {
+                    unsupported_einval(format_args!("timerfd_create(flags = {flags:#x})"))
+                })?;
+                SyscallRequest::TimerfdCreate { clockid, flags }
+            }
+            Sysno::timerfd_settime => {
+                let fd: i32 = ctx.sys_req_arg(0);
+                let flags: i32 = ctx.sys_req_arg(1);
+                let flags = TfdSetTimeFlags::from_bits(flags).ok_or_else(|| {
+                    unsupported_einval(format_args!("timerfd_settime(flags = {flags:#x})"))
+                })?;
+                SyscallRequest::TimerfdSettime {
+                    fd,
+                    flags,
+                    new_value: ctx.sys_req_ptr(2),
+                    old_value: ctx.sys_req_ptr(3),
+                }
+            }
+            Sysno::timerfd_gettime => sys_req!(TimerfdGettime { fd, curr_value:* }),
+            Sysno::flock => {
+                let fd: i32 = ctx.sys_req_arg(0);
+                let operation: i32 = ctx.sys_req_arg(1);
+                let operation = FlockOperation::from_bits(operation).ok_or_else(|| {
+                    unsupported_einval(format_args!("flock(operation = {operation:#x})"))
+                })?;
+                SyscallRequest::Flock { fd, operation }
+            }
+            Sysno::chdir => sys_req!(Chdir { path:* }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone => {
                 let args = CloneArgs {

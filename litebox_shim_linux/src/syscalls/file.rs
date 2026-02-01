@@ -28,12 +28,15 @@ use core::sync::atomic::Ordering;
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {
     umask: core::sync::atomic::AtomicU32,
+    /// Current working directory (must be absolute and not end with '/' unless it's root)
+    cwd: litebox::sync::RwLock<Platform, String>,
 }
 
 impl Clone for FsState {
     fn clone(&self) -> Self {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
+            cwd: litebox::sync::RwLock::new(self.cwd.read().clone()),
         }
     }
 }
@@ -42,11 +45,34 @@ impl FsState {
     pub fn new() -> Self {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
+            cwd: litebox::sync::RwLock::new("/".into()),
         }
     }
 
     fn umask(&self) -> Mode {
         Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
+    }
+
+    /// Get the current working directory
+    pub fn cwd(&self) -> String {
+        self.cwd.read().clone()
+    }
+
+    /// Atomically check if a path is a valid directory and set it as cwd.
+    /// This avoids TOCTOU races in multi-threaded environments.
+    pub fn try_set_cwd<F>(&self, path: String, check_dir: F) -> Result<(), Errno>
+    where
+        F: FnOnce(&str) -> Result<(), Errno>,
+    {
+        // Hold write lock during the entire check-and-set operation
+        let mut cwd = self.cwd.write();
+
+        // Verify the directory exists and is a directory
+        check_dir(&path)?;
+
+        // Update cwd while still holding the lock
+        *cwd = path;
+        Ok(())
     }
 }
 
@@ -177,6 +203,28 @@ impl Task {
         }
     }
 
+    /// Handle syscall `truncate` (path-based)
+    pub(crate) fn sys_truncate(
+        &self,
+        pathname: impl path::Arg,
+        length: usize,
+    ) -> Result<(), Errno> {
+        // Open the file, truncate, then close
+        use litebox::fs::OFlags;
+        let fd = self
+            .global
+            .fs
+            .open(pathname, OFlags::WRONLY, litebox::fs::Mode::empty())
+            .map_err(Errno::from)?;
+        let result = self
+            .global
+            .fs
+            .truncate(&fd, length, false)
+            .map_err(Errno::from);
+        let _ = self.global.fs.close(&fd);
+        result
+    }
+
     /// Handle syscall `ftruncate`
     pub(crate) fn sys_ftruncate(&self, fd: i32, length: usize) -> Result<(), Errno> {
         let Ok(fd) = u32::try_from(fd) else {
@@ -200,6 +248,25 @@ impl Task {
             _ => Err(Errno::EINVAL),
         }
         .flatten()
+    }
+
+    /// Handle syscall `fsync` / `fdatasync`
+    ///
+    /// In LiteBox, this is a no-op since we don't need durability guarantees.
+    /// We just verify the fd is valid.
+    pub(crate) fn sys_fsync(&self, fd: i32) -> Result<(), Errno> {
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+        let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+        match desc {
+            Descriptor::LiteBoxRawFd(_) | Descriptor::Unix { .. } => Ok(()),
+            Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Timerfd { .. } => {
+                Err(Errno::EINVAL)
+            }
+        }
     }
 
     /// Handle syscall `unlinkat`
@@ -289,6 +356,16 @@ impl Task {
                 litebox_common_linux::ReceiveFlags::empty(),
                 None,
             ),
+            Descriptor::Timerfd { file, .. } => {
+                let file = file.clone();
+                drop(file_table);
+                if buf.len() < size_of::<u64>() {
+                    return Err(Errno::EINVAL);
+                }
+                let value = file.read(&self.wait_cx())?;
+                buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+                Ok(size_of::<u64>())
+            }
         }
     }
 
@@ -343,6 +420,10 @@ impl Task {
             Descriptor::Unix { file, .. } => {
                 file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
             }
+            Descriptor::Timerfd { .. } => {
+                // timerfd does not support writing
+                Err(Errno::EINVAL)
+            }
         };
         if let Err(Errno::EPIPE) = res {
             unimplemented!("send SIGPIPE to the current task");
@@ -394,9 +475,10 @@ impl Task {
                     |_| Err(Errno::ESPIPE),
                 )
                 .flatten(),
-            Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } | Descriptor::Unix { .. } => {
-                Err(Errno::ESPIPE)
-            }
+            Descriptor::Epoll { .. }
+            | Descriptor::Eventfd { .. }
+            | Descriptor::Unix { .. }
+            | Descriptor::Timerfd { .. } => Err(Errno::ESPIPE),
         }
     }
 
@@ -404,6 +486,42 @@ impl Task {
     pub fn sys_mkdir(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
         let mode = Mode::from_bits_retain(mode) & !self.get_umask();
         self.global.fs.mkdir(pathname, mode).map_err(Errno::from)
+    }
+
+    /// Handle syscall `chmod`
+    pub fn sys_chmod(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
+        let mode = Mode::from_bits_retain(mode);
+        self.global.fs.chmod(pathname, mode).map_err(Errno::from)
+    }
+
+    /// Handle syscall `chown` / `lchown`
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn sys_chown(&self, pathname: impl path::Arg, owner: u32, group: u32) -> Result<(), Errno> {
+        // Convert -1 (u32::MAX) to None (meaning don't change)
+        // Truncation is intentional: Linux uid/gid are typically 16-bit
+        let user = if owner == u32::MAX {
+            None
+        } else {
+            Some(owner as u16)
+        };
+        let group = if group == u32::MAX {
+            None
+        } else {
+            Some(group as u16)
+        };
+        self.global
+            .fs
+            .chown(pathname, user, group)
+            .map_err(Errno::from)
+    }
+
+    /// Handle syscall `rename` / `renameat`
+    pub fn sys_rename(
+        &self,
+        oldpath: impl path::Arg,
+        newpath: impl path::Arg,
+    ) -> Result<(), Errno> {
+        self.global.fs.rename(oldpath, newpath).map_err(Errno::from)
     }
 
     pub(crate) fn do_close(&self, desc: Descriptor) -> Result<(), Errno> {
@@ -444,9 +562,10 @@ impl Task {
                     }
                 }
             }
-            Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                Ok(())
-            }
+            Descriptor::Eventfd { .. }
+            | Descriptor::Epoll { .. }
+            | Descriptor::Unix { .. }
+            | Descriptor::Timerfd { .. } => Ok(()),
         }
     }
 
@@ -516,6 +635,7 @@ impl Task {
                 Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
                 Descriptor::Eventfd { .. } => todo!(),
                 Descriptor::Unix { .. } => todo!(),
+                Descriptor::Timerfd { .. } => todo!(),
             };
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
@@ -599,7 +719,7 @@ impl Task {
                     )
                     .flatten()
             }
-            Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+            Descriptor::Epoll { .. } | Descriptor::Timerfd { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { .. } => todo!(),
             Descriptor::Unix { .. } => todo!(),
         };
@@ -792,6 +912,20 @@ impl Descriptor {
                 st_blocks: 0,
                 ..Default::default()
             },
+            Descriptor::Timerfd { .. } => FileStat {
+                // timerfd is a special anonymous file
+                st_dev: 0,
+                st_ino: 0,
+                st_nlink: 1,
+                st_mode: (Mode::RUSR).bits().truncate(),
+                st_uid: 0,
+                st_gid: 0,
+                st_rdev: 0,
+                st_size: 0,
+                st_blksize: 4096,
+                st_blocks: 0,
+                ..Default::default()
+            },
         };
         Ok(fstat)
     }
@@ -822,7 +956,8 @@ impl Descriptor {
             ),
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => Ok(
+            | Descriptor::Unix { close_on_exec, .. }
+            | Descriptor::Timerfd { close_on_exec, .. } => Ok(
                 if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                     FileDescriptorFlags::FD_CLOEXEC
                 } else {
@@ -857,7 +992,8 @@ impl Descriptor {
             )?,
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => {
+            | Descriptor::Unix { close_on_exec, .. }
+            | Descriptor::Timerfd { close_on_exec, .. } => {
                 close_on_exec.store(
                     flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                     core::sync::atomic::Ordering::Relaxed,
@@ -1002,6 +1138,7 @@ impl Task {
                 Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Unix { file, .. } => Ok(file.get_status().bits()),
+                Descriptor::Timerfd { file, .. } => Ok(file.get_status().bits()),
             },
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
@@ -1081,6 +1218,9 @@ impl Task {
                     }
                     Descriptor::Epoll { .. } => todo!(),
                     Descriptor::Unix { file, .. } => {
+                        toggle_flags!(file);
+                    }
+                    Descriptor::Timerfd { file, .. } => {
                         toggle_flags!(file);
                     }
                 }
@@ -1164,8 +1304,8 @@ impl Task {
 
     /// Handle syscall `getcwd`
     pub fn sys_getcwd(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        // TODO: use a fixed path for now
-        let cwd = "/";
+        let fs = self.fs.borrow();
+        let cwd = fs.cwd();
         // need to account for the null terminator
         if cwd.len() >= buf.len() {
             return Err(Errno::ERANGE);
@@ -1177,6 +1317,72 @@ impl Task {
         let bytes = name.as_bytes_with_nul();
         buf[..bytes.len()].copy_from_slice(bytes);
         Ok(bytes.len())
+    }
+
+    /// Handle syscall `chdir`
+    pub fn sys_chdir(&self, path: impl path::Arg) -> Result<usize, Errno> {
+        let path_str = path.as_rust_str()?;
+
+        if path_str.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+
+        // Resolve to absolute path
+        let absolute_path = if path_str.starts_with('/') {
+            // Already absolute
+            path_str.to_string()
+        } else {
+            // Relative to cwd
+            let fs = self.fs.borrow();
+            let cwd = fs.cwd();
+            if cwd == "/" {
+                alloc::format!("/{path_str}")
+            } else {
+                alloc::format!("{cwd}/{path_str}")
+            }
+        };
+
+        // Normalize the path (remove . and ..)
+        let normalized = normalize_path(&absolute_path);
+
+        // Atomically verify directory exists and update cwd to avoid TOCTOU race
+        let fs = self.fs.borrow();
+        let global_fs = &self.global.fs;
+        fs.try_set_cwd(normalized, |path| {
+            let status = global_fs.file_status(path).map_err(Errno::from)?;
+            if status.file_type != litebox::fs::FileType::Directory {
+                return Err(Errno::ENOTDIR);
+            }
+            Ok(())
+        })?;
+
+        Ok(0)
+    }
+}
+
+/// Normalize a path by resolving `.` and `..` components
+fn normalize_path(path: &str) -> String {
+    let mut components = vec![];
+
+    for component in path.split('/') {
+        match component {
+            "" | "." => {
+                // Skip empty or current directory
+            }
+            ".." => {
+                // Go up one directory (if possible)
+                components.pop();
+            }
+            other => {
+                components.push(other);
+            }
+        }
+    }
+
+    if components.is_empty() {
+        "/".to_string()
+    } else {
+        alloc::format!("/{}", components.join("/"))
     }
 }
 
@@ -1251,6 +1457,164 @@ impl Task {
                 },
             )
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
+    }
+
+    /// Handle syscall `timerfd_create`
+    pub fn sys_timerfd_create(
+        &self,
+        clockid: i32,
+        flags: litebox_common_linux::TfdFlags,
+    ) -> Result<u32, Errno> {
+        use litebox_common_linux::ClockId;
+
+        // Validate clockid
+        let clock = ClockId::try_from(clockid).map_err(|_| Errno::EINVAL)?;
+
+        // Only CLOCK_MONOTONIC and CLOCK_REALTIME are supported
+        match clock {
+            ClockId::Monotonic | ClockId::RealTime => {}
+            _ => return Err(Errno::EINVAL),
+        }
+
+        let timerfd = super::timerfd::TimerFile::new(self.global.platform, clock, flags);
+        let files = self.files.borrow();
+        files
+            .file_descriptors
+            .write()
+            .insert(
+                self,
+                Descriptor::Timerfd {
+                    file: alloc::sync::Arc::new(timerfd),
+                    close_on_exec: core::sync::atomic::AtomicBool::new(
+                        flags.contains(litebox_common_linux::TfdFlags::TFD_CLOEXEC),
+                    ),
+                },
+            )
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
+    }
+
+    /// Handle syscall `timerfd_settime`
+    pub(crate) fn sys_timerfd_settime(
+        &self,
+        fd: i32,
+        flags: litebox_common_linux::TfdSetTimeFlags,
+        new_value: ConstPtr<litebox_common_linux::Itimerspec>,
+        old_value: Option<MutPtr<litebox_common_linux::Itimerspec>>,
+    ) -> Result<usize, Errno> {
+        use litebox::platform::RawConstPointer as _;
+        use litebox::platform::RawMutPointer as _;
+
+        // TFD_TIMER_ABSTIME is not currently supported - would require proper
+        // clock epoch handling to convert absolute time to internal Instant
+        if flags.contains(litebox_common_linux::TfdSetTimeFlags::TFD_TIMER_ABSTIME) {
+            return Err(Errno::EINVAL);
+        }
+
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        // Read new timer settings
+        let new_spec = new_value.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let new_expire: core::time::Duration = new_spec.it_value.try_into()?;
+        let new_interval: core::time::Duration = new_spec.it_interval.try_into()?;
+
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+        let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+
+        let Descriptor::Timerfd { file, .. } = desc else {
+            return Err(Errno::EINVAL);
+        };
+
+        let (old_remaining, old_interval) = file.set_time(flags, new_expire, new_interval);
+
+        // Write old values if requested
+        if let Some(old_ptr) = old_value {
+            let old_spec = litebox_common_linux::Itimerspec {
+                it_value: old_remaining.into(),
+                it_interval: old_interval.into(),
+            };
+            old_ptr.write_at_offset(0, old_spec).ok_or(Errno::EFAULT)?;
+        }
+
+        Ok(0)
+    }
+
+    /// Handle syscall `timerfd_gettime`
+    pub(crate) fn sys_timerfd_gettime(
+        &self,
+        fd: i32,
+        curr_value: MutPtr<litebox_common_linux::Itimerspec>,
+    ) -> Result<usize, Errno> {
+        use litebox::platform::RawMutPointer as _;
+
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+        let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+
+        let Descriptor::Timerfd { file, .. } = desc else {
+            return Err(Errno::EINVAL);
+        };
+
+        let (remaining, interval) = file.get_time();
+
+        let spec = litebox_common_linux::Itimerspec {
+            it_value: remaining.into(),
+            it_interval: interval.into(),
+        };
+        curr_value.write_at_offset(0, spec).ok_or(Errno::EFAULT)?;
+
+        Ok(0)
+    }
+
+    /// Handle syscall `flock`
+    ///
+    /// flock applies or removes an advisory lock on a file.
+    /// In LiteBox's single-process environment, locks always succeed since there's
+    /// no multi-process contention. We validate the fd and operation, then return success.
+    pub(crate) fn sys_flock(
+        &self,
+        fd: i32,
+        operation: litebox_common_linux::FlockOperation,
+    ) -> Result<usize, Errno> {
+        use litebox_common_linux::FlockOperation;
+
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        // Validate the fd exists
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+        let _desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+
+        // Validate operation - must have exactly one of SH, EX, or UN
+        let has_sh = operation.contains(FlockOperation::LOCK_SH);
+        let has_ex = operation.contains(FlockOperation::LOCK_EX);
+        let has_un = operation.contains(FlockOperation::LOCK_UN);
+
+        // Count how many of SH/EX/UN are set
+        let op_count = u8::from(has_sh) + u8::from(has_ex) + u8::from(has_un);
+        if op_count != 1 {
+            // Must have exactly one operation
+            return Err(Errno::EINVAL);
+        }
+
+        // Note: LOCK_NB with LOCK_UN is allowed by Linux (LOCK_NB is simply ignored).
+        // We don't need to validate this combination.
+
+        // In a single-process environment, locks always succeed.
+        // There's no other process to contend with, so:
+        // - LOCK_SH: Always succeeds
+        // - LOCK_EX: Always succeeds
+        // - LOCK_UN: Always succeeds (even if there was no lock)
+        // - LOCK_NB: Irrelevant since we never block
+        Ok(0)
     }
 
     fn stdio_ioctl(
@@ -1363,6 +1727,9 @@ impl Task {
                     Descriptor::Unix { file, .. } => {
                         file.set_status(OFlags::NONBLOCK, val != 0);
                     }
+                    Descriptor::Timerfd { file, .. } => {
+                        file.set_status(OFlags::NONBLOCK, val != 0);
+                    }
                 }
                 Ok(0)
             }
@@ -1382,7 +1749,8 @@ impl Task {
                 )?,
                 Descriptor::Eventfd { close_on_exec, .. }
                 | Descriptor::Epoll { close_on_exec, .. }
-                | Descriptor::Unix { close_on_exec, .. } => {
+                | Descriptor::Unix { close_on_exec, .. }
+                | Descriptor::Timerfd { close_on_exec, .. } => {
                     close_on_exec.store(true, core::sync::atomic::Ordering::Relaxed);
                     Ok(0)
                 }
@@ -1403,9 +1771,10 @@ impl Task {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                 )?,
-                Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                    Err(Errno::ENOTTY)
-                }
+                Descriptor::Eventfd { .. }
+                | Descriptor::Epoll { .. }
+                | Descriptor::Unix { .. }
+                | Descriptor::Timerfd { .. } => Err(Errno::ENOTTY),
             },
             _ => {
                 #[cfg(debug_assertions)]
@@ -1766,6 +2135,10 @@ impl Task {
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
             }),
             Descriptor::Unix { file, .. } => Ok(Descriptor::Unix {
+                file: file.clone(),
+                close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+            }),
+            Descriptor::Timerfd { file, .. } => Ok(Descriptor::Timerfd {
                 file: file.clone(),
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
             }),

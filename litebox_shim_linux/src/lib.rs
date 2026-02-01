@@ -389,15 +389,19 @@ impl Descriptors {
         min_idx: usize,
         max_idx: usize,
     ) -> Result<u32, Descriptor> {
+        // Find first None slot at or after min_idx
         let idx = self
             .descriptors
             .iter()
             .skip(min_idx)
             .position(Option::is_none)
-            .unwrap_or_else(|| {
-                self.descriptors.push(None);
-                self.descriptors.len() - 1
-            });
+            .map_or_else(
+                || {
+                    self.descriptors.push(None);
+                    self.descriptors.len() - 1
+                },
+                |pos| min_idx + pos, // position is relative to skip, so add min_idx
+            );
         if idx >= max_idx {
             return Err(descriptor);
         }
@@ -479,6 +483,10 @@ enum Descriptor {
     },
     Unix {
         file: alloc::sync::Arc<syscalls::unix::UnixSocket>,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
+    Timerfd {
+        file: alloc::sync::Arc<syscalls::timerfd::TimerFile<Platform>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
 }
@@ -704,6 +712,21 @@ impl Task {
             SyscallRequest::Mkdir { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_mkdir(path, mode))),
+            SyscallRequest::Chmod { pathname, mode } => pathname
+                .to_cstring()
+                .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chmod(path, mode))),
+            SyscallRequest::Chown {
+                pathname,
+                owner,
+                group,
+            } => pathname.to_cstring().map_or(Err(Errno::EINVAL), |path| {
+                syscall!(sys_chown(path, owner, group))
+            }),
+            SyscallRequest::Rename { oldpath, newpath } => {
+                let old = oldpath.to_cstring().ok_or(Errno::EFAULT)?;
+                let new = newpath.to_cstring().ok_or(Errno::EFAULT)?;
+                syscall!(sys_rename(old, new))
+            }
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
@@ -764,6 +787,27 @@ impl Task {
             SyscallRequest::Access { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),
+            SyscallRequest::Faccessat {
+                dirfd,
+                pathname,
+                mode,
+                flags: _,
+            } => {
+                // For now, ignore dirfd and flags - just use the path
+                // TODO: handle AT_FDCWD and relative paths properly
+                if dirfd != litebox_common_linux::AT_FDCWD
+                    && pathname
+                        .to_cstring()
+                        .is_none_or(|p| p.as_bytes().first() != Some(&b'/'))
+                {
+                    // Relative path with non-CWD dirfd - not supported
+                    return Err(Errno::ENOTSUP);
+                }
+                // AT_SYMLINK_NOFOLLOW and AT_EACCESS flags are ignored for now
+                pathname
+                    .to_cstring()
+                    .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode)))
+            }
             SyscallRequest::Madvise {
                 addr,
                 length,
@@ -964,6 +1008,20 @@ impl Task {
                 syscall!(sys_openat(dirfd, path, flags, mode))
             }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
+            SyscallRequest::Fsync { fd, datasync: _ } => {
+                // For now, fsync/fdatasync are no-ops in LiteBox since we don't need
+                // durability guarantees in a sandbox. Just verify the fd is valid.
+                syscall!(sys_fsync(fd))
+            }
+            SyscallRequest::Sync => {
+                // sync() is always a no-op in LiteBox - just return success
+                Ok(0)
+            }
+            SyscallRequest::Truncate { pathname, length } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_truncate(path, length))
+                })
+            }
             SyscallRequest::Unlinkat {
                 dirfd,
                 pathname,
@@ -1023,6 +1081,22 @@ impl Task {
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
+            SyscallRequest::TimerfdCreate { clockid, flags } => {
+                syscall!(sys_timerfd_create(clockid, flags))
+            }
+            SyscallRequest::TimerfdSettime {
+                fd,
+                flags,
+                new_value,
+                old_value,
+            } => self.sys_timerfd_settime(fd, flags, new_value, old_value),
+            SyscallRequest::TimerfdGettime { fd, curr_value } => {
+                self.sys_timerfd_gettime(fd, curr_value)
+            }
+            SyscallRequest::Flock { fd, operation } => self.sys_flock(fd, operation),
+            SyscallRequest::Chdir { path } => path
+                .to_cstring()
+                .map_or(Err(Errno::EFAULT), |p| syscall!(sys_chdir(p))),
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                     pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT)?;
@@ -1088,6 +1162,25 @@ impl Task {
             }
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Getpgid { pid } => {
+                // In LiteBox, each process is its own process group
+                // getpgid(0) or getpgid(self) returns self's pid
+                let target_pid = if pid == 0 { self.sys_getpid() } else { pid };
+                Ok(target_pid.reinterpret_as_unsigned() as usize)
+            }
+            SyscallRequest::Setpgid { pid: _, pgid: _ } => {
+                // Stub: always succeed (single process, can't really change pgid)
+                Ok(0)
+            }
+            SyscallRequest::Getsid { pid } => {
+                // In LiteBox, session id = pid (each process is its own session)
+                let target_pid = if pid == 0 { self.sys_getpid() } else { pid };
+                Ok(target_pid.reinterpret_as_unsigned() as usize)
+            }
+            SyscallRequest::Setsid => {
+                // Return the new session id (which is our pid)
+                Ok(self.sys_getpid().reinterpret_as_unsigned() as usize)
+            }
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),

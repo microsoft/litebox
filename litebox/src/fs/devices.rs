@@ -13,7 +13,8 @@ use crate::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
             ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+            ReadDirError, ReadError, RenameError, RmdirError, SeekError, TruncateError,
+            UnlinkError, WriteError,
         },
     },
     path::Arg,
@@ -344,6 +345,11 @@ impl<
 
     #[expect(unused_variables, reason = "unimplemented")]
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
+        unimplemented!()
+    }
+
+    #[expect(unused_variables, reason = "unimplemented")]
+    fn rename(&self, old: impl Arg, new: impl Arg) -> Result<(), RenameError> {
         unimplemented!()
     }
 

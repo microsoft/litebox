@@ -213,6 +213,44 @@ impl From<litebox::fs::errors::SeekError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::ChmodError> for Errno {
+    fn from(value: litebox::fs::errors::ChmodError) -> Self {
+        match value {
+            litebox::fs::errors::ChmodError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::ChmodError::NotTheOwner => Errno::EPERM,
+            litebox::fs::errors::ChmodError::ReadOnlyFileSystem => Errno::EROFS,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::ChownError> for Errno {
+    fn from(value: litebox::fs::errors::ChownError) -> Self {
+        match value {
+            litebox::fs::errors::ChownError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::ChownError::NotTheOwner => Errno::EPERM,
+            litebox::fs::errors::ChownError::ReadOnlyFileSystem => Errno::EROFS,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::RenameError> for Errno {
+    fn from(value: litebox::fs::errors::RenameError) -> Self {
+        match value {
+            litebox::fs::errors::RenameError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::RenameError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::RenameError::NewPathNotEmpty => Errno::ENOTEMPTY,
+            litebox::fs::errors::RenameError::CrossDevice => Errno::EXDEV,
+            litebox::fs::errors::RenameError::NewPathIsDirectory => Errno::EISDIR,
+            litebox::fs::errors::RenameError::OldPathIsDirectory => Errno::ENOTDIR,
+            litebox::fs::errors::RenameError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::RenameError::Loop => Errno::ELOOP,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::MkdirError> for Errno {
     fn from(value: litebox::fs::errors::MkdirError) -> Self {
         match value {
