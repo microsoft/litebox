@@ -2,6 +2,10 @@
 // Licensed under the MIT license.
 
 fn build_binding_from_sandbox_driver() {
+    // Explicitly tell cargo to rerun this build script if the header files change
+    println!("cargo:rerun-if-changed=src/host/snp/wrapper.h");
+    println!("cargo:rerun-if-changed=src/host/snp/snp-sandbox.h");
+
     let bindings = bindgen::Builder::default()
         .clang_arg("--target=x86_64-unknown-none")
         // The input header we would like to generate
