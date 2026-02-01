@@ -386,6 +386,254 @@ impl From<FileStat> for FileStat64 {
     }
 }
 
+// ============================================================================
+// statx syscall types
+// ============================================================================
+
+bitflags::bitflags! {
+    /// Flags for the statx() syscall
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct StatxFlags: u32 {
+        /// Allow empty relative pathname to operate on dirfd directly.
+        const AT_EMPTY_PATH = 0x1000;
+        /// Suppress terminal automount traversal.
+        const AT_NO_AUTOMOUNT = 0x0800;
+        /// Do not follow symbolic links.
+        const AT_SYMLINK_NOFOLLOW = 0x0100;
+        /// Do whatever stat() does (default).
+        const AT_STATX_SYNC_AS_STAT = 0x0000;
+        /// Force the attributes to be sync'd with the server.
+        const AT_STATX_FORCE_SYNC = 0x2000;
+        /// Don't sync attributes with the server.
+        const AT_STATX_DONT_SYNC = 0x4000;
+    }
+}
+
+bitflags::bitflags! {
+    /// Mask for the statx() syscall - indicates which fields are requested/returned
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct StatxMask: u32 {
+        /// Want stx_mode & S_IFMT
+        const STATX_TYPE = 0x0000_0001;
+        /// Want stx_mode & ~S_IFMT
+        const STATX_MODE = 0x0000_0002;
+        /// Want stx_nlink
+        const STATX_NLINK = 0x0000_0004;
+        /// Want stx_uid
+        const STATX_UID = 0x0000_0008;
+        /// Want stx_gid
+        const STATX_GID = 0x0000_0010;
+        /// Want stx_atime
+        const STATX_ATIME = 0x0000_0020;
+        /// Want stx_mtime
+        const STATX_MTIME = 0x0000_0040;
+        /// Want stx_ctime
+        const STATX_CTIME = 0x0000_0080;
+        /// Want stx_ino
+        const STATX_INO = 0x0000_0100;
+        /// Want stx_size
+        const STATX_SIZE = 0x0000_0200;
+        /// Want stx_blocks
+        const STATX_BLOCKS = 0x0000_0400;
+        /// All of the above (the stuff in the normal stat struct)
+        const STATX_BASIC_STATS = 0x0000_07ff;
+        /// Want stx_btime (birth/creation time)
+        const STATX_BTIME = 0x0000_0800;
+        /// Want stx_mnt_id
+        const STATX_MNT_ID = 0x0000_1000;
+        /// Want direct I/O alignment info
+        const STATX_DIOALIGN = 0x0000_2000;
+        /// Want extended stx_mount_id
+        const STATX_MNT_ID_UNIQUE = 0x0000_4000;
+        /// Want stx_subvol
+        const STATX_SUBVOL = 0x0000_8000;
+        /// Want atomic write fields
+        const STATX_WRITE_ATOMIC = 0x0001_0000;
+        /// Want dio read alignment info
+        const STATX_DIO_READ_ALIGN = 0x0002_0000;
+        /// Reserved for future struct statx expansion
+        const STATX_RESERVED = 0x8000_0000;
+    }
+}
+
+/// Timestamp structure for statx
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes)]
+pub struct StatxTimestamp {
+    /// Seconds since epoch
+    pub tv_sec: i64,
+    /// Nanoseconds (0..999,999,999)
+    pub tv_nsec: u32,
+    /// Reserved for future use
+    __reserved: i32,
+}
+
+impl StatxTimestamp {
+    /// Create a new StatxTimestamp
+    #[allow(clippy::similar_names)] // tv_sec and tv_nsec are standard POSIX names
+    pub const fn new(tv_sec: i64, tv_nsec: u32) -> Self {
+        Self {
+            tv_sec,
+            tv_nsec,
+            __reserved: 0,
+        }
+    }
+
+    /// Create a zero timestamp
+    pub const fn zero() -> Self {
+        Self::new(0, 0)
+    }
+}
+
+/// Extended file status structure returned by statx()
+///
+/// This structure is 256 bytes and matches the Linux ABI.
+/// It is architecture-independent (same layout on x86 and x86_64).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes)]
+pub struct Statx {
+    /// What results were written (bitmask of STATX_* values)
+    pub stx_mask: u32,
+    /// Preferred general I/O size
+    pub stx_blksize: u32,
+    /// Flags conveying information about the file (STATX_ATTR_*)
+    pub stx_attributes: u64,
+    /// Number of hard links
+    pub stx_nlink: u32,
+    /// User ID of owner
+    pub stx_uid: u32,
+    /// Group ID of owner
+    pub stx_gid: u32,
+    /// File mode (type and permissions)
+    pub stx_mode: u16,
+    /// Padding
+    __spare0: [u16; 1],
+    /// Inode number
+    pub stx_ino: u64,
+    /// File size in bytes
+    pub stx_size: u64,
+    /// Number of 512-byte blocks allocated
+    pub stx_blocks: u64,
+    /// Mask to show what's supported in stx_attributes
+    pub stx_attributes_mask: u64,
+    /// Last access time
+    pub stx_atime: StatxTimestamp,
+    /// File creation (birth) time
+    pub stx_btime: StatxTimestamp,
+    /// Last attribute change time
+    pub stx_ctime: StatxTimestamp,
+    /// Last data modification time
+    pub stx_mtime: StatxTimestamp,
+    /// Device ID of special file (major)
+    pub stx_rdev_major: u32,
+    /// Device ID of special file (minor)
+    pub stx_rdev_minor: u32,
+    /// ID of device containing file (major)
+    pub stx_dev_major: u32,
+    /// ID of device containing file (minor)
+    pub stx_dev_minor: u32,
+    /// Mount ID
+    pub stx_mnt_id: u64,
+    /// Memory buffer alignment for direct I/O
+    pub stx_dio_mem_align: u32,
+    /// File offset alignment for direct I/O
+    pub stx_dio_offset_align: u32,
+    /// Spare space for future expansion
+    __spare3: [u64; 12],
+}
+
+impl Default for Statx {
+    fn default() -> Self {
+        Self {
+            stx_mask: 0,
+            stx_blksize: 0,
+            stx_attributes: 0,
+            stx_nlink: 0,
+            stx_uid: 0,
+            stx_gid: 0,
+            stx_mode: 0,
+            __spare0: [0; 1],
+            stx_ino: 0,
+            stx_size: 0,
+            stx_blocks: 0,
+            stx_attributes_mask: 0,
+            stx_atime: StatxTimestamp::zero(),
+            stx_btime: StatxTimestamp::zero(),
+            stx_ctime: StatxTimestamp::zero(),
+            stx_mtime: StatxTimestamp::zero(),
+            stx_rdev_major: 0,
+            stx_rdev_minor: 0,
+            stx_dev_major: 0,
+            stx_dev_minor: 0,
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_offset_align: 0,
+            __spare3: [0; 12],
+        }
+    }
+}
+
+impl From<litebox::fs::FileStatus> for Statx {
+    #[allow(clippy::cast_possible_truncation)] // Intentional truncation for Linux ABI
+    fn from(value: litebox::fs::FileStatus) -> Self {
+        let litebox::fs::FileStatus {
+            file_type,
+            mode,
+            size,
+            owner: litebox::fs::UserInfo { user, group },
+            node_info: litebox::fs::NodeInfo { dev, ino, rdev },
+            blksize,
+            ..
+        } = value;
+
+        // Decode device numbers into major/minor
+        // Device number encoding: major = (dev >> 8) & 0xfff, minor = dev & 0xff | (dev >> 12) & 0xfff00
+        // Simplified: for most cases, major = (dev >> 8) & 0xff, minor = dev & 0xff
+        let (stx_dev_major, stx_dev_minor) = ((dev >> 8) as u32 & 0xfff, (dev & 0xff) as u32);
+        let (rdev_major, rdev_minor) = rdev.map_or((0, 0), |r| {
+            let r = r.get();
+            ((r >> 8) as u32 & 0xfff, (r & 0xff) as u32)
+        });
+
+        // We provide basic stats (without timestamps, which we don't track)
+        let stx_mask = (StatxMask::STATX_TYPE
+            | StatxMask::STATX_MODE
+            | StatxMask::STATX_NLINK
+            | StatxMask::STATX_UID
+            | StatxMask::STATX_GID
+            | StatxMask::STATX_INO
+            | StatxMask::STATX_SIZE)
+            .bits();
+
+        Self {
+            stx_mask,
+            stx_blksize: blksize as u32,
+            stx_attributes: 0,
+            stx_nlink: 1, // Hardcoded, same as FileStat
+            stx_uid: u32::from(user),
+            stx_gid: u32::from(group),
+            stx_mode: (mode.bits() | InodeType::from(file_type) as u32) as u16,
+            __spare0: [0; 1],
+            stx_ino: ino as u64,
+            stx_size: size as u64,
+            stx_blocks: 0,          // Not tracked
+            stx_attributes_mask: 0, // No attributes supported
+            stx_atime: StatxTimestamp::zero(),
+            stx_btime: StatxTimestamp::zero(),
+            stx_ctime: StatxTimestamp::zero(),
+            stx_mtime: StatxTimestamp::zero(),
+            stx_rdev_major: rdev_major,
+            stx_rdev_minor: rdev_minor,
+            stx_dev_major,
+            stx_dev_minor,
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_offset_align: 0,
+            __spare3: [0; 12],
+        }
+    }
+}
+
 /// Linux's `iovec` struct for `writev`
 #[derive(FromBytes, IntoBytes)]
 #[repr(C, packed)]
@@ -2139,6 +2387,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawMutPointer<FileStat64>,
         flags: AtFlags,
     },
+    Statx {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        flags: StatxFlags,
+        mask: u32,
+        buf: Platform::RawMutPointer<Statx>,
+    },
     Eventfd2 {
         initval: u32,
         flags: EfdFlags,
@@ -2800,8 +3055,24 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::statx => {
+                let dirfd: i32 = ctx.sys_req_arg(0);
+                let pathname = ctx.sys_req_ptr(1);
+                let flags: u32 = ctx.sys_req_arg(2);
+                let mask: u32 = ctx.sys_req_arg(3);
+                let buf = ctx.sys_req_ptr(4);
+                let flags = StatxFlags::from_bits(flags)
+                    .ok_or_else(|| unsupported_einval(format_args!("statx(flags = {flags:#x})")))?;
+                SyscallRequest::Statx {
+                    dirfd,
+                    pathname,
+                    flags,
+                    mask,
+                    buf,
+                }
+            }
             // Noisy unsupported syscalls.
-            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {

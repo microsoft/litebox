@@ -584,3 +584,229 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+// ============================================================================
+// statx tests
+// ============================================================================
+
+#[test]
+fn test_statx_basic() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    // Create a test file
+    let test_file = "/statx_test_file";
+    let fd = task
+        .sys_open(
+            test_file,
+            OFlags::CREAT | OFlags::WRONLY | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd_i32 = i32::try_from(fd).unwrap();
+
+    // Write some data
+    let data = b"hello statx";
+    task.sys_write(fd_i32, data, None)
+        .expect("Failed to write to file");
+    task.sys_close(fd_i32).expect("Failed to close file");
+
+    // Call statx on the file
+    let statx = task
+        .sys_statx(
+            litebox_common_linux::AT_FDCWD,
+            test_file,
+            StatxFlags::empty(),
+            StatxMask::STATX_BASIC_STATS.bits(),
+        )
+        .expect("statx should succeed");
+
+    // Verify basic fields
+    assert!(
+        statx.stx_mask & StatxMask::STATX_TYPE.bits() != 0,
+        "stx_mask should include TYPE"
+    );
+    assert!(
+        statx.stx_mask & StatxMask::STATX_SIZE.bits() != 0,
+        "stx_mask should include SIZE"
+    );
+    assert_eq!(
+        statx.stx_size,
+        data.len() as u64,
+        "File size should match written data"
+    );
+    assert!(
+        statx.stx_mode & 0o100000 != 0,
+        "Should be a regular file (S_IFREG)"
+    );
+}
+
+#[test]
+fn test_statx_empty_path() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    // Create and open a test file
+    let test_file = "/statx_empty_path_test";
+    let fd = task
+        .sys_open(
+            test_file,
+            OFlags::CREAT | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd_i32 = i32::try_from(fd).unwrap();
+
+    // Write some data
+    let data = b"empty path test";
+    task.sys_write(fd_i32, data, None)
+        .expect("Failed to write to file");
+
+    // Call statx with AT_EMPTY_PATH on the open fd
+    let statx = task
+        .sys_statx(
+            fd_i32,
+            "",
+            StatxFlags::AT_EMPTY_PATH,
+            StatxMask::STATX_BASIC_STATS.bits(),
+        )
+        .expect("statx with AT_EMPTY_PATH should succeed");
+
+    assert_eq!(statx.stx_size, data.len() as u64, "File size should match");
+
+    task.sys_close(fd_i32).expect("Failed to close file");
+}
+
+#[test]
+fn test_statx_invalid_flags() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    // Create a test file
+    let test_file = "/statx_invalid_flags_test";
+    let fd = task
+        .sys_open(
+            test_file,
+            OFlags::CREAT | OFlags::WRONLY | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    task.sys_close(i32::try_from(fd).unwrap())
+        .expect("Failed to close file");
+
+    // AT_STATX_FORCE_SYNC and AT_STATX_DONT_SYNC are mutually exclusive
+    let result = task.sys_statx(
+        litebox_common_linux::AT_FDCWD,
+        test_file,
+        StatxFlags::AT_STATX_FORCE_SYNC | StatxFlags::AT_STATX_DONT_SYNC,
+        StatxMask::STATX_BASIC_STATS.bits(),
+    );
+
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "Conflicting flags should return EINVAL"
+    );
+}
+
+#[test]
+fn test_statx_invalid_mask() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    // Create a test file
+    let test_file = "/statx_invalid_mask_test";
+    let fd = task
+        .sys_open(
+            test_file,
+            OFlags::CREAT | OFlags::WRONLY | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    task.sys_close(i32::try_from(fd).unwrap())
+        .expect("Failed to close file");
+
+    // STATX_RESERVED should be rejected
+    let result = task.sys_statx(
+        litebox_common_linux::AT_FDCWD,
+        test_file,
+        StatxFlags::empty(),
+        StatxMask::STATX_RESERVED.bits(),
+    );
+
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "Reserved mask should return EINVAL"
+    );
+}
+
+#[test]
+fn test_statx_enoent() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    // Try to statx a non-existent file
+    let result = task.sys_statx(
+        litebox_common_linux::AT_FDCWD,
+        "/nonexistent_file_for_statx",
+        StatxFlags::empty(),
+        StatxMask::STATX_BASIC_STATS.bits(),
+    );
+
+    assert_eq!(
+        result,
+        Err(Errno::ENOENT),
+        "Non-existent file should return ENOENT"
+    );
+}
+
+#[test]
+fn test_statx_ebadf() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    // Try to statx with AT_EMPTY_PATH on an invalid fd
+    let result = task.sys_statx(
+        9999, // Invalid fd
+        "",
+        StatxFlags::AT_EMPTY_PATH,
+        StatxMask::STATX_BASIC_STATS.bits(),
+    );
+
+    assert_eq!(result, Err(Errno::EBADF), "Invalid fd should return EBADF");
+}
+
+#[test]
+fn test_statx_directory() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    // Create a test directory
+    let test_dir = "/statx_test_dir";
+    task.sys_mkdir(test_dir, (Mode::RWXU).bits())
+        .expect("Failed to create test directory");
+
+    // Call statx on the directory
+    let statx = task
+        .sys_statx(
+            litebox_common_linux::AT_FDCWD,
+            test_dir,
+            StatxFlags::empty(),
+            StatxMask::STATX_BASIC_STATS.bits(),
+        )
+        .expect("statx on directory should succeed");
+
+    // S_IFDIR = 0o040000
+    assert!(
+        statx.stx_mode & 0o040000 != 0,
+        "Should be a directory (S_IFDIR)"
+    );
+}

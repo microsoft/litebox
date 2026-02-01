@@ -18,7 +18,7 @@ use litebox::{
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    IoWriteVec, IoctlArg, Statx, StatxFlags, StatxTimestamp, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -938,6 +938,158 @@ impl Task {
             FsPath::FdRelative { .. } => todo!(),
         };
         Ok(fstat)
+    }
+
+    /// Handle syscall `statx`
+    ///
+    /// statx provides extended file metadata with more fields than stat.
+    pub fn sys_statx(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: StatxFlags,
+        mask: u32,
+    ) -> Result<Statx, Errno> {
+        use litebox_common_linux::StatxMask;
+
+        // Validate flags: AT_STATX_FORCE_SYNC and AT_STATX_DONT_SYNC are mutually exclusive
+        if flags.contains(StatxFlags::AT_STATX_FORCE_SYNC)
+            && flags.contains(StatxFlags::AT_STATX_DONT_SYNC)
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        // Validate mask: reject reserved bits
+        if mask & StatxMask::STATX_RESERVED.bits() != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let pathname_str = pathname.normalized()?;
+        let is_empty_path = pathname_str.is_empty();
+
+        // Handle AT_EMPTY_PATH
+        if is_empty_path && !flags.contains(StatxFlags::AT_EMPTY_PATH) {
+            return Err(Errno::ENOENT);
+        }
+
+        let follow_symlink = !flags.contains(StatxFlags::AT_SYMLINK_NOFOLLOW);
+
+        // If AT_EMPTY_PATH is set and pathname is empty, stat the fd itself
+        if is_empty_path && flags.contains(StatxFlags::AT_EMPTY_PATH) {
+            // Stat the directory fd itself
+            let Ok(fd) = u32::try_from(dirfd) else {
+                return Err(Errno::EBADF);
+            };
+            let files = self.files.borrow();
+            let statx = files
+                .file_descriptors
+                .read()
+                .get_fd(fd)
+                .ok_or(Errno::EBADF)?
+                .stat(self)
+                .map(|fstat| self.filestat_to_statx(fstat))?;
+            return Ok(statx);
+        }
+
+        // Use FsPath to resolve the path
+        let fs_path = FsPath::new(dirfd, pathname_str.as_str())?;
+        let statx: Statx = match fs_path {
+            FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
+                let fstat = self.do_stat(path, follow_symlink)?;
+                self.filestat_to_statx(fstat)
+            }
+            FsPath::Cwd => {
+                let status = self.global.fs.file_status("")?;
+                Statx::from(status)
+            }
+            FsPath::Fd(fd) => {
+                let files = self.files.borrow();
+                let fstat = files
+                    .file_descriptors
+                    .read()
+                    .get_fd(fd)
+                    .ok_or(Errno::EBADF)?
+                    .stat(self)?;
+                self.filestat_to_statx(fstat)
+            }
+            FsPath::FdRelative { .. } => {
+                // TODO: implement fd-relative path resolution
+                return Err(Errno::ENOENT);
+            }
+        };
+
+        Ok(statx)
+    }
+
+    /// Convert a FileStat to Statx
+    ///
+    /// This is a helper to convert from the internal FileStat format to Statx.
+    #[allow(clippy::cast_possible_truncation)] // Intentional truncation for Linux ABI
+    fn filestat_to_statx(&self, fstat: FileStat) -> Statx {
+        use litebox_common_linux::StatxMask;
+
+        // Decode device numbers
+        #[cfg(target_arch = "x86_64")]
+        let (dev, rdev, ino, size, blksize, mode, uid, gid) = (
+            fstat.st_dev,
+            fstat.st_rdev,
+            fstat.st_ino,
+            fstat.st_size as u64,
+            fstat.st_blksize as u32,
+            fstat.st_mode as u16,
+            fstat.st_uid,
+            fstat.st_gid,
+        );
+
+        #[cfg(target_arch = "x86")]
+        let (dev, rdev, ino, size, blksize, mode, uid, gid) = (
+            u64::from(fstat.st_dev),
+            u64::from(fstat.st_rdev),
+            u64::from(fstat.st_ino),
+            fstat.st_size as u64,
+            fstat.st_blksize as u32,
+            fstat.st_mode,
+            u32::from(fstat.st_uid),
+            u32::from(fstat.st_gid),
+        );
+
+        let (stx_dev_major, stx_dev_minor) = ((dev >> 8) as u32 & 0xfff, (dev & 0xff) as u32);
+        let (rdev_major, rdev_minor) = ((rdev >> 8) as u32 & 0xfff, (rdev & 0xff) as u32);
+
+        // We provide basic stats (without timestamps)
+        let stx_mask = (StatxMask::STATX_TYPE
+            | StatxMask::STATX_MODE
+            | StatxMask::STATX_NLINK
+            | StatxMask::STATX_UID
+            | StatxMask::STATX_GID
+            | StatxMask::STATX_INO
+            | StatxMask::STATX_SIZE)
+            .bits();
+
+        let mut statx = Statx::default();
+        statx.stx_mask = stx_mask;
+        statx.stx_blksize = blksize;
+        statx.stx_attributes = 0;
+        statx.stx_nlink = 1;
+        statx.stx_uid = uid;
+        statx.stx_gid = gid;
+        statx.stx_mode = mode;
+        statx.stx_ino = ino;
+        statx.stx_size = size;
+        statx.stx_blocks = 0;
+        statx.stx_attributes_mask = 0;
+        statx.stx_atime = StatxTimestamp::zero();
+        statx.stx_btime = StatxTimestamp::zero();
+        statx.stx_ctime = StatxTimestamp::zero();
+        statx.stx_mtime = StatxTimestamp::zero();
+        statx.stx_rdev_major = rdev_major;
+        statx.stx_rdev_minor = rdev_minor;
+        statx.stx_dev_major = stx_dev_major;
+        statx.stx_dev_minor = stx_dev_minor;
+        statx.stx_mnt_id = 0;
+        statx.stx_dio_mem_align = 0;
+        statx.stx_dio_offset_align = 0;
+        statx
     }
 
     pub(crate) fn sys_fcntl(
