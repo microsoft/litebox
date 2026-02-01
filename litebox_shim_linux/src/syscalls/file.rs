@@ -1711,11 +1711,19 @@ impl Task {
         // SigSetPack contains a pointer to the actual sigset and its size.
         let new_mask = if let Some(pack_ptr) = sigsetpack {
             let pack = pack_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-            if pack.size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
-                return Err(Errno::EINVAL);
+            // Copy fields from packed struct to avoid unaligned reference
+            let sigset_ptr = pack.sigset_ptr;
+            let size = pack.size;
+            // Check if the sigset pointer is NULL (user passed NULL sigmask to pselect)
+            if sigset_ptr.as_usize() == 0 {
+                None
+            } else {
+                if size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
+                    return Err(Errno::EINVAL);
+                }
+                // Dereference the sigset pointer to get the actual mask
+                Some(sigset_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
             }
-            // Dereference the sigset pointer to get the actual mask
-            Some(pack.sigset_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
         } else {
             None
         };
