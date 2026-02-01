@@ -30,6 +30,23 @@
 - `cargo clippy` passes with no warnings
 - `cargo fmt` applied and passes
 
+### 2024-XX-XX HH:MM - Draft PR Created
+- PR #605: https://github.com/microsoft/litebox/pull/605
+- All CI checks pass:
+  - Build and Test (all platforms)
+  - CodeQL analysis
+  - SemVer check
+  - no_std confirmation
+
+### 2024-XX-XX HH:MM - Code Review Feedback Addressed
+- Launched 3 review agents from different angles (correctness, architecture, testing)
+- Key feedback:
+  1. Toggle logic is mathematically correct but needs better comments - FIXED
+  2. Missing error condition tests - FIXED (added `test_fcntl_setfl_errors`)
+  3. Missing dup() flag inheritance test - FIXED (added `test_fcntl_setfl_dup_inheritance`)
+  4. Comments needed for asymmetric error handling - FIXED
+- All 4 fcntl tests now pass
+
 ---
 ## Append-Only Progress Below
 ---

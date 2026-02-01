@@ -1041,14 +1041,20 @@ impl Task {
                                 {
                                     todo!("unsupported flags");
                                 }
+                                // F_SETFL replaces all modifiable flags with the new value.
+                                // Only flags in setfl_mask can be modified.
+                                // toggle(diff) effectively sets *f = flags for the differing bits.
                                 f.toggle(diff);
                             });
                             match result {
                                 Ok(()) => Ok(()),
                                 Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
                                 Err(MetadataError::NoSuchMetadata) => {
-                                    // Initialize metadata for files that don't have it yet
-                                    // (e.g., files opened before this code was added, or edge cases)
+                                    // Initialize metadata for files that don't have it yet.
+                                    // This handles edge cases like inherited FDs or files opened
+                                    // before this code was added. Since sockets always have
+                                    // SocketOFlags initialized at creation, this path is unique
+                                    // to regular filesystem FDs.
                                     let status_flags = flags & setfl_mask;
                                     dt.set_entry_metadata(fd, crate::FileStatusFlags(status_flags));
                                     Ok(())

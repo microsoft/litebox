@@ -660,3 +660,107 @@ fn test_fcntl_setfl_regular_file() {
 
     task.sys_close(fd2).expect("Failed to close second file");
 }
+
+/// Test fcntl F_SETFL error conditions
+#[test]
+fn test_fcntl_setfl_errors() {
+    let task = init_platform(None);
+
+    // Test 1: Invalid FD should return EBADF
+    assert_eq!(
+        task.sys_fcntl(-1, FcntlArg::SETFL(OFlags::NONBLOCK)),
+        Err(Errno::EBADF),
+        "SETFL on invalid FD -1 should return EBADF"
+    );
+
+    // Test 2: Non-existent FD should return EBADF
+    assert_eq!(
+        task.sys_fcntl(9999, FcntlArg::SETFL(OFlags::NONBLOCK)),
+        Err(Errno::EBADF),
+        "SETFL on non-existent FD should return EBADF"
+    );
+
+    // Test 3: GETFL on invalid FD should return EBADF
+    assert_eq!(
+        task.sys_fcntl(-1, FcntlArg::GETFL),
+        Err(Errno::EBADF),
+        "GETFL on invalid FD -1 should return EBADF"
+    );
+
+    // Test 4: Closed FD should return EBADF
+    let fd = task
+        .sys_open(
+            "/test_fcntl_error_file.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+    task.sys_close(fd).expect("Failed to close file");
+    assert_eq!(
+        task.sys_fcntl(fd, FcntlArg::SETFL(OFlags::NONBLOCK)),
+        Err(Errno::EBADF),
+        "SETFL on closed FD should return EBADF"
+    );
+}
+
+/// Test that dup'd FDs share status flags (entry-level metadata)
+#[test]
+fn test_fcntl_setfl_dup_inheritance() {
+    let task = init_platform(None);
+
+    // Create a file
+    let fd1 = task
+        .sys_open(
+            "/test_fcntl_dup_file.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd1 = i32::try_from(fd1).unwrap();
+
+    // Duplicate the FD
+    let fd2 = task.sys_dup(fd1, None, None).expect("dup should succeed");
+    let fd2 = i32::try_from(fd2).unwrap();
+
+    // Set O_NONBLOCK on fd1
+    task.sys_fcntl(fd1, FcntlArg::SETFL(OFlags::NONBLOCK))
+        .expect("SETFL should succeed");
+
+    // Verify fd1 has O_NONBLOCK
+    let flags1 = task
+        .sys_fcntl(fd1, FcntlArg::GETFL)
+        .expect("GETFL should succeed");
+    let flags1 = OFlags::from_bits_truncate(flags1 as u32);
+    assert!(
+        flags1.contains(OFlags::NONBLOCK),
+        "fd1 should have O_NONBLOCK"
+    );
+
+    // Verify fd2 also has O_NONBLOCK (shared entry-level metadata)
+    let flags2 = task
+        .sys_fcntl(fd2, FcntlArg::GETFL)
+        .expect("GETFL should succeed");
+    let flags2 = OFlags::from_bits_truncate(flags2 as u32);
+    assert!(
+        flags2.contains(OFlags::NONBLOCK),
+        "fd2 should also have O_NONBLOCK (status flags are shared across dup'd FDs)"
+    );
+
+    // Clear O_NONBLOCK on fd2
+    task.sys_fcntl(fd2, FcntlArg::SETFL(OFlags::empty()))
+        .expect("SETFL should succeed");
+
+    // Verify fd1 also loses O_NONBLOCK
+    let flags1_after = task
+        .sys_fcntl(fd1, FcntlArg::GETFL)
+        .expect("GETFL should succeed");
+    let flags1_after = OFlags::from_bits_truncate(flags1_after as u32);
+    assert!(
+        !flags1_after.contains(OFlags::NONBLOCK),
+        "fd1 should also lose O_NONBLOCK when cleared via fd2"
+    );
+
+    task.sys_close(fd1).expect("Failed to close fd1");
+    task.sys_close(fd2).expect("Failed to close fd2");
+}
