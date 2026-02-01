@@ -16,13 +16,16 @@ Usage:
 """
 
 import argparse
+import ast
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import Set, List, Tuple
 
 def get_python_info():
     """Get Python installation paths."""
@@ -46,6 +49,122 @@ def get_python_info():
     python_paths = [x for x in python_paths if not (x in seen or seen.add(x))]
     
     return python_home, python_paths, version
+
+def detect_imports_from_file(filepath: Path) -> Set[str]:
+    """
+    Extract import statements from a Python file.
+    Returns set of top-level module names (e.g., 'yaml' from 'import yaml' or 'from yaml import X').
+    """
+    imports = set()
+    
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Parse the Python AST
+        tree = ast.parse(content, str(filepath))
+        
+        for node in ast.walk(tree):
+            # Handle 'import xyz'
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_name = alias.name.split('.')[0]
+                    imports.add(module_name)
+            
+            # Handle 'from xyz import ...'
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    module_name = node.module.split('.')[0]
+                    imports.add(module_name)
+    
+    except (SyntaxError, UnicodeDecodeError) as e:
+        # If parsing fails, try regex fallback
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            # Find 'import xyz' patterns
+            for match in re.finditer(r'^\s*import\s+([a-zA-Z_][a-zA-Z0-9_]*)', content, re.MULTILINE):
+                imports.add(match.group(1))
+            
+            # Find 'from xyz import' patterns
+            for match in re.finditer(r'^\s*from\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+import', content, re.MULTILINE):
+                imports.add(match.group(1))
+        
+        except Exception:
+            pass
+    
+    return imports
+
+def detect_skill_dependencies(skill_dir: Path) -> Tuple[Set[str], Set[str]]:
+    """
+    Scan all Python files in a skill directory to detect required packages.
+    Returns (stdlib_modules, external_modules).
+    """
+    # Python stdlib modules (Python 3.12)
+    STDLIB_MODULES = {
+        'abc', 'argparse', 'ast', 'asyncio', 'base64', 'builtins', 'collections',
+        'contextlib', 'copy', 'dataclasses', 'datetime', 'enum', 'functools',
+        'hashlib', 'io', 'itertools', 'json', 'logging', 'math', 'os', 'pathlib',
+        'pickle', 're', 'shutil', 'socket', 'sqlite3', 'string', 'subprocess',
+        'sys', 'tempfile', 'textwrap', 'time', 'traceback', 'types', 'typing',
+        'unittest', 'urllib', 'uuid', 'warnings', 'weakref', 'xml', 'zipfile',
+    }
+    
+    all_imports = set()
+    
+    # Find all Python files
+    python_files = list(skill_dir.rglob('*.py'))
+    
+    print(f"\nScanning {len(python_files)} Python files for dependencies...")
+    
+    for py_file in python_files:
+        imports = detect_imports_from_file(py_file)
+        all_imports.update(imports)
+    
+    # Separate stdlib from external
+    stdlib = all_imports & STDLIB_MODULES
+    external = all_imports - STDLIB_MODULES
+    
+    return stdlib, external
+
+def install_packages(packages: List[str], target_dir: Path) -> bool:
+    """
+    Install Python packages using pip.
+    Returns True if successful, False otherwise.
+    """
+    if not packages:
+        return True
+    
+    print(f"\nInstalling packages: {', '.join(packages)}")
+    print(f"Target directory: {target_dir}")
+    
+    target_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        cmd = [
+            sys.executable, '-m', 'pip', 'install',
+            '--target', str(target_dir),
+            '--no-compile',  # Don't create .pyc files
+        ] + packages
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        
+        if result.returncode == 0:
+            print("✓ Package installation successful")
+            return True
+        else:
+            print(f"✗ Package installation failed: {result.stderr}", file=sys.stderr)
+            return False
+    
+    except Exception as e:
+        print(f"✗ Package installation error: {e}", file=sys.stderr)
+        return False
 
 def find_so_files(directory):
     """Find all .so files in a directory recursively."""
@@ -204,6 +323,10 @@ Examples:
     parser.add_argument('--rewriter-path', 
                        default='./target/release/litebox_syscall_rewriter',
                        help='Path to litebox_syscall_rewriter binary')
+    parser.add_argument('--auto-install', action='store_true',
+                       help='Automatically install detected external dependencies')
+    parser.add_argument('--extra-packages', nargs='*', default=[],
+                       help='Additional packages to install (e.g., PyYAML pypdf)')
     
     args = parser.parse_args()
     
@@ -219,6 +342,50 @@ Examples:
     # Validate output path
     output_tar = Path(args.output).resolve()
     output_tar.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Detect skill dependencies
+    print(f"\n{'='*60}")
+    print("DEPENDENCY ANALYSIS")
+    print(f"{'='*60}")
+    
+    stdlib_modules, external_modules = detect_skill_dependencies(skill_dir)
+    
+    print(f"\n✓ Found {len(stdlib_modules)} standard library imports")
+    if stdlib_modules:
+        print(f"  {', '.join(sorted(stdlib_modules)[:10])}{', ...' if len(stdlib_modules) > 10 else ''}")
+    
+    print(f"\n⚠ Found {len(external_modules)} external package imports")
+    
+    # Initialize variables
+    python_home, python_paths, version = get_python_info()
+    extra_package_dir = None
+    
+    if external_modules:
+        print(f"  {', '.join(sorted(external_modules))}")
+        
+        if args.auto_install or args.extra_packages:
+            # Combine detected and extra packages
+            packages_to_install = list(external_modules) + args.extra_packages
+            packages_to_install = list(set(packages_to_install))  # Deduplicate
+            
+            print(f"\n📦 Will install packages: {', '.join(packages_to_install)}")
+            
+            # Create directory for packages (needs to persist for tar creation)
+            extra_package_dir = Path(tempfile.mkdtemp(prefix='litebox_packages_'))
+            
+            if install_packages(packages_to_install, extra_package_dir):
+                # Add this directory to Python paths for packaging
+                python_paths.append(str(extra_package_dir))
+                print(f"✓ Added {extra_package_dir} to Python paths")
+            else:
+                print("\n⚠ Warning: Package installation had errors")
+                print("Continuing anyway, but execution may fail...")
+        else:
+            print("\n💡 Tip: Use --auto-install to automatically install these packages")
+            print("   Or use --extra-packages to specify packages manually")
+    else:
+        print("  (none detected - skill uses only standard library)")
+    
     
     # Validate rewriter
     rewriter_path = Path(args.rewriter_path).resolve() if args.rewriter_path else None
@@ -244,8 +411,6 @@ Examples:
             print("  cargo build --release -p litebox_syscall_rewriter")
             rewriter_path = None
     
-    # Get Python information
-    python_home, python_paths, version = get_python_info()
     print(f"\nPython Configuration:")
     print(f"  Version: Python {version}")
     print(f"  Home: {python_home}")
@@ -254,7 +419,17 @@ Examples:
         print(f"    - {path}")
     
     # Create the tar file
-    if create_skill_tar_with_python(skill_dir, output_tar, python_home, python_paths, rewriter_path):
+    success = create_skill_tar_with_python(skill_dir, output_tar, python_home, python_paths, rewriter_path)
+    
+    # Clean up temporary package directory if created
+    if extra_package_dir and extra_package_dir.exists():
+        try:
+            shutil.rmtree(extra_package_dir)
+            print(f"\n✓ Cleaned up temporary package directory")
+        except Exception as e:
+            print(f"Warning: Failed to clean up {extra_package_dir}: {e}", file=sys.stderr)
+    
+    if success:
         print("\n" + "="*60)
         print("SUCCESS! Skill is ready for LiteBox execution")
         print("="*60)
