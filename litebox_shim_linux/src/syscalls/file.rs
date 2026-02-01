@@ -1974,7 +1974,7 @@ impl Task {
             (atime, mtime)
         } else {
             // times is NULL: set both timestamps to current time
-            let now = self.get_current_time();
+            let now = self.get_current_time()?;
             (Some(now), Some(now))
         };
 
@@ -2000,7 +2000,8 @@ impl Task {
                     self.global.fs.set_times(path, atime, mtime)?;
                 }
                 FsPath::Cwd => {
-                    self.global.fs.set_times("", atime, mtime)?;
+                    // Use "." explicitly for current directory (clearer semantics than empty string)
+                    self.global.fs.set_times(".", atime, mtime)?;
                 }
                 FsPath::Fd(fd) => {
                     // AT_EMPTY_PATH case: operate on the fd itself
@@ -2022,6 +2023,12 @@ impl Task {
             // This is only valid if dirfd is a valid file descriptor
             if dirfd == litebox_common_linux::AT_FDCWD {
                 return Err(Errno::EFAULT);
+            }
+            // Per Linux man page: EINVAL if pathname is NULL, dirfd is not AT_FDCWD,
+            // and flags contains AT_SYMLINK_NOFOLLOW (this combination is nonsensical
+            // since there's no path to not-follow through)
+            if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
+                return Err(Errno::EINVAL);
             }
             let fd = usize::try_from(dirfd).map_err(|_| Errno::EBADF)?;
             self.do_fd_set_times(fd, atime, mtime)?;
@@ -2068,7 +2075,7 @@ impl Task {
             (atime, mtime)
         } else {
             // times is NULL: set both timestamps to current time
-            let now = self.get_current_time();
+            let now = self.get_current_time()?;
             (Some(now), Some(now))
         };
 
@@ -2097,10 +2104,12 @@ impl Task {
                     .fd_set_times(typed_fd, atime, mtime)
                     .map_err(Errno::from)
             },
-            // Network fds don't support setting times
-            |_| Err(Errno::ENOENT),
-            // Pipe fds don't support setting times
-            |_| Err(Errno::ENOENT),
+            // Network fds: succeed as no-op (matching Linux behavior - sockets don't have
+            // persistent timestamps, but futimens on a socket fd succeeds silently)
+            |_| Ok(()),
+            // Pipe fds: succeed as no-op (matching Linux behavior - pipes don't have
+            // persistent timestamps, but futimens on a pipe fd succeeds silently)
+            |_| Ok(()),
         )?
     }
 
@@ -2120,7 +2129,7 @@ impl Task {
         if ts.is_utime_omit() {
             Ok(None)
         } else if ts.is_utime_now() {
-            Ok(Some(self.get_current_time()))
+            Ok(Some(self.get_current_time()?))
         } else {
             // Regular timestamp - convert to Duration
             // Note: tv_sec can be negative on Linux, but Duration only supports non-negative values.
@@ -2137,14 +2146,16 @@ impl Task {
     }
 
     /// Get the current time as a Duration since Unix epoch.
-    fn get_current_time(&self) -> core::time::Duration {
+    ///
+    /// Returns Err(EINVAL) if the system clock is misconfigured (before Unix epoch).
+    fn get_current_time(&self) -> Result<core::time::Duration, Errno> {
         use litebox::platform::{SystemTime as _, TimeProvider};
         // Get the current real time from the platform
         let now = self.global.platform.current_time();
         let unix_epoch =
             <litebox_platform_multiplex::Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
         // Calculate duration since Unix epoch - this is the wall-clock time
-        now.duration_since(&unix_epoch)
-            .expect("current time should be after unix epoch")
+        // If the clock is misconfigured (before Unix epoch), return an error instead of panicking
+        now.duration_since(&unix_epoch).map_err(|_| Errno::EINVAL)
     }
 }
