@@ -2019,6 +2019,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         addr: Option<Platform::RawMutPointer<u8>>,
         addrlen: Platform::RawMutPointer<u32>,
     },
+    Recvmsg {
+        sockfd: i32,
+        msg: Platform::RawMutPointer<UserMsgHdr<Platform>>,
+        flags: ReceiveFlags,
+    },
     Bind {
         sockfd: i32,
         sockaddr: Platform::RawConstPointer<u8>,
@@ -2493,6 +2498,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::sendto => sys_req!(Sendto { sockfd, buf:*, len, flags, addr:*, addrlen }),
             Sysno::sendmsg => sys_req!(Sendmsg { sockfd, msg:*, flags }),
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
+            Sysno::recvmsg => sys_req!(Recvmsg { sockfd, msg:*, flags }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
             Sysno::setsockopt => sys_req!(Setsockopt {

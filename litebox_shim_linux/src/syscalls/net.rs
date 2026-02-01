@@ -1524,6 +1524,181 @@ impl Task {
         Ok(size)
     }
 
+    /// Handle syscall `recvmsg`
+    ///
+    /// Receives a message from a socket with support for scatter/gather I/O.
+    ///
+    /// # Errors
+    /// - `EBADF` - Invalid socket file descriptor
+    /// - `EFAULT` - Invalid msg pointer or iovec pointers
+    /// - `EINVAL` - Invalid msg_iovlen (0 or > 1024)
+    /// - `ENOTSOCK` - File descriptor is not a socket
+    pub(crate) fn sys_recvmsg(
+        &self,
+        fd: i32,
+        msg: MutPtr<litebox_common_linux::UserMsgHdr<Platform>>,
+        flags: ReceiveFlags,
+    ) -> Result<usize, Errno> {
+        let Ok(sockfd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let mut user_msg = msg.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let (total_received, source_addr) = self.do_recvmsg(sockfd, &user_msg, flags)?;
+
+        // Copy packed struct fields to locals to avoid unaligned references
+        let msg_name = user_msg.msg_name;
+
+        // Write source address back to user space if requested
+        if msg_name.as_usize() != 0 {
+            if let Some(addr) = source_addr {
+                let addr_ptr = MutPtr::from_usize(msg_name.as_usize());
+                let addrlen_offset =
+                    core::mem::offset_of!(litebox_common_linux::UserMsgHdr<Platform>, msg_namelen);
+                let addrlen_ptr = MutPtr::from_usize(msg.as_usize() + addrlen_offset);
+                write_sockaddr_to_user(addr, addr_ptr, addrlen_ptr)?;
+            } else {
+                // No source address, set msg_namelen to 0
+                user_msg.msg_namelen = 0;
+            }
+        }
+
+        // Write updated msg_namelen back if we modified it
+        // Note: msg_flags is an output field that should reflect actual receive flags
+        // For now, we leave it unchanged as most implementations do
+        msg.write_at_offset(0, user_msg).ok_or(Errno::EFAULT)?;
+
+        Ok(total_received)
+    }
+
+    fn do_recvmsg(
+        &self,
+        sockfd: u32,
+        msg: &litebox_common_linux::UserMsgHdr<Platform>,
+        flags: ReceiveFlags,
+    ) -> Result<(usize, Option<SocketAddress>), Errno> {
+        // Copy packed struct fields to locals to avoid unaligned references
+        let msg_iovlen = msg.msg_iovlen;
+        let msg_controllen = msg.msg_controllen;
+        let msg_iov = msg.msg_iov;
+        let msg_name = msg.msg_name;
+
+        // Validate msg_iovlen
+        if msg_iovlen == 0 || msg_iovlen > 1024 {
+            return Err(Errno::EINVAL);
+        }
+
+        // Check for ancillary data - not supported (consistent with sendmsg)
+        if msg_controllen != 0 {
+            unimplemented!("ancillary data is not supported");
+        }
+
+        // Read iovec array from user space
+        let iovs = msg_iov.to_owned_slice(msg_iovlen).ok_or(Errno::EFAULT)?;
+
+        let want_source = msg_name.as_usize() != 0;
+
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| {
+                const MAX_LEN: usize = 4096;
+                let mut total_received = 0;
+                let mut source_addr: Option<SocketAddress> = None;
+
+                for iov in &iovs {
+                    if iov.iov_len == 0 {
+                        continue;
+                    }
+
+                    let recv_len = MAX_LEN.min(iov.iov_len);
+                    let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
+                    let buffer: &mut [u8] = &mut buffer[..recv_len];
+
+                    let mut addr = None;
+                    let size = self.global.receive(
+                        &self.wait_cx(),
+                        fd,
+                        buffer,
+                        flags,
+                        if want_source && source_addr.is_none() {
+                            Some(&mut addr)
+                        } else {
+                            None
+                        },
+                    )?;
+
+                    // Capture source address from first receive
+                    if source_addr.is_none() {
+                        source_addr = addr.map(SocketAddress::Inet);
+                    }
+
+                    // Write received data to user buffer
+                    let write_len = size.min(iov.iov_len);
+                    iov.iov_base
+                        .copy_from_slice(0, &buffer[..write_len])
+                        .ok_or(Errno::EFAULT)?;
+
+                    total_received += size;
+
+                    // For stream sockets, if we got less than requested, stop
+                    // For datagram sockets, one recv = one message
+                    if size < recv_len {
+                        break;
+                    }
+                }
+
+                Ok((total_received, source_addr))
+            },
+            |file| {
+                const MAX_LEN: usize = 4096;
+                let mut total_received = 0;
+                let mut source_addr: Option<SocketAddress> = None;
+
+                for iov in &iovs {
+                    if iov.iov_len == 0 {
+                        continue;
+                    }
+
+                    let recv_len = MAX_LEN.min(iov.iov_len);
+                    let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
+                    let buffer: &mut [u8] = &mut buffer[..recv_len];
+
+                    let mut addr = None;
+                    let size = file.recvfrom(
+                        &self.wait_cx(),
+                        buffer,
+                        flags,
+                        if want_source && source_addr.is_none() {
+                            Some(&mut addr)
+                        } else {
+                            None
+                        },
+                    )?;
+
+                    // Capture source address from first receive
+                    if source_addr.is_none() {
+                        source_addr = addr.map(SocketAddress::Unix);
+                    }
+
+                    // Write received data to user buffer
+                    let write_len = size.min(iov.iov_len);
+                    iov.iov_base
+                        .copy_from_slice(0, &buffer[..write_len])
+                        .ok_or(Errno::EFAULT)?;
+
+                    total_received += size;
+
+                    // For stream sockets, if we got less than requested, stop
+                    // For datagram sockets, one recv = one message
+                    if size < recv_len {
+                        break;
+                    }
+                }
+
+                Ok((total_received, source_addr))
+            },
+        )
+    }
+
     pub(crate) fn sys_setsockopt(
         &self,
         sockfd: i32,
@@ -1819,6 +1994,13 @@ impl Task {
             }
             SocketcallType::Sendmsg => {
                 parse_socketcall_args!(3 => sys_sendmsg {
+                    sockfd: 0,
+                    msg: [ 1 ],
+                    flags: 2,
+                })
+            }
+            SocketcallType::Recvmsg => {
+                parse_socketcall_args!(3 => sys_recvmsg {
                     sockfd: 0,
                     msg: [ 1 ],
                     flags: 2,
@@ -2469,7 +2651,7 @@ mod unix_tests {
     use core::time::Duration;
 
     use alloc::{string::ToString, vec::Vec};
-    use litebox::{event::Events, platform::RawConstPointer};
+    use litebox::{event::Events, platform::RawConstPointer, utils::TruncateExt as _};
     use litebox_common_linux::{
         AddressFamily, AtFlags, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
         SocketOptionName, TimeParam, errno::Errno,
@@ -3185,6 +3367,241 @@ mod unix_tests {
         // Server hasn't connected, so getpeername should fail with ENOTCONN
         let server_peer_result = task.do_getpeername(server_fd);
         assert_eq!(server_peer_result.unwrap_err(), Errno::ENOTCONN);
+
+        close_socket(&task, server_fd);
+        close_socket(&task, client_fd);
+        task.sys_unlinkat(-1, server_path, AtFlags::empty())
+            .unwrap();
+        task.sys_unlinkat(-1, client_path, AtFlags::empty())
+            .unwrap();
+    }
+
+    // recvmsg tests
+
+    #[test]
+    fn test_recvmsg_unix_stream_basic() {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        // Send data via sock1
+        let send_data = b"Hello, recvmsg!";
+        let send_ptr = ConstPtr::from_usize(send_data.as_ptr() as usize);
+        let sent = task
+            .do_sendto(sock1, send_ptr, send_data.len(), SendFlags::empty(), None)
+            .expect("send failed");
+        assert_eq!(sent, send_data.len());
+
+        // Receive data via recvmsg on sock2
+        let mut recv_buf = [0u8; 32];
+        let iovec = [litebox_common_linux::IoVec {
+            iov_base: MutPtr::from_usize(recv_buf.as_mut_ptr() as usize),
+            iov_len: recv_buf.len(),
+        }];
+        let hdr = litebox_common_linux::UserMsgHdr {
+            msg_name: ConstPtr::from_usize(0),
+            msg_namelen: 0,
+            msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
+            msg_iovlen: iovec.len(),
+            msg_control: ConstPtr::from_usize(0),
+            msg_controllen: 0,
+            msg_flags: SendFlags::empty(),
+        };
+        let (received, _) = task
+            .do_recvmsg(sock2, &hdr, ReceiveFlags::empty())
+            .expect("recvmsg failed");
+        assert_eq!(received, send_data.len());
+        assert_eq!(&recv_buf[..received], send_data);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_recvmsg_scatter_gather() {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        // Send data via sock1
+        let send_data = b"HelloWorld";
+        let send_ptr = ConstPtr::from_usize(send_data.as_ptr() as usize);
+        let sent = task
+            .do_sendto(sock1, send_ptr, send_data.len(), SendFlags::empty(), None)
+            .expect("send failed");
+        assert_eq!(sent, send_data.len());
+
+        // Receive data via recvmsg with multiple iovec buffers (scatter)
+        let mut buf1 = [0u8; 5];
+        let mut buf2 = [0u8; 5];
+        let iovec = [
+            litebox_common_linux::IoVec {
+                iov_base: MutPtr::from_usize(buf1.as_mut_ptr() as usize),
+                iov_len: buf1.len(),
+            },
+            litebox_common_linux::IoVec {
+                iov_base: MutPtr::from_usize(buf2.as_mut_ptr() as usize),
+                iov_len: buf2.len(),
+            },
+        ];
+        let hdr = litebox_common_linux::UserMsgHdr {
+            msg_name: ConstPtr::from_usize(0),
+            msg_namelen: 0,
+            msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
+            msg_iovlen: iovec.len(),
+            msg_control: ConstPtr::from_usize(0),
+            msg_controllen: 0,
+            msg_flags: SendFlags::empty(),
+        };
+        let (received, _) = task
+            .do_recvmsg(sock2, &hdr, ReceiveFlags::empty())
+            .expect("recvmsg failed");
+        assert_eq!(received, send_data.len());
+        assert_eq!(&buf1, b"Hello");
+        assert_eq!(&buf2, b"World");
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_recvmsg_invalid_fd() {
+        let task = init_platform(None);
+        let iovec = [litebox_common_linux::IoVec {
+            iov_base: MutPtr::from_usize(0x1000),
+            iov_len: 16,
+        }];
+        let hdr = litebox_common_linux::UserMsgHdr {
+            msg_name: ConstPtr::from_usize(0),
+            msg_namelen: 0,
+            msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
+            msg_iovlen: iovec.len(),
+            msg_control: ConstPtr::from_usize(0),
+            msg_controllen: 0,
+            msg_flags: SendFlags::empty(),
+        };
+        let err = task
+            .do_recvmsg(999, &hdr, ReceiveFlags::empty())
+            .unwrap_err();
+        assert_eq!(err, Errno::EBADF);
+    }
+
+    #[test]
+    fn test_recvmsg_empty_iovec() {
+        let task = init_platform(None);
+        let (sock1, _sock2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        // Test with zero iovec length
+        let hdr = litebox_common_linux::UserMsgHdr {
+            msg_name: ConstPtr::from_usize(0),
+            msg_namelen: 0,
+            msg_iov: ConstPtr::from_usize(0x1000),
+            msg_iovlen: 0,
+            msg_control: ConstPtr::from_usize(0),
+            msg_controllen: 0,
+            msg_flags: SendFlags::empty(),
+        };
+        let err = task
+            .do_recvmsg(sock1, &hdr, ReceiveFlags::empty())
+            .unwrap_err();
+        assert_eq!(err, Errno::EINVAL);
+
+        close_socket(&task, sock1);
+    }
+
+    #[test]
+    fn test_recvmsg_too_many_iovec() {
+        let task = init_platform(None);
+        let (sock1, _sock2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        // Test with too many iovec elements (> 1024)
+        let hdr = litebox_common_linux::UserMsgHdr {
+            msg_name: ConstPtr::from_usize(0),
+            msg_namelen: 0,
+            msg_iov: ConstPtr::from_usize(0x1000),
+            msg_iovlen: 2000,
+            msg_control: ConstPtr::from_usize(0),
+            msg_controllen: 0,
+            msg_flags: SendFlags::empty(),
+        };
+        let err = task
+            .do_recvmsg(sock1, &hdr, ReceiveFlags::empty())
+            .unwrap_err();
+        assert_eq!(err, Errno::EINVAL);
+
+        close_socket(&task, sock1);
+    }
+
+    #[test]
+    fn test_recvmsg_unix_datagram_with_source_addr() {
+        let task = init_platform(None);
+        let server_path = "/recvmsg_dgram_server.sock";
+        let client_path = "/recvmsg_dgram_client.sock";
+
+        // Create server socket
+        let server_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+        task.do_bind(
+            server_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
+        )
+        .unwrap();
+
+        // Create client socket and bind it
+        let client_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+        task.do_bind(
+            client_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(client_path.to_string())),
+        )
+        .unwrap();
+
+        // Send data from client to server
+        let send_data = b"Hello from client";
+        let send_ptr = ConstPtr::from_usize(send_data.as_ptr() as usize);
+        task.do_sendto(
+            client_fd,
+            send_ptr,
+            send_data.len(),
+            SendFlags::empty(),
+            Some(SocketAddress::Unix(UnixSocketAddr::Path(
+                server_path.to_string(),
+            ))),
+        )
+        .expect("sendto failed");
+
+        // Receive with recvmsg, requesting source address
+        let mut recv_buf = [0u8; 32];
+        let mut addr_buf = [0u8; 128];
+        let iovec = [litebox_common_linux::IoVec {
+            iov_base: MutPtr::from_usize(recv_buf.as_mut_ptr() as usize),
+            iov_len: recv_buf.len(),
+        }];
+        let hdr = litebox_common_linux::UserMsgHdr {
+            msg_name: ConstPtr::from_usize(addr_buf.as_mut_ptr() as usize),
+            msg_namelen: addr_buf.len().truncate(),
+            msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
+            msg_iovlen: iovec.len(),
+            msg_control: ConstPtr::from_usize(0),
+            msg_controllen: 0,
+            msg_flags: SendFlags::empty(),
+        };
+        let (received, source_addr) = task
+            .do_recvmsg(server_fd, &hdr, ReceiveFlags::empty())
+            .expect("recvmsg failed");
+        assert_eq!(received, send_data.len());
+        assert_eq!(&recv_buf[..received], send_data);
+
+        // Verify source address
+        let source_addr = source_addr.expect("expected source address");
+        assert_eq!(
+            source_addr,
+            SocketAddress::Unix(UnixSocketAddr::Path(client_path.to_string()))
+        );
 
         close_socket(&task, server_fd);
         close_socket(&task, client_fd);

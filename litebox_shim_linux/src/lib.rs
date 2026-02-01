@@ -815,6 +815,7 @@ impl Task {
                 addr,
                 addrlen,
             } => self.sys_recvfrom(sockfd, buf, len, flags, addr, addrlen),
+            SyscallRequest::Recvmsg { sockfd, msg, flags } => self.sys_recvmsg(sockfd, msg, flags),
             SyscallRequest::Bind {
                 sockfd,
                 sockaddr,
