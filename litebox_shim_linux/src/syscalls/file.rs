@@ -1028,6 +1028,10 @@ impl Task {
     fn filestat_to_statx(&self, fstat: FileStat) -> Statx {
         use litebox_common_linux::StatxMask;
 
+        // Device number encoding constants (Linux uses 20-bit minor numbers)
+        const MINORBITS: u64 = 20;
+        const MINORMASK: u64 = (1 << MINORBITS) - 1;
+
         // Decode device numbers
         #[cfg(target_arch = "x86_64")]
         let (dev, rdev, ino, size, blksize, mode, uid, gid) = (
@@ -1053,8 +1057,8 @@ impl Task {
             u32::from(fstat.st_gid),
         );
 
-        let (stx_dev_major, stx_dev_minor) = ((dev >> 8) as u32 & 0xfff, (dev & 0xff) as u32);
-        let (rdev_major, rdev_minor) = ((rdev >> 8) as u32 & 0xfff, (rdev & 0xff) as u32);
+        let (stx_dev_major, stx_dev_minor) = ((dev >> MINORBITS) as u32, (dev & MINORMASK) as u32);
+        let (rdev_major, rdev_minor) = ((rdev >> MINORBITS) as u32, (rdev & MINORMASK) as u32);
 
         // We provide basic stats (without timestamps)
         let stx_mask = (StatxMask::STATX_TYPE

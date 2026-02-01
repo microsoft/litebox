@@ -538,9 +538,28 @@ pub struct Statx {
     pub stx_dio_mem_align: u32,
     /// File offset alignment for direct I/O
     pub stx_dio_offset_align: u32,
-    /// Spare space for future expansion
-    __spare3: [u64; 12],
+    // 0xa0: Extended fields added in newer kernels
+    /// Subvolume identifier
+    pub stx_subvol: u64,
+    /// Min atomic write unit in bytes
+    pub stx_atomic_write_unit_min: u32,
+    /// Max atomic write unit in bytes
+    pub stx_atomic_write_unit_max: u32,
+    // 0xb0
+    /// Max atomic write segment count
+    pub stx_atomic_write_segments_max: u32,
+    /// File offset alignment for direct I/O reads
+    pub stx_dio_read_offset_align: u32,
+    /// Optimised max atomic write unit in bytes
+    pub stx_atomic_write_unit_max_opt: u32,
+    /// Padding
+    __spare2: [u32; 1],
+    // 0xc0: Spare space for future expansion (8 * 8 = 64 bytes)
+    __spare3: [u64; 8],
 }
+
+// Compile-time assertion to ensure struct matches Linux ABI
+const _: () = assert!(core::mem::size_of::<Statx>() == 256);
 
 impl Default for Statx {
     fn default() -> Self {
@@ -568,10 +587,22 @@ impl Default for Statx {
             stx_mnt_id: 0,
             stx_dio_mem_align: 0,
             stx_dio_offset_align: 0,
-            __spare3: [0; 12],
+            stx_subvol: 0,
+            stx_atomic_write_unit_min: 0,
+            stx_atomic_write_unit_max: 0,
+            stx_atomic_write_segments_max: 0,
+            stx_dio_read_offset_align: 0,
+            stx_atomic_write_unit_max_opt: 0,
+            __spare2: [0; 1],
+            __spare3: [0; 8],
         }
     }
 }
+
+// Linux device number encoding constants
+// Linux uses 20-bit minor numbers: major = dev >> 20, minor = dev & 0xfffff
+const DEV_MINORBITS: usize = 20;
+const DEV_MINORMASK: usize = (1 << DEV_MINORBITS) - 1;
 
 impl From<litebox::fs::FileStatus> for Statx {
     #[allow(clippy::cast_possible_truncation)] // Intentional truncation for Linux ABI
@@ -586,13 +617,11 @@ impl From<litebox::fs::FileStatus> for Statx {
             ..
         } = value;
 
-        // Decode device numbers into major/minor
-        // Device number encoding: major = (dev >> 8) & 0xfff, minor = dev & 0xff | (dev >> 12) & 0xfff00
-        // Simplified: for most cases, major = (dev >> 8) & 0xff, minor = dev & 0xff
-        let (stx_dev_major, stx_dev_minor) = ((dev >> 8) as u32 & 0xfff, (dev & 0xff) as u32);
+        let (stx_dev_major, stx_dev_minor) =
+            ((dev >> DEV_MINORBITS) as u32, (dev & DEV_MINORMASK) as u32);
         let (rdev_major, rdev_minor) = rdev.map_or((0, 0), |r| {
             let r = r.get();
-            ((r >> 8) as u32 & 0xfff, (r & 0xff) as u32)
+            ((r >> DEV_MINORBITS) as u32, (r & DEV_MINORMASK) as u32)
         });
 
         // We provide basic stats (without timestamps, which we don't track)
@@ -629,7 +658,14 @@ impl From<litebox::fs::FileStatus> for Statx {
             stx_mnt_id: 0,
             stx_dio_mem_align: 0,
             stx_dio_offset_align: 0,
-            __spare3: [0; 12],
+            stx_subvol: 0,
+            stx_atomic_write_unit_min: 0,
+            stx_atomic_write_unit_max: 0,
+            stx_atomic_write_segments_max: 0,
+            stx_dio_read_offset_align: 0,
+            stx_atomic_write_unit_max_opt: 0,
+            __spare2: [0; 1],
+            __spare3: [0; 8],
         }
     }
 }

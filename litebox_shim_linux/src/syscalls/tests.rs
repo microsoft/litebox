@@ -810,3 +810,133 @@ fn test_statx_directory() {
         "Should be a directory (S_IFDIR)"
     );
 }
+
+#[test]
+fn test_statx_empty_path_without_flag() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    // Try to statx with empty path but without AT_EMPTY_PATH flag
+    let result = task.sys_statx(
+        litebox_common_linux::AT_FDCWD,
+        "",
+        StatxFlags::empty(), // Missing AT_EMPTY_PATH
+        StatxMask::STATX_BASIC_STATS.bits(),
+    );
+
+    assert_eq!(
+        result,
+        Err(Errno::ENOENT),
+        "Empty path without AT_EMPTY_PATH should return ENOENT"
+    );
+}
+
+#[test]
+fn test_statx_symlink_nofollow_flag() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    let test_file = "/statx_nofollow_test";
+    let fd = task
+        .sys_open(
+            test_file,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+
+    // Should succeed with AT_SYMLINK_NOFOLLOW (even if symlinks aren't supported)
+    let result = task.sys_statx(
+        litebox_common_linux::AT_FDCWD,
+        test_file,
+        StatxFlags::AT_SYMLINK_NOFOLLOW,
+        StatxMask::STATX_BASIC_STATS.bits(),
+    );
+
+    assert!(result.is_ok(), "AT_SYMLINK_NOFOLLOW should be accepted");
+}
+
+#[test]
+fn test_statx_invalid_negative_dirfd() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    // Use -5 (not AT_FDCWD which is -100)
+    let result = task.sys_statx(
+        -5,
+        "some_file",
+        StatxFlags::empty(),
+        StatxMask::STATX_BASIC_STATS.bits(),
+    );
+
+    assert_eq!(
+        result,
+        Err(Errno::EBADF),
+        "Invalid negative dirfd should return EBADF"
+    );
+}
+
+#[test]
+fn test_statx_eventfd() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    let eventfd = task
+        .sys_eventfd2(0, EfdFlags::empty())
+        .expect("Failed to create eventfd");
+    let fd_i32 = i32::try_from(eventfd).unwrap();
+
+    // Call statx with AT_EMPTY_PATH on eventfd
+    let statx = task
+        .sys_statx(
+            fd_i32,
+            "",
+            StatxFlags::AT_EMPTY_PATH,
+            StatxMask::STATX_BASIC_STATS.bits(),
+        )
+        .expect("statx on eventfd should succeed");
+
+    // Eventfd should have RUSR | WUSR permissions
+    assert!(
+        statx.stx_mode & 0o600 != 0,
+        "Eventfd should have read/write permissions"
+    );
+
+    task.sys_close(fd_i32).expect("Failed to close eventfd");
+}
+
+#[test]
+fn test_statx_pipe() {
+    use litebox_common_linux::{StatxFlags, StatxMask};
+
+    let task = init_platform(None);
+
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::empty())
+        .expect("Failed to create pipe");
+    let read_fd_i32 = i32::try_from(read_fd).unwrap();
+
+    // Call statx with AT_EMPTY_PATH on pipe read end
+    let statx = task
+        .sys_statx(
+            read_fd_i32,
+            "",
+            StatxFlags::AT_EMPTY_PATH,
+            StatxMask::STATX_BASIC_STATS.bits(),
+        )
+        .expect("statx on pipe should succeed");
+
+    // Pipe should be S_IFIFO (0o010000)
+    assert!(
+        statx.stx_mode & 0o010000 != 0,
+        "Pipe should be a named pipe (S_IFIFO)"
+    );
+
+    task.sys_close(read_fd_i32).unwrap();
+    task.sys_close(i32::try_from(write_fd).unwrap()).unwrap();
+}
