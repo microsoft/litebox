@@ -676,4 +676,18 @@ fn test_fstatfs() {
         Err(Errno::EBADF),
         "fstatfs on negative fd should return EBADF"
     );
+
+    // Test fstatfs on directory
+    let dir_fd = task
+        .sys_open("/", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open root directory");
+    let dir_fd = i32::try_from(dir_fd).unwrap();
+    let statfs_dir = task
+        .sys_fstatfs(dir_fd)
+        .expect("fstatfs on directory should succeed");
+    assert!(
+        statfs_dir.f_bsize > 0,
+        "Directory statfs block size should be positive"
+    );
+    task.sys_close(dir_fd).expect("Failed to close directory");
 }
