@@ -2810,7 +2810,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             #[cfg(target_arch = "x86")]
             Sysno::readahead => sys_req!(Readahead {
                 fd,
-                // On 32-bit, offset is passed as two 32-bit values (low, high)
+                // On 32-bit, offset is passed as two 32-bit values (low, high).
+                // Note: This uses the same pattern as pread64/pwrite64. The sign-extension
+                // behavior is acceptable because offset is unused in the no-op implementation.
                 offset: { ctx.sys_req_arg::<i64>(1) | ((ctx.sys_req_arg::<i64>(2)) << 32) },
                 count: { ctx.sys_req_arg::<usize>(3) },
             }),

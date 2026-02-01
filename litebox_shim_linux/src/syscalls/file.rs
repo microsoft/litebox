@@ -1937,8 +1937,13 @@ impl Task {
     /// * `Ok(())` on success
     /// * `Err(EBADF)` if fd is invalid or not open for reading
     /// * `Err(EINVAL)` if fd does not refer to a regular file
+    ///
+    /// # Note
+    /// This implementation does not fully validate that the file descriptor is open for reading
+    /// (i.e., write-only files may succeed). This is acceptable because the implementation is
+    /// a no-op that doesn't actually read any data.
     #[expect(unused_variables, reason = "offset and count are intentionally unused")]
-    pub fn sys_readahead(&self, fd: i32, offset: i64, count: usize) -> Result<(), Errno> {
+    pub(crate) fn sys_readahead(&self, fd: i32, offset: i64, count: usize) -> Result<(), Errno> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
