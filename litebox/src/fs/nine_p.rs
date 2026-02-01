@@ -113,6 +113,21 @@ impl<Platform: platform::Provider + Sync> super::FileSystem for FileSystem<Platf
         todo!()
     }
 
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        linkpath: impl crate::path::Arg,
+    ) -> Result<(), super::errors::SymlinkError> {
+        todo!()
+    }
+
+    fn readlink(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadlinkError> {
+        todo!()
+    }
+
     fn read_dir(
         &self,
         fd: &FileFd<Platform>,

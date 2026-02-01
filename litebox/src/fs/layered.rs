@@ -3,7 +3,7 @@
 
 //! An layered file system, layering on [`FileSystem`](super::FileSystem) on top of another.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -16,7 +16,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadDirError, ReadError, ReadlinkError, RmdirError, SeekError, SymlinkError, TruncateError,
+    UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -148,7 +149,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     }
                 }
-                Ok(FileType::RegularFile | FileType::CharacterDevice)
+                Ok(FileType::RegularFile | FileType::CharacterDevice | FileType::SymbolicLink)
                 | Err(PathError::MissingComponent) => unreachable!(),
                 Err(PathError::ComponentNotADirectory) => unimplemented!(),
                 Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
@@ -1019,7 +1020,7 @@ impl<
                     // We must now check if the lower level contains the file; if it does not, we
                     // must exit with failure. Otherwise, we fallthrough to place the tombstone.
                     match self.ensure_lower_contains(&path)? {
-                        FileType::RegularFile => {
+                        FileType::RegularFile | FileType::SymbolicLink => {
                             // fallthrough
                         }
                         FileType::Directory => {
@@ -1165,6 +1166,46 @@ impl<
             }
         }
         Ok(())
+    }
+
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        linkpath: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
+        let linkpath_str = linkpath.as_rust_str()?.to_string();
+        // Migrate parent directory to upper layer if needed
+        if let Some(parent_path) = linkpath_str.rsplit_once('/').map(|(p, _)| p)
+            && !parent_path.is_empty()
+        {
+            self.mkdir_migrating_ancestor_dirs(parent_path)
+                .map_err(|e| match e {
+                    MkdirError::AlreadyExists => {
+                        SymlinkError::PathError(PathError::NoSuchFileOrDirectory)
+                    } // This shouldn't happen
+                    MkdirError::NoWritePerms => SymlinkError::NoWritePerms,
+                    MkdirError::ReadOnlyFileSystem => SymlinkError::ReadOnlyFileSystem,
+                    MkdirError::PathError(p) => SymlinkError::PathError(p),
+                })?;
+        }
+        // Create symlink in upper layer
+        self.upper.symlink(target, &linkpath_str)
+    }
+
+    fn readlink(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, ReadlinkError> {
+        let path_str = path.as_rust_str()?.to_string();
+        // Try upper layer first
+        match self.upper.readlink(&path_str) {
+            Ok(target) => Ok(target),
+            Err(ReadlinkError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                // Try lower layer
+                self.lower.readlink(&path_str)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn read_dir(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<Vec<DirEntry>, ReadDirError> {

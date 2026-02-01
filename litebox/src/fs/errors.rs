@@ -73,6 +73,7 @@ pub enum SeekError {
 }
 
 /// Possible errors from [`FileSystem::truncate`]
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum TruncateError {
     #[error("fd has been closed already")]
@@ -163,6 +164,32 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::symlink`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SymlinkError {
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("linkpath already exists")]
+    AlreadyExists,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("target is an empty string")]
+    EmptyTarget,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::readlink`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ReadlinkError {
+    #[error("the named file is not a symbolic link")]
+    NotASymlink,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`FileSystem::read_dir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -206,5 +233,17 @@ pub enum PathError {
 impl From<crate::path::ConversionError> for PathError {
     fn from(_value: crate::path::ConversionError) -> Self {
         Self::InvalidPathname
+    }
+}
+
+impl From<crate::path::ConversionError> for SymlinkError {
+    fn from(value: crate::path::ConversionError) -> Self {
+        Self::PathError(value.into())
+    }
+}
+
+impl From<crate::path::ConversionError> for ReadlinkError {
+    fn from(value: crate::path::ConversionError) -> Self {
+        Self::PathError(value.into())
     }
 }

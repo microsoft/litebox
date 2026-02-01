@@ -40,7 +40,8 @@ use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+        ReadError, ReadlinkError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
+        WriteError,
     },
 };
 
@@ -404,6 +405,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         // TODO: Do we need to do the type of checks that are happening in the other functions, or
         // should the other functions be simplified to this?
         Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn symlink(
+        &self,
+        _target: impl crate::path::Arg,
+        _linkpath: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
+        Err(SymlinkError::ReadOnlyFileSystem)
+    }
+
+    fn readlink(&self, path: impl crate::path::Arg) -> Result<String, ReadlinkError> {
+        let _path = path.as_rust_str()?;
+        // The read-only tar filesystem doesn't currently track symlinks distinctly
+        // from regular files. Return NotASymlink for any existing file.
+        Err(ReadlinkError::NotASymlink)
     }
 
     fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {

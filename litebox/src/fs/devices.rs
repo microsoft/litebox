@@ -13,7 +13,8 @@ use crate::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
             ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+            ReadDirError, ReadError, ReadlinkError, RmdirError, SeekError, SymlinkError,
+            TruncateError, UnlinkError, WriteError,
         },
     },
     path::Arg,
@@ -355,6 +356,16 @@ impl<
     #[expect(unused_variables, reason = "unimplemented")]
     fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
         unimplemented!()
+    }
+
+    fn symlink(&self, _target: impl Arg, _linkpath: impl Arg) -> Result<(), SymlinkError> {
+        // Device filesystem doesn't support creating symlinks
+        Err(SymlinkError::ReadOnlyFileSystem)
+    }
+
+    fn readlink(&self, _path: impl Arg) -> Result<String, ReadlinkError> {
+        // Device filesystem doesn't have symlinks - return PathError for consistency
+        Err(ReadlinkError::PathError(PathError::NoSuchFileOrDirectory))
     }
 
     fn read_dir(

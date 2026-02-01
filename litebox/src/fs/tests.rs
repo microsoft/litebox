@@ -623,6 +623,175 @@ mod in_mem {
 
         fs.close(&fd).expect("close failed");
     }
+
+    #[test]
+    fn symlink_creation_and_readlink() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            // Create a symlink
+            let target = "/some/target/path";
+            let linkpath = "/testlink";
+            fs.symlink(target, linkpath)
+                .expect("Failed to create symlink");
+
+            // Read the symlink target
+            let read_target = fs.readlink(linkpath).expect("Failed to read symlink");
+            assert_eq!(read_target, target);
+
+            // Verify file status shows it as a symlink
+            let status = fs.file_status(linkpath).expect("Failed to get file status");
+            assert_eq!(status.file_type, crate::fs::FileType::SymbolicLink);
+            assert_eq!(status.size, target.len());
+        });
+    }
+
+    #[test]
+    fn symlink_to_nonexistent_target() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            // Symlink target doesn't need to exist
+            let target = "/nonexistent/target";
+            let linkpath = "/testlink";
+            fs.symlink(target, linkpath)
+                .expect("Failed to create symlink to nonexistent target");
+
+            // Verify the symlink was created and points to the target
+            let read_target = fs.readlink(linkpath).expect("Failed to read symlink");
+            assert_eq!(read_target, target);
+        });
+    }
+
+    #[test]
+    fn symlink_already_exists() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            // Create a file first
+            let path = "/existing_file";
+            let fd = fs
+                .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create file");
+            fs.close(&fd).expect("Failed to close file");
+
+            // Attempt to create symlink at the same path (should fail)
+            let result = fs.symlink("/target", path);
+            assert!(matches!(
+                result,
+                Err(crate::fs::errors::SymlinkError::AlreadyExists)
+            ));
+        });
+    }
+
+    #[test]
+    fn symlink_empty_target() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            // Attempt to create symlink with empty target (should fail)
+            let result = fs.symlink("", "/testlink");
+            assert!(matches!(
+                result,
+                Err(crate::fs::errors::SymlinkError::EmptyTarget)
+            ));
+        });
+    }
+
+    #[test]
+    fn readlink_not_a_symlink() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            // Create a regular file
+            let path = "/regular_file";
+            let fd = fs
+                .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create file");
+            fs.close(&fd).expect("Failed to close file");
+
+            // Attempt to readlink on a regular file (should fail)
+            let result = fs.readlink(path);
+            assert!(matches!(
+                result,
+                Err(crate::fs::errors::ReadlinkError::NotASymlink)
+            ));
+        });
+    }
+
+    #[test]
+    fn readlink_nonexistent() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            // Attempt to readlink on nonexistent path (should fail)
+            let result = fs.readlink("/nonexistent");
+            assert!(matches!(
+                result,
+                Err(crate::fs::errors::ReadlinkError::PathError(
+                    crate::fs::errors::PathError::NoSuchFileOrDirectory
+                ))
+            ));
+        });
+    }
+
+    #[test]
+    fn symlink_unlink() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            // Create a symlink
+            let target = "/target";
+            let linkpath = "/testlink";
+            fs.symlink(target, linkpath)
+                .expect("Failed to create symlink");
+
+            // Verify it exists
+            assert!(fs.readlink(linkpath).is_ok());
+
+            // Unlink the symlink
+            fs.unlink(linkpath).expect("Failed to unlink symlink");
+
+            // Verify it no longer exists
+            let result = fs.readlink(linkpath);
+            assert!(matches!(
+                result,
+                Err(crate::fs::errors::ReadlinkError::PathError(
+                    crate::fs::errors::PathError::NoSuchFileOrDirectory
+                ))
+            ));
+        });
+    }
+
+    #[test]
+    fn symlink_in_directory_listing() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            // Create a symlink
+            let linkpath = "/testlink";
+            fs.symlink("/target", linkpath)
+                .expect("Failed to create symlink");
+
+            // Read root directory
+            let fd = fs
+                .open("/", OFlags::RDONLY, Mode::empty())
+                .expect("Failed to open root directory");
+            let entries = fs.read_dir(&fd).expect("Failed to read directory");
+            fs.close(&fd).expect("Failed to close directory");
+
+            // Find the symlink entry
+            let symlink_entry = entries.iter().find(|e| e.name == "testlink");
+            assert!(
+                symlink_entry.is_some(),
+                "Symlink should appear in directory listing"
+            );
+            assert_eq!(
+                symlink_entry.unwrap().file_type,
+                crate::fs::FileType::SymbolicLink
+            );
+        });
+    }
 }
 
 mod tar_ro {

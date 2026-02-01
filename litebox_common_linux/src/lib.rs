@@ -2261,6 +2261,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    Symlinkat {
+        target: Platform::RawConstPointer<i8>,
+        newdirfd: i32,
+        linkpath: Platform::RawConstPointer<i8>,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2713,6 +2718,15 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     dirfd: AT_FDCWD,
                     pathname: ctx.sys_req_ptr(0),
                     flags: AtFlags::empty(),
+                }
+            }
+            Sysno::symlinkat => sys_req!(Symlinkat { target:*, newdirfd, linkpath:* }),
+            Sysno::symlink => {
+                // symlink is equivalent to symlinkat with newdirfd AT_FDCWD
+                SyscallRequest::Symlinkat {
+                    target: ctx.sys_req_ptr(0),
+                    newdirfd: AT_FDCWD,
+                    linkpath: ctx.sys_req_ptr(1),
                 }
             }
             Sysno::creat => {

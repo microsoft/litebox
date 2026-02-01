@@ -639,12 +639,59 @@ impl Task {
         Ok(())
     }
 
+    /// Handle syscall `symlink`
+    #[allow(dead_code)] // Public API - used directly, not through syscall dispatch
+    pub fn sys_symlink(
+        &self,
+        target: impl path::Arg,
+        linkpath: impl path::Arg,
+    ) -> Result<(), Errno> {
+        self.sys_symlinkat(target, litebox_common_linux::AT_FDCWD, linkpath)
+    }
+
+    /// Handle syscall `symlinkat`
+    pub fn sys_symlinkat(
+        &self,
+        target: impl path::Arg,
+        newdirfd: i32,
+        linkpath: impl path::Arg,
+    ) -> Result<(), Errno> {
+        // Convert and validate target path
+        let target_str = target.as_rust_str()?;
+        if target_str.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        if target_str.len() >= PATH_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
+
+        // Validate linkpath - empty linkpath should return ENOENT
+        if linkpath.as_rust_str()?.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+
+        let fspath = FsPath::new(newdirfd, linkpath)?;
+        let linkpath_str = match fspath {
+            FsPath::Absolute { path } => path.normalized()?.clone(),
+            FsPath::Cwd => return Err(Errno::ENOENT), // Empty path resolves to CWD
+            FsPath::CwdRelative { path } => {
+                let normalized_path = path.normalized()?;
+                alloc::format!("/{}", normalized_path.as_str())
+            }
+            FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
+        };
+        self.global
+            .fs
+            .symlink(target_str, &*linkpath_str)
+            .map_err(Errno::from)
+    }
+
     /// Read the target of a symbolic link
     ///
-    /// Note that this function only handles the following cases that we hardcoded:
+    /// Note that this function also handles the following special cases:
     /// - `/proc/self/fd/<fd>`
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
-        // It assumes that the path is absolute. Will fix once #71 is done.
+        // Handle special /proc/self/fd/<fd> paths
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
             match fd {
@@ -655,8 +702,13 @@ impl Task {
             }
         }
 
-        // TODO: we do not support symbolic links other than stdio yet.
-        Err(Errno::ENOENT)
+        // Try to read symlink from filesystem
+        match self.global.fs.readlink(fullpath) {
+            Ok(target) => Ok(target),
+            Err(litebox::fs::errors::ReadlinkError::PathError(e)) => Err(e.into()),
+            // NotASymlink and any future non-exhaustive variants return EINVAL
+            Err(litebox::fs::errors::ReadlinkError::NotASymlink | _) => Err(Errno::EINVAL),
+        }
     }
 
     /// Handle syscall `readlink`
@@ -671,11 +723,16 @@ impl Task {
         pathname: impl path::Arg,
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
+        // Empty pathname should return ENOENT
+        if pathname.as_rust_str()?.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+
         let fspath = FsPath::new(dirfd, pathname)?;
         let path = match fspath {
             FsPath::Absolute { path } => self.do_readlink(path.normalized()?.as_str()),
             // Note we don't support changing cwd yet; cwd is always `/`.
-            FsPath::Cwd => self.do_readlink("/"),
+            FsPath::Cwd => return Err(Errno::ENOENT), // Empty path case
             FsPath::CwdRelative { path } => {
                 let normalized_path = path.normalized()?;
                 let full_path = alloc::format!("/{}", normalized_path.as_str());

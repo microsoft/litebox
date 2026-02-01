@@ -24,7 +24,8 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, ReadlinkError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
+    WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -126,6 +127,35 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Remove a directory
     fn rmdir(&self, path: impl path::Arg) -> Result<(), RmdirError>;
 
+    /// Create a symbolic link
+    ///
+    /// Creates a symbolic link at `linkpath` pointing to `target`.
+    ///
+    /// # Arguments
+    /// * `target` - The path the symlink will point to (does not need to exist)
+    /// * `linkpath` - Where to create the symbolic link
+    ///
+    /// # Errors
+    /// * `SymlinkError::PathError(PathError::NoSuchFileOrDirectory)` - A component of `linkpath` does not exist
+    /// * `SymlinkError::PathError(PathError::NotADirectory)` - A component of `linkpath` is not a directory
+    /// * `SymlinkError::AlreadyExists` - `linkpath` already exists
+    /// * `SymlinkError::EmptyTarget` - `target` is an empty string
+    /// * `SymlinkError::ReadOnlyFileSystem` - The filesystem is read-only
+    fn symlink(&self, target: impl path::Arg, linkpath: impl path::Arg)
+    -> Result<(), SymlinkError>;
+
+    /// Read the target of a symbolic link
+    ///
+    /// Returns the target path stored in the symbolic link at `path`.
+    ///
+    /// # Arguments
+    /// * `path` - The path to the symbolic link
+    ///
+    /// # Errors
+    /// * `ReadlinkError::PathError` - The path does not exist or a component is not a directory
+    /// * `ReadlinkError::NotASymlink` - The path exists but is not a symbolic link
+    fn readlink(&self, path: impl path::Arg) -> Result<alloc::string::String, ReadlinkError>;
+
     /// Read directory entries from a directory file descriptor.
     ///
     /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
@@ -187,6 +217,7 @@ pub enum FileType {
     RegularFile,
     Directory,
     CharacterDevice,
+    SymbolicLink,
 }
 
 bitflags! {

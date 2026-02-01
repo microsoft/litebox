@@ -971,6 +971,15 @@ impl Task {
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 syscall!(sys_unlinkat(dirfd, path, flags))
             }),
+            SyscallRequest::Symlinkat {
+                target,
+                newdirfd,
+                linkpath,
+            } => {
+                let target_cstr = target.to_cstring().ok_or(Errno::EFAULT)?;
+                let linkpath_cstr = linkpath.to_cstring().ok_or(Errno::EFAULT)?;
+                syscall!(sys_symlinkat(target_cstr, newdirfd, linkpath_cstr))
+            }
             SyscallRequest::Stat { pathname, buf } => {
                 pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                     self.sys_stat(path).and_then(|stat| {
