@@ -45,6 +45,7 @@ use zerocopy::{FromBytes, IntoBytes};
 extern crate alloc;
 
 pub mod arch;
+pub mod csprng;
 pub mod host;
 pub mod mm;
 pub mod mshv;

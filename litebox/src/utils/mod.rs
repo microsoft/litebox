@@ -9,7 +9,6 @@
 //! be changed if necessary.
 // NOTE: There is a separate `utilities` module in this crate meant for crate-internal utilities.
 
-pub mod csprng;
 pub mod rng;
 
 /// An extension trait that adds `truncate` to truncate integers to a specific size of the same

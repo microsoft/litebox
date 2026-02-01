@@ -84,7 +84,7 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
 
 /// DRBG module for cryptographically secure random number generation.
 mod csprng_state {
-    use litebox::utils::csprng::{AesCtrDrbg, NonceBuffer};
+    use crate::csprng::{AesCtrDrbg, NonceBuffer};
 
     /// Static DRBG instance, lazily initialized with hardware entropy.
     pub static DRBG: spin::mutex::SpinMutex<Option<AesCtrDrbg>> = spin::mutex::SpinMutex::new(None);
@@ -111,7 +111,7 @@ pub fn initialize_crng_nonce(nonce: &[u8]) {
 
 impl litebox::platform::CrngProvider for LvbsLinuxKernel {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
-        use litebox::utils::csprng::{AesCtrDrbg, EntropySource, RdseedEntropySource};
+        use crate::csprng::{AesCtrDrbg, EntropySource, RdseedEntropySource};
 
         let mut drbg_guard = csprng_state::DRBG.lock();
 
