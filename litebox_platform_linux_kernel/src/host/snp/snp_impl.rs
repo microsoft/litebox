@@ -339,6 +339,23 @@ pub struct SyscallN<const N: usize, const ID: u32> {
 }
 
 impl HostSnpInterface {
+    #[cfg(debug_assertions)]
+    pub fn dump_stack(rsp: usize, count: usize) {
+        let mut req = bindings::SnpVmplRequestArgs::new_request(
+            bindings::SNP_VMPL_PRINT_REQ,
+            3,
+            [
+                bindings::SNP_VMPL_PRINT_STACK as u64,
+                rsp as u64,
+                count as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        Self::request(&mut req);
+    }
+
     /// [VTL CALL](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/vsm#vtl-call) via VMMCALL
     fn request(arg: &mut bindings::SnpVmplRequestArgs) {
         unsafe {
@@ -463,7 +480,6 @@ impl HostInterface for HostSnpInterface {
     }
 
     fn wake_many(mutex: &core::sync::atomic::AtomicU32, n: usize) -> Result<usize, Errno> {
-        // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
             args: [mutex.as_ptr() as u64, FUTEX_WAKE as u64, n as u64, 0, 0, 0],
         })
@@ -478,7 +494,6 @@ impl HostInterface for HostSnpInterface {
             tv_sec: i64::try_from(t.as_secs()).unwrap(),
             tv_nsec: u64::from(t.subsec_nanos()),
         });
-        // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
             args: [
                 mutex.as_ptr() as u64,

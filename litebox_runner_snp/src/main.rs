@@ -60,6 +60,11 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
 pub extern "C" fn int_handler(pt_regs: &mut litebox_common_linux::PtRegs, vector: u64) {
     litebox_platform_linux_kernel::print_str_and_int!("Unhandled interrupt: ", vector, 10);
     litebox_platform_linux_kernel::print_str_and_int!("RIP: ", pt_regs.rip as u64, 16);
+    #[cfg(debug_assertions)]
+    litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::dump_stack(
+        pt_regs.rsp,
+        512,
+    );
     litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
         globals::SM_SEV_TERM_SET,
         globals::SM_TERM_EXCEPTION,
@@ -158,7 +163,12 @@ pub extern "C" fn sandbox_process_init(
 
     // Loading a program may trigger page faults, so we need to set SHIM before this.
     let shim = &raw const SHIM;
-    let program = match unsafe { (*shim).as_ref().unwrap() }.load_program(platform.init_task(boot_params), &program, argv, envp) {
+    let program = match unsafe { (*shim).as_ref().unwrap() }.load_program(
+        platform.init_task(boot_params),
+        &program,
+        argv,
+        envp,
+    ) {
         Ok(program) => program,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);
