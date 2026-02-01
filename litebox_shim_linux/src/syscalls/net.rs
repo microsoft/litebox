@@ -1595,106 +1595,96 @@ impl Task {
         // Read iovec array from user space
         let iovs = msg_iov.to_owned_slice(msg_iovlen).ok_or(Errno::EFAULT)?;
 
+        // P2 Fix: Validate each iov_len fits in isize (consistent with sys_readv)
+        // Also calculate total buffer size for receive
+        let mut total_iov_len: usize = 0;
+        for iov in &iovs {
+            if isize::try_from(iov.iov_len).is_err() {
+                return Err(Errno::EINVAL);
+            }
+            total_iov_len = total_iov_len.saturating_add(iov.iov_len);
+        }
+
         let want_source = msg_name.as_usize() != 0;
 
         self.files.borrow().with_socket(
             sockfd,
             |fd| {
-                const MAX_LEN: usize = 4096;
-                let mut total_received = 0;
-                let mut source_addr: Option<SocketAddress> = None;
+                // P0 & P1 Fix: Receive the entire message first, then scatter across iovecs.
+                // This ensures correct datagram semantics (one recvmsg = one message) and
+                // properly handles buffers larger than our internal buffer size.
+                //
+                // We cap the receive buffer at a reasonable size to avoid excessive allocation.
+                const MAX_MSG_SIZE: usize = 65536; // 64KB max message size
+                let recv_buf_size = total_iov_len.min(MAX_MSG_SIZE);
 
+                // Allocate receive buffer
+                let mut recv_buffer = alloc::vec![0u8; recv_buf_size];
+
+                // Receive the message into our buffer
+                let mut source_addr = None;
+                let received = self.global.receive(
+                    &self.wait_cx(),
+                    fd,
+                    &mut recv_buffer,
+                    flags,
+                    if want_source {
+                        Some(&mut source_addr)
+                    } else {
+                        None
+                    },
+                )?;
+
+                // Scatter the received data across the iovec buffers
+                let mut offset = 0;
                 for iov in &iovs {
-                    if iov.iov_len == 0 {
+                    if iov.iov_len == 0 || offset >= received {
                         continue;
                     }
 
-                    let recv_len = MAX_LEN.min(iov.iov_len);
-                    let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
-                    let buffer: &mut [u8] = &mut buffer[..recv_len];
-
-                    let mut addr = None;
-                    let size = self.global.receive(
-                        &self.wait_cx(),
-                        fd,
-                        buffer,
-                        flags,
-                        if want_source && source_addr.is_none() {
-                            Some(&mut addr)
-                        } else {
-                            None
-                        },
-                    )?;
-
-                    // Capture source address from first receive
-                    if source_addr.is_none() {
-                        source_addr = addr.map(SocketAddress::Inet);
-                    }
-
-                    // Write received data to user buffer
-                    let write_len = size.min(iov.iov_len);
+                    let copy_len = (received - offset).min(iov.iov_len);
                     iov.iov_base
-                        .copy_from_slice(0, &buffer[..write_len])
+                        .copy_from_slice(0, &recv_buffer[offset..offset + copy_len])
                         .ok_or(Errno::EFAULT)?;
-
-                    total_received += size;
-
-                    // For stream sockets, if we got less than requested, stop
-                    // For datagram sockets, one recv = one message
-                    if size < recv_len {
-                        break;
-                    }
+                    offset += copy_len;
                 }
 
-                Ok((total_received, source_addr))
+                Ok((received, source_addr.map(SocketAddress::Inet)))
             },
             |file| {
-                const MAX_LEN: usize = 4096;
-                let mut total_received = 0;
-                let mut source_addr: Option<SocketAddress> = None;
+                // P0 & P1 Fix: Same approach for Unix sockets
+                const MAX_MSG_SIZE: usize = 65536;
+                let recv_buf_size = total_iov_len.min(MAX_MSG_SIZE);
 
+                let mut recv_buffer = alloc::vec![0u8; recv_buf_size];
+
+                let mut source_addr = None;
+                let received = file.recvfrom(
+                    &self.wait_cx(),
+                    &mut recv_buffer,
+                    flags,
+                    if want_source {
+                        Some(&mut source_addr)
+                    } else {
+                        None
+                    },
+                )?;
+
+                // Scatter the received data across the iovec buffers
+                let mut offset = 0;
                 for iov in &iovs {
-                    if iov.iov_len == 0 {
+                    if iov.iov_len == 0 || offset >= received {
                         continue;
                     }
 
-                    let recv_len = MAX_LEN.min(iov.iov_len);
-                    let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
-                    let buffer: &mut [u8] = &mut buffer[..recv_len];
-
-                    let mut addr = None;
-                    let size = file.recvfrom(
-                        &self.wait_cx(),
-                        buffer,
-                        flags,
-                        if want_source && source_addr.is_none() {
-                            Some(&mut addr)
-                        } else {
-                            None
-                        },
-                    )?;
-
-                    // Capture source address from first receive
-                    if source_addr.is_none() {
-                        source_addr = addr.map(SocketAddress::Unix);
-                    }
-
-                    // Write received data to user buffer
-                    let write_len = size.min(iov.iov_len);
+                    let copy_len = (received - offset).min(iov.iov_len);
                     iov.iov_base
-                        .copy_from_slice(0, &buffer[..write_len])
+                        .copy_from_slice(0, &recv_buffer[offset..offset + copy_len])
                         .ok_or(Errno::EFAULT)?;
-
-                    total_received += size;
-
-                    // For stream sockets, if we got less than requested, stop
-                    // For datagram sockets, one recv = one message
-                    if size < recv_len {
-                        break;
-                    }
+                    offset += copy_len;
                 }
 
-                Ok((total_received, source_addr))
+                Ok((received, source_addr.map(SocketAddress::Unix)))
             },
         )
     }
@@ -2650,7 +2640,7 @@ mod tests {
 mod unix_tests {
     use core::time::Duration;
 
-    use alloc::{string::ToString, vec::Vec};
+    use alloc::{string::ToString, vec, vec::Vec};
     use litebox::{event::Events, platform::RawConstPointer, utils::TruncateExt as _};
     use litebox_common_linux::{
         AddressFamily, AtFlags, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
@@ -3609,5 +3599,114 @@ mod unix_tests {
             .unwrap();
         task.sys_unlinkat(-1, client_path, AtFlags::empty())
             .unwrap();
+    }
+
+    #[test]
+    fn test_recvmsg_large_buffer() {
+        // P1 test: Verify buffers larger than 4096 bytes work correctly
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        // Send 8KB of data
+        let send_data: Vec<u8> = (0u8..=255).cycle().take(8192).collect();
+        let send_ptr = ConstPtr::from_usize(send_data.as_ptr() as usize);
+        let sent = task
+            .do_sendto(sock1, send_ptr, send_data.len(), SendFlags::empty(), None)
+            .expect("send failed");
+        assert_eq!(sent, send_data.len());
+
+        // Receive with a single large iovec buffer (> 4096 bytes)
+        let mut recv_buf = vec![0u8; 8192];
+        let iovec = [litebox_common_linux::IoVec {
+            iov_base: MutPtr::from_usize(recv_buf.as_mut_ptr() as usize),
+            iov_len: recv_buf.len(),
+        }];
+        let hdr = litebox_common_linux::UserMsgHdr {
+            msg_name: ConstPtr::from_usize(0),
+            msg_namelen: 0,
+            msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
+            msg_iovlen: iovec.len(),
+            msg_control: ConstPtr::from_usize(0),
+            msg_controllen: 0,
+            msg_flags: SendFlags::empty(),
+        };
+        let (received, _) = task
+            .do_recvmsg(sock2, &hdr, ReceiveFlags::empty())
+            .expect("recvmsg failed");
+
+        // Should receive all 8KB
+        assert_eq!(received, send_data.len());
+        assert_eq!(&recv_buf[..received], &send_data[..]);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_recvmsg_datagram_single_message() {
+        // P0 test: Verify scatter/gather works correctly - a single receive should
+        // scatter data across multiple buffers, not receive from each buffer separately.
+        //
+        // Note: The current Unix datagram socket implementation coalesces messages from
+        // the same source (see unix.rs try_read). This test verifies the scatter behavior
+        // works correctly for the data that IS received.
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .expect("socketpair failed");
+
+        // Send a single message that should be scattered across multiple buffers
+        let msg = b"HelloWorld"; // 10 bytes
+
+        let ptr = ConstPtr::from_usize(msg.as_ptr() as usize);
+        task.do_sendto(sock1, ptr, msg.len(), SendFlags::empty(), None)
+            .expect("send failed");
+
+        // Receive with multiple small buffers - data should be scattered correctly
+        let mut buf1 = [0u8; 3]; // "Hel"
+        let mut buf2 = [0u8; 4]; // "loWo"
+        let mut buf3 = [0u8; 5]; // "rld" (only 3 bytes used)
+        let iovec = [
+            litebox_common_linux::IoVec {
+                iov_base: MutPtr::from_usize(buf1.as_mut_ptr() as usize),
+                iov_len: buf1.len(),
+            },
+            litebox_common_linux::IoVec {
+                iov_base: MutPtr::from_usize(buf2.as_mut_ptr() as usize),
+                iov_len: buf2.len(),
+            },
+            litebox_common_linux::IoVec {
+                iov_base: MutPtr::from_usize(buf3.as_mut_ptr() as usize),
+                iov_len: buf3.len(),
+            },
+        ];
+        let hdr = litebox_common_linux::UserMsgHdr {
+            msg_name: ConstPtr::from_usize(0),
+            msg_namelen: 0,
+            msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
+            msg_iovlen: iovec.len(),
+            msg_control: ConstPtr::from_usize(0),
+            msg_controllen: 0,
+            msg_flags: SendFlags::empty(),
+        };
+        let (received, _) = task
+            .do_recvmsg(sock2, &hdr, ReceiveFlags::empty())
+            .expect("recvmsg failed");
+
+        // Should receive all 10 bytes scattered across buffers
+        assert_eq!(received, msg.len());
+        assert_eq!(&buf1, b"Hel");
+        assert_eq!(&buf2, b"loWo");
+        assert_eq!(&buf3[..3], b"rld");
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
     }
 }
