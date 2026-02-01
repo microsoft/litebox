@@ -90,7 +90,7 @@ mod csprng_state {
     pub static DRBG: spin::mutex::SpinMutex<Option<AesCtrDrbg>> = spin::mutex::SpinMutex::new(None);
 
     /// Nonce buffer for additional entropy (e.g., from TPM).
-    /// Must be initialized via [`initialize_crng_nonce`] before the CRNG can be used.
+    /// Must be initialized via `initialize_crng_nonce` before the CRNG can be used.
     pub static NONCE_BUFFER: spin::mutex::SpinMutex<NonceBuffer> =
         spin::mutex::SpinMutex::new(NonceBuffer::new());
 }
