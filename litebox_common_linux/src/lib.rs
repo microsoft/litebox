@@ -2261,6 +2261,23 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    /// Transfer data between file descriptors.
+    /// On x86_64, this handles both sendfile (64-bit offset).
+    /// On x86, sendfile uses 32-bit offset.
+    Sendfile {
+        out_fd: i32,
+        in_fd: i32,
+        offset: Option<Platform::RawMutPointer<i64>>,
+        count: usize,
+    },
+    /// Transfer data between file descriptors with 64-bit offset (x86 32-bit only).
+    #[cfg(target_arch = "x86")]
+    Sendfile64 {
+        out_fd: i32,
+        in_fd: i32,
+        offset: Option<Platform::RawMutPointer<i64>>,
+        count: usize,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2800,6 +2817,23 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            // sendfile - on x86_64, sendfile uses 64-bit offsets natively
+            #[cfg(target_arch = "x86_64")]
+            Sysno::sendfile => sys_req!(Sendfile { out_fd, in_fd, offset:*, count }),
+            // sendfile - on x86, sendfile uses 32-bit offsets, sendfile64 uses 64-bit
+            #[cfg(target_arch = "x86")]
+            Sysno::sendfile => {
+                // 32-bit sendfile uses off_t (32-bit), we need to handle this specially
+                // The offset pointer points to a 32-bit value, not 64-bit
+                SyscallRequest::Sendfile {
+                    out_fd: ctx.sys_req_arg(0),
+                    in_fd: ctx.sys_req_arg(1),
+                    offset: ctx.sys_req_ptr(2),
+                    count: ctx.sys_req_arg(3),
+                }
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::sendfile64 => sys_req!(Sendfile64 { out_fd, in_fd, offset:*, count }),
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

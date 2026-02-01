@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::vec;
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
@@ -583,4 +584,330 @@ fn test_unlinkat() {
         Err(Errno::ENOENT),
         "Second directory should no longer exist after removal"
     );
+}
+
+#[test]
+fn test_sendfile_file_to_file_basic() {
+    let task = init_platform(None);
+
+    // Create source file with test content
+    let source_path = "/sendfile_source.txt";
+    let source_fd = task
+        .sys_open(
+            source_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let source_fd = i32::try_from(source_fd).unwrap();
+
+    let test_data = b"Hello, sendfile world! This is test data.";
+    task.sys_write(source_fd, test_data, None)
+        .expect("Failed to write to source file");
+    task.sys_close(source_fd).expect("Failed to close source");
+
+    // Create destination file
+    let dest_path = "/sendfile_dest.txt";
+    let dest_fd = task
+        .sys_open(
+            dest_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create dest file");
+    let dest_fd = i32::try_from(dest_fd).unwrap();
+
+    // Reopen source for reading
+    let source_fd = task
+        .sys_open(source_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open source for reading");
+    let source_fd = i32::try_from(source_fd).unwrap();
+
+    // Perform sendfile
+    let bytes_sent = task
+        .sys_sendfile(dest_fd, source_fd, None, test_data.len())
+        .expect("sendfile should succeed");
+    assert_eq!(bytes_sent, test_data.len());
+
+    task.sys_close(source_fd).expect("Failed to close source");
+    task.sys_close(dest_fd).expect("Failed to close dest");
+
+    // Verify destination content
+    let dest_fd = task
+        .sys_open(dest_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open dest for reading");
+    let dest_fd = i32::try_from(dest_fd).unwrap();
+
+    let mut read_buf = vec![0u8; test_data.len()];
+    let bytes_read = task
+        .sys_read(dest_fd, &mut read_buf, None)
+        .expect("Failed to read dest file");
+    assert_eq!(bytes_read, test_data.len());
+    assert_eq!(&read_buf, test_data);
+
+    task.sys_close(dest_fd).expect("Failed to close dest");
+}
+
+#[test]
+fn test_sendfile_with_offset() {
+    let task = init_platform(None);
+
+    // Create source file with test content
+    let source_path = "/sendfile_offset_source.txt";
+    let source_fd = task
+        .sys_open(
+            source_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let source_fd = i32::try_from(source_fd).unwrap();
+
+    let test_data = b"0123456789ABCDEFGHIJ";
+    task.sys_write(source_fd, test_data, None)
+        .expect("Failed to write to source file");
+    task.sys_close(source_fd).expect("Failed to close source");
+
+    // Create destination file
+    let dest_path = "/sendfile_offset_dest.txt";
+    let dest_fd = task
+        .sys_open(
+            dest_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create dest file");
+    let dest_fd = i32::try_from(dest_fd).unwrap();
+
+    // Reopen source for reading
+    let source_fd = task
+        .sys_open(source_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open source for reading");
+    let source_fd = i32::try_from(source_fd).unwrap();
+
+    // Create offset pointer - start from offset 10
+    let mut offset: i64 = 10;
+    let offset_ptr = MutPtr::from_usize(&raw mut offset as usize);
+
+    // Perform sendfile with offset
+    let bytes_sent = task
+        .sys_sendfile(dest_fd, source_fd, Some(offset_ptr), 5)
+        .expect("sendfile with offset should succeed");
+    assert_eq!(bytes_sent, 5);
+
+    // Verify offset was updated
+    assert_eq!(offset, 15);
+
+    task.sys_close(source_fd).expect("Failed to close source");
+    task.sys_close(dest_fd).expect("Failed to close dest");
+
+    // Verify destination content (should be "ABCDE")
+    let dest_fd = task
+        .sys_open(dest_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open dest for reading");
+    let dest_fd = i32::try_from(dest_fd).unwrap();
+
+    let mut read_buf = vec![0u8; 5];
+    let bytes_read = task
+        .sys_read(dest_fd, &mut read_buf, None)
+        .expect("Failed to read dest file");
+    assert_eq!(bytes_read, 5);
+    assert_eq!(&read_buf, b"ABCDE");
+
+    task.sys_close(dest_fd).expect("Failed to close dest");
+}
+
+#[test]
+fn test_sendfile_partial_transfer() {
+    let task = init_platform(None);
+
+    // Create source file with small content
+    let source_path = "/sendfile_partial_source.txt";
+    let source_fd = task
+        .sys_open(
+            source_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let source_fd = i32::try_from(source_fd).unwrap();
+
+    let test_data = b"small";
+    task.sys_write(source_fd, test_data, None)
+        .expect("Failed to write to source file");
+    task.sys_close(source_fd).expect("Failed to close source");
+
+    // Create destination file
+    let dest_path = "/sendfile_partial_dest.txt";
+    let dest_fd = task
+        .sys_open(
+            dest_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create dest file");
+    let dest_fd = i32::try_from(dest_fd).unwrap();
+
+    // Reopen source for reading
+    let source_fd = task
+        .sys_open(source_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open source for reading");
+    let source_fd = i32::try_from(source_fd).unwrap();
+
+    // Request more bytes than available - should only transfer what's available
+    let bytes_sent = task
+        .sys_sendfile(dest_fd, source_fd, None, 1000)
+        .expect("sendfile should succeed");
+    assert_eq!(bytes_sent, test_data.len());
+
+    task.sys_close(source_fd).expect("Failed to close source");
+    task.sys_close(dest_fd).expect("Failed to close dest");
+}
+
+#[test]
+fn test_sendfile_invalid_in_fd() {
+    let task = init_platform(None);
+
+    // Create a valid output file
+    let dest_path = "/sendfile_invalid_dest.txt";
+    let dest_fd = task
+        .sys_open(
+            dest_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create dest file");
+    let dest_fd = i32::try_from(dest_fd).unwrap();
+
+    // Try sendfile with invalid input fd
+    let result = task.sys_sendfile(dest_fd, 999, None, 100);
+    assert_eq!(result, Err(Errno::EBADF));
+
+    task.sys_close(dest_fd).expect("Failed to close dest");
+}
+
+#[test]
+fn test_sendfile_invalid_out_fd() {
+    let task = init_platform(None);
+
+    // Create a valid input file
+    let source_path = "/sendfile_invalid_source.txt";
+    let source_fd = task
+        .sys_open(
+            source_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let source_fd = i32::try_from(source_fd).unwrap();
+    task.sys_write(source_fd, b"test", None).unwrap();
+    task.sys_close(source_fd).unwrap();
+
+    let source_fd = task
+        .sys_open(source_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open source");
+    let source_fd = i32::try_from(source_fd).unwrap();
+
+    // Try sendfile with invalid output fd
+    let result = task.sys_sendfile(999, source_fd, None, 100);
+    assert_eq!(result, Err(Errno::EBADF));
+
+    task.sys_close(source_fd).expect("Failed to close source");
+}
+
+#[test]
+fn test_sendfile_negative_offset() {
+    let task = init_platform(None);
+
+    // Create source file
+    let source_path = "/sendfile_negoff_source.txt";
+    let source_fd = task
+        .sys_open(
+            source_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let source_fd = i32::try_from(source_fd).unwrap();
+    task.sys_write(source_fd, b"test", None).unwrap();
+    task.sys_close(source_fd).unwrap();
+
+    // Reopen for reading
+    let source_fd = task
+        .sys_open(source_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open source");
+    let source_fd = i32::try_from(source_fd).unwrap();
+
+    // Create destination file
+    let dest_path = "/sendfile_negoff_dest.txt";
+    let dest_fd = task
+        .sys_open(
+            dest_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create dest file");
+    let dest_fd = i32::try_from(dest_fd).unwrap();
+
+    // Try sendfile with negative offset
+    let mut offset: i64 = -5;
+    let offset_ptr = MutPtr::from_usize(&raw mut offset as usize);
+    let result = task.sys_sendfile(dest_fd, source_fd, Some(offset_ptr), 100);
+    assert_eq!(result, Err(Errno::EINVAL));
+
+    task.sys_close(source_fd).expect("Failed to close source");
+    task.sys_close(dest_fd).expect("Failed to close dest");
+}
+
+#[test]
+fn test_sendfile_file_to_pipe() {
+    let task = init_platform(None);
+
+    // Create source file with test content
+    let source_path = "/sendfile_pipe_source.txt";
+    let source_fd = task
+        .sys_open(
+            source_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let source_fd = i32::try_from(source_fd).unwrap();
+
+    let test_data = b"Pipe test data";
+    task.sys_write(source_fd, test_data, None)
+        .expect("Failed to write to source file");
+    task.sys_close(source_fd).expect("Failed to close source");
+
+    // Create a pipe
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::empty())
+        .expect("Failed to create pipe");
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    // Reopen source for reading
+    let source_fd = task
+        .sys_open(source_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open source for reading");
+    let source_fd = i32::try_from(source_fd).unwrap();
+
+    // Perform sendfile to pipe
+    let bytes_sent = task
+        .sys_sendfile(write_fd, source_fd, None, test_data.len())
+        .expect("sendfile to pipe should succeed");
+    assert_eq!(bytes_sent, test_data.len());
+
+    task.sys_close(source_fd).expect("Failed to close source");
+    task.sys_close(write_fd).expect("Failed to close write end");
+
+    // Read from pipe
+    let mut read_buf = vec![0u8; test_data.len()];
+    let bytes_read = task
+        .sys_read(read_fd, &mut read_buf, None)
+        .expect("Failed to read from pipe");
+    assert_eq!(bytes_read, test_data.len());
+    assert_eq!(&read_buf, test_data);
+
+    task.sys_close(read_fd).expect("Failed to close read end");
 }

@@ -1130,6 +1130,19 @@ impl Task {
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
+            SyscallRequest::Sendfile {
+                out_fd,
+                in_fd,
+                offset,
+                count,
+            } => self.sys_sendfile(out_fd, in_fd, offset, count),
+            #[cfg(target_arch = "x86")]
+            SyscallRequest::Sendfile64 {
+                out_fd,
+                in_fd,
+                offset,
+                count,
+            } => self.sys_sendfile(out_fd, in_fd, offset, count),
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)

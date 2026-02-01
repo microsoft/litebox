@@ -22,7 +22,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
-use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, MutPtr, Task};
+use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, LinuxFS, MutPtr, Task};
 use core::sync::atomic::Ordering;
 
 /// Task state shared by `CLONE_FS`.
@@ -360,6 +360,240 @@ impl Task {
     pub fn sys_pwrite64(&self, fd: i32, buf: &[u8], offset: i64) -> Result<usize, Errno> {
         let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
         self.sys_write(fd, buf, Some(pos))
+    }
+
+    /// Handle syscall `sendfile` / `sendfile64`
+    ///
+    /// Copies data between file descriptors. The input fd must be a regular file
+    /// (supports mmap/pread), while the output fd can be a file, socket, or pipe.
+    ///
+    /// If `offset_ptr` is Some, data is read from that offset without changing
+    /// the file position, and the offset is updated after the transfer.
+    /// If `offset_ptr` is None, data is read from the current file position.
+    pub fn sys_sendfile(
+        &self,
+        out_fd: i32,
+        in_fd: i32,
+        offset_ptr: Option<MutPtr<i64>>,
+        count: usize,
+    ) -> Result<usize, Errno> {
+        // Validate file descriptors
+        let Ok(in_fd_u32) = u32::try_from(in_fd) else {
+            return Err(Errno::EBADF);
+        };
+        let Ok(out_fd_u32) = u32::try_from(out_fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+
+        // Get input descriptor - must be a regular file (supports pread)
+        let in_desc = file_table.get_fd(in_fd_u32).ok_or(Errno::EBADF)?;
+        let in_raw_fd = match in_desc {
+            Descriptor::LiteBoxRawFd(raw_fd) => *raw_fd,
+            // Sockets, eventfds, epoll, unix sockets don't support sendfile as input
+            _ => return Err(Errno::EINVAL),
+        };
+
+        // Check that input is a file (not a socket or pipe)
+        // We try to get the fs fd - if it fails with InvalidSubsystem, it's not a file
+        let in_fd_typed = {
+            let rds = files.raw_descriptor_store.read();
+            match rds.fd_from_raw_integer::<LinuxFS>(in_raw_fd) {
+                Ok(fd) => fd.clone(),
+                Err(_) => {
+                    // Not a filesystem fd - could be socket or pipe
+                    // sendfile requires input to support pread (regular files only)
+                    return Err(Errno::EINVAL);
+                }
+            }
+        };
+
+        // Get output descriptor
+        let out_desc = file_table.get_fd(out_fd_u32).ok_or(Errno::EBADF)?;
+
+        // We need to drop the file_table lock before doing I/O
+        let out_raw_fd = match out_desc {
+            Descriptor::LiteBoxRawFd(raw_fd) => Some(*raw_fd),
+            Descriptor::Unix { file, .. } => {
+                // Unix socket - handle separately
+                let file = file.clone();
+                drop(file_table);
+                return self.do_sendfile_to_unix_socket(&in_fd_typed, file, offset_ptr, count);
+            }
+            // Can't write to epoll or eventfd
+            Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } => return Err(Errno::EINVAL),
+        };
+
+        drop(file_table);
+
+        let out_raw_fd = out_raw_fd.ok_or(Errno::EBADF)?;
+
+        // Determine the output type and perform the transfer
+        files
+            .run_on_raw_fd(
+                out_raw_fd,
+                |out_fd| {
+                    // File-to-file transfer
+                    self.do_sendfile_to_file(&in_fd_typed, out_fd, offset_ptr, count)
+                },
+                |out_fd| {
+                    // File-to-socket transfer
+                    self.do_sendfile_to_socket(&in_fd_typed, out_fd, offset_ptr, count)
+                },
+                |out_fd| {
+                    // File-to-pipe transfer
+                    self.do_sendfile_to_pipe(&in_fd_typed, out_fd, offset_ptr, count)
+                },
+            )
+            .flatten()
+    }
+
+    /// Perform sendfile to a regular file
+    fn do_sendfile_to_file(
+        &self,
+        in_fd: &TypedFd<LinuxFS>,
+        out_fd: &TypedFd<LinuxFS>,
+        offset_ptr: Option<MutPtr<i64>>,
+        count: usize,
+    ) -> Result<usize, Errno> {
+        self.do_sendfile_impl(in_fd, offset_ptr, count, |buf| {
+            self.global.fs.write(out_fd, buf, None).map_err(Errno::from)
+        })
+    }
+
+    /// Perform sendfile to a network socket
+    fn do_sendfile_to_socket(
+        &self,
+        in_fd: &TypedFd<LinuxFS>,
+        out_fd: &TypedFd<litebox::net::Network<Platform>>,
+        offset_ptr: Option<MutPtr<i64>>,
+        count: usize,
+    ) -> Result<usize, Errno> {
+        self.do_sendfile_impl(in_fd, offset_ptr, count, |buf| {
+            self.global.sendto(
+                &self.wait_cx(),
+                out_fd,
+                buf,
+                litebox_common_linux::SendFlags::empty(),
+                None,
+            )
+        })
+    }
+
+    /// Perform sendfile to a pipe
+    fn do_sendfile_to_pipe(
+        &self,
+        in_fd: &TypedFd<LinuxFS>,
+        out_fd: &TypedFd<litebox::pipes::Pipes<Platform>>,
+        offset_ptr: Option<MutPtr<i64>>,
+        count: usize,
+    ) -> Result<usize, Errno> {
+        self.do_sendfile_impl(in_fd, offset_ptr, count, |buf| {
+            self.global
+                .pipes
+                .write(&self.wait_cx(), out_fd, buf)
+                .map_err(Errno::from)
+        })
+    }
+
+    /// Perform sendfile to a Unix domain socket
+    fn do_sendfile_to_unix_socket(
+        &self,
+        in_fd: &TypedFd<LinuxFS>,
+        out_file: alloc::sync::Arc<crate::syscalls::unix::UnixSocket>,
+        offset_ptr: Option<MutPtr<i64>>,
+        count: usize,
+    ) -> Result<usize, Errno> {
+        self.do_sendfile_impl(in_fd, offset_ptr, count, |buf| {
+            out_file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
+        })
+    }
+
+    /// Core sendfile implementation that reads from input file and writes using the provided writer
+    fn do_sendfile_impl<W>(
+        &self,
+        in_fd: &TypedFd<LinuxFS>,
+        offset_ptr: Option<MutPtr<i64>>,
+        count: usize,
+        mut writer: W,
+    ) -> Result<usize, Errno>
+    where
+        W: FnMut(&[u8]) -> Result<usize, Errno>,
+    {
+        // Linux limits sendfile to 0x7ffff000 bytes per call
+        const MAX_SENDFILE_COUNT: usize = 0x7fff_f000;
+        // Use a reasonably sized buffer for transfers
+        const BUFFER_SIZE: usize = 4096;
+
+        let count = count.min(MAX_SENDFILE_COUNT);
+
+        // Read the initial offset if provided
+        let mut offset = if let Some(ptr) = offset_ptr {
+            let off = ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if off < 0 {
+                return Err(Errno::EINVAL);
+            }
+            #[allow(clippy::cast_sign_loss)]
+            Some(usize::try_from(off).map_err(|_| Errno::EINVAL)?)
+        } else {
+            None
+        };
+
+        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let mut total_written = 0usize;
+
+        while total_written < count {
+            let to_read = BUFFER_SIZE.min(count - total_written);
+
+            // Read from input file
+            let read_len = match self.global.fs.read(in_fd, &mut buffer[..to_read], offset) {
+                Ok(0) => break, // EOF
+                Ok(len) => len,
+                Err(e) => {
+                    if total_written > 0 {
+                        // Return partial transfer on error
+                        break;
+                    }
+                    return Err(Errno::from(e));
+                }
+            };
+
+            // Update offset for next read if using explicit offset
+            if let Some(ref mut off) = offset {
+                *off += read_len;
+            }
+
+            // Write to output
+            let write_len = match writer(&buffer[..read_len]) {
+                Ok(len) => len,
+                Err(e) => {
+                    if total_written > 0 {
+                        // Return partial transfer on error
+                        break;
+                    }
+                    return Err(e);
+                }
+            };
+
+            total_written += write_len;
+
+            // If we couldn't write everything we read, stop
+            if write_len < read_len {
+                break;
+            }
+        }
+
+        // Update the offset pointer if provided
+        if let Some(ptr) = offset_ptr
+            && let Some(off) = offset
+        {
+            #[allow(clippy::cast_possible_wrap)]
+            ptr.write_at_offset(0, off as i64).ok_or(Errno::EFAULT)?;
+        }
+
+        Ok(total_written)
     }
 }
 
