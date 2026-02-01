@@ -584,3 +584,96 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+#[test]
+fn test_statfs() {
+    let task = init_platform(None);
+
+    // Test statfs on root path
+    let statfs = task.sys_statfs("/").expect("statfs on root should succeed");
+
+    // Verify basic fields are populated with reasonable values
+    assert!(statfs.f_bsize > 0, "Block size should be positive");
+    assert!(statfs.f_blocks > 0, "Total blocks should be positive");
+    assert!(statfs.f_bfree > 0, "Free blocks should be positive");
+    assert!(statfs.f_bavail > 0, "Available blocks should be positive");
+    assert!(statfs.f_files > 0, "Total inodes should be positive");
+    assert!(statfs.f_ffree > 0, "Free inodes should be positive");
+    assert!(
+        statfs.f_namelen > 0,
+        "Max filename length should be positive"
+    );
+
+    // Test statfs on a specific file
+    let file_path = "/statfs_test_file.txt";
+    let fd = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file for statfs");
+    task.sys_close(i32::try_from(fd).unwrap())
+        .expect("Failed to close test file");
+
+    let statfs2 = task
+        .sys_statfs(file_path)
+        .expect("statfs on file should succeed");
+    assert_eq!(
+        statfs.f_type, statfs2.f_type,
+        "Same filesystem should have same type"
+    );
+
+    // Test statfs on non-existent path
+    assert_eq!(
+        task.sys_statfs("/nonexistent_path_for_statfs_test"),
+        Err(Errno::ENOENT),
+        "statfs on non-existent path should return ENOENT"
+    );
+}
+
+#[test]
+fn test_fstatfs() {
+    let task = init_platform(None);
+
+    // Create a test file and get its fd
+    let file_path = "/fstatfs_test_file.txt";
+    let fd = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file for fstatfs");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Test fstatfs on valid fd
+    let statfs = task
+        .sys_fstatfs(fd)
+        .expect("fstatfs should succeed on valid fd");
+
+    // Verify basic fields are populated with reasonable values
+    assert!(statfs.f_bsize > 0, "Block size should be positive");
+    assert!(statfs.f_blocks > 0, "Total blocks should be positive");
+    assert!(
+        statfs.f_namelen > 0,
+        "Max filename length should be positive"
+    );
+
+    // Close the file
+    task.sys_close(fd).expect("Failed to close test file");
+
+    // Test fstatfs on closed/invalid fd
+    assert_eq!(
+        task.sys_fstatfs(fd),
+        Err(Errno::EBADF),
+        "fstatfs on closed fd should return EBADF"
+    );
+
+    // Test fstatfs on negative fd
+    assert_eq!(
+        task.sys_fstatfs(-1),
+        Err(Errno::EBADF),
+        "fstatfs on negative fd should return EBADF"
+    );
+}

@@ -994,6 +994,20 @@ impl Task {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }),
+            SyscallRequest::Statfs { path, buf } => {
+                path.to_cstring().map_or(Err(Errno::EFAULT), |p| {
+                    self.sys_statfs(p).and_then(|statfs| {
+                        buf.write_at_offset(0, statfs)
+                            .ok_or(Errno::EFAULT)
+                            .map(|()| 0)
+                    })
+                })
+            }
+            SyscallRequest::Fstatfs { fd, buf } => self.sys_fstatfs(fd).and_then(|statfs| {
+                buf.write_at_offset(0, statfs)
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }),
             #[cfg(target_arch = "x86_64")]
             SyscallRequest::Newfstatat {
                 dirfd,

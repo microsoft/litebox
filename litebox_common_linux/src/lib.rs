@@ -386,6 +386,79 @@ impl From<FileStat> for FileStat64 {
     }
 }
 
+/// Linux's `__kernel_fsid_t` struct
+#[derive(Clone, Copy, Default, Debug, PartialEq, FromBytes, IntoBytes)]
+#[repr(C)]
+pub struct FsId {
+    pub val: [i32; 2],
+}
+
+/// Linux's `statfs` struct for x86_64
+///
+/// On 64-bit systems, `__statfs_word` is `long` (i64).
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Clone, Default, Debug, PartialEq, FromBytes, IntoBytes)]
+pub struct Statfs {
+    /// Type of filesystem
+    pub f_type: i64,
+    /// Optimal transfer block size
+    pub f_bsize: i64,
+    /// Total data blocks in filesystem
+    pub f_blocks: i64,
+    /// Free blocks in filesystem
+    pub f_bfree: i64,
+    /// Free blocks available to unprivileged user
+    pub f_bavail: i64,
+    /// Total file nodes in filesystem
+    pub f_files: i64,
+    /// Free file nodes in filesystem
+    pub f_ffree: i64,
+    /// Filesystem ID
+    pub f_fsid: FsId,
+    /// Maximum length of filenames
+    pub f_namelen: i64,
+    /// Fragment size
+    pub f_frsize: i64,
+    /// Mount flags of filesystem
+    pub f_flags: i64,
+    /// Padding
+    pub f_spare: [i64; 4],
+}
+
+/// Linux's `statfs` struct for x86 (32-bit)
+///
+/// On 32-bit systems, `__statfs_word` is `__u32` (u32).
+#[cfg(target_arch = "x86")]
+#[repr(C)]
+#[derive(Clone, Default, Debug, PartialEq, FromBytes, IntoBytes)]
+pub struct Statfs {
+    /// Type of filesystem
+    pub f_type: u32,
+    /// Optimal transfer block size
+    pub f_bsize: u32,
+    /// Total data blocks in filesystem
+    pub f_blocks: u32,
+    /// Free blocks in filesystem
+    pub f_bfree: u32,
+    /// Free blocks available to unprivileged user
+    pub f_bavail: u32,
+    /// Total file nodes in filesystem
+    pub f_files: u32,
+    /// Free file nodes in filesystem
+    pub f_ffree: u32,
+    /// Filesystem ID
+    pub f_fsid: FsId,
+    /// Maximum length of filenames
+    pub f_namelen: u32,
+    /// Fragment size
+    pub f_frsize: u32,
+    /// Mount flags of filesystem
+    pub f_flags: u32,
+    /// Padding
+    pub f_spare: [u32; 4],
+}
+
 /// Linux's `iovec` struct for `writev`
 #[derive(FromBytes, IntoBytes)]
 #[repr(C, packed)]
@@ -1868,6 +1941,14 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         buf: Platform::RawMutPointer<FileStat>,
     },
+    Statfs {
+        path: Platform::RawConstPointer<i8>,
+        buf: Platform::RawMutPointer<Statfs>,
+    },
+    Fstatfs {
+        fd: i32,
+        buf: Platform::RawMutPointer<Statfs>,
+    },
     Mkdir {
         pathname: Platform::RawConstPointer<i8>,
         mode: u32,
@@ -2359,6 +2440,8 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::stat => sys_req!(Stat { pathname:*, buf:* }),
             Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
+            Sysno::statfs => sys_req!(Statfs { path:*, buf:* }),
+            Sysno::fstatfs => sys_req!(Fstatfs { fd, buf:* }),
             Sysno::mkdir => sys_req!(Mkdir { pathname:*, mode }),
             #[cfg(target_arch = "x86_64")]
             Sysno::mmap => sys_req!(Mmap {
@@ -2801,7 +2884,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
             // Noisy unsupported syscalls.
-            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {
