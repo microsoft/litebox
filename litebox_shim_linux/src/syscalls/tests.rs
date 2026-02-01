@@ -594,12 +594,27 @@ fn test_getrusage_self() {
     // Test RUSAGE_SELF - should return successfully with zeroed values
     let rusage = task.sys_getrusage(RusageWho::RusageSelf);
 
-    // Verify the struct is zeroed (default values)
+    // Verify all fields are zeroed (default values).
+    // The current implementation returns a zeroed struct for all who variants,
+    // which is valid behavior since Linux itself doesn't maintain many of these fields.
     assert_eq!(rusage.ru_maxrss, 0);
+    assert_eq!(rusage.ru_ixrss, 0);
+    assert_eq!(rusage.ru_idrss, 0);
+    assert_eq!(rusage.ru_isrss, 0);
     assert_eq!(rusage.ru_minflt, 0);
     assert_eq!(rusage.ru_majflt, 0);
+    assert_eq!(rusage.ru_nswap, 0);
+    assert_eq!(rusage.ru_inblock, 0);
+    assert_eq!(rusage.ru_oublock, 0);
+    assert_eq!(rusage.ru_msgsnd, 0);
+    assert_eq!(rusage.ru_msgrcv, 0);
+    assert_eq!(rusage.ru_nsignals, 0);
     assert_eq!(rusage.ru_nvcsw, 0);
     assert_eq!(rusage.ru_nivcsw, 0);
+
+    // Verify calling twice returns consistent results (idempotency)
+    let rusage2 = task.sys_getrusage(RusageWho::RusageSelf);
+    assert_eq!(rusage.ru_maxrss, rusage2.ru_maxrss);
 }
 
 #[test]
