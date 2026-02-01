@@ -1323,6 +1323,36 @@ impl Task {
         )
     }
 
+    /// Handle syscall `shutdown`
+    ///
+    /// Shuts down part or all of a full-duplex connection on the socket.
+    pub(crate) fn sys_shutdown(
+        &self,
+        sockfd: i32,
+        how: litebox_common_linux::SockShutdownCmd,
+    ) -> Result<(), Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
+        self.do_shutdown(sockfd, how)
+    }
+
+    fn do_shutdown(
+        &self,
+        sockfd: u32,
+        how: litebox_common_linux::SockShutdownCmd,
+    ) -> Result<(), Errno> {
+        self.files.borrow().with_socket(
+            sockfd,
+            |fd| {
+                let proxy = self.global.get_proxy(fd)?;
+                proxy.shutdown(how.shut_read(), how.shut_write());
+                Ok(())
+            },
+            |file| file.shutdown(how),
+        )
+    }
+
     /// Handle syscall `sendto`
     pub(crate) fn sys_sendto(
         &self,
@@ -3192,5 +3222,128 @@ mod unix_tests {
             .unwrap();
         task.sys_unlinkat(-1, client_path, AtFlags::empty())
             .unwrap();
+    }
+
+    #[test]
+    fn test_unix_stream_socket_shutdown() {
+        use litebox_common_linux::SockShutdownCmd;
+
+        let task = init_platform(None);
+
+        // Create a connected pair via socketpair for simplicity
+        let (fd1, fd2) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .expect("socketpair failed");
+
+        // First write some data before shutdown
+        let msg = b"hello";
+        let n = task
+            .do_sendto(
+                fd1,
+                ConstPtr::from_usize(msg.as_ptr() as usize),
+                msg.len(),
+                SendFlags::empty(),
+                None,
+            )
+            .expect("initial write should succeed");
+        assert_eq!(n, msg.len());
+
+        // Test SHUT_WR: shutdown write side of fd1
+        task.do_shutdown(fd1, SockShutdownCmd::Write)
+            .expect("shutdown SHUT_WR failed");
+
+        // Read the data that was written before shutdown
+        let mut buf = [0u8; 64];
+        let n = task
+            .do_recvfrom(
+                fd2,
+                MutPtr::from_usize(buf.as_mut_ptr() as usize),
+                buf.len(),
+                ReceiveFlags::empty(),
+                None,
+            )
+            .expect("recvfrom should succeed");
+        assert_eq!(n, msg.len());
+        assert_eq!(&buf[..n], msg);
+
+        // Now reading from fd2 should return 0 (EOF) since fd1's write side is shut down
+        let n = task
+            .do_recvfrom(
+                fd2,
+                MutPtr::from_usize(buf.as_mut_ptr() as usize),
+                buf.len(),
+                ReceiveFlags::empty(),
+                None,
+            )
+            .expect("recvfrom should succeed with EOF");
+        assert_eq!(
+            n, 0,
+            "should receive EOF (0 bytes) after peer shutdown write"
+        );
+
+        // Test SHUT_RD: shutdown read side of fd2
+        task.do_shutdown(fd2, SockShutdownCmd::Read)
+            .expect("shutdown SHUT_RD failed");
+
+        // fd2 can still write to fd1 (fd1's read side is still open)
+        let msg2 = b"world";
+        let n = task
+            .do_sendto(
+                fd2,
+                ConstPtr::from_usize(msg2.as_ptr() as usize),
+                msg2.len(),
+                SendFlags::empty(),
+                None,
+            )
+            .expect("write from fd2 should still succeed");
+        assert_eq!(n, msg2.len());
+
+        // fd1 can read the data
+        let n = task
+            .do_recvfrom(
+                fd1,
+                MutPtr::from_usize(buf.as_mut_ptr() as usize),
+                buf.len(),
+                ReceiveFlags::empty(),
+                None,
+            )
+            .expect("fd1 recvfrom should succeed");
+        assert_eq!(n, msg2.len());
+        assert_eq!(&buf[..n], msg2);
+
+        close_socket(&task, fd1);
+        close_socket(&task, fd2);
+    }
+
+    #[test]
+    fn test_shutdown_invalid_fd() {
+        use litebox_common_linux::SockShutdownCmd;
+
+        let task = init_platform(None);
+
+        // Test with invalid fd
+        let result = task.do_shutdown(9999, SockShutdownCmd::ReadWrite);
+        assert_eq!(result.unwrap_err(), Errno::EBADF);
+    }
+
+    #[test]
+    fn test_shutdown_not_connected() {
+        use litebox_common_linux::SockShutdownCmd;
+
+        let task = init_platform(None);
+
+        // Create an unconnected stream socket
+        let fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+
+        // Shutdown on unconnected socket should return ENOTCONN
+        let result = task.do_shutdown(fd, SockShutdownCmd::ReadWrite);
+        assert_eq!(result.unwrap_err(), Errno::ENOTCONN);
+
+        close_socket(&task, fd);
     }
 }

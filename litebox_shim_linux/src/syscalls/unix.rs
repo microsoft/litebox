@@ -804,6 +804,24 @@ impl UnixStream {
             UnixStreamState::Connected(conn) => conn.check_io_events(),
         })
     }
+
+    fn shutdown(&self, how: litebox_common_linux::SockShutdownCmd) -> Result<(), Errno> {
+        self.with_state_ref(|state| match state {
+            UnixStreamState::Init(_) | UnixStreamState::Listen(_) => {
+                // Linux returns ENOTCONN for unconnected stream sockets
+                Err(Errno::ENOTCONN)
+            }
+            UnixStreamState::Connected(conn) => {
+                if how.shut_read() {
+                    conn.recv_channel.shutdown();
+                }
+                if how.shut_write() {
+                    conn.connected_send_channel.shutdown();
+                }
+                Ok(())
+            }
+        })
+    }
 }
 
 /// A datagram message with source address information
@@ -1281,6 +1299,19 @@ impl UnixSocket {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.get_peer_addr(),
             UnixSocketInner::Datagram(datagram) => datagram.get_peer_addr(),
+        }
+    }
+
+    /// Shutdown part or all of a full-duplex connection on the socket.
+    pub(super) fn shutdown(&self, how: litebox_common_linux::SockShutdownCmd) -> Result<(), Errno> {
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.shutdown(how),
+            UnixSocketInner::Datagram(_datagram) => {
+                // Linux allows shutdown on unconnected datagram sockets.
+                // It's mostly a no-op but marks the socket state.
+                // For now, just return success.
+                Ok(())
+            }
         }
     }
 

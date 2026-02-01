@@ -20,8 +20,7 @@ macro_rules! common_functions_for_channel {
         }
 
         /// Shut this channel down.
-        #[expect(dead_code)]
-        fn shutdown(&self) {
+        pub(crate) fn shutdown(&self) {
             self.endpoint.shutdown();
         }
 

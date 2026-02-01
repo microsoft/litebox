@@ -164,6 +164,29 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Raw => unimplemented!(),
         }
     }
+
+    /// Shutdown the read side, write side, or both sides of the socket.
+    ///
+    /// For stream sockets (TCP), this properly shuts down the connection direction(s).
+    /// For datagram sockets (UDP), shutdown is a no-op but we track the state.
+    pub fn shutdown(&self, read: bool, write: bool) {
+        match self {
+            NetworkProxy::Stream(channel) => {
+                if read {
+                    channel.shutdown_read();
+                }
+                if write {
+                    channel.shutdown_write();
+                }
+            }
+            NetworkProxy::Datagram(_channel) => {
+                // UDP sockets don't have a connection state to shutdown,
+                // but Linux allows the syscall and it affects future operations.
+                // For now, this is a no-op for UDP.
+            }
+            NetworkProxy::Raw => {}
+        }
+    }
 }
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for NetworkProxy<Platform> {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {

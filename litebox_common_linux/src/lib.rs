@@ -687,6 +687,31 @@ pub enum UnixProtocol {
     UNIX = 1,
 }
 
+/// Shutdown types for the `shutdown` syscall.
+/// From <https://elixir.bootlin.com/linux/v6.0.9/source/include/linux/net.h>
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntEnum)]
+pub enum SockShutdownCmd {
+    /// Shutdown receptions (SHUT_RD)
+    Read = 0,
+    /// Shutdown transmissions (SHUT_WR)
+    Write = 1,
+    /// Shutdown receptions and transmissions (SHUT_RDWR)
+    ReadWrite = 2,
+}
+
+impl SockShutdownCmd {
+    /// Returns true if this command shuts down the read side.
+    pub fn shut_read(&self) -> bool {
+        matches!(self, Self::Read | Self::ReadWrite)
+    }
+
+    /// Returns true if this command shuts down the write side.
+    pub fn shut_write(&self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
+}
+
 #[repr(u32)]
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
@@ -2261,6 +2286,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    Shutdown {
+        sockfd: i32,
+        how: SockShutdownCmd,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2511,6 +2540,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }),
             Sysno::getsockname => sys_req!(Getsockname { sockfd, addr:*, addrlen:* }),
             Sysno::getpeername => sys_req!(Getpeername { sockfd, addr:*, addrlen:* }),
+            Sysno::shutdown => sys_req!(Shutdown { sockfd, how:? }),
             Sysno::exit => sys_req!(Exit { status }),
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             Sysno::uname => sys_req!(Uname { buf:* }),

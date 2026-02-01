@@ -823,6 +823,9 @@ impl Task {
             SyscallRequest::Listen { sockfd, backlog } => {
                 syscall!(sys_listen(sockfd, backlog))
             }
+            SyscallRequest::Shutdown { sockfd, how } => {
+                syscall!(sys_shutdown(sockfd, how))
+            }
             SyscallRequest::Setsockopt {
                 sockfd,
                 level,
