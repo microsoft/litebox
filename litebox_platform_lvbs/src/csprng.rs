@@ -67,18 +67,32 @@ impl AesCtrDrbg {
     ///
     /// # Arguments
     ///
-    /// * `entropy_input` - Primary entropy source (from RDSEED or similar)
-    /// * `nonce` - Additional entropy source (e.g., from TPM)
+    /// * `entropy_input` - Primary entropy source (from RDSEED or similar), must be non-empty
+    /// * `nonce` - Additional entropy source (e.g., from TPM), must be non-empty
     ///
     /// # Panics
     ///
-    /// Panics if unable to gather sufficient entropy.
+    /// Panics if:
+    /// - `entropy_input` is empty
+    /// - `nonce` is empty  
+    /// - Combined length of `entropy_input` and `nonce` exceeds maximum seed material size (96 bytes)
     #[must_use]
     pub fn new(entropy_input: &[u8], nonce: &[u8]) -> Self {
+        // Validate input lengths
+        assert!(!entropy_input.is_empty(), "entropy_input must not be empty");
+        assert!(!nonce.is_empty(), "nonce must not be empty");
+
+        let input_len = entropy_input.len() + nonce.len();
+        assert!(
+            input_len <= SEED_LEN * 2,
+            "combined entropy_input and nonce length ({}) exceeds maximum seed material size ({})",
+            input_len,
+            SEED_LEN * 2
+        );
+
         // Step 1: seed_material = entropy_input || nonce
         // (No personalization string per requirements)
         let mut seed_material = [0u8; SEED_LEN * 2];
-        let input_len = entropy_input.len() + nonce.len();
         seed_material[..entropy_input.len()].copy_from_slice(entropy_input);
         seed_material[entropy_input.len()..entropy_input.len() + nonce.len()]
             .copy_from_slice(nonce);
@@ -113,7 +127,17 @@ impl AesCtrDrbg {
     ///   4. reseed_counter = 1
     ///   5. Return (Key, V, reseed_counter)
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `entropy_input` is empty.
     pub fn reseed(&mut self, entropy_input: &[u8]) {
+        // Validate input length
+        assert!(
+            !entropy_input.is_empty(),
+            "entropy_input must not be empty for reseed"
+        );
+
         // Step 1: seed_material = entropy_input (no additional_input)
         // Step 2: Apply derivation function
         let derived_seed = block_cipher_df(entropy_input, SEED_LEN);
