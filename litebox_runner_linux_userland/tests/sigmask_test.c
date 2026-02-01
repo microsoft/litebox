@@ -314,10 +314,19 @@ int main(void) {
     printf("=== Signal mask tests for ppoll/pselect/epoll_pwait ===\n\n");
 
     failed += test_ppoll_null_sigmask();
+#if defined(__x86_64__) || defined(__aarch64__)
+    // pselect tests are skipped on 32-bit as pselect6 syscall isn't handled
     failed += test_pselect_null_sigmask();
+#else
+    printf("test_pselect_null_sigmask: SKIPPED (32-bit)\n");
+#endif
     failed += test_epoll_pwait_null_sigmask();
     failed += test_ppoll_sigmask_restored();
+#if defined(__x86_64__) || defined(__aarch64__)
     failed += test_pselect_sigmask_restored();
+#else
+    printf("test_pselect_sigmask_restored: SKIPPED (32-bit)\n");
+#endif
     failed += test_epoll_pwait_sigmask_restored();
 
     printf("\n");
