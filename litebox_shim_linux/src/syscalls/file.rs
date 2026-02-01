@@ -345,7 +345,7 @@ impl Task {
             }
         };
         if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
+            self.send_sigpipe();
         }
         res
     }
@@ -604,7 +604,7 @@ impl Task {
             Descriptor::Unix { .. } => todo!(),
         };
         if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
+            self.send_sigpipe();
         }
         res
     }

@@ -741,8 +741,8 @@ impl GlobalState {
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
 
-        let ret = cx
-            .with_timeout(timeout)
+        // Note: SIGPIPE is handled at the Task level (in do_sendto/do_sendmsg)
+        cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblock,
                 Events::OUT,
@@ -756,13 +756,7 @@ impl GlobalState {
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
-            .map_err(Errno::from);
-        if let Err(Errno::EPIPE) = ret
-            && !flags.contains(SendFlags::NOSIGNAL)
-        {
-            unimplemented!("send signal SIGPIPE on EPIPE");
-        }
-        ret
+            .map_err(Errno::from)
     }
 
     /// Receive data via socket channel (lock-free path).
@@ -1350,7 +1344,7 @@ impl Task {
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
         let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
-        self.files.borrow().with_socket(
+        let ret = self.files.borrow().with_socket(
             sockfd,
             |fd| {
                 let sockaddr = sockaddr
@@ -1365,9 +1359,17 @@ impl Task {
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
+                // Unix socket handles SIGPIPE internally
                 file.sendto(self, &buf, flags, addr)
             },
-        )
+        );
+        // Send SIGPIPE for INET sockets on EPIPE (Unix sockets handle it internally)
+        if let Err(Errno::EPIPE) = ret
+            && !flags.contains(SendFlags::NOSIGNAL)
+        {
+            self.send_sigpipe();
+        }
+        ret
     }
 
     /// Handle syscall `sendmsg`
@@ -1408,7 +1410,7 @@ impl Task {
             .msg_iov
             .to_owned_slice(msg.msg_iovlen)
             .ok_or(Errno::EFAULT)?;
-        self.files.borrow().with_socket(
+        let ret = self.files.borrow().with_socket(
             sockfd,
             |fd| {
                 let sock_addr = sock_addr
@@ -1431,7 +1433,14 @@ impl Task {
                 Ok(total_sent)
             },
             |_file| Err(Errno::ENOTSOCK),
-        )
+        );
+        // Send SIGPIPE on EPIPE unless MSG_NOSIGNAL is set
+        if let Err(Errno::EPIPE) = ret
+            && !flags.contains(SendFlags::NOSIGNAL)
+        {
+            self.send_sigpipe();
+        }
+        ret
     }
 
     /// Handle syscall `recvfrom`

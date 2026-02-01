@@ -656,4 +656,24 @@ impl Task {
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
     }
+
+    /// Sends SIGPIPE to the current task.
+    ///
+    /// This is called when writing to a pipe or socket that has been closed on
+    /// the reading end. The signal will be delivered after the current syscall
+    /// returns, following normal signal delivery rules:
+    /// - If SIG_DFL: process terminates
+    /// - If SIG_IGN: signal ignored
+    /// - If custom handler: handler runs
+    pub(crate) fn send_sigpipe(&self) {
+        let siginfo = Siginfo {
+            signo: Signal::SIGPIPE.as_i32(),
+            errno: 0,
+            code: SI_KERNEL,
+            #[cfg(target_arch = "x86_64")]
+            __pad: 0,
+            data: SiginfoData::new_zeroed(),
+        };
+        self.send_signal(Signal::SIGPIPE, siginfo);
+    }
 }

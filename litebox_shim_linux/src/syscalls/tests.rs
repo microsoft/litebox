@@ -584,3 +584,51 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+#[test]
+fn test_pipe_epipe() {
+    let task = init_platform(None);
+
+    // Create a pipe
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::NONBLOCK)
+        .expect("Failed to create pipe");
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    // Close the read end
+    task.sys_close(read_fd).expect("Failed to close read end");
+
+    // Writing to a pipe with closed read end should return EPIPE
+    let buf = b"test data";
+    let result = task.sys_write(write_fd, buf, None);
+
+    assert_eq!(
+        result,
+        Err(Errno::EPIPE),
+        "Write to closed pipe should return EPIPE"
+    );
+
+    // Clean up
+    task.sys_close(write_fd).expect("Failed to close write end");
+}
+
+#[test]
+fn test_sigpipe_signal_queued() {
+    let task = init_platform(None);
+
+    // Verify no pending signals initially
+    assert!(
+        !task.has_pending_signals(),
+        "Should have no pending signals initially"
+    );
+
+    // Send SIGPIPE
+    task.send_sigpipe();
+
+    // Verify SIGPIPE is pending
+    assert!(
+        task.has_pending_signals(),
+        "SIGPIPE should be pending after send_sigpipe"
+    );
+}
