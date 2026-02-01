@@ -180,11 +180,21 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
                 }
             }
             NetworkProxy::Datagram(_channel) => {
-                // UDP sockets don't have a connection state to shutdown,
-                // but Linux allows the syscall and it affects future operations.
-                // For now, this is a no-op for UDP.
+                // TODO: Track shutdown state for UDP sockets. While UDP doesn't have
+                // a connection state, Linux tracks shutdown flags which affect
+                // subsequent send/recv operations. For now, this is a no-op.
             }
             NetworkProxy::Raw => {}
+        }
+    }
+
+    /// Get the socket state for stream sockets.
+    ///
+    /// Returns `Some(state)` for stream sockets, `None` for datagram and raw sockets.
+    pub fn stream_state(&self) -> Option<SocketState> {
+        match self {
+            NetworkProxy::Stream(channel) => Some(channel.state()),
+            NetworkProxy::Datagram(_) | NetworkProxy::Raw => None,
         }
     }
 }
@@ -602,7 +612,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     }
 
     /// Get the current socket state.
-    pub(super) fn state(&self) -> SocketState {
+    pub fn state(&self) -> SocketState {
         self.inner.state()
     }
 

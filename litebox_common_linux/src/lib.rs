@@ -690,6 +690,7 @@ pub enum UnixProtocol {
 /// Shutdown types for the `shutdown` syscall.
 /// From <https://elixir.bootlin.com/linux/v6.0.9/source/include/linux/net.h>
 #[repr(i32)]
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntEnum)]
 pub enum SockShutdownCmd {
     /// Shutdown receptions (SHUT_RD)

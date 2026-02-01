@@ -1307,9 +1307,8 @@ impl UnixSocket {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.shutdown(how),
             UnixSocketInner::Datagram(_datagram) => {
-                // Linux allows shutdown on unconnected datagram sockets.
-                // It's mostly a no-op but marks the socket state.
-                // For now, just return success.
+                // TODO: Track shutdown state for datagram sockets. While it affects
+                // future send/recv operations in Linux, for now this is a no-op.
                 Ok(())
             }
         }

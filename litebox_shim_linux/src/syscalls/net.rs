@@ -1326,6 +1326,11 @@ impl Task {
     /// Handle syscall `shutdown`
     ///
     /// Shuts down part or all of a full-duplex connection on the socket.
+    ///
+    /// # Errors
+    /// - `EBADF` - Invalid socket file descriptor
+    /// - `ENOTCONN` - Socket is not connected (for stream sockets)
+    /// - `ENOTSOCK` - File descriptor is not a socket
     pub(crate) fn sys_shutdown(
         &self,
         sockfd: i32,
@@ -1346,6 +1351,12 @@ impl Task {
             sockfd,
             |fd| {
                 let proxy = self.global.get_proxy(fd)?;
+                // For stream (TCP) sockets, check connection state
+                if let Some(state) = proxy.stream_state()
+                    && state != litebox::net::socket_channel::SocketState::Connected
+                {
+                    return Err(Errno::ENOTCONN);
+                }
                 proxy.shutdown(how.shut_read(), how.shut_write());
                 Ok(())
             },
@@ -3343,6 +3354,91 @@ mod unix_tests {
         // Shutdown on unconnected socket should return ENOTCONN
         let result = task.do_shutdown(fd, SockShutdownCmd::ReadWrite);
         assert_eq!(result.unwrap_err(), Errno::ENOTCONN);
+
+        close_socket(&task, fd);
+    }
+
+    #[test]
+    fn test_shutdown_rdwr() {
+        use litebox_common_linux::SockShutdownCmd;
+
+        let task = init_platform(None);
+
+        // Create a connected pair via socketpair
+        let (fd1, fd2) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .expect("socketpair failed");
+
+        // Shutdown both directions at once on fd1
+        task.do_shutdown(fd1, SockShutdownCmd::ReadWrite)
+            .expect("shutdown SHUT_RDWR failed");
+
+        // Verify read returns EOF on fd2 (peer's write is shut down)
+        let mut buf = [0u8; 64];
+        let n = task
+            .do_recvfrom(
+                fd2,
+                MutPtr::from_usize(buf.as_mut_ptr() as usize),
+                buf.len(),
+                ReceiveFlags::empty(),
+                None,
+            )
+            .expect("recvfrom should succeed");
+        assert_eq!(n, 0, "should receive EOF after SHUT_RDWR");
+
+        close_socket(&task, fd1);
+        close_socket(&task, fd2);
+    }
+
+    #[test]
+    fn test_shutdown_idempotent() {
+        use litebox_common_linux::SockShutdownCmd;
+
+        let task = init_platform(None);
+
+        // Create a connected pair via socketpair
+        let (fd1, fd2) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .expect("socketpair failed");
+
+        // Shutdown write twice - should succeed both times (idempotent)
+        task.do_shutdown(fd1, SockShutdownCmd::Write)
+            .expect("first shutdown should succeed");
+        task.do_shutdown(fd1, SockShutdownCmd::Write)
+            .expect("second shutdown should also succeed (idempotent)");
+
+        // Shutdown read twice - should succeed both times
+        task.do_shutdown(fd1, SockShutdownCmd::Read)
+            .expect("first read shutdown should succeed");
+        task.do_shutdown(fd1, SockShutdownCmd::Read)
+            .expect("second read shutdown should also succeed");
+
+        close_socket(&task, fd1);
+        close_socket(&task, fd2);
+    }
+
+    #[test]
+    fn test_shutdown_datagram_socket() {
+        use litebox_common_linux::SockShutdownCmd;
+
+        let task = init_platform(None);
+
+        // Create a datagram socket (not connected)
+        let fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+
+        // Shutdown on datagram socket should succeed (even if not connected)
+        task.do_shutdown(fd, SockShutdownCmd::ReadWrite)
+            .expect("shutdown on datagram socket should succeed");
 
         close_socket(&task, fd);
     }
