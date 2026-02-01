@@ -55,7 +55,6 @@ pub(crate) struct ThreadState {
 unsafe impl Send for ThreadState {}
 
 impl ThreadState {
-    #[expect(clippy::arc_with_non_send_sync)]
     pub fn new_process(pid: i32) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
@@ -136,7 +135,10 @@ pub(crate) struct Process {
     /// thread. This simplifies the implementation and avoids complex synchronization,
     /// though it means very short timers may be delayed if the process is blocked
     /// in a long syscall.
-    pub(crate) real_timer: Cell<Option<RealIntervalTimer>>,
+    ///
+    /// Note: This must be a Mutex (not Cell) because Process is shared across
+    /// multiple threads in a multi-threaded process via Arc<Process>.
+    pub(crate) real_timer: Mutex<Platform, Option<RealIntervalTimer>>,
 }
 
 /// State for ITIMER_REAL interval timer.
@@ -183,7 +185,7 @@ impl Process {
                 threads: BTreeMap::from_iter([(pid, remote)]),
             }),
             limits: ResourceLimits::default(),
-            real_timer: Cell::new(None),
+            real_timer: Mutex::new(None),
         }
     }
 
@@ -1208,11 +1210,11 @@ impl Task {
     #[expect(clippy::cast_possible_truncation)]
     pub(crate) fn sys_alarm(&self, seconds: u32) -> u32 {
         let process = self.process();
-        let old_timer = process.real_timer.get();
+        let mut timer_guard = process.real_timer.lock();
+        let now = self.global.platform.now();
 
         // Calculate remaining time from old timer (rounded up to seconds)
-        let remaining = if let Some(timer) = old_timer {
-            let now = self.global.platform.now();
+        let remaining = if let Some(timer) = *timer_guard {
             if now < timer.expiration {
                 let remaining_duration = timer.expiration.duration_since(&now);
                 // Round up: any partial second counts as a full second
@@ -1233,18 +1235,17 @@ impl Task {
 
         if seconds == 0 {
             // Cancel any existing timer
-            process.real_timer.set(None);
+            *timer_guard = None;
         } else {
             // Set a new one-shot timer
-            let now = self.global.platform.now();
             if let Some(expiration) = now.checked_add(Duration::from_secs(u64::from(seconds))) {
-                process.real_timer.set(Some(RealIntervalTimer {
+                *timer_guard = Some(RealIntervalTimer {
                     expiration,
                     interval: None,
-                }));
+                });
             } else {
                 // Overflow, set to max possible time (effectively no timer)
-                process.real_timer.set(None);
+                *timer_guard = None;
             }
         }
 
@@ -1272,12 +1273,12 @@ impl Task {
         }
 
         let process = self.process();
-        let old_timer = process.real_timer.get();
+        let mut timer_guard = process.real_timer.lock();
         let now = self.global.platform.now();
 
         // Write old value if requested
         if let Some(old_value_ptr) = old_value {
-            let old_itimerval = if let Some(timer) = old_timer {
+            let old_itimerval = if let Some(timer) = *timer_guard {
                 let remaining = if now < timer.expiration {
                     timer.expiration.duration_since(&now)
                 } else {
@@ -1301,7 +1302,7 @@ impl Task {
         // Set new timer
         if new_value_duration.is_zero() {
             // Disarm the timer
-            process.real_timer.set(None);
+            *timer_guard = None;
         } else {
             // Arm the timer
             if let Some(expiration) = now.checked_add(new_value_duration) {
@@ -1310,13 +1311,13 @@ impl Task {
                 } else {
                     Some(new_interval)
                 };
-                process.real_timer.set(Some(RealIntervalTimer {
+                *timer_guard = Some(RealIntervalTimer {
                     expiration,
                     interval,
-                }));
+                });
             } else {
                 // Overflow, effectively no timer
-                process.real_timer.set(None);
+                *timer_guard = None;
             }
         }
 
@@ -1337,10 +1338,10 @@ impl Task {
         }
 
         let process = self.process();
-        let timer = process.real_timer.get();
+        let timer_guard = process.real_timer.lock();
         let now = self.global.platform.now();
 
-        let itimerval = if let Some(timer) = timer {
+        let itimerval = if let Some(timer) = *timer_guard {
             let remaining = if now < timer.expiration {
                 timer.expiration.duration_since(&now)
             } else {

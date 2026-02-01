@@ -535,29 +535,64 @@ impl Task {
     /// This is called on syscall boundaries rather than using a background thread.
     /// This simplifies the implementation but means very short timers may be
     /// delayed if the process is blocked in a long syscall.
+    ///
+    /// Note: If the process was blocked and missed multiple intervals, we only
+    /// send one SIGALRM (signals coalesce per POSIX), but we advance the timer
+    /// to the next future expiration to avoid a busy-loop of signal delivery.
     pub(crate) fn check_timer_expiration(&self) {
         use litebox::platform::Instant as _;
 
         let process = self.process();
-        if let Some(timer) = process.real_timer.get() {
+        let timer_guard = process.real_timer.lock();
+
+        if let Some(timer) = *timer_guard {
             let now = self.global.platform.now();
             if now >= timer.expiration {
                 // Timer has expired, send SIGALRM
+                // Note: We drop the lock before sending the signal to avoid
+                // potential deadlocks if signal handling tries to access the timer.
+                drop(timer_guard);
                 self.send_sigalrm();
 
-                // If this is an interval timer, reset the expiration time
-                if let Some(interval) = timer.interval {
-                    // Calculate new expiration based on the old one to prevent drift
-                    let new_expiration = timer.expiration.checked_add(interval);
-                    process.real_timer.set(new_expiration.map(|exp| {
-                        crate::syscalls::process::RealIntervalTimer {
-                            expiration: exp,
-                            interval: timer.interval,
+                // Re-acquire the lock to update the timer
+                let mut timer_guard = process.real_timer.lock();
+
+                // Re-check the timer state (it may have been modified while we
+                // didn't hold the lock)
+                if let Some(timer) = *timer_guard {
+                    // If this is an interval timer, reset the expiration time
+                    if let Some(interval) = timer.interval {
+                        // Calculate new expiration that is in the future.
+                        // If the process was blocked and missed multiple intervals,
+                        // we skip ahead to the next future expiration to avoid
+                        // a busy-loop of SIGALRM delivery.
+                        let mut new_expiration = timer.expiration;
+                        loop {
+                            match new_expiration.checked_add(interval) {
+                                Some(exp) if exp > now => {
+                                    // Found an expiration in the future
+                                    *timer_guard =
+                                        Some(crate::syscalls::process::RealIntervalTimer {
+                                            expiration: exp,
+                                            interval: timer.interval,
+                                        });
+                                    break;
+                                }
+                                Some(exp) => {
+                                    // Still in the past, keep advancing
+                                    new_expiration = exp;
+                                }
+                                None => {
+                                    // Overflow, disable the timer
+                                    *timer_guard = None;
+                                    break;
+                                }
+                            }
                         }
-                    }));
-                } else {
-                    // One-shot timer, clear it
-                    process.real_timer.set(None);
+                    } else {
+                        // One-shot timer, clear it
+                        *timer_guard = None;
+                    }
                 }
             }
         }
@@ -635,10 +670,11 @@ impl Task {
     /// - If SIG_IGN: signal ignored
     /// - If custom handler: handler runs
     pub(crate) fn send_sigalrm(&self) {
+        use litebox_common_linux::signal::SI_TIMER;
         let siginfo = Siginfo {
             signo: Signal::SIGALRM.as_i32(),
             errno: 0,
-            code: SI_KERNEL,
+            code: SI_TIMER,
             #[cfg(target_arch = "x86_64")]
             __pad: 0,
             data: SiginfoData::new_zeroed(),

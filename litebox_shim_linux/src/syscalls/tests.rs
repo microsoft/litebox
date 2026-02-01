@@ -886,3 +886,119 @@ fn test_timer_expiration_queues_sigalrm() {
     let remaining = task.sys_alarm(0);
     assert!(remaining > 0, "Timer should have been set");
 }
+
+#[test]
+fn test_alarm_overflow() {
+    let task = init_platform(None);
+
+    // Set maximum alarm value - this tests overflow handling
+    // The implementation uses checked_add which may overflow for very large values
+    let remaining = task.sys_alarm(u32::MAX);
+    assert_eq!(remaining, 0, "No previous timer, should return 0");
+
+    // The timer should either be set (if no overflow) or cleared (if overflow)
+    // Either way, canceling should not panic
+    let remaining = task.sys_alarm(0);
+    // We don't assert a specific value since behavior depends on platform time representation
+    // Just verify it doesn't panic and returns something reasonable
+    let _ = remaining;
+}
+
+#[test]
+fn test_setitimer_subsecond_precision() {
+    let task = init_platform(None);
+
+    // Create ItimerVal with subsecond precision (500ms = 500000 microseconds)
+    // We need to create the raw struct since ItimerVal::new takes Duration
+    let half_second = std::time::Duration::from_millis(500);
+    let new_value = litebox_common_linux::ItimerVal::new(
+        std::time::Duration::ZERO, // no interval
+        half_second,               // 500ms
+    );
+
+    let new_value_ptr = crate::ConstPtr::from_ptr(&raw const new_value);
+    task.sys_setitimer(
+        litebox_common_linux::IntervalTimer::Real,
+        new_value_ptr,
+        None,
+    )
+    .expect("setitimer should succeed");
+
+    // Get the current timer state
+    let mut curr_value = litebox_common_linux::ItimerVal::zero();
+    let curr_value_ptr: MutPtr<litebox_common_linux::ItimerVal> =
+        MutPtr::from_ptr(&raw mut curr_value);
+    task.sys_getitimer(litebox_common_linux::IntervalTimer::Real, curr_value_ptr)
+        .expect("getitimer should succeed");
+
+    // Remaining time should be close to 500ms (between 0 and 500ms)
+    let remaining = curr_value.value().unwrap();
+    assert!(
+        remaining.as_millis() <= 500,
+        "Remaining time should be <= 500ms, got {remaining:?}"
+    );
+    assert!(
+        remaining.as_millis() > 0,
+        "Remaining time should be > 0ms (timer should be active)"
+    );
+
+    // Clean up
+    task.sys_alarm(0);
+}
+
+#[test]
+fn test_setitimer_efault_bad_new_value() {
+    let task = init_platform(None);
+
+    // Create a pointer to an invalid address
+    let bad_ptr: crate::ConstPtr<litebox_common_linux::ItimerVal> =
+        crate::ConstPtr::from_ptr(0xDEADBEEF_usize as *const _);
+
+    let result = task.sys_setitimer(litebox_common_linux::IntervalTimer::Real, bad_ptr, None);
+    assert_eq!(
+        result,
+        Err(Errno::EFAULT),
+        "setitimer with bad new_value pointer should return EFAULT"
+    );
+}
+
+#[test]
+fn test_getitimer_efault_bad_curr_value() {
+    let task = init_platform(None);
+
+    // Create a pointer to an invalid address
+    let bad_ptr: MutPtr<litebox_common_linux::ItimerVal> =
+        MutPtr::from_ptr(0xDEADBEEF_usize as *mut _);
+
+    let result = task.sys_getitimer(litebox_common_linux::IntervalTimer::Real, bad_ptr);
+    assert_eq!(
+        result,
+        Err(Errno::EFAULT),
+        "getitimer with bad curr_value pointer should return EFAULT"
+    );
+}
+
+#[test]
+fn test_getitimer_no_timer_set() {
+    let task = init_platform(None);
+
+    // Ensure no timer is set
+    task.sys_alarm(0);
+
+    // Get timer state when no timer is active
+    let mut curr_value = litebox_common_linux::ItimerVal::zero();
+    let curr_value_ptr: MutPtr<litebox_common_linux::ItimerVal> =
+        MutPtr::from_ptr(&raw mut curr_value);
+    task.sys_getitimer(litebox_common_linux::IntervalTimer::Real, curr_value_ptr)
+        .expect("getitimer should succeed even with no timer");
+
+    // Both value and interval should be zero
+    assert!(
+        curr_value.value().unwrap().is_zero(),
+        "value should be zero when no timer is set"
+    );
+    assert!(
+        curr_value.interval().unwrap().is_zero(),
+        "interval should be zero when no timer is set"
+    );
+}
