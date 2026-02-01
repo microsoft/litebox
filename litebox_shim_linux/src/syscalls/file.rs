@@ -1536,12 +1536,8 @@ impl Task {
             }
         };
 
-        // Execute with or without sigmask
-        if let Some(mask) = new_mask {
-            self.with_sigmask(mask, do_epoll_wait)
-        } else {
-            do_epoll_wait()
-        }
+        // Execute with optional sigmask
+        self.with_optional_sigmask(new_mask, do_epoll_wait)
     }
 
     /// Handle syscall `ppoll`.
@@ -1616,12 +1612,8 @@ impl Task {
             Ok(ready_count)
         };
 
-        // Execute with or without sigmask
-        if let Some(mask) = new_mask {
-            self.with_sigmask(mask, do_poll)
-        } else {
-            do_poll()
-        }
+        // Execute with optional sigmask
+        self.with_optional_sigmask(new_mask, do_poll)
     }
 
     pub(crate) fn do_pselect(
@@ -1717,10 +1709,9 @@ impl Task {
             // Check if the sigset pointer is NULL (user passed NULL sigmask to pselect)
             if sigset_ptr.as_usize() == 0 {
                 None
+            } else if size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
+                return Err(Errno::EINVAL);
             } else {
-                if size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
-                    return Err(Errno::EINVAL);
-                }
                 // Dereference the sigset pointer to get the actual mask
                 Some(sigset_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
             }
@@ -1784,12 +1775,8 @@ impl Task {
             Ok(count)
         };
 
-        // Execute with or without sigmask
-        if let Some(mask) = new_mask {
-            self.with_sigmask(mask, do_select)
-        } else {
-            do_select()
-        }
+        // Execute with optional sigmask
+        self.with_optional_sigmask(new_mask, do_select)
     }
 
     fn do_dup(&self, file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {

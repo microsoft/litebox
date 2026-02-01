@@ -431,15 +431,51 @@ impl Task {
     ///
     /// If signals become unblocked and are pending, they may be delivered
     /// during the wait, causing the operation to return with `EINTR`.
+    ///
+    /// The mask is restored even if the closure panics (via a drop guard).
+    ///
+    /// Note: This is a cooperative approximation of Linux's atomic signal mask
+    /// semantics. In the kernel, steps 2-4 are truly atomic with respect to
+    /// signal delivery. In litebox's single-threaded per-task model, signals
+    /// are checked during the wait operation with the new mask, which provides
+    /// the correct behavior for the critical window.
     pub(crate) fn with_sigmask<F, R>(&self, new_mask: SigSet, f: F) -> R
     where
         F: FnOnce() -> R,
     {
+        // Guard struct ensures mask is restored even on panic/unwind
+        struct MaskGuard<'a> {
+            signals: &'a SignalState,
+            old_mask: SigSet,
+        }
+        impl Drop for MaskGuard<'_> {
+            fn drop(&mut self) {
+                self.signals.set_signal_mask(self.old_mask);
+            }
+        }
+
         let old_mask = self.signals.blocked.get();
+        let _guard = MaskGuard {
+            signals: &self.signals,
+            old_mask,
+        };
         self.signals.set_signal_mask(new_mask);
-        let result = f();
-        self.signals.set_signal_mask(old_mask);
-        result
+        f()
+    }
+
+    /// Executes an operation with an optional temporary signal mask.
+    ///
+    /// If `mask` is `Some`, the signal mask is temporarily changed during
+    /// the execution of `f`. If `mask` is `None`, `f` is executed directly
+    /// without changing the mask.
+    pub(crate) fn with_optional_sigmask<F, R>(&self, mask: Option<SigSet>, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        match mask {
+            Some(m) => self.with_sigmask(m, f),
+            None => f(),
+        }
     }
 
     pub(crate) fn sys_sigaltstack(

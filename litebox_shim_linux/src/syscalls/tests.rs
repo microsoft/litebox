@@ -907,6 +907,30 @@ fn test_pselect_with_sigsetpack() {
         "pselect with invalid sigsetpack size should return EINVAL"
     );
 
+    // Test 4: pselect with NULL sigset_ptr inside sigsetpack (glibc compat)
+    // When glibc's pselect() is called with NULL sigmask, it still passes a
+    // sigsetpack structure with sigset_ptr=NULL. This should work.
+    let sigsetpack_null_ptr: SigSetPack<ConstPtr<SigSet>> = SigSetPack {
+        sigset_ptr: ConstPtr::from_usize(0), // NULL pointer
+        size: core::mem::size_of::<SigSet>(),
+    };
+
+    let mut writefds: usize = 1 << write_fd_u32;
+
+    let result = task.sys_pselect(
+        nfds,
+        None,
+        Some(MutPtr::from_usize((&raw mut writefds) as usize)),
+        None,
+        TimeParam::None,
+        Some(ConstPtr::from_usize((&raw const sigsetpack_null_ptr) as usize)),
+    );
+    assert!(
+        result.is_ok(),
+        "pselect with NULL sigset_ptr in sigsetpack should succeed"
+    );
+    assert_eq!(result.unwrap(), 1, "Write fd should be ready");
+
     // Clean up
     task.sys_close(read_fd).expect("Failed to close read end");
     task.sys_close(write_fd).expect("Failed to close write end");
