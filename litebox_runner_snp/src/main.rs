@@ -154,7 +154,11 @@ pub extern "C" fn sandbox_process_init(
         );
     };
     let shim = shim_builder.build();
-    let program = match shim.load_program(platform.init_task(boot_params), &program, argv, envp) {
+    unsafe { SHIM = Some(shim) };
+
+    // Loading a program may trigger page faults, so we need to set SHIM before this.
+    let shim = &raw const SHIM;
+    let program = match unsafe { (*shim).as_ref().unwrap() }.load_program(platform.init_task(boot_params), &program, argv, envp) {
         Ok(program) => program,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);
@@ -164,7 +168,6 @@ pub extern "C" fn sandbox_process_init(
             );
         }
     };
-    unsafe { SHIM = Some(shim) };
     litebox_platform_linux_kernel::host::snp::snp_impl::init_thread(
         alloc::boxed::Box::new(program.entrypoints),
         pt_regs,
