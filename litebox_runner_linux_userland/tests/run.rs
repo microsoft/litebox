@@ -192,6 +192,20 @@ impl Runner {
 
 /// Find all C test files in a directory
 fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
+    // Tests that require syscalls not yet supported on 32-bit:
+    // - _llseek: lseek_test.c, fileio_test.c, preadwrite_test.c
+    // - pselect6: poll_select.c
+    const SKIP_ON_32BIT: &[&str] = &[
+        "lseek_test.c",
+        "poll_select.c",
+        "fileio_test.c",
+        "preadwrite_test.c",
+    ];
+
+    // Check the target architecture at compile time using cfg
+    // This will be the target triple's architecture, not the host
+    let is_32bit = cfg!(target_arch = "x86") || cfg!(target_pointer_width = "32");
+
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();
@@ -200,6 +214,15 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
             continue;
         }
         if let Some("c") = path.extension().and_then(|e| e.to_str()) {
+            // Skip tests that don't work on 32-bit
+            if is_32bit
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|file_name| SKIP_ON_32BIT.contains(&file_name))
+            {
+                continue;
+            }
             files.push(path);
         }
     }

@@ -298,12 +298,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let new_posn = base
             .checked_add_signed(offset)
             .ok_or(SeekError::InvalidOffset)?;
-        if new_posn > file_len {
-            Err(SeekError::InvalidOffset)
-        } else {
-            *position = new_posn;
-            Ok(new_posn)
-        }
+        // Linux allows seeking past EOF - reads will return 0 bytes
+        *position = new_posn;
+        Ok(new_posn)
     }
 
     fn truncate(
