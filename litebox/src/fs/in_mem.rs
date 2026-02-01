@@ -3,6 +3,9 @@
 
 //! An in-memory file system, not backed by any physical device.
 
+use alloc::format;
+use alloc::string::ToString;
+
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -14,7 +17,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError,
+    WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
 
@@ -541,6 +545,103 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let removed = root.entries.remove(&path).unwrap();
         // Just a sanity check
         assert!(matches!(removed, Entry::File(File { .. })));
+        Ok(())
+    }
+
+    fn rename(
+        &self,
+        old: impl crate::path::Arg,
+        new: impl crate::path::Arg,
+    ) -> Result<(), RenameError> {
+        let old_path = self.absolute_path(old)?;
+        let new_path = self.absolute_path(new)?;
+
+        // Can't rename root
+        if old_path.as_str() == "/" || new_path.as_str() == "/" {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        }
+
+        let mut root = self.root.write();
+
+        // Check old exists and get its type
+        let old_entry = root
+            .entries
+            .get(&old_path)
+            .ok_or(PathError::NoSuchFileOrDirectory)?;
+        let old_is_dir = matches!(old_entry, Entry::Dir(_));
+
+        // Check if new path exists and validate
+        if let Some(new_entry) = root.entries.get(&new_path) {
+            let new_is_dir = matches!(new_entry, Entry::Dir(_));
+            if old_is_dir && !new_is_dir {
+                // Cannot rename a directory to overwrite a non-directory
+                return Err(RenameError::OldPathIsDirectory);
+            }
+            if !old_is_dir && new_is_dir {
+                // Cannot rename a non-directory to overwrite a directory
+                return Err(RenameError::NewPathIsDirectory);
+            }
+            if new_is_dir
+                && let Entry::Dir(dir) = new_entry
+                && !dir.read().children.is_empty()
+            {
+                return Err(RenameError::NewPathNotEmpty);
+            }
+        }
+
+        // Get parent paths by removing the last component
+        // Note: components() splits by '/', so "/tmp/foo" becomes ["", "tmp", "foo"]
+        // The leading "" represents the root. We need to skip it when joining.
+        let old_components: Vec<_> = old_path.components().unwrap().collect();
+        let new_components: Vec<_> = new_path.components().unwrap().collect();
+
+        // For "/tmp/foo", components = ["", "tmp", "foo"], len = 3
+        // Parent should be "/tmp", so we take [1..2] = ["tmp"] and join with "/"
+        let old_parent_path = if old_components.len() > 2 {
+            format!("/{}", old_components[1..old_components.len() - 1].join("/"))
+        } else {
+            "/".to_string()
+        };
+        let new_parent_path = if new_components.len() > 2 {
+            format!("/{}", new_components[1..new_components.len() - 1].join("/"))
+        } else {
+            "/".to_string()
+        };
+
+        let old_name = (*old_components.last().unwrap()).to_string();
+        let new_name = (*new_components.last().unwrap()).to_string();
+
+        // Determine file type
+        let file_type = match root.entries.get(&old_path) {
+            Some(Entry::File(_)) => FileType::RegularFile,
+            Some(Entry::Dir(_)) => FileType::Directory,
+            None => return Err(PathError::NoSuchFileOrDirectory)?,
+        };
+
+        // Update parent directories
+        if let Some(Entry::Dir(old_parent)) = root.entries.get(&old_parent_path) {
+            old_parent.write().children.remove(&old_name);
+        }
+
+        // Remove target if it exists
+        if root.entries.contains_key(&new_path) {
+            if let Some(Entry::Dir(new_parent)) = root.entries.get(&new_parent_path) {
+                new_parent.write().children.remove(&new_name);
+            }
+            root.entries.remove(&new_path);
+        }
+
+        // Add to new parent's children
+        if let Some(Entry::Dir(new_parent)) = root.entries.get(&new_parent_path) {
+            new_parent.write().children.insert(new_name, file_type);
+        } else {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        }
+
+        // Move the entry
+        let entry = root.entries.remove(&old_path).unwrap();
+        root.entries.insert(new_path, entry);
+
         Ok(())
     }
 

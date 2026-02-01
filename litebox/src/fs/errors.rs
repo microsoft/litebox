@@ -115,6 +115,28 @@ pub enum ChownError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from rename operations
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum RenameError {
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("newpath already exists and is a non-empty directory")]
+    NewPathNotEmpty,
+    #[error("oldpath and newpath are not on the same filesystem")]
+    CrossDevice,
+    #[error("newpath is a directory but oldpath is not")]
+    NewPathIsDirectory,
+    #[error("oldpath is a directory but newpath is not")]
+    OldPathIsDirectory,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("would create a loop in the directory tree")]
+    Loop,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`FileSystem::unlink`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

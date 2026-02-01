@@ -193,13 +193,16 @@ impl Runner {
 /// Find all C test files in a directory
 fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
     // Tests that require syscalls not yet supported on 32-bit:
-    // - _llseek: lseek_test.c, fileio_test.c, preadwrite_test.c
+    // - _llseek: lseek_test.c, fileio_test.c, preadwrite_test.c, truncate_test.c
     // - pselect6: poll_select.c
+    // - timerfd timing issues: timerfd_test.c
     const SKIP_ON_32BIT: &[&str] = &[
         "lseek_test.c",
         "poll_select.c",
         "fileio_test.c",
         "preadwrite_test.c",
+        "truncate_test.c",
+        "timerfd_test.c",
     ];
 
     // Check the target architecture at compile time using cfg

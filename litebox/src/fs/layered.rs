@@ -16,7 +16,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError,
+    WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -1061,6 +1062,42 @@ impl<
             .entries
             .insert(path, Arc::new(EntryX::Tombstone));
         Ok(())
+    }
+
+    fn rename(
+        &self,
+        old: impl crate::path::Arg,
+        new: impl crate::path::Arg,
+    ) -> Result<(), RenameError> {
+        let old_path = self.absolute_path(old)?;
+        let new_path = self.absolute_path(new)?;
+
+        // Try rename on upper layer first
+        match self.upper.rename(old_path.as_str(), new_path.as_str()) {
+            Ok(()) => {
+                // If source was also in lower layer, mark old path as tombstone
+                if self.ensure_lower_contains(&old_path).is_ok() {
+                    self.root
+                        .write()
+                        .entries
+                        .insert(old_path, Arc::new(EntryX::Tombstone));
+                }
+                // Remove any tombstone at new path
+                self.root.write().entries.remove(&new_path);
+                Ok(())
+            }
+            Err(RenameError::PathError(
+                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+            )) => {
+                // Source not in upper layer, check lower layer
+                self.ensure_lower_contains(&old_path)
+                    .map_err(|_| PathError::NoSuchFileOrDirectory)?;
+                // Need to migrate from lower to upper, then rename
+                // For simplicity, return error for now (cross-layer rename is complex)
+                Err(RenameError::CrossDevice)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {

@@ -101,6 +101,14 @@ impl<Platform: platform::Provider + Sync> super::FileSystem for FileSystem<Platf
         todo!()
     }
 
+    fn rename(
+        &self,
+        old: impl crate::path::Arg,
+        new: impl crate::path::Arg,
+    ) -> Result<(), super::errors::RenameError> {
+        todo!()
+    }
+
     fn mkdir(
         &self,
         path: impl crate::path::Arg,

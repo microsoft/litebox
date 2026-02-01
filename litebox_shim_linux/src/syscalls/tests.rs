@@ -584,3 +584,167 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+#[test]
+fn test_flock_validation() {
+    use litebox_common_linux::FlockOperation;
+
+    let task = init_platform(None);
+
+    // Create a test file
+    let fd = task
+        .sys_open(
+            "/flock_test",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd_i32 = i32::try_from(fd).unwrap();
+
+    // Test EBADF for invalid fd
+    assert_eq!(
+        task.sys_flock(-1, FlockOperation::LOCK_SH),
+        Err(Errno::EBADF),
+        "flock on invalid fd should return EBADF"
+    );
+
+    // Test EINVAL for multiple operations (LOCK_SH | LOCK_EX)
+    let invalid_multi = FlockOperation::LOCK_SH | FlockOperation::LOCK_EX;
+    assert_eq!(
+        task.sys_flock(fd_i32, invalid_multi),
+        Err(Errno::EINVAL),
+        "flock with multiple ops should return EINVAL"
+    );
+
+    // Test EINVAL for no operation
+    let empty = FlockOperation::empty();
+    assert_eq!(
+        task.sys_flock(fd_i32, empty),
+        Err(Errno::EINVAL),
+        "flock with no op should return EINVAL"
+    );
+
+    // Test valid operations succeed
+    assert_eq!(
+        task.sys_flock(fd_i32, FlockOperation::LOCK_SH),
+        Ok(0),
+        "LOCK_SH should succeed"
+    );
+    assert_eq!(
+        task.sys_flock(fd_i32, FlockOperation::LOCK_EX),
+        Ok(0),
+        "LOCK_EX should succeed"
+    );
+    assert_eq!(
+        task.sys_flock(fd_i32, FlockOperation::LOCK_UN),
+        Ok(0),
+        "LOCK_UN should succeed"
+    );
+
+    // Test LOCK_NB combinations
+    assert_eq!(
+        task.sys_flock(fd_i32, FlockOperation::LOCK_SH | FlockOperation::LOCK_NB),
+        Ok(0),
+        "LOCK_SH | LOCK_NB should succeed"
+    );
+    assert_eq!(
+        task.sys_flock(fd_i32, FlockOperation::LOCK_UN | FlockOperation::LOCK_NB),
+        Ok(0),
+        "LOCK_UN | LOCK_NB should succeed (NB is ignored)"
+    );
+
+    task.sys_close(fd_i32).expect("Failed to close test file");
+}
+
+#[test]
+fn test_chdir_and_getcwd() {
+    let task = init_platform(None);
+
+    // Initial cwd should be "/"
+    let mut buf = [0u8; 256];
+    let len = task.sys_getcwd(&mut buf).expect("getcwd failed");
+    let cwd = core::str::from_utf8(&buf[..len - 1]).expect("Invalid UTF-8"); // -1 to remove null
+    assert_eq!(cwd, "/", "Initial cwd should be /");
+
+    // Create a test directory
+    task.sys_mkdir("/chdir_test", Mode::RWXU.bits())
+        .expect("Failed to create test directory");
+
+    // chdir to the test directory
+    let path = alloc::ffi::CString::new("/chdir_test").unwrap();
+    task.sys_chdir(path.clone()).expect("chdir failed");
+
+    // Verify cwd changed
+    let len = task.sys_getcwd(&mut buf).expect("getcwd failed");
+    let cwd = core::str::from_utf8(&buf[..len - 1]).expect("Invalid UTF-8");
+    assert_eq!(cwd, "/chdir_test", "cwd should be /chdir_test");
+
+    // chdir back to root
+    let root = alloc::ffi::CString::new("/").unwrap();
+    task.sys_chdir(root).expect("chdir to / failed");
+
+    let len = task.sys_getcwd(&mut buf).expect("getcwd failed");
+    let cwd = core::str::from_utf8(&buf[..len - 1]).expect("Invalid UTF-8");
+    assert_eq!(cwd, "/", "cwd should be back to /");
+}
+
+#[test]
+fn test_chdir_errors() {
+    let task = init_platform(None);
+
+    // Test ENOENT for nonexistent directory
+    let nonexistent = alloc::ffi::CString::new("/nonexistent_dir_12345").unwrap();
+    assert_eq!(
+        task.sys_chdir(nonexistent),
+        Err(Errno::ENOENT),
+        "chdir to nonexistent dir should return ENOENT"
+    );
+
+    // Create a regular file
+    let fd = task
+        .sys_open(
+            "/chdir_file_test",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    task.sys_close(i32::try_from(fd).unwrap())
+        .expect("Failed to close file");
+
+    // Test ENOTDIR for regular file
+    let file_path = alloc::ffi::CString::new("/chdir_file_test").unwrap();
+    assert_eq!(
+        task.sys_chdir(file_path),
+        Err(Errno::ENOTDIR),
+        "chdir to file should return ENOTDIR"
+    );
+}
+
+#[test]
+fn test_normalize_path() {
+    // Test the normalize_path function via chdir behavior
+    let task = init_platform(None);
+
+    // Create nested directories
+    task.sys_mkdir("/norm_test", Mode::RWXU.bits())
+        .expect("mkdir failed");
+    task.sys_mkdir("/norm_test/sub", Mode::RWXU.bits())
+        .expect("mkdir failed");
+
+    // Test path with . and ..
+    let path = alloc::ffi::CString::new("/norm_test/./sub/../sub").unwrap();
+    task.sys_chdir(path).expect("chdir with . and .. failed");
+
+    let mut buf = [0u8; 256];
+    let len = task.sys_getcwd(&mut buf).expect("getcwd failed");
+    let cwd = core::str::from_utf8(&buf[..len - 1]).expect("Invalid UTF-8");
+    assert_eq!(cwd, "/norm_test/sub", "Path should be normalized");
+
+    // Test .. at root stays at root
+    let root_dotdot = alloc::ffi::CString::new("/..").unwrap();
+    task.sys_chdir(root_dotdot).expect("chdir /.. failed");
+
+    let len = task.sys_getcwd(&mut buf).expect("getcwd failed");
+    let cwd = core::str::from_utf8(&buf[..len - 1]).expect("Invalid UTF-8");
+    assert_eq!(cwd, "/", ".. at root should stay at /");
+}
