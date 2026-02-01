@@ -133,16 +133,26 @@ impl Task {
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let mode = mode & !self.get_umask();
         let file = self.global.fs.open(path, flags - OFlags::CLOEXEC, mode)?;
+
+        // Set up file metadata
+        let mut dt = self.global.litebox.descriptor_table_mut();
+
+        // Set FD_CLOEXEC if requested (per-FD metadata)
         if flags.contains(OFlags::CLOEXEC) {
-            let None = self
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
-            else {
+            let None = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC) else {
                 unreachable!()
             };
         }
+
+        // Set file status flags (entry-level metadata, shared by dup'd FDs)
+        // Only store the status flags that were passed to open()
+        let status_flags = flags & OFlags::STATUS_FLAGS_MASK;
+        let None = dt.set_entry_metadata(&file, crate::FileStatusFlags(status_flags)) else {
+            unreachable!()
+        };
+
+        drop(dt);
+
         let files = self.files.borrow();
         let raw_fd = files.raw_descriptor_store.write().fd_into_raw_integer(file);
         files
@@ -972,7 +982,7 @@ impl Task {
                                 .global
                                 .litebox
                                 .descriptor_table()
-                                .with_metadata(fd, |crate::StdioStatusFlags(flags)| {
+                                .with_metadata(fd, |crate::FileStatusFlags(flags)| {
                                     *flags & OFlags::STATUS_FLAGS_MASK
                                 })
                                 .unwrap_or(OFlags::empty()))
@@ -1023,24 +1033,27 @@ impl Task {
                     Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                         *raw_fd,
                         |fd| {
-                            self.global
-                                .litebox
-                                .descriptor_table_mut()
-                                .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| {
-                                    let diff = *f ^ flags;
-                                    if diff.intersects(
-                                        OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME,
-                                    ) {
-                                        todo!("unsupported flags");
-                                    }
-                                    f.toggle(diff);
-                                })
-                                .map_err(|err| match err {
-                                    MetadataError::ClosedFd => Errno::EBADF,
-                                    MetadataError::NoSuchMetadata => {
-                                        unimplemented!("SETFL on non-stdio")
-                                    }
-                                })
+                            let mut dt = self.global.litebox.descriptor_table_mut();
+                            let result = dt.with_metadata_mut(fd, |crate::FileStatusFlags(f)| {
+                                let diff = *f ^ flags;
+                                if diff
+                                    .intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME)
+                                {
+                                    todo!("unsupported flags");
+                                }
+                                f.toggle(diff);
+                            });
+                            match result {
+                                Ok(()) => Ok(()),
+                                Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
+                                Err(MetadataError::NoSuchMetadata) => {
+                                    // Initialize metadata for files that don't have it yet
+                                    // (e.g., files opened before this code was added, or edge cases)
+                                    let status_flags = flags & setfl_mask;
+                                    dt.set_entry_metadata(fd, crate::FileStatusFlags(status_flags));
+                                    Ok(())
+                                }
+                            }
                         },
                         |fd| {
                             self.global

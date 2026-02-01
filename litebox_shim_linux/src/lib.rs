@@ -316,8 +316,10 @@ fn default_fs(
     )
 }
 
-// Special override so that `GETFL` can return stdio-specific flags
-pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
+// Status flags for file descriptors (O_NONBLOCK, O_APPEND, etc.)
+// Used for both stdio and regular files to track status flags that can be
+// modified via fcntl(F_SETFL).
+pub(crate) struct FileStatusFlags(pub litebox::fs::OFlags);
 
 impl syscalls::file::FilesState {
     fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState) {
@@ -339,7 +341,7 @@ impl syscalls::file::FilesState {
         for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
             let status_flags = OFlags::APPEND | OFlags::RDWR;
             debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
-            let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
+            let old = dt.set_entry_metadata(&fd, FileStatusFlags(status_flags));
             assert!(old.is_none());
             let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
             assert!(success);

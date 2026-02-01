@@ -584,3 +584,79 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+/// Test fcntl F_SETFL on regular files (not just pipes/eventfd/sockets)
+#[test]
+fn test_fcntl_setfl_regular_file() {
+    let task = init_platform(None);
+
+    // Test 1: Open a file without O_NONBLOCK and set it later
+    let fd = task
+        .sys_open(
+            "/test_fcntl_file.txt",
+            OFlags::CREAT | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Verify initial flags (should NOT have O_NONBLOCK)
+    let initial_flags = task
+        .sys_fcntl(fd, FcntlArg::GETFL)
+        .expect("GETFL should succeed");
+    let initial_flags = OFlags::from_bits_truncate(initial_flags as u32);
+    assert!(
+        !initial_flags.contains(OFlags::NONBLOCK),
+        "File should not have O_NONBLOCK initially"
+    );
+
+    // Set O_NONBLOCK using F_SETFL
+    task.sys_fcntl(fd, FcntlArg::SETFL(OFlags::NONBLOCK))
+        .expect("SETFL should succeed on regular file");
+
+    // Verify O_NONBLOCK is now set
+    let new_flags = task
+        .sys_fcntl(fd, FcntlArg::GETFL)
+        .expect("GETFL should succeed");
+    let new_flags = OFlags::from_bits_truncate(new_flags as u32);
+    assert!(
+        new_flags.contains(OFlags::NONBLOCK),
+        "File should have O_NONBLOCK after SETFL"
+    );
+
+    // Test 2: Clear O_NONBLOCK
+    task.sys_fcntl(fd, FcntlArg::SETFL(OFlags::empty()))
+        .expect("SETFL should succeed when clearing flags");
+
+    let cleared_flags = task
+        .sys_fcntl(fd, FcntlArg::GETFL)
+        .expect("GETFL should succeed");
+    let cleared_flags = OFlags::from_bits_truncate(cleared_flags as u32);
+    assert!(
+        !cleared_flags.contains(OFlags::NONBLOCK),
+        "File should not have O_NONBLOCK after clearing"
+    );
+
+    task.sys_close(fd).expect("Failed to close file");
+
+    // Test 3: Open a file WITH O_NONBLOCK and verify it's reflected in GETFL
+    let fd2 = task
+        .sys_open(
+            "/test_fcntl_file2.txt",
+            OFlags::CREAT | OFlags::RDWR | OFlags::NONBLOCK,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create second test file");
+    let fd2 = i32::try_from(fd2).unwrap();
+
+    let flags_with_nonblock = task
+        .sys_fcntl(fd2, FcntlArg::GETFL)
+        .expect("GETFL should succeed");
+    let flags_with_nonblock = OFlags::from_bits_truncate(flags_with_nonblock as u32);
+    assert!(
+        flags_with_nonblock.contains(OFlags::NONBLOCK),
+        "File opened with O_NONBLOCK should reflect it in GETFL"
+    );
+
+    task.sys_close(fd2).expect("Failed to close second file");
+}
