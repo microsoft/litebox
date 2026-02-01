@@ -163,6 +163,34 @@ not yet implemented
 
 ## Recommendations for Skill Development
 
+### Python Automation Tools (NEW!)
+
+**For automated Python skill preparation, use:**
+
+```bash
+# Advanced Python preparation with .so rewriting
+./litebox_skill_runner/examples/prepare_python_skill_advanced.py \
+    /path/to/skill \
+    -o output.tar \
+    --rewriter-path ./target/release/litebox_syscall_rewriter
+
+# This script automatically:
+# 1. Detects Python version and library paths
+# 2. Packages stdlib and site-packages
+# 3. Rewrites all .so files with litebox_syscall_rewriter
+# 4. Generates ready-to-use command examples
+```
+
+**For integration testing with real Anthropic skills:**
+
+```bash
+# Test a specific skill
+./litebox_skill_runner/examples/test_anthropic_skills.sh --skill skill-creator
+
+# Test all skills
+./litebox_skill_runner/examples/test_anthropic_skills.sh --all
+```
+
 ### For Maximum Compatibility
 
 1. **Use `/bin/sh` for shell scripts** - Works perfectly, no issues
@@ -224,10 +252,10 @@ Several skills use JavaScript:
 - [x] Update skill_runner README (DONE)
 
 ### Short Term
-- [ ] Automate Python setup in skill_runner
-- [ ] Test with real Anthropic skills
-- [ ] Create integration test suite
-- [ ] Add example skills using each interpreter
+- [x] Automate Python setup in skill_runner ✅ (Added `prepare_python_skill_advanced.py`)
+- [ ] Test with real Anthropic skills (Integration tests ready, needs build environment)
+- [x] Create integration test suite ✅ (Added `test_anthropic_skills.sh`)
+- [ ] Validate skills work end-to-end
 
 ### Medium Term
 - [ ] Implement getpgrp syscall for bash support
