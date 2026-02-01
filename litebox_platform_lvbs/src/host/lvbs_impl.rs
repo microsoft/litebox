@@ -145,7 +145,10 @@ impl litebox::platform::CrngProvider for LvbsLinuxKernel {
         }
 
         // Generate random bytes
-        let drbg = drbg_guard.as_mut().unwrap();
+        // Safety: drbg_guard is guaranteed to be Some after the initialization above
+        let drbg = drbg_guard
+            .as_mut()
+            .expect("DRBG should be initialized at this point");
         if !drbg.generate(buf) {
             // DRBG needs reseed - gather new entropy
             let entropy_source = RdseedEntropySource::new();
