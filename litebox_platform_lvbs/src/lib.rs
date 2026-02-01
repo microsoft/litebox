@@ -24,6 +24,7 @@ use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
     platform::page_mgmt::FixedAddressBehavior,
     shim::ContinueOperation,
+    utils::TruncateExt,
 };
 use litebox_common_linux::{
     PunchthroughSyscall,
@@ -191,7 +192,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
         Ok((
             self.page_table.map_phys_frame_range(frame_range, flags)?,
-            usize::try_from(frame_range.len()).unwrap() * PAGE_SIZE,
+            TruncateExt::<usize>::truncate(frame_range.len()) * PAGE_SIZE,
         ))
     }
 
@@ -209,13 +210,11 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         unsafe {
             self.page_table.unmap_pages(
                 PageRange::<PAGE_SIZE>::new(
-                    usize::try_from(page_addr.as_u64()).unwrap(),
-                    usize::try_from(
-                        (page_addr + u64::try_from(length).unwrap())
-                            .align_up(Size4KiB::SIZE)
-                            .as_u64(),
-                    )
-                    .unwrap(),
+                    page_addr.as_u64().truncate(),
+                    (page_addr + length as u64)
+                        .align_up(Size4KiB::SIZE)
+                        .as_u64()
+                        .truncate(),
                 )
                 .ok_or(DeallocationError::Unaligned)?,
                 false,
@@ -240,11 +239,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
         if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
             phys_addr,
-            phys_addr + u64::try_from(core::mem::size_of::<T>()).unwrap(),
+            phys_addr + core::mem::size_of::<T>() as u64,
             PageTableFlags::PRESENT,
         ) {
-            let page_offset =
-                usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
+            let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
             let src_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(src_ptr.is_aligned(), "src_ptr is not properly aligned");
 
@@ -276,11 +274,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ) -> bool {
         if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
             phys_addr,
-            phys_addr + u64::try_from(core::mem::size_of::<T>()).unwrap(),
+            phys_addr + core::mem::size_of::<T>() as u64,
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         ) {
-            let page_offset =
-                usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
+            let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
             let dst_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(dst_ptr.is_aligned(), "dst_ptr is not properly aligned");
 
@@ -313,11 +310,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ) -> bool {
         if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
             phys_addr,
-            phys_addr + u64::try_from(core::mem::size_of_val(value)).unwrap(),
+            phys_addr + core::mem::size_of_val(value) as u64,
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         ) {
-            let page_offset =
-                usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
+            let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
             let dst_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(dst_ptr.is_aligned(), "dst_ptr is not properly aligned");
 
@@ -351,11 +347,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ) -> bool {
         if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
             phys_addr,
-            phys_addr + u64::try_from(core::mem::size_of_val(buf)).unwrap(),
+            phys_addr + core::mem::size_of_val(buf) as u64,
             PageTableFlags::PRESENT,
         ) {
-            let page_offset =
-                usize::try_from(phys_addr - phys_addr.align_down(Size4KiB::SIZE)).unwrap();
+            let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
             let src_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(src_ptr.is_aligned(), "src_ptr is not properly aligned");
 

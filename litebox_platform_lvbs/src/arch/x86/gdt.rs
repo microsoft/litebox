@@ -83,10 +83,9 @@ impl Default for GdtWrapper {
 
 fn setup_gdt_tss() {
     let stack_top = with_per_cpu_variables_asm(PerCpuVariablesAsm::get_interrupt_stack_ptr);
-    let stack_top = u64::try_from(stack_top).unwrap();
 
     let mut tss = Box::new(AlignedTss(TaskStateSegment::new()));
-    tss.0.interrupt_stack_table[0] = VirtAddr::new(stack_top);
+    tss.0.interrupt_stack_table[0] = VirtAddr::new(stack_top as u64);
     // `tss_segment()` requires `&'static TaskStateSegment`. Leaking `tss` is fine because
     // it will be used until the LVBS kernel resets.
     let tss = Box::leak(tss);

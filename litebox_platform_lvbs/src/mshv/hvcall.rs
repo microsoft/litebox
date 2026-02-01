@@ -28,6 +28,7 @@ use crate::{
 };
 use core::arch::asm;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use thiserror::Error;
 
 #[cfg(debug_assertions)]
 use crate::mshv::HV_REGISTER_VP_INDEX;
@@ -225,36 +226,61 @@ pub fn hv_do_rep_hypercall(
     Ok(rep_comp.into())
 }
 
-/// Error for Hyper-V initialization
-#[derive(Debug, PartialEq)]
+/// Errors for Hyper-V initialization.
+#[derive(Debug, Error, PartialEq)]
+#[non_exhaustive]
 pub enum HypervError {
+    #[error("not running in a virtualized environment")]
     NonVirtualized,
+    #[error("hypervisor is not Hyper-V")]
     NonHyperv,
+    #[error("VTL support not available")]
     NoVTLSupport,
+    #[error("invalid VP assist page")]
     InvalidAssistPage,
+    #[error("invalid guest OS ID")]
     InvalidGuestOSID,
+    #[error("invalid hypercall page")]
     InvalidHypercallPage,
+    #[error("invalid SIEFP page")]
     InvalidSiefpPage,
+    #[error("invalid SIMP page")]
     InvalidSimpPage,
+    #[error("VP setup failed")]
     VPSetupFailed,
+    #[error("unknown Hyper-V error")]
     Unknown,
 }
 
-/// Error for Hyper-V Hypercall
-#[derive(Debug, TryFromPrimitive, IntoPrimitive)]
+/// Errors for Hyper-V hypercalls.
+#[derive(Debug, Error, TryFromPrimitive, IntoPrimitive)]
+#[non_exhaustive]
 #[repr(u32)]
 pub enum HypervCallError {
+    #[error("invalid hypercall code")]
     InvalidCode = HV_STATUS_INVALID_HYPERCALL_CODE,
+    #[error("invalid hypercall input")]
     InvalidInput = HV_STATUS_INVALID_HYPERCALL_INPUT,
+    #[error("invalid alignment")]
     InvalidAlignment = HV_STATUS_INVALID_ALIGNMENT,
+    #[error("invalid parameter")]
     InvalidParameter = HV_STATUS_INVALID_PARAMETER,
+    #[error("access denied")]
     AccessDenied = HV_STATUS_ACCESS_DENIED,
+    #[error("operation denied")]
     OperationDenied = HV_STATUS_OPERATION_DENIED,
+    #[error("insufficient memory")]
     InsufficientMemory = HV_STATUS_INSUFFICIENT_MEMORY,
+    #[error("invalid port ID")]
     InvalidPortID = HV_STATUS_INVALID_PORT_ID,
+    #[error("invalid connection ID")]
     InvalidConnectionID = HV_STATUS_INVALID_CONNECTION_ID,
+    #[error("insufficient buffers")]
     InsufficientBuffers = HV_STATUS_INSUFFICIENT_BUFFERS,
+    #[error("timeout")]
     TimeOut = HV_STATUS_TIME_OUT,
+    #[error("VTL already enabled")]
     AlreadyEnabled = HV_STATUS_VTL_ALREADY_ENABLED,
+    #[error("unknown hypercall error")]
     Unknown = 0xffff_ffff,
 }

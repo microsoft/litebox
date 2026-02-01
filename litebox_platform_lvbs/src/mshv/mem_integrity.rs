@@ -32,6 +32,7 @@ use object::read::pe::PeFile64;
 use rangemap::set::RangeSet;
 use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, signature::Verifier};
 use sha2::{Digest, Sha256, Sha512};
+use thiserror::Error;
 use x86_64::structures::paging::{PageSize, Size4KiB};
 use x509_cert::{
     Certificate,
@@ -73,9 +74,8 @@ pub fn validate_kernel_module_against_elf(
         let Some(target_shdr) = shdrs.iter().find(|s| {
             s.sh_flags & u64::from(SHF_ALLOC) != 0
                 && s.sh_size > 0
-                && usize::try_from(s.sh_name).is_ok()
                 && shdr_strtab
-                    .get(usize::try_from(s.sh_name).unwrap())
+                    .get(s.sh_name as usize)
                     .is_ok_and(|n| n == target_section_name)
         }) else {
             return Err(KernelElfError::SectionNotFound);
@@ -182,10 +182,9 @@ fn identify_direct_relocations(
     if let Some(rela_shdr) = elf_params.shdrs.iter().find(|s| {
         s.sh_size > 0
             && s.sh_type == SHT_RELA
-            && usize::try_from(s.sh_name).is_ok()
             && elf_params
                 .shdr_strtab
-                .get(usize::try_from(s.sh_name).unwrap())
+                .get(s.sh_name as usize)
                 .is_ok_and(|n| n == [".rela", target_section_name].join(""))
     }) {
         let relas = elf_params
@@ -245,10 +244,9 @@ fn identify_indirect_relocations(
     for shdr in elf_params.shdrs.iter().filter(|s| {
         s.sh_size > 0
             && s.sh_type == SHT_RELA
-            && usize::try_from(s.sh_name).is_ok()
             && elf_params
                 .shdr_strtab
-                .get(usize::try_from(s.sh_name).unwrap())
+                .get(s.sh_name as usize)
                 .is_ok_and(is_allowed_rela_section)
     }) {
         let relas = elf_params
@@ -339,9 +337,8 @@ pub fn parse_modinfo(original_elf_data: &[u8]) -> Result<(), KernelElfError> {
     if let Some(shdr) = shdrs.iter().find(|s| {
         s.sh_flags & u64::from(SHF_ALLOC) != 0
             && s.sh_size > 0
-            && usize::try_from(s.sh_name).is_ok()
             && shdr_strtab
-                .get(usize::try_from(s.sh_name).unwrap())
+                .get(s.sh_name as usize)
                 .is_ok_and(|n| n == ".modinfo")
     }) {
         let start = usize::try_from(shdr.sh_offset).map_err(|_| KernelElfError::ElfParseFailed)?;
@@ -674,21 +671,31 @@ pub fn validate_text_patch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch
     // TODO: support other patching methods
 }
 
-/// Error for Kernel ELF validation and relocation failures.
-#[derive(Debug, PartialEq)]
+/// Errors for kernel ELF validation and relocation.
+#[derive(Debug, Error, PartialEq)]
+#[non_exhaustive]
 pub enum KernelElfError {
+    #[error("failed to parse ELF file")]
     ElfParseFailed,
+    #[error("required section not found")]
     SectionNotFound,
 }
 
-/// Errors for module signature verification failures.
-#[derive(Debug, PartialEq)]
+/// Errors for module signature verification.
+#[derive(Debug, Error, PartialEq)]
+#[non_exhaustive]
 pub enum VerificationError {
+    #[error("signature not found in module")]
     SignatureNotFound,
+    #[error("invalid signature format")]
     InvalidSignature,
+    #[error("invalid certificate")]
     InvalidCertificate,
+    #[error("signature authentication failed")]
     AuthenticationFailed,
+    #[error("failed to parse signature data")]
     ParseFailed,
+    #[error("unsupported signature algorithm")]
     Unsupported,
 }
 
