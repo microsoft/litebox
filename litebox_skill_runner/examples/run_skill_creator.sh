@@ -1,3 +1,8 @@
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 #!/bin/bash
 # Example script showing how to run skill-creator with litebox
 # This demonstrates the concept but has known limitations (see README.md)

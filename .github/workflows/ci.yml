@@ -292,6 +292,9 @@ jobs:
           # - `litebox_syscall_rewriter` is allowed to have `std` access since
           #   it is a helper binary that runs in userland to AOT "compile" ELFs.
           #
+          # - `litebox_skill_runner` is allowed to have `std` access since
+          #   it is a helper binary that runs in userland to manage skills.
+          #
           # - `litebox_runner_snp` is `no_std` but requires custom target to build
           #
           # - `dev_tests` is meant to only be used for tests, and thus can
@@ -312,6 +315,7 @@ jobs:
             -not -path './litebox_shim_linux/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
+            -not -path './litebox_skill_runner/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \

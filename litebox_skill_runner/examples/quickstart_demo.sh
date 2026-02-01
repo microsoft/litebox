@@ -1,3 +1,8 @@
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 #!/bin/bash
 # Simple Quick Start Example - Run this to see litebox_skill_runner in action!
 #

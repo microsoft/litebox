@@ -1,3 +1,8 @@
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 #!/bin/bash
 # Complete example for running Python skills in LiteBox
 # This demonstrates the full workflow including syscall rewriting
