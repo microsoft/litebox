@@ -524,8 +524,8 @@ impl Task {
     {
         // Linux limits sendfile to 0x7ffff000 bytes per call
         const MAX_SENDFILE_COUNT: usize = 0x7fff_f000;
-        // Use a reasonably sized buffer for transfers
-        const BUFFER_SIZE: usize = 4096;
+        // Use a larger buffer for better throughput on large transfers
+        const BUFFER_SIZE: usize = 64 * 1024; // 64KB
 
         let count = count.min(MAX_SENDFILE_COUNT);
 
@@ -541,6 +541,8 @@ impl Task {
             None
         };
 
+        // Use a larger buffer for better throughput on large transfers
+        // TODO: Consider zero-copy optimization via platform-level splice for file-to-socket
         let mut buffer = vec![0u8; BUFFER_SIZE];
         let mut total_written = 0usize;
 
@@ -560,11 +562,6 @@ impl Task {
                 }
             };
 
-            // Update offset for next read if using explicit offset
-            if let Some(ref mut off) = offset {
-                *off += read_len;
-            }
-
             // Write to output
             let write_len = match writer(&buffer[..read_len]) {
                 Ok(len) => len,
@@ -576,6 +573,12 @@ impl Task {
                     return Err(e);
                 }
             };
+
+            // Update offset only by the amount actually written (not read)
+            // This ensures correctness on short writes
+            if let Some(ref mut off) = offset {
+                *off = off.checked_add(write_len).ok_or(Errno::EOVERFLOW)?;
+            }
 
             total_written += write_len;
 
