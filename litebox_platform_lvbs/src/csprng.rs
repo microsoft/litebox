@@ -34,6 +34,14 @@ const RESEED_INTERVAL: u64 = 1 << 48;
 /// Maximum number of bytes per request (2^19 bits = 2^16 bytes as per NIST spec)
 const MAX_BYTES_PER_REQUEST: usize = 1 << 16;
 
+/// Minimum entropy input length in bytes (256 bits = 32 bytes)
+/// Per NIST SP 800-90A Section 10.2.1: minimum entropy = security strength = 256 bits for AES-256
+const MIN_ENTROPY_INPUT_LEN: usize = 32;
+
+/// Minimum nonce length in bytes (128 bits = 16 bytes)
+/// Per NIST SP 800-90A Section 8.6.7: minimum nonce = 1/2 security strength = 128 bits for AES-256
+const MIN_NONCE_LEN: usize = 16;
+
 /// AES-CTR DRBG state following NIST SP 800-90A.
 ///
 /// This structure maintains the internal state of the DRBG:
