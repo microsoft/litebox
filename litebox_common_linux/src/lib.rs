@@ -2261,6 +2261,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    Readahead {
+        fd: i32,
+        offset: i64,
+        count: usize,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2800,6 +2805,15 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::readahead => sys_req!(Readahead { fd, offset, count }),
+            #[cfg(target_arch = "x86")]
+            Sysno::readahead => sys_req!(Readahead {
+                fd,
+                // On 32-bit, offset is passed as two 32-bit values (low, high)
+                offset: { ctx.sys_req_arg::<i64>(1) | ((ctx.sys_req_arg::<i64>(2)) << 32) },
+                count: { ctx.sys_req_arg::<usize>(3) },
+            }),
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

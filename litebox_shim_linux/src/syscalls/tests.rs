@@ -584,3 +584,143 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+// ========================= readahead tests =========================
+
+#[test]
+fn test_readahead_basic() {
+    let task = init_platform(None);
+
+    // Create a test file
+    let test_file = "/readahead_test.txt";
+    let fd = task
+        .sys_open(
+            test_file,
+            OFlags::CREAT | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd_i32 = i32::try_from(fd).unwrap();
+
+    // Write some data to the file
+    let data = b"Hello, readahead test!";
+    task.sys_write(fd_i32, data, None)
+        .expect("Failed to write to file");
+
+    // readahead should succeed on a regular file (returns 0)
+    let result = task.sys_readahead(fd_i32, 0, 1024);
+    assert_eq!(result, Ok(()), "readahead should succeed on regular file");
+
+    // readahead with offset and count should also succeed
+    let result = task.sys_readahead(fd_i32, 10, 5);
+    assert_eq!(
+        result,
+        Ok(()),
+        "readahead with offset and count should succeed"
+    );
+
+    // Clean up
+    task.sys_close(fd_i32).expect("Failed to close file");
+}
+
+#[test]
+fn test_readahead_invalid_fd() {
+    let task = init_platform(None);
+
+    // readahead on invalid fd should return EBADF
+    let result = task.sys_readahead(-1, 0, 1024);
+    assert_eq!(
+        result,
+        Err(Errno::EBADF),
+        "readahead on invalid fd should return EBADF"
+    );
+
+    // readahead on non-existent fd should return EBADF
+    let result = task.sys_readahead(9999, 0, 1024);
+    assert_eq!(
+        result,
+        Err(Errno::EBADF),
+        "readahead on non-existent fd should return EBADF"
+    );
+}
+
+#[test]
+fn test_readahead_closed_fd() {
+    let task = init_platform(None);
+
+    // Create and close a file
+    let test_file = "/readahead_closed_test.txt";
+    let fd = task
+        .sys_open(
+            test_file,
+            OFlags::CREAT | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd_i32 = i32::try_from(fd).unwrap();
+    task.sys_close(fd_i32).expect("Failed to close file");
+
+    // readahead on closed fd should return EBADF
+    let result = task.sys_readahead(fd_i32, 0, 1024);
+    assert_eq!(
+        result,
+        Err(Errno::EBADF),
+        "readahead on closed fd should return EBADF"
+    );
+}
+
+#[test]
+fn test_readahead_eventfd() {
+    let task = init_platform(None);
+
+    // Create an eventfd
+    let fd = task
+        .sys_eventfd2(0, EfdFlags::CLOEXEC)
+        .expect("Failed to create eventfd");
+    let fd_i32 = i32::try_from(fd).unwrap();
+
+    // readahead on eventfd should return EINVAL
+    let result = task.sys_readahead(fd_i32, 0, 1024);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "readahead on eventfd should return EINVAL"
+    );
+
+    // Clean up
+    task.sys_close(fd_i32).expect("Failed to close eventfd");
+}
+
+#[test]
+fn test_readahead_pipe() {
+    let task = init_platform(None);
+
+    // Create a pipe
+    let pipe_fds = task
+        .sys_pipe2(OFlags::CLOEXEC)
+        .expect("Failed to create pipe");
+    let read_fd = i32::try_from(pipe_fds.0).unwrap();
+    let write_fd = i32::try_from(pipe_fds.1).unwrap();
+
+    // readahead on pipe read end should return EINVAL
+    let result = task.sys_readahead(read_fd, 0, 1024);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "readahead on pipe should return EINVAL"
+    );
+
+    // readahead on pipe write end should also return EINVAL
+    let result = task.sys_readahead(write_fd, 0, 1024);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "readahead on pipe should return EINVAL"
+    );
+
+    // Clean up
+    task.sys_close(read_fd)
+        .expect("Failed to close pipe read end");
+    task.sys_close(write_fd)
+        .expect("Failed to close pipe write end");
+}

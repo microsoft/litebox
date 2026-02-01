@@ -22,7 +22,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
-use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, MutPtr, Task};
+use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, MutPtr, StrongFd, Task};
 use core::sync::atomic::Ordering;
 
 /// Task state shared by `CLONE_FS`.
@@ -1920,5 +1920,62 @@ impl Task {
             |_fd| todo!("net"),
             |_fd| todo!("pipes"),
         )?
+    }
+
+    /// Handle syscall `readahead`
+    ///
+    /// Initiates readahead on a file so that subsequent reads from that file
+    /// will be satisfied from the cache. Since LiteBox uses a virtual filesystem
+    /// without a traditional page cache, this is implemented as a validated no-op.
+    ///
+    /// # Arguments
+    /// * `fd` - File descriptor identifying the file to be read
+    /// * `offset` - Starting point from which data is to be read (ignored)
+    /// * `count` - Number of bytes to be read (ignored)
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(EBADF)` if fd is invalid or not open for reading
+    /// * `Err(EINVAL)` if fd does not refer to a regular file
+    #[expect(unused_variables, reason = "offset and count are intentionally unused")]
+    pub fn sys_readahead(&self, fd: i32, offset: i64, count: usize) -> Result<(), Errno> {
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let files = self.files.borrow();
+        let locked_fds = files.file_descriptors.read();
+        let desc = locked_fds.get_fd(fd).ok_or(Errno::EBADF)?;
+
+        // Validate that the file descriptor refers to a regular file
+        match desc {
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                // Check if it's a regular file by using the StrongFd helper
+                // which can distinguish between filesystem, network, and pipe fds
+                match StrongFd::from_raw(&files, *raw_fd) {
+                    Ok(StrongFd::FileSystem(_)) => {
+                        // Regular files support readahead (as a no-op hint)
+                        Ok(())
+                    }
+                    Ok(StrongFd::Network(_)) => {
+                        // Network sockets don't support readahead
+                        Err(Errno::EINVAL)
+                    }
+                    Ok(StrongFd::Pipes(_)) => {
+                        // Pipes don't support readahead
+                        Err(Errno::EINVAL)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Descriptor::Unix { .. } => {
+                // Unix domain sockets don't support readahead
+                Err(Errno::EINVAL)
+            }
+            Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } => {
+                // Special file descriptors don't support readahead
+                Err(Errno::EINVAL)
+            }
+        }
     }
 }
