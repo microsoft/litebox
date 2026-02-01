@@ -1130,6 +1130,13 @@ impl Task {
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
+            SyscallRequest::Utimensat {
+                dirfd,
+                pathname,
+                times,
+                flags,
+            } => syscall!(sys_utimensat(dirfd, pathname, times, flags)),
+            SyscallRequest::Futimens { fd, times } => syscall!(sys_futimens(fd, times)),
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)

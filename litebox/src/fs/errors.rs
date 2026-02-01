@@ -203,6 +203,23 @@ pub enum PathError {
     ComponentNotADirectory,
 }
 
+/// Possible errors from [`FileSystem::set_times`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SetTimesError {
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error(
+        "the effective UID does not match the owner of the file, \
+         and the process is not privileged"
+    )]
+    NotPermitted,
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 impl From<crate::path::ConversionError> for PathError {
     fn from(_value: crate::path::ConversionError) -> Self {
         Self::InvalidPathname

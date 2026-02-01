@@ -24,7 +24,7 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, RmdirError, SeekError, SetTimesError, TruncateError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -136,6 +136,56 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
 
     /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
     fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
+
+    /// Set the access and modification times of a file.
+    ///
+    /// This is used by `utimensat(2)` and `futimens(3)` syscalls.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the file
+    /// * `atime` - Access time to set, or None to leave unchanged
+    /// * `mtime` - Modification time to set, or None to leave unchanged
+    ///
+    /// # Note
+    /// The default implementation is a no-op that returns Ok(()), since not all
+    /// filesystems track timestamps. Filesystems that do track timestamps should
+    /// override this method.
+    ///
+    /// TODO: Currently permission checks are not enforced. Linux requires either:
+    /// - Write access to the file (for setting to current time)
+    /// - Ownership or CAP_FOWNER (for setting arbitrary times)
+    fn set_times(
+        &self,
+        _path: impl path::Arg,
+        _atime: Option<core::time::Duration>,
+        _mtime: Option<core::time::Duration>,
+    ) -> Result<(), SetTimesError> {
+        // Default implementation: no-op since timestamps are not tracked in all filesystems.
+        // This allows basic compatibility without requiring all filesystems to implement
+        // timestamp tracking.
+        Ok(())
+    }
+
+    /// Set the access and modification times of a file by file descriptor.
+    ///
+    /// This is used by `futimens(3)` syscall when operating on an open fd.
+    ///
+    /// # Arguments
+    /// * `fd` - File descriptor of the file
+    /// * `atime` - Access time to set, or None to leave unchanged
+    /// * `mtime` - Modification time to set, or None to leave unchanged
+    ///
+    /// # Note
+    /// The default implementation is a no-op. See [`Self::set_times`] for details.
+    fn fd_set_times(
+        &self,
+        _fd: &TypedFd<Self>,
+        _atime: Option<core::time::Duration>,
+        _mtime: Option<core::time::Duration>,
+    ) -> Result<(), SetTimesError> {
+        // Default implementation: no-op since timestamps are not tracked in all filesystems.
+        Ok(())
+    }
 }
 
 bitflags! {

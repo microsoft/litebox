@@ -851,6 +851,45 @@ impl From<Duration> for Timespec32 {
     }
 }
 
+/// Special value for `tv_nsec` in `Timespec` to indicate the timestamp should be set to the
+/// current time. Used with `utimensat(2)` and `futimens(3)`.
+///
+/// From Linux: `((1l << 30) - 1l)` = 0x3fffffff
+pub const UTIME_NOW: i64 = 0x3fffffff;
+
+/// Special value for `tv_nsec` in `Timespec` to indicate the timestamp should be left unchanged.
+/// Used with `utimensat(2)` and `futimens(3)`.
+///
+/// From Linux: `((1l << 30) - 2l)` = 0x3ffffffe
+pub const UTIME_OMIT: i64 = 0x3ffffffe;
+
+// Unsigned versions of UTIME constants for comparison with u64 tv_nsec
+const UTIME_NOW_U64: u64 = UTIME_NOW as u64;
+const UTIME_OMIT_U64: u64 = UTIME_OMIT as u64;
+
+impl Timespec {
+    /// Check if this timespec indicates UTIME_NOW (set to current time).
+    #[inline]
+    pub fn is_utime_now(&self) -> bool {
+        self.tv_nsec == UTIME_NOW_U64
+    }
+
+    /// Check if this timespec indicates UTIME_OMIT (leave unchanged).
+    #[inline]
+    pub fn is_utime_omit(&self) -> bool {
+        self.tv_nsec == UTIME_OMIT_U64
+    }
+
+    /// Check if the nanoseconds field is valid (either a valid nsec value or UTIME_NOW/UTIME_OMIT).
+    /// Valid nsec values are in range 0..=999_999_999.
+    #[inline]
+    pub fn is_valid_for_utimensat(&self) -> bool {
+        self.tv_nsec == UTIME_NOW_U64
+            || self.tv_nsec == UTIME_OMIT_U64
+            || self.tv_nsec <= 999_999_999
+    }
+}
+
 #[repr(C)]
 #[derive(Default, Clone, Copy, FromBytes, IntoBytes)]
 pub struct TimeVal {
@@ -2261,6 +2300,30 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    /// Set file access and modification times with nanosecond precision.
+    ///
+    /// If `times` is None, both timestamps are set to the current time.
+    /// Special values UTIME_NOW and UTIME_OMIT can be used in `tv_nsec` to set
+    /// the timestamp to current time or leave it unchanged, respectively.
+    Utimensat {
+        /// Directory file descriptor (or AT_FDCWD for current working directory)
+        dirfd: i32,
+        /// Path to the file (relative to dirfd if not absolute)
+        pathname: Option<Platform::RawConstPointer<i8>>,
+        /// Array of two Timespec structures: [atime, mtime]
+        times: Option<Platform::RawConstPointer<Timespec>>,
+        /// Flags (e.g., AT_SYMLINK_NOFOLLOW)
+        flags: AtFlags,
+    },
+    /// Set file access and modification times on an open file descriptor.
+    ///
+    /// Equivalent to `utimensat(fd, NULL, times, 0)` but operates on an open fd.
+    Futimens {
+        /// File descriptor of the file to modify
+        fd: i32,
+        /// Array of two Timespec structures: [atime, mtime]
+        times: Option<Platform::RawConstPointer<Timespec>>,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2800,6 +2863,22 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            // utimensat: set file timestamps with nanosecond precision
+            Sysno::utimensat => SyscallRequest::Utimensat {
+                dirfd: ctx.sys_req_arg(0),
+                pathname: ctx.sys_req_ptr(1),
+                times: ctx.sys_req_ptr(2),
+                flags: ctx.sys_req_arg(3),
+            },
+            // futimens is not a syscall on Linux x86_64 - it's a libc wrapper around utimensat.
+            // However, on some architectures it might be a syscall, so we handle it if present.
+            #[cfg(target_arch = "x86")]
+            Sysno::utimensat_time64 => SyscallRequest::Utimensat {
+                dirfd: ctx.sys_req_arg(0),
+                pathname: ctx.sys_req_ptr(1),
+                times: ctx.sys_req_ptr(2),
+                flags: ctx.sys_req_arg(3),
+            },
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

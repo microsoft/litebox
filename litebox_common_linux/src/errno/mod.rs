@@ -558,3 +558,16 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
         }
     }
 }
+
+impl From<litebox::fs::errors::SetTimesError> for Errno {
+    fn from(value: litebox::fs::errors::SetTimesError) -> Self {
+        match value {
+            litebox::fs::errors::SetTimesError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::SetTimesError::NotPermitted => Errno::EPERM,
+            litebox::fs::errors::SetTimesError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::SetTimesError::PathError(e) => e.into(),
+            // Catch any future variants - default to a generic I/O error
+            _ => Errno::EIO,
+        }
+    }
+}

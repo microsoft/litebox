@@ -1921,4 +1921,230 @@ impl Task {
             |_fd| todo!("pipes"),
         )?
     }
+
+    /// Handle syscall `utimensat`
+    ///
+    /// Set file access and modification times with nanosecond precision.
+    ///
+    /// # Arguments
+    /// * `dirfd` - Directory file descriptor (or AT_FDCWD for current working directory)
+    /// * `pathname` - Path to the file (can be None with AT_EMPTY_PATH flag)
+    /// * `times` - Pointer to array of two Timespec structures [atime, mtime], or None to set both to current time
+    /// * `flags` - Flags (e.g., AT_SYMLINK_NOFOLLOW)
+    ///
+    /// # Special values for tv_nsec
+    /// * UTIME_NOW (0x3fffffff): Set timestamp to current time
+    /// * UTIME_OMIT (0x3ffffffe): Leave timestamp unchanged
+    pub fn sys_utimensat(
+        &self,
+        dirfd: i32,
+        pathname: Option<ConstPtr<i8>>,
+        times: Option<ConstPtr<litebox_common_linux::Timespec>>,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        use litebox::fs::FileSystem as _;
+        use litebox::platform::RawConstPointer;
+
+        // Validate flags - only AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH are valid for utimensat
+        let valid_flags = AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+        if flags.contains(valid_flags.complement()) {
+            return Err(Errno::EINVAL);
+        }
+
+        // Read and validate the times array if provided
+        let (atime, mtime) = if let Some(times_ptr) = times {
+            // Read two Timespec structures using read_at_offset
+            let atime_spec = times_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let mtime_spec = times_ptr.read_at_offset(1).ok_or(Errno::EFAULT)?;
+
+            // Validate nanosecond fields
+            if !atime_spec.is_valid_for_utimensat() || !mtime_spec.is_valid_for_utimensat() {
+                return Err(Errno::EINVAL);
+            }
+
+            // If both are UTIME_OMIT, we don't need to do anything (Linux kernel optimization)
+            if atime_spec.is_utime_omit() && mtime_spec.is_utime_omit() {
+                return Ok(());
+            }
+
+            // Convert to Duration options
+            let atime = self.timespec_to_duration(&atime_spec)?;
+            let mtime = self.timespec_to_duration(&mtime_spec)?;
+
+            (atime, mtime)
+        } else {
+            // times is NULL: set both timestamps to current time
+            let now = self.get_current_time();
+            (Some(now), Some(now))
+        };
+
+        // Handle the path resolution based on pathname and flags
+        if let Some(path_ptr) = pathname {
+            // Read the pathname using to_cstring
+            let path_cstr = path_ptr.to_cstring().ok_or(Errno::EFAULT)?;
+            let path_str = path_cstr.to_str().map_err(|_| Errno::EINVAL)?;
+
+            if path_str.is_empty() && !flags.contains(AtFlags::AT_EMPTY_PATH) {
+                return Err(Errno::ENOENT);
+            }
+
+            let fs_path = FsPath::new(dirfd, path_str)?;
+
+            // TODO: AT_SYMLINK_NOFOLLOW handling - currently we don't fully support symlinks
+            // so this flag is effectively ignored. When symlink support is added,
+            // this flag should control whether we operate on the symlink or its target.
+            let _follow_symlinks = !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
+
+            match fs_path {
+                FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
+                    self.global.fs.set_times(path, atime, mtime)?;
+                }
+                FsPath::Cwd => {
+                    self.global.fs.set_times("", atime, mtime)?;
+                }
+                FsPath::Fd(fd) => {
+                    // AT_EMPTY_PATH case: operate on the fd itself
+                    self.do_fd_set_times(fd as usize, atime, mtime)?;
+                }
+                FsPath::FdRelative { fd: _, path } => {
+                    // TODO: Implement relative path resolution from fd
+                    // For now, if the path is absolute, use it directly
+                    if path.starts_with('/') {
+                        self.global.fs.set_times(path, atime, mtime)?;
+                    } else {
+                        // Relative to fd - not yet implemented
+                        return Err(Errno::ENOSYS);
+                    }
+                }
+            }
+        } else {
+            // pathname is NULL: operate on the file referred to by dirfd
+            // This is only valid if dirfd is a valid file descriptor
+            if dirfd == litebox_common_linux::AT_FDCWD {
+                return Err(Errno::EFAULT);
+            }
+            let fd = usize::try_from(dirfd).map_err(|_| Errno::EBADF)?;
+            self.do_fd_set_times(fd, atime, mtime)?;
+        }
+
+        Ok(())
+    }
+
+    /// Handle syscall `futimens`
+    ///
+    /// Set file access and modification times on an open file descriptor.
+    /// This is equivalent to `utimensat(fd, NULL, times, 0)`.
+    ///
+    /// # Arguments
+    /// * `fd` - File descriptor of the file to modify
+    /// * `times` - Pointer to array of two Timespec structures [atime, mtime], or None to set both to current time
+    pub fn sys_futimens(
+        &self,
+        fd: i32,
+        times: Option<ConstPtr<litebox_common_linux::Timespec>>,
+    ) -> Result<(), Errno> {
+        use litebox::platform::RawConstPointer;
+
+        // Read and validate the times array if provided
+        let (atime, mtime) = if let Some(times_ptr) = times {
+            // Read two Timespec structures using read_at_offset
+            let atime_spec = times_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let mtime_spec = times_ptr.read_at_offset(1).ok_or(Errno::EFAULT)?;
+
+            // Validate nanosecond fields
+            if !atime_spec.is_valid_for_utimensat() || !mtime_spec.is_valid_for_utimensat() {
+                return Err(Errno::EINVAL);
+            }
+
+            // If both are UTIME_OMIT, we don't need to do anything
+            if atime_spec.is_utime_omit() && mtime_spec.is_utime_omit() {
+                return Ok(());
+            }
+
+            // Convert to Duration options
+            let atime = self.timespec_to_duration(&atime_spec)?;
+            let mtime = self.timespec_to_duration(&mtime_spec)?;
+
+            (atime, mtime)
+        } else {
+            // times is NULL: set both timestamps to current time
+            let now = self.get_current_time();
+            (Some(now), Some(now))
+        };
+
+        // Get the file descriptor and set times
+        let fd_usize = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        self.do_fd_set_times(fd_usize, atime, mtime)?;
+
+        Ok(())
+    }
+
+    /// Helper to set times on a file descriptor, dispatching to the appropriate subsystem.
+    fn do_fd_set_times(
+        &self,
+        fd: usize,
+        atime: Option<core::time::Duration>,
+        mtime: Option<core::time::Duration>,
+    ) -> Result<(), Errno> {
+        use litebox::fs::FileSystem as _;
+
+        let files = self.files.borrow();
+        files.run_on_raw_fd(
+            fd,
+            |typed_fd| {
+                self.global
+                    .fs
+                    .fd_set_times(typed_fd, atime, mtime)
+                    .map_err(Errno::from)
+            },
+            // Network fds don't support setting times
+            |_| Err(Errno::ENOENT),
+            // Pipe fds don't support setting times
+            |_| Err(Errno::ENOENT),
+        )?
+    }
+
+    /// Helper to convert a Timespec to an optional Duration, handling UTIME_NOW and UTIME_OMIT.
+    ///
+    /// Returns:
+    /// * `Ok(Some(duration))` - Use this specific time
+    /// * `Ok(None)` - UTIME_OMIT: leave timestamp unchanged
+    /// * UTIME_NOW is converted to current time
+    fn timespec_to_duration(
+        &self,
+        ts: &litebox_common_linux::Timespec,
+    ) -> Result<Option<core::time::Duration>, Errno> {
+        use core::time::Duration;
+        use litebox::utils::TruncateExt;
+
+        if ts.is_utime_omit() {
+            Ok(None)
+        } else if ts.is_utime_now() {
+            Ok(Some(self.get_current_time()))
+        } else {
+            // Regular timestamp - convert to Duration
+            // Note: tv_sec can be negative on Linux, but Duration only supports non-negative values.
+            // For timestamps before Unix epoch, we return EINVAL (this matches common behavior).
+            if ts.tv_sec < 0 {
+                return Err(Errno::EINVAL);
+            }
+            // SAFETY: We checked that tv_sec is non-negative above
+            let secs = u64::try_from(ts.tv_sec).map_err(|_| Errno::EINVAL)?;
+            // SAFETY: tv_nsec is validated to be in [0, 999999999] by is_valid_for_utimensat()
+            let nsecs = ts.tv_nsec.truncate();
+            Ok(Some(Duration::new(secs, nsecs)))
+        }
+    }
+
+    /// Get the current time as a Duration since Unix epoch.
+    fn get_current_time(&self) -> core::time::Duration {
+        use litebox::platform::{SystemTime as _, TimeProvider};
+        // Get the current real time from the platform
+        let now = self.global.platform.current_time();
+        let unix_epoch =
+            <litebox_platform_multiplex::Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
+        // Calculate duration since Unix epoch - this is the wall-clock time
+        now.duration_since(&unix_epoch)
+            .expect("current time should be after unix epoch")
+    }
 }
