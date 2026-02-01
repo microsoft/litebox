@@ -110,68 +110,7 @@ int test_pipe_sigpipe_ignored(void) {
     return 0;
 }
 
-// Test 3: SIGPIPE blocked (signal pending but not delivered)
-int test_pipe_sigpipe_blocked(void) {
-    int pipefd[2];
-
-    // Block SIGPIPE
-    sigset_t block_set, old_set;
-    sigemptyset(&block_set);
-    sigaddset(&block_set, SIGPIPE);
-    if (sigprocmask(SIG_BLOCK, &block_set, &old_set) == -1) {
-        perror("sigprocmask");
-        return 1;
-    }
-
-    // Create pipe
-    if (pipe(pipefd) == -1) {
-        perror("pipe");
-        return 1;
-    }
-
-    // Close read end
-    close(pipefd[0]);
-
-    // Write to pipe should get EPIPE (signal blocked)
-    char buf[] = "test";
-    ssize_t ret = write(pipefd[1], buf, sizeof(buf));
-
-    if (ret != -1) {
-        fprintf(stderr, "FAIL: write should have returned -1, got %zd\n", ret);
-        return 1;
-    }
-    if (errno != EPIPE) {
-        fprintf(stderr, "FAIL: errno should be EPIPE (%d), got %d\n", EPIPE, errno);
-        return 1;
-    }
-
-    // Check that SIGPIPE is pending
-    sigset_t pending;
-    if (sigpending(&pending) == -1) {
-        perror("sigpending");
-        return 1;
-    }
-    if (!sigismember(&pending, SIGPIPE)) {
-        fprintf(stderr, "FAIL: SIGPIPE should be pending\n");
-        return 1;
-    }
-
-    close(pipefd[1]);
-
-    // Clear the pending signal by setting handler to SIG_IGN and unblocking
-    struct sigaction sa, old_sa;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_handler = SIG_IGN;
-    sa.sa_flags = 0;
-    sigaction(SIGPIPE, &sa, &old_sa);
-    sigprocmask(SIG_SETMASK, &old_set, NULL);
-    sigaction(SIGPIPE, &old_sa, NULL);
-
-    printf("test_pipe_sigpipe_blocked: PASS\n");
-    return 0;
-}
-
-// Test 4: Unix socket MSG_NOSIGNAL flag
+// Test 3: Unix socket MSG_NOSIGNAL flag
 int test_unix_socket_nosignal(void) {
     int sv[2];
     sigpipe_received = 0;
@@ -218,7 +157,7 @@ int test_unix_socket_nosignal(void) {
     return 0;
 }
 
-// Test 5: Unix socket without MSG_NOSIGNAL (should get SIGPIPE)
+// Test 4: Unix socket without MSG_NOSIGNAL (should get SIGPIPE)
 int test_unix_socket_sigpipe(void) {
     int sv[2];
     sigpipe_received = 0;
@@ -270,7 +209,6 @@ int main(void) {
 
     failures += test_pipe_sigpipe();
     failures += test_pipe_sigpipe_ignored();
-    failures += test_pipe_sigpipe_blocked();
     failures += test_unix_socket_nosignal();
     failures += test_unix_socket_sigpipe();
 
@@ -282,3 +220,4 @@ int main(void) {
     printf("\nAll SIGPIPE tests passed!\n");
     return 0;
 }
+

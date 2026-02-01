@@ -1359,11 +1359,10 @@ impl Task {
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                // Unix socket handles SIGPIPE internally
                 file.sendto(self, &buf, flags, addr)
             },
         );
-        // Send SIGPIPE for INET sockets on EPIPE (Unix sockets handle it internally)
+        // Send SIGPIPE on EPIPE for both INET and Unix sockets (unless MSG_NOSIGNAL is set)
         if let Err(Errno::EPIPE) = ret
             && !flags.contains(SendFlags::NOSIGNAL)
         {
