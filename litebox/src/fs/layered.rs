@@ -450,7 +450,8 @@ impl<
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK
             | OFlags::LARGEFILE
-            | OFlags::NOFOLLOW;
+            | OFlags::NOFOLLOW
+            | OFlags::APPEND;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }
@@ -763,7 +764,7 @@ impl<
         // Writing needs to be careful of how it is performing the write. Any upper-level file can
         // instantly be written to; but a lower-level file must become a upper-level file, before
         // actually being written to.
-        let (entry, path) = self
+        let (entry, path, is_append) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |descriptor| {
@@ -775,14 +776,37 @@ impl<
                     Ok((
                         Arc::clone(&descriptor.entry.entry),
                         descriptor.entry.path.clone(),
+                        descriptor.entry.flags.contains(OFlags::APPEND),
                     ))
                 }
             })
             .ok_or(WriteError::ClosedFd)
             .flatten()?;
+
+        // For O_APPEND, seek to end before writing (only for writes without explicit offset)
+        let write_offset = if is_append && offset.is_none() {
+            match entry.as_ref() {
+                EntryX::Upper { fd: upper_fd } => {
+                    // Get file size and use it as offset
+                    self.upper
+                        .fd_file_status(upper_fd)
+                        .map(|status| Some(status.size))
+                        .unwrap_or(None)
+                }
+                EntryX::Lower { fd: lower_fd } => self
+                    .lower
+                    .fd_file_status(lower_fd)
+                    .map(|status| Some(status.size))
+                    .unwrap_or(None),
+                EntryX::Tombstone => None,
+            }
+        } else {
+            offset
+        };
+
         match entry.as_ref() {
             EntryX::Upper { fd: upper_fd } => {
-                let num_bytes = self.upper.write(upper_fd, buf, offset)?;
+                let num_bytes = self.upper.write(upper_fd, buf, write_offset)?;
                 self.litebox
                     .descriptor_table()
                     .get_entry(fd)
@@ -799,7 +823,7 @@ impl<
                     }
                     LayeringSemantics::LowerLayerWritableFiles => {
                         // Allow direct write to lower layer
-                        let num_bytes = self.lower.write(lower_fd, buf, offset)?;
+                        let num_bytes = self.lower.write(lower_fd, buf, write_offset)?;
                         if let Some(e) = self.litebox.descriptor_table().get_entry(fd) {
                             e.entry.position.fetch_add(num_bytes, SeqCst);
                         }

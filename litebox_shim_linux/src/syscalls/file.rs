@@ -481,14 +481,13 @@ impl Task {
         let locked_file_descriptors = files.file_descriptors.read();
         let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
         let mut total_read = 0;
-        let mut kernel_buffer = vec![
-            0u8;
-            iovs.iter()
-                .map(|i| i.iov_len)
-                .max()
-                .unwrap_or_default()
-                .min(super::super::MAX_KERNEL_BUF_SIZE)
-        ];
+        let max_buf_size = iovs
+            .iter()
+            .map(|i| i.iov_len)
+            .max()
+            .unwrap_or_default()
+            .min(super::super::MAX_KERNEL_BUF_SIZE);
+        let mut kernel_buffer = vec![0u8; max_buf_size];
         for iov in iovs {
             if iov.iov_len == 0 {
                 continue;
@@ -496,6 +495,8 @@ impl Task {
             let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
                 return Err(Errno::EINVAL);
             };
+            // Limit kernel buffer to this iov's length to avoid reading more than needed
+            let read_len = iov.iov_len.min(kernel_buffer.len());
             // TODO: The data transfers performed by readv() and writev() are atomic: the data
             // written by writev() is written as a single block that is not intermingled with
             // output from writes in other processes
@@ -506,7 +507,7 @@ impl Task {
                         |fd| {
                             self.global
                                 .fs
-                                .read(fd, &mut kernel_buffer, None)
+                                .read(fd, &mut kernel_buffer[..read_len], None)
                                 .map_err(Errno::from)
                         },
                         |_fd| todo!("net"),
