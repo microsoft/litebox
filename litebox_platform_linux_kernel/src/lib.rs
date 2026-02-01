@@ -485,7 +485,9 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
 
 impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
     fn get_syscall_entry_point(&self) -> usize {
-        todo!()
+        // Currently this is only used in ELF loader to fix trampoline code.
+        // When running in kernel mode, we don't need a syscall trampoline.
+        0
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
