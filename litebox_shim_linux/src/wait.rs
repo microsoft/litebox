@@ -37,6 +37,9 @@ impl Task {
     #[must_use]
     pub(crate) fn prepare_to_run_guest(&self, ctx: &mut litebox_common_linux::PtRegs) -> bool {
         self.wait_state.0.prepare_to_run_guest(|| {
+            // Check for expired interval timers before processing signals.
+            // This ensures SIGALRM is queued before we deliver signals.
+            self.check_timer_expiration();
             self.process_signals(ctx);
             !self.is_exiting()
         })

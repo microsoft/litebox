@@ -55,6 +55,7 @@ pub(crate) struct ThreadState {
 unsafe impl Send for ThreadState {}
 
 impl ThreadState {
+    #[expect(clippy::arc_with_non_send_sync)]
     pub fn new_process(pid: i32) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
@@ -125,6 +126,28 @@ pub(crate) struct Process {
     inner: Mutex<Platform, ProcessInner>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits,
+    /// Interval timer for ITIMER_REAL.
+    ///
+    /// This timer uses wall-clock time and delivers SIGALRM when it expires.
+    /// We only support ITIMER_REAL because ITIMER_VIRTUAL and ITIMER_PROF
+    /// require tracking CPU time per-process, which is complex and rarely used.
+    ///
+    /// The timer is checked on syscall boundaries rather than using a background
+    /// thread. This simplifies the implementation and avoids complex synchronization,
+    /// though it means very short timers may be delayed if the process is blocked
+    /// in a long syscall.
+    pub(crate) real_timer: Cell<Option<RealIntervalTimer>>,
+}
+
+/// State for ITIMER_REAL interval timer.
+///
+/// This timer counts down in wall-clock time and delivers SIGALRM when it expires.
+#[derive(Clone, Copy)]
+pub(crate) struct RealIntervalTimer {
+    /// Absolute monotonic time when the timer should next fire.
+    pub(crate) expiration: <Platform as TimeProvider>::Instant,
+    /// Interval for repeating timers. If None, this is a one-shot timer.
+    pub(crate) interval: Option<Duration>,
 }
 
 /// The locked portion of the process state.
@@ -160,6 +183,7 @@ impl Process {
                 threads: BTreeMap::from_iter([(pid, remote)]),
             }),
             limits: ResourceLimits::default(),
+            real_timer: Cell::new(None),
         }
     }
 
@@ -1170,6 +1194,168 @@ impl Task {
     /// Handle syscall `getegid`.
     pub(crate) fn sys_getegid(&self) -> u32 {
         self.credentials.egid
+    }
+
+    /// Handle syscall `alarm`.
+    ///
+    /// Sets an alarm clock for delivery of SIGALRM. If `seconds` is non-zero,
+    /// arranges for SIGALRM to be delivered after `seconds` wall-clock seconds.
+    /// If `seconds` is zero, any pending alarm is canceled.
+    ///
+    /// Returns the number of seconds remaining until any previously scheduled
+    /// alarm was due to be delivered, or zero if there was no previously
+    /// scheduled alarm.
+    #[expect(clippy::cast_possible_truncation)]
+    pub(crate) fn sys_alarm(&self, seconds: u32) -> u32 {
+        let process = self.process();
+        let old_timer = process.real_timer.get();
+
+        // Calculate remaining time from old timer (rounded up to seconds)
+        let remaining = if let Some(timer) = old_timer {
+            let now = self.global.platform.now();
+            if now < timer.expiration {
+                let remaining_duration = timer.expiration.duration_since(&now);
+                // Round up: any partial second counts as a full second
+                let secs = remaining_duration.as_secs();
+                let remaining_secs = if remaining_duration.subsec_nanos() > 0 {
+                    secs.saturating_add(1)
+                } else {
+                    secs
+                };
+                // Clamp to u32::MAX (truncation is intentional)
+                remaining_secs.min(u64::from(u32::MAX)) as u32
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        if seconds == 0 {
+            // Cancel any existing timer
+            process.real_timer.set(None);
+        } else {
+            // Set a new one-shot timer
+            let now = self.global.platform.now();
+            if let Some(expiration) = now.checked_add(Duration::from_secs(u64::from(seconds))) {
+                process.real_timer.set(Some(RealIntervalTimer {
+                    expiration,
+                    interval: None,
+                }));
+            } else {
+                // Overflow, set to max possible time (effectively no timer)
+                process.real_timer.set(None);
+            }
+        }
+
+        remaining
+    }
+
+    /// Handle syscall `setitimer`.
+    ///
+    /// Sets the value of an interval timer. Only ITIMER_REAL is supported,
+    /// which counts down in wall-clock time and delivers SIGALRM on expiration.
+    ///
+    /// ITIMER_VIRTUAL and ITIMER_PROF are not supported because they require
+    /// tracking CPU time per-process, which is complex and rarely used.
+    pub(crate) fn sys_setitimer(
+        &self,
+        which: litebox_common_linux::IntervalTimer,
+        new_value: crate::ConstPtr<litebox_common_linux::ItimerVal>,
+        old_value: Option<crate::MutPtr<litebox_common_linux::ItimerVal>>,
+    ) -> Result<(), Errno> {
+        // Only ITIMER_REAL is supported
+        if which != litebox_common_linux::IntervalTimer::Real {
+            // ITIMER_VIRTUAL and ITIMER_PROF require tracking CPU time,
+            // which we don't currently support.
+            return Err(Errno::EINVAL);
+        }
+
+        let process = self.process();
+        let old_timer = process.real_timer.get();
+        let now = self.global.platform.now();
+
+        // Write old value if requested
+        if let Some(old_value_ptr) = old_value {
+            let old_itimerval = if let Some(timer) = old_timer {
+                let remaining = if now < timer.expiration {
+                    timer.expiration.duration_since(&now)
+                } else {
+                    Duration::ZERO
+                };
+                let interval = timer.interval.unwrap_or(Duration::ZERO);
+                litebox_common_linux::ItimerVal::new(interval, remaining)
+            } else {
+                litebox_common_linux::ItimerVal::zero()
+            };
+            old_value_ptr
+                .write_at_offset(0, old_itimerval)
+                .ok_or(Errno::EFAULT)?;
+        }
+
+        // Read new value
+        let new_itimerval = new_value.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let new_interval = new_itimerval.interval()?;
+        let new_value_duration = new_itimerval.value()?;
+
+        // Set new timer
+        if new_value_duration.is_zero() {
+            // Disarm the timer
+            process.real_timer.set(None);
+        } else {
+            // Arm the timer
+            if let Some(expiration) = now.checked_add(new_value_duration) {
+                let interval = if new_interval.is_zero() {
+                    None
+                } else {
+                    Some(new_interval)
+                };
+                process.real_timer.set(Some(RealIntervalTimer {
+                    expiration,
+                    interval,
+                }));
+            } else {
+                // Overflow, effectively no timer
+                process.real_timer.set(None);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle syscall `getitimer`.
+    ///
+    /// Returns the current value of an interval timer. Only ITIMER_REAL is supported.
+    pub(crate) fn sys_getitimer(
+        &self,
+        which: litebox_common_linux::IntervalTimer,
+        curr_value: crate::MutPtr<litebox_common_linux::ItimerVal>,
+    ) -> Result<(), Errno> {
+        // Only ITIMER_REAL is supported
+        if which != litebox_common_linux::IntervalTimer::Real {
+            return Err(Errno::EINVAL);
+        }
+
+        let process = self.process();
+        let timer = process.real_timer.get();
+        let now = self.global.platform.now();
+
+        let itimerval = if let Some(timer) = timer {
+            let remaining = if now < timer.expiration {
+                timer.expiration.duration_since(&now)
+            } else {
+                Duration::ZERO
+            };
+            let interval = timer.interval.unwrap_or(Duration::ZERO);
+            litebox_common_linux::ItimerVal::new(interval, remaining)
+        } else {
+            litebox_common_linux::ItimerVal::zero()
+        };
+
+        curr_value
+            .write_at_offset(0, itimerval)
+            .ok_or(Errno::EFAULT)?;
+        Ok(())
     }
 }
 

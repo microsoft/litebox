@@ -584,3 +584,310 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+// ============================================================================
+// alarm / setitimer / getitimer tests
+// ============================================================================
+
+#[test]
+fn test_alarm_basic() {
+    let task = init_platform(None);
+
+    // Initially no alarm set, should return 0
+    let remaining = task.sys_alarm(0);
+    assert_eq!(remaining, 0, "No alarm should be set initially");
+
+    // Set an alarm for 10 seconds
+    let remaining = task.sys_alarm(10);
+    assert_eq!(remaining, 0, "No previous alarm, should return 0");
+
+    // Setting another alarm should return the remaining time from the first
+    // (should be close to 10 seconds since we just set it)
+    let remaining = task.sys_alarm(5);
+    assert!(
+        (9..=10).contains(&remaining),
+        "Should return ~10 seconds remaining, got {remaining}",
+    );
+
+    // Cancel the alarm
+    let remaining = task.sys_alarm(0);
+    assert!(
+        (4..=5).contains(&remaining),
+        "Should return ~5 seconds remaining, got {remaining}",
+    );
+
+    // No alarm should be set now
+    let remaining = task.sys_alarm(0);
+    assert_eq!(remaining, 0, "Alarm should be cancelled");
+}
+
+#[test]
+fn test_setitimer_oneshot() {
+    let task = init_platform(None);
+
+    // Create ItimerVal for a one-shot 5 second timer
+    let new_value = litebox_common_linux::ItimerVal::new(
+        std::time::Duration::ZERO,         // no interval (one-shot)
+        std::time::Duration::from_secs(5), // 5 seconds
+    );
+
+    // Get a pointer for the old value
+    let mut old_value_storage = litebox_common_linux::ItimerVal::zero();
+    let old_value_ptr: MutPtr<litebox_common_linux::ItimerVal> =
+        MutPtr::from_ptr(&mut old_value_storage as *mut _);
+
+    // Set the timer
+    let new_value_ptr = crate::ConstPtr::from_ptr(&new_value as *const _);
+    task.sys_setitimer(
+        litebox_common_linux::IntervalTimer::Real,
+        new_value_ptr,
+        Some(old_value_ptr),
+    )
+    .expect("setitimer should succeed");
+
+    // Old value should be zero (no previous timer)
+    assert!(
+        old_value_storage.interval().unwrap().is_zero(),
+        "Old interval should be zero"
+    );
+    assert!(
+        old_value_storage.value().unwrap().is_zero(),
+        "Old value should be zero"
+    );
+
+    // Now get the current timer state
+    let mut curr_value = litebox_common_linux::ItimerVal::zero();
+    let curr_value_ptr: MutPtr<litebox_common_linux::ItimerVal> =
+        MutPtr::from_ptr(&mut curr_value as *mut _);
+    task.sys_getitimer(litebox_common_linux::IntervalTimer::Real, curr_value_ptr)
+        .expect("getitimer should succeed");
+
+    // Remaining time should be close to 5 seconds
+    let remaining = curr_value.value().unwrap();
+    assert!(
+        remaining.as_secs() >= 4 && remaining.as_secs() <= 5,
+        "Remaining time should be ~5 seconds, got {:?}",
+        remaining
+    );
+    // Interval should be zero (one-shot)
+    assert!(
+        curr_value.interval().unwrap().is_zero(),
+        "Interval should be zero for one-shot timer"
+    );
+}
+
+#[test]
+fn test_setitimer_interval() {
+    let task = init_platform(None);
+
+    // Create ItimerVal for an interval timer: fire in 2 seconds, repeat every 1 second
+    let new_value = litebox_common_linux::ItimerVal::new(
+        std::time::Duration::from_secs(1), // 1 second interval
+        std::time::Duration::from_secs(2), // first fire in 2 seconds
+    );
+
+    let new_value_ptr = crate::ConstPtr::from_ptr(&new_value as *const _);
+    task.sys_setitimer(
+        litebox_common_linux::IntervalTimer::Real,
+        new_value_ptr,
+        None,
+    )
+    .expect("setitimer should succeed");
+
+    // Get the current timer state
+    let mut curr_value = litebox_common_linux::ItimerVal::zero();
+    let curr_value_ptr: MutPtr<litebox_common_linux::ItimerVal> =
+        MutPtr::from_ptr(&mut curr_value as *mut _);
+    task.sys_getitimer(litebox_common_linux::IntervalTimer::Real, curr_value_ptr)
+        .expect("getitimer should succeed");
+
+    // Remaining time should be close to 2 seconds
+    let remaining = curr_value.value().unwrap();
+    assert!(
+        remaining.as_secs() >= 1 && remaining.as_secs() <= 2,
+        "Remaining time should be ~2 seconds, got {:?}",
+        remaining
+    );
+    // Interval should be 1 second
+    let interval = curr_value.interval().unwrap();
+    assert_eq!(
+        interval.as_secs(),
+        1,
+        "Interval should be 1 second, got {:?}",
+        interval
+    );
+}
+
+#[test]
+fn test_setitimer_disarm() {
+    let task = init_platform(None);
+
+    // Set a timer
+    let new_value = litebox_common_linux::ItimerVal::new(
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(5),
+    );
+    let new_value_ptr = crate::ConstPtr::from_ptr(&new_value as *const _);
+    task.sys_setitimer(
+        litebox_common_linux::IntervalTimer::Real,
+        new_value_ptr,
+        None,
+    )
+    .expect("setitimer should succeed");
+
+    // Now disarm it with zero value
+    let disarm_value = litebox_common_linux::ItimerVal::zero();
+    let disarm_ptr = crate::ConstPtr::from_ptr(&disarm_value as *const _);
+    let mut old_value = litebox_common_linux::ItimerVal::zero();
+    let old_value_ptr: MutPtr<litebox_common_linux::ItimerVal> =
+        MutPtr::from_ptr(&mut old_value as *mut _);
+    task.sys_setitimer(
+        litebox_common_linux::IntervalTimer::Real,
+        disarm_ptr,
+        Some(old_value_ptr),
+    )
+    .expect("setitimer should succeed");
+
+    // Old value should show the remaining time from previous timer
+    let old_remaining = old_value.value().unwrap();
+    assert!(
+        old_remaining.as_secs() >= 4,
+        "Old remaining should be ~5 seconds, got {:?}",
+        old_remaining
+    );
+
+    // Current timer should be disarmed
+    let mut curr_value = litebox_common_linux::ItimerVal::zero();
+    let curr_value_ptr: MutPtr<litebox_common_linux::ItimerVal> =
+        MutPtr::from_ptr(&mut curr_value as *mut _);
+    task.sys_getitimer(litebox_common_linux::IntervalTimer::Real, curr_value_ptr)
+        .expect("getitimer should succeed");
+    assert!(
+        curr_value.value().unwrap().is_zero(),
+        "Timer should be disarmed"
+    );
+    assert!(
+        curr_value.interval().unwrap().is_zero(),
+        "Interval should be zero"
+    );
+}
+
+#[test]
+fn test_setitimer_invalid_which() {
+    let task = init_platform(None);
+
+    let new_value = litebox_common_linux::ItimerVal::new(
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(1),
+    );
+    let new_value_ptr = crate::ConstPtr::from_ptr(&new_value as *const _);
+
+    // ITIMER_VIRTUAL should return EINVAL (not supported)
+    assert_eq!(
+        task.sys_setitimer(
+            litebox_common_linux::IntervalTimer::Virtual,
+            new_value_ptr,
+            None
+        ),
+        Err(Errno::EINVAL),
+        "ITIMER_VIRTUAL should return EINVAL"
+    );
+
+    // ITIMER_PROF should return EINVAL (not supported)
+    assert_eq!(
+        task.sys_setitimer(
+            litebox_common_linux::IntervalTimer::Prof,
+            new_value_ptr,
+            None
+        ),
+        Err(Errno::EINVAL),
+        "ITIMER_PROF should return EINVAL"
+    );
+}
+
+#[test]
+fn test_getitimer_invalid_which() {
+    let task = init_platform(None);
+
+    let mut curr_value = litebox_common_linux::ItimerVal::zero();
+    let curr_value_ptr: MutPtr<litebox_common_linux::ItimerVal> =
+        MutPtr::from_ptr(&mut curr_value as *mut _);
+
+    // ITIMER_VIRTUAL should return EINVAL
+    assert_eq!(
+        task.sys_getitimer(litebox_common_linux::IntervalTimer::Virtual, curr_value_ptr),
+        Err(Errno::EINVAL),
+        "ITIMER_VIRTUAL should return EINVAL"
+    );
+
+    // ITIMER_PROF should return EINVAL
+    assert_eq!(
+        task.sys_getitimer(litebox_common_linux::IntervalTimer::Prof, curr_value_ptr),
+        Err(Errno::EINVAL),
+        "ITIMER_PROF should return EINVAL"
+    );
+}
+
+#[test]
+fn test_alarm_and_setitimer_interaction() {
+    let task = init_platform(None);
+
+    // alarm() and setitimer(ITIMER_REAL) use the same timer
+    // Set using alarm
+    task.sys_alarm(10);
+
+    // Check with getitimer
+    let mut curr_value = litebox_common_linux::ItimerVal::zero();
+    let curr_value_ptr: MutPtr<litebox_common_linux::ItimerVal> =
+        MutPtr::from_ptr(&mut curr_value as *mut _);
+    task.sys_getitimer(litebox_common_linux::IntervalTimer::Real, curr_value_ptr)
+        .expect("getitimer should succeed");
+
+    let remaining = curr_value.value().unwrap();
+    assert!(
+        remaining.as_secs() >= 9,
+        "Timer set by alarm should be visible via getitimer"
+    );
+
+    // Now set using setitimer
+    let new_value = litebox_common_linux::ItimerVal::new(
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(5),
+    );
+    let new_value_ptr = crate::ConstPtr::from_ptr(&new_value as *const _);
+    task.sys_setitimer(
+        litebox_common_linux::IntervalTimer::Real,
+        new_value_ptr,
+        None,
+    )
+    .expect("setitimer should succeed");
+
+    // Check with alarm (should return remaining time)
+    let remaining = task.sys_alarm(0);
+    assert!(
+        remaining >= 4 && remaining <= 5,
+        "alarm should see timer set by setitimer, got {}",
+        remaining
+    );
+}
+
+#[test]
+fn test_timer_expiration_queues_sigalrm() {
+    let task = init_platform(None);
+
+    // Set a very short timer (will expire almost immediately in test)
+    // Since we check on syscall boundaries, we need to manually trigger the check
+    task.sys_alarm(0); // Cancel any existing timer
+
+    // We can't easily test actual signal delivery without running guest code,
+    // but we can verify that check_timer_expiration works by setting a timer
+    // and then checking for pending signals after some time passes.
+
+    // For now, just verify the timer state management works correctly
+    let remaining = task.sys_alarm(1);
+    assert_eq!(remaining, 0);
+
+    // Timer should be set
+    let remaining = task.sys_alarm(0);
+    assert!(remaining > 0, "Timer should have been set");
+}

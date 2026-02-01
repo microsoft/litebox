@@ -866,6 +866,34 @@ pub struct ItimerVal {
     value: TimeVal,
 }
 
+impl ItimerVal {
+    /// Create a new ItimerVal with the given interval and value.
+    pub fn new(interval: Duration, value: Duration) -> Self {
+        Self {
+            interval: TimeVal::from(interval),
+            value: TimeVal::from(value),
+        }
+    }
+
+    /// Returns a zeroed ItimerVal (disabled timer).
+    pub fn zero() -> Self {
+        Self {
+            interval: TimeVal::default(),
+            value: TimeVal::default(),
+        }
+    }
+
+    /// Get the timer interval as a Duration.
+    pub fn interval(&self) -> Result<Duration, errno::Errno> {
+        Duration::try_from(self.interval)
+    }
+
+    /// Get the current value as a Duration.
+    pub fn value(&self) -> Result<Duration, errno::Errno> {
+        Duration::try_from(self.value)
+    }
+}
+
 impl TryFrom<TimeVal> for Duration {
     type Error = errno::Errno;
 
@@ -1698,7 +1726,7 @@ pub enum PrctlArg<Platform: litebox::platform::RawPointerProvider> {
 }
 
 #[repr(i32)]
-#[derive(Debug, IntEnum)]
+#[derive(Debug, IntEnum, PartialEq, Eq)]
 pub enum IntervalTimer {
     /// This timer counts down in real (i.e., wall clock) time.  At each expiration, a SIGALRM signal is generated.
     Real = 0,
@@ -2261,6 +2289,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    GetITimer {
+        which: IntervalTimer,
+        curr_value: Platform::RawMutPointer<ItimerVal>,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2800,6 +2832,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::getitimer => sys_req!(GetITimer { which:?, curr_value:* }),
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

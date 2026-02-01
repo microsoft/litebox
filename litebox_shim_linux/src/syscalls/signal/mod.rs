@@ -21,7 +21,7 @@ use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
     shim::Exception,
     sync::Mutex,
     utils::ReinterpretUnsignedExt as _,
@@ -530,6 +530,39 @@ impl Task {
         !pending.is_empty()
     }
 
+    /// Check if the ITIMER_REAL timer has expired and send SIGALRM if so.
+    ///
+    /// This is called on syscall boundaries rather than using a background thread.
+    /// This simplifies the implementation but means very short timers may be
+    /// delayed if the process is blocked in a long syscall.
+    pub(crate) fn check_timer_expiration(&self) {
+        use litebox::platform::Instant as _;
+
+        let process = self.process();
+        if let Some(timer) = process.real_timer.get() {
+            let now = self.global.platform.now();
+            if now >= timer.expiration {
+                // Timer has expired, send SIGALRM
+                self.send_sigalrm();
+
+                // If this is an interval timer, reset the expiration time
+                if let Some(interval) = timer.interval {
+                    // Calculate new expiration based on the old one to prevent drift
+                    let new_expiration = timer.expiration.checked_add(interval);
+                    process.real_timer.set(new_expiration.map(|exp| {
+                        crate::syscalls::process::RealIntervalTimer {
+                            expiration: exp,
+                            interval: timer.interval,
+                        }
+                    }));
+                } else {
+                    // One-shot timer, clear it
+                    process.real_timer.set(None);
+                }
+            }
+        }
+    }
+
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
         loop {
@@ -591,6 +624,26 @@ impl Task {
             .pending
             .borrow_mut()
             .push(&self.process().limits, signal, siginfo);
+    }
+
+    /// Sends SIGALRM to the current task.
+    ///
+    /// This is called when an interval timer (ITIMER_REAL) expires.
+    /// The signal will be delivered after the current syscall returns,
+    /// following normal signal delivery rules:
+    /// - If SIG_DFL: process terminates
+    /// - If SIG_IGN: signal ignored
+    /// - If custom handler: handler runs
+    pub(crate) fn send_sigalrm(&self) {
+        let siginfo = Siginfo {
+            signo: Signal::SIGALRM.as_i32(),
+            errno: 0,
+            code: SI_KERNEL,
+            #[cfg(target_arch = "x86_64")]
+            __pad: 0,
+            data: SiginfoData::new_zeroed(),
+        };
+        self.send_signal(Signal::SIGALRM, siginfo);
     }
 
     /// Forces a signal to be delivered on next call to `check_for_signals`.
