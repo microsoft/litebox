@@ -841,6 +841,7 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 name = "litebox"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "arrayvec",
  "bitflags 2.9.4",
  "buddy_system_allocator",

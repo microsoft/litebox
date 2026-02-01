@@ -82,16 +82,80 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
     }
 }
 
+/// DRBG module for cryptographically secure random number generation.
+mod csprng_state {
+    use litebox::utils::csprng::{AesCtrDrbg, NonceBuffer};
+
+    /// Static DRBG instance, lazily initialized with hardware entropy.
+    pub static DRBG: spin::mutex::SpinMutex<Option<AesCtrDrbg>> = spin::mutex::SpinMutex::new(None);
+
+    /// Nonce buffer for additional entropy (e.g., from TPM).
+    /// Can be initialized externally via [`initialize_crng_nonce`].
+    pub static NONCE_BUFFER: spin::mutex::SpinMutex<NonceBuffer> =
+        spin::mutex::SpinMutex::new(NonceBuffer::new());
+}
+
+/// Initialize the CRNG nonce buffer with data from an external source (e.g., TPM).
+///
+/// This should be called before the first use of the CRNG to provide additional
+/// entropy for the DRBG initialization. If not called, the DRBG will use
+/// additional hardware entropy (RDSEED/RDRAND) as a fallback.
+///
+/// # Arguments
+///
+/// * `nonce` - Up to 32 bytes of nonce data from an external entropy source
+pub fn initialize_crng_nonce(nonce: &[u8]) {
+    let mut nonce_guard = csprng_state::NONCE_BUFFER.lock();
+    nonce_guard.initialize(nonce);
+}
+
 impl litebox::platform::CrngProvider for LvbsLinuxKernel {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
-        // FIXME: generate real random data.
-        static RANDOM: spin::mutex::SpinMutex<litebox::utils::rng::FastRng> =
-            spin::mutex::SpinMutex::new(litebox::utils::rng::FastRng::new_from_seed(
-                core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
-            ));
-        let mut random = RANDOM.lock();
-        for b in buf.chunks_mut(8) {
-            b.copy_from_slice(&random.next_u64().to_ne_bytes()[..b.len()]);
+        use litebox::utils::csprng::{AesCtrDrbg, EntropySource, RdseedEntropySource};
+
+        let mut drbg_guard = csprng_state::DRBG.lock();
+
+        // Initialize DRBG on first use
+        if drbg_guard.is_none() {
+            // Gather entropy from RDSEED/RDRAND
+            let entropy_source = RdseedEntropySource::new();
+            let mut entropy = [0u8; 32];
+            let entropy_bytes = entropy_source.get_entropy(&mut entropy);
+            assert!(
+                entropy_bytes >= 32,
+                "Failed to gather sufficient entropy from hardware"
+            );
+
+            // Get nonce from buffer (or use zeros if not initialized)
+            let nonce_guard = csprng_state::NONCE_BUFFER.lock();
+            let nonce = nonce_guard.get();
+
+            // If nonce buffer is empty, use a fallback nonce from additional entropy
+            let mut nonce_buf = [0u8; 16];
+            if nonce.is_empty() {
+                // Gather additional entropy for nonce
+                let _ = entropy_source.get_entropy(&mut nonce_buf);
+            } else {
+                let copy_len = core::cmp::min(nonce.len(), 16);
+                nonce_buf[..copy_len].copy_from_slice(&nonce[..copy_len]);
+            }
+            drop(nonce_guard);
+
+            *drbg_guard = Some(AesCtrDrbg::new(&entropy, &nonce_buf));
+        }
+
+        // Generate random bytes
+        let drbg = drbg_guard.as_mut().unwrap();
+        if !drbg.generate(buf) {
+            // DRBG needs reseed - gather new entropy
+            let entropy_source = RdseedEntropySource::new();
+            let mut new_entropy = [0u8; 32];
+            let entropy_bytes = entropy_source.get_entropy(&mut new_entropy);
+            assert!(entropy_bytes >= 32, "Failed to gather entropy for reseed");
+            drbg.reseed(&new_entropy);
+
+            // Retry generate
+            assert!(drbg.generate(buf), "DRBG generate failed after reseed");
         }
     }
 }
