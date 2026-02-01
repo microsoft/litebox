@@ -923,7 +923,9 @@ fn test_pselect_with_sigsetpack() {
         Some(MutPtr::from_usize((&raw mut writefds) as usize)),
         None,
         TimeParam::None,
-        Some(ConstPtr::from_usize((&raw const sigsetpack_null_ptr) as usize)),
+        Some(ConstPtr::from_usize(
+            (&raw const sigsetpack_null_ptr) as usize,
+        )),
     );
     assert!(
         result.is_ok(),
