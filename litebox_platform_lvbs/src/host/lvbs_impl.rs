@@ -90,20 +90,19 @@ mod csprng_state {
     pub static DRBG: spin::mutex::SpinMutex<Option<AesCtrDrbg>> = spin::mutex::SpinMutex::new(None);
 
     /// Nonce buffer for additional entropy (e.g., from TPM).
-    /// Can be initialized externally via [`initialize_crng_nonce`].
+    /// Must be initialized via [`initialize_crng_nonce`] before the CRNG can be used.
     pub static NONCE_BUFFER: spin::mutex::SpinMutex<NonceBuffer> =
         spin::mutex::SpinMutex::new(NonceBuffer::new());
 }
 
 /// Initialize the CRNG nonce buffer with data from an external source (e.g., TPM).
 ///
-/// This should be called before the first use of the CRNG to provide additional
-/// entropy for the DRBG initialization. If not called, the DRBG will use
-/// additional hardware entropy (RDSEED/RDRAND) as a fallback.
+/// This **must** be called before the first use of the CRNG. The CRNG will panic
+/// if `fill_bytes_crng` is called without first initializing the nonce buffer.
 ///
 /// # Arguments
 ///
-/// * `nonce` - Up to 32 bytes of nonce data from an external entropy source
+/// * `nonce` - Up to 32 bytes of nonce data from an external entropy source (e.g., TPM boot nonce)
 pub fn initialize_crng_nonce(nonce: &[u8]) {
     let mut nonce_guard = csprng_state::NONCE_BUFFER.lock();
     nonce_guard.initialize(nonce);
@@ -117,6 +116,18 @@ impl litebox::platform::CrngProvider for LvbsLinuxKernel {
 
         // Initialize DRBG on first use
         if drbg_guard.is_none() {
+            // Get nonce from buffer - boot nonce MUST be initialized before using CRNG
+            let nonce_guard = csprng_state::NONCE_BUFFER.lock();
+            assert!(
+                nonce_guard.is_initialized(),
+                "CRNG boot nonce must be initialized before use. Call initialize_crng_nonce() first."
+            );
+            let nonce = nonce_guard.get();
+            let mut nonce_buf = [0u8; 16];
+            let copy_len = core::cmp::min(nonce.len(), 16);
+            nonce_buf[..copy_len].copy_from_slice(&nonce[..copy_len]);
+            drop(nonce_guard);
+
             // Gather entropy from RDSEED/RDRAND
             let entropy_source = RdseedEntropySource::new();
             let mut entropy = [0u8; 32];
@@ -125,21 +136,6 @@ impl litebox::platform::CrngProvider for LvbsLinuxKernel {
                 entropy_bytes >= 32,
                 "Failed to gather sufficient entropy from hardware"
             );
-
-            // Get nonce from buffer (or use zeros if not initialized)
-            let nonce_guard = csprng_state::NONCE_BUFFER.lock();
-            let nonce = nonce_guard.get();
-
-            // If nonce buffer is empty, use a fallback nonce from additional entropy
-            let mut nonce_buf = [0u8; 16];
-            if nonce.is_empty() {
-                // Gather additional entropy for nonce
-                let _ = entropy_source.get_entropy(&mut nonce_buf);
-            } else {
-                let copy_len = core::cmp::min(nonce.len(), 16);
-                nonce_buf[..copy_len].copy_from_slice(&nonce[..copy_len]);
-            }
-            drop(nonce_guard);
 
             *drbg_guard = Some(AesCtrDrbg::new(&entropy, &nonce_buf));
         }
