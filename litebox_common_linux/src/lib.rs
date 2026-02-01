@@ -1762,11 +1762,17 @@ bitflags::bitflags! {
     }
 }
 
-/// Packaged sigset with its size, used by `pselect` syscall
+/// Packaged sigset with its size, used by `pselect6` syscall.
+///
+/// Linux pselect6 syscall takes a pointer to this structure as the 6th argument.
+/// The structure contains a pointer to the actual sigset and its size.
+/// See Linux kernel `fs/select.c` (`struct sigset_argpack`).
 #[derive(Clone, Copy, FromBytes, IntoBytes)]
-#[repr(C)]
-pub struct SigSetPack {
-    pub sigset: SigSet,
+#[repr(C, packed)]
+pub struct SigSetPack<P: RawConstPointer<SigSet>> {
+    /// Pointer to the sigset in user space
+    pub sigset_ptr: P,
+    /// Size of the sigset (should be sizeof(SigSet))
     pub size: usize,
 }
 
@@ -2094,7 +2100,8 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         writefds: Option<Platform::RawMutPointer<usize>>,
         exceptfds: Option<Platform::RawMutPointer<usize>>,
         timeout: TimeParam<Platform>,
-        sigsetpack: Option<Platform::RawConstPointer<SigSetPack>>,
+        sigsetpack:
+            Option<Platform::RawConstPointer<SigSetPack<Platform::RawConstPointer<SigSet>>>>,
     },
     ArchPrctl {
         arg: ArchPrctlArg<Platform>,

@@ -419,6 +419,29 @@ impl Task {
         Ok(0)
     }
 
+    /// Executes an operation with a temporarily changed signal mask.
+    ///
+    /// This is used by `pselect`, `ppoll`, and `epoll_pwait` to implement
+    /// their sigmask parameter semantics. According to POSIX, these syscalls
+    /// atomically:
+    /// 1. Save the current signal mask
+    /// 2. Set the new signal mask
+    /// 3. Execute the wait operation
+    /// 4. Restore the original signal mask
+    ///
+    /// If signals become unblocked and are pending, they may be delivered
+    /// during the wait, causing the operation to return with `EINTR`.
+    pub(crate) fn with_sigmask<F, R>(&self, new_mask: SigSet, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let old_mask = self.signals.blocked.get();
+        self.signals.set_signal_mask(new_mask);
+        let result = f();
+        self.signals.set_signal_mask(old_mask);
+        result
+    }
+
     pub(crate) fn sys_sigaltstack(
         &self,
         ss_ptr: Option<ConstPtr<SigAltStack>>,

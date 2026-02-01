@@ -1481,49 +1481,66 @@ impl Task {
         maxevents: u32,
         timeout: i32,
         sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
-        _sigsetsize: usize,
+        sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if sigmask.is_some() {
-            todo!("sigmask not supported");
-        }
-        let Ok(epfd) = u32::try_from(epfd) else {
-            return Err(Errno::EBADF);
-        };
-        let maxevents = maxevents as usize;
-        if maxevents == 0
-            || maxevents > i32::MAX as usize / size_of::<litebox_common_linux::EpollEvent>()
-        {
-            return Err(Errno::EINVAL);
-        }
-        let timeout = if timeout >= 0 {
-            #[allow(clippy::cast_sign_loss, reason = "timeout is a positive integer")]
-            Some(core::time::Duration::from_millis(timeout as u64))
+        // Read and validate sigmask if provided
+        let new_mask = if let Some(sigmask_ptr) = sigmask {
+            if sigsetsize != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
+                return Err(Errno::EINVAL);
+            }
+            Some(sigmask_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
         } else {
             None
         };
-        let epoll_file = {
-            let files = self.files.borrow();
-            let locked_file_descriptors = files.file_descriptors.read();
-            match locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)? {
-                Descriptor::Epoll { file, .. } => file.clone(),
-                _ => return Err(Errno::EBADF),
+
+        // Define the actual epoll_wait operation
+        let do_epoll_wait = || -> Result<usize, Errno> {
+            let Ok(epfd) = u32::try_from(epfd) else {
+                return Err(Errno::EBADF);
+            };
+            let maxevents = maxevents as usize;
+            if maxevents == 0
+                || maxevents > i32::MAX as usize / size_of::<litebox_common_linux::EpollEvent>()
+            {
+                return Err(Errno::EINVAL);
+            }
+            let timeout = if timeout >= 0 {
+                #[allow(clippy::cast_sign_loss, reason = "timeout is a positive integer")]
+                Some(core::time::Duration::from_millis(timeout as u64))
+            } else {
+                None
+            };
+            let epoll_file = {
+                let files = self.files.borrow();
+                let locked_file_descriptors = files.file_descriptors.read();
+                match locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)? {
+                    Descriptor::Epoll { file, .. } => file.clone(),
+                    _ => return Err(Errno::EBADF),
+                }
+            };
+            match epoll_file.wait(
+                &self.global,
+                &self.wait_cx().with_timeout(timeout),
+                maxevents,
+            ) {
+                Ok(epoll_events) => {
+                    if !epoll_events.is_empty() {
+                        events
+                            .copy_from_slice(0, &epoll_events)
+                            .ok_or(Errno::EFAULT)?;
+                    }
+                    Ok(epoll_events.len())
+                }
+                Err(WaitError::TimedOut) => Ok(0),
+                Err(WaitError::Interrupted) => Err(Errno::EINTR),
             }
         };
-        match epoll_file.wait(
-            &self.global,
-            &self.wait_cx().with_timeout(timeout),
-            maxevents,
-        ) {
-            Ok(epoll_events) => {
-                if !epoll_events.is_empty() {
-                    events
-                        .copy_from_slice(0, &epoll_events)
-                        .ok_or(Errno::EFAULT)?;
-                }
-                Ok(epoll_events.len())
-            }
-            Err(WaitError::TimedOut) => Ok(0),
-            Err(WaitError::Interrupted) => Err(Errno::EINTR),
+
+        // Execute with or without sigmask
+        if let Some(mask) = new_mask {
+            self.with_sigmask(mask, do_epoll_wait)
+        } else {
+            do_epoll_wait()
         }
     }
 
@@ -1536,61 +1553,75 @@ impl Task {
         sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if sigmask.is_some() {
+        // Read and validate sigmask if provided
+        let new_mask = if let Some(sigmask_ptr) = sigmask {
             if sigsetsize != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
-                // Expected via ppoll(2) manpage
-                unimplemented!()
+                return Err(Errno::EINVAL);
             }
-            unimplemented!("no sigmask support yet");
-        }
-        let timeout = timeout.read()?;
-        let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
+            Some(sigmask_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
+        } else {
+            None
+        };
 
-        let mut set = super::epoll::PollSet::with_capacity(nfds);
-        for i in 0..nfds_signed {
-            let fd = fds.read_at_offset(i).ok_or(Errno::EFAULT)?;
+        // Define the actual poll operation
+        let do_poll = || -> Result<usize, Errno> {
+            let timeout = timeout.read()?;
+            let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
 
-            let events = litebox::event::Events::from_bits_truncate(
-                fd.events.reinterpret_as_unsigned().into(),
-            );
-            set.add_fd(fd.fd, events);
-        }
+            let mut set = super::epoll::PollSet::with_capacity(nfds);
+            for i in 0..nfds_signed {
+                let fd = fds.read_at_offset(i).ok_or(Errno::EFAULT)?;
 
-        match set.wait(
-            &self.global,
-            &self.wait_cx().with_timeout(timeout),
-            &self.files.borrow(),
-        ) {
-            Ok(()) => {}
-            Err(WaitError::Interrupted) => {
-                // TODO: update the remaining time.
-                return Err(Errno::EINTR);
+                let events = litebox::event::Events::from_bits_truncate(
+                    fd.events.reinterpret_as_unsigned().into(),
+                );
+                set.add_fd(fd.fd, events);
             }
-            Err(WaitError::TimedOut) => {
-                // A timeout occurred. Scan one last time.
-                set.scan(&self.global, &self.files.borrow());
-            }
-        }
 
-        // Write just the revents back.
-        let fds_base_addr = fds.as_usize();
-        let mut ready_count = 0;
-        for (i, revents) in set.revents().enumerate() {
-            // TODO: This is not great from a provenance perspective. Consider
-            // adding cast+add methods to ConstPtr/MutPtr.
-            let fd_addr = fds_base_addr + i * core::mem::size_of::<litebox_common_linux::Pollfd>();
-            let revents_ptr = crate::MutPtr::<i16>::from_usize(
-                fd_addr + core::mem::offset_of!(litebox_common_linux::Pollfd, revents),
-            );
-            let revents: u16 = revents.bits().truncate();
-            revents_ptr
-                .write_at_offset(0, revents.reinterpret_as_signed())
-                .ok_or(Errno::EFAULT)?;
-            if revents != 0 {
-                ready_count += 1;
+            match set.wait(
+                &self.global,
+                &self.wait_cx().with_timeout(timeout),
+                &self.files.borrow(),
+            ) {
+                Ok(()) => {}
+                Err(WaitError::Interrupted) => {
+                    // TODO: update the remaining time.
+                    return Err(Errno::EINTR);
+                }
+                Err(WaitError::TimedOut) => {
+                    // A timeout occurred. Scan one last time.
+                    set.scan(&self.global, &self.files.borrow());
+                }
             }
+
+            // Write just the revents back.
+            let fds_base_addr = fds.as_usize();
+            let mut ready_count = 0;
+            for (i, revents) in set.revents().enumerate() {
+                // TODO: This is not great from a provenance perspective. Consider
+                // adding cast+add methods to ConstPtr/MutPtr.
+                let fd_addr =
+                    fds_base_addr + i * core::mem::size_of::<litebox_common_linux::Pollfd>();
+                let revents_ptr = crate::MutPtr::<i16>::from_usize(
+                    fd_addr + core::mem::offset_of!(litebox_common_linux::Pollfd, revents),
+                );
+                let revents: u16 = revents.bits().truncate();
+                revents_ptr
+                    .write_at_offset(0, revents.reinterpret_as_signed())
+                    .ok_or(Errno::EFAULT)?;
+                if revents != 0 {
+                    ready_count += 1;
+                }
+            }
+            Ok(ready_count)
+        };
+
+        // Execute with or without sigmask
+        if let Some(mask) = new_mask {
+            self.with_sigmask(mask, do_poll)
+        } else {
+            do_poll()
         }
-        Ok(ready_count)
     }
 
     pub(crate) fn do_pselect(
@@ -1670,63 +1701,87 @@ impl Task {
         writefds: Option<MutPtr<usize>>,
         exceptfds: Option<MutPtr<usize>>,
         timeout: TimeParam<Platform>,
-        sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
+        sigsetpack: Option<
+            ConstPtr<
+                litebox_common_linux::SigSetPack<ConstPtr<litebox_common_linux::signal::SigSet>>,
+            >,
+        >,
     ) -> Result<usize, Errno> {
-        if sigsetpack.is_some() {
-            unimplemented!("no sigsetpack support yet");
-        }
-        let timeout = timeout.read()?;
-        if nfds >= i32::MAX as u32
-            || nfds as usize
-                > self
-                    .process()
-                    .limits
-                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
-        {
-            return Err(Errno::EINVAL);
-        }
-        let len = (nfds as usize).div_ceil(core::mem::size_of::<usize>() * 8);
-        let mut kreadfds = readfds
-            .map(|fds| fds.to_owned_slice(len).ok_or(Errno::EFAULT))
-            .transpose()?
-            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
-        let mut kwritefds = writefds
-            .map(|fds| fds.to_owned_slice(len).ok_or(Errno::EFAULT))
-            .transpose()?
-            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
-        let mut kexceptfds = exceptfds
-            .map(|fds| fds.to_owned_slice(len).ok_or(Errno::EFAULT))
-            .transpose()?
-            .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
+        // Read and validate sigsetpack if provided.
+        // SigSetPack contains a pointer to the actual sigset and its size.
+        let new_mask = if let Some(pack_ptr) = sigsetpack {
+            let pack = pack_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if pack.size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
+                return Err(Errno::EINVAL);
+            }
+            // Dereference the sigset pointer to get the actual mask
+            Some(pack.sigset_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
+        } else {
+            None
+        };
 
-        let count = self.do_pselect(
-            nfds,
-            kreadfds.as_mut(),
-            kwritefds.as_mut(),
-            kexceptfds.as_mut(),
-            timeout,
-        )?;
+        // Define the actual select operation
+        let do_select = || -> Result<usize, Errno> {
+            let timeout = timeout.read()?;
+            if nfds >= i32::MAX as u32
+                || nfds as usize
+                    > self
+                        .process()
+                        .limits
+                        .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+            {
+                return Err(Errno::EINVAL);
+            }
+            let len = (nfds as usize).div_ceil(core::mem::size_of::<usize>() * 8);
+            let mut kreadfds = readfds
+                .map(|fds| fds.to_owned_slice(len).ok_or(Errno::EFAULT))
+                .transpose()?
+                .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
+            let mut kwritefds = writefds
+                .map(|fds| fds.to_owned_slice(len).ok_or(Errno::EFAULT))
+                .transpose()?
+                .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
+            let mut kexceptfds = exceptfds
+                .map(|fds| fds.to_owned_slice(len).ok_or(Errno::EFAULT))
+                .transpose()?
+                .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
 
-        if let Some(fds) = kreadfds {
-            readfds
-                .unwrap()
-                .write_slice_at_offset(0, fds.as_raw_slice())
-                .ok_or(Errno::EFAULT)?;
-        }
-        if let Some(fds) = kwritefds {
-            writefds
-                .unwrap()
-                .write_slice_at_offset(0, fds.as_raw_slice())
-                .ok_or(Errno::EFAULT)?;
-        }
-        if let Some(fds) = kexceptfds {
-            exceptfds
-                .unwrap()
-                .write_slice_at_offset(0, fds.as_raw_slice())
-                .ok_or(Errno::EFAULT)?;
-        }
+            let count = self.do_pselect(
+                nfds,
+                kreadfds.as_mut(),
+                kwritefds.as_mut(),
+                kexceptfds.as_mut(),
+                timeout,
+            )?;
 
-        Ok(count)
+            if let Some(fds) = kreadfds {
+                readfds
+                    .unwrap()
+                    .write_slice_at_offset(0, fds.as_raw_slice())
+                    .ok_or(Errno::EFAULT)?;
+            }
+            if let Some(fds) = kwritefds {
+                writefds
+                    .unwrap()
+                    .write_slice_at_offset(0, fds.as_raw_slice())
+                    .ok_or(Errno::EFAULT)?;
+            }
+            if let Some(fds) = kexceptfds {
+                exceptfds
+                    .unwrap()
+                    .write_slice_at_offset(0, fds.as_raw_slice())
+                    .ok_or(Errno::EFAULT)?;
+            }
+
+            Ok(count)
+        };
+
+        // Execute with or without sigmask
+        if let Some(mask) = new_mask {
+            self.with_sigmask(mask, do_select)
+        } else {
+            do_select()
+        }
     }
 
     fn do_dup(&self, file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {

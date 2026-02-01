@@ -6,7 +6,7 @@ use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
 use litebox_platform_multiplex::{Platform, set_platform};
 
-use crate::MutPtr;
+use crate::{ConstPtr, MutPtr};
 
 extern crate std;
 
@@ -583,4 +583,329 @@ fn test_unlinkat() {
         Err(Errno::ENOENT),
         "Second directory should no longer exist after removal"
     );
+}
+
+// ============================================================================
+// Signal mask tests for ppoll, pselect, and epoll_pwait
+// ============================================================================
+
+#[test]
+fn test_ppoll_with_sigmask() {
+    use litebox_common_linux::{Pollfd, TimeParam, signal::SigSet};
+
+    let task = init_platform(None);
+
+    // Create a pipe to poll on
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::NONBLOCK)
+        .expect("Failed to create pipe");
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    // Create a sigmask that blocks SIGUSR1
+    let mut sigmask = SigSet::empty();
+    sigmask.add(litebox_common_linux::signal::Signal::SIGUSR1);
+
+    // Test 1: ppoll with NULL sigmask should work
+    // Write end of a pipe is immediately ready for writing
+    let mut pollfd = [Pollfd {
+        fd: write_fd,
+        events: i16::try_from(litebox::event::Events::OUT.bits()).unwrap(),
+        revents: 0,
+    }];
+    let result = task.sys_ppoll(
+        MutPtr::from_usize(pollfd.as_mut_ptr() as usize),
+        1,
+        TimeParam::None, // No timeout - but fd is ready so returns immediately
+        None,
+        0,
+    );
+    assert!(result.is_ok(), "ppoll with NULL sigmask should succeed");
+    assert_eq!(result.unwrap(), 1, "Write end of pipe should be ready");
+
+    // Test 2: ppoll with valid sigmask should work
+    let mut pollfd = [Pollfd {
+        fd: write_fd,
+        events: i16::try_from(litebox::event::Events::OUT.bits()).unwrap(),
+        revents: 0,
+    }];
+    let result = task.sys_ppoll(
+        MutPtr::from_usize(pollfd.as_mut_ptr() as usize),
+        1,
+        TimeParam::None,
+        Some(ConstPtr::from_usize(&sigmask as *const _ as usize)),
+        core::mem::size_of::<SigSet>(),
+    );
+    assert!(result.is_ok(), "ppoll with sigmask should succeed");
+    assert_eq!(result.unwrap(), 1, "Write end of pipe should be ready");
+
+    // Test 3: ppoll with invalid sigsetsize should return EINVAL
+    let mut pollfd = [Pollfd {
+        fd: write_fd,
+        events: i16::try_from(litebox::event::Events::OUT.bits()).unwrap(),
+        revents: 0,
+    }];
+    let result = task.sys_ppoll(
+        MutPtr::from_usize(pollfd.as_mut_ptr() as usize),
+        1,
+        TimeParam::None,
+        Some(ConstPtr::from_usize(&sigmask as *const _ as usize)),
+        0, // Invalid size
+    );
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "ppoll with invalid sigsetsize should return EINVAL"
+    );
+
+    // Clean up
+    task.sys_close(read_fd).expect("Failed to close read end");
+    task.sys_close(write_fd).expect("Failed to close write end");
+}
+
+#[test]
+fn test_ppoll_sigmask_restored_after_call() {
+    use litebox_common_linux::{
+        Pollfd, TimeParam,
+        signal::{SigSet, SigmaskHow, Signal},
+    };
+
+    let task = init_platform(None);
+
+    // Create a pipe to poll on
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::NONBLOCK)
+        .expect("Failed to create pipe");
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    // Set up initial signal mask (block SIGUSR2)
+    let initial_mask = {
+        let mut mask = SigSet::empty();
+        mask.add(Signal::SIGUSR2);
+        mask
+    };
+    task.sys_rt_sigprocmask(
+        SigmaskHow::SIG_SETMASK,
+        Some(ConstPtr::from_usize(&initial_mask as *const _ as usize)),
+        None,
+        core::mem::size_of::<SigSet>(),
+    )
+    .expect("Failed to set initial sigmask");
+
+    // Create a different sigmask for ppoll (block SIGUSR1 instead)
+    let ppoll_mask = {
+        let mut mask = SigSet::empty();
+        mask.add(Signal::SIGUSR1);
+        mask
+    };
+
+    // Call ppoll with the new mask
+    let mut pollfd = [Pollfd {
+        fd: write_fd,
+        events: i16::try_from(litebox::event::Events::OUT.bits()).unwrap(),
+        revents: 0,
+    }];
+    task.sys_ppoll(
+        MutPtr::from_usize(pollfd.as_mut_ptr() as usize),
+        1,
+        TimeParam::None,
+        Some(ConstPtr::from_usize(&ppoll_mask as *const _ as usize)),
+        core::mem::size_of::<SigSet>(),
+    )
+    .expect("ppoll should succeed");
+
+    // Verify the original mask is restored
+    let mut restored_mask = SigSet::empty();
+    task.sys_rt_sigprocmask(
+        SigmaskHow::SIG_SETMASK,
+        None,
+        Some(MutPtr::from_usize(&mut restored_mask as *mut _ as usize)),
+        core::mem::size_of::<SigSet>(),
+    )
+    .expect("Failed to get current sigmask");
+
+    assert_eq!(
+        restored_mask.as_u64(),
+        initial_mask.as_u64(),
+        "Signal mask should be restored to original after ppoll"
+    );
+
+    // Clean up
+    task.sys_close(read_fd).expect("Failed to close read end");
+    task.sys_close(write_fd).expect("Failed to close write end");
+}
+
+#[test]
+fn test_epoll_pwait_with_sigmask() {
+    use litebox::event::Events;
+    use litebox_common_linux::{EpollCreateFlags, EpollEvent, EpollOp, signal::SigSet};
+
+    let task = init_platform(None);
+
+    // Create an epoll instance
+    let epfd = task
+        .sys_epoll_create(EpollCreateFlags::EPOLL_CLOEXEC)
+        .expect("Failed to create epoll");
+    let epfd = i32::try_from(epfd).unwrap();
+
+    // Create a pipe to monitor
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::NONBLOCK)
+        .expect("Failed to create pipe");
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    // Add the write end to epoll (it should be immediately ready)
+    let event = EpollEvent {
+        events: Events::OUT.bits(),
+        data: write_fd as u64,
+    };
+    task.sys_epoll_ctl(
+        epfd,
+        EpollOp::EpollCtlAdd,
+        write_fd,
+        ConstPtr::from_usize(&event as *const _ as usize),
+    )
+    .expect("Failed to add fd to epoll");
+
+    // Create a sigmask
+    let mut sigmask = SigSet::empty();
+    sigmask.add(litebox_common_linux::signal::Signal::SIGUSR1);
+
+    // Test 1: epoll_pwait with NULL sigmask should work
+    let mut events = [EpollEvent { events: 0, data: 0 }];
+    let result = task.sys_epoll_pwait(
+        epfd,
+        MutPtr::from_usize(events.as_mut_ptr() as usize),
+        1,
+        0, // 0ms timeout means poll and return immediately
+        None,
+        0,
+    );
+    assert!(
+        result.is_ok(),
+        "epoll_pwait with NULL sigmask should succeed"
+    );
+    assert_eq!(result.unwrap(), 1, "Should have one ready event");
+
+    // Test 2: epoll_pwait with valid sigmask should work
+    let mut events = [EpollEvent { events: 0, data: 0 }];
+    let result = task.sys_epoll_pwait(
+        epfd,
+        MutPtr::from_usize(events.as_mut_ptr() as usize),
+        1,
+        0,
+        Some(ConstPtr::from_usize(&sigmask as *const _ as usize)),
+        core::mem::size_of::<SigSet>(),
+    );
+    assert!(result.is_ok(), "epoll_pwait with sigmask should succeed");
+    assert_eq!(result.unwrap(), 1, "Should have one ready event");
+
+    // Test 3: epoll_pwait with invalid sigsetsize should return EINVAL
+    let mut events = [EpollEvent { events: 0, data: 0 }];
+    let result = task.sys_epoll_pwait(
+        epfd,
+        MutPtr::from_usize(events.as_mut_ptr() as usize),
+        1,
+        0,
+        Some(ConstPtr::from_usize(&sigmask as *const _ as usize)),
+        0, // Invalid size
+    );
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "epoll_pwait with invalid sigsetsize should return EINVAL"
+    );
+
+    // Clean up
+    task.sys_close(epfd).expect("Failed to close epoll");
+    task.sys_close(read_fd).expect("Failed to close read end");
+    task.sys_close(write_fd).expect("Failed to close write end");
+}
+
+#[test]
+fn test_pselect_with_sigsetpack() {
+    use litebox_common_linux::{SigSetPack, TimeParam, signal::SigSet};
+
+    let task = init_platform(None);
+
+    // Create a pipe to select on
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::NONBLOCK)
+        .expect("Failed to create pipe");
+    let write_fd_u32 = u32::try_from(write_fd).unwrap();
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    // Test 1: pselect with NULL sigsetpack should work
+    // We need nfds to be at least write_fd + 1
+    let nfds = write_fd_u32 + 1;
+
+    // Create write fd set (one usize can hold at least 64 fds on 64-bit)
+    let mut writefds: usize = 1 << write_fd_u32;
+
+    let result = task.sys_pselect(
+        nfds,
+        None,
+        Some(MutPtr::from_usize(&mut writefds as *mut _ as usize)),
+        None,
+        TimeParam::None,
+        None,
+    );
+    assert!(
+        result.is_ok(),
+        "pselect with NULL sigsetpack should succeed"
+    );
+    assert_eq!(result.unwrap(), 1, "Write fd should be ready");
+    assert!(
+        writefds & (1 << write_fd_u32) != 0,
+        "Write fd should be set in result"
+    );
+
+    // Test 2: pselect with valid sigsetpack should work
+    let sigmask = SigSet::empty();
+    let sigsetpack: SigSetPack<ConstPtr<SigSet>> = SigSetPack {
+        sigset_ptr: ConstPtr::from_usize(&sigmask as *const _ as usize),
+        size: core::mem::size_of::<SigSet>(),
+    };
+
+    let mut writefds: usize = 1 << write_fd_u32;
+
+    let result = task.sys_pselect(
+        nfds,
+        None,
+        Some(MutPtr::from_usize(&mut writefds as *mut _ as usize)),
+        None,
+        TimeParam::None,
+        Some(ConstPtr::from_usize(&sigsetpack as *const _ as usize)),
+    );
+    assert!(result.is_ok(), "pselect with sigsetpack should succeed");
+    assert_eq!(result.unwrap(), 1, "Write fd should be ready");
+
+    // Test 3: pselect with invalid size in sigsetpack should return EINVAL
+    let sigsetpack_bad: SigSetPack<ConstPtr<SigSet>> = SigSetPack {
+        sigset_ptr: ConstPtr::from_usize(&sigmask as *const _ as usize),
+        size: 0, // Invalid size
+    };
+
+    let mut writefds: usize = 1 << write_fd_u32;
+
+    let result = task.sys_pselect(
+        nfds,
+        None,
+        Some(MutPtr::from_usize(&mut writefds as *mut _ as usize)),
+        None,
+        TimeParam::None,
+        Some(ConstPtr::from_usize(&sigsetpack_bad as *const _ as usize)),
+    );
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "pselect with invalid sigsetpack size should return EINVAL"
+    );
+
+    // Clean up
+    task.sys_close(read_fd).expect("Failed to close read end");
+    task.sys_close(write_fd).expect("Failed to close write end");
 }
