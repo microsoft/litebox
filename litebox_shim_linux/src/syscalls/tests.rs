@@ -614,7 +614,7 @@ fn test_ppoll_with_sigmask() {
         revents: 0,
     }];
     let result = task.sys_ppoll(
-        MutPtr::from_usize(pollfd.as_mut_ptr() as usize),
+        MutPtr::from_usize((&raw mut pollfd).cast::<Pollfd>() as usize),
         1,
         TimeParam::None, // No timeout - but fd is ready so returns immediately
         None,
@@ -630,10 +630,10 @@ fn test_ppoll_with_sigmask() {
         revents: 0,
     }];
     let result = task.sys_ppoll(
-        MutPtr::from_usize(pollfd.as_mut_ptr() as usize),
+        MutPtr::from_usize((&raw mut pollfd).cast::<Pollfd>() as usize),
         1,
         TimeParam::None,
-        Some(ConstPtr::from_usize(&sigmask as *const _ as usize)),
+        Some(ConstPtr::from_usize((&raw const sigmask) as usize)),
         core::mem::size_of::<SigSet>(),
     );
     assert!(result.is_ok(), "ppoll with sigmask should succeed");
@@ -646,10 +646,10 @@ fn test_ppoll_with_sigmask() {
         revents: 0,
     }];
     let result = task.sys_ppoll(
-        MutPtr::from_usize(pollfd.as_mut_ptr() as usize),
+        MutPtr::from_usize((&raw mut pollfd).cast::<Pollfd>() as usize),
         1,
         TimeParam::None,
-        Some(ConstPtr::from_usize(&sigmask as *const _ as usize)),
+        Some(ConstPtr::from_usize((&raw const sigmask) as usize)),
         0, // Invalid size
     );
     assert_eq!(
@@ -687,7 +687,7 @@ fn test_ppoll_sigmask_restored_after_call() {
     };
     task.sys_rt_sigprocmask(
         SigmaskHow::SIG_SETMASK,
-        Some(ConstPtr::from_usize(&initial_mask as *const _ as usize)),
+        Some(ConstPtr::from_usize((&raw const initial_mask) as usize)),
         None,
         core::mem::size_of::<SigSet>(),
     )
@@ -707,10 +707,10 @@ fn test_ppoll_sigmask_restored_after_call() {
         revents: 0,
     }];
     task.sys_ppoll(
-        MutPtr::from_usize(pollfd.as_mut_ptr() as usize),
+        MutPtr::from_usize((&raw mut pollfd).cast::<Pollfd>() as usize),
         1,
         TimeParam::None,
-        Some(ConstPtr::from_usize(&ppoll_mask as *const _ as usize)),
+        Some(ConstPtr::from_usize((&raw const ppoll_mask) as usize)),
         core::mem::size_of::<SigSet>(),
     )
     .expect("ppoll should succeed");
@@ -720,7 +720,7 @@ fn test_ppoll_sigmask_restored_after_call() {
     task.sys_rt_sigprocmask(
         SigmaskHow::SIG_SETMASK,
         None,
-        Some(MutPtr::from_usize(&mut restored_mask as *mut _ as usize)),
+        Some(MutPtr::from_usize((&raw mut restored_mask) as usize)),
         core::mem::size_of::<SigSet>(),
     )
     .expect("Failed to get current sigmask");
@@ -757,6 +757,7 @@ fn test_epoll_pwait_with_sigmask() {
     let write_fd = i32::try_from(write_fd).unwrap();
 
     // Add the write end to epoll (it should be immediately ready)
+    #[allow(clippy::cast_sign_loss)]
     let event = EpollEvent {
         events: Events::OUT.bits(),
         data: write_fd as u64,
@@ -765,7 +766,7 @@ fn test_epoll_pwait_with_sigmask() {
         epfd,
         EpollOp::EpollCtlAdd,
         write_fd,
-        ConstPtr::from_usize(&event as *const _ as usize),
+        ConstPtr::from_usize((&raw const event) as usize),
     )
     .expect("Failed to add fd to epoll");
 
@@ -777,7 +778,7 @@ fn test_epoll_pwait_with_sigmask() {
     let mut events = [EpollEvent { events: 0, data: 0 }];
     let result = task.sys_epoll_pwait(
         epfd,
-        MutPtr::from_usize(events.as_mut_ptr() as usize),
+        MutPtr::from_usize((&raw mut events).cast::<EpollEvent>() as usize),
         1,
         0, // 0ms timeout means poll and return immediately
         None,
@@ -793,10 +794,10 @@ fn test_epoll_pwait_with_sigmask() {
     let mut events = [EpollEvent { events: 0, data: 0 }];
     let result = task.sys_epoll_pwait(
         epfd,
-        MutPtr::from_usize(events.as_mut_ptr() as usize),
+        MutPtr::from_usize((&raw mut events).cast::<EpollEvent>() as usize),
         1,
         0,
-        Some(ConstPtr::from_usize(&sigmask as *const _ as usize)),
+        Some(ConstPtr::from_usize((&raw const sigmask) as usize)),
         core::mem::size_of::<SigSet>(),
     );
     assert!(result.is_ok(), "epoll_pwait with sigmask should succeed");
@@ -806,10 +807,10 @@ fn test_epoll_pwait_with_sigmask() {
     let mut events = [EpollEvent { events: 0, data: 0 }];
     let result = task.sys_epoll_pwait(
         epfd,
-        MutPtr::from_usize(events.as_mut_ptr() as usize),
+        MutPtr::from_usize((&raw mut events).cast::<EpollEvent>() as usize),
         1,
         0,
-        Some(ConstPtr::from_usize(&sigmask as *const _ as usize)),
+        Some(ConstPtr::from_usize((&raw const sigmask) as usize)),
         0, // Invalid size
     );
     assert_eq!(
@@ -834,7 +835,8 @@ fn test_pselect_with_sigsetpack() {
     let (read_fd, write_fd) = task
         .sys_pipe2(OFlags::NONBLOCK)
         .expect("Failed to create pipe");
-    let write_fd_u32 = u32::try_from(write_fd).unwrap();
+    // write_fd is u32, use it directly for bit shifting
+    let write_fd_u32 = write_fd;
     let read_fd = i32::try_from(read_fd).unwrap();
     let write_fd = i32::try_from(write_fd).unwrap();
 
@@ -848,7 +850,7 @@ fn test_pselect_with_sigsetpack() {
     let result = task.sys_pselect(
         nfds,
         None,
-        Some(MutPtr::from_usize(&mut writefds as *mut _ as usize)),
+        Some(MutPtr::from_usize((&raw mut writefds) as usize)),
         None,
         TimeParam::None,
         None,
@@ -866,7 +868,7 @@ fn test_pselect_with_sigsetpack() {
     // Test 2: pselect with valid sigsetpack should work
     let sigmask = SigSet::empty();
     let sigsetpack: SigSetPack<ConstPtr<SigSet>> = SigSetPack {
-        sigset_ptr: ConstPtr::from_usize(&sigmask as *const _ as usize),
+        sigset_ptr: ConstPtr::from_usize((&raw const sigmask) as usize),
         size: core::mem::size_of::<SigSet>(),
     };
 
@@ -875,17 +877,17 @@ fn test_pselect_with_sigsetpack() {
     let result = task.sys_pselect(
         nfds,
         None,
-        Some(MutPtr::from_usize(&mut writefds as *mut _ as usize)),
+        Some(MutPtr::from_usize((&raw mut writefds) as usize)),
         None,
         TimeParam::None,
-        Some(ConstPtr::from_usize(&sigsetpack as *const _ as usize)),
+        Some(ConstPtr::from_usize((&raw const sigsetpack) as usize)),
     );
     assert!(result.is_ok(), "pselect with sigsetpack should succeed");
     assert_eq!(result.unwrap(), 1, "Write fd should be ready");
 
     // Test 3: pselect with invalid size in sigsetpack should return EINVAL
     let sigsetpack_bad: SigSetPack<ConstPtr<SigSet>> = SigSetPack {
-        sigset_ptr: ConstPtr::from_usize(&sigmask as *const _ as usize),
+        sigset_ptr: ConstPtr::from_usize((&raw const sigmask) as usize),
         size: 0, // Invalid size
     };
 
@@ -894,10 +896,10 @@ fn test_pselect_with_sigsetpack() {
     let result = task.sys_pselect(
         nfds,
         None,
-        Some(MutPtr::from_usize(&mut writefds as *mut _ as usize)),
+        Some(MutPtr::from_usize((&raw mut writefds) as usize)),
         None,
         TimeParam::None,
-        Some(ConstPtr::from_usize(&sigsetpack_bad as *const _ as usize)),
+        Some(ConstPtr::from_usize((&raw const sigsetpack_bad) as usize)),
     );
     assert_eq!(
         result,
