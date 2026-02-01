@@ -137,7 +137,7 @@ pub(crate) struct Process {
     /// in a long syscall.
     ///
     /// Note: This must be a Mutex (not Cell) because Process is shared across
-    /// multiple threads in a multi-threaded process via Arc<Process>.
+    /// multiple threads in a multi-threaded process via `Arc<Process>`.
     pub(crate) real_timer: Mutex<Platform, Option<RealIntervalTimer>>,
 }
 
