@@ -25,7 +25,7 @@ use litebox::platform::{
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
-    ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
+    ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, Rusage, RusageWho, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -1170,6 +1170,23 @@ impl Task {
     /// Handle syscall `getegid`.
     pub(crate) fn sys_getegid(&self) -> u32 {
         self.credentials.egid
+    }
+
+    /// Handle syscall `getrusage`.
+    ///
+    /// Returns resource usage statistics. Since LiteBox doesn't track detailed
+    /// resource usage, we return a zeroed struct (which is valid - Linux itself
+    /// doesn't maintain many of these fields).
+    pub(crate) fn sys_getrusage(&self, _who: RusageWho) -> Rusage {
+        // Return zeroed struct - this is valid behavior as:
+        // 1. Linux itself doesn't maintain many of these fields
+        // 2. Applications typically check for errors, not specific values
+        // 3. We can enhance later to track real statistics if needed
+        //
+        // The `who` parameter (RusageSelf, RusageChildren, RusageThread) would
+        // affect which statistics are returned if we tracked them, but since
+        // we return zeros for all cases, we don't need to differentiate.
+        Rusage::default()
     }
 }
 

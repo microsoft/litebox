@@ -852,7 +852,7 @@ impl From<Duration> for Timespec32 {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Default, Clone, Copy, Debug, FromBytes, IntoBytes)]
 pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
@@ -1481,6 +1481,71 @@ pub struct Sysinfo {
     /// Padding: libc5 uses this..
     #[allow(clippy::pub_underscore_fields)]
     pub _f: [u8; 20 - 2 * core::mem::size_of::<usize>() - core::mem::size_of::<u32>()],
+}
+
+/// Resource usage statistics returned by `getrusage(2)`.
+///
+/// Many fields are not maintained by the Linux kernel and are set to 0.
+#[repr(C)]
+#[derive(Clone, Debug, Default, FromBytes, IntoBytes)]
+pub struct Rusage {
+    /// User CPU time used
+    pub ru_utime: TimeVal,
+    /// System CPU time used
+    pub ru_stime: TimeVal,
+    /// Maximum resident set size (in kilobytes)
+    pub ru_maxrss: isize,
+    /// Integral shared memory size (unused on Linux)
+    pub ru_ixrss: isize,
+    /// Integral unshared data size (unused on Linux)
+    pub ru_idrss: isize,
+    /// Integral unshared stack size (unused on Linux)
+    pub ru_isrss: isize,
+    /// Page reclaims (soft page faults)
+    pub ru_minflt: isize,
+    /// Page faults (hard page faults)
+    pub ru_majflt: isize,
+    /// Swaps (unused on Linux)
+    pub ru_nswap: isize,
+    /// Block input operations
+    pub ru_inblock: isize,
+    /// Block output operations
+    pub ru_oublock: isize,
+    /// IPC messages sent (unused on Linux)
+    pub ru_msgsnd: isize,
+    /// IPC messages received (unused on Linux)
+    pub ru_msgrcv: isize,
+    /// Signals received (unused on Linux)
+    pub ru_nsignals: isize,
+    /// Voluntary context switches
+    pub ru_nvcsw: isize,
+    /// Involuntary context switches
+    pub ru_nivcsw: isize,
+}
+
+/// Target for `getrusage(2)` syscall specifying whose resource usage to return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum RusageWho {
+    /// Return resource usage for the calling process (sum of all threads)
+    RusageSelf = 0,
+    /// Return resource usage for all terminated and waited-for children
+    RusageChildren = -1,
+    /// Return resource usage for the calling thread
+    RusageThread = 1,
+}
+
+impl TryFrom<i32> for RusageWho {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::RusageSelf),
+            -1 => Ok(Self::RusageChildren),
+            1 => Ok(Self::RusageThread),
+            _ => Err(()),
+        }
+    }
 }
 
 bitflags::bitflags! {
@@ -2224,6 +2289,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Sysinfo {
         buf: Platform::RawMutPointer<Sysinfo>,
     },
+    Getrusage {
+        who: RusageWho,
+        usage: Platform::RawMutPointer<Rusage>,
+    },
     CapGet {
         header: Platform::RawMutPointer<CapHeader>,
         data: Option<Platform::RawMutPointer<CapData>>,
@@ -2780,6 +2849,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::sysinfo => sys_req!(Sysinfo { buf:* }),
+            Sysno::getrusage => sys_req!(Getrusage { who:?, usage:* }),
             Sysno::capget => sys_req!(CapGet { header:*,data:* }),
             Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
             Sysno::sched_getaffinity => {

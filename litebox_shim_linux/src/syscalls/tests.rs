@@ -584,3 +584,51 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+#[test]
+fn test_getrusage_self() {
+    use litebox_common_linux::RusageWho;
+
+    let task = init_platform(None);
+
+    // Test RUSAGE_SELF - should return successfully with zeroed values
+    let rusage = task.sys_getrusage(RusageWho::RusageSelf);
+
+    // Verify the struct is zeroed (default values)
+    assert_eq!(rusage.ru_maxrss, 0);
+    assert_eq!(rusage.ru_minflt, 0);
+    assert_eq!(rusage.ru_majflt, 0);
+    assert_eq!(rusage.ru_nvcsw, 0);
+    assert_eq!(rusage.ru_nivcsw, 0);
+}
+
+#[test]
+fn test_getrusage_thread() {
+    use litebox_common_linux::RusageWho;
+
+    let task = init_platform(None);
+
+    // Test RUSAGE_THREAD - should return successfully
+    let rusage = task.sys_getrusage(RusageWho::RusageThread);
+
+    // Verify the struct is zeroed (default values)
+    assert_eq!(rusage.ru_maxrss, 0);
+    assert_eq!(rusage.ru_inblock, 0);
+    assert_eq!(rusage.ru_oublock, 0);
+}
+
+#[test]
+fn test_getrusage_children() {
+    use litebox_common_linux::RusageWho;
+
+    let task = init_platform(None);
+
+    // Test RUSAGE_CHILDREN - should return successfully
+    // (no children have been created, so all values should be zero)
+    let rusage = task.sys_getrusage(RusageWho::RusageChildren);
+
+    // Verify the struct is zeroed (default values)
+    assert_eq!(rusage.ru_maxrss, 0);
+    assert_eq!(rusage.ru_minflt, 0);
+    assert_eq!(rusage.ru_majflt, 0);
+}

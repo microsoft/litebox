@@ -1098,6 +1098,13 @@ impl Task {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }
+            SyscallRequest::Getrusage { who, usage } => {
+                let rusage = self.sys_getrusage(who);
+                usage
+                    .write_at_offset(0, rusage)
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
             SyscallRequest::CapGet { header, data } => syscall!(sys_capget(header, data)),
             SyscallRequest::GetDirent64 { fd, dirp, count } => {
                 self.sys_getdirent64(fd, dirp, count)
