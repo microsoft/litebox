@@ -564,6 +564,25 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Flags for the memfd_create syscall.
+    #[derive(Debug, Clone, Copy)]
+    pub struct MfdFlags: core::ffi::c_uint {
+        /// Set the close-on-exec flag on the file descriptor.
+        const CLOEXEC = 0x0001;
+        /// Allow sealing operations on the file.
+        const ALLOW_SEALING = 0x0002;
+        /// Create in hugetlbfs (not supported, will return EINVAL).
+        const HUGETLB = 0x0004;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+/// Maximum file name length for `memfd_create`, excluding the null terminator.
+/// See <https://man7.org/linux/man-pages/man2/memfd_create.2.html>
+pub const MEMFD_MAX_NAME_LEN: usize = 249;
+
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 #[repr(C)]
@@ -2143,6 +2162,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         initval: u32,
         flags: EfdFlags,
     },
+    /// Create an anonymous memory-backed file.
+    MemfdCreate {
+        name: Platform::RawConstPointer<i8>,
+        flags: MfdFlags,
+    },
     Pipe2 {
         pipefd: Platform::RawMutPointer<u32>,
         flags: litebox::fs::OFlags,
@@ -2736,6 +2760,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            Sysno::memfd_create => sys_req!(MemfdCreate { name:*, flags }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone => {
                 let args = CloneArgs {
@@ -3182,6 +3207,7 @@ reinterpret_truncated_from_usize_for! {
         ReceiveFlags,
         EpollCreateFlags,
         EfdFlags,
+        MfdFlags,
         RngFlags,
         TimerFlags,
     ],

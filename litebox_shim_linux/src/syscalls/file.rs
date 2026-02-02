@@ -18,7 +18,7 @@ use litebox::{
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    IoWriteVec, IoctlArg, MEMFD_MAX_NAME_LEN, MfdFlags, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -197,6 +197,11 @@ impl Task {
                 |_fd| todo!("net"),
                 |_fd| todo!("pipes"),
             ),
+            Descriptor::Memfd { file, .. } => {
+                let file = file.clone();
+                drop(file_table);
+                file.truncate(length).map(|()| Ok(()))
+            }
             _ => Err(Errno::EINVAL),
         }
         .flatten()
@@ -289,6 +294,21 @@ impl Task {
                 litebox_common_linux::ReceiveFlags::empty(),
                 None,
             ),
+            Descriptor::Memfd { file, position, .. } => {
+                let file = file.clone();
+                let cur_pos = position.load(Ordering::Relaxed);
+                drop(file_table);
+                let pos = offset.unwrap_or(cur_pos);
+                let bytes_read = file.read_at(pos, buf)?;
+                if offset.is_none() {
+                    // Re-acquire the lock to update position
+                    let file_table = files.file_descriptors.read();
+                    if let Some(Descriptor::Memfd { position, .. }) = file_table.get_fd(fd) {
+                        position.fetch_add(bytes_read, Ordering::Relaxed);
+                    }
+                }
+                Ok(bytes_read)
+            }
         }
     }
 
@@ -342,6 +362,21 @@ impl Task {
             }
             Descriptor::Unix { file, .. } => {
                 file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
+            }
+            Descriptor::Memfd { file, position, .. } => {
+                let file = file.clone();
+                let cur_pos = position.load(Ordering::Relaxed);
+                drop(file_table);
+                let pos = offset.unwrap_or(cur_pos);
+                let bytes_written = file.write_at(pos, buf)?;
+                if offset.is_none() {
+                    // Re-acquire the lock to update position
+                    let file_table = files.file_descriptors.read();
+                    if let Some(Descriptor::Memfd { position, .. }) = file_table.get_fd(fd) {
+                        position.fetch_add(bytes_written, Ordering::Relaxed);
+                    }
+                }
+                Ok(bytes_written)
             }
         };
         if let Err(Errno::EPIPE) = res {
@@ -397,6 +432,43 @@ impl Task {
             Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } | Descriptor::Unix { .. } => {
                 Err(Errno::ESPIPE)
             }
+            Descriptor::Memfd { file, position, .. } => {
+                let cur_pos = position.load(Ordering::Relaxed);
+                let file_size = file.size();
+                let new_pos = match whence {
+                    SeekWhence::RelativeToBeginning => {
+                        usize::try_from(offset).map_err(|_| Errno::EINVAL)?
+                    }
+                    SeekWhence::RelativeToCurrentOffset => {
+                        if offset < 0 {
+                            #[expect(clippy::cast_sign_loss)]
+                            cur_pos
+                                .checked_sub((-offset) as usize)
+                                .ok_or(Errno::EINVAL)?
+                        } else {
+                            #[expect(clippy::cast_sign_loss)]
+                            cur_pos
+                                .checked_add(offset as usize)
+                                .ok_or(Errno::EOVERFLOW)?
+                        }
+                    }
+                    SeekWhence::RelativeToEnd => {
+                        if offset < 0 {
+                            #[expect(clippy::cast_sign_loss)]
+                            file_size
+                                .checked_sub((-offset) as usize)
+                                .ok_or(Errno::EINVAL)?
+                        } else {
+                            #[expect(clippy::cast_sign_loss)]
+                            file_size
+                                .checked_add(offset as usize)
+                                .ok_or(Errno::EOVERFLOW)?
+                        }
+                    }
+                };
+                position.store(new_pos, Ordering::Relaxed);
+                Ok(new_pos)
+            }
         }
     }
 
@@ -444,9 +516,10 @@ impl Task {
                     }
                 }
             }
-            Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                Ok(())
-            }
+            Descriptor::Eventfd { .. }
+            | Descriptor::Epoll { .. }
+            | Descriptor::Unix { .. }
+            | Descriptor::Memfd { .. } => Ok(()),
         }
     }
 
@@ -516,6 +589,7 @@ impl Task {
                 Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
                 Descriptor::Eventfd { .. } => todo!(),
                 Descriptor::Unix { .. } => todo!(),
+                Descriptor::Memfd { .. } => todo!(),
             };
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
@@ -602,6 +676,7 @@ impl Task {
             Descriptor::Epoll { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { .. } => todo!(),
             Descriptor::Unix { .. } => todo!(),
+            Descriptor::Memfd { .. } => todo!(),
         };
         if let Err(Errno::EPIPE) = res {
             unimplemented!("send SIGPIPE to the current task");
@@ -792,6 +867,26 @@ impl Descriptor {
                 st_blocks: 0,
                 ..Default::default()
             },
+            Descriptor::Memfd { file, .. } => {
+                let size = file.size();
+                FileStat {
+                    st_dev: 0,
+                    st_ino: 0,
+                    st_nlink: 1,
+                    // Regular file with rw permissions
+                    st_mode: (litebox_common_linux::InodeType::File as u32
+                        | (Mode::RUSR | Mode::WUSR).bits())
+                    .truncate(),
+                    st_uid: 0,
+                    st_gid: 0,
+                    st_rdev: 0,
+                    st_size: size,
+                    st_blksize: 4096,
+                    #[expect(clippy::cast_possible_wrap)]
+                    st_blocks: size.div_ceil(512) as i64, // number of 512B blocks
+                    ..Default::default()
+                }
+            }
         };
         Ok(fstat)
     }
@@ -822,7 +917,8 @@ impl Descriptor {
             ),
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => Ok(
+            | Descriptor::Unix { close_on_exec, .. }
+            | Descriptor::Memfd { close_on_exec, .. } => Ok(
                 if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                     FileDescriptorFlags::FD_CLOEXEC
                 } else {
@@ -857,7 +953,8 @@ impl Descriptor {
             )?,
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => {
+            | Descriptor::Unix { close_on_exec, .. }
+            | Descriptor::Memfd { close_on_exec, .. } => {
                 close_on_exec.store(
                     flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                     core::sync::atomic::Ordering::Relaxed,
@@ -1002,6 +1099,7 @@ impl Task {
                 Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Unix { file, .. } => Ok(file.get_status().bits()),
+                Descriptor::Memfd { file, .. } => Ok(file.get_status().bits()),
             },
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
@@ -1081,6 +1179,9 @@ impl Task {
                     }
                     Descriptor::Epoll { .. } => todo!(),
                     Descriptor::Unix { file, .. } => {
+                        toggle_flags!(file);
+                    }
+                    Descriptor::Memfd { file, .. } => {
                         toggle_flags!(file);
                     }
                 }
@@ -1253,6 +1354,53 @@ impl Task {
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 
+    /// Create an anonymous memory-backed file.
+    ///
+    /// # Arguments
+    /// * `name` - A name for the file (for debugging, shown in /proc/self/fd/)
+    /// * `flags` - Flags (MFD_CLOEXEC, MFD_ALLOW_SEALING)
+    ///
+    /// # Returns
+    /// File descriptor on success, error on failure.
+    pub fn sys_memfd_create(&self, name: CString, flags: MfdFlags) -> Result<u32, Errno> {
+        // MFD_HUGETLB is not supported
+        if flags.contains(MfdFlags::HUGETLB) {
+            return Err(Errno::EINVAL);
+        }
+
+        // Check for unknown flags
+        let known_flags = MfdFlags::CLOEXEC | MfdFlags::ALLOW_SEALING | MfdFlags::HUGETLB;
+        if flags.contains(known_flags.complement()) {
+            return Err(Errno::EINVAL);
+        }
+
+        // Validate name length (max 249 bytes)
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > MEMFD_MAX_NAME_LEN {
+            return Err(Errno::EINVAL);
+        }
+
+        // Convert to string
+        let name_str = name.to_string_lossy().into_owned();
+
+        let memfd = super::memfd::MemfdFile::new(name_str, flags);
+        let files = self.files.borrow();
+        files
+            .file_descriptors
+            .write()
+            .insert(
+                self,
+                Descriptor::Memfd {
+                    file: alloc::sync::Arc::new(memfd),
+                    close_on_exec: core::sync::atomic::AtomicBool::new(
+                        flags.contains(MfdFlags::CLOEXEC),
+                    ),
+                    position: core::sync::atomic::AtomicUsize::new(0),
+                },
+            )
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
+    }
+
     fn stdio_ioctl(
         &self,
         arg: &IoctlArg<litebox_platform_multiplex::Platform>,
@@ -1363,6 +1511,9 @@ impl Task {
                     Descriptor::Unix { file, .. } => {
                         file.set_status(OFlags::NONBLOCK, val != 0);
                     }
+                    Descriptor::Memfd { file, .. } => {
+                        file.set_status(OFlags::NONBLOCK, val != 0);
+                    }
                 }
                 Ok(0)
             }
@@ -1382,7 +1533,8 @@ impl Task {
                 )?,
                 Descriptor::Eventfd { close_on_exec, .. }
                 | Descriptor::Epoll { close_on_exec, .. }
-                | Descriptor::Unix { close_on_exec, .. } => {
+                | Descriptor::Unix { close_on_exec, .. }
+                | Descriptor::Memfd { close_on_exec, .. } => {
                     close_on_exec.store(true, core::sync::atomic::Ordering::Relaxed);
                     Ok(0)
                 }
@@ -1403,9 +1555,10 @@ impl Task {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                 )?,
-                Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                    Err(Errno::ENOTTY)
-                }
+                Descriptor::Eventfd { .. }
+                | Descriptor::Epoll { .. }
+                | Descriptor::Unix { .. }
+                | Descriptor::Memfd { .. } => Err(Errno::ENOTTY),
             },
             _ => {
                 #[cfg(debug_assertions)]
@@ -1768,6 +1921,13 @@ impl Task {
             Descriptor::Unix { file, .. } => Ok(Descriptor::Unix {
                 file: file.clone(),
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+            }),
+            Descriptor::Memfd { file, position, .. } => Ok(Descriptor::Memfd {
+                file: file.clone(),
+                close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+                position: core::sync::atomic::AtomicUsize::new(
+                    position.load(core::sync::atomic::Ordering::Relaxed),
+                ),
             }),
         }
     }

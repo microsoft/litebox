@@ -481,6 +481,12 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::unix::UnixSocket>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
+    Memfd {
+        file: alloc::sync::Arc<syscalls::memfd::MemfdFile<Platform>>,
+        close_on_exec: core::sync::atomic::AtomicBool,
+        /// Current file position for read/write operations.
+        position: core::sync::atomic::AtomicUsize,
+    },
 }
 
 /// A strongly-typed FD.
@@ -1022,6 +1028,11 @@ impl Task {
             }),
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
+            }
+            SyscallRequest::MemfdCreate { name, flags } => {
+                name.to_cstring().map_or(Err(Errno::EFAULT), |name_cstr| {
+                    syscall!(sys_memfd_create(name_cstr, flags))
+                })
             }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
