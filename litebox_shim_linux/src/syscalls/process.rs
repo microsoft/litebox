@@ -1211,11 +1211,13 @@ impl Task {
     /// Handle syscall `setreuid`.
     ///
     /// Sets the real and effective user IDs. A value of -1 (0xFFFFFFFF) means
-    /// "don't change that ID". If the real UID is set or the effective UID
-    /// changes, the saved set-user-ID is set to the new effective UID.
+    /// "don't change that ID". Per POSIX, the saved set-user-ID is updated to
+    /// the new effective UID if either:
+    /// - The real UID is set (ruid != -1), OR
+    /// - The effective UID is set to a value not equal to the old real UID
     pub(crate) fn sys_setreuid(&self, ruid: u32, euid: u32) {
         let mut creds = self.credentials.borrow_mut();
-        let old_euid = creds.euid;
+        let old_uid = creds.uid; // save old real UID before modification
 
         if ruid != u32::MAX {
             creds.uid = ruid;
@@ -1224,8 +1226,8 @@ impl Task {
             creds.euid = euid;
         }
 
-        // If ruid was set or euid changed, update suid to new euid
-        if ruid != u32::MAX || (euid != u32::MAX && euid != old_euid) {
+        // Per POSIX: update suid if ruid was set, or if euid differs from old real uid
+        if ruid != u32::MAX || (euid != u32::MAX && euid != old_uid) {
             creds.suid = creds.euid;
         }
     }
@@ -1233,11 +1235,13 @@ impl Task {
     /// Handle syscall `setregid`.
     ///
     /// Sets the real and effective group IDs. A value of -1 (0xFFFFFFFF) means
-    /// "don't change that ID". If the real GID is set or the effective GID
-    /// changes, the saved set-group-ID is set to the new effective GID.
+    /// "don't change that ID". Per POSIX, the saved set-group-ID is updated to
+    /// the new effective GID if either:
+    /// - The real GID is set (rgid != -1), OR
+    /// - The effective GID is set to a value not equal to the old real GID
     pub(crate) fn sys_setregid(&self, rgid: u32, egid: u32) {
         let mut creds = self.credentials.borrow_mut();
-        let old_egid = creds.egid;
+        let old_gid = creds.gid; // save old real GID before modification
 
         if rgid != u32::MAX {
             creds.gid = rgid;
@@ -1246,8 +1250,8 @@ impl Task {
             creds.egid = egid;
         }
 
-        // If rgid was set or egid changed, update sgid to new egid
-        if rgid != u32::MAX || (egid != u32::MAX && egid != old_egid) {
+        // Per POSIX: update sgid if rgid was set, or if egid differs from old real gid
+        if rgid != u32::MAX || (egid != u32::MAX && egid != old_gid) {
             creds.sgid = creds.egid;
         }
     }
@@ -1785,7 +1789,7 @@ mod tests {
     fn test_setreuid() {
         let task = crate::syscalls::tests::init_platform(None);
 
-        // setreuid(1000, 2000)
+        // setreuid(1000, 2000) - ruid is set, so suid should be updated
         task.sys_setreuid(1000, 2000);
         assert_eq!(task.sys_getuid(), 1000);
         assert_eq!(task.sys_geteuid(), 2000);
@@ -1793,25 +1797,33 @@ mod tests {
         let (_, _, suid) = task.sys_getresuid();
         assert_eq!(suid, 2000);
 
-        // setreuid(-1, 3000) - only change euid
+        // setreuid(-1, 3000) - euid (3000) != old ruid (1000), so suid should be updated
         task.sys_setreuid(u32::MAX, 3000);
         assert_eq!(task.sys_getuid(), 1000); // unchanged
         assert_eq!(task.sys_geteuid(), 3000);
-        // suid should be updated because euid changed
+        // suid should be updated because euid (3000) differs from old ruid (1000)
         let (_, _, suid) = task.sys_getresuid();
         assert_eq!(suid, 3000);
+
+        // setreuid(-1, 1000) - euid (1000) == old ruid (1000), suid should NOT be updated
+        task.sys_setreuid(u32::MAX, 1000);
+        assert_eq!(task.sys_getuid(), 1000);
+        assert_eq!(task.sys_geteuid(), 1000);
+        // suid should NOT be updated because euid == old ruid
+        let (_, _, suid) = task.sys_getresuid();
+        assert_eq!(suid, 3000); // unchanged from previous
 
         // setreuid(-1, -1) - no-op
         task.sys_setreuid(u32::MAX, u32::MAX);
         assert_eq!(task.sys_getuid(), 1000);
-        assert_eq!(task.sys_geteuid(), 3000);
+        assert_eq!(task.sys_geteuid(), 1000);
     }
 
     #[test]
     fn test_setregid() {
         let task = crate::syscalls::tests::init_platform(None);
 
-        // setregid(1000, 2000)
+        // setregid(1000, 2000) - rgid is set, so sgid should be updated
         task.sys_setregid(1000, 2000);
         assert_eq!(task.sys_getgid(), 1000);
         assert_eq!(task.sys_getegid(), 2000);
@@ -1819,13 +1831,21 @@ mod tests {
         let (_, _, sgid) = task.sys_getresgid();
         assert_eq!(sgid, 2000);
 
-        // setregid(-1, 3000) - only change egid
+        // setregid(-1, 3000) - egid (3000) != old rgid (1000), so sgid should be updated
         task.sys_setregid(u32::MAX, 3000);
         assert_eq!(task.sys_getgid(), 1000); // unchanged
         assert_eq!(task.sys_getegid(), 3000);
-        // sgid should be updated because egid changed
+        // sgid should be updated because egid (3000) differs from old rgid (1000)
         let (_, _, sgid) = task.sys_getresgid();
         assert_eq!(sgid, 3000);
+
+        // setregid(-1, 1000) - egid (1000) == old rgid (1000), sgid should NOT be updated
+        task.sys_setregid(u32::MAX, 1000);
+        assert_eq!(task.sys_getgid(), 1000);
+        assert_eq!(task.sys_getegid(), 1000);
+        // sgid should NOT be updated because egid == old rgid
+        let (_, _, sgid) = task.sys_getresgid();
+        assert_eq!(sgid, 3000); // unchanged from previous
     }
 
     #[test]
