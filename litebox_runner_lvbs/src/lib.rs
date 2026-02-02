@@ -39,7 +39,7 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{
-    MAX_TA_INSTANCES, SessionMap, SingleInstanceCache, TaInstance, allocate_session_id,
+    MAX_TA_INSTANCES, SessionManager, TaInstance, allocate_session_id,
 };
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
 use once_cell::race::OnceBox;
@@ -180,25 +180,10 @@ fn optee_smc_handler_entry_inner(
     Ok(0)
 }
 
-/// Get the global session map.
-fn session_map() -> &'static SessionMap {
-    static SESSION_MAP: OnceBox<SessionMap> = OnceBox::new();
-    SESSION_MAP.get_or_init(|| Box::new(SessionMap::new()))
-}
-
-/// Get the global single-instance TA cache.
-fn single_instance_cache() -> &'static SingleInstanceCache {
-    static CACHE: OnceBox<SingleInstanceCache> = OnceBox::new();
-    CACHE.get_or_init(|| Box::new(SingleInstanceCache::new()))
-}
-
-/// Get the count of unique TA instances (for limit checking).
-///
-/// This counts:
-/// - All single-instance TAs in the cache (regardless of how many sessions use them)
-/// - All multi-instance TA sessions (each session has its own instance)
-fn instance_count() -> usize {
-    single_instance_cache().len() + session_map().count_multi_instance_tas()
+/// Get the global session manager.
+fn session_manager() -> &'static SessionManager {
+    static SESSION_MANAGER: OnceBox<SessionManager> = OnceBox::new();
+    SESSION_MANAGER.get_or_init(|| Box::new(SessionManager::new()))
 }
 
 /// Switch to the base page table.
@@ -327,7 +312,7 @@ fn handle_open_session(
 
     // Try to reuse existing single-instance TA, or create a new instance
     // If the TA is busy (lock held), return EThreadLimit - driver will wait and retry
-    if let Some(existing) = single_instance_cache().get(&ta_uuid) {
+    if let Some(existing) = session_manager().get_single_instance(&ta_uuid) {
         open_session_single_instance(
             msg_args,
             msg_args_phys_addr,
@@ -443,7 +428,9 @@ fn open_session_single_instance(
         if return_code == TeeResult::TargetDead {
             // Check if any other sessions are using this instance by counting sessions
             // in the session map that reference this TA instance.
-            let session_count = session_map().count_sessions_for_instance(&instance_arc);
+            let session_count = session_manager()
+                .sessions()
+                .count_sessions_for_instance(&instance_arc);
 
             if session_count == 0 {
                 debug_serial_println!(
@@ -460,7 +447,7 @@ fn open_session_single_instance(
                     Some(ta_req_info),
                 )?;
 
-                single_instance_cache().remove(&ta_uuid);
+                session_manager().remove_single_instance(&ta_uuid);
 
                 // Switch to base page table and delete the task page table
                 unsafe { switch_to_base_page_table() };
@@ -494,7 +481,7 @@ fn open_session_single_instance(
     }
 
     // Success: register session
-    session_map().insert(runner_session_id, instance_arc.clone(), ta_uuid, ta_flags);
+    session_manager().register_session(runner_session_id, instance_arc.clone(), ta_uuid, ta_flags);
 
     write_msg_args_to_normal_world(
         msg_args,
@@ -527,7 +514,7 @@ fn open_session_new_instance(
 ) -> Result<(), OpteeSmcReturnCode> {
     // Check TA instance limit
     // TODO: consider better resource management strategy
-    if instance_count() >= MAX_TA_INSTANCES {
+    if session_manager().instance_count() >= MAX_TA_INSTANCES {
         debug_serial_println!("TA instance limit reached ({} instances)", MAX_TA_INSTANCES);
         return Err(OpteeSmcReturnCode::ENomem);
     }
@@ -688,11 +675,11 @@ fn open_session_new_instance(
 
     // Cache single-instance TAs for future sessions
     if ta_flags.is_single_instance() {
-        single_instance_cache().insert(ta_uuid, instance.clone());
+        session_manager().cache_single_instance(ta_uuid, instance.clone());
     }
 
     // Register session (runner_session_id already allocated above)
-    session_map().insert(runner_session_id, instance.clone(), ta_uuid, ta_flags);
+    session_manager().register_session(runner_session_id, instance.clone(), ta_uuid, ta_flags);
 
     // Write success response back to normal world
     write_msg_args_to_normal_world(
@@ -733,8 +720,8 @@ fn handle_invoke_command(
     let session_id = ta_req_info.session;
 
     // Get the session entry from the session map (need full entry for potential cleanup)
-    let session_entry = session_map()
-        .get_entry(session_id)
+    let session_entry = session_manager()
+        .get_session_entry(session_id)
         .ok_or(OpteeSmcReturnCode::EBadCmd)?;
     // Use try_lock to avoid spinning - return EThreadLimit if TA is in use
     // The Linux driver will handle this by waiting and retrying
@@ -806,11 +793,13 @@ fn handle_invoke_command(
         drop(instance);
 
         // Remove the session from the map
-        session_map().remove(session_id);
+        session_manager().unregister_session(session_id);
 
         // Check if this was the last session using the TA instance by counting
         // remaining sessions that reference this instance.
-        let remaining_sessions = session_map().count_sessions_for_instance(&instance_arc);
+        let remaining_sessions = session_manager()
+            .sessions()
+            .count_sessions_for_instance(&instance_arc);
         let is_last_session = remaining_sessions == 0;
 
         // Write response BEFORE switching page tables (accesses user memory)
@@ -826,7 +815,7 @@ fn handle_invoke_command(
         if is_last_session {
             // Clear single-instance cache if applicable
             if ta_flags.is_single_instance() {
-                single_instance_cache().remove(&ta_uuid);
+                session_manager().remove_single_instance(&ta_uuid);
             }
 
             // Switch to base page table and delete the task page table
@@ -881,8 +870,8 @@ fn handle_close_session(
     debug_serial_println!("CloseSession: session_id={}", session_id);
 
     // Get the session entry from the session map
-    let session_entry = session_map()
-        .get_entry(session_id)
+    let session_entry = session_manager()
+        .get_session_entry(session_id)
         .ok_or(OpteeSmcReturnCode::EBadCmd)?;
     // Use try_lock to avoid spinning - return EThreadLimit if TA is in use
     // The Linux driver will handle this by waiting and retrying
@@ -941,11 +930,13 @@ fn handle_close_session(
     drop(instance);
 
     // Remove the session entry from the map
-    let removed_entry = session_map().remove(session_id);
+    let removed_entry = session_manager().unregister_session(session_id);
 
     // Check if this was the last session using the TA instance by counting
     // remaining sessions that reference this instance.
-    let remaining_sessions = session_map().count_sessions_for_instance(&instance_arc);
+    let remaining_sessions = session_manager()
+        .sessions()
+        .count_sessions_for_instance(&instance_arc);
     let is_last_session = remaining_sessions == 0;
 
     // If this was the last session using the TA instance, clean up (unless keep_alive is set)
@@ -963,7 +954,7 @@ fn handle_close_session(
 
             // Clear single-instance cache if this was a single-instance TA
             if entry.ta_flags.is_single_instance() {
-                single_instance_cache().remove(&entry.ta_uuid);
+                session_manager().remove_single_instance(&entry.ta_uuid);
             }
 
             let instance = entry.instance.lock();

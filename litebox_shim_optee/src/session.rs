@@ -98,7 +98,7 @@ use hashbrown::HashMap;
 use litebox_common_optee::{TaFlags, TeeUuid};
 use spin::mutex::SpinMutex;
 
-/// Maximum number of concurrent TA instances.
+/// Maximum number of concurrent TA instances to avoid out of memory situations.
 pub const MAX_TA_INSTANCES: usize = 16;
 
 /// A loaded TA instance that can be shared across multiple sessions.
@@ -190,18 +190,6 @@ impl SessionMap {
         self.inner.lock().len()
     }
 
-    /// Count the number of unique multi-instance TA instances (non-single-instance TAs).
-    ///
-    /// Each multi-instance TA session has its own unique instance, so we count
-    /// sessions that are NOT single-instance TAs.
-    pub fn count_multi_instance_tas(&self) -> usize {
-        self.inner
-            .lock()
-            .values()
-            .filter(|e| !e.ta_flags.is_single_instance())
-            .count()
-    }
-
     /// Check if the session map is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.lock().is_empty()
@@ -250,8 +238,8 @@ impl SingleInstanceCache {
     }
 
     /// Remove a cached single-instance TA by UUID.
-    pub fn remove(&self, uuid: &TeeUuid) {
-        self.inner.lock().remove(uuid);
+    pub fn remove(&self, uuid: &TeeUuid) -> Option<Arc<SpinMutex<TaInstance>>> {
+        self.inner.lock().remove(uuid)
     }
 
     /// Get the number of cached single-instance TAs.
@@ -349,13 +337,29 @@ impl SessionManager {
     }
 
     /// Remove a single-instance TA from the cache.
-    pub fn remove_single_instance(&self, uuid: &TeeUuid) {
-        self.single_instance_cache.remove(uuid);
+    pub fn remove_single_instance(&self, uuid: &TeeUuid) -> Option<Arc<SpinMutex<TaInstance>>> {
+        self.single_instance_cache.remove(uuid)
     }
 
     /// Get the total count of unique TA instances (for limit checking).
+    ///
+    /// This counts:
+    /// - All single-instance TAs in the cache (each UUID = 1 instance, regardless of session count)
+    /// - All multi-instance TA sessions (each session = 1 instance)
     pub fn instance_count(&self) -> usize {
-        self.single_instance_cache.len() + self.sessions.len()
+        let single_instance_count = self.single_instance_cache.len();
+        let multi_instance_count = self.count_multi_instance_sessions();
+        single_instance_count + multi_instance_count
+    }
+
+    /// Count multi-instance TA sessions (sessions whose TAs are NOT single-instance).
+    fn count_multi_instance_sessions(&self) -> usize {
+        self.sessions
+            .inner
+            .lock()
+            .values()
+            .filter(|e| !e.ta_flags.is_single_instance())
+            .count()
     }
 
     /// Check if instance limit is reached.
