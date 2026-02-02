@@ -7,16 +7,28 @@
 //! inotify instances and add/remove watches, but never generates any events. This is
 //! sufficient for applications that use inotify optionally or with timeouts.
 
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use alloc::{collections::BTreeMap, string::String, sync::Weak};
 use litebox::{
-    event::{Events, IOPollable, observer::Observer, polling::Pollee},
+    event::{
+        Events, IOPollable,
+        observer::Observer,
+        polling::{Pollee, TryOpError},
+        wait::WaitContext,
+    },
     fs::OFlags,
     platform::TimeProvider,
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{InotifyInitFlags, errno::Errno};
+
+/// Maximum number of watches per inotify instance.
+/// Linux default is typically 8192 (via /proc/sys/fs/inotify/max_user_watches).
+const MAX_WATCHES_PER_INSTANCE: usize = 8192;
+
+/// Maximum pathname length (PATH_MAX on Linux).
+const MAX_PATHNAME_LEN: usize = 4096;
 
 /// An inotify file instance.
 ///
@@ -25,7 +37,8 @@ use litebox_common_linux::{InotifyInitFlags, errno::Errno};
 /// block indefinitely (blocking mode).
 pub(crate) struct InotifyFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// Next watch descriptor to allocate (starts at 1).
-    next_wd: AtomicI32,
+    /// Uses u32 to avoid signed overflow issues.
+    next_wd: AtomicU32,
     /// Map of watch descriptors to watch entries.
     watches: litebox::sync::Mutex<Platform, BTreeMap<i32, WatchEntry>>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
@@ -52,7 +65,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InotifyFile<Platform> {
 
         Self {
             // Watch descriptors start at 1 (like Linux)
-            next_wd: AtomicI32::new(1),
+            next_wd: AtomicU32::new(1),
             watches: litebox::sync::Mutex::new(BTreeMap::new()),
             status: AtomicU32::new(status.bits()),
             pollee: Pollee::new(),
@@ -69,6 +82,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InotifyFile<Platform> {
             return Err(Errno::EINVAL);
         }
 
+        // Validate pathname length (defense against memory exhaustion)
+        if pathname.len() > MAX_PATHNAME_LEN {
+            return Err(Errno::ENAMETOOLONG);
+        }
+
         let mut watches = self.watches.lock();
 
         // Check if we already have a watch on this path
@@ -82,14 +100,27 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InotifyFile<Platform> {
             }
         }
 
-        // Allocate new watch descriptor
-        let wd = self.next_wd.fetch_add(1, Ordering::Relaxed);
-        if wd < 0 {
-            // Overflow - roll back and return error
-            self.next_wd.fetch_sub(1, Ordering::Relaxed);
+        // Check watch count limit (defense against memory exhaustion)
+        if watches.len() >= MAX_WATCHES_PER_INSTANCE {
             return Err(Errno::ENOSPC);
         }
 
+        // Allocate new watch descriptor using compare-and-swap to prevent overflow
+        let wd = self
+            .next_wd
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                // i32::MAX as u32 is 2147483647, which is the max valid watch descriptor
+                if current > i32::MAX as u32 {
+                    None // Don't update, overflow would occur
+                } else {
+                    Some(current + 1)
+                }
+            })
+            .map_err(|_| Errno::ENOSPC)?;
+
+        // Safe cast: we validated wd <= i32::MAX above
+        #[allow(clippy::cast_possible_wrap)]
+        let wd = wd as i32;
         watches.insert(wd, WatchEntry { pathname, mask });
         Ok(wd)
     }
@@ -102,6 +133,27 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InotifyFile<Platform> {
         } else {
             Err(Errno::EINVAL)
         }
+    }
+
+    /// Read events from the inotify instance.
+    ///
+    /// This is a stub implementation that never has events available.
+    /// - In nonblocking mode: returns EAGAIN immediately
+    /// - In blocking mode: blocks indefinitely (until interrupted)
+    #[expect(
+        dead_code,
+        reason = "API provided for future use; currently read() returns EAGAIN directly in file.rs"
+    )]
+    pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<usize, Errno> {
+        self.pollee
+            .wait(
+                cx,
+                self.get_status().contains(OFlags::NONBLOCK),
+                Events::IN,
+                // Stub: always return TryAgain (no events available)
+                || Err(TryOpError::<Errno>::TryAgain),
+            )
+            .map_err(Errno::from)
     }
 
     super::common_functions_for_file_status!();
@@ -175,6 +227,23 @@ mod tests {
         // Mask of 0 should fail
         let result = inotify.add_watch("/tmp/test".into(), 0);
         assert_eq!(result, Err(litebox_common_linux::errno::Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_inotify_add_watch_pathname_too_long() {
+        let _task = crate::syscalls::tests::init_platform(None);
+
+        let inotify = super::InotifyFile::<litebox_platform_multiplex::Platform>::new(
+            InotifyInitFlags::empty(),
+        );
+
+        // Pathname too long should fail
+        let long_path = "x".repeat(super::MAX_PATHNAME_LEN + 1);
+        let result = inotify.add_watch(long_path, 0x100);
+        assert_eq!(
+            result,
+            Err(litebox_common_linux::errno::Errno::ENAMETOOLONG)
+        );
     }
 
     #[test]

@@ -289,7 +289,10 @@ impl Task {
                 litebox_common_linux::ReceiveFlags::empty(),
                 None,
             ),
-            // inotify stub: never has events, always returns EAGAIN
+            // Inotify stub: never has events available.
+            // Note: This returns EAGAIN regardless of blocking mode. A full implementation
+            // would block indefinitely in blocking mode. For this stub, applications must
+            // use non-blocking mode or timeouts (which is the common pattern anyway).
             Descriptor::Inotify { .. } => Err(Errno::EAGAIN),
         }
     }
