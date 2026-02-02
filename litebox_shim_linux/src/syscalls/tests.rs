@@ -584,3 +584,155 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+// ===== fadvise64 tests =====
+
+#[test]
+fn test_fadvise_basic() {
+    use litebox_common_linux::FadviseAdvice;
+
+    let task = init_platform(None);
+
+    // Create a test file
+    let path = "/fadvise_test.txt";
+    let fd = task
+        .sys_open(path, OFlags::CREAT | OFlags::RDWR, Mode::RUSR | Mode::WUSR)
+        .expect("Failed to create test file");
+    let fd_i32 = i32::try_from(fd).unwrap();
+
+    // Test all valid advice values - all should succeed
+    assert!(
+        task.sys_fadvise64(fd_i32, 0, 0, FadviseAdvice::Normal)
+            .is_ok()
+    );
+    assert!(
+        task.sys_fadvise64(fd_i32, 0, 0, FadviseAdvice::Random)
+            .is_ok()
+    );
+    assert!(
+        task.sys_fadvise64(fd_i32, 0, 0, FadviseAdvice::Sequential)
+            .is_ok()
+    );
+    assert!(
+        task.sys_fadvise64(fd_i32, 0, 0, FadviseAdvice::WillNeed)
+            .is_ok()
+    );
+    assert!(
+        task.sys_fadvise64(fd_i32, 0, 0, FadviseAdvice::DontNeed)
+            .is_ok()
+    );
+    assert!(
+        task.sys_fadvise64(fd_i32, 0, 0, FadviseAdvice::NoReuse)
+            .is_ok()
+    );
+
+    // Test with various offset and length combinations
+    assert!(
+        task.sys_fadvise64(fd_i32, 100, 200, FadviseAdvice::Normal)
+            .is_ok()
+    );
+    assert!(
+        task.sys_fadvise64(fd_i32, 0, 1000, FadviseAdvice::Sequential)
+            .is_ok()
+    );
+
+    task.sys_close(fd_i32).expect("Failed to close file");
+}
+
+#[test]
+fn test_fadvise_invalid_fd() {
+    use litebox_common_linux::FadviseAdvice;
+
+    let task = init_platform(None);
+
+    // Invalid file descriptor (negative)
+    assert_eq!(
+        task.sys_fadvise64(-1, 0, 0, FadviseAdvice::Normal),
+        Err(Errno::EBADF),
+        "fadvise on negative fd should return EBADF"
+    );
+
+    // Non-existent file descriptor
+    assert_eq!(
+        task.sys_fadvise64(9999, 0, 0, FadviseAdvice::Normal),
+        Err(Errno::EBADF),
+        "fadvise on non-existent fd should return EBADF"
+    );
+}
+
+#[test]
+fn test_fadvise_closed_fd() {
+    use litebox_common_linux::FadviseAdvice;
+
+    let task = init_platform(None);
+
+    // Create and close a file
+    let path = "/fadvise_closed_test.txt";
+    let fd = task
+        .sys_open(path, OFlags::CREAT | OFlags::RDWR, Mode::RUSR | Mode::WUSR)
+        .expect("Failed to create test file");
+    let fd_i32 = i32::try_from(fd).unwrap();
+    task.sys_close(fd_i32).expect("Failed to close file");
+
+    // fadvise on closed fd should return EBADF
+    assert_eq!(
+        task.sys_fadvise64(fd_i32, 0, 0, FadviseAdvice::Normal),
+        Err(Errno::EBADF),
+        "fadvise on closed fd should return EBADF"
+    );
+}
+
+#[test]
+fn test_fadvise_pipe() {
+    use litebox_common_linux::FadviseAdvice;
+
+    let task = init_platform(None);
+
+    // Create a pipe
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::empty())
+        .expect("Failed to create pipe");
+    let read_fd_i32 = i32::try_from(read_fd).unwrap();
+    let write_fd_i32 = i32::try_from(write_fd).unwrap();
+
+    // fadvise on read end of pipe should return ESPIPE
+    assert_eq!(
+        task.sys_fadvise64(read_fd_i32, 0, 0, FadviseAdvice::Normal),
+        Err(Errno::ESPIPE),
+        "fadvise on pipe read end should return ESPIPE"
+    );
+
+    // fadvise on write end of pipe should return ESPIPE
+    assert_eq!(
+        task.sys_fadvise64(write_fd_i32, 0, 0, FadviseAdvice::Normal),
+        Err(Errno::ESPIPE),
+        "fadvise on pipe write end should return ESPIPE"
+    );
+
+    task.sys_close(read_fd_i32)
+        .expect("Failed to close pipe read end");
+    task.sys_close(write_fd_i32)
+        .expect("Failed to close pipe write end");
+}
+
+#[test]
+fn test_fadvise_eventfd() {
+    use litebox_common_linux::FadviseAdvice;
+
+    let task = init_platform(None);
+
+    // Create an eventfd
+    let efd = task
+        .sys_eventfd2(0, EfdFlags::empty())
+        .expect("Failed to create eventfd");
+    let efd_i32 = i32::try_from(efd).unwrap();
+
+    // fadvise on eventfd should return ESPIPE (not a regular file)
+    assert_eq!(
+        task.sys_fadvise64(efd_i32, 0, 0, FadviseAdvice::Normal),
+        Err(Errno::ESPIPE),
+        "fadvise on eventfd should return ESPIPE"
+    );
+
+    task.sys_close(efd_i32).expect("Failed to close eventfd");
+}

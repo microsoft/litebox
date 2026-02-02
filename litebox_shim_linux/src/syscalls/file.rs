@@ -202,6 +202,44 @@ impl Task {
         .flatten()
     }
 
+    /// Handle syscall `fadvise64` / `posix_fadvise`
+    ///
+    /// This is a no-op implementation since LiteBox uses a virtual filesystem
+    /// without a traditional page cache. The kernel is allowed to ignore advisory
+    /// hints, so returning success without taking action is valid behavior.
+    ///
+    /// # Errors
+    /// - `EBADF`: `fd` is not a valid file descriptor
+    /// - `ESPIPE`: `fd` refers to a pipe or FIFO
+    pub(crate) fn sys_fadvise64(
+        &self,
+        fd: i32,
+        _offset: i64,
+        _len: i64,
+        _advice: litebox_common_linux::FadviseAdvice,
+    ) -> Result<(), Errno> {
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+        let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+        match desc {
+            // Regular file - return success (no-op, advice is ignored)
+            Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
+                *raw_fd,
+                |_fd| Ok(()),             // Regular file: success
+                |_fd| Ok(()),             // Network socket: success (POSIX allows ignoring advice)
+                |_fd| Err(Errno::ESPIPE), // Pipe: not seekable
+            ),
+            // Eventfd, epoll, unix socket - return ESPIPE (not seekable)
+            Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
+                Err(Errno::ESPIPE)
+            }
+        }
+        .flatten()
+    }
+
     /// Handle syscall `unlinkat`
     pub(crate) fn sys_unlinkat(
         &self,

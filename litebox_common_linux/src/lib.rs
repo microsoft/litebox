@@ -1450,6 +1450,27 @@ pub enum MadviseBehavior {
     DontNeedLocked = 24,
 }
 
+/// Advice values for `fadvise64`/`posix_fadvise` syscall.
+///
+/// These values are the same for x86 and x86_64 architectures.
+/// Note: s390x uses different values for DontNeed (6) and NoReuse (7).
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, IntEnum, PartialEq, Eq)]
+pub enum FadviseAdvice {
+    /// No special treatment (default).
+    Normal = 0,
+    /// Expect random page references.
+    Random = 1,
+    /// Expect sequential page references.
+    Sequential = 2,
+    /// Will need these pages soon.
+    WillNeed = 3,
+    /// Don't need these pages anymore.
+    DontNeed = 4,
+    /// Data will be accessed only once.
+    NoReuse = 5,
+}
+
 #[derive(Clone, Debug, Default, FromBytes, IntoBytes)]
 pub struct Sysinfo {
     /// Seconds since boot
@@ -2261,6 +2282,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    /// File advisory information syscall (`fadvise64`/`posix_fadvise`).
+    Fadvise64 {
+        fd: i32,
+        offset: i64,
+        len: i64,
+        advice: FadviseAdvice,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2800,6 +2828,21 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            // fadvise64 syscall - x86_64 version
+            #[cfg(target_arch = "x86_64")]
+            Sysno::fadvise64 => sys_req!(Fadvise64 { fd, offset, len, advice:? }),
+            // fadvise64_64 syscall - x86 32-bit version
+            // Arguments: fd, offset_lo, offset_hi, len_lo, len_hi, advice
+            #[cfg(target_arch = "x86")]
+            Sysno::fadvise64_64 => SyscallRequest::Fadvise64 {
+                fd: ctx.sys_req_arg(0),
+                offset: ctx.sys_req_arg::<i64>(1) | (ctx.sys_req_arg::<i64>(2) << 32),
+                len: ctx.sys_req_arg::<i64>(3) | (ctx.sys_req_arg::<i64>(4) << 32),
+                advice: ctx
+                    .sys_req_arg::<i32>(5)
+                    .try_into()
+                    .or(Err(errno::Errno::EINVAL))?,
+            },
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

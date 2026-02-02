@@ -1130,6 +1130,12 @@ impl Task {
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
+            SyscallRequest::Fadvise64 {
+                fd,
+                offset,
+                len,
+                advice,
+            } => syscall!(sys_fadvise64(fd, offset, len, advice)),
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)
