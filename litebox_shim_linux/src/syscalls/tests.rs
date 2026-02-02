@@ -701,3 +701,27 @@ fn test_fchdir_to_root() {
     task.sys_close(i32::try_from(dir_fd).unwrap()).ok();
     task.sys_close(i32::try_from(root_fd).unwrap()).ok();
 }
+
+#[test]
+fn test_fchdir_eacces() {
+    let task = init_platform(None);
+
+    // Create a directory with no execute permission (read-write only)
+    let test_dir = "/fchdir_no_exec_test_dir";
+    task.sys_mkdir(test_dir, Mode::RUSR.bits() | Mode::WUSR.bits())
+        .expect("Failed to create directory with no execute permission");
+
+    // Open the directory (should succeed as we have read permission)
+    let dir_fd = task
+        .sys_open(test_dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .expect("Failed to open directory");
+
+    // fchdir should fail with EACCES because we don't have execute permission
+    assert_eq!(
+        task.sys_fchdir(i32::try_from(dir_fd).unwrap()),
+        Err(Errno::EACCES),
+        "fchdir to directory without execute permission should return EACCES"
+    );
+
+    task.sys_close(i32::try_from(dir_fd).unwrap()).ok();
+}

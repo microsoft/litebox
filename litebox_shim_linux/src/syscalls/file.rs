@@ -1246,6 +1246,18 @@ impl Task {
     ///
     /// Changes the current working directory to the directory referred to by the
     /// file descriptor fd.
+    ///
+    /// # Known Limitations
+    ///
+    /// The current implementation stores the directory path as a string when the
+    /// directory is opened. This means:
+    /// - If the directory is renamed after opening, `fchdir` will set the CWD to
+    ///   the original path, not the new path. This differs from Linux which uses
+    ///   inode-based tracking.
+    /// - Similarly, `getcwd` after such a rename will return the original path.
+    ///
+    /// This is an architectural limitation of the current implementation that
+    /// requires more extensive changes to fix properly.
     pub fn sys_fchdir(&self, fd: i32) -> Result<(), Errno> {
         if fd < 0 {
             return Err(Errno::EBADF);
@@ -1267,6 +1279,18 @@ impl Task {
                 let status = self.global.fs.fd_file_status(typed_fd)?;
                 if status.file_type != litebox::fs::FileType::Directory {
                     return Err(Errno::ENOTDIR);
+                }
+
+                // Check execute (search) permission on the directory
+                // fchdir requires search permission, similar to chdir
+                let mode = status.mode;
+                // TODO: Proper permission check should consider uid/gid of current process
+                // For now, check if any execute bit is set
+                if !(mode.contains(Mode::XUSR)
+                    || mode.contains(Mode::XGRP)
+                    || mode.contains(Mode::XOTH))
+                {
+                    return Err(Errno::EACCES);
                 }
 
                 // Get the directory path from metadata
