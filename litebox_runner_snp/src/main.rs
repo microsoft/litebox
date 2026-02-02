@@ -10,7 +10,7 @@ mod globals;
 
 extern crate alloc;
 
-use alloc::borrow::ToOwned;
+use alloc::{borrow::ToOwned, string::ToString};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
@@ -100,7 +100,65 @@ pub extern "C" fn sandbox_kernel_init(
     litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::return_to_host();
 }
 
-const ROOTFS: &[u8] = include_bytes!("./test.tar");
+/// Pre-defined file paths to load from host
+const HOST_FILE_PATHS: &[&str] = &[
+    "/out/efault",
+    // Add more paths as needed
+];
+
+/// Load pre-set files from host into the in-memory filesystem
+fn load_host_files_into_fs<Platform: litebox::sync::RawSyncPrimitivesProvider>(
+    in_mem_fs: &mut litebox::fs::in_mem::FileSystem<Platform>,
+) {
+    use litebox::fs::FileSystem;
+
+    in_mem_fs.with_root_privileges(|fs| {
+        // Create /out directory if needed
+        let _ = fs.mkdir(
+            "/out",
+            litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+        );
+
+        for path in HOST_FILE_PATHS {
+            match litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::load_file_from_host(path) {
+                Ok(data) if !data.is_empty() => {
+                    // Create parent directories if needed
+                    if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
+                        if !parent.is_empty() {
+                            let _ = fs.mkdir(
+                                parent,
+                                litebox::fs::Mode::RWXU
+                                    | litebox::fs::Mode::RWXG
+                                    | litebox::fs::Mode::RWXO,
+                            );
+                        }
+                    }
+
+                    // Create and initialize the file
+                    let mode =
+                        litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO; // executable
+                    let flags = litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY;
+                    if let Ok(fd) = fs.open(path, flags, mode) {
+                        fs.initialize_primarily_read_heavy_file(&fd, data.into());
+                        let _ = fs.close(&fd);
+                    }
+                }
+                Ok(_) => {
+                    // Empty file, skip
+                    litebox::log_println!(
+                        litebox_platform_multiplex::platform(),
+                        "File is empty, skipping\n"
+                    );
+                }
+                Err(e) => {
+                    let s = format_args!("Failed to load file {}: {}\n", path, e).to_string();
+                    // File not available from host or too large, skip
+                    litebox::log_println!(litebox_platform_multiplex::platform(), &s);
+                }
+            }
+        }
+    });
+}
 
 /// Initializes the sandbox process.
 #[unsafe(no_mangle)]
@@ -113,13 +171,16 @@ pub extern "C" fn sandbox_process_init(
             & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
     );
     let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
-    litebox::log_println!(platform, "sandbox_process_init called");
+    litebox::log_println!(platform, "sandbox_process_init called\n");
 
     litebox_platform_multiplex::set_platform(platform);
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
-    let in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
-    let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, ROOTFS.into());
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    load_host_files_into_fs(&mut in_mem_fs);
+
+    let tar_ro =
+        litebox::fs::tar_ro::FileSystem::new(litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
     shim_builder.set_fs(shim_builder.default_fs(in_mem_fs, tar_ro));
 
     let parse_args =

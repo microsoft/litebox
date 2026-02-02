@@ -26,6 +26,7 @@
 #define SNP_VMPL_CLONE_REQ 0xd
 #define SNP_VMPL_EXECVE_REQ 0xe
 #define SNP_VMPL_HANDLE_SIGNAL_REQ 0xf
+#define SNP_VMPL_LOAD_FILE_REQ 0x10
 // Do nothing, just return back to VMPL2 for measurement
 #define SNP_VMPL_IDLE_REQ 0xff
 #define SNP_VMPL_TERMINATE_REQ 0x100

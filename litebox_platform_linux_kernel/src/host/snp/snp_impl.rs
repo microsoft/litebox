@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! An implementation of [`HostInterface`] for SNP VMM
-use ::alloc::boxed::Box;
+use ::alloc::{boxed::Box, vec::Vec};
 use core::{
     arch::asm,
     cell::{Cell, OnceCell},
@@ -338,6 +338,14 @@ pub struct SyscallN<const N: usize, const ID: u32> {
     args: [u64; N],
 }
 
+/// Page-aligned buffer for reading file chunks from host
+#[repr(C, align(4096))]
+struct PageAlignedBuffer([u8; 4096]);
+
+/// Maximum file size that can be loaded (2MB)
+/// This is limited by the maximum contiguous memory allocation size.
+const MAX_FILE_SIZE: usize = 2 * 1024 * 1024;
+
 impl HostSnpInterface {
     #[cfg(debug_assertions)]
     pub fn dump_stack(rsp: usize, count: usize) {
@@ -354,6 +362,44 @@ impl HostSnpInterface {
             ],
         );
         Self::request(&mut req);
+    }
+
+    /// Load a file from host by path
+    pub fn load_file_from_host(path: &str) -> Result<Vec<u8>, litebox_common_linux::errno::Errno> {
+        use crate::alloc::string::ToString;
+
+        const CHUNK_SIZE: usize = 4096;
+        let mut result = Vec::new();
+        let mut offset = 0u64;
+
+        // Host only accept heap or stack memory
+        let path = path.to_string();
+        let mut chunk_buffer = Box::new(PageAlignedBuffer([0u8; CHUNK_SIZE]));
+        loop {
+            let bytes_read = Self::load_file(&path, &mut chunk_buffer.0, offset)?;
+
+            if bytes_read == 0 {
+                // End of file reached
+                break;
+            }
+
+            // Only append the bytes that were actually read
+            result.extend_from_slice(&chunk_buffer.0[..bytes_read]);
+            offset += bytes_read as u64;
+
+            // Check if file exceeds maximum size
+            if result.len() > MAX_FILE_SIZE {
+                return Err(litebox_common_linux::errno::Errno::EFBIG); // File too large
+            }
+
+            // If we read less than the chunk size, we've reached the end of the file
+            if bytes_read < CHUNK_SIZE {
+                break;
+            }
+        }
+
+        result.shrink_to_fit();
+        Ok(result)
     }
 
     /// [VTL CALL](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/vsm#vtl-call) via VMMCALL
@@ -373,6 +419,35 @@ impl HostSnpInterface {
             bindings::SNP_VMPL_SYSCALL_REQ,
             ID, // repurpose size field to syscall id
             args,
+        );
+        Self::request(&mut req);
+        Self::parse_result(req.ret)
+    }
+
+    /// Load a file from host by path
+    ///
+    /// The host provides files at fixed, predetermined locations identified by path.
+    ///
+    /// # Parameters
+    /// - `path`: Path of the file to load
+    /// - `buffer`: Buffer to store the file content (must be page-aligned, max 4KB)
+    /// - `offset`: Byte offset in the file to start reading from
+    ///
+    /// # Returns
+    /// The number of bytes read on success, or an error
+    fn load_file(path: &str, buffer: &mut [u8], offset: u64) -> Result<usize, Errno> {
+        let path_bytes = path.as_bytes();
+        let mut req = bindings::SnpVmplRequestArgs::new_request(
+            bindings::SNP_VMPL_LOAD_FILE_REQ,
+            4, // number of arguments
+            [
+                path_bytes.as_ptr() as u64,
+                buffer.as_mut_ptr() as u64,
+                buffer.len() as u64,
+                offset,
+                0,
+                0,
+            ],
         );
         Self::request(&mut req);
         Self::parse_result(req.ret)
