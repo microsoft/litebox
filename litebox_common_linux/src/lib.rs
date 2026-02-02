@@ -2226,7 +2226,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         list: Option<Platform::RawMutPointer<u32>>,
     },
     Setgroups {
-        size: usize,
+        size: i32,
         list: Option<Platform::RawConstPointer<u32>>,
     },
     Sysinfo {

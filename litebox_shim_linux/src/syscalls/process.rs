@@ -1221,11 +1221,27 @@ impl Task {
     /// Handle syscall `setgroups`.
     ///
     /// Sets the supplementary group IDs for the calling process.
+    ///
+    /// # Notes
+    /// - Requires CAP_SETGID (checked via euid == 0 since capabilities are not implemented)
+    /// - Changes are per-Task, not shared across threads in the same thread group.
+    ///   This is a known limitation; Linux shares credentials within thread groups.
+    #[expect(clippy::cast_sign_loss, reason = "size is validated to be >= 0")]
     pub(crate) fn sys_setgroups(
         &self,
-        size: usize,
+        size: i32,
         list: Option<crate::ConstPtr<u32>>,
     ) -> Result<usize, Errno> {
+        // Check for CAP_SETGID capability (requires root since capabilities not implemented)
+        if self.credentials.borrow().euid != 0 {
+            return Err(Errno::EPERM);
+        }
+
+        if size < 0 {
+            return Err(Errno::EINVAL);
+        }
+        let size = size as usize;
+
         if size > NGROUPS_MAX {
             return Err(Errno::EINVAL);
         }
@@ -1703,7 +1719,7 @@ mod tests {
         // Set some supplementary groups
         let groups: [u32; 3] = [100, 200, 300];
         let list_ptr = crate::ConstPtr::from_ptr(groups.as_ptr());
-        task.sys_setgroups(groups.len(), Some(list_ptr))
+        task.sys_setgroups(3, Some(list_ptr))
             .expect("sys_setgroups failed");
 
         // Query the number of groups
@@ -1729,7 +1745,7 @@ mod tests {
         // Set some supplementary groups
         let groups: [u32; 3] = [100, 200, 300];
         let list_ptr = crate::ConstPtr::from_ptr(groups.as_ptr());
-        task.sys_setgroups(groups.len(), Some(list_ptr))
+        task.sys_setgroups(3, Some(list_ptr))
             .expect("sys_setgroups failed");
 
         // Try to retrieve with a buffer that's too small
@@ -1765,7 +1781,17 @@ mod tests {
         let task = crate::syscalls::tests::init_platform(None);
 
         // Trying to set more than NGROUPS_MAX should return EINVAL
-        let result = task.sys_setgroups(super::NGROUPS_MAX + 1, None);
+        // NGROUPS_MAX is 65536, so 65537 is one more than that
+        let result = task.sys_setgroups(65537, None);
+        assert_eq!(result, Err(litebox_common_linux::errno::Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_setgroups_negative_size() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Negative size should return EINVAL
+        let result = task.sys_setgroups(-1, None);
         assert_eq!(result, Err(litebox_common_linux::errno::Errno::EINVAL));
     }
 }
