@@ -167,8 +167,7 @@ impl From<VsmError> for Errno {
             // Not found errors
             VsmError::SystemCertificatesNotFound
             | VsmError::KernelSymbolTableNotFound
-            | VsmError::PrecomputedPatchNotFound
-            | VsmError::SymbolNameNoTerminator => Errno::ENOENT,
+            | VsmError::PrecomputedPatchNotFound => Errno::ENOENT,
 
             // Operation not permitted after end of boot
             VsmError::OperationAfterEndOfBoot(_) => Errno::EPERM,
@@ -202,7 +201,8 @@ impl From<VsmError> for Errno {
             | VsmError::SymbolTableLengthInvalid
             | VsmError::SymbolParseFailed(_)
             | VsmError::SymbolNameOffsetInvalid
-            | VsmError::SymbolNameInvalidUtf8 => Errno::EINVAL,
+            | VsmError::SymbolNameInvalidUtf8
+            | VsmError::SymbolNameNoTerminator => Errno::EINVAL,
 
             // Signature verification failures delegate to VerificationError's Errno mapping
             VsmError::SignatureVerificationFailed(e) => Errno::from(e),
