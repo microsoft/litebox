@@ -1126,6 +1126,10 @@ impl Task {
                 let old_mask = self.sys_umask(mask);
                 Ok(old_mask.bits() as usize)
             }
+            SyscallRequest::Fchdir { fd } => {
+                self.sys_fchdir(fd)?;
+                Ok(0)
+            }
             SyscallRequest::Kill { pid, sig } => self.sys_kill(pid, sig),
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),

@@ -2250,6 +2250,9 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Umask {
         mask: u32,
     },
+    Fchdir {
+        fd: i32,
+    },
     Prctl {
         args: PrctlArg<Platform>,
     },
@@ -2798,6 +2801,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
+            Sysno::fchdir => sys_req!(Fchdir { fd }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
             // Noisy unsupported syscalls.

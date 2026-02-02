@@ -28,12 +28,15 @@ use core::sync::atomic::Ordering;
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {
     umask: core::sync::atomic::AtomicU32,
+    /// Current working directory path.
+    cwd: litebox::sync::RwLock<Platform, String>,
 }
 
 impl Clone for FsState {
     fn clone(&self) -> Self {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
+            cwd: litebox::sync::RwLock::new(self.cwd.read().clone()),
         }
     }
 }
@@ -42,13 +45,28 @@ impl FsState {
     pub fn new() -> Self {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
+            cwd: litebox::sync::RwLock::new("/".to_string()),
         }
     }
 
     fn umask(&self) -> Mode {
         Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
     }
+
+    /// Get the current working directory.
+    pub fn get_cwd(&self) -> String {
+        self.cwd.read().clone()
+    }
+
+    /// Set the current working directory.
+    pub fn set_cwd(&self, path: String) {
+        *self.cwd.write() = path;
+    }
 }
+
+/// Metadata type to store the absolute path of a directory file descriptor.
+/// This is used by fchdir to retrieve the path when changing the working directory.
+pub(crate) struct DirectoryPath(pub String);
 
 /// Task state shared by `CLONE_FILES`.
 pub(crate) struct FilesState {
@@ -118,6 +136,37 @@ impl Task {
         self.fs.borrow().umask()
     }
 
+    /// Compute the absolute path from a path argument.
+    /// If the path is relative, it is joined with the current working directory.
+    fn compute_absolute_path(&self, path: &impl path::Arg) -> Result<String, Errno> {
+        let path_str = path.as_rust_str()?;
+        // Check if the original path is absolute before normalization
+        let is_absolute = path_str.starts_with('/');
+
+        let normalized = path.normalized()?;
+        let normalized_str = normalized.as_str();
+
+        if is_absolute {
+            // Absolute path - handle the special case where "/" normalizes to ""
+            if normalized_str.is_empty() {
+                Ok("/".to_string())
+            } else {
+                Ok(normalized_str.to_string())
+            }
+        } else {
+            // Relative path - join with CWD
+            let cwd = self.fs.borrow().get_cwd();
+            if normalized_str.is_empty() {
+                // Empty normalized path (e.g., ".") means stay in CWD
+                Ok(cwd)
+            } else if cwd.ends_with('/') {
+                Ok(alloc::format!("{cwd}{normalized_str}"))
+            } else {
+                Ok(alloc::format!("{cwd}/{normalized_str}"))
+            }
+        }
+    }
+
     /// Handle syscall `umask`
     pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
         let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
@@ -131,6 +180,9 @@ impl Task {
 
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
+        // Compute the absolute path before opening - needed for fchdir support
+        let abs_path = self.compute_absolute_path(&path)?;
+
         let mode = mode & !self.get_umask();
         let file = self.global.fs.open(path, flags - OFlags::CLOEXEC, mode)?;
         if flags.contains(OFlags::CLOEXEC) {
@@ -143,6 +195,18 @@ impl Task {
                 unreachable!()
             };
         }
+
+        // If this is a directory, store its path as entry metadata for fchdir support
+        if let Ok(status) = self.global.fs.fd_file_status(&file)
+            && status.file_type == litebox::fs::FileType::Directory
+        {
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&file, DirectoryPath(abs_path));
+        }
+
         let files = self.files.borrow();
         let raw_fd = files.raw_descriptor_store.write().fd_into_raw_integer(file);
         files
@@ -1164,8 +1228,7 @@ impl Task {
 
     /// Handle syscall `getcwd`
     pub fn sys_getcwd(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        // TODO: use a fixed path for now
-        let cwd = "/";
+        let cwd = self.fs.borrow().get_cwd();
         // need to account for the null terminator
         if cwd.len() >= buf.len() {
             return Err(Errno::ERANGE);
@@ -1177,6 +1240,50 @@ impl Task {
         let bytes = name.as_bytes_with_nul();
         buf[..bytes.len()].copy_from_slice(bytes);
         Ok(bytes.len())
+    }
+
+    /// Handle syscall `fchdir`
+    ///
+    /// Changes the current working directory to the directory referred to by the
+    /// file descriptor fd.
+    pub fn sys_fchdir(&self, fd: i32) -> Result<(), Errno> {
+        if fd < 0 {
+            return Err(Errno::EBADF);
+        }
+        let fd_u32 = u32::try_from(fd).expect("fd >= 0");
+
+        let files = self.files.borrow();
+        let raw_fd = match files.file_descriptors.read().get_fd(fd_u32) {
+            Some(Descriptor::LiteBoxRawFd(raw_fd)) => *raw_fd,
+            Some(_) => return Err(Errno::ENOTDIR), // eventfd, epoll, unix socket - not directories
+            None => return Err(Errno::EBADF),
+        };
+
+        // Get the typed fd and check if it's a directory
+        files.run_on_raw_fd(
+            raw_fd,
+            |typed_fd| {
+                // Check if this fd is a directory
+                let status = self.global.fs.fd_file_status(typed_fd)?;
+                if status.file_type != litebox::fs::FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+
+                // Get the directory path from metadata
+                let path = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(typed_fd, |dir_path: &DirectoryPath| dir_path.0.clone())
+                    .map_err(|_| Errno::EBADF)?;
+
+                // Update the CWD in FsState
+                self.fs.borrow().set_cwd(path);
+                Ok(())
+            },
+            |_| Err(Errno::ENOTDIR), // Network fd
+            |_| Err(Errno::ENOTDIR), // Pipe fd
+        )?
     }
 }
 

@@ -584,3 +584,120 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+#[test]
+fn test_fchdir_basic() {
+    let task = init_platform(None);
+
+    // Create a test directory
+    let test_dir = "/fchdir_test_dir";
+    let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
+    task.sys_mkdir(test_dir, dir_mode)
+        .expect("Failed to create test directory");
+
+    // Initial CWD should be "/"
+    let mut buf = [0u8; 256];
+    let len = task.sys_getcwd(&mut buf).expect("getcwd failed");
+    let initial_cwd = core::str::from_utf8(&buf[..len - 1]).unwrap(); // -1 to skip null terminator
+    assert_eq!(initial_cwd, "/", "Initial CWD should be /");
+
+    // Open the directory
+    let dir_fd = task
+        .sys_open(test_dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .expect("Failed to open test directory");
+
+    // Change to the directory using fchdir
+    task.sys_fchdir(i32::try_from(dir_fd).unwrap())
+        .expect("fchdir should succeed");
+
+    // Verify CWD changed
+    let len = task
+        .sys_getcwd(&mut buf)
+        .expect("getcwd failed after fchdir");
+    let new_cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
+    assert_eq!(new_cwd, test_dir, "CWD should be updated to {test_dir}");
+
+    // Clean up
+    task.sys_close(i32::try_from(dir_fd).unwrap())
+        .expect("Failed to close directory");
+}
+
+#[test]
+fn test_fchdir_ebadf() {
+    let task = init_platform(None);
+
+    // Invalid fd (-1)
+    assert_eq!(
+        task.sys_fchdir(-1),
+        Err(Errno::EBADF),
+        "fchdir with fd=-1 should return EBADF"
+    );
+
+    // Non-existent fd (high number)
+    assert_eq!(
+        task.sys_fchdir(999),
+        Err(Errno::EBADF),
+        "fchdir with non-existent fd should return EBADF"
+    );
+}
+
+#[test]
+fn test_fchdir_enotdir() {
+    let task = init_platform(None);
+
+    // Create a regular file
+    let test_file = "/fchdir_test_regular_file.txt";
+    let fd = task
+        .sys_open(
+            test_file,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+
+    // fchdir on a regular file should fail with ENOTDIR
+    assert_eq!(
+        task.sys_fchdir(i32::try_from(fd).unwrap()),
+        Err(Errno::ENOTDIR),
+        "fchdir on a regular file should return ENOTDIR"
+    );
+
+    task.sys_close(i32::try_from(fd).unwrap())
+        .expect("Failed to close file");
+}
+
+#[test]
+fn test_fchdir_to_root() {
+    let task = init_platform(None);
+
+    // Create and change to a subdirectory first
+    let test_dir = "/fchdir_root_test_dir";
+    let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
+    task.sys_mkdir(test_dir, dir_mode)
+        .expect("Failed to create test directory");
+
+    let dir_fd = task
+        .sys_open(test_dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .expect("Failed to open test directory");
+
+    task.sys_fchdir(i32::try_from(dir_fd).unwrap())
+        .expect("fchdir should succeed");
+
+    // Now open root directory and fchdir back to it
+    let root_fd = task
+        .sys_open("/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .expect("Failed to open root directory");
+
+    task.sys_fchdir(i32::try_from(root_fd).unwrap())
+        .expect("fchdir to root should succeed");
+
+    // Verify CWD is back to /
+    let mut buf = [0u8; 256];
+    let len = task.sys_getcwd(&mut buf).expect("getcwd failed");
+    let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
+    assert_eq!(cwd, "/", "CWD should be back to /");
+
+    // Clean up
+    task.sys_close(i32::try_from(dir_fd).unwrap()).ok();
+    task.sys_close(i32::try_from(root_fd).unwrap()).ok();
+}
