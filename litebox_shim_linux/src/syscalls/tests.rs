@@ -584,3 +584,205 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+#[test]
+fn test_preadv_pwritev_basic() {
+    use crate::ConstPtr;
+    use litebox_common_linux::{IoReadVec, IoWriteVec};
+
+    let task = init_platform(None);
+
+    // Create a test file
+    let file_path = "/preadv_test_file.txt";
+    let fd = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Write some initial data using regular write
+    let initial_data = b"HEADER__CONTENT_DATA__FOOTER__";
+    task.sys_write(fd, initial_data, None)
+        .expect("Failed to write initial data");
+
+    // Seek back to start
+    task.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToBeginning)
+        .expect("Failed to seek");
+
+    // Test preadv: read at offset 8 (should get "CONTENT_DATA__FOOTER__")
+    let mut buf1 = [0u8; 8]; // "CONTENT_"
+    let mut buf2 = [0u8; 6]; // "DATA__"
+
+    let ptr1 = MutPtr::<u8>::from_ptr(buf1.as_mut_ptr());
+    let ptr2 = MutPtr::<u8>::from_ptr(buf2.as_mut_ptr());
+
+    let iov_read = [
+        IoReadVec {
+            iov_base: ptr1,
+            iov_len: buf1.len(),
+        },
+        IoReadVec {
+            iov_base: ptr2,
+            iov_len: buf2.len(),
+        },
+    ];
+
+    let iovec_ptr = ConstPtr::<IoReadVec<MutPtr<u8>>>::from_ptr(iov_read.as_ptr());
+
+    let bytes_read = task
+        .sys_preadv(fd, iovec_ptr, 2, 8)
+        .expect("preadv should succeed");
+    assert_eq!(bytes_read, 14);
+    assert_eq!(&buf1, b"CONTENT_");
+    assert_eq!(&buf2, b"DATA__");
+
+    // Test pwritev: write at offset 8
+    let write_data1 = b"NEWDATA_";
+    let write_data2 = b"XYZ___";
+
+    let write_ptr1 = ConstPtr::<u8>::from_ptr(write_data1.as_ptr());
+    let write_ptr2 = ConstPtr::<u8>::from_ptr(write_data2.as_ptr());
+
+    let iov_write = [
+        IoWriteVec {
+            iov_base: write_ptr1,
+            iov_len: write_data1.len(),
+        },
+        IoWriteVec {
+            iov_base: write_ptr2,
+            iov_len: write_data2.len(),
+        },
+    ];
+
+    let iovec_write_ptr = ConstPtr::<IoWriteVec<ConstPtr<u8>>>::from_ptr(iov_write.as_ptr());
+
+    let bytes_written = task
+        .sys_pwritev(fd, iovec_write_ptr, 2, 8)
+        .expect("pwritev should succeed");
+    assert_eq!(bytes_written, 14);
+
+    // Verify the write by reading back
+    let mut verify_buf = [0u8; 30];
+    task.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToBeginning)
+        .expect("Failed to seek");
+    let read_back = task
+        .sys_read(fd, &mut verify_buf, None)
+        .expect("Failed to read back");
+    assert_eq!(read_back, 30);
+    assert_eq!(&verify_buf, b"HEADER__NEWDATA_XYZ___FOOTER__");
+
+    task.sys_close(fd).expect("Failed to close test file");
+}
+
+#[test]
+fn test_preadv2_offset_minus_one() {
+    use crate::ConstPtr;
+    use litebox_common_linux::{IoReadVec, RwfFlags};
+
+    let task = init_platform(None);
+
+    // Create a test file with some data
+    let file_path = "/preadv2_test_file.txt";
+    let fd = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    let data = b"0123456789";
+    task.sys_write(fd, data, None)
+        .expect("Failed to write data");
+
+    // Seek to position 5
+    task.sys_lseek(fd, 5, litebox::fs::SeekWhence::RelativeToBeginning)
+        .expect("Failed to seek");
+
+    // Test preadv2 with offset=-1 (should use current position like readv)
+    let mut buf = [0u8; 5];
+    let ptr = MutPtr::<u8>::from_ptr(buf.as_mut_ptr());
+    let iov = [IoReadVec {
+        iov_base: ptr,
+        iov_len: buf.len(),
+    }];
+    let iovec_ptr = ConstPtr::<IoReadVec<MutPtr<u8>>>::from_ptr(iov.as_ptr());
+
+    let bytes_read = task
+        .sys_preadv2(fd, iovec_ptr, 1, -1, RwfFlags::empty())
+        .expect("preadv2 with offset=-1 should succeed");
+    assert_eq!(bytes_read, 5);
+    assert_eq!(&buf, b"56789");
+
+    task.sys_close(fd).expect("Failed to close test file");
+}
+
+#[test]
+fn test_preadv_invalid_offset() {
+    use crate::ConstPtr;
+    use litebox_common_linux::IoReadVec;
+
+    let task = init_platform(None);
+
+    // Create a test file
+    let file_path = "/preadv_invalid_offset_test.txt";
+    let fd = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    let mut buf = [0u8; 10];
+    let ptr = MutPtr::<u8>::from_ptr(buf.as_mut_ptr());
+    let iov = [IoReadVec {
+        iov_base: ptr,
+        iov_len: buf.len(),
+    }];
+    let iovec_ptr = ConstPtr::<IoReadVec<MutPtr<u8>>>::from_ptr(iov.as_ptr());
+
+    // Negative offset should return EINVAL
+    let result = task.sys_preadv(fd, iovec_ptr, 1, -5);
+    assert_eq!(result, Err(Errno::EINVAL));
+
+    task.sys_close(fd).expect("Failed to close test file");
+}
+
+#[test]
+fn test_preadv2_invalid_flags() {
+    use crate::ConstPtr;
+    use litebox_common_linux::{IoReadVec, RwfFlags};
+
+    let task = init_platform(None);
+
+    // Create a test file
+    let file_path = "/preadv2_invalid_flags_test.txt";
+    let fd = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    let mut buf = [0u8; 10];
+    let ptr = MutPtr::<u8>::from_ptr(buf.as_mut_ptr());
+    let iov = [IoReadVec {
+        iov_base: ptr,
+        iov_len: buf.len(),
+    }];
+    let iovec_ptr = ConstPtr::<IoReadVec<MutPtr<u8>>>::from_ptr(iov.as_ptr());
+
+    // RWF_APPEND is invalid for read operations
+    let result = task.sys_preadv2(fd, iovec_ptr, 1, 0, RwfFlags::RWF_APPEND);
+    assert_eq!(result, Err(Errno::EINVAL));
+
+    task.sys_close(fd).expect("Failed to close test file");
+}

@@ -1762,6 +1762,29 @@ bitflags::bitflags! {
     }
 }
 
+/// Flags for the `preadv2` and `pwritev2` syscalls.
+/// These are the Read/Write flags (RWF_*) that modify I/O behavior.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct RwfFlags(u32);
+
+bitflags::bitflags! {
+    impl RwfFlags: u32 {
+        /// High priority request, may use polling.
+        const RWF_HIPRI = 0x00000001;
+        /// Per-I/O O_DSYNC equivalent.
+        const RWF_DSYNC = 0x00000002;
+        /// Per-I/O O_SYNC equivalent.
+        const RWF_SYNC = 0x00000004;
+        /// Don't block, return EAGAIN if would block.
+        const RWF_NOWAIT = 0x00000008;
+        /// Per-I/O O_APPEND equivalent.
+        const RWF_APPEND = 0x00000010;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 /// Packaged sigset with its size, used by `pselect` syscall
 #[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C)]
@@ -1956,6 +1979,32 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         iovec: Platform::RawConstPointer<IoWriteVec<Platform::RawConstPointer<u8>>>,
         iovcnt: usize,
+    },
+    Preadv {
+        fd: i32,
+        iovec: Platform::RawConstPointer<IoReadVec<Platform::RawMutPointer<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+    },
+    Pwritev {
+        fd: i32,
+        iovec: Platform::RawConstPointer<IoWriteVec<Platform::RawConstPointer<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+    },
+    Preadv2 {
+        fd: i32,
+        iovec: Platform::RawConstPointer<IoReadVec<Platform::RawMutPointer<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+        flags: RwfFlags,
+    },
+    Pwritev2 {
+        fd: i32,
+        iovec: Platform::RawConstPointer<IoWriteVec<Platform::RawConstPointer<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+        flags: RwfFlags,
     },
     Access {
         pathname: Platform::RawConstPointer<i8>,
@@ -2449,6 +2498,38 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }),
             Sysno::readv => sys_req!(Readv { fd, iovec:*, iovcnt }),
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::preadv => {
+                sys_req!(Preadv { fd, iovec:*, iovcnt, offset: { ctx.sys_req_arg::<i64>(3) } })
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::preadv => {
+                sys_req!(Preadv { fd, iovec:*, iovcnt, offset: { ctx.sys_req_arg::<i64>(3) | ((ctx.sys_req_arg::<i64>(4)) << 32) } })
+            }
+            #[cfg(target_arch = "x86_64")]
+            Sysno::pwritev => {
+                sys_req!(Pwritev { fd, iovec:*, iovcnt, offset: { ctx.sys_req_arg::<i64>(3) } })
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::pwritev => {
+                sys_req!(Pwritev { fd, iovec:*, iovcnt, offset: { ctx.sys_req_arg::<i64>(3) | ((ctx.sys_req_arg::<i64>(4)) << 32) } })
+            }
+            #[cfg(target_arch = "x86_64")]
+            Sysno::preadv2 => {
+                sys_req!(Preadv2 { fd, iovec:*, iovcnt, offset: { ctx.sys_req_arg::<i64>(3) }, flags })
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::preadv2 => {
+                sys_req!(Preadv2 { fd, iovec:*, iovcnt, offset: { ctx.sys_req_arg::<i64>(3) | ((ctx.sys_req_arg::<i64>(4)) << 32) }, flags })
+            }
+            #[cfg(target_arch = "x86_64")]
+            Sysno::pwritev2 => {
+                sys_req!(Pwritev2 { fd, iovec:*, iovcnt, offset: { ctx.sys_req_arg::<i64>(3) }, flags })
+            }
+            #[cfg(target_arch = "x86")]
+            Sysno::pwritev2 => {
+                sys_req!(Pwritev2 { fd, iovec:*, iovcnt, offset: { ctx.sys_req_arg::<i64>(3) | ((ctx.sys_req_arg::<i64>(4)) << 32) }, flags })
+            }
             Sysno::access => sys_req!(Access { pathname:*, mode }),
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
@@ -3184,6 +3265,7 @@ reinterpret_truncated_from_usize_for! {
         EfdFlags,
         RngFlags,
         TimerFlags,
+        RwfFlags,
     ],
 }
 

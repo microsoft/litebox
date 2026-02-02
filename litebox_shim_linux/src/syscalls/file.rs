@@ -609,6 +609,250 @@ impl Task {
         res
     }
 
+    /// Handle syscall `preadv`
+    ///
+    /// Read data from file descriptor at the specified offset into multiple buffers.
+    /// The file offset is not changed.
+    pub fn sys_preadv(
+        &self,
+        fd: i32,
+        iovec: ConstPtr<IoReadVec<MutPtr<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+    ) -> Result<usize, Errno> {
+        // Negative offsets are invalid
+        let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        self.do_preadv(fd, iovec, iovcnt, Some(pos))
+    }
+
+    /// Handle syscall `pwritev`
+    ///
+    /// Write data to file descriptor at the specified offset from multiple buffers.
+    /// The file offset is not changed.
+    pub fn sys_pwritev(
+        &self,
+        fd: i32,
+        iovec: ConstPtr<IoWriteVec<ConstPtr<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+    ) -> Result<usize, Errno> {
+        // Negative offsets are invalid
+        let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        self.do_pwritev(fd, iovec, iovcnt, Some(pos))
+    }
+
+    /// Handle syscall `preadv2`
+    ///
+    /// Like preadv, but with additional flags. When offset is -1, uses current
+    /// file position like readv.
+    pub fn sys_preadv2(
+        &self,
+        fd: i32,
+        iovec: ConstPtr<IoReadVec<MutPtr<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+        flags: litebox_common_linux::RwfFlags,
+    ) -> Result<usize, Errno> {
+        // Validate flags - reject unknown flags
+        let known_flags = litebox_common_linux::RwfFlags::RWF_HIPRI
+            | litebox_common_linux::RwfFlags::RWF_DSYNC
+            | litebox_common_linux::RwfFlags::RWF_SYNC
+            | litebox_common_linux::RwfFlags::RWF_NOWAIT
+            | litebox_common_linux::RwfFlags::RWF_APPEND;
+        if !known_flags.contains(flags) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+
+        // RWF_APPEND is not valid for read operations
+        if flags.contains(litebox_common_linux::RwfFlags::RWF_APPEND) {
+            return Err(Errno::EINVAL);
+        }
+
+        // When offset is -1, behave like readv (use current position)
+        if offset == -1 {
+            return self.sys_readv(fd, iovec, iovcnt);
+        }
+
+        // Otherwise behave like preadv
+        let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        // Note: flags like RWF_HIPRI, RWF_DSYNC, RWF_SYNC, RWF_NOWAIT are accepted
+        // but not implemented (advisory only in this implementation)
+        self.do_preadv(fd, iovec, iovcnt, Some(pos))
+    }
+
+    /// Handle syscall `pwritev2`
+    ///
+    /// Like pwritev, but with additional flags. When offset is -1, uses current
+    /// file position like writev.
+    pub fn sys_pwritev2(
+        &self,
+        fd: i32,
+        iovec: ConstPtr<IoWriteVec<ConstPtr<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+        flags: litebox_common_linux::RwfFlags,
+    ) -> Result<usize, Errno> {
+        // Validate flags - reject unknown flags
+        let known_flags = litebox_common_linux::RwfFlags::RWF_HIPRI
+            | litebox_common_linux::RwfFlags::RWF_DSYNC
+            | litebox_common_linux::RwfFlags::RWF_SYNC
+            | litebox_common_linux::RwfFlags::RWF_NOWAIT
+            | litebox_common_linux::RwfFlags::RWF_APPEND;
+        if !known_flags.contains(flags) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+
+        // When offset is -1, behave like writev (use current position)
+        // Note: RWF_APPEND with offset=-1 is valid (append mode write)
+        if offset == -1 {
+            return self.sys_writev(fd, iovec, iovcnt);
+        }
+
+        // RWF_APPEND is invalid when offset is not -1
+        if flags.contains(litebox_common_linux::RwfFlags::RWF_APPEND) {
+            return Err(Errno::EINVAL);
+        }
+
+        let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        // Note: flags like RWF_HIPRI, RWF_DSYNC, RWF_SYNC, RWF_NOWAIT are accepted
+        // but not implemented (advisory only in this implementation)
+        self.do_pwritev(fd, iovec, iovcnt, Some(pos))
+    }
+
+    /// Internal implementation for preadv/preadv2
+    fn do_preadv(
+        &self,
+        fd: i32,
+        iovec: ConstPtr<IoReadVec<MutPtr<u8>>>,
+        iovcnt: usize,
+        pos: Option<usize>,
+    ) -> Result<usize, Errno> {
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
+        let files = self.files.borrow();
+        let locked_file_descriptors = files.file_descriptors.read();
+        let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+        let mut total_read = 0;
+        let mut kernel_buffer = vec![
+            0u8;
+            iovs.iter()
+                .map(|i| i.iov_len)
+                .max()
+                .unwrap_or_default()
+                .min(super::super::MAX_KERNEL_BUF_SIZE)
+        ];
+        let mut current_offset = pos;
+        for iov in iovs {
+            if iov.iov_len == 0 {
+                continue;
+            }
+            let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
+                return Err(Errno::EINVAL);
+            };
+            // Only read up to the requested iov_len
+            let read_len = iov.iov_len.min(kernel_buffer.len());
+            let size = match desc {
+                Descriptor::LiteBoxRawFd(raw_fd) => files
+                    .run_on_raw_fd(
+                        *raw_fd,
+                        |fd| {
+                            self.global
+                                .fs
+                                .read(fd, &mut kernel_buffer[..read_len], current_offset)
+                                .map_err(Errno::from)
+                        },
+                        // Sockets/pipes don't support positioned I/O
+                        |_fd| Err(Errno::ESPIPE),
+                        |_fd| Err(Errno::ESPIPE),
+                    )
+                    .flatten()?,
+                Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
+                Descriptor::Eventfd { .. } | Descriptor::Unix { .. } => return Err(Errno::ESPIPE),
+            };
+            iov.iov_base
+                .copy_from_slice(0, &kernel_buffer[..size])
+                .ok_or(Errno::EFAULT)?;
+            total_read += size;
+            // Advance offset for next iovec element
+            if let Some(ref mut offset) = current_offset {
+                *offset += size;
+            }
+            if size < iov.iov_len {
+                // Okay to transfer fewer bytes than requested
+                break;
+            }
+        }
+        Ok(total_read)
+    }
+
+    /// Internal implementation for pwritev/pwritev2
+    fn do_pwritev(
+        &self,
+        fd: i32,
+        iovec: ConstPtr<IoWriteVec<ConstPtr<u8>>>,
+        iovcnt: usize,
+        pos: Option<usize>,
+    ) -> Result<usize, Errno> {
+        let Ok(fd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let iovs: &[IoWriteVec<ConstPtr<u8>>] =
+            &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
+        let files = self.files.borrow();
+        let locked_file_descriptors = files.file_descriptors.read();
+        let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+        let mut current_offset = pos;
+        let res = match desc {
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                let raw_fd = *raw_fd;
+                drop(locked_file_descriptors); // drop before potentially blocking write
+                files
+                    .run_on_raw_fd(
+                        raw_fd,
+                        |fd| {
+                            let mut total_written = 0;
+                            for iov in iovs {
+                                if iov.iov_len == 0 {
+                                    continue;
+                                }
+                                let slice = iov
+                                    .iov_base
+                                    .to_owned_slice(iov.iov_len)
+                                    .ok_or(Errno::EFAULT)?;
+                                let size = self
+                                    .global
+                                    .fs
+                                    .write(fd, &slice, current_offset)
+                                    .map_err(Errno::from)?;
+                                total_written += size;
+                                // Advance offset for next iovec element
+                                if let Some(ref mut offset) = current_offset {
+                                    *offset += size;
+                                }
+                                if size < iov.iov_len {
+                                    // Partial write
+                                    break;
+                                }
+                            }
+                            Ok(total_written)
+                        },
+                        // Sockets/pipes don't support positioned I/O
+                        |_fd| Err(Errno::ESPIPE),
+                        |_fd| Err(Errno::ESPIPE),
+                    )
+                    .flatten()
+            }
+            Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+            Descriptor::Eventfd { .. } | Descriptor::Unix { .. } => Err(Errno::ESPIPE),
+        };
+        if let Err(Errno::EPIPE) = res {
+            unimplemented!("send SIGPIPE to the current task");
+        }
+        res
+    }
+
     /// Handle syscall `access`
     pub fn sys_access(
         &self,

@@ -761,6 +761,32 @@ impl Task {
             SyscallRequest::Brk { addr } => self.sys_brk(addr),
             SyscallRequest::Readv { fd, iovec, iovcnt } => self.sys_readv(fd, iovec, iovcnt),
             SyscallRequest::Writev { fd, iovec, iovcnt } => self.sys_writev(fd, iovec, iovcnt),
+            SyscallRequest::Preadv {
+                fd,
+                iovec,
+                iovcnt,
+                offset,
+            } => self.sys_preadv(fd, iovec, iovcnt, offset),
+            SyscallRequest::Pwritev {
+                fd,
+                iovec,
+                iovcnt,
+                offset,
+            } => self.sys_pwritev(fd, iovec, iovcnt, offset),
+            SyscallRequest::Preadv2 {
+                fd,
+                iovec,
+                iovcnt,
+                offset,
+                flags,
+            } => self.sys_preadv2(fd, iovec, iovcnt, offset, flags),
+            SyscallRequest::Pwritev2 {
+                fd,
+                iovec,
+                iovcnt,
+                offset,
+                flags,
+            } => self.sys_pwritev2(fd, iovec, iovcnt, offset, flags),
             SyscallRequest::Access { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),
