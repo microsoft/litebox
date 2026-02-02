@@ -1960,6 +1960,11 @@ impl Task {
         let desc_in = file_table.get_fd(fd_in_u32).ok_or(Errno::EBADF)?;
         let desc_out = file_table.get_fd(fd_out_u32).ok_or(Errno::EBADF)?;
 
+        // fd_in and fd_out must not be the same (can cause deadlock on same pipe)
+        if fd_in == fd_out {
+            return Err(Errno::EINVAL);
+        }
+
         // Determine which descriptor is a pipe
         let in_is_pipe = matches!(desc_in, Descriptor::LiteBoxRawFd(raw_fd) if {
             let rds = files.raw_descriptor_store.read();
@@ -2100,15 +2105,14 @@ impl Task {
             .clone();
         drop(rds);
 
-        // Read offset from user pointer if provided
-        let offset = if let Some(off_ptr) = off_out {
-            Some(
-                off_ptr
-                    .read_at_offset(0)
-                    .ok_or(Errno::EFAULT)?
-                    .try_into()
-                    .map_err(|_| Errno::EINVAL)?,
-            )
+        // Read offset from user pointer if provided (read once to avoid TOCTOU)
+        let offset: Option<(usize, i64)> = if let Some(off_ptr) = off_out {
+            let off: i64 = off_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if off < 0 {
+                return Err(Errno::EINVAL);
+            }
+            let off_usize: usize = off.try_into().map_err(|_| Errno::EINVAL)?;
+            Some((off_usize, off))
         } else {
             None
         };
@@ -2142,19 +2146,24 @@ impl Task {
             return Ok(0);
         }
 
-        // Write to file
+        // Write to file (use usize offset for fs.write)
         let bytes_written = self
             .global
             .fs
-            .write(&out_file_fd, &buf[..bytes_read], offset)
+            .write(&out_file_fd, &buf[..bytes_read], offset.map(|(off, _)| off))
             .map_err(Errno::from)?;
 
-        // Update offset if provided
-        if let Some(off_ptr) = off_out {
-            let current_offset: i64 = off_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-            #[expect(clippy::cast_possible_wrap, reason = "offset won't exceed i64::MAX")]
-            let new_offset = current_offset + bytes_written as i64;
-            off_ptr
+        // Update offset if provided (use saved i64 offset to avoid TOCTOU)
+        if let Some((_, original_offset)) = offset {
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "bytes_written ≤ 65536, cannot wrap i64"
+            )]
+            let new_offset = original_offset
+                .checked_add(bytes_written as i64)
+                .ok_or(Errno::EOVERFLOW)?;
+            off_out
+                .unwrap()
                 .write_at_offset(0, new_offset)
                 .ok_or(Errno::EFAULT)?;
         }
@@ -2184,15 +2193,14 @@ impl Task {
             .clone();
         drop(rds);
 
-        // Read offset from user pointer if provided
-        let offset = if let Some(off_ptr) = off_in {
-            Some(
-                off_ptr
-                    .read_at_offset(0)
-                    .ok_or(Errno::EFAULT)?
-                    .try_into()
-                    .map_err(|_| Errno::EINVAL)?,
-            )
+        // Read offset from user pointer if provided (read once to avoid TOCTOU)
+        let offset: Option<(usize, i64)> = if let Some(off_ptr) = off_in {
+            let off: i64 = off_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if off < 0 {
+                return Err(Errno::EINVAL);
+            }
+            let off_usize: usize = off.try_into().map_err(|_| Errno::EINVAL)?;
+            Some((off_usize, off))
         } else {
             None
         };
@@ -2201,11 +2209,11 @@ impl Task {
         let buf_size = len.min(65536);
         let mut buf = vec![0u8; buf_size];
 
-        // Read from file
+        // Read from file (use usize offset for fs.read)
         let bytes_read = self
             .global
             .fs
-            .read(&in_file_fd, &mut buf, offset)
+            .read(&in_file_fd, &mut buf, offset.map(|(off, _)| off))
             .map_err(Errno::from)?;
 
         if bytes_read == 0 {
@@ -2233,12 +2241,17 @@ impl Task {
             Err(e) => return Err(Errno::from(e)),
         };
 
-        // Update offset if provided
-        if let Some(off_ptr) = off_in {
-            let current_offset: i64 = off_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-            #[expect(clippy::cast_possible_wrap, reason = "offset won't exceed i64::MAX")]
-            let new_offset = current_offset + bytes_written as i64;
-            off_ptr
+        // Update offset if provided (use saved i64 offset to avoid TOCTOU)
+        if let Some((_, original_offset)) = offset {
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "bytes_written ≤ 65536, cannot wrap i64"
+            )]
+            let new_offset = original_offset
+                .checked_add(bytes_written as i64)
+                .ok_or(Errno::EOVERFLOW)?;
+            off_in
+                .unwrap()
                 .write_at_offset(0, new_offset)
                 .ok_or(Errno::EFAULT)?;
         }
@@ -2250,6 +2263,14 @@ impl Task {
     ///
     /// Duplicates data from one pipe to another without consuming it from the
     /// source pipe. Both file descriptors must be pipes.
+    ///
+    /// # Implementation Notes
+    ///
+    /// This is a simplified implementation that reads from the source pipe and
+    /// writes back to it after writing to the destination. This approach may not
+    /// work correctly in multi-threaded scenarios where another thread could observe
+    /// an empty source pipe between the read and write-back operations. A proper
+    /// implementation would use a peek() operation that doesn't consume data.
     pub fn sys_tee(
         &self,
         fd_in: i32,
@@ -2372,12 +2393,14 @@ impl Task {
             Err(e) => return Err(Errno::from(e)),
         };
 
-        // Write back to input pipe to restore data (tee doesn't consume from source)
-        // This is a simplification - proper tee would peek without consuming
+        // Write back to input pipe only what was successfully written to output.
+        // This ensures consistency: if partial write occurs, we only "keep" in the
+        // source pipe what was actually duplicated.
+        // NOTE: This is a simplification - proper tee would use peek() without consuming.
         let _ = self
             .global
             .pipes
-            .write(&self.wait_cx(), &in_pipe_fd, &buf[..bytes_read]);
+            .write(&self.wait_cx(), &in_pipe_fd, &buf[..bytes_written]);
 
         Ok(bytes_written)
     }
