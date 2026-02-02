@@ -109,6 +109,15 @@ impl<Platform: platform::Provider + Sync> super::FileSystem for FileSystem<Platf
         todo!()
     }
 
+    fn mknod(
+        &self,
+        path: impl crate::path::Arg,
+        mode: super::Mode,
+        file_type: super::FileType,
+    ) -> Result<(), super::errors::MknodError> {
+        todo!()
+    }
+
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), super::errors::RmdirError> {
         todo!()
     }

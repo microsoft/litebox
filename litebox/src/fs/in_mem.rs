@@ -13,8 +13,9 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, MknodError, OpenError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError,
+    WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
 
@@ -228,6 +229,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     },
                     data: Vec::new().into(),
                     unique_id: self.fresh_id(),
+                    file_type: FileType::RegularFile,
                 })));
                 let old = root.entries.insert(path, entry.clone());
                 assert!(old.is_none());
@@ -538,8 +540,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let removed = parent
             .children
             .remove(path.components().unwrap().last().unwrap());
-        // Just a sanity check
-        assert!(matches!(removed, Some(FileType::RegularFile)));
+        // Just a sanity check: should be a file-like type (regular file or named pipe)
+        assert!(matches!(
+            removed,
+            Some(FileType::RegularFile | FileType::NamedPipe)
+        ));
         let removed = root.entries.remove(&path).unwrap();
         // Just a sanity check
         assert!(matches!(removed, Entry::File(File { .. })));
@@ -577,6 +582,62 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 unique_id: self.fresh_id(),
             }))),
         );
+        assert!(old.is_none());
+        Ok(())
+    }
+
+    fn mknod(
+        &self,
+        path: impl crate::path::Arg,
+        mode: super::Mode,
+        file_type: super::FileType,
+    ) -> Result<(), MknodError> {
+        // Only support regular files and named pipes
+        match file_type {
+            FileType::RegularFile | FileType::NamedPipe => {}
+            FileType::CharacterDevice | FileType::Directory => {
+                return Err(MknodError::OperationNotPermitted);
+            }
+        }
+
+        let path = self.absolute_path(path)?;
+        let mut root = self.root.write();
+        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let Some((_parent_path, parent)) = parent else {
+            // Attempted to make `/`
+            return Err(MknodError::AlreadyExists);
+        };
+        if entry.is_some() {
+            return Err(MknodError::AlreadyExists);
+        }
+        let mut parent = parent.write();
+        if !self.current_user.can_write(&parent.perms) {
+            return Err(MknodError::NoWritePerms);
+        }
+        let old = parent.children.insert(
+            path.components().unwrap().last().unwrap().into(),
+            file_type.clone(),
+        );
+        assert!(old.is_none());
+
+        let entry = match file_type {
+            FileType::RegularFile | FileType::NamedPipe => {
+                // For both regular files and named pipes, create an empty file entry.
+                // Named pipes in a single-process libOS behave like regular files.
+                Entry::File(Arc::new(sync::RwLock::new(FileX {
+                    perms: Permissions {
+                        mode,
+                        userinfo: self.current_user,
+                    },
+                    data: alloc::borrow::Cow::Borrowed(&[]),
+                    unique_id: self.fresh_id(),
+                    file_type: file_type.clone(),
+                })))
+            }
+            _ => unreachable!(), // Already handled above
+        };
+
+        let old = root.entries.insert(path, entry);
         assert!(old.is_none());
         Ok(())
     }
@@ -698,7 +759,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             Entry::File(file) => {
                 let file = file.read();
                 (
-                    super::FileType::RegularFile,
+                    file.file_type.clone(),
                     file.perms.clone(),
                     file.data.len(),
                     file.unique_id,
@@ -739,7 +800,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             Descriptor::File { file, .. } => {
                 let file = file.read();
                 (
-                    super::FileType::RegularFile,
+                    file.file_type.clone(),
                     file.perms.clone(),
                     file.data.len(),
                     file.unique_id,
@@ -879,6 +940,7 @@ pub(crate) struct FileX {
     perms: Permissions,
     data: alloc::borrow::Cow<'static, [u8]>,
     unique_id: usize,
+    file_type: super::FileType,
 }
 
 #[derive(Clone, Debug)]

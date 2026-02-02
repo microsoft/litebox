@@ -23,8 +23,8 @@ pub mod tar_ro;
 mod tests;
 
 use errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, MknodError, OpenError,
+    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -123,6 +123,18 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Create a new directory
     fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;
 
+    /// Create a filesystem node (regular file, device special file, or named pipe)
+    ///
+    /// The `file_type` specifies what kind of node to create. Note that device
+    /// special files (character and block devices) are not supported and will
+    /// return `MknodError::OperationNotPermitted`.
+    fn mknod(
+        &self,
+        path: impl path::Arg,
+        mode: Mode,
+        file_type: FileType,
+    ) -> Result<(), MknodError>;
+
     /// Remove a directory
     fn rmdir(&self, path: impl path::Arg) -> Result<(), RmdirError>;
 
@@ -187,6 +199,7 @@ pub enum FileType {
     RegularFile,
     Directory,
     CharacterDevice,
+    NamedPipe,
 }
 
 bitflags! {

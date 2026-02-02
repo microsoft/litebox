@@ -39,8 +39,8 @@ use crate::{
 use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
-        ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+        ChmodError, ChownError, CloseError, MkdirError, MknodError, OpenError, PathError,
+        ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
     },
 };
 
@@ -398,6 +398,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         // TODO: Do we need to do the type of checks that are happening in the other functions, or
         // should the other functions be simplified to this?
         Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn mknod(
+        &self,
+        _path: impl crate::path::Arg,
+        _mode: Mode,
+        _file_type: FileType,
+    ) -> Result<(), MknodError> {
+        Err(MknodError::ReadOnlyFileSystem)
     }
 
     fn rmdir(&self, _path: impl crate::path::Arg) -> Result<(), RmdirError> {

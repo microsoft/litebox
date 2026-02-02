@@ -704,6 +704,14 @@ impl Task {
             SyscallRequest::Mkdir { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_mkdir(path, mode))),
+            SyscallRequest::Mknodat {
+                dirfd,
+                pathname,
+                mode,
+                dev,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_mknodat(dirfd, path, mode, dev))
+            }),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,

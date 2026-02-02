@@ -1872,6 +1872,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         mode: u32,
     },
+    Mknodat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        mode: u32,
+        dev: u64,
+    },
     Mmap {
         addr: usize,
         length: usize,
@@ -2360,6 +2366,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
             Sysno::mkdir => sys_req!(Mkdir { pathname:*, mode }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::mknod => SyscallRequest::Mknodat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                mode: ctx.sys_req_arg(1),
+                dev: ctx.sys_req_arg::<u64>(2),
+            },
+            Sysno::mknodat => sys_req!(Mknodat { dirfd, pathname:*, mode, dev }),
             #[cfg(target_arch = "x86_64")]
             Sysno::mmap => sys_req!(Mmap {
                 addr,

@@ -623,6 +623,115 @@ mod in_mem {
 
         fs.close(&fd).expect("close failed");
     }
+
+    #[test]
+    fn mknod_regular_file() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            use crate::fs::FileType;
+
+            // Create a regular file with mknod
+            let path = "/testfile_mknod";
+            fs.mknod(path, Mode::RUSR | Mode::WUSR, FileType::RegularFile)
+                .expect("Failed to create file with mknod");
+
+            // Verify the file exists and has correct type
+            let stat = fs.file_status(path).expect("Failed to get file status");
+            assert_eq!(stat.file_type, FileType::RegularFile);
+            assert_eq!(stat.mode, Mode::RUSR | Mode::WUSR);
+
+            // Verify we can open, write to, and read from the file
+            let fd = fs
+                .open(path, OFlags::RDWR, Mode::empty())
+                .expect("Failed to open file");
+            fs.write(&fd, b"test data", None)
+                .expect("Failed to write to file");
+            fs.seek(&fd, 0, crate::fs::SeekWhence::RelativeToBeginning)
+                .expect("Failed to seek");
+            let mut buf = [0u8; 16];
+            let n = fs.read(&fd, &mut buf, None).expect("Failed to read");
+            assert_eq!(&buf[..n], b"test data");
+            fs.close(&fd).expect("Failed to close file");
+
+            // Clean up
+            fs.unlink(path).expect("Failed to unlink file");
+        });
+    }
+
+    #[test]
+    fn mknod_named_pipe() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            use crate::fs::FileType;
+
+            // Create a named pipe with mknod
+            let path = "/test_fifo";
+            fs.mknod(path, Mode::RUSR | Mode::WUSR, FileType::NamedPipe)
+                .expect("Failed to create named pipe with mknod");
+
+            // Verify the file exists and has correct type
+            let stat = fs.file_status(path).expect("Failed to get file status");
+            assert_eq!(stat.file_type, FileType::NamedPipe);
+
+            // Clean up
+            fs.unlink(path).expect("Failed to unlink named pipe");
+        });
+    }
+
+    #[test]
+    fn mknod_already_exists() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            use crate::fs::FileType;
+            use crate::fs::errors::MknodError;
+
+            // Create a file first
+            let path = "/existing_file";
+            fs.mknod(path, Mode::RUSR | Mode::WUSR, FileType::RegularFile)
+                .expect("Failed to create file with mknod");
+
+            // Try to create another file at the same path
+            let result = fs.mknod(path, Mode::RUSR | Mode::WUSR, FileType::RegularFile);
+            assert!(
+                matches!(result, Err(MknodError::AlreadyExists)),
+                "Expected AlreadyExists error"
+            );
+
+            // Clean up
+            fs.unlink(path).expect("Failed to unlink file");
+        });
+    }
+
+    #[test]
+    fn mknod_unsupported_types() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            use crate::fs::FileType;
+            use crate::fs::errors::MknodError;
+
+            // Try to create a character device (should fail)
+            let result = fs.mknod(
+                "/test_chardev",
+                Mode::RUSR | Mode::WUSR,
+                FileType::CharacterDevice,
+            );
+            assert!(
+                matches!(result, Err(MknodError::OperationNotPermitted)),
+                "Expected OperationNotPermitted error for CharacterDevice"
+            );
+
+            // Try to create a directory with mknod (should fail)
+            let result = fs.mknod("/test_dir", Mode::RWXU, FileType::Directory);
+            assert!(
+                matches!(result, Err(MknodError::OperationNotPermitted)),
+                "Expected OperationNotPermitted error for Directory"
+            );
+        });
+    }
 }
 
 mod tar_ro {

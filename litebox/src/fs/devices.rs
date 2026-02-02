@@ -12,8 +12,9 @@ use crate::{
     fs::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
-            ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+            ChmodError, ChownError, CloseError, FileStatusError, MkdirError, MknodError, OpenError,
+            PathError, ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError,
+            WriteError,
         },
     },
     path::Arg,
@@ -350,6 +351,12 @@ impl<
     #[expect(unused_variables, reason = "unimplemented")]
     fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
         unimplemented!()
+    }
+
+    #[expect(unused_variables, reason = "unimplemented")]
+    fn mknod(&self, path: impl Arg, mode: Mode, file_type: FileType) -> Result<(), MknodError> {
+        // Device filesystem doesn't support creating new nodes
+        Err(MknodError::OperationNotPermitted)
     }
 
     #[expect(unused_variables, reason = "unimplemented")]

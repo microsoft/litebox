@@ -208,3 +208,19 @@ impl From<crate::path::ConversionError> for PathError {
         Self::InvalidPathname
     }
 }
+
+/// Possible errors from [`FileSystem::mknod`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum MknodError {
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("pathname already exists")]
+    AlreadyExists,
+    #[error("operation not permitted for this file type")]
+    OperationNotPermitted,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}

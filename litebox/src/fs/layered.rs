@@ -15,8 +15,9 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, MknodError, OpenError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError,
+    WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -148,7 +149,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     }
                 }
-                Ok(FileType::RegularFile | FileType::CharacterDevice)
+                Ok(FileType::RegularFile | FileType::CharacterDevice | FileType::NamedPipe)
                 | Err(PathError::MissingComponent) => unreachable!(),
                 Err(PathError::ComponentNotADirectory) => unimplemented!(),
                 Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
@@ -1019,7 +1020,7 @@ impl<
                     // We must now check if the lower level contains the file; if it does not, we
                     // must exit with failure. Otherwise, we fallthrough to place the tombstone.
                     match self.ensure_lower_contains(&path)? {
-                        FileType::RegularFile => {
+                        FileType::RegularFile | FileType::NamedPipe => {
                             // fallthrough
                         }
                         FileType::Directory => {
@@ -1076,6 +1077,42 @@ impl<
         self.mkdir_migrating_ancestor_dirs(&path)?;
         // And then now we can make the upper directory.
         self.upper.mkdir(path, mode)
+    }
+
+    fn mknod(
+        &self,
+        path: impl crate::path::Arg,
+        mode: Mode,
+        file_type: FileType,
+    ) -> Result<(), MknodError> {
+        let path = self.absolute_path(path)?;
+
+        // Check if file already exists at either layer
+        if self.upper.file_status(path.as_str()).is_ok() {
+            return Err(MknodError::AlreadyExists);
+        }
+        if self.ensure_lower_contains(&path).is_ok() {
+            return Err(MknodError::AlreadyExists);
+        }
+
+        // Try to create in upper layer first
+        match self.upper.mknod(path.as_str(), mode, file_type.clone()) {
+            Ok(()) => Ok(()),
+            Err(MknodError::PathError(
+                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+            )) => {
+                // Need to migrate ancestor directories from lower layer
+                self.mkdir_migrating_ancestor_dirs(&path)
+                    .map_err(|e| match e {
+                        MkdirError::NoWritePerms => MknodError::NoWritePerms,
+                        MkdirError::AlreadyExists => MknodError::AlreadyExists,
+                        MkdirError::ReadOnlyFileSystem => MknodError::ReadOnlyFileSystem,
+                        MkdirError::PathError(p) => MknodError::PathError(p),
+                    })?;
+                self.upper.mknod(path, mode, file_type)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {

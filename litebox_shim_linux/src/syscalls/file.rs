@@ -11,7 +11,7 @@ use alloc::{
 use litebox::{
     event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
-    fs::{FileSystem as _, Mode, OFlags, SeekWhence},
+    fs::{FileSystem as _, FileType, Mode, OFlags, SeekWhence},
     path,
     platform::{RawConstPointer, RawMutPointer},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
@@ -404,6 +404,49 @@ impl Task {
     pub fn sys_mkdir(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
         let mode = Mode::from_bits_retain(mode) & !self.get_umask();
         self.global.fs.mkdir(pathname, mode).map_err(Errno::from)
+    }
+
+    /// Handle syscall `mknod` and `mknodat`
+    ///
+    /// Creates a filesystem node (regular file, device special file, or named pipe).
+    /// Note: Device special files (S_IFCHR, S_IFBLK) and Unix sockets are not supported.
+    pub fn sys_mknodat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: u32,
+        _dev: u64,
+    ) -> Result<(), Errno> {
+        // Extract file type from mode (S_IFMT mask is 0o170000)
+        const S_IFMT: u32 = 0o170000;
+        const S_IFREG: u32 = 0o100000;
+        const S_IFIFO: u32 = 0o010000;
+        const S_IFCHR: u32 = 0o020000;
+        const S_IFBLK: u32 = 0o060000;
+        const S_IFSOCK: u32 = 0o140000;
+
+        let file_type = match mode & S_IFMT {
+            0 | S_IFREG => FileType::RegularFile,
+            S_IFIFO => FileType::NamedPipe,
+            S_IFCHR | S_IFBLK | S_IFSOCK => return Err(Errno::EPERM),
+            _ => return Err(Errno::EINVAL),
+        };
+
+        let perms = Mode::from_bits_retain(mode & 0o7777) & !self.get_umask();
+
+        let fs_path = FsPath::new(dirfd, pathname)?;
+        match fs_path {
+            FsPath::Absolute { path } | FsPath::CwdRelative { path } => self
+                .global
+                .fs
+                .mknod(path, perms, file_type)
+                .map_err(Errno::from),
+            FsPath::Cwd => Err(Errno::EEXIST), // Cannot mknod on cwd itself
+            FsPath::Fd(_) | FsPath::FdRelative { .. } => {
+                log_unsupported!("mknodat with FsPath::Fd or FsPath::FdRelative");
+                Err(Errno::EINVAL)
+            }
+        }
     }
 
     pub(crate) fn do_close(&self, desc: Descriptor) -> Result<(), Errno> {
