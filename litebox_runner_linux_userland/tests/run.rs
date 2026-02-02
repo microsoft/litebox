@@ -583,6 +583,67 @@ fn test_runner_with_shell_script() {
     assert!(output_str.contains("Math result: 4"));
 }
 
+/// Test shell script with ls command
+/// This demonstrates script interpreter support 
+/// Note: Currently requires vfork/fork support to execute external commands from shell
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+#[ignore = "Shell executing external commands requires vfork/fork which needs additional work"]
+fn test_runner_with_shell_script_ls() {
+    let sh_path = run_which("sh");
+
+    if has_origin_in_libs(&sh_path) {
+        println!("Skipping test: Shell script ls test - shell uses $ORIGIN in library paths");
+        return;
+    }
+
+    // Find ls command
+    let ls_path_output = std::process::Command::new("which")
+        .arg("ls")
+        .output()
+        .expect("Failed to find ls");
+    let ls_path = String::from_utf8(ls_path_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    if ls_path.is_empty() {
+        println!("Skipping test: ls command not found");
+        return;
+    }
+
+    println!("Testing shell script with ls command from: {}", ls_path);
+
+    // Test a shell script that uses ls to list the root directory
+    // Keep it simple - just call ls without pipes or redirects
+    let script = format!(
+        r#"
+        echo "=== Script Interpreter Test with ls ==="
+        echo "Calling ls command:"
+        {} /
+        echo "=== Script test completed ==="
+    "#,
+        ls_path
+    );
+
+    let output = Runner::new(Backend::Rewriter, &sh_path, "shell_script_ls_rewriter")
+        .args(["-c", &script])
+        .output();
+
+    let output_str = String::from_utf8_lossy(&output);
+    println!("Shell script with ls output:\n{output_str}");
+
+    // Verify the script executed (the output should contain our markers)
+    assert!(
+        output_str.contains("Script Interpreter Test with ls"),
+        "Script should have started execution"
+    );
+    assert!(
+        output_str.contains("Script test completed"),
+        "Script should have completed"
+    );
+}
+
 /// Test bash shell with advanced features
 /// Note: Bash requires getpgrp syscall and ioctl which are not yet implemented
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
