@@ -1762,6 +1762,33 @@ bitflags::bitflags! {
     }
 }
 
+/// Flags for the `splice(2)` and `tee(2)` syscalls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes)]
+#[repr(C)]
+pub struct SpliceFlags(u32);
+
+bitflags::bitflags! {
+    impl SpliceFlags: u32 {
+        /// `SPLICE_F_MOVE`: Attempt to move pages instead of copying.
+        /// This is only a hint; the kernel may still copy.
+        const MOVE = 0x01;
+        /// `SPLICE_F_NONBLOCK`: Do not block on I/O.
+        const NONBLOCK = 0x02;
+        /// `SPLICE_F_MORE`: More data will be coming in a subsequent splice.
+        /// This is a hint for sockets.
+        const MORE = 0x04;
+        /// `SPLICE_F_GIFT`: Pages passed in are a gift (vmsplice only).
+        const GIFT = 0x08;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+impl SpliceFlags {
+    /// All valid splice flags combined.
+    pub const VALID_MASK: u32 = 0x0F;
+}
+
 /// Packaged sigset with its size, used by `pselect` syscall
 #[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C)]
@@ -2260,6 +2287,24 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         which: IntervalTimer,
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
+    },
+    /// Move data between file descriptors without copying.
+    /// At least one of fd_in or fd_out must be a pipe.
+    Splice {
+        fd_in: i32,
+        off_in: Option<Platform::RawMutPointer<i64>>,
+        fd_out: i32,
+        off_out: Option<Platform::RawMutPointer<i64>>,
+        len: usize,
+        flags: SpliceFlags,
+    },
+    /// Duplicate pipe content without consuming it.
+    /// Both fd_in and fd_out must be pipes.
+    Tee {
+        fd_in: i32,
+        fd_out: i32,
+        len: usize,
+        flags: SpliceFlags,
     },
 }
 
@@ -2800,6 +2845,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::splice => sys_req!(Splice { fd_in, off_in:*, fd_out, off_out:*, len, flags }),
+            Sysno::tee => sys_req!(Tee {
+                fd_in,
+                fd_out,
+                len,
+                flags
+            }),
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);
@@ -3184,6 +3236,7 @@ reinterpret_truncated_from_usize_for! {
         EfdFlags,
         RngFlags,
         TimerFlags,
+        SpliceFlags,
     ],
 }
 

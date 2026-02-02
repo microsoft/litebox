@@ -1130,6 +1130,20 @@ impl Task {
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
+            SyscallRequest::Splice {
+                fd_in,
+                off_in,
+                fd_out,
+                off_out,
+                len,
+                flags,
+            } => self.sys_splice(fd_in, off_in, fd_out, off_out, len, flags),
+            SyscallRequest::Tee {
+                fd_in,
+                fd_out,
+                len,
+                flags,
+            } => self.sys_tee(fd_in, fd_out, len, flags),
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)

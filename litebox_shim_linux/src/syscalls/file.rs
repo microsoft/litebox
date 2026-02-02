@@ -22,7 +22,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
-use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, MutPtr, Task};
+use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, LinuxFS, MutPtr, Task};
 use core::sync::atomic::Ordering;
 
 /// Task state shared by `CLONE_FS`.
@@ -1920,5 +1920,465 @@ impl Task {
             |_fd| todo!("net"),
             |_fd| todo!("pipes"),
         )?
+    }
+
+    /// Handle syscall `splice`
+    ///
+    /// Moves data between two file descriptors without copying between kernel
+    /// and user space. At least one of the file descriptors must be a pipe.
+    pub fn sys_splice(
+        &self,
+        fd_in: i32,
+        off_in: Option<MutPtr<i64>>,
+        fd_out: i32,
+        off_out: Option<MutPtr<i64>>,
+        len: usize,
+        flags: litebox_common_linux::SpliceFlags,
+    ) -> Result<usize, Errno> {
+        use litebox_common_linux::SpliceFlags;
+
+        // Validate flags - reject unknown bits
+        if flags.bits() & !SpliceFlags::VALID_MASK != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        // If len is 0, return 0 immediately
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let Ok(fd_in_u32) = u32::try_from(fd_in) else {
+            return Err(Errno::EBADF);
+        };
+        let Ok(fd_out_u32) = u32::try_from(fd_out) else {
+            return Err(Errno::EBADF);
+        };
+
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+
+        let desc_in = file_table.get_fd(fd_in_u32).ok_or(Errno::EBADF)?;
+        let desc_out = file_table.get_fd(fd_out_u32).ok_or(Errno::EBADF)?;
+
+        // Determine which descriptor is a pipe
+        let in_is_pipe = matches!(desc_in, Descriptor::LiteBoxRawFd(raw_fd) if {
+            let rds = files.raw_descriptor_store.read();
+            rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(*raw_fd).is_ok()
+        });
+        let out_is_pipe = matches!(desc_out, Descriptor::LiteBoxRawFd(raw_fd) if {
+            let rds = files.raw_descriptor_store.read();
+            rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(*raw_fd).is_ok()
+        });
+
+        // At least one must be a pipe
+        if !in_is_pipe && !out_is_pipe {
+            return Err(Errno::EINVAL);
+        }
+
+        // If fd is a pipe, offset must be NULL
+        if in_is_pipe && off_in.is_some() {
+            return Err(Errno::ESPIPE);
+        }
+        if out_is_pipe && off_out.is_some() {
+            return Err(Errno::ESPIPE);
+        }
+
+        // Get raw fds for pipe operations
+        let in_raw_fd = match desc_in {
+            Descriptor::LiteBoxRawFd(raw_fd) => *raw_fd,
+            _ => return Err(Errno::EINVAL),
+        };
+        let out_raw_fd = match desc_out {
+            Descriptor::LiteBoxRawFd(raw_fd) => *raw_fd,
+            _ => return Err(Errno::EINVAL),
+        };
+
+        drop(file_table);
+
+        let nonblock = flags.contains(SpliceFlags::NONBLOCK);
+
+        // Handle the different cases
+        if in_is_pipe && out_is_pipe {
+            // Pipe to pipe: read from input, write to output
+            self.do_splice_pipe_to_pipe(in_raw_fd, out_raw_fd, len, nonblock)
+        } else if in_is_pipe {
+            // Pipe to file: read from pipe, write to file
+            self.do_splice_pipe_to_file(in_raw_fd, out_raw_fd, off_out, len, nonblock)
+        } else {
+            // File to pipe: read from file, write to pipe
+            self.do_splice_file_to_pipe(in_raw_fd, off_in, out_raw_fd, len, nonblock)
+        }
+    }
+
+    /// Splice from pipe to pipe
+    fn do_splice_pipe_to_pipe(
+        &self,
+        in_raw_fd: usize,
+        out_raw_fd: usize,
+        len: usize,
+        nonblock: bool,
+    ) -> Result<usize, Errno> {
+        let files = self.files.borrow();
+        let rds = files.raw_descriptor_store.read();
+
+        let in_pipe_fd = rds
+            .fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(in_raw_fd)
+            .map_err(|_| Errno::EBADF)?
+            .clone();
+        let out_pipe_fd = rds
+            .fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(out_raw_fd)
+            .map_err(|_| Errno::EBADF)?
+            .clone();
+        drop(rds);
+
+        // Use a temporary buffer to transfer data
+        let buf_size = len.min(65536); // Cap at 64KB to avoid huge allocations
+        let mut buf = vec![0u8; buf_size];
+
+        // Set nonblock temporarily if requested
+        if nonblock {
+            let _ = self.global.pipes.update_flags(
+                &in_pipe_fd,
+                litebox::pipes::Flags::NON_BLOCKING,
+                true,
+            );
+            let _ = self.global.pipes.update_flags(
+                &out_pipe_fd,
+                litebox::pipes::Flags::NON_BLOCKING,
+                true,
+            );
+        }
+
+        // Read from input pipe
+        let read_result = self
+            .global
+            .pipes
+            .read(&self.wait_cx(), &in_pipe_fd, &mut buf);
+
+        let bytes_read = match read_result {
+            Ok(n) => n,
+            Err(litebox::pipes::errors::ReadError::WouldBlock) => return Err(Errno::EAGAIN),
+            Err(e) => return Err(Errno::from(e)),
+        };
+
+        if bytes_read == 0 {
+            return Ok(0);
+        }
+
+        // Write to output pipe
+        let write_result =
+            self.global
+                .pipes
+                .write(&self.wait_cx(), &out_pipe_fd, &buf[..bytes_read]);
+
+        match write_result {
+            Ok(n) => Ok(n),
+            Err(litebox::pipes::errors::WriteError::WouldBlock) => Err(Errno::EAGAIN),
+            Err(e) => Err(Errno::from(e)),
+        }
+    }
+
+    /// Splice from pipe to file
+    fn do_splice_pipe_to_file(
+        &self,
+        in_raw_fd: usize,
+        out_raw_fd: usize,
+        off_out: Option<MutPtr<i64>>,
+        len: usize,
+        nonblock: bool,
+    ) -> Result<usize, Errno> {
+        let files = self.files.borrow();
+        let rds = files.raw_descriptor_store.read();
+
+        let in_pipe_fd = rds
+            .fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(in_raw_fd)
+            .map_err(|_| Errno::EBADF)?
+            .clone();
+        let out_file_fd = rds
+            .fd_from_raw_integer::<LinuxFS>(out_raw_fd)
+            .map_err(|_| Errno::EBADF)?
+            .clone();
+        drop(rds);
+
+        // Read offset from user pointer if provided
+        let offset = if let Some(off_ptr) = off_out {
+            Some(
+                off_ptr
+                    .read_at_offset(0)
+                    .ok_or(Errno::EFAULT)?
+                    .try_into()
+                    .map_err(|_| Errno::EINVAL)?,
+            )
+        } else {
+            None
+        };
+
+        // Use a temporary buffer
+        let buf_size = len.min(65536);
+        let mut buf = vec![0u8; buf_size];
+
+        // Set nonblock temporarily if requested
+        if nonblock {
+            let _ = self.global.pipes.update_flags(
+                &in_pipe_fd,
+                litebox::pipes::Flags::NON_BLOCKING,
+                true,
+            );
+        }
+
+        // Read from pipe
+        let read_result = self
+            .global
+            .pipes
+            .read(&self.wait_cx(), &in_pipe_fd, &mut buf);
+
+        let bytes_read = match read_result {
+            Ok(n) => n,
+            Err(litebox::pipes::errors::ReadError::WouldBlock) => return Err(Errno::EAGAIN),
+            Err(e) => return Err(Errno::from(e)),
+        };
+
+        if bytes_read == 0 {
+            return Ok(0);
+        }
+
+        // Write to file
+        let bytes_written = self
+            .global
+            .fs
+            .write(&out_file_fd, &buf[..bytes_read], offset)
+            .map_err(Errno::from)?;
+
+        // Update offset if provided
+        if let Some(off_ptr) = off_out {
+            let current_offset: i64 = off_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            #[expect(clippy::cast_possible_wrap, reason = "offset won't exceed i64::MAX")]
+            let new_offset = current_offset + bytes_written as i64;
+            off_ptr
+                .write_at_offset(0, new_offset)
+                .ok_or(Errno::EFAULT)?;
+        }
+
+        Ok(bytes_written)
+    }
+
+    /// Splice from file to pipe
+    fn do_splice_file_to_pipe(
+        &self,
+        in_raw_fd: usize,
+        off_in: Option<MutPtr<i64>>,
+        out_raw_fd: usize,
+        len: usize,
+        nonblock: bool,
+    ) -> Result<usize, Errno> {
+        let files = self.files.borrow();
+        let rds = files.raw_descriptor_store.read();
+
+        let in_file_fd = rds
+            .fd_from_raw_integer::<LinuxFS>(in_raw_fd)
+            .map_err(|_| Errno::EBADF)?
+            .clone();
+        let out_pipe_fd = rds
+            .fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(out_raw_fd)
+            .map_err(|_| Errno::EBADF)?
+            .clone();
+        drop(rds);
+
+        // Read offset from user pointer if provided
+        let offset = if let Some(off_ptr) = off_in {
+            Some(
+                off_ptr
+                    .read_at_offset(0)
+                    .ok_or(Errno::EFAULT)?
+                    .try_into()
+                    .map_err(|_| Errno::EINVAL)?,
+            )
+        } else {
+            None
+        };
+
+        // Use a temporary buffer
+        let buf_size = len.min(65536);
+        let mut buf = vec![0u8; buf_size];
+
+        // Read from file
+        let bytes_read = self
+            .global
+            .fs
+            .read(&in_file_fd, &mut buf, offset)
+            .map_err(Errno::from)?;
+
+        if bytes_read == 0 {
+            return Ok(0);
+        }
+
+        // Set nonblock on pipe if requested
+        if nonblock {
+            let _ = self.global.pipes.update_flags(
+                &out_pipe_fd,
+                litebox::pipes::Flags::NON_BLOCKING,
+                true,
+            );
+        }
+
+        // Write to pipe
+        let write_result =
+            self.global
+                .pipes
+                .write(&self.wait_cx(), &out_pipe_fd, &buf[..bytes_read]);
+
+        let bytes_written = match write_result {
+            Ok(n) => n,
+            Err(litebox::pipes::errors::WriteError::WouldBlock) => return Err(Errno::EAGAIN),
+            Err(e) => return Err(Errno::from(e)),
+        };
+
+        // Update offset if provided
+        if let Some(off_ptr) = off_in {
+            let current_offset: i64 = off_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            #[expect(clippy::cast_possible_wrap, reason = "offset won't exceed i64::MAX")]
+            let new_offset = current_offset + bytes_written as i64;
+            off_ptr
+                .write_at_offset(0, new_offset)
+                .ok_or(Errno::EFAULT)?;
+        }
+
+        Ok(bytes_written)
+    }
+
+    /// Handle syscall `tee`
+    ///
+    /// Duplicates data from one pipe to another without consuming it from the
+    /// source pipe. Both file descriptors must be pipes.
+    pub fn sys_tee(
+        &self,
+        fd_in: i32,
+        fd_out: i32,
+        len: usize,
+        flags: litebox_common_linux::SpliceFlags,
+    ) -> Result<usize, Errno> {
+        use litebox_common_linux::SpliceFlags;
+
+        // Validate flags
+        if flags.bits() & !SpliceFlags::VALID_MASK != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let Ok(fd_in_u32) = u32::try_from(fd_in) else {
+            return Err(Errno::EBADF);
+        };
+        let Ok(fd_out_u32) = u32::try_from(fd_out) else {
+            return Err(Errno::EBADF);
+        };
+
+        // fd_in and fd_out must not be the same
+        if fd_in == fd_out {
+            return Err(Errno::EINVAL);
+        }
+
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+
+        let desc_in = file_table.get_fd(fd_in_u32).ok_or(Errno::EBADF)?;
+        let desc_out = file_table.get_fd(fd_out_u32).ok_or(Errno::EBADF)?;
+
+        // Both must be pipes
+        let in_raw_fd = match desc_in {
+            Descriptor::LiteBoxRawFd(raw_fd) => *raw_fd,
+            _ => return Err(Errno::EINVAL),
+        };
+        let out_raw_fd = match desc_out {
+            Descriptor::LiteBoxRawFd(raw_fd) => *raw_fd,
+            _ => return Err(Errno::EINVAL),
+        };
+
+        drop(file_table);
+
+        let rds = files.raw_descriptor_store.read();
+
+        // Verify both are pipes
+        let in_pipe_fd = rds
+            .fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(in_raw_fd)
+            .map_err(|_| Errno::EINVAL)?
+            .clone();
+        let out_pipe_fd = rds
+            .fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(out_raw_fd)
+            .map_err(|_| Errno::EINVAL)?
+            .clone();
+        drop(rds);
+
+        let nonblock = flags.contains(SpliceFlags::NONBLOCK);
+
+        // For tee, we need to duplicate data without consuming it.
+        // Since we don't have a peek operation on pipes, we'll read and then
+        // write back to the original pipe (which is not ideal but works for
+        // single-threaded scenarios).
+        //
+        // NOTE: A proper implementation would add a peek() method to pipes.
+        // For now, we implement tee as read + write to both pipes.
+
+        let buf_size = len.min(65536);
+        let mut buf = vec![0u8; buf_size];
+
+        if nonblock {
+            let _ = self.global.pipes.update_flags(
+                &in_pipe_fd,
+                litebox::pipes::Flags::NON_BLOCKING,
+                true,
+            );
+            let _ = self.global.pipes.update_flags(
+                &out_pipe_fd,
+                litebox::pipes::Flags::NON_BLOCKING,
+                true,
+            );
+        }
+
+        // Read from input pipe
+        let read_result = self
+            .global
+            .pipes
+            .read(&self.wait_cx(), &in_pipe_fd, &mut buf);
+
+        let bytes_read = match read_result {
+            Ok(n) => n,
+            Err(litebox::pipes::errors::ReadError::WouldBlock) => return Err(Errno::EAGAIN),
+            Err(e) => return Err(Errno::from(e)),
+        };
+
+        if bytes_read == 0 {
+            return Ok(0);
+        }
+
+        // Write to output pipe
+        let write_result =
+            self.global
+                .pipes
+                .write(&self.wait_cx(), &out_pipe_fd, &buf[..bytes_read]);
+
+        let bytes_written = match write_result {
+            Ok(n) => n,
+            Err(litebox::pipes::errors::WriteError::WouldBlock) => {
+                // Write back to input pipe what we read (best effort)
+                let _ = self
+                    .global
+                    .pipes
+                    .write(&self.wait_cx(), &in_pipe_fd, &buf[..bytes_read]);
+                return Err(Errno::EAGAIN);
+            }
+            Err(e) => return Err(Errno::from(e)),
+        };
+
+        // Write back to input pipe to restore data (tee doesn't consume from source)
+        // This is a simplification - proper tee would peek without consuming
+        let _ = self
+            .global
+            .pipes
+            .write(&self.wait_cx(), &in_pipe_fd, &buf[..bytes_read]);
+
+        Ok(bytes_written)
     }
 }

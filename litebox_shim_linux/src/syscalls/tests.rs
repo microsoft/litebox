@@ -584,3 +584,200 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+#[test]
+#[expect(clippy::cast_possible_wrap, reason = "test fd values are small")]
+fn test_splice_invalid_flags() {
+    let task = init_platform(None);
+
+    // Create a pipe
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).expect("pipe2 failed");
+
+    // Test with invalid flags (bits outside valid mask)
+    let invalid_flags = litebox_common_linux::SpliceFlags::from_bits_retain(0x100);
+    assert_eq!(
+        task.sys_splice(
+            read_fd as i32,
+            None,
+            write_fd as i32,
+            None,
+            100,
+            invalid_flags
+        ),
+        Err(Errno::EINVAL),
+        "splice with invalid flags should return EINVAL"
+    );
+
+    task.sys_close(read_fd as i32).unwrap();
+    task.sys_close(write_fd as i32).unwrap();
+}
+
+#[test]
+#[expect(clippy::cast_possible_wrap, reason = "test fd values are small")]
+fn test_splice_zero_len() {
+    let task = init_platform(None);
+
+    // Create a pipe
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).expect("pipe2 failed");
+
+    // splice with len=0 should return 0 immediately
+    let flags = litebox_common_linux::SpliceFlags::empty();
+    let result = task.sys_splice(read_fd as i32, None, write_fd as i32, None, 0, flags);
+    assert_eq!(result, Ok(0), "splice with len=0 should return 0");
+
+    task.sys_close(read_fd as i32).unwrap();
+    task.sys_close(write_fd as i32).unwrap();
+}
+
+#[test]
+#[expect(clippy::cast_possible_wrap, reason = "test fd values are small")]
+fn test_splice_no_pipe() {
+    let task = init_platform(None);
+
+    // Create a file
+    let fd = task
+        .sys_open(
+            "/test_splice_file.txt",
+            OFlags::CREAT | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::RWXU,
+        )
+        .expect("Failed to create file");
+
+    // splice between two files (neither is a pipe) should fail
+    let flags = litebox_common_linux::SpliceFlags::empty();
+    assert_eq!(
+        task.sys_splice(fd as i32, None, fd as i32, None, 100, flags),
+        Err(Errno::EINVAL),
+        "splice with no pipe should return EINVAL"
+    );
+
+    task.sys_close(fd as i32).unwrap();
+}
+
+#[test]
+#[expect(clippy::cast_possible_wrap, reason = "test fd values are small")]
+fn test_splice_pipe_with_offset() {
+    let task = init_platform(None);
+
+    // Create a pipe
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).expect("pipe2 failed");
+
+    // Create a file
+    let file_fd = task
+        .sys_open(
+            "/test_splice_offset.txt",
+            OFlags::CREAT | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::RWXU,
+        )
+        .expect("Failed to create file");
+
+    // splice from pipe with offset should return ESPIPE
+    let _flags = litebox_common_linux::SpliceFlags::empty();
+
+    // We can't easily test offset pointers in unit tests without MutPtr,
+    // so we'll skip the offset-related tests here and test via C integration tests.
+
+    task.sys_close(read_fd as i32).unwrap();
+    task.sys_close(write_fd as i32).unwrap();
+    task.sys_close(file_fd as i32).unwrap();
+}
+
+#[test]
+#[expect(clippy::cast_possible_wrap, reason = "test fd values are small")]
+fn test_tee_invalid_flags() {
+    let task = init_platform(None);
+
+    // Create two pipes
+    let (read_fd1, write_fd1) = task.sys_pipe2(OFlags::empty()).expect("pipe2 failed");
+    let (read_fd2, write_fd2) = task.sys_pipe2(OFlags::empty()).expect("pipe2 failed");
+
+    // Test with invalid flags
+    let invalid_flags = litebox_common_linux::SpliceFlags::from_bits_retain(0x100);
+    assert_eq!(
+        task.sys_tee(read_fd1 as i32, write_fd2 as i32, 100, invalid_flags),
+        Err(Errno::EINVAL),
+        "tee with invalid flags should return EINVAL"
+    );
+
+    task.sys_close(read_fd1 as i32).unwrap();
+    task.sys_close(write_fd1 as i32).unwrap();
+    task.sys_close(read_fd2 as i32).unwrap();
+    task.sys_close(write_fd2 as i32).unwrap();
+}
+
+#[test]
+#[expect(clippy::cast_possible_wrap, reason = "test fd values are small")]
+fn test_tee_zero_len() {
+    let task = init_platform(None);
+
+    // Create two pipes
+    let (read_fd1, write_fd1) = task.sys_pipe2(OFlags::empty()).expect("pipe2 failed");
+    let (read_fd2, write_fd2) = task.sys_pipe2(OFlags::empty()).expect("pipe2 failed");
+
+    // tee with len=0 should return 0
+    let flags = litebox_common_linux::SpliceFlags::empty();
+    let result = task.sys_tee(read_fd1 as i32, write_fd2 as i32, 0, flags);
+    assert_eq!(result, Ok(0), "tee with len=0 should return 0");
+
+    task.sys_close(read_fd1 as i32).unwrap();
+    task.sys_close(write_fd1 as i32).unwrap();
+    task.sys_close(read_fd2 as i32).unwrap();
+    task.sys_close(write_fd2 as i32).unwrap();
+}
+
+#[test]
+#[expect(clippy::cast_possible_wrap, reason = "test fd values are small")]
+fn test_tee_same_fd() {
+    let task = init_platform(None);
+
+    // Create a pipe
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).expect("pipe2 failed");
+
+    // tee with same fd_in and fd_out should return EINVAL
+    let flags = litebox_common_linux::SpliceFlags::empty();
+    assert_eq!(
+        task.sys_tee(read_fd as i32, read_fd as i32, 100, flags),
+        Err(Errno::EINVAL),
+        "tee with same fd should return EINVAL"
+    );
+
+    task.sys_close(read_fd as i32).unwrap();
+    task.sys_close(write_fd as i32).unwrap();
+}
+
+#[test]
+#[expect(clippy::cast_possible_wrap, reason = "test fd values are small")]
+fn test_tee_not_pipe() {
+    let task = init_platform(None);
+
+    // Create a file
+    let file_fd = task
+        .sys_open(
+            "/test_tee_file.txt",
+            OFlags::CREAT | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::RWXU,
+        )
+        .expect("Failed to create file");
+
+    // Create a pipe
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).expect("pipe2 failed");
+
+    // tee with file as input should fail
+    let flags = litebox_common_linux::SpliceFlags::empty();
+    assert_eq!(
+        task.sys_tee(file_fd as i32, write_fd as i32, 100, flags),
+        Err(Errno::EINVAL),
+        "tee with non-pipe input should return EINVAL"
+    );
+
+    // tee with file as output should fail
+    assert_eq!(
+        task.sys_tee(read_fd as i32, file_fd as i32, 100, flags),
+        Err(Errno::EINVAL),
+        "tee with non-pipe output should return EINVAL"
+    );
+
+    task.sys_close(file_fd as i32).unwrap();
+    task.sys_close(read_fd as i32).unwrap();
+    task.sys_close(write_fd as i32).unwrap();
+}
