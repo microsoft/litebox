@@ -1275,8 +1275,115 @@ impl Task {
 
 const MAX_VEC: usize = 4096; // limit count
 const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
+const MAX_SHEBANG_LEN: usize = 256; // Maximum length of shebang line
+
+/// Information about a script interpreter extracted from a shebang line.
+struct ScriptInterpreter {
+    /// The interpreter path (e.g., "/bin/sh")
+    interpreter: alloc::ffi::CString,
+    /// Optional argument to the interpreter (e.g., "-x")
+    arg: Option<alloc::ffi::CString>,
+}
 
 impl Task {
+    /// Attempts to parse a shebang line from a file.
+    /// Returns Some(ScriptInterpreter) if the file starts with "#!", None if it's not a script,
+    /// or an error if the file cannot be read or the shebang is invalid.
+    fn try_parse_shebang(&self, path: &str) -> Result<Option<ScriptInterpreter>, Errno> {
+        use litebox::fs::{Mode, OFlags};
+        use litebox::utils::ReinterpretSignedExt;
+
+        // Open the file
+        let fd = self
+            .sys_open(path, OFlags::RDONLY, Mode::empty())?
+            .reinterpret_as_signed();
+
+        // Ensure we close the file when done
+        let result = (|| {
+            // Read first bytes to check for shebang
+            let mut buf = [0u8; MAX_SHEBANG_LEN];
+            let bytes_read = self.sys_read(fd, &mut buf[..], Some(0))?;
+
+            if bytes_read < 2 {
+                return Ok(None); // File too short to be a script
+            }
+
+            // Check for shebang marker
+            if buf[0] != b'#' || buf[1] != b'!' {
+                return Ok(None); // Not a script
+            }
+
+            // Find the end of the first line
+            let line_end = buf[..bytes_read]
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(bytes_read);
+
+            if line_end <= 2 {
+                return Err(Errno::ENOEXEC); // Empty shebang
+            }
+
+            // Parse the shebang line (skip "#!")
+            let shebang = &buf[2..line_end];
+
+            // Trim leading whitespace
+            let shebang = shebang
+                .iter()
+                .position(|&b| b != b' ' && b != b'\t')
+                .map(|start| &shebang[start..])
+                .unwrap_or(&[]);
+
+            if shebang.is_empty() {
+                return Err(Errno::ENOEXEC); // Empty shebang
+            }
+
+            // Find the interpreter path (up to first space/tab or end)
+            let interp_end = shebang
+                .iter()
+                .position(|&b| b == b' ' || b == b'\t')
+                .unwrap_or(shebang.len());
+
+            let interp_path = &shebang[..interp_end];
+
+            // Create CString for interpreter
+            let interpreter = alloc::ffi::CString::new(interp_path).map_err(|_| Errno::ENOEXEC)?;
+
+            // Check for optional argument after interpreter
+            let arg = if interp_end < shebang.len() {
+                // Skip whitespace after interpreter
+                let arg_start = shebang[interp_end..]
+                    .iter()
+                    .position(|&b| b != b' ' && b != b'\t')
+                    .map(|pos| interp_end + pos);
+
+                if let Some(start) = arg_start {
+                    // Find end of argument (up to next space or end)
+                    let arg_bytes = &shebang[start..];
+                    let arg_end = arg_bytes
+                        .iter()
+                        .position(|&b| b == b' ' || b == b'\t')
+                        .unwrap_or(arg_bytes.len());
+
+                    Some(
+                        alloc::ffi::CString::new(&arg_bytes[..arg_end])
+                            .map_err(|_| Errno::ENOEXEC)?,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            Ok(Some(ScriptInterpreter { interpreter, arg }))
+        })();
+
+        // Close the file
+        let _ = self.sys_close(fd);
+
+        result
+    }
+
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
@@ -1334,7 +1441,37 @@ impl Task {
             copy_vector(envp, "envp")?
         };
 
-        let loader = crate::loader::elf::ElfLoader::new(self, path)?;
+        // Check if the file is a script (starts with #!)
+        let (final_path, final_argv) = if let Some(script_info) = self.try_parse_shebang(path)? {
+            // This is a script file. Build new argv:
+            // [interpreter, [optional_arg], script_path, original_argv[1..]]
+            let mut new_argv = alloc::vec::Vec::new();
+
+            // Add interpreter as argv[0]
+            new_argv.push(script_info.interpreter.clone());
+
+            // Add optional interpreter argument if present
+            if let Some(arg) = script_info.arg {
+                new_argv.push(arg);
+            }
+
+            // Add the script path
+            new_argv.push(path_cstr.clone());
+
+            // Add remaining original arguments (skip argv[0] which was the script path)
+            if !argv_vec.is_empty() {
+                new_argv.extend_from_slice(&argv_vec[1..]);
+            }
+
+            // Use the interpreter path as the new target
+            (script_info.interpreter, new_argv)
+        } else {
+            // Not a script, use original path and argv
+            (path_cstr, argv_vec)
+        };
+
+        let final_path_str = final_path.to_str().map_err(|_| Errno::ENOENT)?;
+        let loader = crate::loader::elf::ElfLoader::new(self, final_path_str)?;
 
         // After this point, the old program is torn down and failures must terminate the process.
 
@@ -1366,7 +1503,7 @@ impl Task {
             ctx.xgs.truncate(),
         );
 
-        self.load_program(loader, argv_vec, envp_vec)
+        self.load_program(loader, final_argv, envp_vec)
             .expect("TODO: terminate the process cleanly");
 
         self.init_thread_context(ctx);
