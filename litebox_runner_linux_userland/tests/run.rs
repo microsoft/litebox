@@ -584,7 +584,7 @@ fn test_runner_with_shell_script() {
 }
 
 /// Test shell script with ls command
-/// This demonstrates script interpreter support 
+/// This demonstrates script interpreter support
 /// Note: Currently requires vfork/fork support to execute external commands from shell
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
