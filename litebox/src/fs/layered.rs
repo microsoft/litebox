@@ -1087,17 +1087,24 @@ impl<
     ) -> Result<(), MknodError> {
         let path = self.absolute_path(path)?;
 
-        // Check if file already exists at either layer
-        if self.upper.file_status(path.as_str()).is_ok() {
-            return Err(MknodError::AlreadyExists);
-        }
-        if self.ensure_lower_contains(&path).is_ok() {
-            return Err(MknodError::AlreadyExists);
-        }
-
-        // Try to create in upper layer first
+        // Try to create in upper layer first. We don't pre-check existence to avoid
+        // TOCTOU race conditions - let the upper layer's atomic operations handle it.
         match self.upper.mknod(path.as_str(), mode, file_type.clone()) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Successfully created in upper layer. Check if it already exists in lower
+                // layer - if so, that's an error (we created a shadow, not a new file).
+                if self.ensure_lower_contains(&path).is_ok() {
+                    // File existed in lower layer - remove from upper and return error.
+                    // Note: This is still racy but matches mkdir behavior in this codebase.
+                    let _ = self.upper.unlink(path.as_str());
+                    return Err(MknodError::AlreadyExists);
+                }
+                Ok(())
+            }
+            Err(MknodError::AlreadyExists) => {
+                // Already exists in upper layer - true error
+                Err(MknodError::AlreadyExists)
+            }
             Err(MknodError::PathError(
                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
             )) => {
@@ -1109,6 +1116,10 @@ impl<
                         MkdirError::ReadOnlyFileSystem => MknodError::ReadOnlyFileSystem,
                         MkdirError::PathError(p) => MknodError::PathError(p),
                     })?;
+                // Check if file exists in lower layer before creating in upper
+                if self.ensure_lower_contains(&path).is_ok() {
+                    return Err(MknodError::AlreadyExists);
+                }
                 self.upper.mknod(path, mode, file_type)
             }
             Err(e) => Err(e),

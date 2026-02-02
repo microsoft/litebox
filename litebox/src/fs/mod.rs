@@ -125,6 +125,11 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
 
     /// Create a filesystem node (regular file, device special file, or named pipe)
     ///
+    /// Unlike the POSIX `mknod(2)` syscall where the file type is encoded in the upper
+    /// bits of the `mode` parameter (S_IFMT), this trait method takes the file type
+    /// as a separate `FileType` parameter for clarity. The `mode` parameter should
+    /// contain only permission bits (0o7777 mask).
+    ///
     /// The `file_type` specifies what kind of node to create. Note that device
     /// special files (character and block devices) are not supported and will
     /// return `MknodError::OperationNotPermitted`.
