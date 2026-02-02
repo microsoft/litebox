@@ -211,6 +211,22 @@ impl Task {
     ) -> Result<(), Errno> {
         litebox_common_linux::mm::sys_madvise(&self.global.pm, addr, len, advice)
     }
+
+    /// Handle syscall `msync`
+    ///
+    /// Synchronize a file with a memory map. Since litebox only supports `MAP_PRIVATE`
+    /// mappings (not `MAP_SHARED`), changes to memory-mapped regions are never written
+    /// back to the underlying file. Therefore, this syscall is implemented as a no-op
+    /// that validates the arguments and returns success.
+    #[inline]
+    pub(crate) fn sys_msync(
+        &self,
+        addr: MutPtr<u8>,
+        len: usize,
+        flags: litebox_common_linux::MsyncFlags,
+    ) -> Result<(), Errno> {
+        litebox_common_linux::mm::sys_msync(&self.global.pm, addr, len, flags)
+    }
 }
 
 #[cfg(test)]
@@ -439,6 +455,105 @@ mod tests {
         addr.to_owned_slice(0x10).unwrap().iter().for_each(|&x| {
             assert_eq!(x, 0); // Should be zeroed after MADV_DONTNEED
         });
+
+        task.sys_munmap(addr, 0x2000).unwrap();
+    }
+
+    #[test]
+    fn test_msync_basic() {
+        use litebox_common_linux::MsyncFlags;
+
+        let task = init_platform(None);
+
+        // Create a mapping
+        let addr = task
+            .sys_mmap(
+                0,
+                0x2000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+
+        // msync with MS_SYNC should succeed (no-op)
+        assert!(task.sys_msync(addr, 0x2000, MsyncFlags::MS_SYNC).is_ok());
+
+        // msync with MS_ASYNC should succeed (no-op)
+        assert!(task.sys_msync(addr, 0x2000, MsyncFlags::MS_ASYNC).is_ok());
+
+        // msync with MS_INVALIDATE should succeed (no-op)
+        assert!(
+            task.sys_msync(addr, 0x2000, MsyncFlags::MS_INVALIDATE)
+                .is_ok()
+        );
+
+        // msync with MS_SYNC | MS_INVALIDATE should succeed
+        assert!(
+            task.sys_msync(
+                addr,
+                0x2000,
+                MsyncFlags::MS_SYNC | MsyncFlags::MS_INVALIDATE
+            )
+            .is_ok()
+        );
+
+        // Zero length should succeed
+        assert!(task.sys_msync(addr, 0, MsyncFlags::MS_SYNC).is_ok());
+
+        task.sys_munmap(addr, 0x2000).unwrap();
+    }
+
+    #[test]
+    fn test_msync_invalid_flags() {
+        use litebox_common_linux::MsyncFlags;
+
+        let task = init_platform(None);
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x2000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+
+        // MS_ASYNC and MS_SYNC together should fail with EINVAL
+        assert_eq!(
+            task.sys_msync(addr, 0x2000, MsyncFlags::MS_ASYNC | MsyncFlags::MS_SYNC),
+            Err(Errno::EINVAL)
+        );
+
+        task.sys_munmap(addr, 0x2000).unwrap();
+    }
+
+    #[test]
+    fn test_msync_unaligned_addr() {
+        use litebox_common_linux::MsyncFlags;
+
+        let task = init_platform(None);
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x2000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+
+        // Unaligned address should fail with EINVAL
+        let unaligned = crate::MutPtr::<u8>::from_usize(addr.as_usize() + 1);
+        assert_eq!(
+            task.sys_msync(unaligned, 0x1000, MsyncFlags::MS_SYNC),
+            Err(Errno::EINVAL)
+        );
 
         task.sys_munmap(addr, 0x2000).unwrap();
     }

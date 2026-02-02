@@ -254,3 +254,60 @@ pub fn sys_madvise<
         _ => unimplemented!("Unsupported madvise behavior {:?}", advice),
     }
 }
+
+/// Handle syscall `msync`
+///
+/// Synchronize a file with a memory map. Since litebox only supports `MAP_PRIVATE`
+/// mappings (not `MAP_SHARED`), changes to memory-mapped regions are never written
+/// back to the underlying file. Therefore, this syscall is implemented as a no-op
+/// that validates the arguments and returns success.
+///
+/// # Arguments
+/// * `_pm` - The page manager (unused, as this is a no-op)
+/// * `addr` - Start of the memory region to sync (must be page-aligned)
+/// * `len` - Length of the region
+/// * `flags` - Flags controlling the sync operation (MS_ASYNC, MS_SYNC, MS_INVALIDATE)
+///
+/// # Errors
+/// * `EINVAL` - `addr` is not page-aligned, or invalid flags combination
+/// * `ENOMEM` - Overflow when computing end address
+pub fn sys_msync<
+    Platform: litebox::platform::RawPointerProvider
+        + litebox::sync::RawSyncPrimitivesProvider
+        + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
+>(
+    _pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    addr: Platform::RawMutPointer<u8>,
+    len: usize,
+    flags: crate::MsyncFlags,
+) -> Result<(), Errno> {
+    use crate::MsyncFlags;
+
+    // Check for invalid flags (any flags other than MS_ASYNC, MS_INVALIDATE, MS_SYNC)
+    let valid_flags = MsyncFlags::MS_ASYNC | MsyncFlags::MS_INVALIDATE | MsyncFlags::MS_SYNC;
+    if flags.intersects(!valid_flags) {
+        return Err(Errno::EINVAL);
+    }
+
+    // addr must be page-aligned
+    if addr.as_usize() & !PAGE_MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    // MS_ASYNC and MS_SYNC are mutually exclusive
+    if flags.contains(MsyncFlags::MS_ASYNC) && flags.contains(MsyncFlags::MS_SYNC) {
+        return Err(Errno::EINVAL);
+    }
+
+    // Align length up to page boundary
+    let aligned_len = len.next_multiple_of(PAGE_SIZE);
+
+    // Check for overflow
+    if addr.as_usize().checked_add(aligned_len).is_none() {
+        return Err(Errno::ENOMEM);
+    }
+
+    // No-op: litebox only supports MAP_PRIVATE, so there's nothing to sync.
+    // In a MAP_PRIVATE mapping, changes are never written back to the file.
+    Ok(())
+}

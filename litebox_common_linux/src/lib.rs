@@ -631,6 +631,21 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Flags for the `msync` syscall.
+    #[derive(Debug, Clone, Copy)]
+    pub struct MsyncFlags: i32 {
+        /// Schedule the write and return immediately.
+        const MS_ASYNC = 1;
+        /// Invalidate other mappings of the same file so they can be updated with fresh data.
+        const MS_INVALIDATE = 2;
+        /// Synchronous write: block until the write is complete.
+        const MS_SYNC = 4;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 #[repr(u32)]
 #[non_exhaustive]
 #[derive(Debug, IntEnum)]
@@ -1966,6 +1981,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         length: usize,
         behavior: MadviseBehavior,
     },
+    /// Synchronize a file with a memory map.
+    Msync {
+        addr: Platform::RawMutPointer<u8>,
+        length: usize,
+        flags: MsyncFlags,
+    },
     Dup {
         oldfd: i32,
         newfd: Option<i32>,
@@ -2453,6 +2474,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
+            Sysno::msync => sys_req!(Msync { addr:*, length, flags }),
             Sysno::dup => SyscallRequest::Dup {
                 oldfd: ctx.sys_req_arg(0),
                 newfd: None,
@@ -3173,6 +3195,7 @@ reinterpret_truncated_from_usize_for! {
         ProtFlags,
         MapFlags,
         MRemapFlags,
+        MsyncFlags,
         AccessFlags,
         litebox::fs::Mode,
         litebox::fs::OFlags,
