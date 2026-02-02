@@ -10,10 +10,11 @@ use alloc::string::String;
 use crate::{
     LiteBox,
     fs::{
-        FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
+        FallocMode, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
-            ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+            ChmodError, ChownError, CloseError, FallocateError, FileStatusError, MkdirError,
+            OpenError, PathError, ReadDirError, ReadError, RmdirError, SeekError, TruncateError,
+            UnlinkError, WriteError,
         },
     },
     path::Arg,
@@ -325,6 +326,17 @@ impl<
         _reset_offset: bool,
     ) -> Result<(), TruncateError> {
         Err(TruncateError::IsTerminalDevice)
+    }
+
+    fn fallocate(
+        &self,
+        _fd: &FileFd<Platform>,
+        _mode: FallocMode,
+        _offset: i64,
+        _len: i64,
+    ) -> Result<(), FallocateError> {
+        // Device files don't support fallocate
+        Err(FallocateError::NotSupported)
     }
 
     #[expect(unused_variables, reason = "unimplemented")]

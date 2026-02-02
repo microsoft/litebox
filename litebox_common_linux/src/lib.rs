@@ -218,6 +218,135 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Flags for the `fallocate` syscall that control how space is allocated or deallocated.
+    ///
+    /// These flags can be combined to achieve different behaviors:
+    /// - `KEEP_SIZE`: Allocate space without changing the file size
+    /// - `PUNCH_HOLE`: Deallocate space (must be combined with `KEEP_SIZE`)
+    /// - `COLLAPSE_RANGE`: Remove a range and shift subsequent data (mutually exclusive)
+    /// - `ZERO_RANGE`: Zero out a range, potentially preallocating space
+    /// - `INSERT_RANGE`: Insert a hole, shifting subsequent data (mutually exclusive)
+    /// - `UNSHARE_RANGE`: Unshare shared blocks (for copy-on-write files)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FallocateMode: core::ffi::c_int {
+        /// Default mode: allocate disk space within the range specified.
+        /// The file size will be extended if offset+len exceeds it.
+        const ALLOCATE = 0;
+        /// Do not modify the file size even if offset+len exceeds the current size.
+        const KEEP_SIZE = 0x01;
+        /// Deallocate space (create a hole). Must be combined with `KEEP_SIZE`.
+        const PUNCH_HOLE = 0x02;
+        /// Remove a range of bytes from the file without leaving a hole.
+        /// Data after the range is shifted down. Cannot be combined with other flags.
+        const COLLAPSE_RANGE = 0x08;
+        /// Zero out a range of bytes. May be combined with `KEEP_SIZE`.
+        const ZERO_RANGE = 0x10;
+        /// Insert a hole at the specified range, shifting existing data.
+        /// Cannot be combined with other flags.
+        const INSERT_RANGE = 0x20;
+        /// Unshare shared blocks within the range (useful for copy-on-write files).
+        /// May be combined with `KEEP_SIZE`.
+        const UNSHARE_RANGE = 0x40;
+
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+impl FallocateMode {
+    /// Validates the fallocate mode flags for correctness.
+    ///
+    /// Returns `true` if the flags represent a valid combination, `false` otherwise.
+    /// Invalid combinations include:
+    /// - `PUNCH_HOLE` without `KEEP_SIZE`
+    /// - `COLLAPSE_RANGE` or `INSERT_RANGE` combined with other flags
+    /// - `COLLAPSE_RANGE` combined with `INSERT_RANGE`
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        // PUNCH_HOLE must be combined with KEEP_SIZE
+        if self.contains(Self::PUNCH_HOLE) && !self.contains(Self::KEEP_SIZE) {
+            return false;
+        }
+
+        // COLLAPSE_RANGE must be exclusive (except ALLOCATE which is 0)
+        if self.contains(Self::COLLAPSE_RANGE)
+            && self.intersects(
+                Self::KEEP_SIZE
+                    | Self::PUNCH_HOLE
+                    | Self::ZERO_RANGE
+                    | Self::INSERT_RANGE
+                    | Self::UNSHARE_RANGE,
+            )
+        {
+            return false;
+        }
+
+        // INSERT_RANGE must be exclusive (except ALLOCATE which is 0)
+        if self.contains(Self::INSERT_RANGE)
+            && self.intersects(
+                Self::KEEP_SIZE
+                    | Self::PUNCH_HOLE
+                    | Self::ZERO_RANGE
+                    | Self::COLLAPSE_RANGE
+                    | Self::UNSHARE_RANGE,
+            )
+        {
+            return false;
+        }
+
+        true
+    }
+
+    /// Convert the Linux-specific flags to the generic `FallocMode` enum.
+    ///
+    /// Returns `None` if the flags represent an invalid or unsupported combination.
+    #[must_use]
+    pub fn to_falloc_mode(&self) -> Option<litebox::fs::FallocMode> {
+        use litebox::fs::FallocMode;
+
+        // Check validity first
+        if !self.is_valid() {
+            return None;
+        }
+
+        // Handle exclusive modes first
+        if self.contains(Self::COLLAPSE_RANGE) {
+            return Some(FallocMode::CollapseRange);
+        }
+        if self.contains(Self::INSERT_RANGE) {
+            return Some(FallocMode::InsertRange);
+        }
+
+        // PUNCH_HOLE must be combined with KEEP_SIZE (already validated)
+        if self.contains(Self::PUNCH_HOLE) {
+            return Some(FallocMode::PunchHoleKeepSize);
+        }
+
+        // ZERO_RANGE
+        if self.contains(Self::ZERO_RANGE) {
+            if self.contains(Self::KEEP_SIZE) {
+                return Some(FallocMode::ZeroRangeKeepSize);
+            }
+            return Some(FallocMode::ZeroRange);
+        }
+
+        // UNSHARE_RANGE (with optional KEEP_SIZE)
+        if self.contains(Self::UNSHARE_RANGE) {
+            // UNSHARE_RANGE always implies allocation
+            return Some(FallocMode::AllocateUnshareRange);
+        }
+
+        // Simple allocation modes
+        if self.contains(Self::KEEP_SIZE) {
+            return Some(FallocMode::AllocateKeepSize);
+        }
+
+        // Default mode (no flags or just ALLOCATE=0)
+        Some(FallocMode::Allocate)
+    }
+}
+
 #[repr(u32)]
 pub enum InodeType {
     /// FIFO (named pipe)
@@ -2120,6 +2249,16 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         length: usize,
     },
+    /// Manipulate file space.
+    ///
+    /// Allows allocating, deallocating, or otherwise manipulating disk space for a file.
+    /// The behavior depends on the `mode` flags provided.
+    Fallocate {
+        fd: i32,
+        mode: FallocateMode,
+        offset: i64,
+        len: i64,
+    },
     Unlinkat {
         dirfd: i32,
         pathname: Platform::RawConstPointer<i8>,
@@ -2727,6 +2866,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 }
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
+            Sysno::fallocate => sys_req!(Fallocate {
+                fd,
+                mode,
+                offset,
+                len
+            }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "x86")]
@@ -3182,6 +3327,7 @@ reinterpret_truncated_from_usize_for! {
         ReceiveFlags,
         EpollCreateFlags,
         EfdFlags,
+        FallocateMode,
         RngFlags,
         TimerFlags,
     ],

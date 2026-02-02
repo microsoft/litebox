@@ -3,7 +3,9 @@
 
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
-use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
+use litebox_common_linux::{
+    AtFlags, EfdFlags, FallocateMode, FcntlArg, FileDescriptorFlags, errno::Errno,
+};
 use litebox_platform_multiplex::{Platform, set_platform};
 
 use crate::MutPtr;
@@ -583,4 +585,332 @@ fn test_unlinkat() {
         Err(Errno::ENOENT),
         "Second directory should no longer exist after removal"
     );
+}
+
+#[test]
+fn test_fallocate_basic_allocation() {
+    let task = init_platform(None);
+
+    // Create a test file
+    let fd = task
+        .sys_open(
+            "/fallocate_test.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Test basic allocation (mode = 0)
+    let result = task.sys_fallocate(fd, FallocateMode::empty(), 0, 1024);
+    assert!(result.is_ok(), "fallocate with default mode should succeed");
+
+    // Verify file size was extended
+    let stat = task.sys_fstat(fd).expect("fstat should succeed");
+    let size = { stat.st_size };
+    assert_eq!(size, 1024, "File size should be extended to 1024");
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
+}
+
+#[test]
+fn test_fallocate_keep_size() {
+    let task = init_platform(None);
+
+    // Create a test file
+    let fd = task
+        .sys_open(
+            "/fallocate_keepsize.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Test allocation with KEEP_SIZE
+    let result = task.sys_fallocate(fd, FallocateMode::KEEP_SIZE, 0, 2048);
+    assert!(result.is_ok(), "fallocate with KEEP_SIZE should succeed");
+
+    // Verify file size is still 0
+    let stat = task.sys_fstat(fd).expect("fstat should succeed");
+    let size = { stat.st_size };
+    assert_eq!(size, 0, "File size should remain 0 with KEEP_SIZE");
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
+}
+
+#[test]
+fn test_fallocate_punch_hole() {
+    let task = init_platform(None);
+
+    // Create a test file with some content
+    let fd = task
+        .sys_open(
+            "/fallocate_punch.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Write some data
+    let data = b"Hello, World! This is a test file with content.";
+    task.sys_write(fd, data, None)
+        .expect("write should succeed");
+
+    // Get original size
+    let stat = task.sys_fstat(fd).expect("fstat should succeed");
+    let original_size = { stat.st_size };
+
+    // Punch a hole (PUNCH_HOLE requires KEEP_SIZE)
+    let result = task.sys_fallocate(
+        fd,
+        FallocateMode::PUNCH_HOLE | FallocateMode::KEEP_SIZE,
+        10,
+        20,
+    );
+    assert!(result.is_ok(), "PUNCH_HOLE should succeed");
+
+    // Verify file size hasn't changed
+    let stat = task.sys_fstat(fd).expect("fstat should succeed");
+    let size = { stat.st_size };
+    assert_eq!(
+        size, original_size,
+        "File size should not change with PUNCH_HOLE"
+    );
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
+}
+
+#[test]
+fn test_fallocate_zero_range() {
+    let task = init_platform(None);
+
+    // Create a test file with content
+    let fd = task
+        .sys_open(
+            "/fallocate_zero.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Write some data
+    let data = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    task.sys_write(fd, data, None)
+        .expect("write should succeed");
+
+    // Zero out a range
+    let result = task.sys_fallocate(fd, FallocateMode::ZERO_RANGE, 5, 10);
+    assert!(result.is_ok(), "ZERO_RANGE should succeed");
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
+}
+
+#[test]
+fn test_fallocate_collapse_range() {
+    let task = init_platform(None);
+
+    // Create a test file with content
+    let fd = task
+        .sys_open(
+            "/fallocate_collapse.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Write some data
+    let data = b"Hello, World! This is a test.";
+    task.sys_write(fd, data, None)
+        .expect("write should succeed");
+
+    let original_size = data.len();
+
+    // Collapse a range
+    let result = task.sys_fallocate(fd, FallocateMode::COLLAPSE_RANGE, 7, 7);
+    assert!(result.is_ok(), "COLLAPSE_RANGE should succeed");
+
+    // Verify file size decreased
+    let stat = task.sys_fstat(fd).expect("fstat should succeed");
+    let size = { stat.st_size };
+    assert_eq!(
+        size,
+        original_size - 7,
+        "File size should decrease after COLLAPSE_RANGE"
+    );
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
+}
+
+#[test]
+fn test_fallocate_insert_range() {
+    let task = init_platform(None);
+
+    // Create a test file with content
+    let fd = task
+        .sys_open(
+            "/fallocate_insert.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Write some data
+    let data = b"Hello, World!";
+    task.sys_write(fd, data, None)
+        .expect("write should succeed");
+
+    let original_size = data.len();
+
+    // Insert a range
+    let result = task.sys_fallocate(fd, FallocateMode::INSERT_RANGE, 7, 5);
+    assert!(result.is_ok(), "INSERT_RANGE should succeed");
+
+    // Verify file size increased
+    let stat = task.sys_fstat(fd).expect("fstat should succeed");
+    let size = { stat.st_size };
+    assert_eq!(
+        size,
+        original_size + 5,
+        "File size should increase after INSERT_RANGE"
+    );
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
+}
+
+#[test]
+fn test_fallocate_invalid_mode() {
+    let task = init_platform(None);
+
+    // Create a test file
+    let fd = task
+        .sys_open(
+            "/fallocate_invalid.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // PUNCH_HOLE without KEEP_SIZE is invalid
+    let result = task.sys_fallocate(fd, FallocateMode::PUNCH_HOLE, 0, 100);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "PUNCH_HOLE without KEEP_SIZE should return EINVAL"
+    );
+
+    // COLLAPSE_RANGE with KEEP_SIZE is invalid
+    let result = task.sys_fallocate(
+        fd,
+        FallocateMode::COLLAPSE_RANGE | FallocateMode::KEEP_SIZE,
+        0,
+        100,
+    );
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "COLLAPSE_RANGE with KEEP_SIZE should return EINVAL"
+    );
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
+}
+
+#[test]
+fn test_fallocate_invalid_parameters() {
+    let task = init_platform(None);
+
+    // Create a test file
+    let fd = task
+        .sys_open(
+            "/fallocate_params.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Negative offset should fail
+    let result = task.sys_fallocate(fd, FallocateMode::empty(), -1, 100);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "Negative offset should return EINVAL"
+    );
+
+    // Zero length should fail
+    let result = task.sys_fallocate(fd, FallocateMode::empty(), 0, 0);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "Zero length should return EINVAL"
+    );
+
+    // Negative length should fail
+    let result = task.sys_fallocate(fd, FallocateMode::empty(), 0, -100);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "Negative length should return EINVAL"
+    );
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
+}
+
+#[test]
+fn test_fallocate_bad_fd() {
+    let task = init_platform(None);
+
+    // Use an invalid file descriptor
+    let result = task.sys_fallocate(9999, FallocateMode::empty(), 0, 100);
+    assert_eq!(result, Err(Errno::EBADF), "Invalid fd should return EBADF");
+
+    // Negative fd should also fail
+    let result = task.sys_fallocate(-1, FallocateMode::empty(), 0, 100);
+    assert_eq!(result, Err(Errno::EBADF), "Negative fd should return EBADF");
+}
+
+#[test]
+fn test_fallocate_read_only_file() {
+    let task = init_platform(None);
+
+    // Create a file first
+    let fd = task
+        .sys_open(
+            "/fallocate_readonly.txt",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    task.sys_close(i32::try_from(fd).unwrap())
+        .expect("close should succeed");
+
+    // Open the file as read-only
+    let fd = task
+        .sys_open("/fallocate_readonly.txt", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // fallocate on read-only file should fail
+    let result = task.sys_fallocate(fd, FallocateMode::empty(), 0, 100);
+    assert_eq!(
+        result,
+        Err(Errno::EBADF),
+        "fallocate on read-only file should return EBADF"
+    );
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
 }

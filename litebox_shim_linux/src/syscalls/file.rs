@@ -17,8 +17,8 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    AtFlags, EfdFlags, EpollCreateFlags, FallocateMode, FcntlArg, FileDescriptorFlags, FileStat,
+    IoReadVec, IoWriteVec, IoctlArg, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -198,6 +198,61 @@ impl Task {
                 |_fd| todo!("pipes"),
             ),
             _ => Err(Errno::EINVAL),
+        }
+        .flatten()
+    }
+
+    /// Handle syscall `fallocate`
+    ///
+    /// Manipulates the file space. The behavior depends on the mode:
+    /// - Default (mode=0): Allocate disk space for the range [offset, offset+len)
+    /// - KEEP_SIZE: Don't extend file size even if offset+len > file size
+    /// - PUNCH_HOLE | KEEP_SIZE: Deallocate space (create a hole)
+    /// - ZERO_RANGE: Zero out the range
+    /// - COLLAPSE_RANGE: Remove the range and shift data down
+    /// - INSERT_RANGE: Insert a hole and shift data up
+    pub(crate) fn sys_fallocate(
+        &self,
+        fd: i32,
+        mode: FallocateMode,
+        offset: i64,
+        len: i64,
+    ) -> Result<(), Errno> {
+        // Convert Linux flags to FallocMode enum, validating flags in the process
+        let falloc_mode = mode.to_falloc_mode().ok_or(Errno::EINVAL)?;
+
+        // Validate offset and len
+        if offset < 0 || len <= 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        // Check for overflow
+        if offset.checked_add(len).is_none() {
+            return Err(Errno::EFBIG);
+        }
+
+        let Ok(fd_u32) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+        let desc = file_table.get_fd(fd_u32).ok_or(Errno::EBADF)?;
+        match desc {
+            Descriptor::LiteBoxRawFd(raw_fd) => self.files.borrow().run_on_raw_fd(
+                *raw_fd,
+                |typed_fd| {
+                    self.global
+                        .fs
+                        .fallocate(typed_fd, falloc_mode, offset, len)
+                        .map_err(Errno::from)
+                },
+                |_fd| Err(Errno::ESPIPE), // Sockets don't support fallocate
+                |_fd| Err(Errno::ESPIPE), // Pipes don't support fallocate
+            ),
+            Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } | Descriptor::Unix { .. } => {
+                Err(Errno::ENODEV)
+            }
         }
         .flatten()
     }

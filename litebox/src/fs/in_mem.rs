@@ -13,10 +13,11 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FallocateError, FileStatusError, MkdirError, OpenError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError,
+    WriteError,
 };
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
+use super::{DirEntry, FallocMode, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
 /// `b'IMem'.hex()`.
@@ -444,6 +445,114 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
         if reset_offset {
             *position = 0;
+        }
+        Ok(())
+    }
+
+    fn fallocate(
+        &self,
+        fd: &FileFd<Platform>,
+        mode: FallocMode,
+        offset: i64,
+        len: i64,
+    ) -> Result<(), FallocateError> {
+        // Validate offset and len (should be non-negative, len > 0)
+        if offset < 0 || len <= 0 {
+            return Err(FallocateError::InvalidRange);
+        }
+
+        // Safe to cast since we validated offset >= 0 and len > 0
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "offset and len validated to be non-negative above"
+        )]
+        let offset = offset as usize;
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "offset and len validated to be non-negative above"
+        )]
+        let len = len as usize;
+
+        let descriptor_table = self.litebox.descriptor_table();
+        let Descriptor::File {
+            file,
+            read_allowed: _,
+            write_allowed,
+            position: _,
+        } = &mut descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(FallocateError::ClosedFd)?
+            .entry
+        else {
+            return Err(FallocateError::IsDirectory);
+        };
+        if !*write_allowed {
+            return Err(FallocateError::NotForWriting);
+        }
+
+        let mut file_data = file.write();
+        let current_size = file_data.data.len();
+        let end_offset = offset
+            .checked_add(len)
+            .ok_or(FallocateError::InvalidRange)?;
+
+        match mode {
+            FallocMode::Allocate => {
+                // Allocate space and extend file if needed
+                if end_offset > current_size {
+                    file_data.data.to_mut().resize(end_offset, 0);
+                }
+            }
+            FallocMode::AllocateKeepSize | FallocMode::AllocateUnshareRange => {
+                // For in-memory filesystem, these are no-ops since we don't have
+                // actual disk blocks to allocate or COW semantics
+            }
+            FallocMode::PunchHoleKeepSize => {
+                // Zero out the range without changing file size
+                if offset < current_size {
+                    let end = core::cmp::min(end_offset, current_size);
+                    let data = file_data.data.to_mut();
+                    data[offset..end].fill(0);
+                }
+            }
+            FallocMode::ZeroRange => {
+                // Zero out the range, extending file if needed
+                if end_offset > current_size {
+                    file_data.data.to_mut().resize(end_offset, 0);
+                }
+                let data = file_data.data.to_mut();
+                data[offset..end_offset].fill(0);
+            }
+            FallocMode::ZeroRangeKeepSize => {
+                // Zero out the range without extending file
+                if offset < current_size {
+                    let end = core::cmp::min(end_offset, current_size);
+                    let data = file_data.data.to_mut();
+                    data[offset..end].fill(0);
+                }
+            }
+            FallocMode::CollapseRange => {
+                // Remove the range and shift data down
+                if offset >= current_size {
+                    return Err(FallocateError::InvalidRange);
+                }
+                if end_offset > current_size {
+                    return Err(FallocateError::InvalidRange);
+                }
+                let data = file_data.data.to_mut();
+                data.drain(offset..end_offset);
+            }
+            FallocMode::InsertRange => {
+                // Insert zeros and shift data up
+                if offset > current_size {
+                    return Err(FallocateError::InvalidRange);
+                }
+                let data = file_data.data.to_mut();
+                // Insert `len` zeros at `offset`
+                data.splice(offset..offset, core::iter::repeat_n(0, len));
+            }
         }
         Ok(())
     }

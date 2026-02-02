@@ -15,10 +15,11 @@ use crate::path::Arg;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FallocateError, FileStatusError, MkdirError, OpenError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError,
+    WriteError,
 };
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
+use super::{DirEntry, FallocMode, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
 /// `b'Lyrs'.hex()`.
@@ -909,6 +910,74 @@ impl<
                             // The lower level truncate will correctly identify dir/file and handle
                             // the difference in erroring.
                             self.lower.truncate(fd, length, reset_offset)
+                        }
+                    }
+                }
+            }
+            EntryX::Tombstone => unreachable!(),
+        }
+    }
+
+    fn fallocate(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        mode: FallocMode,
+        offset: i64,
+        len: i64,
+    ) -> Result<(), FallocateError> {
+        let (flags, entry) = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| {
+                (descriptor.entry.flags, Arc::clone(&descriptor.entry.entry))
+            })
+            .ok_or(FallocateError::ClosedFd)?;
+        let layered_fd = fd;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.fallocate(fd, mode, offset, len),
+            EntryX::Lower { fd } => {
+                match self.layering_semantics {
+                    LayeringSemantics::LowerLayerWritableFiles => {
+                        self.lower.fallocate(fd, mode, offset, len)
+                    }
+                    LayeringSemantics::LowerLayerReadOnly => {
+                        if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
+                            // We might need to migrate the file up
+                            match self.lower.fallocate(fd, mode, offset, len) {
+                                Ok(()) | Err(FallocateError::ClosedFd) => unreachable!(),
+                                Err(FallocateError::IsDirectory) => {
+                                    Err(FallocateError::IsDirectory)
+                                }
+                                Err(FallocateError::IsPipe) => Err(FallocateError::IsPipe),
+                                Err(FallocateError::NotSupported) => {
+                                    Err(FallocateError::NotSupported)
+                                }
+                                Err(FallocateError::InvalidMode) => {
+                                    Err(FallocateError::InvalidMode)
+                                }
+                                Err(FallocateError::InvalidRange) => {
+                                    Err(FallocateError::InvalidRange)
+                                }
+                                Err(FallocateError::NotForWriting) => {
+                                    // We must migrate this file up first.
+                                    drop(entry);
+                                    let path = self
+                                        .litebox
+                                        .descriptor_table()
+                                        .with_entry(layered_fd, |descriptor| {
+                                            descriptor.entry.path.clone()
+                                        })
+                                        .ok_or(FallocateError::ClosedFd)?;
+                                    self.migrate_file_up(&path, false)
+                                        .expect("this migration should always succeed");
+                                    // Re-invoke fallocate on the migrated file
+                                    self.fallocate(layered_fd, mode, offset, len)
+                                }
+                            }
+                        } else {
+                            // The lower level fallocate will correctly identify dir/file and handle
+                            // the difference in erroring.
+                            self.lower.fallocate(fd, mode, offset, len)
                         }
                     }
                 }

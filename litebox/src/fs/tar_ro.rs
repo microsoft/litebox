@@ -37,10 +37,10 @@ use crate::{
 };
 
 use super::{
-    Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
+    FallocMode, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
-        ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+        ChmodError, ChownError, CloseError, FallocateError, MkdirError, OpenError, PathError,
+        ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
     },
 };
 
@@ -321,6 +321,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         {
             Descriptor::File { .. } => Err(TruncateError::NotForWriting),
             Descriptor::Dir { .. } => Err(TruncateError::IsDirectory),
+        }
+    }
+
+    fn fallocate(
+        &self,
+        fd: &FileFd<Platform>,
+        _mode: FallocMode,
+        _offset: i64,
+        _len: i64,
+    ) -> Result<(), FallocateError> {
+        // tar_ro is a read-only filesystem
+        match self
+            .litebox
+            .descriptor_table()
+            .get_entry(fd)
+            .ok_or(FallocateError::ClosedFd)?
+            .entry
+        {
+            Descriptor::File { .. } => Err(FallocateError::NotForWriting),
+            Descriptor::Dir { .. } => Err(FallocateError::IsDirectory),
         }
     }
 

@@ -964,6 +964,12 @@ impl Task {
                 syscall!(sys_openat(dirfd, path, flags, mode))
             }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
+            SyscallRequest::Fallocate {
+                fd,
+                mode,
+                offset,
+                len,
+            } => syscall!(sys_fallocate(fd, mode, offset, len)),
             SyscallRequest::Unlinkat {
                 dirfd,
                 pathname,

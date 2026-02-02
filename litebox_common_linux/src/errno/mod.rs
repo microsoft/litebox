@@ -558,3 +558,19 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
         }
     }
 }
+
+impl From<litebox::fs::errors::FallocateError> for Errno {
+    fn from(value: litebox::fs::errors::FallocateError) -> Self {
+        match value {
+            litebox::fs::errors::FallocateError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::FallocateError::IsDirectory => Errno::EISDIR,
+            litebox::fs::errors::FallocateError::NotForWriting => Errno::EBADF,
+            litebox::fs::errors::FallocateError::IsPipe => Errno::ESPIPE,
+            litebox::fs::errors::FallocateError::NotSupported => Errno::EOPNOTSUPP,
+            litebox::fs::errors::FallocateError::InvalidMode => Errno::EINVAL,
+            litebox::fs::errors::FallocateError::InvalidRange => Errno::EINVAL,
+            // FallocateError is non-exhaustive, handle future variants
+            _ => Errno::EIO,
+        }
+    }
+}

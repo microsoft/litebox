@@ -23,8 +23,8 @@ pub mod tar_ro;
 mod tests;
 
 use errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FallocateError, FileStatusError, MkdirError, OpenError,
+    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -106,6 +106,25 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         reset_offset: bool,
     ) -> Result<(), TruncateError>;
 
+    /// Manipulate file space.
+    ///
+    /// The behavior depends on the mode:
+    /// - `Allocate`: Allocate disk space for the range [offset, offset+len)
+    /// - `AllocateKeepSize`: Like Allocate, but don't extend file size
+    /// - `AllocateUnshareRange`: Make shared data extents private
+    /// - `PunchHoleKeepSize`: Deallocate space (create a hole)
+    /// - `ZeroRange`: Zero out the range, potentially extending the file
+    /// - `ZeroRangeKeepSize`: Like ZeroRange, but don't extend file size
+    /// - `CollapseRange`: Remove the range and shift data down
+    /// - `InsertRange`: Insert a hole and shift data up
+    fn fallocate(
+        &self,
+        fd: &TypedFd<Self>,
+        mode: FallocMode,
+        offset: i64,
+        len: i64,
+    ) -> Result<(), FallocateError>;
+
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
 
@@ -136,6 +155,36 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
 
     /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
     fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
+}
+
+/// Represents the various operation modes for [`FileSystem::fallocate`].
+///
+/// Each mode determines whether the target disk space within a file
+/// will be allocated, deallocated, or zeroed, among other operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FallocMode {
+    /// Allocates disk space within the range specified.
+    /// The file size will be extended if offset+len exceeds it.
+    Allocate,
+    /// Like `Allocate`, but does not change the file size even if offset+len
+    /// exceeds the current size.
+    AllocateKeepSize,
+    /// Makes shared file data extents private to guarantee subsequent writes
+    /// will not fail due to lack of space.
+    AllocateUnshareRange,
+    /// Deallocates space (creates a hole) while keeping the file size unchanged.
+    /// This is useful for sparse files.
+    PunchHoleKeepSize,
+    /// Converts a file range to zeros, expanding the file if necessary.
+    ZeroRange,
+    /// Like `ZeroRange`, but does not change the file size.
+    ZeroRangeKeepSize,
+    /// Removes a range of bytes without leaving a hole.
+    /// Data after the range is shifted down.
+    CollapseRange,
+    /// Inserts space within a file without overwriting existing data.
+    /// Existing data is shifted up.
+    InsertRange,
 }
 
 bitflags! {

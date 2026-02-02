@@ -85,6 +85,26 @@ pub enum TruncateError {
     IsTerminalDevice,
 }
 
+/// Possible errors from [`FileSystem::fallocate`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum FallocateError {
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("file descriptor points to a directory")]
+    IsDirectory,
+    #[error("file is not opened for writing")]
+    NotForWriting,
+    #[error("file descriptor refers to a pipe")]
+    IsPipe,
+    #[error("operation not supported by this filesystem")]
+    NotSupported,
+    #[error("invalid mode flags")]
+    InvalidMode,
+    #[error("offset or length is invalid")]
+    InvalidRange,
+}
+
 /// Possible errors from [`FileSystem::chmod`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

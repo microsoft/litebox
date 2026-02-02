@@ -80,6 +80,16 @@ impl<Platform: platform::Provider + Sync> super::FileSystem for FileSystem<Platf
         todo!()
     }
 
+    fn fallocate(
+        &self,
+        fd: &FileFd<Platform>,
+        mode: super::FallocMode,
+        offset: i64,
+        len: i64,
+    ) -> Result<(), super::errors::FallocateError> {
+        todo!()
+    }
+
     fn chmod(
         &self,
         path: impl crate::path::Arg,
