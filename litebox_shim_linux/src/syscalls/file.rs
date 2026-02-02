@@ -18,7 +18,9 @@ use litebox::{
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    IoWriteVec, IoctlArg, SfdFlags, TimeParam,
+    errno::Errno,
+    signal::{SigSet, Signal},
 };
 use litebox_platform_multiplex::Platform;
 
@@ -283,6 +285,44 @@ impl Task {
                 buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
                 Ok(size_of::<u64>())
             }
+            Descriptor::Signalfd { file, .. } => {
+                use litebox_common_linux::SignalfdSiginfo;
+                use zerocopy::IntoBytes;
+
+                let file = file.clone();
+                drop(file_table);
+
+                // Buffer must be at least the size of one SignalfdSiginfo
+                if buf.len() < size_of::<SignalfdSiginfo>() {
+                    return Err(Errno::EINVAL);
+                }
+
+                // Try to read signals
+                let mask = file.get_mask();
+                let signals = self.read_signals_for_signalfd(mask);
+
+                if signals.is_empty() {
+                    if file.get_status().contains(OFlags::NONBLOCK) {
+                        return Err(Errno::EAGAIN);
+                    } else {
+                        // For blocking mode, we would need to wait
+                        // TODO: implement proper blocking wait
+                        return Err(Errno::EAGAIN);
+                    }
+                }
+
+                // Copy signals to buffer
+                let mut bytes_written = 0;
+                for siginfo in signals {
+                    if bytes_written + size_of::<SignalfdSiginfo>() > buf.len() {
+                        break;
+                    }
+                    buf[bytes_written..bytes_written + size_of::<SignalfdSiginfo>()]
+                        .copy_from_slice(siginfo.as_bytes());
+                    bytes_written += size_of::<SignalfdSiginfo>();
+                }
+                Ok(bytes_written)
+            }
             Descriptor::Unix { file, .. } => file.recvfrom(
                 &self.wait_cx(),
                 buf,
@@ -329,7 +369,7 @@ impl Task {
                     )
                     .flatten()
             }
-            Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+            Descriptor::Epoll { .. } | Descriptor::Signalfd { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { file, .. } => {
                 let file = file.clone();
                 drop(file_table);
@@ -394,9 +434,10 @@ impl Task {
                     |_| Err(Errno::ESPIPE),
                 )
                 .flatten(),
-            Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } | Descriptor::Unix { .. } => {
-                Err(Errno::ESPIPE)
-            }
+            Descriptor::Epoll { .. }
+            | Descriptor::Eventfd { .. }
+            | Descriptor::Unix { .. }
+            | Descriptor::Signalfd { .. } => Err(Errno::ESPIPE),
         }
     }
 
@@ -444,9 +485,10 @@ impl Task {
                     }
                 }
             }
-            Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                Ok(())
-            }
+            Descriptor::Eventfd { .. }
+            | Descriptor::Epoll { .. }
+            | Descriptor::Unix { .. }
+            | Descriptor::Signalfd { .. } => Ok(()),
         }
     }
 
@@ -513,7 +555,9 @@ impl Task {
                         |_fd| todo!("pipes"),
                     )
                     .flatten()?,
-                Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
+                Descriptor::Epoll { .. } | Descriptor::Signalfd { .. } => {
+                    return Err(Errno::EINVAL);
+                }
                 Descriptor::Eventfd { .. } => todo!(),
                 Descriptor::Unix { .. } => todo!(),
             };
@@ -599,7 +643,7 @@ impl Task {
                     )
                     .flatten()
             }
-            Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+            Descriptor::Epoll { .. } | Descriptor::Signalfd { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { .. } => todo!(),
             Descriptor::Unix { .. } => todo!(),
         };
@@ -792,6 +836,20 @@ impl Descriptor {
                 st_blocks: 0,
                 ..Default::default()
             },
+            Descriptor::Signalfd { .. } => FileStat {
+                // Signalfd is read-only
+                st_dev: 0,
+                st_ino: 0,
+                st_nlink: 1,
+                st_mode: Mode::RUSR.bits().truncate(),
+                st_uid: 0,
+                st_gid: 0,
+                st_rdev: 0,
+                st_size: 0,
+                st_blksize: 4096,
+                st_blocks: 0,
+                ..Default::default()
+            },
         };
         Ok(fstat)
     }
@@ -822,7 +880,8 @@ impl Descriptor {
             ),
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => Ok(
+            | Descriptor::Unix { close_on_exec, .. }
+            | Descriptor::Signalfd { close_on_exec, .. } => Ok(
                 if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                     FileDescriptorFlags::FD_CLOEXEC
                 } else {
@@ -857,7 +916,8 @@ impl Descriptor {
             )?,
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => {
+            | Descriptor::Unix { close_on_exec, .. }
+            | Descriptor::Signalfd { close_on_exec, .. } => {
                 close_on_exec.store(
                     flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                     core::sync::atomic::Ordering::Relaxed,
@@ -1002,6 +1062,7 @@ impl Task {
                 Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Unix { file, .. } => Ok(file.get_status().bits()),
+                Descriptor::Signalfd { file, .. } => Ok(file.get_status().bits()),
             },
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
@@ -1081,6 +1142,9 @@ impl Task {
                     }
                     Descriptor::Epoll { .. } => todo!(),
                     Descriptor::Unix { file, .. } => {
+                        toggle_flags!(file);
+                    }
+                    Descriptor::Signalfd { file, .. } => {
                         toggle_flags!(file);
                     }
                 }
@@ -1253,6 +1317,68 @@ impl Task {
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 
+    /// Handle the `signalfd4` syscall.
+    ///
+    /// If `fd` is -1, creates a new signalfd. Otherwise, updates the signal mask
+    /// of an existing signalfd.
+    ///
+    /// See `signalfd(2)` for details.
+    pub fn sys_signalfd4(
+        &self,
+        fd: i32,
+        mut mask: SigSet,
+        sizemask: usize,
+        flags: SfdFlags,
+    ) -> Result<i32, Errno> {
+        // Validate sizemask
+        if sizemask != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+
+        // Validate flags (only CLOEXEC and NONBLOCK are allowed)
+        if flags.contains((SfdFlags::CLOEXEC | SfdFlags::NONBLOCK).complement()) {
+            return Err(Errno::EINVAL);
+        }
+
+        // SIGKILL and SIGSTOP cannot be monitored via signalfd
+        mask.remove(Signal::SIGKILL);
+        mask.remove(Signal::SIGSTOP);
+
+        if fd == -1 {
+            // Create a new signalfd
+            let signalfd = super::signalfd::SignalFile::new(mask, flags);
+            let files = self.files.borrow();
+            files
+                .file_descriptors
+                .write()
+                .insert(
+                    self,
+                    Descriptor::Signalfd {
+                        file: alloc::sync::Arc::new(signalfd),
+                        close_on_exec: core::sync::atomic::AtomicBool::new(
+                            flags.contains(SfdFlags::CLOEXEC),
+                        ),
+                    },
+                )
+                .map(|fd| i32::try_from(fd).expect("fd should fit in i32"))
+                .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
+        } else {
+            // Update an existing signalfd
+            let fd_u32 = u32::try_from(fd).map_err(|_| Errno::EBADF)?;
+            let files = self.files.borrow();
+            let file_table = files.file_descriptors.read();
+            let desc = file_table.get_fd(fd_u32).ok_or(Errno::EBADF)?;
+
+            match desc {
+                Descriptor::Signalfd { file, .. } => {
+                    file.update_mask(mask);
+                    Ok(fd)
+                }
+                _ => Err(Errno::EINVAL), // fd is not a signalfd
+            }
+        }
+    }
+
     fn stdio_ioctl(
         &self,
         arg: &IoctlArg<litebox_platform_multiplex::Platform>,
@@ -1363,6 +1489,9 @@ impl Task {
                     Descriptor::Unix { file, .. } => {
                         file.set_status(OFlags::NONBLOCK, val != 0);
                     }
+                    Descriptor::Signalfd { file, .. } => {
+                        file.set_status(OFlags::NONBLOCK, val != 0);
+                    }
                 }
                 Ok(0)
             }
@@ -1382,7 +1511,8 @@ impl Task {
                 )?,
                 Descriptor::Eventfd { close_on_exec, .. }
                 | Descriptor::Epoll { close_on_exec, .. }
-                | Descriptor::Unix { close_on_exec, .. } => {
+                | Descriptor::Unix { close_on_exec, .. }
+                | Descriptor::Signalfd { close_on_exec, .. } => {
                     close_on_exec.store(true, core::sync::atomic::Ordering::Relaxed);
                     Ok(0)
                 }
@@ -1403,9 +1533,10 @@ impl Task {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                 )?,
-                Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                    Err(Errno::ENOTTY)
-                }
+                Descriptor::Eventfd { .. }
+                | Descriptor::Epoll { .. }
+                | Descriptor::Unix { .. }
+                | Descriptor::Signalfd { .. } => Err(Errno::ENOTTY),
             },
             _ => {
                 #[cfg(debug_assertions)]
@@ -1766,6 +1897,10 @@ impl Task {
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
             }),
             Descriptor::Unix { file, .. } => Ok(Descriptor::Unix {
+                file: file.clone(),
+                close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+            }),
+            Descriptor::Signalfd { file, .. } => Ok(Descriptor::Signalfd {
                 file: file.clone(),
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
             }),

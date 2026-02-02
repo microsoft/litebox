@@ -584,3 +584,83 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+#[test]
+fn test_signalfd_create() {
+    use litebox_common_linux::{
+        SfdFlags,
+        signal::{SigSet, Signal},
+    };
+
+    let task = init_platform(None);
+
+    // Create a signalfd
+    let mask = SigSet::empty().with(Signal::SIGUSR1).with(Signal::SIGUSR2);
+    let fd = task
+        .sys_signalfd4(-1, mask, core::mem::size_of::<SigSet>(), SfdFlags::CLOEXEC)
+        .expect("Failed to create signalfd");
+    assert!(fd >= 0);
+
+    // Check that we can get the status flags
+    let flags = task.sys_fcntl(fd, FcntlArg::GETFD).unwrap();
+    assert_eq!(flags, FileDescriptorFlags::FD_CLOEXEC.bits());
+}
+
+#[test]
+fn test_signalfd_update_mask() {
+    use litebox_common_linux::{
+        SfdFlags,
+        signal::{SigSet, Signal},
+    };
+
+    let task = init_platform(None);
+
+    // Create a signalfd
+    let mask1 = SigSet::empty().with(Signal::SIGUSR1);
+    let fd = task
+        .sys_signalfd4(-1, mask1, core::mem::size_of::<SigSet>(), SfdFlags::empty())
+        .expect("Failed to create signalfd");
+
+    // Update the mask using the same fd
+    let mask2 = SigSet::empty().with(Signal::SIGUSR2);
+    let fd2 = task
+        .sys_signalfd4(fd, mask2, core::mem::size_of::<SigSet>(), SfdFlags::empty())
+        .expect("Failed to update signalfd mask");
+    assert_eq!(fd, fd2);
+}
+
+#[test]
+fn test_signalfd_invalid_sizemask() {
+    use litebox_common_linux::{
+        SfdFlags,
+        signal::{SigSet, Signal},
+    };
+
+    let task = init_platform(None);
+
+    let mask = SigSet::empty().with(Signal::SIGUSR1);
+    // Use wrong sizemask
+    let result = task.sys_signalfd4(-1, mask, 0, SfdFlags::empty());
+    assert_eq!(result, Err(Errno::EINVAL));
+}
+
+#[test]
+fn test_signalfd_nonblock_read_eagain() {
+    use litebox_common_linux::{
+        SfdFlags,
+        signal::{SigSet, Signal},
+    };
+
+    let task = init_platform(None);
+
+    // Create a non-blocking signalfd
+    let mask = SigSet::empty().with(Signal::SIGUSR1);
+    let fd = task
+        .sys_signalfd4(-1, mask, core::mem::size_of::<SigSet>(), SfdFlags::NONBLOCK)
+        .expect("Failed to create signalfd");
+
+    // Try to read - should return EAGAIN since no signals are pending
+    let mut buf = [0u8; 128];
+    let result = task.sys_read(fd, &mut buf, None);
+    assert_eq!(result, Err(Errno::EAGAIN));
+}

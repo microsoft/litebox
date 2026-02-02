@@ -656,4 +656,31 @@ impl Task {
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
     }
+
+    /// Read pending signals that match the given mask for signalfd.
+    ///
+    /// This consumes signals from the pending queue, converting them to
+    /// `SignalfdSiginfo` structures.
+    pub(crate) fn read_signals_for_signalfd(
+        &self,
+        mask: SigSet,
+    ) -> alloc::vec::Vec<litebox_common_linux::SignalfdSiginfo> {
+        let mut result = alloc::vec::Vec::new();
+        let mut pending = self.signals.pending.borrow_mut();
+
+        // Find signals that are both pending and in the signalfd mask
+        // Re-compute on each iteration since we're removing signals
+        loop {
+            let readable_signals = pending.pending & mask;
+            let Some(signal) = readable_signals.lowest_set() else {
+                break;
+            };
+
+            let siginfo = pending.remove(signal);
+            let sigfd_info = super::signalfd::siginfo_to_signalfd_siginfo(&siginfo, signal);
+            result.push(sigfd_info);
+        }
+
+        result
+    }
 }

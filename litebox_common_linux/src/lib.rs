@@ -14,7 +14,7 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, TruncateExt},
 };
 use syscalls::Sysno;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::signal::SigSet;
 
@@ -562,6 +562,73 @@ bitflags::bitflags! {
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
+}
+
+// Constants for SfdFlags to avoid clippy warnings in bitflags macro
+const SFD_CLOEXEC: i32 = 0o2000000; // O_CLOEXEC = 0x80000
+const SFD_NONBLOCK: i32 = 0o4000; // O_NONBLOCK = 0x800
+
+bitflags::bitflags! {
+    /// Flags for the `signalfd4` syscall.
+    #[derive(Debug, Clone, Copy)]
+    pub struct SfdFlags: core::ffi::c_int {
+        const CLOEXEC = SFD_CLOEXEC;
+        const NONBLOCK = SFD_NONBLOCK;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+/// The structure returned when reading from a signalfd file descriptor.
+///
+/// This struct is exactly 128 bytes to maintain ABI compatibility with Linux.
+/// See `signalfd(2)` and `<linux/signalfd.h>`.
+#[repr(C)]
+#[derive(Debug, Clone, Default, FromBytes, IntoBytes, Immutable)]
+pub struct SignalfdSiginfo {
+    /// Signal number.
+    pub ssi_signo: u32,
+    /// Error number (unused, always 0).
+    pub ssi_errno: i32,
+    /// Signal code.
+    pub ssi_code: i32,
+    /// Sender's PID.
+    pub ssi_pid: u32,
+    /// Sender's UID.
+    pub ssi_uid: u32,
+    /// File descriptor (for SIGIO).
+    pub ssi_fd: i32,
+    /// Kernel timer ID.
+    pub ssi_tid: u32,
+    /// Band event (for SIGIO).
+    pub ssi_band: u32,
+    /// POSIX timer overrun count.
+    pub ssi_overrun: u32,
+    /// Trap number that caused the signal.
+    pub ssi_trapno: u32,
+    /// Exit status or signal (for SIGCHLD).
+    pub ssi_status: i32,
+    /// Integer sent via `sigqueue(3)`.
+    pub ssi_int: i32,
+    /// Pointer sent via `sigqueue(3)`.
+    pub ssi_ptr: u64,
+    /// User CPU time consumed (for SIGCHLD).
+    pub ssi_utime: u64,
+    /// System CPU time consumed (for SIGCHLD).
+    pub ssi_stime: u64,
+    /// Address that generated signal (for hardware-generated signals).
+    pub ssi_addr: u64,
+    /// Least significant bit of address (for SIGBUS).
+    pub ssi_addr_lsb: u16,
+    __pad2: u16,
+    /// Syscall number (for SIGSYS).
+    pub ssi_syscall: i32,
+    /// Syscall address (for SIGSYS).
+    pub ssi_call_addr: u64,
+    /// Architecture (for SIGSYS).
+    pub ssi_arch: u32,
+    /// Padding to 128 bytes.
+    __pad: [u8; 28],
 }
 
 type cc_t = ::core::ffi::c_uchar;
@@ -1931,6 +1998,20 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         ss: Option<Platform::RawConstPointer<signal::SigAltStack>>,
         old_ss: Option<Platform::RawMutPointer<signal::SigAltStack>>,
     },
+    /// Create or modify a signalfd for receiving signals via a file descriptor.
+    ///
+    /// If `fd` is -1, creates a new signalfd. Otherwise, modifies the signal mask
+    /// of an existing signalfd.
+    Signalfd4 {
+        /// File descriptor: -1 to create new, or existing signalfd to modify.
+        fd: i32,
+        /// Pointer to the signal mask to monitor.
+        mask: Platform::RawConstPointer<SigSet>,
+        /// Size of the signal mask (must equal `size_of::<SigSet>()`).
+        sizemask: usize,
+        /// Flags: `SFD_CLOEXEC` and/or `SFD_NONBLOCK`.
+        flags: SfdFlags,
+    },
     Ioctl {
         fd: i32,
         arg: IoctlArg<Platform>,
@@ -2401,6 +2482,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::tkill => sys_req!(Tkill { tid, sig }),
             Sysno::tgkill => sys_req!(Tgkill { tgid, tid, sig }),
             Sysno::sigaltstack => sys_req!(Sigaltstack { ss:*, old_ss:* }),
+            Sysno::signalfd => SyscallRequest::Signalfd4 {
+                fd: ctx.sys_req_arg(0),
+                mask: ctx.sys_req_ptr(1),
+                sizemask: core::mem::size_of::<SigSet>(),
+                flags: SfdFlags::empty(),
+            },
+            Sysno::signalfd4 => sys_req!(Signalfd4 { fd, mask:*, sizemask, flags }),
             Sysno::ioctl => SyscallRequest::Ioctl {
                 fd: ctx.sys_req_arg(0),
                 arg: {
@@ -3182,6 +3270,7 @@ reinterpret_truncated_from_usize_for! {
         ReceiveFlags,
         EpollCreateFlags,
         EfdFlags,
+        SfdFlags,
         RngFlags,
         TimerFlags,
     ],

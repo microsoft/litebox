@@ -481,6 +481,10 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::unix::UnixSocket>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
+    Signalfd {
+        file: alloc::sync::Arc<syscalls::signalfd::SignalFile<Platform>>,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
 }
 
 /// A strongly-typed FD.
@@ -1023,6 +1027,16 @@ impl Task {
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
+            SyscallRequest::Signalfd4 {
+                fd,
+                mask,
+                sizemask,
+                flags,
+            } => mask
+                .read_at_offset(0)
+                .ok_or(Errno::EFAULT)
+                .and_then(|mask| self.sys_signalfd4(fd, mask, sizemask, flags))
+                .map(|fd| usize::try_from(fd).expect("fd should be non-negative")),
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                     pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT)?;
