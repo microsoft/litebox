@@ -342,9 +342,9 @@ pub struct SyscallN<const N: usize, const ID: u32> {
 #[repr(C, align(4096))]
 struct PageAlignedBuffer([u8; 4096]);
 
-/// Maximum file size that can be loaded (2MB)
+/// Maximum file size that can be loaded (4MB)
 /// This is limited by the maximum contiguous memory allocation size.
-const MAX_FILE_SIZE: usize = 2 * 1024 * 1024;
+const MAX_FILE_SIZE: usize = (PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER) as usize;
 
 impl HostSnpInterface {
     #[cfg(debug_assertions)]
@@ -365,6 +365,8 @@ impl HostSnpInterface {
     }
 
     /// Load a file from host by path
+    /// 
+    /// Note that the maximum file size is limited to 4MB.
     pub fn load_file_from_host(path: &str) -> Result<Vec<u8>, litebox_common_linux::errno::Errno> {
         use crate::alloc::string::ToString;
 
