@@ -633,7 +633,7 @@ bitflags::bitflags! {
 
 bitflags::bitflags! {
     /// Flags for the `msync` syscall.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug)]
     pub struct MsyncFlags: i32 {
         /// Schedule the write and return immediately.
         const MS_ASYNC = 1;

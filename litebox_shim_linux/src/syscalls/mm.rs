@@ -499,6 +499,16 @@ mod tests {
             .is_ok()
         );
 
+        // msync with MS_ASYNC | MS_INVALIDATE should succeed
+        assert!(
+            task.sys_msync(
+                addr,
+                0x2000,
+                MsyncFlags::MS_ASYNC | MsyncFlags::MS_INVALIDATE
+            )
+            .is_ok()
+        );
+
         // Zero length should succeed
         assert!(task.sys_msync(addr, 0, MsyncFlags::MS_SYNC).is_ok());
 
@@ -525,6 +535,12 @@ mod tests {
         // MS_ASYNC and MS_SYNC together should fail with EINVAL
         assert_eq!(
             task.sys_msync(addr, 0x2000, MsyncFlags::MS_ASYNC | MsyncFlags::MS_SYNC),
+            Err(Errno::EINVAL)
+        );
+
+        // Invalid flag bits (bit 3 = value 8 is not defined) should fail with EINVAL
+        assert_eq!(
+            task.sys_msync(addr, 0x2000, MsyncFlags::from_bits_truncate(8)),
             Err(Errno::EINVAL)
         );
 
