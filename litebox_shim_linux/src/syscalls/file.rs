@@ -1474,6 +1474,10 @@ impl Task {
     }
 
     /// Handle syscall `epoll_pwait`
+    ///
+    /// Waits for events on an epoll file descriptor with an optional signal mask.
+    /// The timeout is specified in milliseconds. A negative timeout means infinite wait,
+    /// zero means return immediately, and positive values are the maximum wait time.
     pub fn sys_epoll_pwait(
         &self,
         epfd: i32,
@@ -1553,6 +1557,16 @@ impl Task {
         sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
+        // Read and validate timeout if provided (Linux validates timeout before sigmask)
+        let timeout_duration = if let Some(ts_ptr) = timeout {
+            let ts = ts_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            // Convert Timespec to Duration, validating the values
+            Some(core::time::Duration::try_from(ts)?)
+        } else {
+            // NULL timeout means infinite wait
+            None
+        };
+
         // Read and validate sigmask if provided
         let new_mask = if let Some(sigmask_ptr) = sigmask {
             if sigsetsize != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
@@ -1560,16 +1574,6 @@ impl Task {
             }
             Some(sigmask_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
         } else {
-            None
-        };
-
-        // Read and validate timeout if provided
-        let timeout_duration = if let Some(ts_ptr) = timeout {
-            let ts = ts_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-            // Convert Timespec to Duration, validating the values
-            Some(core::time::Duration::try_from(ts)?)
-        } else {
-            // NULL timeout means infinite wait
             None
         };
 
