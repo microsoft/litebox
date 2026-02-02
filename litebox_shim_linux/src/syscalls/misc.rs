@@ -56,11 +56,10 @@ const fn to_fixed_size_array<const N: usize>(s: &str) -> [u8; N] {
     arr
 }
 
-/// Convert a string slice to a fixed-size array of bytes at runtime.
+/// Convert a byte slice to a fixed-size array at runtime.
 ///
-/// Similar to `to_fixed_size_array` but works at runtime for dynamic strings.
-fn str_to_fixed_array<const N: usize>(s: &str) -> [u8; N] {
-    let bytes = s.as_bytes();
+/// Copies bytes into the array and zero-fills the rest.
+fn bytes_to_fixed_array<const N: usize>(bytes: &[u8]) -> [u8; N] {
     let mut arr = [0u8; N];
     let len = bytes.len().min(N - 1);
     arr[..len].copy_from_slice(&bytes[..len]);
@@ -87,7 +86,7 @@ impl Task {
     ) -> Result<(), Errno> {
         let mut utsname = SYS_INFO_BASE;
         let hostname = self.global.hostname.read();
-        utsname.nodename = str_to_fixed_array::<65>(hostname.as_str());
+        utsname.nodename = bytes_to_fixed_array::<65>(&hostname);
         buf.write_at_offset(0, utsname).ok_or(Errno::EFAULT)
     }
 
@@ -122,29 +121,34 @@ impl Task {
     ///
     /// Sets the system hostname. In LiteBox, no permission check is performed
     /// (any user can change the hostname in the sandbox).
+    ///
+    /// The hostname is stored as raw bytes (not UTF-8) to match Linux kernel
+    /// behavior which accepts arbitrary bytes up to 64 bytes.
     pub(crate) fn sys_sethostname(
         &self,
         name: crate::ConstPtr<u8>,
-        len: usize,
+        len: isize,
     ) -> Result<(), Errno> {
         // Linux HOST_NAME_MAX is 64 (not including null terminator)
-        const HOST_NAME_MAX: usize = 64;
+        const HOST_NAME_MAX: isize = 64;
 
-        if len > HOST_NAME_MAX {
+        // Check for negative length (Linux kernel does this check)
+        if !(0..=HOST_NAME_MAX).contains(&len) {
             return Err(Errno::EINVAL);
         }
 
-        // Read the hostname from user space
-        let buf = name.to_owned_slice(len).ok_or(Errno::EFAULT)?;
+        // SAFETY: We've validated that len is in range 0..=64, so the cast is safe
+        #[allow(clippy::cast_sign_loss)]
+        let len = len as usize;
 
-        // Convert to string and validate UTF-8
-        let hostname_str = core::str::from_utf8(&buf).map_err(|_| Errno::EINVAL)?;
+        // Read the hostname from user space (raw bytes, no UTF-8 validation)
+        let buf = name.to_owned_slice(len).ok_or(Errno::EFAULT)?;
 
         // Update the global hostname
         let mut hostname = self.global.hostname.write();
         hostname.clear();
         hostname
-            .try_push_str(hostname_str)
+            .try_extend_from_slice(&buf)
             .map_err(|_| Errno::EINVAL)?;
 
         Ok(())
@@ -212,6 +216,7 @@ impl Task {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_wrap)]
 mod tests {
     use core::mem::MaybeUninit;
 
@@ -265,7 +270,7 @@ mod tests {
         // Set a new hostname
         let new_hostname = b"myhost";
         let name_ptr = crate::ConstPtr::from_ptr(new_hostname.as_ptr());
-        task.sys_sethostname(name_ptr, new_hostname.len())
+        task.sys_sethostname(name_ptr, new_hostname.len() as isize)
             .expect("sethostname failed");
 
         // Verify the hostname was changed via uname
@@ -288,7 +293,7 @@ mod tests {
         // Set hostname at max length (64 bytes)
         let max_hostname = [b'a'; 64];
         let name_ptr = crate::ConstPtr::from_ptr(max_hostname.as_ptr());
-        task.sys_sethostname(name_ptr, max_hostname.len())
+        task.sys_sethostname(name_ptr, max_hostname.len() as isize)
             .expect("sethostname with max length should succeed");
 
         // Verify via uname
@@ -314,9 +319,27 @@ mod tests {
         // Try to set hostname longer than max (65 bytes)
         let too_long_hostname = [b'a'; 65];
         let name_ptr = crate::ConstPtr::from_ptr(too_long_hostname.as_ptr());
-        let result = task.sys_sethostname(name_ptr, too_long_hostname.len());
+        let result = task.sys_sethostname(name_ptr, too_long_hostname.len() as isize);
 
         assert_eq!(result, Err(Errno::EINVAL), "should fail with EINVAL");
+    }
+
+    #[test]
+    fn test_sethostname_negative_length() {
+        use litebox_common_linux::errno::Errno;
+
+        let task = init_platform(None);
+
+        // Try to set hostname with negative length (matches Linux kernel behavior)
+        let hostname = b"test";
+        let name_ptr = crate::ConstPtr::from_ptr(hostname.as_ptr());
+        let result = task.sys_sethostname(name_ptr, -1);
+
+        assert_eq!(
+            result,
+            Err(Errno::EINVAL),
+            "negative length should fail with EINVAL"
+        );
     }
 
     #[test]
@@ -336,5 +359,30 @@ mod tests {
         let utsname = unsafe { utsname.assume_init() };
 
         assert_eq!(utsname.nodename[0], 0, "hostname should be empty");
+    }
+
+    #[test]
+    fn test_sethostname_non_utf8() {
+        // Linux kernel accepts arbitrary bytes, not just UTF-8
+        let task = init_platform(None);
+
+        // Set hostname with non-UTF-8 bytes (invalid UTF-8 sequence)
+        let non_utf8_hostname: [u8; 4] = [0xFF, 0xFE, 0x80, 0x81];
+        let name_ptr = crate::ConstPtr::from_ptr(non_utf8_hostname.as_ptr());
+        task.sys_sethostname(name_ptr, non_utf8_hostname.len() as isize)
+            .expect("sethostname with non-UTF-8 bytes should succeed");
+
+        // Verify via uname
+        let mut utsname = MaybeUninit::<litebox_common_linux::Utsname>::uninit();
+        let ptr = crate::MutPtr::from_ptr(utsname.as_mut_ptr());
+        task.sys_uname(ptr).expect("uname failed");
+        let utsname = unsafe { utsname.assume_init() };
+
+        assert_eq!(
+            &utsname.nodename[..4],
+            &non_utf8_hostname,
+            "hostname should contain the non-UTF-8 bytes"
+        );
+        assert_eq!(utsname.nodename[4], 0, "should have null terminator");
     }
 }

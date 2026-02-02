@@ -196,7 +196,11 @@ impl LinuxShimBuilder {
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
-            hostname: litebox::sync::RwLock::new(arrayvec::ArrayString::from("litebox").unwrap()),
+            hostname: litebox::sync::RwLock::new({
+                let mut v = arrayvec::ArrayVec::new();
+                v.try_extend_from_slice(b"litebox").unwrap();
+                v
+            }),
         });
         LinuxShim(global)
     }
@@ -1165,8 +1169,9 @@ struct GlobalState {
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable>,
-    /// System hostname (used by uname and sethostname)
-    hostname: litebox::sync::RwLock<Platform, arrayvec::ArrayString<65>>,
+    /// System hostname (used by uname and sethostname). Stored as raw bytes
+    /// (not UTF-8) to match Linux kernel behavior which accepts arbitrary bytes.
+    hostname: litebox::sync::RwLock<Platform, arrayvec::ArrayVec<u8, 65>>,
 }
 
 struct Task {

@@ -2057,7 +2057,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     SetHostname {
         name: Platform::RawConstPointer<u8>,
-        len: usize,
+        len: isize,
     },
     Fcntl {
         fd: i32,
