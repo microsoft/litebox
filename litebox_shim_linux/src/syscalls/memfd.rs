@@ -20,6 +20,9 @@ use litebox::{
 };
 use litebox_common_linux::{MfdFlags, errno::Errno};
 
+/// Maximum size limit for memfd files (1 GiB) to prevent DoS via unbounded memory allocation.
+pub const MAX_MEMFD_SIZE: usize = 1 << 30;
+
 /// An anonymous memory-backed file.
 pub(crate) struct MemfdFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// The name for debugging (shown in /proc/self/fd/).
@@ -78,12 +81,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> MemfdFile<Platform> {
     }
 
     /// Write data to the file at the specified offset.
-    #[expect(clippy::unnecessary_wraps)]
     pub(crate) fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize, Errno> {
-        let mut data = self.data.lock();
+        // Check for overflow and enforce size limit
+        let required_len = offset.checked_add(buf.len()).ok_or(Errno::EFBIG)?;
+        if required_len > MAX_MEMFD_SIZE {
+            return Err(Errno::EFBIG);
+        }
 
+        let mut data = self.data.lock();
         // Extend the file if necessary
-        let required_len = offset.saturating_add(buf.len());
         if required_len > data.len() {
             data.resize(required_len, 0);
         }
@@ -101,8 +107,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> MemfdFile<Platform> {
     }
 
     /// Truncate or extend the file to the specified length.
-    #[expect(clippy::unnecessary_wraps)]
     pub(crate) fn truncate(&self, length: usize) -> Result<(), Errno> {
+        if length > MAX_MEMFD_SIZE {
+            return Err(Errno::EFBIG);
+        }
         let mut data = self.data.lock();
         data.resize(length, 0);
         drop(data);
@@ -245,5 +253,27 @@ mod tests {
         let memfd_seal: super::MemfdFile<Platform> =
             super::MemfdFile::new("seal".into(), MfdFlags::ALLOW_SEALING);
         assert!(memfd_seal.allow_sealing());
+    }
+
+    #[test]
+    fn test_memfd_size_limit() {
+        let _task = crate::syscalls::tests::init_platform(None);
+
+        let memfd = alloc::sync::Arc::new(super::MemfdFile::<Platform>::new(
+            "limit".into(),
+            MfdFlags::empty(),
+        ));
+
+        // Write at an offset that would exceed MAX_MEMFD_SIZE should fail
+        let result = memfd.write_at(super::MAX_MEMFD_SIZE, b"overflow");
+        assert_eq!(result, Err(litebox_common_linux::errno::Errno::EFBIG));
+
+        // Truncate beyond MAX_MEMFD_SIZE should fail
+        let result = memfd.truncate(super::MAX_MEMFD_SIZE + 1);
+        assert_eq!(result, Err(litebox_common_linux::errno::Errno::EFBIG));
+
+        // Write at exactly MAX_MEMFD_SIZE - 1 with 1 byte should succeed
+        // (boundary test: offset 1073741823 + 1 byte = exactly 1 GiB)
+        // Skip this test as it would allocate 1 GiB of memory
     }
 }

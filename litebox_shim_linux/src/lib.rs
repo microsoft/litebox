@@ -485,7 +485,9 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::memfd::MemfdFile<Platform>>,
         close_on_exec: core::sync::atomic::AtomicBool,
         /// Current file position for read/write operations.
-        position: core::sync::atomic::AtomicUsize,
+        /// Shared via Arc so that dup'd file descriptors share the same position
+        /// per POSIX semantics.
+        position: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
     },
 }
 

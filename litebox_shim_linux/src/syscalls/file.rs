@@ -296,16 +296,20 @@ impl Task {
             ),
             Descriptor::Memfd { file, position, .. } => {
                 let file = file.clone();
-                let cur_pos = position.load(Ordering::Relaxed);
+                let position = position.clone();
                 drop(file_table);
-                let pos = offset.unwrap_or(cur_pos);
+                // If offset is provided (pread), use it directly without updating position
+                // Otherwise, atomically fetch-and-add the position for the read
+                let pos = if let Some(off) = offset {
+                    off
+                } else {
+                    // Use SeqCst for visibility across threads
+                    position.load(Ordering::SeqCst)
+                };
                 let bytes_read = file.read_at(pos, buf)?;
                 if offset.is_none() {
-                    // Re-acquire the lock to update position
-                    let file_table = files.file_descriptors.read();
-                    if let Some(Descriptor::Memfd { position, .. }) = file_table.get_fd(fd) {
-                        position.fetch_add(bytes_read, Ordering::Relaxed);
-                    }
+                    // Update position using SeqCst ordering
+                    position.fetch_add(bytes_read, Ordering::SeqCst);
                 }
                 Ok(bytes_read)
             }
@@ -365,16 +369,20 @@ impl Task {
             }
             Descriptor::Memfd { file, position, .. } => {
                 let file = file.clone();
-                let cur_pos = position.load(Ordering::Relaxed);
+                let position = position.clone();
                 drop(file_table);
-                let pos = offset.unwrap_or(cur_pos);
+                // If offset is provided (pwrite), use it directly without updating position
+                // Otherwise, atomically fetch-and-add the position for the write
+                let pos = if let Some(off) = offset {
+                    off
+                } else {
+                    // Use SeqCst for visibility across threads
+                    position.load(Ordering::SeqCst)
+                };
                 let bytes_written = file.write_at(pos, buf)?;
                 if offset.is_none() {
-                    // Re-acquire the lock to update position
-                    let file_table = files.file_descriptors.read();
-                    if let Some(Descriptor::Memfd { position, .. }) = file_table.get_fd(fd) {
-                        position.fetch_add(bytes_written, Ordering::Relaxed);
-                    }
+                    // Update position using SeqCst ordering
+                    position.fetch_add(bytes_written, Ordering::SeqCst);
                 }
                 Ok(bytes_written)
             }
@@ -433,7 +441,7 @@ impl Task {
                 Err(Errno::ESPIPE)
             }
             Descriptor::Memfd { file, position, .. } => {
-                let cur_pos = position.load(Ordering::Relaxed);
+                let cur_pos = position.load(Ordering::SeqCst);
                 let file_size = file.size();
                 let new_pos = match whence {
                     SeekWhence::RelativeToBeginning => {
@@ -466,7 +474,7 @@ impl Task {
                         }
                     }
                 };
-                position.store(new_pos, Ordering::Relaxed);
+                position.store(new_pos, Ordering::SeqCst);
                 Ok(new_pos)
             }
         }
@@ -874,10 +882,8 @@ impl Descriptor {
                     st_dev: 0,
                     st_ino: 0,
                     st_nlink: 1,
-                    // Regular file with rw permissions
-                    st_mode: (litebox_common_linux::InodeType::File as u32
-                        | (Mode::RUSR | Mode::WUSR).bits())
-                    .truncate(),
+                    // Regular file with rwxrwxrwx permissions (Linux memfd returns 0777)
+                    st_mode: (litebox_common_linux::InodeType::File as u32 | 0o777).truncate(),
                     st_uid: 0,
                     st_gid: 0,
                     st_rdev: 0,
@@ -1400,7 +1406,8 @@ impl Task {
                     close_on_exec: core::sync::atomic::AtomicBool::new(
                         flags.contains(MfdFlags::CLOEXEC),
                     ),
-                    position: core::sync::atomic::AtomicUsize::new(0),
+                    // Position is Arc-wrapped so that dup'd FDs share the same offset
+                    position: alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0)),
                 },
             )
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
@@ -1930,9 +1937,8 @@ impl Task {
             Descriptor::Memfd { file, position, .. } => Ok(Descriptor::Memfd {
                 file: file.clone(),
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
-                position: core::sync::atomic::AtomicUsize::new(
-                    position.load(core::sync::atomic::Ordering::Relaxed),
-                ),
+                // Share the same Arc<AtomicUsize> so dup'd FDs share file position per POSIX
+                position: position.clone(),
             }),
         }
     }
