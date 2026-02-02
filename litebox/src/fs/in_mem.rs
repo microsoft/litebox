@@ -456,24 +456,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         offset: i64,
         len: i64,
     ) -> Result<(), FallocateError> {
+        // Maximum file size limit to prevent memory exhaustion
+        // This limit is arbitrary but reasonable for an in-memory filesystem
+        const MAX_FILE_SIZE: usize = isize::MAX as usize;
+
         // Validate offset and len (should be non-negative, len > 0)
         if offset < 0 || len <= 0 {
             return Err(FallocateError::InvalidRange);
         }
 
-        // Safe to cast since we validated offset >= 0 and len > 0
-        #[expect(
-            clippy::cast_sign_loss,
-            clippy::cast_possible_truncation,
-            reason = "offset and len validated to be non-negative above"
-        )]
-        let offset = offset as usize;
-        #[expect(
-            clippy::cast_sign_loss,
-            clippy::cast_possible_truncation,
-            reason = "offset and len validated to be non-negative above"
-        )]
-        let len = len as usize;
+        // Use try_from for safe conversion that fails on 32-bit if values are too large
+        let offset = usize::try_from(offset).map_err(|_| FallocateError::InvalidRange)?;
+        let len = usize::try_from(len).map_err(|_| FallocateError::InvalidRange)?;
+
+        // Check for reasonable file size limit to prevent memory exhaustion
+        let end_offset = offset
+            .checked_add(len)
+            .ok_or(FallocateError::InvalidRange)?;
+        if end_offset > MAX_FILE_SIZE {
+            return Err(FallocateError::InvalidRange);
+        }
 
         let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
@@ -494,9 +496,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
         let mut file_data = file.write();
         let current_size = file_data.data.len();
-        let end_offset = offset
-            .checked_add(len)
-            .ok_or(FallocateError::InvalidRange)?;
 
         match mode {
             FallocMode::Allocate => {
@@ -505,7 +504,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     file_data.data.to_mut().resize(end_offset, 0);
                 }
             }
-            FallocMode::AllocateKeepSize | FallocMode::AllocateUnshareRange => {
+            FallocMode::AllocateKeepSize
+            | FallocMode::AllocateUnshareRange
+            | FallocMode::AllocateUnshareRangeKeepSize => {
                 // For in-memory filesystem, these are no-ops since we don't have
                 // actual disk blocks to allocate or COW semantics
             }
@@ -535,10 +536,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             FallocMode::CollapseRange => {
                 // Remove the range and shift data down
-                if offset >= current_size {
-                    return Err(FallocateError::InvalidRange);
-                }
-                if end_offset > current_size {
+                // Per Linux man page: error if offset+len "reaches or passes" EOF
+                if offset >= current_size || end_offset >= current_size {
                     return Err(FallocateError::InvalidRange);
                 }
                 let data = file_data.data.to_mut();
@@ -546,7 +545,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             FallocMode::InsertRange => {
                 // Insert zeros and shift data up
-                if offset > current_size {
+                // Per Linux man page: error if offset is "equal to or greater than" EOF
+                if offset >= current_size {
                     return Err(FallocateError::InvalidRange);
                 }
                 let data = file_data.data.to_mut();

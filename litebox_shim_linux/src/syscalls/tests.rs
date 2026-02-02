@@ -914,3 +914,136 @@ fn test_fallocate_read_only_file() {
     // Clean up
     task.sys_close(fd).expect("close should succeed");
 }
+
+#[test]
+fn test_fallocate_collapse_range_boundary() {
+    let task = init_platform(None);
+
+    // Create a test file with content
+    let fd = task
+        .sys_open(
+            "/fallocate_collapse_boundary.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Write exactly 30 bytes
+    let data = b"012345678901234567890123456789";
+    task.sys_write(fd, data, None)
+        .expect("write should succeed");
+
+    // Per Linux man page: collapse should fail if offset+len "reaches or passes" EOF
+    // Test: collapsing exactly to EOF should fail
+    let result = task.sys_fallocate(fd, FallocateMode::COLLAPSE_RANGE, 20, 10);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "COLLAPSE_RANGE reaching exactly EOF should return EINVAL"
+    );
+
+    // Test: collapsing past EOF should also fail
+    let result = task.sys_fallocate(fd, FallocateMode::COLLAPSE_RANGE, 20, 20);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "COLLAPSE_RANGE past EOF should return EINVAL"
+    );
+
+    // Test: collapsing that doesn't reach EOF should succeed
+    let result = task.sys_fallocate(fd, FallocateMode::COLLAPSE_RANGE, 10, 5);
+    assert!(
+        result.is_ok(),
+        "COLLAPSE_RANGE not reaching EOF should succeed"
+    );
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
+}
+
+#[test]
+fn test_fallocate_insert_range_boundary() {
+    let task = init_platform(None);
+
+    // Create a test file with content
+    let fd = task
+        .sys_open(
+            "/fallocate_insert_boundary.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Write exactly 20 bytes
+    let data = b"01234567890123456789";
+    task.sys_write(fd, data, None)
+        .expect("write should succeed");
+
+    // Per Linux man page: insert should fail if offset is "equal to or greater than" EOF
+    // Test: inserting exactly at EOF should fail
+    let result = task.sys_fallocate(fd, FallocateMode::INSERT_RANGE, 20, 5);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "INSERT_RANGE at exactly EOF should return EINVAL"
+    );
+
+    // Test: inserting past EOF should also fail
+    let result = task.sys_fallocate(fd, FallocateMode::INSERT_RANGE, 30, 5);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "INSERT_RANGE past EOF should return EINVAL"
+    );
+
+    // Test: inserting before EOF should succeed
+    let result = task.sys_fallocate(fd, FallocateMode::INSERT_RANGE, 10, 5);
+    assert!(result.is_ok(), "INSERT_RANGE before EOF should succeed");
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
+}
+
+#[test]
+fn test_fallocate_empty_file_edge_cases() {
+    let task = init_platform(None);
+
+    // Create an empty test file
+    let fd = task
+        .sys_open(
+            "/fallocate_empty.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // INSERT_RANGE on empty file at offset 0 should fail (offset == file_size == 0)
+    let result = task.sys_fallocate(fd, FallocateMode::INSERT_RANGE, 0, 10);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "INSERT_RANGE on empty file should return EINVAL"
+    );
+
+    // COLLAPSE_RANGE on empty file should fail
+    let result = task.sys_fallocate(fd, FallocateMode::COLLAPSE_RANGE, 0, 10);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "COLLAPSE_RANGE on empty file should return EINVAL"
+    );
+
+    // ALLOCATE on empty file should succeed and extend file
+    let result = task.sys_fallocate(fd, FallocateMode::empty(), 0, 100);
+    assert!(result.is_ok(), "ALLOCATE on empty file should succeed");
+
+    let stat = task.sys_fstat(fd).expect("fstat should succeed");
+    let size = { stat.st_size };
+    assert_eq!(size, 100, "File size should be extended to 100");
+
+    // Clean up
+    task.sys_close(fd).expect("close should succeed");
+}

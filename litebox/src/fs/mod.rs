@@ -170,8 +170,10 @@ pub enum FallocMode {
     /// exceeds the current size.
     AllocateKeepSize,
     /// Makes shared file data extents private to guarantee subsequent writes
-    /// will not fail due to lack of space.
+    /// will not fail due to lack of space. May extend file size.
     AllocateUnshareRange,
+    /// Like `AllocateUnshareRange`, but does not change the file size.
+    AllocateUnshareRangeKeepSize,
     /// Deallocates space (creates a hole) while keeping the file size unchanged.
     /// This is useful for sparse files.
     PunchHoleKeepSize,

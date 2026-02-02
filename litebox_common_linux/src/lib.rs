@@ -333,7 +333,9 @@ impl FallocateMode {
 
         // UNSHARE_RANGE (with optional KEEP_SIZE)
         if self.contains(Self::UNSHARE_RANGE) {
-            // UNSHARE_RANGE always implies allocation
+            if self.contains(Self::KEEP_SIZE) {
+                return Some(FallocMode::AllocateUnshareRangeKeepSize);
+            }
             return Some(FallocMode::AllocateUnshareRange);
         }
 
