@@ -193,8 +193,12 @@ fn single_instance_cache() -> &'static SingleInstanceCache {
 }
 
 /// Get the count of unique TA instances (for limit checking).
+///
+/// This counts:
+/// - All single-instance TAs in the cache (regardless of how many sessions use them)
+/// - All multi-instance TA sessions (each session has its own instance)
 fn instance_count() -> usize {
-    single_instance_cache().len() + session_map().len()
+    single_instance_cache().len() + session_map().count_multi_instance_tas()
 }
 
 /// Switch to the base page table.
@@ -437,13 +441,25 @@ fn open_session_single_instance(
         // Regular errors (access denied, bad params, etc.) don't mean the TA is dead -
         // it can still serve future OpenSession requests from other clients.
         if return_code == TeeResult::TargetDead {
-            // Check if any other sessions are using this instance
-            let other_sessions_exist = Arc::strong_count(&instance_arc) > 1;
+            // Check if any other sessions are using this instance by counting sessions
+            // in the session map that reference this TA instance.
+            let session_count = session_map().count_sessions_for_instance(&instance_arc);
 
-            if !other_sessions_exist {
+            if session_count == 0 {
                 debug_serial_println!(
                     "Single-instance TA panicked with no other sessions, cleaning up"
                 );
+
+                // Write error response BEFORE switching page tables (accesses user memory)
+                write_msg_args_to_normal_world(
+                    msg_args,
+                    msg_args_phys_addr,
+                    return_code,
+                    None, // No session ID on failure
+                    Some(&ta_params),
+                    Some(ta_req_info),
+                )?;
+
                 single_instance_cache().remove(&ta_uuid);
 
                 // Switch to base page table and delete the task page table
@@ -459,6 +475,8 @@ fn open_session_single_instance(
                 // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
                 // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
                 // cleaning it up. Currently we always clean up on panic.
+
+                return Ok(());
             }
         }
 
@@ -782,6 +800,7 @@ fn handle_invoke_command(
 
         let ta_uuid = session_entry.ta_uuid;
         let ta_flags = session_entry.ta_flags;
+        let instance_arc = session_entry.instance.clone();
 
         // Drop the instance lock before cleanup
         drop(instance);
@@ -789,9 +808,20 @@ fn handle_invoke_command(
         // Remove the session from the map
         session_map().remove(session_id);
 
-        // Check if this was the last session using the TA instance
-        // After removing from session_map, strong_count == 1 means only cache (or our ref) holds it
-        let is_last_session = Arc::strong_count(&session_entry.instance) == 1;
+        // Check if this was the last session using the TA instance by counting
+        // remaining sessions that reference this instance.
+        let remaining_sessions = session_map().count_sessions_for_instance(&instance_arc);
+        let is_last_session = remaining_sessions == 0;
+
+        // Write response BEFORE switching page tables (accesses user memory)
+        write_msg_args_to_normal_world(
+            msg_args,
+            msg_args_phys_addr,
+            return_code,
+            None,
+            Some(&ta_params),
+            Some(&ta_req_info),
+        )?;
 
         if is_last_session {
             // Clear single-instance cache if applicable
@@ -817,6 +847,8 @@ fn handle_invoke_command(
             // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
             // cleaning it up. Currently we always clean up on panic.
         }
+
+        return Ok(());
     }
 
     write_msg_args_to_normal_world(
@@ -902,16 +934,19 @@ fn handle_close_session(
         None,
     )?;
 
+    // Clone the instance Arc before dropping the lock for later cleanup check
+    let instance_arc = session_entry.instance.clone();
+
     // Drop the instance lock before removing from map
     drop(instance);
 
     // Remove the session entry from the map
     let removed_entry = session_map().remove(session_id);
 
-    // Check if this was the last session using the TA instance.
-    // After removing from session_map, strong_count == 1 means only the cache (or our local ref) holds it.
-    // For non-cached TAs, strong_count == 1 means we hold the last reference.
-    let is_last_session = Arc::strong_count(&session_entry.instance) == 1;
+    // Check if this was the last session using the TA instance by counting
+    // remaining sessions that reference this instance.
+    let remaining_sessions = session_map().count_sessions_for_instance(&instance_arc);
+    let is_last_session = remaining_sessions == 0;
 
     // If this was the last session using the TA instance, clean up (unless keep_alive is set)
     if is_last_session {

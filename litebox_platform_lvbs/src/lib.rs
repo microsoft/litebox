@@ -78,9 +78,14 @@ use litebox_common_optee::{USER_ADDR_MAX, USER_ADDR_MIN};
 pub struct PageTableManager {
     /// The base page table, containing only VTL1 kernel mappings (no user-space).
     base_page_table: mm::PageTable<PAGE_SIZE>,
+    /// Cached physical frame of the base page table (for fast CR3 comparison).
+    base_page_table_frame: PhysFrame<Size4KiB>,
     /// Task page tables indexed by their ID (starting from 1).
     /// Each contains kernel mappings + task-specific user-space mappings.
     task_page_tables: spin::Mutex<HashMap<usize, mm::PageTable<PAGE_SIZE>>>,
+    /// Reverse lookup: physical frame -> page table ID (for O(1) CR3 lookup).
+    /// Only contains task page tables (base page table is checked separately).
+    frame_to_id: spin::Mutex<HashMap<PhysFrame<Size4KiB>, usize>>,
     /// Next available task page table ID.
     next_task_pt_id: AtomicUsize,
 }
@@ -93,9 +98,12 @@ impl PageTableManager {
 
     /// Creates a new page table manager with the given base page table.
     fn new(base_pt: mm::PageTable<PAGE_SIZE>) -> Self {
+        let base_frame = base_pt.get_physical_frame();
         Self {
             base_page_table: base_pt,
+            base_page_table_frame: base_frame,
             task_page_tables: spin::Mutex::new(HashMap::new()),
+            frame_to_id: spin::Mutex::new(HashMap::new()),
             next_task_pt_id: AtomicUsize::new(1),
         }
     }
@@ -104,7 +112,7 @@ impl PageTableManager {
     ///
     /// This reads the current CR3 value and finds the matching page table.
     /// If CR3 matches the base page table, returns that. Otherwise, it
-    /// searches through task page tables.
+    /// looks up the task page table by physical frame.
     ///
     /// # Panics
     ///
@@ -115,16 +123,19 @@ impl PageTableManager {
         let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
 
         // Fast path: check base page table first (most common case)
-        if self.base_page_table.get_physical_frame() == cr3_frame {
+        if self.base_page_table_frame == cr3_frame {
             return &self.base_page_table;
         }
 
-        // Slow path: search task page tables
-        // Note: We need to be careful here - we're returning a reference while holding a lock.
-        // This is safe because task page tables are never removed while they're the current CR3.
-        let task_pts = self.task_page_tables.lock();
-        for pt in task_pts.values() {
-            if pt.get_physical_frame() == cr3_frame {
+        // Look up task page table by frame using the reverse lookup map
+        let task_pt_id = {
+            let frame_to_id = self.frame_to_id.lock();
+            frame_to_id.get(&cr3_frame).copied()
+        };
+
+        if let Some(id) = task_pt_id {
+            let task_pts = self.task_page_tables.lock();
+            if let Some(pt) = task_pts.get(&id) {
                 // Safety: The page table won't be removed while it's the current CR3,
                 // and the PageTableManager lives for 'static.
                 // We extend the lifetime here because the lock prevents removal.
@@ -152,15 +163,14 @@ impl PageTableManager {
     pub fn current_page_table_id(&self) -> usize {
         let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
 
-        if self.base_page_table.get_physical_frame() == cr3_frame {
+        // Fast path: check base page table first
+        if self.base_page_table_frame == cr3_frame {
             return BASE_PAGE_TABLE_ID;
         }
 
-        let task_pts = self.task_page_tables.lock();
-        for (id, pt) in task_pts.iter() {
-            if pt.get_physical_frame() == cr3_frame {
-                return *id;
-            }
+        let frame_to_id = self.frame_to_id.lock();
+        if let Some(&id) = frame_to_id.get(&cr3_frame) {
+            return id;
         }
 
         // CR3 doesn't match any known page table - this shouldn't happen
@@ -245,8 +255,15 @@ impl PageTableManager {
             return Err(Errno::ENOMEM);
         }
 
+        let phys_frame = pt.get_physical_frame();
+
         let mut task_pts = self.task_page_tables.lock();
         task_pts.insert(task_pt_id, pt);
+        drop(task_pts);
+
+        let mut frame_to_id = self.frame_to_id.lock();
+        frame_to_id.insert(phys_frame, task_pt_id);
+
         Ok(task_pt_id)
     }
 
@@ -279,6 +296,13 @@ impl PageTableManager {
 
         let mut task_pts = self.task_page_tables.lock();
         if let Some(pt) = task_pts.remove(&task_pt_id) {
+            let phys_frame = pt.get_physical_frame();
+            drop(task_pts);
+
+            let mut frame_to_id = self.frame_to_id.lock();
+            frame_to_id.remove(&phys_frame);
+            drop(frame_to_id);
+
             // Safety: We're about to delete this page table, so it's safe to unmap all pages.
             unsafe {
                 pt.cleanup_user_mappings(Self::USER_ADDR_MIN, Self::USER_ADDR_MAX);

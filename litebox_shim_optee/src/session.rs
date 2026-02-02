@@ -190,9 +190,30 @@ impl SessionMap {
         self.inner.lock().len()
     }
 
+    /// Count the number of unique multi-instance TA instances (non-single-instance TAs).
+    ///
+    /// Each multi-instance TA session has its own unique instance, so we count
+    /// sessions that are NOT single-instance TAs.
+    pub fn count_multi_instance_tas(&self) -> usize {
+        self.inner
+            .lock()
+            .values()
+            .filter(|e| !e.ta_flags.is_single_instance())
+            .count()
+    }
+
     /// Check if the session map is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.lock().is_empty()
+    }
+
+    /// Count sessions for a specific TA instance (by Arc pointer equality).
+    pub fn count_sessions_for_instance(&self, instance: &Arc<SpinMutex<TaInstance>>) -> usize {
+        self.inner
+            .lock()
+            .values()
+            .filter(|e| Arc::ptr_eq(&e.instance, instance))
+            .count()
     }
 }
 
