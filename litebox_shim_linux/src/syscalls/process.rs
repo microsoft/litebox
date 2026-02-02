@@ -318,7 +318,12 @@ pub(crate) struct Credentials {
     pub euid: u32,
     pub gid: u32,
     pub egid: u32,
+    /// Supplementary group IDs
+    pub supplementary_groups: Vec<u32>,
 }
+
+/// Maximum number of supplementary groups (Linux NGROUPS_MAX)
+pub(crate) const NGROUPS_MAX: usize = 65536;
 
 impl Task {
     pub(crate) fn process(&self) -> &Arc<Process> {
@@ -1154,22 +1159,97 @@ impl Task {
 
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
-        self.credentials.uid
+        self.credentials.borrow().uid
     }
 
     /// Handle syscall `geteuid`.
     pub(crate) fn sys_geteuid(&self) -> u32 {
-        self.credentials.euid
+        self.credentials.borrow().euid
     }
 
     /// Handle syscall `getgid`.
     pub(crate) fn sys_getgid(&self) -> u32 {
-        self.credentials.gid
+        self.credentials.borrow().gid
     }
 
     /// Handle syscall `getegid`.
     pub(crate) fn sys_getegid(&self) -> u32 {
-        self.credentials.egid
+        self.credentials.borrow().egid
+    }
+
+    /// Handle syscall `getgroups`.
+    ///
+    /// Returns the supplementary group IDs of the calling process.
+    /// If size is 0, returns the number of supplementary groups.
+    /// If size is non-zero and less than the number of groups, returns EINVAL.
+    #[expect(clippy::cast_sign_loss, reason = "size is validated to be >= 0")]
+    pub(crate) fn sys_getgroups(
+        &self,
+        size: i32,
+        list: Option<crate::MutPtr<u32>>,
+    ) -> Result<usize, Errno> {
+        if size < 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let credentials = self.credentials.borrow();
+        let groups = &credentials.supplementary_groups;
+        let num_groups = groups.len();
+
+        // If size is 0, just return the count
+        if size == 0 {
+            return Ok(num_groups);
+        }
+
+        // Check if buffer is large enough
+        if (size as usize) < num_groups {
+            return Err(Errno::EINVAL);
+        }
+
+        // Write groups to user buffer
+        let list = list.ok_or(Errno::EFAULT)?;
+        for (i, gid) in groups.iter().enumerate() {
+            // i is bounded by num_groups which is validated to be <= NGROUPS_MAX (65536)
+            // which fits in isize on all supported platforms
+            let offset = isize::try_from(i).map_err(|_| Errno::EINVAL)?;
+            list.write_at_offset(offset, *gid).ok_or(Errno::EFAULT)?;
+        }
+
+        Ok(num_groups)
+    }
+
+    /// Handle syscall `setgroups`.
+    ///
+    /// Sets the supplementary group IDs for the calling process.
+    pub(crate) fn sys_setgroups(
+        &self,
+        size: usize,
+        list: Option<crate::ConstPtr<u32>>,
+    ) -> Result<usize, Errno> {
+        if size > NGROUPS_MAX {
+            return Err(Errno::EINVAL);
+        }
+
+        // Read groups from user buffer
+        let mut new_groups = Vec::with_capacity(size);
+        if size > 0 {
+            let list = list.ok_or(Errno::EFAULT)?;
+            for i in 0..size {
+                // i is bounded by NGROUPS_MAX (65536) which fits in isize
+                let offset = isize::try_from(i).map_err(|_| Errno::EINVAL)?;
+                let gid = list.read_at_offset(offset).ok_or(Errno::EFAULT)?;
+                new_groups.push(gid);
+            }
+        }
+
+        // Update credentials - we need to create a new Arc with updated groups
+        let old_credentials = self.credentials.borrow();
+        let mut new_credentials = (**old_credentials).clone();
+        drop(old_credentials);
+        new_credentials.supplementary_groups = new_groups;
+        *self.credentials.borrow_mut() = Arc::new(new_credentials);
+
+        Ok(0)
     }
 }
 
@@ -1605,5 +1685,87 @@ mod tests {
             &long_name[..litebox_common_linux::TASK_COMM_LEN - 1],
             "prctl get_name returned unexpected comm for too long name"
         );
+    }
+
+    #[test]
+    fn test_getgroups_empty() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Initially, there should be no supplementary groups
+        let count = task.sys_getgroups(0, None).expect("sys_getgroups failed");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_setgroups_and_getgroups() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Set some supplementary groups
+        let groups: [u32; 3] = [100, 200, 300];
+        let list_ptr = crate::ConstPtr::from_ptr(groups.as_ptr());
+        task.sys_setgroups(groups.len(), Some(list_ptr))
+            .expect("sys_setgroups failed");
+
+        // Query the number of groups
+        let count = task.sys_getgroups(0, None).expect("sys_getgroups failed");
+        assert_eq!(count, 3);
+
+        // Retrieve the groups
+        let mut buf: [u32; 5] = [0; 5];
+        let buf_ptr = crate::MutPtr::from_ptr(buf.as_mut_ptr());
+        let count = task
+            .sys_getgroups(5, Some(buf_ptr))
+            .expect("sys_getgroups failed");
+        assert_eq!(count, 3);
+        assert_eq!(buf[0], 100);
+        assert_eq!(buf[1], 200);
+        assert_eq!(buf[2], 300);
+    }
+
+    #[test]
+    fn test_getgroups_einval_buffer_too_small() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Set some supplementary groups
+        let groups: [u32; 3] = [100, 200, 300];
+        let list_ptr = crate::ConstPtr::from_ptr(groups.as_ptr());
+        task.sys_setgroups(groups.len(), Some(list_ptr))
+            .expect("sys_setgroups failed");
+
+        // Try to retrieve with a buffer that's too small
+        let mut buf: [u32; 2] = [0; 2];
+        let buf_ptr = crate::MutPtr::from_ptr(buf.as_mut_ptr());
+        let result = task.sys_getgroups(2, Some(buf_ptr));
+        assert_eq!(result, Err(litebox_common_linux::errno::Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_setgroups_empty() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Set empty groups
+        task.sys_setgroups(0, None).expect("sys_setgroups failed");
+
+        // Verify no groups
+        let count = task.sys_getgroups(0, None).expect("sys_getgroups failed");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_getgroups_negative_size() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Negative size should return EINVAL
+        let result = task.sys_getgroups(-1, None);
+        assert_eq!(result, Err(litebox_common_linux::errno::Errno::EINVAL));
+    }
+
+    #[test]
+    fn test_setgroups_too_many() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Trying to set more than NGROUPS_MAX should return EINVAL
+        let result = task.sys_setgroups(super::NGROUPS_MAX + 1, None);
+        assert_eq!(result, Err(litebox_common_linux::errno::Errno::EINVAL));
     }
 }

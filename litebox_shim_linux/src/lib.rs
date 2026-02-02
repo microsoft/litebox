@@ -235,13 +235,13 @@ impl LinuxShim {
                 pid,
                 ppid,
                 tid: pid,
-                credentials: syscalls::process::Credentials {
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials {
                     uid,
                     euid,
                     gid,
                     egid,
-                }
-                .into(),
+                    supplementary_groups: Vec::new(),
+                })),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
@@ -1092,6 +1092,8 @@ impl Task {
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
+            SyscallRequest::Getgroups { size, list } => self.sys_getgroups(size, list),
+            SyscallRequest::Setgroups { size, list } => self.sys_setgroups(size, list),
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
                 buf.write_at_offset(0, sysinfo)
@@ -1175,9 +1177,8 @@ struct Task {
     ppid: i32,
     /// Thread ID
     tid: i32,
-    /// Task credentials. These are set per task but are Arc'd to save space
-    /// since most tasks never change their credentials.
-    credentials: Arc<syscalls::process::Credentials>,
+    /// Task credentials. `RefCell` to support `setgroups` and other credential changes.
+    credentials: RefCell<Arc<syscalls::process::Credentials>>,
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
     /// Filesystem state. `RefCell` to support `unshare` in the future.
@@ -1215,12 +1216,13 @@ mod test_utils {
                 pid,
                 ppid: 0,
                 tid: pid,
-                credentials: Arc::new(syscalls::process::Credentials {
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials {
                     uid: 0,
                     euid: 0,
                     gid: 0,
                     egid: 0,
-                }),
+                    supplementary_groups: Vec::new(),
+                })),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),

@@ -2221,6 +2221,14 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Geteuid,
     Getgid,
     Getegid,
+    Getgroups {
+        size: i32,
+        list: Option<Platform::RawMutPointer<u32>>,
+    },
+    Setgroups {
+        size: usize,
+        list: Option<Platform::RawConstPointer<u32>>,
+    },
     Sysinfo {
         buf: Platform::RawMutPointer<Sysinfo>,
     },
@@ -2591,6 +2599,8 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
+            Sysno::getgroups => sys_req!(Getgroups { size, list:* }),
+            Sysno::setgroups => sys_req!(Setgroups { size, list:* }),
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
             Sysno::epoll_wait => {
                 sys_req!(EpollPwait { epfd, events:*, maxevents, timeout, sigmask: { None }, sigsetsize: { 0 }, })
