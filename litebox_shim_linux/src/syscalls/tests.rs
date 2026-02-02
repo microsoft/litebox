@@ -636,6 +636,13 @@ fn test_fadvise_basic() {
             .is_ok()
     );
 
+    // Test that negative length returns EINVAL (per Linux kernel behavior)
+    assert_eq!(
+        task.sys_fadvise64(fd_i32, 0, -1, FadviseAdvice::Normal),
+        Err(Errno::EINVAL),
+        "fadvise with negative len should return EINVAL"
+    );
+
     task.sys_close(fd_i32).expect("Failed to close file");
 }
 
@@ -727,11 +734,11 @@ fn test_fadvise_eventfd() {
         .expect("Failed to create eventfd");
     let efd_i32 = i32::try_from(efd).unwrap();
 
-    // fadvise on eventfd should return ESPIPE (not a regular file)
+    // fadvise on eventfd should succeed (Linux returns success for special files)
     assert_eq!(
         task.sys_fadvise64(efd_i32, 0, 0, FadviseAdvice::Normal),
-        Err(Errno::ESPIPE),
-        "fadvise on eventfd should return ESPIPE"
+        Ok(()),
+        "fadvise on eventfd should succeed"
     );
 
     task.sys_close(efd_i32).expect("Failed to close eventfd");

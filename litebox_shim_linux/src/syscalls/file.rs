@@ -210,14 +210,20 @@ impl Task {
     ///
     /// # Errors
     /// - `EBADF`: `fd` is not a valid file descriptor
+    /// - `EINVAL`: `len` is negative
     /// - `ESPIPE`: `fd` refers to a pipe or FIFO
     pub(crate) fn sys_fadvise64(
         &self,
         fd: i32,
         _offset: i64,
-        _len: i64,
+        len: i64,
         _advice: litebox_common_linux::FadviseAdvice,
     ) -> Result<(), Errno> {
+        // Linux kernel validates len < 0 returns EINVAL (mm/fadvise.c)
+        if len < 0 {
+            return Err(Errno::EINVAL);
+        }
+
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
@@ -232,9 +238,10 @@ impl Task {
                 |_fd| Ok(()),             // Network socket: success (POSIX allows ignoring advice)
                 |_fd| Err(Errno::ESPIPE), // Pipe: not seekable
             ),
-            // Eventfd, epoll, unix socket - return ESPIPE (not seekable)
+            // Eventfd, epoll, unix socket - Linux returns success for these
+            // (they're special files but POSIX allows ignoring advice)
             Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                Err(Errno::ESPIPE)
+                Ok(Ok(()))
             }
         }
         .flatten()
