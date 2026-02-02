@@ -2083,6 +2083,14 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sigmask: Option<Platform::RawConstPointer<SigSet>>,
         sigsetsize: usize,
     },
+    EpollPwait2 {
+        epfd: i32,
+        events: Platform::RawMutPointer<EpollEvent>,
+        maxevents: u32,
+        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        sigmask: Option<Platform::RawConstPointer<SigSet>>,
+        sigsetsize: usize,
+    },
     EpollCreate {
         size: i32,
         flags: EpollCreateFlags,
@@ -2604,6 +2612,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }
             Sysno::epoll_pwait => {
                 sys_req!(EpollPwait { epfd, events:*, maxevents, timeout, sigmask:*, sigsetsize })
+            }
+            Sysno::epoll_pwait2 => {
+                sys_req!(EpollPwait2 { epfd, events:*, maxevents, timeout:*, sigmask:*, sigsetsize })
             }
             Sysno::epoll_create => sys_req!(EpollCreate {
                 size,

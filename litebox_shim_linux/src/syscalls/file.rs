@@ -1540,6 +1540,80 @@ impl Task {
         self.with_optional_sigmask(new_mask, do_epoll_wait)
     }
 
+    /// Handle syscall `epoll_pwait2`
+    ///
+    /// This is similar to `epoll_pwait` but uses `struct timespec` for the timeout
+    /// instead of an integer millisecond value, providing nanosecond precision.
+    pub fn sys_epoll_pwait2(
+        &self,
+        epfd: i32,
+        events: MutPtr<litebox_common_linux::EpollEvent>,
+        maxevents: u32,
+        timeout: Option<ConstPtr<litebox_common_linux::Timespec>>,
+        sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        // Read and validate sigmask if provided
+        let new_mask = if let Some(sigmask_ptr) = sigmask {
+            if sigsetsize != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
+                return Err(Errno::EINVAL);
+            }
+            Some(sigmask_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
+        } else {
+            None
+        };
+
+        // Read and validate timeout if provided
+        let timeout_duration = if let Some(ts_ptr) = timeout {
+            let ts = ts_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            // Convert Timespec to Duration, validating the values
+            Some(core::time::Duration::try_from(ts)?)
+        } else {
+            // NULL timeout means infinite wait
+            None
+        };
+
+        // Define the actual epoll_wait operation
+        let do_epoll_wait = || -> Result<usize, Errno> {
+            let Ok(epfd) = u32::try_from(epfd) else {
+                return Err(Errno::EBADF);
+            };
+            let maxevents = maxevents as usize;
+            if maxevents == 0
+                || maxevents > i32::MAX as usize / size_of::<litebox_common_linux::EpollEvent>()
+            {
+                return Err(Errno::EINVAL);
+            }
+            let epoll_file = {
+                let files = self.files.borrow();
+                let locked_file_descriptors = files.file_descriptors.read();
+                match locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)? {
+                    Descriptor::Epoll { file, .. } => file.clone(),
+                    _ => return Err(Errno::EBADF),
+                }
+            };
+            match epoll_file.wait(
+                &self.global,
+                &self.wait_cx().with_timeout(timeout_duration),
+                maxevents,
+            ) {
+                Ok(epoll_events) => {
+                    if !epoll_events.is_empty() {
+                        events
+                            .copy_from_slice(0, &epoll_events)
+                            .ok_or(Errno::EFAULT)?;
+                    }
+                    Ok(epoll_events.len())
+                }
+                Err(WaitError::TimedOut) => Ok(0),
+                Err(WaitError::Interrupted) => Err(Errno::EINTR),
+            }
+        };
+
+        // Execute with optional sigmask
+        self.with_optional_sigmask(new_mask, do_epoll_wait)
+    }
+
     /// Handle syscall `ppoll`.
     pub fn sys_ppoll(
         &self,

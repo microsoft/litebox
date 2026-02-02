@@ -826,6 +826,284 @@ fn test_epoll_pwait_with_sigmask() {
 }
 
 #[test]
+fn test_epoll_pwait2_basic() {
+    use litebox::event::Events;
+    use litebox_common_linux::{EpollCreateFlags, EpollEvent, EpollOp, Timespec};
+
+    let task = init_platform(None);
+
+    // Create an epoll instance
+    let epfd = task
+        .sys_epoll_create(EpollCreateFlags::EPOLL_CLOEXEC)
+        .expect("Failed to create epoll");
+    let epfd = i32::try_from(epfd).unwrap();
+
+    // Create a pipe to monitor
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::NONBLOCK)
+        .expect("Failed to create pipe");
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    // Add the write end to epoll (it should be immediately ready)
+    #[allow(clippy::cast_sign_loss)]
+    let event = EpollEvent {
+        events: Events::OUT.bits(),
+        data: write_fd as u64,
+    };
+    task.sys_epoll_ctl(
+        epfd,
+        EpollOp::EpollCtlAdd,
+        write_fd,
+        ConstPtr::from_usize((&raw const event) as usize),
+    )
+    .expect("Failed to add fd to epoll");
+
+    // Test 1: epoll_pwait2 with NULL timeout (infinite wait, but fd is ready)
+    let mut events = [EpollEvent { events: 0, data: 0 }];
+    let result = task.sys_epoll_pwait2(
+        epfd,
+        MutPtr::from_usize((&raw mut events).cast::<EpollEvent>() as usize),
+        1,
+        None, // NULL timeout = infinite wait
+        None,
+        0,
+    );
+    assert!(
+        result.is_ok(),
+        "epoll_pwait2 with NULL timeout should succeed"
+    );
+    assert_eq!(result.unwrap(), 1, "Should have one ready event");
+
+    // Test 2: epoll_pwait2 with zero timeout (poll, non-blocking)
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut events = [EpollEvent { events: 0, data: 0 }];
+    let result = task.sys_epoll_pwait2(
+        epfd,
+        MutPtr::from_usize((&raw mut events).cast::<EpollEvent>() as usize),
+        1,
+        Some(ConstPtr::from_usize((&raw const timeout) as usize)),
+        None,
+        0,
+    );
+    assert!(
+        result.is_ok(),
+        "epoll_pwait2 with zero timeout should succeed"
+    );
+    assert_eq!(result.unwrap(), 1, "Should have one ready event");
+
+    // Test 3: epoll_pwait2 with valid timeout (100ms)
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 100_000_000, // 100ms
+    };
+    let mut events = [EpollEvent { events: 0, data: 0 }];
+    let result = task.sys_epoll_pwait2(
+        epfd,
+        MutPtr::from_usize((&raw mut events).cast::<EpollEvent>() as usize),
+        1,
+        Some(ConstPtr::from_usize((&raw const timeout) as usize)),
+        None,
+        0,
+    );
+    assert!(
+        result.is_ok(),
+        "epoll_pwait2 with valid timeout should succeed"
+    );
+    assert_eq!(result.unwrap(), 1, "Should have one ready event");
+
+    // Clean up
+    task.sys_close(epfd).expect("Failed to close epoll");
+    task.sys_close(read_fd).expect("Failed to close read end");
+    task.sys_close(write_fd).expect("Failed to close write end");
+}
+
+#[test]
+fn test_epoll_pwait2_with_sigmask() {
+    use litebox::event::Events;
+    use litebox_common_linux::{EpollCreateFlags, EpollEvent, EpollOp, Timespec, signal::SigSet};
+
+    let task = init_platform(None);
+
+    // Create an epoll instance
+    let epfd = task
+        .sys_epoll_create(EpollCreateFlags::EPOLL_CLOEXEC)
+        .expect("Failed to create epoll");
+    let epfd = i32::try_from(epfd).unwrap();
+
+    // Create a pipe to monitor
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::NONBLOCK)
+        .expect("Failed to create pipe");
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    // Add the write end to epoll (it should be immediately ready)
+    #[allow(clippy::cast_sign_loss)]
+    let event = EpollEvent {
+        events: Events::OUT.bits(),
+        data: write_fd as u64,
+    };
+    task.sys_epoll_ctl(
+        epfd,
+        EpollOp::EpollCtlAdd,
+        write_fd,
+        ConstPtr::from_usize((&raw const event) as usize),
+    )
+    .expect("Failed to add fd to epoll");
+
+    // Create a sigmask
+    let mut sigmask = SigSet::empty();
+    sigmask.add(litebox_common_linux::signal::Signal::SIGUSR1);
+
+    // Test: epoll_pwait2 with valid sigmask should work
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut events = [EpollEvent { events: 0, data: 0 }];
+    let result = task.sys_epoll_pwait2(
+        epfd,
+        MutPtr::from_usize((&raw mut events).cast::<EpollEvent>() as usize),
+        1,
+        Some(ConstPtr::from_usize((&raw const timeout) as usize)),
+        Some(ConstPtr::from_usize((&raw const sigmask) as usize)),
+        core::mem::size_of::<SigSet>(),
+    );
+    assert!(result.is_ok(), "epoll_pwait2 with sigmask should succeed");
+    assert_eq!(result.unwrap(), 1, "Should have one ready event");
+
+    // Clean up
+    task.sys_close(epfd).expect("Failed to close epoll");
+    task.sys_close(read_fd).expect("Failed to close read end");
+    task.sys_close(write_fd).expect("Failed to close write end");
+}
+
+#[test]
+fn test_epoll_pwait2_invalid_args() {
+    use litebox::event::Events;
+    use litebox_common_linux::{EpollCreateFlags, EpollEvent, EpollOp, Timespec, signal::SigSet};
+
+    let task = init_platform(None);
+
+    // Create an epoll instance
+    let epfd = task
+        .sys_epoll_create(EpollCreateFlags::EPOLL_CLOEXEC)
+        .expect("Failed to create epoll");
+    let epfd = i32::try_from(epfd).unwrap();
+
+    // Create a pipe to monitor
+    let (read_fd, write_fd) = task
+        .sys_pipe2(OFlags::NONBLOCK)
+        .expect("Failed to create pipe");
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    // Add the write end to epoll
+    #[allow(clippy::cast_sign_loss)]
+    let event = EpollEvent {
+        events: Events::OUT.bits(),
+        data: write_fd as u64,
+    };
+    task.sys_epoll_ctl(
+        epfd,
+        EpollOp::EpollCtlAdd,
+        write_fd,
+        ConstPtr::from_usize((&raw const event) as usize),
+    )
+    .expect("Failed to add fd to epoll");
+
+    // Test 1: Invalid sigsetsize should return EINVAL
+    let sigmask = SigSet::empty();
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut events = [EpollEvent { events: 0, data: 0 }];
+    let result = task.sys_epoll_pwait2(
+        epfd,
+        MutPtr::from_usize((&raw mut events).cast::<EpollEvent>() as usize),
+        1,
+        Some(ConstPtr::from_usize((&raw const timeout) as usize)),
+        Some(ConstPtr::from_usize((&raw const sigmask) as usize)),
+        0, // Invalid size
+    );
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "epoll_pwait2 with invalid sigsetsize should return EINVAL"
+    );
+
+    // Test 2: Invalid timeout (tv_nsec >= 1e9) should return EINVAL
+    let invalid_timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000_000, // >= 1 billion is invalid
+    };
+    let mut events = [EpollEvent { events: 0, data: 0 }];
+    let result = task.sys_epoll_pwait2(
+        epfd,
+        MutPtr::from_usize((&raw mut events).cast::<EpollEvent>() as usize),
+        1,
+        Some(ConstPtr::from_usize((&raw const invalid_timeout) as usize)),
+        None,
+        0,
+    );
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "epoll_pwait2 with invalid tv_nsec should return EINVAL"
+    );
+
+    // Test 3: Invalid epfd should return EBADF
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut events = [EpollEvent { events: 0, data: 0 }];
+    let result = task.sys_epoll_pwait2(
+        -1, // Invalid epfd
+        MutPtr::from_usize((&raw mut events).cast::<EpollEvent>() as usize),
+        1,
+        Some(ConstPtr::from_usize((&raw const timeout) as usize)),
+        None,
+        0,
+    );
+    assert_eq!(
+        result,
+        Err(Errno::EBADF),
+        "epoll_pwait2 with invalid epfd should return EBADF"
+    );
+
+    // Test 4: maxevents = 0 should return EINVAL
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut events = [EpollEvent { events: 0, data: 0 }];
+    let result = task.sys_epoll_pwait2(
+        epfd,
+        MutPtr::from_usize((&raw mut events).cast::<EpollEvent>() as usize),
+        0, // Invalid maxevents
+        Some(ConstPtr::from_usize((&raw const timeout) as usize)),
+        None,
+        0,
+    );
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "epoll_pwait2 with maxevents=0 should return EINVAL"
+    );
+
+    // Clean up
+    task.sys_close(epfd).expect("Failed to close epoll");
+    task.sys_close(read_fd).expect("Failed to close read end");
+    task.sys_close(write_fd).expect("Failed to close write end");
+}
+
+#[test]
 fn test_pselect_with_sigsetpack() {
     use litebox_common_linux::{SigSetPack, TimeParam, signal::SigSet};
 

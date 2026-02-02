@@ -14,6 +14,20 @@
 #include <poll.h>
 #include <sys/select.h>
 #include <sys/epoll.h>
+#include <sys/syscall.h>
+
+// epoll_pwait2 syscall number (added in Linux 5.11)
+#ifndef __NR_epoll_pwait2
+#if defined(__x86_64__)
+#define __NR_epoll_pwait2 441
+#elif defined(__i386__)
+#define __NR_epoll_pwait2 441
+#elif defined(__aarch64__)
+#define __NR_epoll_pwait2 441
+#else
+#error "Unsupported architecture for epoll_pwait2"
+#endif
+#endif
 
 // Test 1: ppoll with signal mask - mask should be restored after call
 int test_ppoll_sigmask_restored(void) {
@@ -308,10 +322,185 @@ int test_epoll_pwait_null_sigmask(void) {
     return 0;
 }
 
+// Test 7: epoll_pwait2 basic functionality with struct timespec timeout
+int test_epoll_pwait2_basic(void) {
+    int pipefd[2];
+
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        return 1;
+    }
+
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd == -1) {
+        perror("epoll_create1");
+        return 1;
+    }
+
+    struct epoll_event ev = {
+        .events = EPOLLOUT,
+        .data.fd = pipefd[1]
+    };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[1], &ev) == -1) {
+        perror("epoll_ctl");
+        return 1;
+    }
+
+    // Test with zero timeout (poll, non-blocking)
+    struct epoll_event events[1];
+    struct timespec timeout = { .tv_sec = 0, .tv_nsec = 0 };
+    int ret = syscall(__NR_epoll_pwait2, epfd, events, 1, &timeout, NULL, 0);
+    if (ret < 0) {
+        perror("epoll_pwait2 with zero timeout");
+        return 1;
+    }
+    if (ret != 1 || !(events[0].events & EPOLLOUT)) {
+        fprintf(stderr, "FAIL: epoll_pwait2 should report write ready\n");
+        return 1;
+    }
+
+    // Test with nanosecond timeout (100ms = 100,000,000 ns)
+    memset(events, 0, sizeof(events));
+    timeout.tv_sec = 0;
+    timeout.tv_nsec = 100000000;  // 100ms
+    ret = syscall(__NR_epoll_pwait2, epfd, events, 1, &timeout, NULL, 0);
+    if (ret < 0) {
+        perror("epoll_pwait2 with 100ms timeout");
+        return 1;
+    }
+    if (ret != 1 || !(events[0].events & EPOLLOUT)) {
+        fprintf(stderr, "FAIL: epoll_pwait2 should report write ready with 100ms timeout\n");
+        return 1;
+    }
+
+    close(epfd);
+    close(pipefd[0]);
+    close(pipefd[1]);
+    printf("test_epoll_pwait2_basic: PASS\n");
+    return 0;
+}
+
+// Test 8: epoll_pwait2 with NULL timeout (infinite wait, but fd ready)
+int test_epoll_pwait2_null_timeout(void) {
+    int pipefd[2];
+
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        return 1;
+    }
+
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd == -1) {
+        perror("epoll_create1");
+        return 1;
+    }
+
+    struct epoll_event ev = {
+        .events = EPOLLOUT,
+        .data.fd = pipefd[1]
+    };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[1], &ev) == -1) {
+        perror("epoll_ctl");
+        return 1;
+    }
+
+    // Test with NULL timeout (infinite wait, but fd is ready so it returns immediately)
+    struct epoll_event events[1];
+    int ret = syscall(__NR_epoll_pwait2, epfd, events, 1, NULL, NULL, 0);
+    if (ret < 0) {
+        perror("epoll_pwait2 with NULL timeout");
+        return 1;
+    }
+    if (ret != 1 || !(events[0].events & EPOLLOUT)) {
+        fprintf(stderr, "FAIL: epoll_pwait2 with NULL timeout should report write ready\n");
+        return 1;
+    }
+
+    close(epfd);
+    close(pipefd[0]);
+    close(pipefd[1]);
+    printf("test_epoll_pwait2_null_timeout: PASS\n");
+    return 0;
+}
+
+// Test 9: epoll_pwait2 with signal mask - mask should be restored after call
+int test_epoll_pwait2_sigmask_restored(void) {
+    int pipefd[2];
+    sigset_t original_mask, epoll_mask, after_mask;
+
+    // Create a pipe
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        return 1;
+    }
+
+    // Create epoll instance
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd == -1) {
+        perror("epoll_create1");
+        return 1;
+    }
+
+    // Add write end to epoll
+    struct epoll_event ev = {
+        .events = EPOLLOUT,
+        .data.fd = pipefd[1]
+    };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[1], &ev) == -1) {
+        perror("epoll_ctl");
+        return 1;
+    }
+
+    // Set up initial signal mask (block SIGUSR1)
+    sigemptyset(&original_mask);
+    sigaddset(&original_mask, SIGUSR1);
+    if (sigprocmask(SIG_SETMASK, &original_mask, NULL) == -1) {
+        perror("sigprocmask");
+        return 1;
+    }
+
+    // Create a different mask for epoll_pwait2 (block SIGUSR2 instead)
+    sigemptyset(&epoll_mask);
+    sigaddset(&epoll_mask, SIGUSR2);
+
+    // Call epoll_pwait2 with the new mask and zero timeout
+    struct epoll_event events[1];
+    struct timespec timeout = { .tv_sec = 0, .tv_nsec = 0 };
+    int ret = syscall(__NR_epoll_pwait2, epfd, events, 1, &timeout, &epoll_mask, sizeof(sigset_t));
+    if (ret < 0) {
+        perror("epoll_pwait2");
+        return 1;
+    }
+
+    // Check that the original mask is restored
+    if (sigprocmask(SIG_SETMASK, NULL, &after_mask) == -1) {
+        perror("sigprocmask get");
+        return 1;
+    }
+
+    // Verify SIGUSR1 is still blocked (from original mask)
+    if (!sigismember(&after_mask, SIGUSR1)) {
+        fprintf(stderr, "FAIL: SIGUSR1 should be blocked after epoll_pwait2\n");
+        return 1;
+    }
+
+    // Verify SIGUSR2 is NOT blocked (epoll_pwait2 mask should not persist)
+    if (sigismember(&after_mask, SIGUSR2)) {
+        fprintf(stderr, "FAIL: SIGUSR2 should NOT be blocked after epoll_pwait2\n");
+        return 1;
+    }
+
+    close(epfd);
+    close(pipefd[0]);
+    close(pipefd[1]);
+    printf("test_epoll_pwait2_sigmask_restored: PASS\n");
+    return 0;
+}
+
 int main(void) {
     int failed = 0;
 
-    printf("=== Signal mask tests for ppoll/pselect/epoll_pwait ===\n\n");
+    printf("=== Signal mask tests for ppoll/pselect/epoll_pwait/epoll_pwait2 ===\n\n");
 
     failed += test_ppoll_null_sigmask();
 #if defined(__x86_64__) || defined(__aarch64__)
@@ -328,6 +517,11 @@ int main(void) {
     printf("test_pselect_sigmask_restored: SKIPPED (32-bit)\n");
 #endif
     failed += test_epoll_pwait_sigmask_restored();
+
+    // epoll_pwait2 tests
+    failed += test_epoll_pwait2_basic();
+    failed += test_epoll_pwait2_null_timeout();
+    failed += test_epoll_pwait2_sigmask_restored();
 
     printf("\n");
     if (failed == 0) {

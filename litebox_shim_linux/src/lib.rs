@@ -879,6 +879,14 @@ impl Task {
                 sigmask,
                 sigsetsize,
             } => self.sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize),
+            SyscallRequest::EpollPwait2 {
+                epfd,
+                events,
+                maxevents,
+                timeout,
+                sigmask,
+                sigsetsize,
+            } => self.sys_epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize),
             SyscallRequest::Prctl { args } => self.sys_prctl(args),
             SyscallRequest::ArchPrctl { arg } => syscall!(sys_arch_prctl(arg)),
             SyscallRequest::Readlink {
