@@ -29,6 +29,10 @@
 #endif
 #endif
 
+// Kernel sigset_t size (_NSIG / 8 = 64 / 8 = 8 bytes)
+// glibc's sigset_t is 128 bytes, but syscalls expect kernel size
+#define KERNEL_SIGSET_SIZE 8
+
 // Test 1: ppoll with signal mask - mask should be restored after call
 int test_ppoll_sigmask_restored(void) {
     int pipefd[2];
@@ -466,7 +470,7 @@ int test_epoll_pwait2_sigmask_restored(void) {
     // Call epoll_pwait2 with the new mask and zero timeout
     struct epoll_event events[1];
     struct timespec timeout = { .tv_sec = 0, .tv_nsec = 0 };
-    int ret = syscall(__NR_epoll_pwait2, epfd, events, 1, &timeout, &epoll_mask, sizeof(sigset_t));
+    int ret = syscall(__NR_epoll_pwait2, epfd, events, 1, &timeout, &epoll_mask, KERNEL_SIGSET_SIZE);
     if (ret < 0) {
         perror("epoll_pwait2");
         return 1;
