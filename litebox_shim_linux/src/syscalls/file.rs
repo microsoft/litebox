@@ -1921,4 +1921,168 @@ impl Task {
             |_fd| todo!("pipes"),
         )?
     }
+
+    /// Implement the `copy_file_range` syscall.
+    ///
+    /// Copies data between two file descriptors without transferring data through userspace.
+    /// Returns the number of bytes copied, which may be less than requested.
+    ///
+    /// # Known Limitations
+    /// - Overlap detection only checks fd_in == fd_out, not inode comparison
+    /// - Does not check O_APPEND flag on fd_out (should return EBADF)
+    /// - Does not validate that fds refer to regular files (should return EINVAL/EISDIR)
+    ///
+    /// These limitations are documented for future enhancement.
+    #[allow(clippy::items_after_statements)]
+    pub fn sys_copy_file_range(
+        &self,
+        fd_in: i32,
+        off_in: Option<MutPtr<i64>>,
+        fd_out: i32,
+        off_out: Option<MutPtr<i64>>,
+        len: usize,
+        flags: u32,
+    ) -> Result<usize, Errno> {
+        // flags must be 0 (reserved for future use)
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        // Limit maximum transfer size to prevent overflow issues
+        const MAX_RW_COUNT: usize = 0x7ffff000;
+        let len = len.min(MAX_RW_COUNT);
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        // Read offsets from user pointers or use None to indicate file position
+        let pos_in: Option<i64> = if let Some(ptr) = off_in {
+            let offset = ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if offset < 0 {
+                return Err(Errno::EINVAL);
+            }
+            Some(offset)
+        } else {
+            None
+        };
+
+        let pos_out: Option<i64> = if let Some(ptr) = off_out {
+            let offset = ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if offset < 0 {
+                return Err(Errno::EINVAL);
+            }
+            Some(offset)
+        } else {
+            None
+        };
+
+        // Get input file position
+        #[allow(clippy::cast_sign_loss)]
+        let in_offset = if let Some(offset) = pos_in {
+            offset as u64
+        } else {
+            // Use current file position
+            self.sys_lseek(fd_in, 0, SeekWhence::RelativeToCurrentOffset)? as u64
+        };
+
+        // Get output file position
+        #[allow(clippy::cast_sign_loss)]
+        let out_offset = if let Some(offset) = pos_out {
+            offset as u64
+        } else {
+            // Use current file position
+            self.sys_lseek(fd_out, 0, SeekWhence::RelativeToCurrentOffset)? as u64
+        };
+
+        // Check if input and output are the same file with overlapping ranges
+        // This is a simplified check - in a full implementation we'd compare inodes
+        if fd_in == fd_out {
+            let in_end = in_offset.saturating_add(len as u64);
+            let out_end = out_offset.saturating_add(len as u64);
+            // Check for overlap
+            if in_offset < out_end && out_offset < in_end {
+                return Err(Errno::EINVAL);
+            }
+        }
+
+        // Perform the copy using a reusable buffer
+        const BUF_SIZE: usize = 4096;
+        let mut total_copied: usize = 0;
+        let mut current_in_offset = in_offset;
+        let mut current_out_offset = out_offset;
+        let mut buf = vec![0u8; BUF_SIZE];
+
+        while total_copied < len {
+            let to_copy = (len - total_copied).min(BUF_SIZE);
+
+            // Read from input file at specified offset
+            #[allow(clippy::cast_possible_wrap)]
+            let bytes_read =
+                self.sys_pread64(fd_in, &mut buf[..to_copy], current_in_offset as i64)?;
+
+            if bytes_read == 0 {
+                // EOF reached
+                break;
+            }
+
+            // Write to output file at specified offset
+            #[allow(clippy::cast_possible_wrap)]
+            let bytes_written =
+                self.sys_pwrite64(fd_out, &buf[..bytes_read], current_out_offset as i64)?;
+
+            if bytes_written == 0 {
+                // Could not write any data
+                break;
+            }
+
+            total_copied += bytes_written;
+            current_in_offset += bytes_written as u64;
+            current_out_offset += bytes_written as u64;
+
+            if bytes_written < bytes_read {
+                // Partial write, stop here
+                break;
+            }
+        }
+
+        // Update offsets with overflow protection
+        // Note: The offset must fit in i64, as that's what the user pointer expects
+        if total_copied > 0 {
+            // Check for overflow before updating offsets
+            if current_in_offset > i64::MAX as u64 || current_out_offset > i64::MAX as u64 {
+                return Err(Errno::EOVERFLOW);
+            }
+
+            if let Some(ptr) = off_in {
+                #[allow(clippy::cast_possible_wrap)]
+                ptr.write_at_offset(0, current_in_offset as i64)
+                    .ok_or(Errno::EFAULT)?;
+            } else {
+                // Update file position
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                self.sys_lseek(
+                    fd_in,
+                    current_in_offset as isize,
+                    SeekWhence::RelativeToBeginning,
+                )?;
+            }
+
+            if let Some(ptr) = off_out {
+                #[allow(clippy::cast_possible_wrap)]
+                ptr.write_at_offset(0, current_out_offset as i64)
+                    .ok_or(Errno::EFAULT)?;
+            } else {
+                // Update file position
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                self.sys_lseek(
+                    fd_out,
+                    current_out_offset as isize,
+                    SeekWhence::RelativeToBeginning,
+                )?;
+            }
+        }
+
+        Ok(total_copied)
+    }
 }

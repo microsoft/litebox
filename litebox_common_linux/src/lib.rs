@@ -2261,6 +2261,14 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    CopyFileRange {
+        fd_in: i32,
+        off_in: Option<Platform::RawMutPointer<i64>>,
+        fd_out: i32,
+        off_out: Option<Platform::RawMutPointer<i64>>,
+        len: usize,
+        flags: u32,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2800,6 +2808,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::copy_file_range => SyscallRequest::CopyFileRange {
+                fd_in: ctx.sys_req_arg(0),
+                off_in: ctx.sys_req_ptr(1),
+                fd_out: ctx.sys_req_arg(2),
+                off_out: ctx.sys_req_ptr(3),
+                len: ctx.sys_req_arg(4),
+                flags: ctx.sys_req_arg(5),
+            },
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

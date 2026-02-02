@@ -584,3 +584,310 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+#[test]
+fn test_copy_file_range_basic() {
+    let task = init_platform(None);
+
+    // Create source file with test data
+    let src_path = "/copy_src.txt";
+    let dst_path = "/copy_dst.txt";
+    let test_data = b"Hello, copy_file_range!";
+
+    let src_fd = task
+        .sys_open(
+            src_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let src_fd = i32::try_from(src_fd).unwrap();
+    task.sys_write(src_fd, test_data, None)
+        .expect("Failed to write to source file");
+    task.sys_close(src_fd).expect("Failed to close source file");
+
+    // Reopen source for reading and create destination for writing
+    let src_fd = task
+        .sys_open(src_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to reopen source file");
+    let src_fd = i32::try_from(src_fd).unwrap();
+
+    let dst_fd = task
+        .sys_open(
+            dst_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create destination file");
+    let dst_fd = i32::try_from(dst_fd).unwrap();
+
+    // Perform copy_file_range
+    let copied = task
+        .sys_copy_file_range(src_fd, None, dst_fd, None, test_data.len(), 0)
+        .expect("copy_file_range should succeed");
+
+    assert_eq!(copied, test_data.len(), "Should copy all bytes");
+
+    task.sys_close(src_fd).expect("Failed to close source");
+    task.sys_close(dst_fd).expect("Failed to close destination");
+
+    // Verify destination contains correct data
+    let dst_fd = task
+        .sys_open(dst_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to reopen destination file");
+    let dst_fd = i32::try_from(dst_fd).unwrap();
+
+    let mut buf = [0u8; 64];
+    let bytes_read = task
+        .sys_read(dst_fd, &mut buf, None)
+        .expect("Failed to read from destination");
+
+    assert_eq!(bytes_read, test_data.len());
+    assert_eq!(&buf[..bytes_read], test_data);
+
+    task.sys_close(dst_fd).expect("Failed to close destination");
+}
+
+#[test]
+fn test_copy_file_range_with_offsets() {
+    let task = init_platform(None);
+
+    // Create source file with test data
+    let src_path = "/copy_offset_src.txt";
+    let dst_path = "/copy_offset_dst.txt";
+    let test_data = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    let src_fd = task
+        .sys_open(
+            src_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let src_fd = i32::try_from(src_fd).unwrap();
+    task.sys_write(src_fd, test_data, None)
+        .expect("Failed to write to source file");
+    task.sys_close(src_fd).expect("Failed to close source file");
+
+    // Reopen source for reading and create destination for writing
+    let src_fd = task
+        .sys_open(src_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to reopen source file");
+    let src_fd = i32::try_from(src_fd).unwrap();
+
+    let dst_fd = task
+        .sys_open(
+            dst_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create destination file");
+    let dst_fd = i32::try_from(dst_fd).unwrap();
+
+    // Create offset pointers
+    let mut off_in: i64 = 5; // Start from 'F'
+    let mut off_out: i64 = 0;
+
+    // Using raw pointers wrapped in MutPtr for the test
+    let off_in_ptr = MutPtr::from_usize(&raw mut off_in as usize);
+    let off_out_ptr = MutPtr::from_usize(&raw mut off_out as usize);
+
+    // Copy 10 bytes starting from offset 5
+    let copied = task
+        .sys_copy_file_range(src_fd, Some(off_in_ptr), dst_fd, Some(off_out_ptr), 10, 0)
+        .expect("copy_file_range should succeed");
+
+    assert_eq!(copied, 10, "Should copy 10 bytes");
+    assert_eq!(off_in, 15, "off_in should be updated to 15");
+    assert_eq!(off_out, 10, "off_out should be updated to 10");
+
+    task.sys_close(src_fd).expect("Failed to close source");
+    task.sys_close(dst_fd).expect("Failed to close destination");
+
+    // Verify destination contains "FGHIJKLMNO"
+    let dst_fd = task
+        .sys_open(dst_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to reopen destination file");
+    let dst_fd = i32::try_from(dst_fd).unwrap();
+
+    let mut buf = [0u8; 64];
+    let bytes_read = task
+        .sys_read(dst_fd, &mut buf, None)
+        .expect("Failed to read from destination");
+
+    assert_eq!(bytes_read, 10);
+    assert_eq!(&buf[..bytes_read], b"FGHIJKLMNO");
+
+    task.sys_close(dst_fd).expect("Failed to close destination");
+}
+
+#[test]
+fn test_copy_file_range_partial() {
+    let task = init_platform(None);
+
+    // Create a small source file
+    let src_path = "/copy_partial_src.txt";
+    let dst_path = "/copy_partial_dst.txt";
+    let test_data = b"Short";
+
+    let src_fd = task
+        .sys_open(
+            src_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let src_fd = i32::try_from(src_fd).unwrap();
+    task.sys_write(src_fd, test_data, None)
+        .expect("Failed to write to source file");
+    task.sys_close(src_fd).expect("Failed to close source file");
+
+    // Reopen source for reading and create destination for writing
+    let src_fd = task
+        .sys_open(src_path, OFlags::RDONLY, Mode::empty())
+        .expect("Failed to reopen source file");
+    let src_fd = i32::try_from(src_fd).unwrap();
+
+    let dst_fd = task
+        .sys_open(
+            dst_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create destination file");
+    let dst_fd = i32::try_from(dst_fd).unwrap();
+
+    // Request more bytes than available - should copy what's available
+    let copied = task
+        .sys_copy_file_range(src_fd, None, dst_fd, None, 1000, 0)
+        .expect("copy_file_range should succeed with partial copy");
+
+    assert_eq!(copied, test_data.len(), "Should copy only available bytes");
+
+    task.sys_close(src_fd).expect("Failed to close source");
+    task.sys_close(dst_fd).expect("Failed to close destination");
+}
+
+#[test]
+fn test_copy_file_range_invalid_flags() {
+    let task = init_platform(None);
+
+    // Create source and destination files
+    let src_path = "/copy_flags_src.txt";
+    let dst_path = "/copy_flags_dst.txt";
+
+    let src_fd = task
+        .sys_open(
+            src_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let src_fd = i32::try_from(src_fd).unwrap();
+    task.sys_write(src_fd, b"test", None)
+        .expect("Failed to write to source file");
+
+    let dst_fd = task
+        .sys_open(
+            dst_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create destination file");
+    let dst_fd = i32::try_from(dst_fd).unwrap();
+
+    // Non-zero flags should return EINVAL
+    let result = task.sys_copy_file_range(src_fd, None, dst_fd, None, 10, 1);
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "Non-zero flags should return EINVAL"
+    );
+
+    task.sys_close(src_fd).expect("Failed to close source");
+    task.sys_close(dst_fd).expect("Failed to close destination");
+}
+
+#[test]
+fn test_copy_file_range_invalid_fd() {
+    let task = init_platform(None);
+
+    // Create a valid destination file
+    let dst_path = "/copy_invalid_fd_dst.txt";
+    let dst_fd = task
+        .sys_open(
+            dst_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create destination file");
+    let dst_fd = i32::try_from(dst_fd).unwrap();
+
+    // Invalid source fd should return EBADF
+    let result = task.sys_copy_file_range(9999, None, dst_fd, None, 10, 0);
+    assert_eq!(
+        result,
+        Err(Errno::EBADF),
+        "Invalid source fd should return EBADF"
+    );
+
+    task.sys_close(dst_fd).expect("Failed to close destination");
+
+    // Create a valid source file
+    let src_path = "/copy_invalid_fd_src.txt";
+    let src_fd = task
+        .sys_open(
+            src_path,
+            OFlags::CREAT | OFlags::RDONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let src_fd = i32::try_from(src_fd).unwrap();
+
+    // Invalid destination fd should return EBADF
+    let result = task.sys_copy_file_range(src_fd, None, 9999, None, 10, 0);
+    assert_eq!(
+        result,
+        Err(Errno::EBADF),
+        "Invalid destination fd should return EBADF"
+    );
+
+    task.sys_close(src_fd).expect("Failed to close source");
+}
+
+#[test]
+fn test_copy_file_range_zero_len() {
+    let task = init_platform(None);
+
+    // Create source and destination files
+    let src_path = "/copy_zero_len_src.txt";
+    let dst_path = "/copy_zero_len_dst.txt";
+
+    let src_fd = task
+        .sys_open(
+            src_path,
+            OFlags::CREAT | OFlags::RDONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create source file");
+    let src_fd = i32::try_from(src_fd).unwrap();
+
+    let dst_fd = task
+        .sys_open(
+            dst_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create destination file");
+    let dst_fd = i32::try_from(dst_fd).unwrap();
+
+    // Zero length copy should succeed and return 0
+    let copied = task
+        .sys_copy_file_range(src_fd, None, dst_fd, None, 0, 0)
+        .expect("copy_file_range with len=0 should succeed");
+
+    assert_eq!(copied, 0, "Zero length copy should return 0");
+
+    task.sys_close(src_fd).expect("Failed to close source");
+    task.sys_close(dst_fd).expect("Failed to close destination");
+}
