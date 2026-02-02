@@ -719,6 +719,9 @@ impl Task {
         self.do_pwritev(fd, iovec, iovcnt, Some(pos))
     }
 
+    /// Maximum number of iovec entries, matching Linux's UIO_MAXIOV
+    const UIO_MAXIOV: usize = 1024;
+
     /// Internal implementation for preadv/preadv2
     fn do_preadv(
         &self,
@@ -727,6 +730,10 @@ impl Task {
         iovcnt: usize,
         pos: Option<usize>,
     ) -> Result<usize, Errno> {
+        // Validate iovcnt to prevent resource exhaustion
+        if iovcnt > Self::UIO_MAXIOV {
+            return Err(Errno::EINVAL);
+        }
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
@@ -795,6 +802,10 @@ impl Task {
         iovcnt: usize,
         pos: Option<usize>,
     ) -> Result<usize, Errno> {
+        // Validate iovcnt to prevent resource exhaustion
+        if iovcnt > Self::UIO_MAXIOV {
+            return Err(Errno::EINVAL);
+        }
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };

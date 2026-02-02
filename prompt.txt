@@ -1,0 +1,13 @@
+start with the main branch, create a new branch. before implmentation, start with a design doc to describe your plan, use an appendonly progress         
+  rerport to track your progress. After you finish the implementation, add unit tests, if there are any test errors fix them then repeat. then run         
+  local tests and fix any errors repeatedly. then fix clippy and fmt before creating a *draft* PR. then monitor the CI and fix any CI issues               
+  repeatedly. you can find Linux source code at /workspace/linux and Rust OS code in /workspace/asterinas I will step away. If you have any questions, ask them now. after it passes the CI, launch 3 agents to review this PR from different angles and let them discuss to reach a conclusion. Then implement all recomendations, then update the PR, monitor the CI, till it's passed. after all of this, write what you did in a doc. all docs should be stored in docs/, don't commit them. feature branch uses name wdcui/<feature>, target branch is main.
+
+when you are done, send a message through telegram bot. /workspace/model-proxy has two shell script send_telegram.sh and recv_telegram.sh . Send a one line summary of the task you just completed through       
+  the telegram bot. prefix your message with [cc_litebox]
+
+read the docs to find the list of syscalls to implement. look at the new syscalls implemented by PR #599, #601-#607, #610-#617 in microsoft/litebox repo and suggest a new syscall to implement.
+
+launch 3 agents to review this PR from different angles and let them discuss to reach a conclusion.
+
+summarize what you did in a doc.
