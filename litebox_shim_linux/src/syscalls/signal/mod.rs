@@ -660,17 +660,20 @@ impl Task {
     /// Read pending signals that match the given mask for signalfd.
     ///
     /// This consumes signals from the pending queue, converting them to
-    /// `SignalfdSiginfo` structures.
+    /// `SignalfdSiginfo` structures. Only consumes up to `max_count` signals
+    /// to prevent signal loss when the read buffer is too small.
     pub(crate) fn read_signals_for_signalfd(
         &self,
         mask: SigSet,
+        max_count: usize,
     ) -> alloc::vec::Vec<litebox_common_linux::SignalfdSiginfo> {
         let mut result = alloc::vec::Vec::new();
         let mut pending = self.signals.pending.borrow_mut();
 
         // Find signals that are both pending and in the signalfd mask
         // Re-compute on each iteration since we're removing signals
-        loop {
+        // Only consume up to max_count signals to avoid signal loss
+        while result.len() < max_count {
             let readable_signals = pending.pending & mask;
             let Some(signal) = readable_signals.lowest_set() else {
                 break;

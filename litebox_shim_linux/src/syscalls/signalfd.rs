@@ -85,8 +85,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for SignalFi
 /// Convert a kernel `Siginfo` to the userspace `SignalfdSiginfo` format.
 pub(crate) fn siginfo_to_signalfd_siginfo(siginfo: &Siginfo, signo: Signal) -> SignalfdSiginfo {
     let mut info = SignalfdSiginfo::default();
-    // Signal numbers are always positive, so this cast is safe
-    info.ssi_signo = u32::try_from(signo.as_i32()).expect("signal number should be positive");
+    // Signal numbers are always positive (validated by Signal type construction)
+    // Using as cast since Signal guarantees 1-64 range
+    #[allow(clippy::cast_sign_loss)]
+    {
+        info.ssi_signo = signo.as_i32() as u32;
+    }
     info.ssi_errno = siginfo.errno;
     info.ssi_code = siginfo.code;
     // Other fields would need to be extracted from siginfo.data
@@ -149,9 +153,8 @@ mod tests {
             data: litebox_common_linux::signal::SiginfoData { pad: [0; 28] },
         };
         let sigfd_info = siginfo_to_signalfd_siginfo(&siginfo, Signal::SIGUSR1);
-        assert_eq!(
-            sigfd_info.ssi_signo,
-            u32::try_from(Signal::SIGUSR1.as_i32()).unwrap()
-        );
+        #[allow(clippy::cast_sign_loss)]
+        let expected = Signal::SIGUSR1.as_i32() as u32;
+        assert_eq!(sigfd_info.ssi_signo, expected);
     }
 }

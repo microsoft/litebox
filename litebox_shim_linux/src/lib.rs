@@ -1032,11 +1032,13 @@ impl Task {
                 mask,
                 sizemask,
                 flags,
-            } => mask
-                .read_at_offset(0)
-                .ok_or(Errno::EFAULT)
-                .and_then(|mask| self.sys_signalfd4(fd, mask, sizemask, flags))
-                .map(|fd| usize::try_from(fd).expect("fd should be non-negative")),
+            } => {
+                #[allow(clippy::cast_sign_loss)]
+                mask.read_at_offset(0)
+                    .ok_or(Errno::EFAULT)
+                    .and_then(|mask| self.sys_signalfd4(fd, mask, sizemask, flags))
+                    .map(|fd| fd as usize) // fd is guaranteed non-negative from sys_signalfd4
+            }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                     pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT)?;

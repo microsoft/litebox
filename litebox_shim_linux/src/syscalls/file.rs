@@ -297,9 +297,15 @@ impl Task {
                     return Err(Errno::EINVAL);
                 }
 
-                // Try to read signals
+                // Calculate how many signals can fit in the buffer
+                let max_signals = buf.len() / size_of::<SignalfdSiginfo>();
+                if max_signals == 0 {
+                    return Err(Errno::EINVAL);
+                }
+
+                // Try to read signals (only consume what fits in buffer)
                 let mask = file.get_mask();
-                let signals = self.read_signals_for_signalfd(mask);
+                let signals = self.read_signals_for_signalfd(mask, max_signals);
 
                 if signals.is_empty() {
                     if file.get_status().contains(OFlags::NONBLOCK) {
@@ -314,9 +320,6 @@ impl Task {
                 // Copy signals to buffer
                 let mut bytes_written = 0;
                 for siginfo in signals {
-                    if bytes_written + size_of::<SignalfdSiginfo>() > buf.len() {
-                        break;
-                    }
                     buf[bytes_written..bytes_written + size_of::<SignalfdSiginfo>()]
                         .copy_from_slice(siginfo.as_bytes());
                     bytes_written += size_of::<SignalfdSiginfo>();
@@ -1360,7 +1363,14 @@ impl Task {
                         ),
                     },
                 )
-                .map(|fd| i32::try_from(fd).expect("fd should fit in i32"))
+                .map(|fd| {
+                    // fd is u32, convert to i32. In practice, fd tables are limited
+                    // so this should always succeed. Use saturating conversion.
+                    #[allow(clippy::cast_possible_wrap)]
+                    {
+                        fd.min(i32::MAX as u32) as i32
+                    }
+                })
                 .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
         } else {
             // Update an existing signalfd
