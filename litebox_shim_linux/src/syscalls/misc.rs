@@ -55,9 +55,21 @@ const fn to_fixed_size_array<const N: usize>(s: &str) -> [u8; N] {
     }
     arr
 }
-const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
+
+/// Convert a string slice to a fixed-size array of bytes at runtime.
+///
+/// Similar to `to_fixed_size_array` but works at runtime for dynamic strings.
+fn str_to_fixed_array<const N: usize>(s: &str) -> [u8; N] {
+    let bytes = s.as_bytes();
+    let mut arr = [0u8; N];
+    let len = bytes.len().min(N - 1);
+    arr[..len].copy_from_slice(&bytes[..len]);
+    arr
+}
+
+const SYS_INFO_BASE: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
     sysname: to_fixed_size_array::<65>("LiteBox"),
-    nodename: to_fixed_size_array::<65>("litebox"),
+    nodename: [0u8; 65], // Will be filled dynamically from GlobalState.hostname
     release: to_fixed_size_array::<65>("5.11.0"), // libc seems to expect this to be not too old
     version: to_fixed_size_array::<65>("5.11.0"),
     #[cfg(target_arch = "x86_64")]
@@ -73,7 +85,10 @@ impl Task {
         &self,
         buf: crate::MutPtr<litebox_common_linux::Utsname>,
     ) -> Result<(), Errno> {
-        buf.write_at_offset(0, SYS_INFO).ok_or(Errno::EFAULT)
+        let mut utsname = SYS_INFO_BASE;
+        let hostname = self.global.hostname.read();
+        utsname.nodename = str_to_fixed_array::<65>(hostname.as_str());
+        buf.write_at_offset(0, utsname).ok_or(Errno::EFAULT)
     }
 
     /// Handle syscall `sysinfo`.
@@ -101,6 +116,38 @@ impl Task {
             mem_unit: 1,
             ..Default::default()
         }
+    }
+
+    /// Handle syscall `sethostname`.
+    ///
+    /// Sets the system hostname. In LiteBox, no permission check is performed
+    /// (any user can change the hostname in the sandbox).
+    pub(crate) fn sys_sethostname(
+        &self,
+        name: crate::ConstPtr<u8>,
+        len: usize,
+    ) -> Result<(), Errno> {
+        // Linux HOST_NAME_MAX is 64 (not including null terminator)
+        const HOST_NAME_MAX: usize = 64;
+
+        if len > HOST_NAME_MAX {
+            return Err(Errno::EINVAL);
+        }
+
+        // Read the hostname from user space
+        let buf = name.to_owned_slice(len).ok_or(Errno::EFAULT)?;
+
+        // Convert to string and validate UTF-8
+        let hostname_str = core::str::from_utf8(&buf).map_err(|_| Errno::EINVAL)?;
+
+        // Update the global hostname
+        let mut hostname = self.global.hostname.write();
+        hostname.clear();
+        hostname
+            .try_push_str(hostname_str)
+            .map_err(|_| Errno::EINVAL)?;
+
+        Ok(())
     }
 }
 
@@ -190,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn test_uname() {
+    fn test_uname_default_hostname() {
         let task = init_platform(None);
 
         let mut utsname = MaybeUninit::<litebox_common_linux::Utsname>::uninit();
@@ -198,11 +245,96 @@ mod tests {
         task.sys_uname(ptr).expect("uname failed");
         let utsname = unsafe { utsname.assume_init() };
 
-        assert_eq!(utsname.sysname, super::SYS_INFO.sysname);
-        assert_eq!(utsname.nodename, super::SYS_INFO.nodename);
-        assert_eq!(utsname.release, super::SYS_INFO.release);
-        assert_eq!(utsname.version, super::SYS_INFO.version);
-        assert_eq!(utsname.machine, super::SYS_INFO.machine);
-        assert_eq!(utsname.domainname, super::SYS_INFO.domainname);
+        assert_eq!(utsname.sysname, super::SYS_INFO_BASE.sysname);
+        // Default hostname should be "litebox"
+        assert_eq!(
+            &utsname.nodename[..8],
+            b"litebox\0",
+            "default hostname should be 'litebox'"
+        );
+        assert_eq!(utsname.release, super::SYS_INFO_BASE.release);
+        assert_eq!(utsname.version, super::SYS_INFO_BASE.version);
+        assert_eq!(utsname.machine, super::SYS_INFO_BASE.machine);
+        assert_eq!(utsname.domainname, super::SYS_INFO_BASE.domainname);
+    }
+
+    #[test]
+    fn test_sethostname_and_uname() {
+        let task = init_platform(None);
+
+        // Set a new hostname
+        let new_hostname = b"myhost";
+        let name_ptr = crate::ConstPtr::from_ptr(new_hostname.as_ptr());
+        task.sys_sethostname(name_ptr, new_hostname.len())
+            .expect("sethostname failed");
+
+        // Verify the hostname was changed via uname
+        let mut utsname = MaybeUninit::<litebox_common_linux::Utsname>::uninit();
+        let ptr = crate::MutPtr::from_ptr(utsname.as_mut_ptr());
+        task.sys_uname(ptr).expect("uname failed");
+        let utsname = unsafe { utsname.assume_init() };
+
+        assert_eq!(
+            &utsname.nodename[..7],
+            b"myhost\0",
+            "hostname should be 'myhost'"
+        );
+    }
+
+    #[test]
+    fn test_sethostname_max_length() {
+        let task = init_platform(None);
+
+        // Set hostname at max length (64 bytes)
+        let max_hostname = [b'a'; 64];
+        let name_ptr = crate::ConstPtr::from_ptr(max_hostname.as_ptr());
+        task.sys_sethostname(name_ptr, max_hostname.len())
+            .expect("sethostname with max length should succeed");
+
+        // Verify via uname
+        let mut utsname = MaybeUninit::<litebox_common_linux::Utsname>::uninit();
+        let ptr = crate::MutPtr::from_ptr(utsname.as_mut_ptr());
+        task.sys_uname(ptr).expect("uname failed");
+        let utsname = unsafe { utsname.assume_init() };
+
+        // First 64 bytes should be 'a', byte 65 should be null terminator
+        assert!(
+            utsname.nodename[..64].iter().all(|&b| b == b'a'),
+            "hostname should be 64 'a' characters"
+        );
+        assert_eq!(utsname.nodename[64], 0, "should have null terminator");
+    }
+
+    #[test]
+    fn test_sethostname_too_long() {
+        use litebox_common_linux::errno::Errno;
+
+        let task = init_platform(None);
+
+        // Try to set hostname longer than max (65 bytes)
+        let too_long_hostname = [b'a'; 65];
+        let name_ptr = crate::ConstPtr::from_ptr(too_long_hostname.as_ptr());
+        let result = task.sys_sethostname(name_ptr, too_long_hostname.len());
+
+        assert_eq!(result, Err(Errno::EINVAL), "should fail with EINVAL");
+    }
+
+    #[test]
+    fn test_sethostname_empty() {
+        let task = init_platform(None);
+
+        // Set empty hostname
+        let empty: [u8; 0] = [];
+        let name_ptr = crate::ConstPtr::from_ptr(empty.as_ptr());
+        task.sys_sethostname(name_ptr, 0)
+            .expect("sethostname with empty hostname should succeed");
+
+        // Verify via uname
+        let mut utsname = MaybeUninit::<litebox_common_linux::Utsname>::uninit();
+        let ptr = crate::MutPtr::from_ptr(utsname.as_mut_ptr());
+        task.sys_uname(ptr).expect("uname failed");
+        let utsname = unsafe { utsname.assume_init() };
+
+        assert_eq!(utsname.nodename[0], 0, "hostname should be empty");
     }
 }

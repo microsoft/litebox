@@ -196,6 +196,7 @@ impl LinuxShimBuilder {
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
+            hostname: litebox::sync::RwLock::new(arrayvec::ArrayString::from("litebox").unwrap()),
         });
         LinuxShim(global)
     }
@@ -848,6 +849,7 @@ impl Task {
                 addrlen,
             } => syscall!(sys_getpeername(sockfd, addr, addrlen)),
             SyscallRequest::Uname { buf } => syscall!(sys_uname(buf)),
+            SyscallRequest::SetHostname { name, len } => syscall!(sys_sethostname(name, len)),
             SyscallRequest::Fcntl { fd, arg } => syscall!(sys_fcntl(fd, arg)),
             SyscallRequest::Getcwd { buf, size: count } => {
                 let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
@@ -1163,6 +1165,8 @@ struct GlobalState {
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable>,
+    /// System hostname (used by uname and sethostname)
+    hostname: litebox::sync::RwLock<Platform, arrayvec::ArrayString<65>>,
 }
 
 struct Task {

@@ -2055,6 +2055,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Uname {
         buf: Platform::RawMutPointer<Utsname>,
     },
+    SetHostname {
+        name: Platform::RawConstPointer<u8>,
+        len: usize,
+    },
     Fcntl {
         fd: i32,
         arg: FcntlArg<Platform>,
@@ -2514,6 +2518,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::exit => sys_req!(Exit { status }),
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             Sysno::uname => sys_req!(Uname { buf:* }),
+            Sysno::sethostname => sys_req!(SetHostname { name:*, len }),
             Sysno::fcntl => {
                 let cmd: i32 = ctx.sys_req_arg(1);
                 let arg = ctx.sys_req_arg(2);
