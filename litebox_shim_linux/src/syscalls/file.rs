@@ -869,6 +869,7 @@ impl Descriptor {
             },
             Descriptor::Memfd { file, .. } => {
                 let size = file.size();
+                let blocks = size.div_ceil(512); // number of 512B blocks
                 FileStat {
                     st_dev: 0,
                     st_ino: 0,
@@ -882,8 +883,12 @@ impl Descriptor {
                     st_rdev: 0,
                     st_size: size,
                     st_blksize: 4096,
+                    // st_blocks is i64 on x86_64, u32 on x86
+                    #[cfg(target_arch = "x86_64")]
                     #[expect(clippy::cast_possible_wrap)]
-                    st_blocks: size.div_ceil(512) as i64, // number of 512B blocks
+                    st_blocks: blocks as i64,
+                    #[cfg(target_arch = "x86")]
+                    st_blocks: blocks as u32,
                     ..Default::default()
                 }
             }
