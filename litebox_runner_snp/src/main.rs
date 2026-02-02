@@ -42,6 +42,20 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
     } {
         Ok(()) => (),
         Err(e) => {
+            if let litebox::mm::linux::PageFaultError::AccessError(_) = e {
+                // Try to recover from page faults in kernel mode using the exception table.
+                // This handles fallible memory operations like memcpy_fallible.
+                // Only check the exception table for kernel-space addresses (high canonical addresses).
+                if pt_regs.rip >= <litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel as litebox::platform::PageManagementProvider<4096>>::TASK_ADDR_MAX {
+                    if let Some(fixup_addr) =
+                        litebox::mm::exception_table::search_exception_tables(pt_regs.rip.truncate())
+                    {
+                        pt_regs.rip = fixup_addr;
+                        return;
+                    }
+                }
+            }
+
             litebox::log_println!(
                 litebox_platform_multiplex::platform(),
                 "page fault at {} for {} with code {} failed: {}",
@@ -102,6 +116,7 @@ pub extern "C" fn sandbox_kernel_init(
 
 /// Pre-defined file paths to load from host
 const HOST_FILE_PATHS: &[&str] = &[
+    "/out/hello",
     "/out/efault",
     // Add more paths as needed
 ];

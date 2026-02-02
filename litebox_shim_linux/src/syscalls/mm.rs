@@ -92,8 +92,7 @@ impl Task {
                 if size == 0 {
                     break;
                 }
-                // TODO: implement [`memcpy`](https://elixir.bootlin.com/linux/v5.19.17/source/arch/x86/lib/memcpy_64.S#L30)
-                // to return EFAULT if the user buffer is not valid
+                // ptr is a valid pointer returned by do_mmap.
                 ptr.copy_from_slice(copied, &buffer[..size]).unwrap();
                 copied += size;
                 file_offset += size;
