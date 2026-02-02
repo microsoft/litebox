@@ -2221,6 +2221,48 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Geteuid,
     Getgid,
     Getegid,
+    /// Set real, effective, and saved user ID
+    Setuid {
+        uid: u32,
+    },
+    /// Set real, effective, and saved group ID
+    Setgid {
+        gid: u32,
+    },
+    /// Set real and effective user ID
+    Setreuid {
+        ruid: u32,
+        euid: u32,
+    },
+    /// Set real and effective group ID
+    Setregid {
+        rgid: u32,
+        egid: u32,
+    },
+    /// Set real, effective, and saved user ID
+    Setresuid {
+        ruid: u32,
+        euid: u32,
+        suid: u32,
+    },
+    /// Set real, effective, and saved group ID
+    Setresgid {
+        rgid: u32,
+        egid: u32,
+        sgid: u32,
+    },
+    /// Get real, effective, and saved user ID
+    Getresuid {
+        ruid: Platform::RawMutPointer<u32>,
+        euid: Platform::RawMutPointer<u32>,
+        suid: Platform::RawMutPointer<u32>,
+    },
+    /// Get real, effective, and saved group ID
+    Getresgid {
+        rgid: Platform::RawMutPointer<u32>,
+        egid: Platform::RawMutPointer<u32>,
+        sgid: Platform::RawMutPointer<u32>,
+    },
     Sysinfo {
         buf: Platform::RawMutPointer<Sysinfo>,
     },
@@ -2591,6 +2633,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
+            Sysno::setuid => sys_req!(Setuid { uid }),
+            Sysno::setgid => sys_req!(Setgid { gid }),
+            Sysno::setreuid => sys_req!(Setreuid { ruid, euid }),
+            Sysno::setregid => sys_req!(Setregid { rgid, egid }),
+            Sysno::setresuid => sys_req!(Setresuid { ruid, euid, suid }),
+            Sysno::setresgid => sys_req!(Setresgid { rgid, egid, sgid }),
+            Sysno::getresuid => sys_req!(Getresuid { ruid:*, euid:*, suid:* }),
+            Sysno::getresgid => sys_req!(Getresgid { rgid:*, egid:*, sgid:* }),
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
             Sysno::epoll_wait => {
                 sys_req!(EpollPwait { epfd, events:*, maxevents, timeout, sigmask: { None }, sigsetsize: { 0 }, })

@@ -72,7 +72,7 @@ impl Task {
     pub fn init_auxv(&self) -> AuxVec {
         let mut aux = AuxVec::new();
 
-        let user_info = &self.credentials;
+        let user_info = self.credentials.borrow();
         aux.insert(AuxKey::AT_UID, user_info.uid as usize);
         aux.insert(AuxKey::AT_EUID, user_info.euid as usize);
         aux.insert(AuxKey::AT_GID, user_info.gid as usize);

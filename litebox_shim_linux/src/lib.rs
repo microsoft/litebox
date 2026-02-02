@@ -238,8 +238,10 @@ impl LinuxShim {
                 credentials: syscalls::process::Credentials {
                     uid,
                     euid,
+                    suid: euid, // saved-set-user-ID initialized to euid
                     gid,
                     egid,
+                    sgid: egid, // saved-set-group-ID initialized to egid
                 }
                 .into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
@@ -1092,6 +1094,44 @@ impl Task {
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
+            SyscallRequest::Setuid { uid } => {
+                self.sys_setuid(uid);
+                Ok(0)
+            }
+            SyscallRequest::Setgid { gid } => {
+                self.sys_setgid(gid);
+                Ok(0)
+            }
+            SyscallRequest::Setreuid { ruid, euid } => {
+                self.sys_setreuid(ruid, euid);
+                Ok(0)
+            }
+            SyscallRequest::Setregid { rgid, egid } => {
+                self.sys_setregid(rgid, egid);
+                Ok(0)
+            }
+            SyscallRequest::Setresuid { ruid, euid, suid } => {
+                self.sys_setresuid(ruid, euid, suid);
+                Ok(0)
+            }
+            SyscallRequest::Setresgid { rgid, egid, sgid } => {
+                self.sys_setresgid(rgid, egid, sgid);
+                Ok(0)
+            }
+            SyscallRequest::Getresuid { ruid, euid, suid } => {
+                let (r, e, s) = self.sys_getresuid();
+                ruid.write_at_offset(0, r).ok_or(Errno::EFAULT)?;
+                euid.write_at_offset(0, e).ok_or(Errno::EFAULT)?;
+                suid.write_at_offset(0, s).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            SyscallRequest::Getresgid { rgid, egid, sgid } => {
+                let (r, e, s) = self.sys_getresgid();
+                rgid.write_at_offset(0, r).ok_or(Errno::EFAULT)?;
+                egid.write_at_offset(0, e).ok_or(Errno::EFAULT)?;
+                sgid.write_at_offset(0, s).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
                 buf.write_at_offset(0, sysinfo)
@@ -1175,9 +1215,9 @@ struct Task {
     ppid: i32,
     /// Thread ID
     tid: i32,
-    /// Task credentials. These are set per task but are Arc'd to save space
-    /// since most tasks never change their credentials.
-    credentials: Arc<syscalls::process::Credentials>,
+    /// Task credentials. Uses RefCell to allow setuid/setgid family syscalls
+    /// to modify credentials.
+    credentials: RefCell<syscalls::process::Credentials>,
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
     /// Filesystem state. `RefCell` to support `unshare` in the future.
@@ -1215,11 +1255,13 @@ mod test_utils {
                 pid,
                 ppid: 0,
                 tid: pid,
-                credentials: Arc::new(syscalls::process::Credentials {
+                credentials: RefCell::new(syscalls::process::Credentials {
                     uid: 0,
                     euid: 0,
+                    suid: 0,
                     gid: 0,
                     egid: 0,
+                    sgid: 0,
                 }),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -1244,7 +1286,7 @@ mod test_utils {
                 pid: self.pid,
                 ppid: self.ppid,
                 tid,
-                credentials: self.credentials.clone(),
+                credentials: RefCell::new(self.credentials.borrow().clone()),
                 comm: self.comm.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),

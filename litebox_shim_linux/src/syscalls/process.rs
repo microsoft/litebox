@@ -311,13 +311,23 @@ enum ThreadInitState {
     },
 }
 
-/// Credentials of a process
+/// Credentials of a process.
+///
+/// Stores the real, effective, and saved user/group IDs as per POSIX.
 #[derive(Clone)]
 pub(crate) struct Credentials {
+    /// Real user ID
     pub uid: u32,
+    /// Effective user ID
     pub euid: u32,
+    /// Saved set-user-ID
+    pub suid: u32,
+    /// Real group ID
     pub gid: u32,
+    /// Effective group ID
     pub egid: u32,
+    /// Saved set-group-ID
+    pub sgid: u32,
 }
 
 impl Task {
@@ -752,7 +762,7 @@ impl Task {
                         pid: self.pid,
                         tid: child_tid,
                         ppid: self.ppid,
-                        credentials: self.credentials.clone(),
+                        credentials: core::cell::RefCell::new(self.credentials.borrow().clone()),
                         comm: self.comm.clone(),
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
@@ -1154,22 +1164,142 @@ impl Task {
 
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
-        self.credentials.uid
+        self.credentials.borrow().uid
     }
 
     /// Handle syscall `geteuid`.
     pub(crate) fn sys_geteuid(&self) -> u32 {
-        self.credentials.euid
+        self.credentials.borrow().euid
     }
 
     /// Handle syscall `getgid`.
     pub(crate) fn sys_getgid(&self) -> u32 {
-        self.credentials.gid
+        self.credentials.borrow().gid
     }
 
     /// Handle syscall `getegid`.
     pub(crate) fn sys_getegid(&self) -> u32 {
-        self.credentials.egid
+        self.credentials.borrow().egid
+    }
+
+    /// Handle syscall `setuid`.
+    ///
+    /// Sets the real, effective, and saved user IDs to `uid`.
+    /// A value of -1 (0xFFFFFFFF) means "don't change".
+    pub(crate) fn sys_setuid(&self, uid: u32) {
+        if uid != u32::MAX {
+            let mut creds = self.credentials.borrow_mut();
+            creds.uid = uid;
+            creds.euid = uid;
+            creds.suid = uid;
+        }
+    }
+
+    /// Handle syscall `setgid`.
+    ///
+    /// Sets the real, effective, and saved group IDs to `gid`.
+    /// A value of -1 (0xFFFFFFFF) means "don't change".
+    pub(crate) fn sys_setgid(&self, gid: u32) {
+        if gid != u32::MAX {
+            let mut creds = self.credentials.borrow_mut();
+            creds.gid = gid;
+            creds.egid = gid;
+            creds.sgid = gid;
+        }
+    }
+
+    /// Handle syscall `setreuid`.
+    ///
+    /// Sets the real and effective user IDs. A value of -1 (0xFFFFFFFF) means
+    /// "don't change that ID". If the real UID is set or the effective UID
+    /// changes, the saved set-user-ID is set to the new effective UID.
+    pub(crate) fn sys_setreuid(&self, ruid: u32, euid: u32) {
+        let mut creds = self.credentials.borrow_mut();
+        let old_euid = creds.euid;
+
+        if ruid != u32::MAX {
+            creds.uid = ruid;
+        }
+        if euid != u32::MAX {
+            creds.euid = euid;
+        }
+
+        // If ruid was set or euid changed, update suid to new euid
+        if ruid != u32::MAX || (euid != u32::MAX && euid != old_euid) {
+            creds.suid = creds.euid;
+        }
+    }
+
+    /// Handle syscall `setregid`.
+    ///
+    /// Sets the real and effective group IDs. A value of -1 (0xFFFFFFFF) means
+    /// "don't change that ID". If the real GID is set or the effective GID
+    /// changes, the saved set-group-ID is set to the new effective GID.
+    pub(crate) fn sys_setregid(&self, rgid: u32, egid: u32) {
+        let mut creds = self.credentials.borrow_mut();
+        let old_egid = creds.egid;
+
+        if rgid != u32::MAX {
+            creds.gid = rgid;
+        }
+        if egid != u32::MAX {
+            creds.egid = egid;
+        }
+
+        // If rgid was set or egid changed, update sgid to new egid
+        if rgid != u32::MAX || (egid != u32::MAX && egid != old_egid) {
+            creds.sgid = creds.egid;
+        }
+    }
+
+    /// Handle syscall `setresuid`.
+    ///
+    /// Sets the real, effective, and saved user IDs. A value of -1 (0xFFFFFFFF)
+    /// means "don't change that ID".
+    pub(crate) fn sys_setresuid(&self, ruid: u32, euid: u32, suid: u32) {
+        let mut creds = self.credentials.borrow_mut();
+        if ruid != u32::MAX {
+            creds.uid = ruid;
+        }
+        if euid != u32::MAX {
+            creds.euid = euid;
+        }
+        if suid != u32::MAX {
+            creds.suid = suid;
+        }
+    }
+
+    /// Handle syscall `setresgid`.
+    ///
+    /// Sets the real, effective, and saved group IDs. A value of -1 (0xFFFFFFFF)
+    /// means "don't change that ID".
+    pub(crate) fn sys_setresgid(&self, rgid: u32, egid: u32, sgid: u32) {
+        let mut creds = self.credentials.borrow_mut();
+        if rgid != u32::MAX {
+            creds.gid = rgid;
+        }
+        if egid != u32::MAX {
+            creds.egid = egid;
+        }
+        if sgid != u32::MAX {
+            creds.sgid = sgid;
+        }
+    }
+
+    /// Handle syscall `getresuid`.
+    ///
+    /// Returns the real, effective, and saved user IDs.
+    pub(crate) fn sys_getresuid(&self) -> (u32, u32, u32) {
+        let creds = self.credentials.borrow();
+        (creds.uid, creds.euid, creds.suid)
+    }
+
+    /// Handle syscall `getresgid`.
+    ///
+    /// Returns the real, effective, and saved group IDs.
+    pub(crate) fn sys_getresgid(&self) -> (u32, u32, u32) {
+        let creds = self.credentials.borrow();
+        (creds.gid, creds.egid, creds.sgid)
     }
 }
 
@@ -1605,5 +1735,136 @@ mod tests {
             &long_name[..litebox_common_linux::TASK_COMM_LEN - 1],
             "prctl get_name returned unexpected comm for too long name"
         );
+    }
+
+    #[test]
+    fn test_setuid() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Initial state: all UIDs are 0
+        assert_eq!(task.sys_getuid(), 0);
+        assert_eq!(task.sys_geteuid(), 0);
+        let (ruid, euid, suid) = task.sys_getresuid();
+        assert_eq!((ruid, euid, suid), (0, 0, 0));
+
+        // setuid(1000) should set all three UIDs
+        task.sys_setuid(1000);
+        assert_eq!(task.sys_getuid(), 1000);
+        assert_eq!(task.sys_geteuid(), 1000);
+        let (ruid, euid, suid) = task.sys_getresuid();
+        assert_eq!((ruid, euid, suid), (1000, 1000, 1000));
+
+        // setuid(-1) should be a no-op
+        task.sys_setuid(u32::MAX);
+        assert_eq!(task.sys_getuid(), 1000);
+    }
+
+    #[test]
+    fn test_setgid() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Initial state: all GIDs are 0
+        assert_eq!(task.sys_getgid(), 0);
+        assert_eq!(task.sys_getegid(), 0);
+        let (rgid, egid, sgid) = task.sys_getresgid();
+        assert_eq!((rgid, egid, sgid), (0, 0, 0));
+
+        // setgid(1000) should set all three GIDs
+        task.sys_setgid(1000);
+        assert_eq!(task.sys_getgid(), 1000);
+        assert_eq!(task.sys_getegid(), 1000);
+        let (rgid, egid, sgid) = task.sys_getresgid();
+        assert_eq!((rgid, egid, sgid), (1000, 1000, 1000));
+
+        // setgid(-1) should be a no-op
+        task.sys_setgid(u32::MAX);
+        assert_eq!(task.sys_getgid(), 1000);
+    }
+
+    #[test]
+    fn test_setreuid() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // setreuid(1000, 2000)
+        task.sys_setreuid(1000, 2000);
+        assert_eq!(task.sys_getuid(), 1000);
+        assert_eq!(task.sys_geteuid(), 2000);
+        // suid should be set to new euid when ruid is set
+        let (_, _, suid) = task.sys_getresuid();
+        assert_eq!(suid, 2000);
+
+        // setreuid(-1, 3000) - only change euid
+        task.sys_setreuid(u32::MAX, 3000);
+        assert_eq!(task.sys_getuid(), 1000); // unchanged
+        assert_eq!(task.sys_geteuid(), 3000);
+        // suid should be updated because euid changed
+        let (_, _, suid) = task.sys_getresuid();
+        assert_eq!(suid, 3000);
+
+        // setreuid(-1, -1) - no-op
+        task.sys_setreuid(u32::MAX, u32::MAX);
+        assert_eq!(task.sys_getuid(), 1000);
+        assert_eq!(task.sys_geteuid(), 3000);
+    }
+
+    #[test]
+    fn test_setregid() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // setregid(1000, 2000)
+        task.sys_setregid(1000, 2000);
+        assert_eq!(task.sys_getgid(), 1000);
+        assert_eq!(task.sys_getegid(), 2000);
+        // sgid should be set to new egid when rgid is set
+        let (_, _, sgid) = task.sys_getresgid();
+        assert_eq!(sgid, 2000);
+
+        // setregid(-1, 3000) - only change egid
+        task.sys_setregid(u32::MAX, 3000);
+        assert_eq!(task.sys_getgid(), 1000); // unchanged
+        assert_eq!(task.sys_getegid(), 3000);
+        // sgid should be updated because egid changed
+        let (_, _, sgid) = task.sys_getresgid();
+        assert_eq!(sgid, 3000);
+    }
+
+    #[test]
+    fn test_setresuid() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Set all three independently
+        task.sys_setresuid(100, 200, 300);
+        let (ruid, euid, suid) = task.sys_getresuid();
+        assert_eq!((ruid, euid, suid), (100, 200, 300));
+
+        // Partial update with -1
+        task.sys_setresuid(u32::MAX, 500, u32::MAX);
+        let (ruid, euid, suid) = task.sys_getresuid();
+        assert_eq!((ruid, euid, suid), (100, 500, 300)); // only euid changed
+
+        // All -1 should be no-op
+        task.sys_setresuid(u32::MAX, u32::MAX, u32::MAX);
+        let (ruid, euid, suid) = task.sys_getresuid();
+        assert_eq!((ruid, euid, suid), (100, 500, 300));
+    }
+
+    #[test]
+    fn test_setresgid() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Set all three independently
+        task.sys_setresgid(100, 200, 300);
+        let (rgid, egid, sgid) = task.sys_getresgid();
+        assert_eq!((rgid, egid, sgid), (100, 200, 300));
+
+        // Partial update with -1
+        task.sys_setresgid(u32::MAX, 500, u32::MAX);
+        let (rgid, egid, sgid) = task.sys_getresgid();
+        assert_eq!((rgid, egid, sgid), (100, 500, 300)); // only egid changed
+
+        // All -1 should be no-op
+        task.sys_setresgid(u32::MAX, u32::MAX, u32::MAX);
+        let (rgid, egid, sgid) = task.sys_getresgid();
+        assert_eq!((rgid, egid, sgid), (100, 500, 300));
     }
 }
