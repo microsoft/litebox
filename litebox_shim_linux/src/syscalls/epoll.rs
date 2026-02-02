@@ -41,6 +41,7 @@ pub(crate) enum EpollDescriptor {
     Socket(Arc<super::net::SocketFd>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
     Unix(Arc<crate::syscalls::unix::UnixSocket>),
+    Inotify(Arc<crate::syscalls::inotify::InotifyFile<Platform>>),
 }
 
 impl EpollDescriptor {
@@ -54,6 +55,7 @@ impl EpollDescriptor {
             Descriptor::Eventfd { file, .. } => Ok(EpollDescriptor::Eventfd(file.clone())),
             Descriptor::Epoll { file, .. } => Ok(EpollDescriptor::Epoll(file.clone())),
             Descriptor::Unix { file, .. } => Ok(EpollDescriptor::Unix(file.clone())),
+            Descriptor::Inotify { file, .. } => Ok(EpollDescriptor::Inotify(file.clone())),
         }
     }
 }
@@ -65,6 +67,7 @@ enum DescriptorRef {
     Socket(Weak<super::net::SocketFd>),
     Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
     Unix(Weak<crate::syscalls::unix::UnixSocket>),
+    Inotify(Weak<crate::syscalls::inotify::InotifyFile<Platform>>),
 }
 
 impl DescriptorRef {
@@ -76,6 +79,7 @@ impl DescriptorRef {
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
             EpollDescriptor::Pipe(pipe) => Self::Pipe(Arc::downgrade(pipe)),
             EpollDescriptor::Unix(unix) => Self::Unix(Arc::downgrade(unix)),
+            EpollDescriptor::Inotify(inotify) => Self::Inotify(Arc::downgrade(inotify)),
         }
     }
 
@@ -87,6 +91,7 @@ impl DescriptorRef {
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
             DescriptorRef::Pipe(pipe) => pipe.upgrade().map(EpollDescriptor::Pipe),
             DescriptorRef::Unix(unix) => unix.upgrade().map(EpollDescriptor::Unix),
+            DescriptorRef::Inotify(inotify) => inotify.upgrade().map(EpollDescriptor::Inotify),
         }
     }
 }
@@ -127,6 +132,7 @@ impl EpollDescriptor {
                 return global.pipes.with_iopollable(fd, poll).ok();
             }
             EpollDescriptor::Unix(file) => file,
+            EpollDescriptor::Inotify(file) => file.as_ref(),
         };
         Some(poll(io_pollable))
     }
@@ -300,6 +306,7 @@ impl EpollEntryKey {
             EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).addr(),
             EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).addr(),
             EpollDescriptor::Unix(unix) => Arc::as_ptr(unix).addr(),
+            EpollDescriptor::Inotify(inotify) => Arc::as_ptr(inotify).addr(),
         };
         Self(fd, ptr)
     }

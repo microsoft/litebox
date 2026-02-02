@@ -564,6 +564,19 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Flags for `inotify_init1()`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct InotifyInitFlags: core::ffi::c_int {
+        /// Set the close-on-exec flag on the new file descriptor.
+        #[allow(clippy::cast_possible_wrap)]
+        const IN_CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits() as i32;
+        /// Set the O_NONBLOCK file status flag on the new open file description.
+        #[allow(clippy::cast_possible_wrap)]
+        const IN_NONBLOCK = litebox::fs::OFlags::NONBLOCK.bits() as i32;
+    }
+}
+
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 #[repr(C)]
@@ -2261,6 +2274,21 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    /// Create an inotify instance.
+    InotifyInit {
+        flags: InotifyInitFlags,
+    },
+    /// Add a watch to an inotify instance, or modify an existing watch.
+    InotifyAddWatch {
+        fd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        mask: u32,
+    },
+    /// Remove an existing watch from an inotify instance.
+    InotifyRmWatch {
+        fd: i32,
+        wd: i32,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2736,6 +2764,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            Sysno::inotify_init => SyscallRequest::InotifyInit {
+                flags: InotifyInitFlags::empty(),
+            },
+            Sysno::inotify_init1 => sys_req!(InotifyInit { flags }),
+            Sysno::inotify_add_watch => sys_req!(InotifyAddWatch { fd, pathname:*, mask }),
+            Sysno::inotify_rm_watch => sys_req!(InotifyRmWatch { fd, wd }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone => {
                 let args = CloneArgs {
@@ -3182,6 +3216,7 @@ reinterpret_truncated_from_usize_for! {
         ReceiveFlags,
         EpollCreateFlags,
         EfdFlags,
+        InotifyInitFlags,
         RngFlags,
         TimerFlags,
     ],

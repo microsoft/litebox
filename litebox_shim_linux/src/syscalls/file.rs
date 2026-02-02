@@ -289,6 +289,8 @@ impl Task {
                 litebox_common_linux::ReceiveFlags::empty(),
                 None,
             ),
+            // inotify stub: never has events, always returns EAGAIN
+            Descriptor::Inotify { .. } => Err(Errno::EAGAIN),
         }
     }
 
@@ -329,7 +331,8 @@ impl Task {
                     )
                     .flatten()
             }
-            Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+            // Epoll and inotify fds cannot be written to
+            Descriptor::Epoll { .. } | Descriptor::Inotify { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { file, .. } => {
                 let file = file.clone();
                 drop(file_table);
@@ -394,9 +397,10 @@ impl Task {
                     |_| Err(Errno::ESPIPE),
                 )
                 .flatten(),
-            Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } | Descriptor::Unix { .. } => {
-                Err(Errno::ESPIPE)
-            }
+            Descriptor::Epoll { .. }
+            | Descriptor::Eventfd { .. }
+            | Descriptor::Unix { .. }
+            | Descriptor::Inotify { .. } => Err(Errno::ESPIPE),
         }
     }
 
@@ -444,9 +448,10 @@ impl Task {
                     }
                 }
             }
-            Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                Ok(())
-            }
+            Descriptor::Eventfd { .. }
+            | Descriptor::Epoll { .. }
+            | Descriptor::Unix { .. }
+            | Descriptor::Inotify { .. } => Ok(()),
         }
     }
 
@@ -516,6 +521,7 @@ impl Task {
                 Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
                 Descriptor::Eventfd { .. } => todo!(),
                 Descriptor::Unix { .. } => todo!(),
+                Descriptor::Inotify { .. } => return Err(Errno::EAGAIN),
             };
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
@@ -599,7 +605,8 @@ impl Task {
                     )
                     .flatten()
             }
-            Descriptor::Epoll { .. } => Err(Errno::EINVAL),
+            // Epoll and inotify fds cannot be written to
+            Descriptor::Epoll { .. } | Descriptor::Inotify { .. } => Err(Errno::EINVAL),
             Descriptor::Eventfd { .. } => todo!(),
             Descriptor::Unix { .. } => todo!(),
         };
@@ -792,6 +799,20 @@ impl Descriptor {
                 st_blocks: 0,
                 ..Default::default()
             },
+            Descriptor::Inotify { .. } => FileStat {
+                // inotify file descriptor stats
+                st_dev: 0,
+                st_ino: 0,
+                st_nlink: 1,
+                st_mode: Mode::RUSR.bits().truncate(),
+                st_uid: 0,
+                st_gid: 0,
+                st_rdev: 0,
+                st_size: 0,
+                st_blksize: 4096,
+                st_blocks: 0,
+                ..Default::default()
+            },
         };
         Ok(fstat)
     }
@@ -822,7 +843,8 @@ impl Descriptor {
             ),
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => Ok(
+            | Descriptor::Unix { close_on_exec, .. }
+            | Descriptor::Inotify { close_on_exec, .. } => Ok(
                 if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
                     FileDescriptorFlags::FD_CLOEXEC
                 } else {
@@ -857,7 +879,8 @@ impl Descriptor {
             )?,
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => {
+            | Descriptor::Unix { close_on_exec, .. }
+            | Descriptor::Inotify { close_on_exec, .. } => {
                 close_on_exec.store(
                     flags.contains(FileDescriptorFlags::FD_CLOEXEC),
                     core::sync::atomic::Ordering::Relaxed,
@@ -1002,6 +1025,7 @@ impl Task {
                 Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
                 Descriptor::Unix { file, .. } => Ok(file.get_status().bits()),
+                Descriptor::Inotify { file, .. } => Ok(file.get_status().bits()),
             },
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
@@ -1081,6 +1105,9 @@ impl Task {
                     }
                     Descriptor::Epoll { .. } => todo!(),
                     Descriptor::Unix { file, .. } => {
+                        toggle_flags!(file);
+                    }
+                    Descriptor::Inotify { file, .. } => {
                         toggle_flags!(file);
                     }
                 }
@@ -1253,6 +1280,77 @@ impl Task {
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 
+    /// Create a new inotify instance.
+    pub fn sys_inotify_init(
+        &self,
+        flags: litebox_common_linux::InotifyInitFlags,
+    ) -> Result<u32, Errno> {
+        use litebox_common_linux::InotifyInitFlags;
+
+        // Validate flags - only IN_CLOEXEC and IN_NONBLOCK are valid
+        if flags
+            .contains((InotifyInitFlags::IN_CLOEXEC | InotifyInitFlags::IN_NONBLOCK).complement())
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        let inotify = super::inotify::InotifyFile::new(flags);
+        let files = self.files.borrow();
+        files
+            .file_descriptors
+            .write()
+            .insert(
+                self,
+                Descriptor::Inotify {
+                    file: alloc::sync::Arc::new(inotify),
+                    close_on_exec: core::sync::atomic::AtomicBool::new(
+                        flags.contains(InotifyInitFlags::IN_CLOEXEC),
+                    ),
+                },
+            )
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
+    }
+
+    /// Add a watch to an inotify instance, or modify an existing watch.
+    pub fn sys_inotify_add_watch(
+        &self,
+        fd: i32,
+        pathname: alloc::ffi::CString,
+        mask: u32,
+    ) -> Result<usize, Errno> {
+        let files = self.files.borrow();
+        let fds = files.file_descriptors.read();
+        let desc = fds
+            .get_fd(fd.try_into().map_err(|_| Errno::EBADF)?)
+            .ok_or(Errno::EBADF)?;
+
+        match desc {
+            Descriptor::Inotify { file, .. } => {
+                let path = pathname.to_str().map_err(|_| Errno::EINVAL)?;
+                file.add_watch(alloc::string::String::from(path), mask)
+                    .map(|wd| {
+                        // Watch descriptors are always positive (starting from 1)
+                        usize::try_from(wd).expect("watch descriptor should be positive")
+                    })
+            }
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    /// Remove an existing watch from an inotify instance.
+    pub fn sys_inotify_rm_watch(&self, fd: i32, wd: i32) -> Result<usize, Errno> {
+        let files = self.files.borrow();
+        let fds = files.file_descriptors.read();
+        let desc = fds
+            .get_fd(fd.try_into().map_err(|_| Errno::EBADF)?)
+            .ok_or(Errno::EBADF)?;
+
+        match desc {
+            Descriptor::Inotify { file, .. } => file.rm_watch(wd).map(|()| 0),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
     fn stdio_ioctl(
         &self,
         arg: &IoctlArg<litebox_platform_multiplex::Platform>,
@@ -1363,6 +1461,9 @@ impl Task {
                     Descriptor::Unix { file, .. } => {
                         file.set_status(OFlags::NONBLOCK, val != 0);
                     }
+                    Descriptor::Inotify { file, .. } => {
+                        file.set_status(OFlags::NONBLOCK, val != 0);
+                    }
                 }
                 Ok(0)
             }
@@ -1382,7 +1483,8 @@ impl Task {
                 )?,
                 Descriptor::Eventfd { close_on_exec, .. }
                 | Descriptor::Epoll { close_on_exec, .. }
-                | Descriptor::Unix { close_on_exec, .. } => {
+                | Descriptor::Unix { close_on_exec, .. }
+                | Descriptor::Inotify { close_on_exec, .. } => {
                     close_on_exec.store(true, core::sync::atomic::Ordering::Relaxed);
                     Ok(0)
                 }
@@ -1403,9 +1505,10 @@ impl Task {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                 )?,
-                Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                    Err(Errno::ENOTTY)
-                }
+                Descriptor::Eventfd { .. }
+                | Descriptor::Epoll { .. }
+                | Descriptor::Unix { .. }
+                | Descriptor::Inotify { .. } => Err(Errno::ENOTTY),
             },
             _ => {
                 #[cfg(debug_assertions)]
@@ -1766,6 +1869,10 @@ impl Task {
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
             }),
             Descriptor::Unix { file, .. } => Ok(Descriptor::Unix {
+                file: file.clone(),
+                close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
+            }),
+            Descriptor::Inotify { file, .. } => Ok(Descriptor::Inotify {
                 file: file.clone(),
                 close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
             }),

@@ -481,6 +481,10 @@ enum Descriptor {
         file: alloc::sync::Arc<syscalls::unix::UnixSocket>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
+    Inotify {
+        file: alloc::sync::Arc<syscalls::inotify::InotifyFile<Platform>>,
+        close_on_exec: core::sync::atomic::AtomicBool,
+    },
 }
 
 /// A strongly-typed FD.
@@ -1023,6 +1027,13 @@ impl Task {
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
+            SyscallRequest::InotifyInit { flags } => syscall!(sys_inotify_init(flags)),
+            SyscallRequest::InotifyAddWatch { fd, pathname, mask } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_inotify_add_watch(fd, path, mask))
+                })
+            }
+            SyscallRequest::InotifyRmWatch { fd, wd } => syscall!(sys_inotify_rm_watch(fd, wd)),
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                     pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT)?;
