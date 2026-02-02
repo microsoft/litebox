@@ -195,12 +195,58 @@ fn session_manager() -> &'static SessionManager {
 ///
 /// The caller must ensure that no references to user-space memory are held
 /// after the switch.
+#[inline]
 unsafe fn switch_to_base_page_table() {
     let platform = litebox_platform_multiplex::platform();
     // Safety: We're switching to base page table which contains valid mappings
     // for all kernel memory that will be accessed after the switch.
     unsafe {
         platform.page_table_manager().load_base();
+    }
+}
+
+/// Creates a new task-specific page table.
+#[inline]
+fn create_task_page_table() -> Result<usize, OpteeSmcReturnCode> {
+    let platform = litebox_platform_multiplex::platform();
+    platform
+        .create_task_page_table()
+        .map_err(|_| OpteeSmcReturnCode::ENomem)
+}
+
+/// Switches to a task-specific page table.
+///
+/// # Safety
+///
+/// The caller must ensure that no references to user-space memory from a different
+/// task's address space are held after the switch.
+#[inline]
+unsafe fn switch_to_task_page_table(task_pt_id: usize) -> Result<(), OpteeSmcReturnCode> {
+    let platform = litebox_platform_multiplex::platform();
+    // Safety: We're switching to a task page table which contains valid mappings
+    // for both kernel memory and the specific task's user-space memory.
+    unsafe {
+        platform
+            .page_table_manager()
+            .load_task(task_pt_id)
+            .map_err(|_| OpteeSmcReturnCode::EBadCmd)
+    }
+}
+
+/// Deletes a task-specific page table.
+///
+/// # Safety
+///
+/// The caller must ensure that no references or pointers to memory mapped
+/// by this page table are held after deletion.
+#[inline]
+unsafe fn delete_task_page_table(task_pt_id: usize) -> Result<(), OpteeSmcReturnCode> {
+    let platform = litebox_platform_multiplex::platform();
+    // Safety: caller guarantees no dangling references
+    unsafe {
+        platform
+            .delete_task_page_table(task_pt_id)
+            .map_err(|_| OpteeSmcReturnCode::EBadCmd)
     }
 }
 
@@ -354,7 +400,6 @@ fn open_session_single_instance(
     let instance = instance_arc
         .try_lock()
         .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
-    let platform = litebox_platform_multiplex::platform();
 
     // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID
     let runner_session_id = allocate_session_id();
@@ -370,12 +415,7 @@ fn open_session_single_instance(
     let ta_flags = instance.loaded_program.ta_flags;
 
     // Switch to the existing TA's page table
-    unsafe {
-        platform
-            .page_table_manager()
-            .load_task(task_pt_id)
-            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
-    }
+    unsafe { switch_to_task_page_table(task_pt_id)? };
 
     // Load TA context with parameters for OpenSession - pass actual session_id
     instance
@@ -451,13 +491,8 @@ fn open_session_single_instance(
 
                 // Switch to base page table and delete the task page table
                 unsafe { switch_to_base_page_table() };
-                if let Err(e) = platform.delete_task_page_table(task_pt_id) {
-                    debug_serial_println!(
-                        "Warning: Failed to delete task page table {}: {:?}",
-                        task_pt_id,
-                        e
-                    );
-                }
+                // Safety: We've switched to the base page table above.
+                let _ = unsafe { delete_task_page_table(task_pt_id) };
 
                 // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
                 // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
@@ -519,23 +554,16 @@ fn open_session_new_instance(
         return Err(OpteeSmcReturnCode::ENomem);
     }
 
-    let platform = litebox_platform_multiplex::platform();
-
     // Create and switch to new page table
-    let task_pt_id = platform
-        .create_task_page_table()
-        .map_err(|_| OpteeSmcReturnCode::ENomem)?;
+    let task_pt_id = create_task_page_table()?;
 
     debug_serial_println!("Created task page table ID: {}", task_pt_id);
 
     unsafe {
-        platform
-            .page_table_manager()
-            .load_task(task_pt_id)
-            .inspect_err(|_| {
-                let _ = platform.delete_task_page_table(task_pt_id);
-            })
-            .map_err(|_| OpteeSmcReturnCode::ENotAvail)?;
+        switch_to_task_page_table(task_pt_id).inspect_err(|_| {
+            // Safety: switch_to_task_page_table failed, so task page table is not active.
+            let _ = delete_task_page_table(task_pt_id);
+        })?;
     }
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
@@ -544,7 +572,8 @@ fn open_session_new_instance(
         shim.load_ldelf(LDELF_BINARY, ta_uuid, Some(TA_BINARY), client_identity)
             .map_err(|_| {
                 unsafe { switch_to_base_page_table() };
-                let _ = platform.delete_task_page_table(task_pt_id);
+                // Safety: We've switched to the base page table above.
+                let _ = unsafe { delete_task_page_table(task_pt_id) };
                 OpteeSmcReturnCode::ENomem
             })?,
     );
@@ -576,7 +605,8 @@ fn open_session_new_instance(
             ldelf_return_code
         );
         unsafe { switch_to_base_page_table() };
-        let _ = platform.delete_task_page_table(task_pt_id);
+        // Safety: We've switched to the base page table above.
+        let _ = unsafe { delete_task_page_table(task_pt_id) };
 
         // Write error response back to normal world
         write_msg_args_to_normal_world(
@@ -597,7 +627,8 @@ fn open_session_new_instance(
     // Load TA context with parameters for OpenSession - pass actual session_id
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
         unsafe { switch_to_base_page_table() };
-        let _ = platform.delete_task_page_table(task_pt_id);
+        // Safety: We've switched to the base page table above.
+        let _ = unsafe { delete_task_page_table(task_pt_id) };
         OpteeSmcReturnCode::EBadCmd
     })?;
     loaded_program
@@ -612,7 +643,8 @@ fn open_session_new_instance(
         )
         .map_err(|_| {
             unsafe { switch_to_base_page_table() };
-            let _ = platform.delete_task_page_table(task_pt_id);
+            // Safety: We've switched to the base page table above.
+            let _ = unsafe { delete_task_page_table(task_pt_id) };
             OpteeSmcReturnCode::EBadCmd
         })?;
 
@@ -643,16 +675,6 @@ fn open_session_new_instance(
             return_code
         );
 
-        // Tear down the page table - no session was registered
-        unsafe { switch_to_base_page_table() };
-        if let Err(e) = platform.delete_task_page_table(task_pt_id) {
-            debug_serial_println!(
-                "Warning: Failed to delete task page table {}: {:?}",
-                task_pt_id,
-                e
-            );
-        }
-
         // Write error response back to normal world
         write_msg_args_to_normal_world(
             msg_args,
@@ -662,6 +684,11 @@ fn open_session_new_instance(
             Some(&ta_params),
             Some(ta_req_info),
         )?;
+
+        // Tear down the page table - no session was registered
+        unsafe { switch_to_base_page_table() };
+        // Safety: We've switched to the base page table above.
+        let _ = unsafe { delete_task_page_table(task_pt_id) };
 
         return Ok(());
     }
@@ -729,16 +756,10 @@ fn handle_invoke_command(
         return Err(OpteeSmcReturnCode::EThreadLimit);
     };
 
-    let platform = litebox_platform_multiplex::platform();
     let task_pt_id = instance.task_page_table_id;
 
     // Switch to the TA instance's page table
-    unsafe {
-        platform
-            .page_table_manager()
-            .load_task(task_pt_id)
-            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
-    }
+    unsafe { switch_to_task_page_table(task_pt_id)? };
 
     debug_serial_println!(
         "InvokeCommand: session_id={}, task_pt_id={}, cmd_id={}",
@@ -820,13 +841,8 @@ fn handle_invoke_command(
 
             // Switch to base page table and delete the task page table
             unsafe { switch_to_base_page_table() };
-            if let Err(e) = platform.delete_task_page_table(task_pt_id) {
-                debug_serial_println!(
-                    "Warning: Failed to delete task page table {}: {:?}",
-                    task_pt_id,
-                    e
-                );
-            }
+            // Safety: We've switched to the base page table above.
+            let _ = unsafe { delete_task_page_table(task_pt_id) };
             debug_serial_println!(
                 "InvokeCommand: cleaned up dead TA instance, task_pt_id={}",
                 task_pt_id
@@ -879,16 +895,10 @@ fn handle_close_session(
         return Err(OpteeSmcReturnCode::EThreadLimit);
     };
 
-    let platform = litebox_platform_multiplex::platform();
     let task_pt_id = instance.task_page_table_id;
 
     // Switch to the TA instance's page table
-    unsafe {
-        platform
-            .page_table_manager()
-            .load_task(task_pt_id)
-            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
-    }
+    unsafe { switch_to_task_page_table(task_pt_id)? };
 
     // Load TA context for CloseSession (no params, no cmd_id) - pass actual session_id
     instance
@@ -968,13 +978,8 @@ fn handle_close_session(
             drop(entry);
 
             // Delete the task page table
-            if let Err(e) = platform.delete_task_page_table(task_pt_id) {
-                debug_serial_println!(
-                    "Warning: Failed to delete task page table {}: {:?}",
-                    task_pt_id,
-                    e
-                );
-            }
+            // Safety: We've switched to the base page table above.
+            let _ = unsafe { delete_task_page_table(task_pt_id) };
 
             debug_serial_println!(
                 "CloseSession complete: deleted task_pt_id={} (last session)",
@@ -996,6 +1001,16 @@ fn handle_close_session(
 /// Per OP-TEE OS semantics:
 /// - `TeeOrigin::Tee` is used when the error comes from TEE itself (panic/TARGET_DEAD)
 /// - `TeeOrigin::TrustedApp` is used when the error comes from the TA
+///
+/// # Security Note
+///
+/// This function accesses TA userspace memory via `update_optee_msg_args` to copy out
+/// output parameters. It must be called **before** switching page tables or deleting
+/// the task page table, otherwise the userspace memory references become invalid.
+///
+/// # Panics
+///
+/// Panics if called while the base page table is active (i.e., not in a TA context).
 #[inline]
 fn write_msg_args_to_normal_world(
     msg_args: &mut OpteeMsgArgs,
@@ -1005,6 +1020,15 @@ fn write_msg_args_to_normal_world(
     ta_params: Option<&UteeParams>,
     ta_req_info: Option<&litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>>,
 ) -> Result<(), OpteeSmcReturnCode> {
+    // Ensure we're on a task page table, not the base page table.
+    // Accessing TA userspace memory requires the TA's page table to be active.
+    debug_assert!(
+        !litebox_platform_multiplex::platform()
+            .page_table_manager()
+            .is_base_page_table_active(),
+        "write_msg_args_to_normal_world called on base page table"
+    );
+
     // Per OP-TEE: origin is TEE only if panicked (TARGET_DEAD), otherwise TrustedApp
     let origin = if return_code == TeeResult::TargetDead {
         TeeOrigin::Tee

@@ -39,7 +39,7 @@
 //!
 //! ## OP-TEE OS Thread IDs and RPC
 //!
-//! In OP-TEE OS, **thread IDs** and **session IDs** serve different purposes:
+//! In OP-TEE OS, **session IDs** and **thread IDs** serve different purposes:
 //!
 //! ### Session IDs
 //!

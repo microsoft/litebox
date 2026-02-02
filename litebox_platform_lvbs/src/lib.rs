@@ -180,6 +180,13 @@ impl PageTableManager {
         );
     }
 
+    /// Returns `true` if the base page table is currently active.
+    #[inline]
+    pub fn is_base_page_table_active(&self) -> bool {
+        let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
+        self.base_page_table_frame == cr3_frame
+    }
+
     /// Loads the base page table by updating CR3.
     ///
     /// # Safety
@@ -278,13 +285,18 @@ impl PageTableManager {
     ///
     /// * `task_pt_id` - The ID of the task page table to delete
     ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no references or pointers to memory mapped
+    /// by this page table are held after deletion.
+    ///
     /// # Returns
     ///
     /// - `Ok(())` if the page table was successfully deleted
     /// - `Err(Errno::EINVAL)` if the page table ID is the base page table
     /// - `Err(Errno::ENOENT)` if the page table ID does not exist
     /// - `Err(Errno::EBUSY)` if the page table is currently active (switch away first)
-    pub fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
+    pub unsafe fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
         if task_pt_id == BASE_PAGE_TABLE_ID {
             return Err(Errno::EINVAL);
         }
@@ -671,14 +683,20 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// (they belong to the kernel). Only user-allocated frames are returned to
     /// the allocator.
     ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no references or pointers to memory mapped
+    /// by this page table are held after deletion.
+    ///
     /// # Returns
     ///
     /// - `Ok(())` if successful
     /// - `Err(Errno::EINVAL)` if the page table is the base page table
     /// - `Err(Errno::ENOENT)` if the page table doesn't exist
     /// - `Err(Errno::EBUSY)` if the page table is currently active
-    pub fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
-        self.page_table_manager.delete_task_page_table(task_pt_id)
+    pub unsafe fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
+        // Safety: caller guarantees no dangling references
+        unsafe { self.page_table_manager.delete_task_page_table(task_pt_id) }
     }
 
     /// Switches the current page table to the specified one.
