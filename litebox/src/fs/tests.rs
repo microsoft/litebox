@@ -832,8 +832,7 @@ mod in_mem {
             .expect("Failed to open file with O_APPEND");
 
         // pwrite (write with explicit offset) should ignore O_APPEND per POSIX
-        fs.write(&fd, b"XX", Some(2))
-            .expect("Failed to pwrite");
+        fs.write(&fd, b"XX", Some(2)).expect("Failed to pwrite");
         fs.close(&fd).expect("Failed to close file");
 
         // Verify the file content: XX should be at position 2, not appended
@@ -1992,10 +1991,8 @@ mod layered {
             .expect("Failed to create file with O_APPEND");
 
         // Multiple writes should all append
-        fs.write(&fd, b"First", None)
-            .expect("First write failed");
-        fs.write(&fd, b"Second", None)
-            .expect("Second write failed");
+        fs.write(&fd, b"First", None).expect("First write failed");
+        fs.write(&fd, b"Second", None).expect("Second write failed");
         fs.close(&fd).expect("Failed to close file");
 
         // Verify the content
