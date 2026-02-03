@@ -1296,6 +1296,8 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
     );
 }
 
+pub use crate::host::{UPK_LEN, set_unique_platform_key};
+
 // Note on user page table management:
 // The legacy platform code creates a new page table to load a program in a separate
 // address space and destroys it when the program terminates. This is why the old syscall

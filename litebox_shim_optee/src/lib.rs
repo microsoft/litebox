@@ -205,6 +205,7 @@ impl OpteeShim {
                 thread: ThreadState::new(),
                 session_id: self.0.session_id_pool.allocate(),
                 ta_app_id: ta_uuid,
+                ta_svn: 0, // TODO: Initialize from TA binary or OP-TEE Secure Storage
                 client_identity: client.unwrap_or(TeeIdentity {
                     login: TeeLogin::User,
                     uuid: TeeUuid::default(),
@@ -1141,6 +1142,8 @@ struct Task {
     session_id: u32,
     /// TA UUID
     ta_app_id: TeeUuid,
+    /// TA Secure Version Number (SVN)
+    ta_svn: u32,
     /// Client identity (VTL0 process or another TA)
     client_identity: TeeIdentity,
     /// TEE cryptography state map
@@ -1258,6 +1261,7 @@ mod test_utils {
                 thread: ThreadState::new(),
                 session_id: self.session_id_pool.allocate(),
                 ta_app_id: TeeUuid::default(),
+                ta_svn: 0,
                 client_identity: TeeIdentity {
                     login: TeeLogin::User,
                     uuid: TeeUuid::default(),

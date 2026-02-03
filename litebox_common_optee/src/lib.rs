@@ -447,6 +447,11 @@ pub enum TeeParamType {
 impl UteeParams {
     pub const TEE_NUM_PARAMS: usize = TEE_NUM_PARAMS;
 
+    /// Returns `true` if every parameter slot matches the expected type.
+    pub fn has_types(&self, expected: [TeeParamType; 4]) -> bool {
+        (0..TEE_NUM_PARAMS).all(|i| self.get_type(i).is_ok_and(|t| t == expected[i]))
+    }
+
     pub fn get_type(&self, index: usize) -> Result<TeeParamType, Errno> {
         let type_byte = match index {
             0 => self.types.type_0(),
@@ -595,6 +600,22 @@ impl TeeUuid {
         bytes[0..8].copy_from_slice(&data[0].to_be_bytes());
         bytes[8..16].copy_from_slice(&data[1].to_be_bytes());
         Self::from_bytes(bytes)
+    }
+
+    /// Converts the UUID to a 16-byte array with little-endian encoding for numeric fields.
+    ///
+    /// The byte layout is:
+    /// - bytes[0..4]: `time_low` (little-endian u32)
+    /// - bytes[4..6]: `time_mid` (little-endian u16)
+    /// - bytes[6..8]: `time_hi_and_version` (little-endian u16)
+    /// - bytes[8..16]: `clock_seq_and_node` (8 bytes, direct copy)
+    pub fn to_le_bytes(self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&self.time_low.to_le_bytes());
+        bytes[4..6].copy_from_slice(&self.time_mid.to_le_bytes());
+        bytes[6..8].copy_from_slice(&self.time_hi_and_version.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.clock_seq_and_node);
+        bytes
     }
 }
 
@@ -1700,6 +1721,26 @@ impl From<OpteeSmcReturnCode> for litebox_common_linux::errno::Errno {
         }
     }
 }
+
+/// HUK subkey usage identifiers, matching OP-TEE's `enum huk_subkey_usage`.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub enum HukSubkeyUsage {
+    /// Secure Storage Key
+    Ssk = 0,
+    /// RPMB key
+    Rpmb = 1,
+    /// TA unique key
+    UniqueTa = 2,
+    /// Die ID
+    DieId = 3,
+}
+
+/// Hardware Unique Key length in bytes.
+pub const HUK_LEN: usize = 32;
+
+/// Maximum length of an HUK subkey in bytes.
+pub const HUK_SUBKEY_MAX_LEN: usize = 32;
 
 #[cfg(test)]
 mod tests {

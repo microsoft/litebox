@@ -8,6 +8,7 @@ extern crate alloc;
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
     mm::linux::PAGE_SIZE,
+    platform::CrngProvider,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::errno::Errno;
@@ -100,6 +101,13 @@ pub fn init() -> Option<&'static Platform> {
             );
 
             allocate_per_cpu_variables();
+
+            // Set the Unique Platform Key
+            //
+            // *** This is PoC. Once an HVCI/Heki call is ready, we SHALL set UPK via that function ***
+            let mut upk = [0u8; litebox_platform_lvbs::UPK_LEN];
+            platform.fill_bytes_crng(&mut upk);
+            litebox_platform_lvbs::set_unique_platform_key(&upk);
         } else {
             panic!("Failed to get memory info");
         }
