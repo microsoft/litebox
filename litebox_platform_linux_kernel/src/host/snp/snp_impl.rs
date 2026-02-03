@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! An implementation of [`HostInterface`] for SNP VMM
-use ::alloc::{boxed::Box, vec::Vec};
+use ::alloc::{boxed::Box, ffi::CString, vec::Vec};
 use core::{
     arch::asm,
     cell::{Cell, OnceCell},
@@ -368,14 +368,12 @@ impl HostSnpInterface {
     ///
     /// Note that the maximum file size is limited to 4MB.
     pub fn load_file_from_host(path: &str) -> Result<Vec<u8>, litebox_common_linux::errno::Errno> {
-        use crate::alloc::string::ToString;
-
         const CHUNK_SIZE: usize = 4096;
         let mut result = Vec::new();
         let mut offset = 0u64;
 
-        // Host only accept heap or stack memory
-        let path = path.to_string();
+        // Host only accept heap or stack memory with null-terminated string
+        let path = CString::new(path).expect("path should not contain null bytes");
         let mut chunk_buffer = Box::new(PageAlignedBuffer([0u8; CHUNK_SIZE]));
         loop {
             let bytes_read = Self::load_file(&path, &mut chunk_buffer.0, offset)?;
@@ -447,8 +445,8 @@ impl HostSnpInterface {
     ///
     /// # Returns
     /// The number of bytes read on success, or an error
-    fn load_file(path: &str, buffer: &mut [u8], offset: u64) -> Result<usize, Errno> {
-        let path_bytes = path.as_bytes();
+    fn load_file(path: &CString, buffer: &mut [u8], offset: u64) -> Result<usize, Errno> {
+        let path_bytes = path.as_bytes_with_nul();
         let mut req = bindings::SnpVmplRequestArgs::new_request(
             bindings::SNP_VMPL_LOAD_FILE_REQ,
             4, // number of arguments
