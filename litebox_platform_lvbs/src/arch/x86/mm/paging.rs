@@ -30,15 +30,6 @@ const FLUSH_TLB: bool = true;
 #[cfg(test)]
 const FLUSH_TLB: bool = false;
 
-/// Bit position of P4 (PML4) index in x86_64 virtual address (bits 39-47)
-const P4_INDEX_SHIFT: u64 = 39;
-/// Bit position of P3 (PDPT) index in x86_64 virtual address (bits 30-38)
-const P3_INDEX_SHIFT: u64 = 30;
-/// Bit position of P2 (PD) index in x86_64 virtual address (bits 21-29)
-const P2_INDEX_SHIFT: u64 = 21;
-/// Bit position of P1 (PT) index in x86_64 virtual address (bits 12-20)
-const P1_INDEX_SHIFT: u64 = 12;
-
 #[inline]
 fn frame_to_pointer<M: MemoryProvider>(frame: PhysFrame) -> *mut PageTable {
     let virt = M::pa_to_va(frame.start_address());
@@ -113,6 +104,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
     /// Unmap 4KiB pages from the page table
     /// Set `dealloc_frames` to `true` to free the corresponding physical frames.
+    /// Set `flush_tlb` to `true` to flush TLB entries after unmapping (not needed when
+    /// the page table is being destroyed).
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
@@ -120,6 +113,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         &self,
         range: PageRange<ALIGN>,
         dealloc_frames: bool,
+        flush_tlb: bool,
     ) -> Result<(), page_mgmt::DeallocationError> {
         let start_va = VirtAddr::new(range.start as _);
         let start = Page::<Size4KiB>::from_start_address(start_va)
@@ -138,7 +132,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     if dealloc_frames {
                         unsafe { allocator.deallocate_frame(frame) };
                     }
-                    if FLUSH_TLB {
+                    if flush_tlb && FLUSH_TLB {
                         fl.flush();
                     }
                 }
@@ -174,109 +168,25 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// # Safety
     ///
     /// The caller must ensure that no references to the unmapped pages exist.
+    /// Once we implement page fault handling for user pages with memcpy_fallible in the LVBS platform,
+    /// this safety requirement can be relaxed.
     pub(crate) unsafe fn cleanup_user_mappings(&self, user_addr_min: usize, user_addr_max: usize) {
-        use alloc::vec::Vec;
+        use x86_64::structures::paging::mapper::CleanUp;
 
-        // Collect user pages, and page table frames to deallocate
-        let (pages_to_unmap, pt_frames_to_dealloc): (
-            Vec<Page<Size4KiB>>,
-            Vec<PhysFrame<Size4KiB>>,
-        ) = {
-            let inner = self.inner.lock();
-
-            let mut pages = Vec::new();
-            let mut pt_frames = Vec::new();
-
-            // Iterate through all P4 entries
-            let p4 = inner.level_4_table();
-            for (p4_index, p4_entry) in p4.iter().enumerate() {
-                if p4_entry.is_unused() {
-                    continue;
-                }
-
-                let Ok(p3_frame) = p4_entry.frame() else {
-                    continue;
-                };
-                let p3: &PageTable = unsafe { &*frame_to_pointer::<M>(p3_frame) };
-
-                for (p3_index, p3_entry) in p3.iter().enumerate() {
-                    if p3_entry.is_unused() {
-                        continue;
-                    }
-                    // Skip huge pages (1GiB)
-                    if p3_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                        continue;
-                    }
-                    let Ok(p2_frame) = p3_entry.frame() else {
-                        continue;
-                    };
-                    let p2: &PageTable = unsafe { &*frame_to_pointer::<M>(p2_frame) };
-
-                    for (p2_index, p2_entry) in p2.iter().enumerate() {
-                        if p2_entry.is_unused() {
-                            continue;
-                        }
-                        // Skip huge pages (2MiB)
-                        if p2_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                            continue;
-                        }
-                        let Ok(p1_frame) = p2_entry.frame() else {
-                            continue;
-                        };
-                        let p1: &PageTable = unsafe { &*frame_to_pointer::<M>(p1_frame) };
-
-                        // Collect ALL P1 frames for deallocation (including kernel mapping PT frames)
-                        pt_frames.push(p1_frame);
-
-                        for (p1_index, p1_entry) in p1.iter().enumerate() {
-                            if p1_entry.is_unused() {
-                                continue;
-                            }
-
-                            // Construct the virtual address for this page
-                            let va = VirtAddr::new(
-                                ((p4_index as u64) << P4_INDEX_SHIFT)
-                                    | ((p3_index as u64) << P3_INDEX_SHIFT)
-                                    | ((p2_index as u64) << P2_INDEX_SHIFT)
-                                    | ((p1_index as u64) << P1_INDEX_SHIFT),
-                            );
-
-                            // Only collect USER data pages (VA in [user_addr_min, user_addr_max))
-                            // Kernel data pages are physical memory and must NOT be freed
-                            if va.as_u64() >= user_addr_min as u64
-                                && va.as_u64() < user_addr_max as u64
-                                && let Ok(page) = Page::<Size4KiB>::from_start_address(va)
-                            {
-                                pages.push(page);
-                            }
-                        }
-                    }
-
-                    // Collect ALL P2 frames for deallocation
-                    pt_frames.push(p2_frame);
-                }
-
-                // Collect ALL P3 frames for deallocation
-                pt_frames.push(p3_frame);
-            }
-            (pages, pt_frames)
-        };
-
-        // Unmap and deallocate user pages
+        // Unmap and deallocate user data pages
         // No TLB flush needed - this page table is being destroyed and will never be reused
-        let mut allocator = PageTableAllocator::<M>::new();
-        {
-            let mut inner = self.inner.lock();
-            for page in pages_to_unmap {
-                if let Ok((frame, _flush)) = inner.unmap(page) {
-                    unsafe { allocator.deallocate_frame(frame) };
-                }
-            }
-        }
+        let user_range = PageRange::<ALIGN> {
+            start: user_addr_min,
+            end: user_addr_max,
+        };
+        // Safety: The caller ensures no references to the unmapped pages exist.
+        let _ = unsafe { self.unmap_pages(user_range, true, false) };
 
-        // Deallocate page table frames that were for user mappings
-        for pt_frame in pt_frames_to_dealloc {
-            unsafe { allocator.deallocate_frame(pt_frame) };
+        // Clean up all empty P1 - P3 tables
+        let mut allocator = PageTableAllocator::<M>::new();
+        // Safety: The page table is being destroyed and will not be reused.
+        unsafe {
+            self.inner.lock().clean_up(&mut allocator);
         }
     }
 

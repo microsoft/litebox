@@ -495,6 +495,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
                 )
                 .ok_or(DeallocationError::Unaligned)?,
                 false,
+                true,
             )
         }
     }
@@ -1017,7 +1018,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Clear the existing mappings first.
-                unsafe { current_pt.unmap_pages(range, true).unwrap() };
+                unsafe { current_pt.unmap_pages(range, true, true).unwrap() };
             }
         }
         let flags = u32::from(initial_permissions.bits())
@@ -1039,7 +1040,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         unsafe {
             self.page_table_manager
                 .current_page_table()
-                .unmap_pages(range, true)
+                .unmap_pages(range, true, true)
         }
     }
 
@@ -1217,7 +1218,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             unsafe {
                 self.page_table_manager
                     .current_page_table()
-                    .unmap_pages(page_range, false)
+                    .unmap_pages(page_range, false, true)
                     .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))
             }
         } else {
