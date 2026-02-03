@@ -244,7 +244,7 @@ pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) {
 impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
-    type ThreadHandle = ();
+    type ThreadHandle = u32;
 
     unsafe fn spawn_thread(
         &self,
@@ -275,11 +275,11 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     }
 
     fn current_thread(&self) -> Self::ThreadHandle {
-        // TODO
+        current().unwrap().pid
     }
 
-    fn interrupt_thread(&self, &(): &Self::ThreadHandle) {
-        // TODO
+    fn interrupt_thread(&self, tid: &Self::ThreadHandle) {
+        let _ = HostSnpInterface::interrupt(*tid);
     }
 }
 
@@ -365,7 +365,7 @@ impl HostSnpInterface {
     }
 
     /// Load a file from host by path
-    /// 
+    ///
     /// Note that the maximum file size is limited to 4MB.
     pub fn load_file_from_host(path: &str) -> Result<Vec<u8>, litebox_common_linux::errno::Errno> {
         use crate::alloc::string::ToString;
@@ -426,6 +426,16 @@ impl HostSnpInterface {
         Self::parse_result(req.ret)
     }
 
+    fn interrupt(tid: u32) -> Result<(), Errno> {
+        let mut req = bindings::SnpVmplRequestArgs::new_request(
+            bindings::SNP_VMPL_SEND_INTERRUPT_REQ,
+            1, // number of arguments
+            [tid as u64, 0, 0, 0, 0, 0],
+        );
+        Self::request(&mut req);
+        Self::parse_result(req.ret).map(|_| ())
+    }
+
     /// Load a file from host by path
     ///
     /// The host provides files at fixed, predetermined locations identified by path.
@@ -459,7 +469,16 @@ impl HostSnpInterface {
         if is_err_value(res) {
             #[expect(clippy::cast_possible_wrap)]
             let v = res as i64;
-            Err(Errno::try_from(i32::try_from(v.abs()).unwrap()).unwrap())
+            // ERESTARTSYS (512) and other restart codes are kernel-internal and should
+            // be converted to EINTR when returned back.
+            const ERESTARTSYS: i64 = 512;
+            const ERESTARTNOHAND: i64 = 514;
+            const ERESTART_RESTARTBLOCK: i64 = 516;
+            let errno = match v.abs() {
+                ERESTARTSYS | ERESTARTNOHAND | ERESTART_RESTARTBLOCK => Errno::EINTR,
+                e => Errno::try_from(i32::try_from(e).unwrap()).unwrap(),
+            };
+            Err(errno)
         } else {
             Ok(usize::try_from(res).unwrap())
         }

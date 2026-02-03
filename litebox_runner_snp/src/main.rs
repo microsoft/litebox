@@ -118,6 +118,7 @@ pub extern "C" fn sandbox_kernel_init(
 const HOST_FILE_PATHS: &[&str] = &[
     "/out/hello",
     "/out/efault",
+    "/out/thread_exit",
     // Add more paths as needed
 ];
 

@@ -202,8 +202,7 @@ impl<Host: HostInterface> RawMutex<Host> {
                     return Err(ImmediatelyWokenUp);
                 }
                 Err(Errno::EINTR) => {
-                    // return Err(ImmediatelyWokenUp);
-                    todo!("EINTR");
+                    return Err(ImmediatelyWokenUp);
                 }
                 Err(Errno::ETIMEDOUT) => {
                     return Ok(UnblockedOrTimedOut::TimedOut);
