@@ -450,7 +450,8 @@ impl<
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK
             | OFlags::LARGEFILE
-            | OFlags::NOFOLLOW;
+            | OFlags::NOFOLLOW
+            | OFlags::APPEND;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }

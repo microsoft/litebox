@@ -623,6 +623,279 @@ mod in_mem {
 
         fs.close(&fd).expect("close failed");
     }
+
+    #[test]
+    fn o_append_flag_basic() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        // Create a file and write some initial content
+        let path = "/testfile";
+        let fd = fs
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        let initial_data = b"Hello";
+        fs.write(&fd, initial_data, None)
+            .expect("Failed to write initial content");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Re-open with O_APPEND and write more data
+        let fd = fs
+            .open(path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .expect("Failed to open file with O_APPEND");
+        let append_data = b" World";
+        fs.write(&fd, append_data, None)
+            .expect("Failed to append data");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Verify the file contains both pieces of data concatenated
+        let fd = fs
+            .open(path, OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file for reading");
+        let mut buffer = vec![0; 11];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(bytes_read, 11);
+        assert_eq!(&buffer[..bytes_read], b"Hello World");
+        fs.close(&fd).expect("Failed to close file");
+    }
+
+    #[test]
+    fn o_append_flag_seek_ignored_for_write() {
+        use crate::fs::SeekWhence;
+
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        // Create a file and write some initial content
+        let path = "/testfile";
+        let fd = fs
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        fs.write(&fd, b"ABCDEF", None)
+            .expect("Failed to write initial content");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Re-open with O_APPEND
+        let fd = fs
+            .open(path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .expect("Failed to open file with O_APPEND");
+
+        // Seek to beginning - this should succeed but writes should still append
+        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
+            .expect("Failed to seek to beginning");
+
+        // Write some data - it should go to the end despite the seek
+        fs.write(&fd, b"123", None)
+            .expect("Failed to write after seek");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Verify the file content: original data followed by appended data
+        let fd = fs
+            .open(path, OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file for reading");
+        let mut buffer = vec![0; 20];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(bytes_read, 9);
+        assert_eq!(&buffer[..bytes_read], b"ABCDEF123");
+        fs.close(&fd).expect("Failed to close file");
+    }
+
+    #[test]
+    fn o_append_flag_multiple_writes() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        // Create a file with O_APPEND from the start
+        let path = "/testfile";
+        let fd = fs
+            .open(
+                path,
+                OFlags::CREAT | OFlags::WRONLY | OFlags::APPEND,
+                Mode::RWXU,
+            )
+            .expect("Failed to create file with O_APPEND");
+
+        // Multiple writes should all append in order
+        fs.write(&fd, b"A", None).expect("First write failed");
+        fs.write(&fd, b"B", None).expect("Second write failed");
+        fs.write(&fd, b"C", None).expect("Third write failed");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Verify the file content
+        let fd = fs
+            .open(path, OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file for reading");
+        let mut buffer = vec![0; 10];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(bytes_read, 3);
+        assert_eq!(&buffer[..bytes_read], b"ABC");
+        fs.close(&fd).expect("Failed to close file");
+    }
+
+    #[test]
+    fn o_append_flag_with_rdwr() {
+        use crate::fs::SeekWhence;
+
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        // Create a file with initial content
+        let path = "/testfile";
+        let fd = fs
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        fs.write(&fd, b"Hello", None)
+            .expect("Failed to write initial content");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Re-open with O_RDWR | O_APPEND
+        let fd = fs
+            .open(path, OFlags::RDWR | OFlags::APPEND, Mode::empty())
+            .expect("Failed to open file with O_RDWR | O_APPEND");
+
+        // Read should work normally from the beginning
+        let mut buffer = vec![0; 10];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(bytes_read, 5);
+        assert_eq!(&buffer[..bytes_read], b"Hello");
+
+        // Seek to beginning - write should still append despite position being at 0
+        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
+            .expect("Seek failed");
+
+        // Write should append to end, ignoring the current position
+        fs.write(&fd, b" World", None)
+            .expect("Failed to write with append");
+
+        // Seek to beginning and read the whole file
+        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
+            .expect("Seek failed");
+        let mut buffer = vec![0; 20];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(bytes_read, 11);
+        assert_eq!(&buffer[..bytes_read], b"Hello World");
+        fs.close(&fd).expect("Failed to close file");
+    }
+
+    #[test]
+    fn o_append_pwrite_ignores_append_mode() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        // Create a file with initial content
+        let path = "/testfile";
+        let fd = fs
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        fs.write(&fd, b"ABCDEF", None)
+            .expect("Failed to write initial content");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Re-open with O_APPEND
+        let fd = fs
+            .open(path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .expect("Failed to open file with O_APPEND");
+
+        // pwrite (write with explicit offset) should ignore O_APPEND per POSIX
+        fs.write(&fd, b"XX", Some(2))
+            .expect("Failed to pwrite");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Verify the file content: XX should be at position 2, not appended
+        let fd = fs
+            .open(path, OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file for reading");
+        let mut buffer = vec![0; 10];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(bytes_read, 6);
+        assert_eq!(&buffer[..bytes_read], b"ABXXEF");
+        fs.close(&fd).expect("Failed to close file");
+    }
+
+    #[test]
+    fn o_append_with_trunc() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        // Create a file with initial content
+        let path = "/testfile";
+        let fd = fs
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        fs.write(&fd, b"Original content", None)
+            .expect("Failed to write initial content");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Re-open with O_TRUNC | O_APPEND
+        let fd = fs
+            .open(
+                path,
+                OFlags::WRONLY | OFlags::TRUNC | OFlags::APPEND,
+                Mode::empty(),
+            )
+            .expect("Failed to open file with O_TRUNC | O_APPEND");
+
+        // File should be truncated, then write should append (to empty file)
+        fs.write(&fd, b"New", None)
+            .expect("Failed to write after truncation");
+        fs.write(&fd, b"Content", None)
+            .expect("Failed to write second chunk");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Verify the file content
+        let fd = fs
+            .open(path, OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file for reading");
+        let mut buffer = vec![0; 20];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(bytes_read, 10);
+        assert_eq!(&buffer[..bytes_read], b"NewContent");
+        fs.close(&fd).expect("Failed to close file");
+    }
 }
 
 mod tar_ro {
@@ -1648,6 +1921,93 @@ mod layered {
             fs.rmdir("/regular_file"),
             Err(RmdirError::NotADirectory)
         ));
+    }
+
+    #[test]
+    fn o_append_flag_with_migration() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod / in upper layer");
+        });
+
+        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Open foo (exists in lower layer) with O_APPEND
+        // Original content in tar: "testfoo\n"
+        let fd = fs
+            .open("foo", OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .expect("Failed to open foo with O_APPEND");
+
+        // Write should append to end of migrated file
+        fs.write(&fd, b"APPENDED", None)
+            .expect("Failed to append to file");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Verify the content
+        let fd = fs
+            .open("foo", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open foo for reading");
+        let mut buffer = vec![0; 20];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from foo");
+        assert_eq!(&buffer[..bytes_read], b"testfoo\nAPPENDED");
+        fs.close(&fd).expect("Failed to close file");
+    }
+
+    #[test]
+    fn o_append_flag_upper_layer_only() {
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod / in upper layer");
+        });
+
+        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Create a new file in upper layer with O_APPEND
+        let fd = fs
+            .open(
+                "/newfile",
+                OFlags::CREAT | OFlags::WRONLY | OFlags::APPEND,
+                Mode::RWXU,
+            )
+            .expect("Failed to create file with O_APPEND");
+
+        // Multiple writes should all append
+        fs.write(&fd, b"First", None)
+            .expect("First write failed");
+        fs.write(&fd, b"Second", None)
+            .expect("Second write failed");
+        fs.close(&fd).expect("Failed to close file");
+
+        // Verify the content
+        let fd = fs
+            .open("/newfile", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open newfile for reading");
+        let mut buffer = vec![0; 20];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, None)
+            .expect("Failed to read from newfile");
+        assert_eq!(&buffer[..bytes_read], b"FirstSecond");
+        fs.close(&fd).expect("Failed to close file");
     }
 }
 
