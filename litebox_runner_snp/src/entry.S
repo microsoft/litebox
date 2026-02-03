@@ -8,7 +8,7 @@
 .global _exit;
 
 .macro isr_handler ex:req err=0 handler=int_handler
-    .org 0x20 * \ex + 0x200
+    .org 0x30 * \ex + 0x200
 isr_handler\ex:
     cld
 .if  \err
@@ -18,7 +18,10 @@ isr_handler\ex:
     call    error_entry
     mov     rdi, rsp
     mov     rsi, \ex    /* Pass the vector as argument */
+    mov     rbp, rsp    /* Save original rsp in rbp */
+    and     rsp, -16    /* Align stack to 16 bytes */
     call    \handler
+    mov     rsp, rbp    /* Restore original rsp */
     jmp     error_return
 .endm
 
