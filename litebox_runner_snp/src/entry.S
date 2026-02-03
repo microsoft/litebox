@@ -30,6 +30,7 @@ _start:
 sandbox_kernel_start:
     cld
     cli
+    and     rsp, -16                   /* align stack to 16 bytes */
     call    sandbox_kernel_init
 1:  /* hlt the machine */
     hlt
@@ -37,7 +38,10 @@ sandbox_kernel_start:
 
     .org 0x20
 sandbox_process_start:
+    mov     rbp, rsp                   /* save original rsp in rbp */
+    and     rsp, -16                   /* align stack to 16 bytes */
     call    sandbox_process_init
+    mov     rsp, rbp                   /* restore rsp to pt_regs pointer */
     jmp     swapgs_restore_regs_and_return_to_usermode
 
 1:  /* hlt the machine */

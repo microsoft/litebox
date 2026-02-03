@@ -8,7 +8,8 @@
 
 .section .head.text,"ax"
 sandbox_process_ret_from_fork:
-    jmp thread_start
+    and     rsp, -16                   /* align stack to 16 bytes */
+    call    thread_start
 1:  /* hlt the machine */
     hlt
     jmp	1b
