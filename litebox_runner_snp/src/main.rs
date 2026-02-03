@@ -46,14 +46,13 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
                 // Try to recover from page faults in kernel mode using the exception table.
                 // This handles fallible memory operations like memcpy_fallible.
                 // Only check the exception table for kernel-space addresses (high canonical addresses).
-                if pt_regs.rip >= <litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel as litebox::platform::PageManagementProvider<4096>>::TASK_ADDR_MAX {
-                    if let Some(fixup_addr) =
+                if pt_regs.rip >= <litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel as litebox::platform::PageManagementProvider<4096>>::TASK_ADDR_MAX
+                    && let Some(fixup_addr) =
                         litebox::mm::exception_table::search_exception_tables(pt_regs.rip.truncate())
                     {
                         pt_regs.rip = fixup_addr;
                         return;
                     }
-                }
             }
 
             litebox::log_println!(
@@ -139,8 +138,8 @@ fn load_host_files_into_fs<Platform: litebox::sync::RawSyncPrimitivesProvider>(
             match litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::load_file_from_host(path) {
                 Ok(data) if !data.is_empty() => {
                     // Create parent directories if needed
-                    if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
-                        if !parent.is_empty() {
+                    if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p)
+                        && !parent.is_empty() {
                             let _ = fs.mkdir(
                                 parent,
                                 litebox::fs::Mode::RWXU
@@ -148,7 +147,6 @@ fn load_host_files_into_fs<Platform: litebox::sync::RawSyncPrimitivesProvider>(
                                     | litebox::fs::Mode::RWXO,
                             );
                         }
-                    }
 
                     // Create and initialize the file
                     let mode =
@@ -167,7 +165,7 @@ fn load_host_files_into_fs<Platform: litebox::sync::RawSyncPrimitivesProvider>(
                     );
                 }
                 Err(e) => {
-                    let s = format_args!("Failed to load file {}: {}\n", path, e).to_string();
+                    let s = format_args!("Failed to load file {path}: {e}\n").to_string();
                     // File not available from host or too large, skip
                     litebox::log_println!(litebox_platform_multiplex::platform(), &s);
                 }
@@ -240,7 +238,8 @@ pub extern "C" fn sandbox_process_init(
 
     // Loading a program may trigger page faults, so we need to set SHIM before this.
     let shim = &raw const SHIM;
-    let program = match unsafe { (*shim).as_ref().unwrap() }.load_program(
+    #[allow(clippy::missing_panics_doc)]
+    let program = match unsafe { (*shim).as_ref().expect("initialized") }.load_program(
         platform.init_task(boot_params),
         &program,
         argv,

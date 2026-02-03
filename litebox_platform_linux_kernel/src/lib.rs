@@ -196,19 +196,16 @@ impl<Host: HostInterface> RawMutex<Host> {
                 Ok(()) => {
                     return Ok(UnblockedOrTimedOut::Unblocked);
                 }
-                Err(Errno::EAGAIN) => {
+                Err(Errno::EAGAIN | Errno::EINTR) => {
                     // If the futex value does not match val, then the call fails
                     // immediately with the error EAGAIN.
-                    return Err(ImmediatelyWokenUp);
-                }
-                Err(Errno::EINTR) => {
                     return Err(ImmediatelyWokenUp);
                 }
                 Err(Errno::ETIMEDOUT) => {
                     return Ok(UnblockedOrTimedOut::TimedOut);
                 }
                 Err(e) => {
-                    panic!("Error: {:?}", e);
+                    todo!("Error: {:?}", e);
                 }
             }
         }

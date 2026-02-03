@@ -344,7 +344,7 @@ struct PageAlignedBuffer([u8; 4096]);
 
 /// Maximum file size that can be loaded (4MB)
 /// This is limited by the maximum contiguous memory allocation size.
-const MAX_FILE_SIZE: usize = (PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER) as usize;
+const MAX_FILE_SIZE: u64 = PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER;
 
 impl HostSnpInterface {
     #[cfg(debug_assertions)]
@@ -353,7 +353,7 @@ impl HostSnpInterface {
             bindings::SNP_VMPL_PRINT_REQ,
             3,
             [
-                bindings::SNP_VMPL_PRINT_STACK as u64,
+                u64::from(bindings::SNP_VMPL_PRINT_STACK),
                 rsp as u64,
                 count as u64,
                 0,
@@ -367,13 +367,13 @@ impl HostSnpInterface {
     /// Load a file from host by path
     ///
     /// Note that the maximum file size is limited to 4MB.
-    pub fn load_file_from_host(path: &str) -> Result<Vec<u8>, litebox_common_linux::errno::Errno> {
+    pub fn load_file_from_host(path: &str) -> Result<Vec<u8>, Errno> {
         const CHUNK_SIZE: usize = 4096;
         let mut result = Vec::new();
         let mut offset = 0u64;
 
         // Host only accept heap or stack memory with null-terminated string
-        let path = CString::new(path).expect("path should not contain null bytes");
+        let path = CString::new(path).map_err(|_| Errno::EINVAL)?;
         let mut chunk_buffer = Box::new(PageAlignedBuffer([0u8; CHUNK_SIZE]));
         loop {
             let bytes_read = Self::load_file(&path, &mut chunk_buffer.0, offset)?;
@@ -388,8 +388,8 @@ impl HostSnpInterface {
             offset += bytes_read as u64;
 
             // Check if file exceeds maximum size
-            if result.len() > MAX_FILE_SIZE {
-                return Err(litebox_common_linux::errno::Errno::EFBIG); // File too large
+            if result.len() as u64 > MAX_FILE_SIZE {
+                return Err(Errno::EFBIG); // File too large
             }
 
             // If we read less than the chunk size, we've reached the end of the file
@@ -428,7 +428,7 @@ impl HostSnpInterface {
         let mut req = bindings::SnpVmplRequestArgs::new_request(
             bindings::SNP_VMPL_SEND_INTERRUPT_REQ,
             1, // number of arguments
-            [tid as u64, 0, 0, 0, 0, 0],
+            [u64::from(tid), 0, 0, 0, 0, 0],
         );
         Self::request(&mut req);
         Self::parse_result(req.ret).map(|_| ())
@@ -464,14 +464,15 @@ impl HostSnpInterface {
     }
 
     fn parse_result(res: u64) -> Result<usize, Errno> {
+        const ERESTARTSYS: i64 = 512;
+        const ERESTARTNOHAND: i64 = 514;
+        const ERESTART_RESTARTBLOCK: i64 = 516;
+
         if is_err_value(res) {
             #[expect(clippy::cast_possible_wrap)]
             let v = res as i64;
-            // ERESTARTSYS (512) and other restart codes are kernel-internal and should
+            // ERESTARTSYS and other restart codes are kernel-internal and should
             // be converted to EINTR when returned back.
-            const ERESTARTSYS: i64 = 512;
-            const ERESTARTNOHAND: i64 = 514;
-            const ERESTART_RESTARTBLOCK: i64 = 516;
             let errno = match v.abs() {
                 ERESTARTSYS | ERESTARTNOHAND | ERESTART_RESTARTBLOCK => Errno::EINTR,
                 e => Errno::try_from(i32::try_from(e).unwrap()).unwrap(),
