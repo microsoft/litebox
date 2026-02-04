@@ -160,8 +160,8 @@ impl<
         let flags = flags - OFlags::DIRECTORY;
         let nonblocking = flags.contains(OFlags::NONBLOCK);
         let flags = flags - OFlags::NONBLOCK;
-        // ignore NOCTTY and NOFOLLOW
-        let flags = flags - OFlags::NOCTTY - OFlags::NOFOLLOW;
+        // ignore NOCTTY, NOFOLLOW, and APPEND
+        let flags = flags - OFlags::NOCTTY - OFlags::NOFOLLOW - OFlags::APPEND;
         let truncate = flags.contains(OFlags::TRUNC);
         let flags = flags - OFlags::TRUNC;
         let path = self.absolute_path(path)?;

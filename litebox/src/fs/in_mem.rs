@@ -109,6 +109,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
             read_allowed: _,
             write_allowed: _,
             position: _,
+            append_mode: _,
         } = &mut descriptor_table.get_entry_mut(fd).unwrap().entry
         else {
             panic!("must only be used on files, not directories")
@@ -188,7 +189,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK
             | OFlags::LARGEFILE
-            | OFlags::NOFOLLOW;
+            | OFlags::NOFOLLOW
+            | OFlags::APPEND;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }
@@ -257,6 +259,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else {
             false
         };
+        let append_mode = flags.contains(OFlags::APPEND);
         let fd = match entry {
             Entry::File(file) => {
                 if flags.contains(OFlags::DIRECTORY) {
@@ -269,6 +272,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         read_allowed,
                         write_allowed,
                         position: 0,
+                        append_mode,
                     })
             }
             Entry::Dir(dir) => self
@@ -305,6 +309,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed,
             write_allowed: _,
             position,
+            append_mode: _,
         } = &mut descriptor_table
             .get_entry_mut(fd)
             .ok_or(ReadError::ClosedFd)?
@@ -341,6 +346,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed: _,
             write_allowed,
             position,
+            append_mode,
         } = &mut descriptor_table
             .get_entry_mut(fd)
             .ok_or(WriteError::ClosedFd)?
@@ -351,25 +357,34 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if !*write_allowed {
             return Err(WriteError::NotForWriting);
         }
-        let position = offset.as_mut().unwrap_or(position);
-        let end_position = position.checked_add(buf.len()).unwrap();
+        // For append mode, we always write at the end of the file.
+        // Note: pwrite (offset != None) ignores append mode per POSIX.
         let mut file = file.write();
-        let start = if *position < file.data.len() {
-            let start = *position;
+        let write_position = if *append_mode && offset.is_none() {
+            file.data.len()
+        } else {
+            *offset.as_mut().unwrap_or(position)
+        };
+        let end_position = write_position.checked_add(buf.len()).unwrap();
+        let start = if write_position < file.data.len() {
+            let start = write_position;
             let end = end_position.min(file.data.len());
             debug_assert!(start <= end);
             let first_half_len = end - start;
             file.data.to_mut()[start..end].copy_from_slice(&buf[..first_half_len]);
             first_half_len
         } else {
-            if *position > file.data.len() {
+            if write_position > file.data.len() {
                 // Need to pad with 0s because position was past the end of the file
-                file.data.to_mut().resize(*position, 0);
+                file.data.to_mut().resize(write_position, 0);
             }
             0
         };
         file.data.to_mut().extend(&buf[start..]);
-        *position = end_position;
+        // Update the file position for positional writes (not pwrite)
+        if offset.is_none() {
+            *position = end_position;
+        }
         Ok(buf.len())
     }
 
@@ -385,6 +400,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed: _,
             write_allowed: _,
             position,
+            append_mode: _,
         } = &mut descriptor_table
             .get_entry_mut(fd)
             .ok_or(SeekError::ClosedFd)?
@@ -421,6 +437,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             read_allowed: _,
             write_allowed,
             position,
+            append_mode: _,
         } = &mut descriptor_table
             .get_entry_mut(fd)
             .ok_or(TruncateError::ClosedFd)?
@@ -935,6 +952,7 @@ pub(crate) enum Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
         read_allowed: bool,
         write_allowed: bool,
         position: usize,
+        append_mode: bool,
     },
     Dir {
         dir: Dir<Platform>,
