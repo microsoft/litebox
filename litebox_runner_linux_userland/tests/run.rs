@@ -620,12 +620,12 @@ fn test_runner_with_shell_script_ls() {
     // Test a shell script that uses ls to list the root directory
     // Keep it simple - just call ls without pipes or redirects
     let script = format!(
-        r#"
-        echo "=== Script Interpreter Test with ls ==="
-        echo "Calling ls command:"
+        "
+        echo \"=== Script Interpreter Test with ls ===\"
+        echo \"Calling ls command:\"
         {ls_path} /
-        echo "=== Script test completed ==="
-    "#
+        echo \"=== Script test completed ===\"
+    "
     );
 
     let output = Runner::new(Backend::Rewriter, &sh_path, "shell_script_ls_rewriter")
