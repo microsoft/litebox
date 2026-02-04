@@ -49,6 +49,10 @@ impl Task {
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
         }
+        // MAP_FIXED_NOREPLACE requires a non-zero address
+        if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) && addr == 0 {
+            return Err(Errno::EINVAL);
+        }
         if flags.intersects(
             MapFlags::MAP_SHARED
                 | MapFlags::MAP_32BIT
@@ -58,8 +62,7 @@ impl Task {
                 | MapFlags::MAP_SYNC
                 | MapFlags::MAP_HUGETLB
                 | MapFlags::MAP_HUGE_2MB
-                | MapFlags::MAP_HUGE_1GB
-                | MapFlags::MAP_FIXED_NOREPLACE,
+                | MapFlags::MAP_HUGE_1GB,
         ) {
             todo!("Unsupported flags {:?}", flags);
         }
