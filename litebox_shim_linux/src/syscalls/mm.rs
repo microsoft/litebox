@@ -99,7 +99,7 @@ impl Task {
             }
             Ok(copied)
         };
-        let fixed_addr = flags.contains(MapFlags::MAP_FIXED);
+        let fixed_addr = flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
         self.do_mmap(
             suggested_addr,
             len,
