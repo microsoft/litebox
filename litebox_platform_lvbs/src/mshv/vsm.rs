@@ -39,7 +39,6 @@ use crate::{
         vtl_switch::mshv_vsm_get_code_page_offsets,
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
-    serial_println,
 };
 use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};
 use core::{
@@ -107,7 +106,7 @@ pub(crate) fn init() {
 /// Not supported in this implementation.
 #[allow(clippy::unnecessary_wraps)]
 pub fn mshv_vsm_enable_aps(_cpu_present_mask_pfn: u64) -> Result<i64, VsmError> {
-    serial_println!("mshv_vsm_enable_aps() not supported");
+    debug_serial_println!("mshv_vsm_enable_aps() not supported");
     Ok(0)
 }
 
@@ -308,7 +307,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     Ok(0)
 }
 
-fn parse_certs(mut buf: &[u8]) -> Vec<Certificate> {
+fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
     let mut certs = Vec::new();
 
     while buf.len() >= 4 && buf[0] == 0x30 && buf[1] == 0x82 {
@@ -316,27 +315,19 @@ fn parse_certs(mut buf: &[u8]) -> Vec<Certificate> {
         let total_len = der_len + 4;
 
         if buf.len() < total_len {
-            serial_println!(
-                "Invalid DER data (expected {}, got {})",
-                total_len,
-                buf.len()
-            );
-            break;
+            return Err(VsmError::CertificateDerLengthInvalid {
+                expected: total_len,
+                actual: buf.len(),
+            });
         }
 
         let cert_bytes = &buf[..total_len];
-        match Certificate::from_der(cert_bytes) {
-            Ok(cert) => {
-                certs.push(cert);
-            }
-            Err(e) => {
-                serial_println!("Failed to parse one certificate: {:?}", e);
-                break;
-            }
-        }
+        let cert =
+            Certificate::from_der(cert_bytes).map_err(|_| VsmError::CertificateParseFailed)?;
+        certs.push(cert);
         buf = &buf[total_len..];
     }
-    certs
+    Ok(certs)
 }
 
 /// VSM function for loading kernel data (e.g., certificates, blocklist, kernel symbols) into VTL1.
@@ -412,7 +403,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     }
 
     let cert_buf = &system_certs_mem[..];
-    let certs = parse_certs(cert_buf);
+    let certs = parse_certs(cert_buf)?;
 
     if certs.is_empty() {
         return Err(VsmError::SystemCertificatesInvalid);
@@ -422,7 +413,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     // Its integrity depends on UEFI Secure Boot which ensures only trusted software is loaded during
     // the boot process.
     vtl0_info.set_system_certificates(certs.clone());
-    serial_println!("VSM: Loaded {} system certificate(s)", certs.len());
+    debug_serial_println!("VSM: Loaded {} system certificate(s)", certs.len());
 
     for kexec_trampoline_range in &kexec_trampoline_metadata {
         protect_physical_memory_range(
@@ -938,7 +929,7 @@ fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i6
         ),
         MemAttr::MEM_ATTR_READ,
     )?;
-    serial_println!("VSM: Ring buffer allocated");
+    debug_serial_println!("VSM: Ring buffer allocated");
     Ok(0)
 }
 
@@ -1316,12 +1307,8 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
     let mut range: u64 = 0;
 
     while range < nranges {
-        let Some(heki_page) =
-            (unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(next_pa) })
-        else {
-            serial_println!("Failed to get VTL0 memory for heki page");
-            return None;
-        };
+        let heki_page =
+            (unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(next_pa) })?;
         if !heki_page.is_valid() {
             return None;
         }
@@ -1466,7 +1453,7 @@ impl MemoryContainer {
         if let Some(last_range) = self.range.last()
             && last_range.addr + last_range.len != addr
         {
-            serial_println!("Discontiguous address found {heki_range:?}");
+            debug_serial_println!("Discontiguous address found {heki_range:?}");
             // TODO: This should be an error once patch_info is fixed from VTL0
             // It will simplify patch_info and heki_range parsing as well
         }

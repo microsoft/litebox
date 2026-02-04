@@ -10,7 +10,6 @@ use crate::{
         heki::{HekiPatch, POKE_MAX_OPCODE_SIZE},
         vsm::ModuleMemory,
     },
-    serial_println,
 };
 use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
@@ -124,7 +123,7 @@ pub fn validate_kernel_module_against_elf(
                 section_from_elf[reloc.clone()].copy_from_slice(&section_in_memory[reloc.clone()]);
             }
             if section_from_elf != section_in_memory {
-                serial_println!(
+                debug_serial_println!(
                     "Found {} mismatches in {target_section_name}",
                     target_section_name
                 );
@@ -142,7 +141,7 @@ pub fn validate_kernel_module_against_elf(
                 }
             }
             if !diffs.is_empty() {
-                serial_println!(
+                debug_serial_println!(
                     "Found {} mismatches in {target_section_name} at {:?}",
                     diffs.len(),
                     diffs

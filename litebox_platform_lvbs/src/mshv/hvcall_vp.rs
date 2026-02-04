@@ -8,6 +8,7 @@ use crate::{
         instrs::rdmsr,
         msr::{MSR_EFER, MSR_IA32_CR_PAT},
     },
+    debug_serial_println,
     host::per_cpu_variables::with_per_cpu_variables_mut,
     mshv::{
         HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HV_VTL_NORMAL, HV_VTL_SECURE, HVCALL_ENABLE_VP_VTL,
@@ -223,7 +224,7 @@ fn get_entry() -> u64 {
 pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
     // Skip boot processor since VTL is already enabled for it by VTL0
     if core == 0 {
-        serial_println!("Skipping boot processor (core 0)");
+        debug_serial_println!("Skipping boot processor (core 0)");
         return Ok(0);
     }
 
@@ -234,7 +235,7 @@ pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
     let result = hvcall_enable_vp_vtl(core, HV_VTL_SECURE, tss, rip, rsp);
     match result {
         Ok(_) => {
-            serial_println!("Enabled VTL for core {}", core);
+            debug_serial_println!("Enabled VTL for core {}", core);
             Ok(0)
         }
         Err(e) => {

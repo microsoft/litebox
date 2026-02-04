@@ -64,6 +64,12 @@ pub enum VsmError {
     #[error("no valid system certificates parsed")]
     SystemCertificatesInvalid,
 
+    #[error("invalid DER certificate data (expected {expected} bytes, got {actual})")]
+    CertificateDerLengthInvalid { expected: usize, actual: usize },
+
+    #[error("failed to parse certificate")]
+    CertificateParseFailed,
+
     // Module Validation Errors
     #[error("module ELF size ({size} bytes) exceeds maximum allowed ({max} bytes)")]
     ModuleElfSizeExceeded { size: usize, max: usize },
@@ -202,7 +208,9 @@ impl From<VsmError> for Errno {
             | VsmError::SymbolParseFailed(_)
             | VsmError::SymbolNameOffsetInvalid
             | VsmError::SymbolNameInvalidUtf8
-            | VsmError::SymbolNameNoTerminator => Errno::EINVAL,
+            | VsmError::SymbolNameNoTerminator
+            | VsmError::CertificateDerLengthInvalid { .. }
+            | VsmError::CertificateParseFailed => Errno::EINVAL,
 
             // Signature verification failures delegate to VerificationError's Errno mapping
             VsmError::SignatureVerificationFailed(e) => Errno::from(e),
