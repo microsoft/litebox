@@ -1809,17 +1809,20 @@ impl From<OpteeSmcReturnCode> for litebox_common_linux::errno::Errno {
     }
 }
 
-/// Parse the `.ta_head` section from a raw ELF binary.
+/// Find an ELF section by name and return its offset and size.
 ///
-/// This function searches for the `.ta_head` section in the ELF and parses the `TaHead`
-/// structure from it. Returns `None` if the section is not found or cannot be parsed.
+/// This function searches for a section with the given name in the ELF and returns
+/// the section's file offset and size. Returns `None` if the section is not found
+/// or the ELF is malformed.
 ///
 /// # Arguments
 /// * `elf_data` - Raw bytes of the ELF binary
+/// * `section_name` - Name of the section to find (e.g., ".ta_head")
+///
+/// # Returns
+/// `Some((offset, size))` if the section is found, `None` otherwise.
 #[allow(clippy::cast_possible_truncation)] // ELF offsets fit in usize on 64-bit
-pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
-    use core::mem::size_of;
-
+fn find_elf_section(elf_data: &[u8], section_name: &str) -> Option<(usize, usize)> {
     // Minimum ELF header size check
     if elf_data.len() < 64 {
         return None;
@@ -1866,7 +1869,7 @@ pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
         return None;
     }
 
-    // Search for .ta_head section
+    // Search for the requested section
     for i in 0..e_shnum {
         let sh_off = e_shoff + i * e_shentsize;
         if sh_off + 64 > elf_data.len() {
@@ -1887,33 +1890,47 @@ pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
             .position(|&b| b == 0)
             .map_or(elf_data.len(), |pos| name_start + pos);
 
-        let section_name = &elf_data[name_start..name_end];
-        if section_name != TA_HEAD_SECTION_NAME.as_bytes() {
+        let current_section_name = &elf_data[name_start..name_end];
+        if current_section_name != section_name.as_bytes() {
             continue;
         }
 
-        // Found .ta_head section, parse it
+        // Found the section, return its offset and size
         let sh_offset =
             u64::from_le_bytes(elf_data[sh_off + 24..sh_off + 32].try_into().ok()?) as usize;
         let sh_size =
             u64::from_le_bytes(elf_data[sh_off + 32..sh_off + 40].try_into().ok()?) as usize;
 
-        // Verify size is at least TaHead size
-        if sh_size < size_of::<TaHead>() {
+        let section_end = sh_offset.checked_add(sh_size)?;
+        if section_end > elf_data.len() {
             return None;
         }
 
-        let ta_head_end = sh_offset.checked_add(size_of::<TaHead>())?;
-        if ta_head_end > elf_data.len() {
-            return None;
-        }
-
-        // Parse TaHead structure
-        let ta_head_data = &elf_data[sh_offset..ta_head_end];
-        return TaHead::read_from_bytes(ta_head_data).ok();
+        return Some((sh_offset, sh_size));
     }
 
     None
+}
+
+/// Parse the `.ta_head` section from a raw ELF binary.
+///
+/// This function searches for the `.ta_head` section in the ELF and parses the `TaHead`
+/// structure from it. Returns `None` if the section is not found or cannot be parsed.
+///
+/// # Arguments
+/// * `elf_data` - Raw bytes of the ELF binary
+pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
+    use core::mem::size_of;
+
+    let (offset, size) = find_elf_section(elf_data, TA_HEAD_SECTION_NAME)?;
+
+    // Verify size is at least TaHead size
+    if size < size_of::<TaHead>() {
+        return None;
+    }
+
+    // Parse TaHead structure
+    TaHead::read_from_bytes(&elf_data[offset..offset + size_of::<TaHead>()]).ok()
 }
 
 #[cfg(test)]
