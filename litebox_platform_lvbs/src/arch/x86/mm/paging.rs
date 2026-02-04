@@ -365,6 +365,99 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
 
+    /// Map non-contiguous physical frames to virtually contiguous addresses.
+    ///
+    /// This function maps each physical frame in `frames` to consecutive virtual addresses
+    /// starting from `base_va`. Unlike `map_phys_frame_range`, this allows mapping
+    /// non-contiguous physical pages to a contiguous virtual address range.
+    ///
+    /// # Arguments
+    /// * `frames` - Slice of physical frames to map (may be non-contiguous)
+    /// * `base_va` - Starting virtual address for the mapping
+    /// * `flags` - Page table flags to apply to all mappings
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(MapToError::PageAlreadyMapped)` if any VA is already mapped
+    /// * `Err(MapToError::FrameAllocationFailed)` if page table allocation fails
+    ///
+    /// # Behavior
+    /// - Any existing mapping is treated as an error (shared mappings not supported)
+    /// - On error, all pages mapped by this call are unmapped (atomic)
+    pub(crate) fn map_non_contiguous_phys_pages(
+        &self,
+        frames: &[PhysFrame<Size4KiB>],
+        base_va: VirtAddr,
+        flags: PageTableFlags,
+    ) -> Result<(), MapToError<Size4KiB>> {
+        let mut allocator = PageTableAllocator::<M>::new();
+        let mut mapped_count: usize = 0;
+
+        let mut inner = self.inner.lock();
+        for (i, &target_frame) in frames.iter().enumerate() {
+            let va = base_va + (i as u64) * Size4KiB::SIZE;
+            let page: Page<Size4KiB> = Page::containing_address(va);
+
+            // Without shared mapping support, any existing mapping is an error
+            match inner.translate(page.start_address()) {
+                TranslateResult::Mapped { frame, .. } => {
+                    // Page already mapped - rollback and fail
+                    Self::rollback_mapped_pages(&mut inner, base_va, mapped_count);
+                    // Convert MappedFrame to PhysFrame for the error
+                    let existing_frame =
+                        PhysFrame::<Size4KiB>::containing_address(frame.start_address());
+                    return Err(MapToError::PageAlreadyMapped(existing_frame));
+                }
+                TranslateResult::NotMapped => {}
+                TranslateResult::InvalidFrameAddress(_) => {
+                    Self::rollback_mapped_pages(&mut inner, base_va, mapped_count);
+                    return Err(MapToError::FrameAllocationFailed);
+                }
+            }
+
+            let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+            match unsafe {
+                inner.map_to_with_table_flags(
+                    page,
+                    target_frame,
+                    flags,
+                    table_flags,
+                    &mut allocator,
+                )
+            } {
+                Ok(fl) => {
+                    mapped_count += 1;
+                    if FLUSH_TLB {
+                        fl.flush();
+                    }
+                }
+                Err(e) => {
+                    Self::rollback_mapped_pages(&mut inner, base_va, mapped_count);
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Rollback helper: unmap the first `count` pages starting from `base_va`.
+    fn rollback_mapped_pages(
+        inner: &mut MappedPageTable<'_, FrameMapping<M>>,
+        base_va: VirtAddr,
+        count: usize,
+    ) {
+        for i in 0..count {
+            let va = base_va + (i as u64) * Size4KiB::SIZE;
+            let page: Page<Size4KiB> = Page::containing_address(va);
+            if let Ok((_frame, fl)) = inner.unmap(page)
+                && FLUSH_TLB
+            {
+                fl.flush();
+            }
+        }
+    }
+
     /// This function creates a new empty top-level page table.
     pub(crate) unsafe fn new_top_level() -> Self {
         let frame = PageTableAllocator::<M>::allocate_frame(true)
