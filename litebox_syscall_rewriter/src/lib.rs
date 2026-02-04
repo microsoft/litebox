@@ -44,36 +44,19 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-/// The prefix for any trampolines inserted by any version of this crate.
-///
-/// Downstream users might wish to check for (case-insensitive) comparison against this to see if
-/// there might be a trampoline, if the exact [`TRAMPOLINE_SECTION_NAME`] does not match, in order
-/// to provide more useful error messages.
-///
-/// ```rust
-/// # use litebox_syscall_rewriter::TRAMPOLINE_SECTION_NAME;
-/// # use litebox_syscall_rewriter::TRAMPOLINE_SECTION_NAME_PREFIX;
-/// assert!(TRAMPOLINE_SECTION_NAME.starts_with(TRAMPOLINE_SECTION_NAME_PREFIX));
-/// ```
-pub const TRAMPOLINE_SECTION_NAME_PREFIX: &str = ".trampolineLB";
-
-/// The name of the section for the trampoline.
-///
-/// This contains both [`TRAMPOLINE_SECTION_NAME_PREFIX`] as well as a version number, that might be
-/// incremented if its design changes significantly enough that downstream users might need to care
-/// about it.
-///
-/// Downstream users are exepcted to check for this exact section name (including case sensitivity)
-/// to know that they have a trampoline that satisfies the expected version.
-pub const TRAMPOLINE_SECTION_NAME: &str = ".trampolineLB0";
+/// The magic bytes used to identify the trampoline data.
+/// This is checked by the loader to verify that the trampoline is valid.
+pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
 ///
 /// The `trampoline` must be an absolute address if specified; if unspecified, it will be set to
 /// zeros, and it is the caller's decision to overwrite it at loading time.
 ///
-/// If it succeeds, it produces an executable with a [`TRAMPOLINE_SECTION_NAME`] section whose first
-/// 8 bytes point to the `trampoline` address.
+/// If it succeeds, it produces an executable with trampoline code appended at a page-aligned
+/// offset after the ELF file. The trampoline data starts with the magic bytes [`TRAMPOLINE_MAGIC`],
+/// followed by the syscall entry point placeholder, the trampoline virtual address, the trampoline
+/// size, and then the actual trampoline code.
 #[expect(
     clippy::missing_panics_doc,
     reason = "any panics in here are not part of the public contract and should be fixed within this module"
@@ -122,24 +105,42 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     };
 
     let text_sections = text_sections(&builder)?;
-    let trampoline_section = setup_trampoline_section(&mut builder)?;
+
+    // Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at page boundaries
+    if is_already_hooked(input_binary) {
+        return Err(Error::AlreadyHooked);
+    }
 
     // Get control transfer targets
     let control_transfer_targets = get_control_transfer_targets(arch, &builder, &text_sections);
 
     let trampoline_base_addr = find_addr_for_trampoline_code(&builder);
     let mut trampoline_data = vec![];
-    // The magic prefix for the trampoline section
+    // The magic prefix for the trampoline data
     // This constant should be consistent with the definitions in the shim
-    // (litebox_shim_linux/src/loader/mod.rs)
-    trampoline_data.extend_from_slice("LITEBOX0".as_bytes());
+    // (litebox_common_linux/src/loader.rs)
+    trampoline_data.extend_from_slice(TRAMPOLINE_MAGIC);
     // The placeholder for the address of the new syscall entry point
     let trampoline = trampoline.unwrap_or(0);
+    // Reserve space for the trampoline size (will be filled in later)
+    let size_offset;
     if arch == Arch::X86_64 {
         trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
+        // Store the trampoline virtual address
+        trampoline_data.extend_from_slice(&trampoline_base_addr.to_le_bytes());
+        // Size field: 8 bytes for 64-bit
+        size_offset = trampoline_data.len();
+        trampoline_data.extend_from_slice(&0u64.to_le_bytes());
     } else {
         let trampoline = u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
         trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
+        // Store the trampoline virtual address
+        let trampoline_base_addr_32 =
+            u32::try_from(trampoline_base_addr).map_err(|_| Error::TrampolineAddressTooLarge)?;
+        trampoline_data.extend_from_slice(&trampoline_base_addr_32.to_le_bytes());
+        // Size field: 4 bytes for 32-bit
+        size_offset = trampoline_data.len();
+        trampoline_data.extend_from_slice(&0u32.to_le_bytes());
     }
 
     let mut syscall_insns_found = false;
@@ -169,12 +170,17 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         return Err(Error::NoSyscallInstructionsFound);
     }
 
-    // Repurpose the section header fields to store trampoline info
-    // This constant should be consistent with the definitions in the shim
-    // (litebox_shim_linux/src/loader/mod.rs)
-    builder.sections.get_mut(trampoline_section).sh_addr = u32::from_le_bytes(*b"LTBX").into();
-    builder.sections.get_mut(trampoline_section).sh_offset = trampoline_base_addr;
-    builder.sections.get_mut(trampoline_section).sh_entsize = trampoline_data.len() as u64;
+    // Fill in the trampoline size now that we know it
+    let trampoline_size = trampoline_data.len();
+    if arch == Arch::X86_64 {
+        trampoline_data[size_offset..size_offset + 8]
+            .copy_from_slice(&(trampoline_size as u64).to_le_bytes());
+    } else {
+        // 32-bit trampoline size fits in u32
+        #[allow(clippy::cast_possible_truncation)]
+        let size_u32 = trampoline_size as u32;
+        trampoline_data[size_offset..size_offset + 4].copy_from_slice(&size_u32.to_le_bytes());
+    }
 
     let mut out = vec![];
     builder
@@ -207,23 +213,33 @@ fn text_sections(
     Ok(text_sections)
 }
 
-// (private) Sets up the trampoline section
-fn setup_trampoline_section(
-    builder: &mut object::build::elf::Builder<'_>,
-) -> Result<object::build::elf::SectionId> {
-    if builder
-        .sections
-        .iter()
-        .any(|s| s.name == TRAMPOLINE_SECTION_NAME.into())
-    {
-        return Err(Error::AlreadyHooked);
+/// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at page boundaries.
+fn is_already_hooked(input_binary: &[u8]) -> bool {
+    const PAGE_SIZE: usize = 0x1000;
+    const MAX_SEARCH_PAGES: usize = 16;
+
+    if input_binary.len() < TRAMPOLINE_MAGIC.len() {
+        return false;
     }
-    let s = builder.sections.add();
-    *s.name.to_mut() = TRAMPOLINE_SECTION_NAME.into();
-    s.sh_type = object::elf::SHT_PROGBITS;
-    s.sh_flags = object::elf::SHF_ALLOC.into();
-    s.sh_addralign = 8;
-    Ok(s.id())
+
+    // Start from the last page boundary within the file
+    let mut offset = (input_binary.len().saturating_sub(1)) & !(PAGE_SIZE - 1);
+    let min_offset = input_binary
+        .len()
+        .saturating_sub(MAX_SEARCH_PAGES * PAGE_SIZE);
+
+    while offset >= min_offset {
+        if offset + TRAMPOLINE_MAGIC.len() <= input_binary.len()
+            && &input_binary[offset..offset + TRAMPOLINE_MAGIC.len()] == TRAMPOLINE_MAGIC
+        {
+            return true;
+        }
+        if offset < PAGE_SIZE {
+            break;
+        }
+        offset -= PAGE_SIZE;
+    }
+    false
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
