@@ -54,9 +54,16 @@ pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 /// zeros, and it is the caller's decision to overwrite it at loading time.
 ///
 /// If it succeeds, it produces an executable with trampoline code appended at a page-aligned
-/// offset after the ELF file. The trampoline data starts with the magic bytes [`TRAMPOLINE_MAGIC`],
-/// followed by the syscall entry point placeholder, the trampoline virtual address, the trampoline
-/// size, and then the actual trampoline code.
+/// offset after the ELF file. The file layout is:
+/// `[original ELF][padding to page boundary][trampoline code][header]`
+///
+/// The header at the end contains:
+/// - [`TRAMPOLINE_MAGIC`] (8 bytes)
+/// - syscall entry point placeholder (8 bytes for 64-bit, 4 bytes for 32-bit)
+/// - trampoline virtual address (8 bytes for 64-bit, 4 bytes for 32-bit)
+/// - trampoline code size (8 bytes for 64-bit, 4 bytes for 32-bit)
+///
+/// This layout allows loaders to read just the last 32/20 bytes to get the metadata.
 #[expect(
     clippy::missing_panics_doc,
     reason = "any panics in here are not part of the public contract and should be fixed within this module"
@@ -106,8 +113,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
     let text_sections = text_sections(&builder)?;
 
-    // Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at page boundaries
-    if is_already_hooked(input_binary) {
+    // Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at end of file
+    if is_already_hooked(input_binary, arch) {
         return Err(Error::AlreadyHooked);
     }
 
@@ -115,32 +122,16 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     let control_transfer_targets = get_control_transfer_targets(arch, &builder, &text_sections);
 
     let trampoline_base_addr = find_addr_for_trampoline_code(&builder);
-    let mut trampoline_data = vec![];
-    // The magic prefix for the trampoline data
-    // This constant should be consistent with the definitions in the shim
-    // (litebox_common_linux/src/loader.rs)
-    trampoline_data.extend_from_slice(TRAMPOLINE_MAGIC);
-    // The placeholder for the address of the new syscall entry point
+
+    // Build the trampoline code (without header - header goes at the end)
+    // The code starts with the syscall entry point placeholder
+    let mut trampoline_code = vec![];
     let trampoline = trampoline.unwrap_or(0);
-    // Reserve space for the trampoline size (will be filled in later)
-    let size_offset;
     if arch == Arch::X86_64 {
-        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
-        // Store the trampoline virtual address
-        trampoline_data.extend_from_slice(&trampoline_base_addr.to_le_bytes());
-        // Size field: 8 bytes for 64-bit
-        size_offset = trampoline_data.len();
-        trampoline_data.extend_from_slice(&0u64.to_le_bytes());
+        trampoline_code.extend_from_slice(&trampoline.to_le_bytes());
     } else {
         let trampoline = u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
-        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
-        // Store the trampoline virtual address
-        let trampoline_base_addr_32 =
-            u32::try_from(trampoline_base_addr).map_err(|_| Error::TrampolineAddressTooLarge)?;
-        trampoline_data.extend_from_slice(&trampoline_base_addr_32.to_le_bytes());
-        // Size field: 4 bytes for 32-bit
-        size_offset = trampoline_data.len();
-        trampoline_data.extend_from_slice(&0u32.to_le_bytes());
+        trampoline_code.extend_from_slice(&trampoline.to_le_bytes());
     }
 
     let mut syscall_insns_found = false;
@@ -156,7 +147,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             data.to_mut(),
             trampoline_base_addr,
             dl_sysinfo_int80,
-            &mut trampoline_data,
+            &mut trampoline_code,
         ) {
             Ok(()) => {
                 syscall_insns_found = true;
@@ -170,18 +161,28 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         return Err(Error::NoSyscallInstructionsFound);
     }
 
-    // Fill in the trampoline size now that we know it
-    let trampoline_size = trampoline_data.len();
+    // Build the header (goes at the end of the file)
+    // Header format: magic(8) + entry(8/4) + vaddr(8/4) + code_size(8/4)
+    let code_size = trampoline_code.len();
+    let mut header = vec![];
+    header.extend_from_slice(TRAMPOLINE_MAGIC);
     if arch == Arch::X86_64 {
-        trampoline_data[size_offset..size_offset + 8]
-            .copy_from_slice(&(trampoline_size as u64).to_le_bytes());
+        header.extend_from_slice(&trampoline.to_le_bytes());
+        header.extend_from_slice(&trampoline_base_addr.to_le_bytes());
+        header.extend_from_slice(&(code_size as u64).to_le_bytes());
     } else {
-        // 32-bit trampoline size fits in u32
+        let trampoline_32 =
+            u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
+        let trampoline_base_addr_32 =
+            u32::try_from(trampoline_base_addr).map_err(|_| Error::TrampolineAddressTooLarge)?;
         #[allow(clippy::cast_possible_truncation)]
-        let size_u32 = trampoline_size as u32;
-        trampoline_data[size_offset..size_offset + 4].copy_from_slice(&size_u32.to_le_bytes());
+        let code_size_32 = code_size as u32;
+        header.extend_from_slice(&trampoline_32.to_le_bytes());
+        header.extend_from_slice(&trampoline_base_addr_32.to_le_bytes());
+        header.extend_from_slice(&code_size_32.to_le_bytes());
     }
 
+    // Write output: [ELF][padding][trampoline code][header]
     let mut out = vec![];
     builder
         .write(&mut out)
@@ -189,7 +190,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // ensure the start address of the trampoline code is page-aligned
     let remain = out.len() % 0x1000;
     out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { 0x1000 - remain }]);
-    out.extend_from_slice(&trampoline_data);
+    out.extend_from_slice(&trampoline_code);
+    out.extend_from_slice(&header);
     Ok(out)
 }
 
@@ -213,33 +215,21 @@ fn text_sections(
     Ok(text_sections)
 }
 
-/// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at page boundaries.
-fn is_already_hooked(input_binary: &[u8]) -> bool {
-    const PAGE_SIZE: usize = 0x1000;
-    const MAX_SEARCH_PAGES: usize = 16;
+/// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
+/// The header is at the last 32 bytes (64-bit) or 20 bytes (32-bit) of the file.
+fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
+    let header_size = match arch {
+        Arch::X86_64 => 32,
+        Arch::X86_32 => 20,
+    };
 
-    if input_binary.len() < TRAMPOLINE_MAGIC.len() {
+    if input_binary.len() < header_size {
         return false;
     }
 
-    // Start from the last page boundary within the file
-    let mut offset = (input_binary.len().saturating_sub(1)) & !(PAGE_SIZE - 1);
-    let min_offset = input_binary
-        .len()
-        .saturating_sub(MAX_SEARCH_PAGES * PAGE_SIZE);
-
-    while offset >= min_offset {
-        if offset + TRAMPOLINE_MAGIC.len() <= input_binary.len()
-            && &input_binary[offset..offset + TRAMPOLINE_MAGIC.len()] == TRAMPOLINE_MAGIC
-        {
-            return true;
-        }
-        if offset < PAGE_SIZE {
-            break;
-        }
-        offset -= PAGE_SIZE;
-    }
-    false
+    // Check if the last header_size bytes start with TRAMPOLINE_MAGIC
+    let header_start = input_binary.len() - header_size;
+    &input_binary[header_start..header_start + TRAMPOLINE_MAGIC.len()] == TRAMPOLINE_MAGIC
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
@@ -351,18 +341,27 @@ fn hook_syscalls_in_section(
             trampoline_data
                 .extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
 
-            // Add jmp [rip + offset_to_shared_target]
+            // Add jmp [rip + offset_to_entry_point]
+            // Entry point is at offset 0 of trampoline_data
             trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 4);
+            // disp32 points to offset 0 (entry point) from current RIP
+            // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
+            // We want: RIP + disp32 = trampoline_base_addr + 0
+            // So: disp32 = -(trampoline_data.len() + 4)
+            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
             trampoline_data.extend_from_slice(&disp32.to_le_bytes());
         } else {
-            // Add call [rip + offset_to_shared_target]
-            // For 32-bit, use a different approach to simulate `call [rip + disp32]`
+            // For 32-bit, use a different approach to simulate indirect call
+            // Entry point is at offset 0 of trampoline_data
             trampoline_data.push(0x50); // PUSH EAX
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 11);
+            // The offset should point to the entry at offset 0
+            // EAX contains the address after CALL instruction (offset from entry = current_len - 6)
+            // We want: EAX + offset = trampoline_base_addr + 0
+            // So: offset = -(trampoline_data.len() - 6 + 4) = -(trampoline_data.len() - 2)
+            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 2);
             trampoline_data.extend_from_slice(&disp32.to_le_bytes());
             // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
             // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
@@ -510,18 +509,27 @@ fn hook_syscall_and_after(
         // Put jump back location into rcx, via lea rcx, [next instruction]
         trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
         trampoline_data.extend_from_slice(&6u32.to_le_bytes());
-        // Add jmp [rip + offset_to_shared_target]
+        // Add jmp [rip + offset_to_entry_point]
+        // Entry point is at offset 0 of trampoline_data
         trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 4);
+        // disp32 points to offset 0 (entry point) from current RIP
+        // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
+        // We want: RIP + disp32 = trampoline_base_addr + 0
+        // So: disp32 = -(trampoline_data.len() + 4)
+        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
         trampoline_data.extend_from_slice(&disp32.to_le_bytes());
     } else {
-        // Add call [rip + offset_to_shared_target]
-        // For 32-bit, use a different approach to simulate `call [rip + disp32]`
+        // For 32-bit, use a different approach to simulate indirect call
+        // Entry point is at offset 0 of trampoline_data
         trampoline_data.push(0x50); // PUSH EAX
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 11);
+        // The offset should point to the entry at offset 0
+        // EAX contains the address after CALL instruction (offset 6)
+        // We want: EAX + offset = trampoline_base_addr + 0
+        // So: offset = -(trampoline_data.len() - 6 + 4) = -(trampoline_data.len() - 2)
+        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 2);
         trampoline_data.extend_from_slice(&disp32.to_le_bytes());
         // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
         // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.

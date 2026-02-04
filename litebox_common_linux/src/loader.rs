@@ -16,7 +16,6 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };
 use thiserror::Error;
-use zerocopy::IntoBytes as _;
 
 use crate::errno::Errno;
 
@@ -138,8 +137,6 @@ pub enum ElfLoadError<E> {
     Map(#[source] E),
     #[error("Invalid program header")]
     InvalidProgramHeader,
-    #[error("Invalid trampoline magic")]
-    InvalidTrampolineMagic,
     #[error(transparent)]
     Fault(#[from] Fault),
 }
@@ -147,9 +144,7 @@ pub enum ElfLoadError<E> {
 impl<E: Into<Errno>> From<ElfLoadError<E>> for Errno {
     fn from(value: ElfLoadError<E>) -> Self {
         match value {
-            ElfLoadError::InvalidProgramHeader | ElfLoadError::InvalidTrampolineMagic => {
-                Errno::ENOEXEC
-            }
+            ElfLoadError::InvalidProgramHeader => Errno::ENOEXEC,
             ElfLoadError::Fault(Fault) => Errno::EFAULT,
             ElfLoadError::Map(err) => err.into(),
         }
@@ -203,9 +198,9 @@ impl ElfParsedFile {
 
     /// Parse the LiteBox trampoline data, if any.
     ///
-    /// The trampoline is located at a page-aligned offset at the end of the file.
-    /// We search backwards from the end of the file for the magic number at page
-    /// boundaries.
+    /// The trampoline header is located at the end of the file (last 32/20 bytes).
+    /// The trampoline code starts at a page-aligned offset before the header.
+    /// File layout: `[ELF][padding][trampoline code][header]`
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
     /// into the trampoline at map time.
@@ -223,7 +218,7 @@ impl ElfParsedFile {
             // and may give zero as entry point.
             return Ok(());
         }
-        const MAX_SEARCH_PAGES: usize = 16;
+        const MAX_TRAMPOLINE_SIZE: usize = 16 * PAGE_SIZE;
 
         let file_size = file.size().map_err(ElfParseError::Io)?;
 
@@ -233,71 +228,61 @@ impl ElfParsedFile {
             TRAMPOLINE_HEADER_SIZE_32
         };
 
-        // Search backwards from the end of the file at page boundaries for the magic.
-        // We limit the search to a reasonable number of pages to avoid scanning the
-        // entire file.
-        let min_offset = file_size.saturating_sub((MAX_SEARCH_PAGES * PAGE_SIZE) as u64);
-
-        // Start from the last page boundary within the file
-        let mut offset = (file_size.saturating_sub(1)) & !(PAGE_SIZE as u64 - 1);
-
-        while offset >= min_offset {
-            let mut magic_buf = [0u8; 8];
-            if file.read_at(offset, &mut magic_buf).is_ok() {
-                let magic = u64::from_le_bytes(magic_buf);
-                if magic == TRAMPOLINE_MAGIC {
-                    // Found the trampoline, now read the rest of the header
-                    let mut header_buf = [0u8; 32]; // Max header size
-                    file.read_at(offset, &mut header_buf[..header_size])
-                        .map_err(ElfParseError::Io)?;
-
-                    let (vaddr, size) = if cfg!(target_pointer_width = "64") {
-                        // 64-bit: [0..8] magic, [8..16] entry, [16..24] vaddr, [24..32] size
-                        let vaddr: usize =
-                            u64::from_le_bytes(header_buf[16..24].try_into().unwrap())
-                                .try_into()
-                                .map_err(|_| ElfParseError::BadTrampoline)?;
-                        let size: usize =
-                            u64::from_le_bytes(header_buf[24..32].try_into().unwrap())
-                                .try_into()
-                                .map_err(|_| ElfParseError::BadTrampoline)?;
-                        (vaddr, size)
-                    } else {
-                        // 32-bit: [0..8] magic, [8..12] entry, [12..16] vaddr, [16..20] size
-                        let vaddr =
-                            u32::from_le_bytes(header_buf[12..16].try_into().unwrap()) as usize;
-                        let size =
-                            u32::from_le_bytes(header_buf[16..20].try_into().unwrap()) as usize;
-                        (vaddr, size)
-                    };
-
-                    // Validate size bounds
-                    if size == 0 || size > PAGE_SIZE * MAX_SEARCH_PAGES {
-                        return Err(ElfParseError::BadTrampoline);
-                    }
-
-                    // Validate trampoline doesn't extend beyond file
-                    if offset + size as u64 > file_size {
-                        return Err(ElfParseError::BadTrampoline);
-                    }
-
-                    self.trampoline = Some(TrampolineInfo {
-                        vaddr,
-                        size,
-                        file_offset: offset,
-                        syscall_entry_point,
-                    });
-                    return Ok(());
-                }
-            }
-
-            if offset < PAGE_SIZE as u64 {
-                break;
-            }
-            offset -= PAGE_SIZE as u64;
+        // File must be large enough to contain the header
+        if file_size < header_size as u64 {
+            return Ok(());
         }
 
-        // No trampoline found, which is OK (not all binaries are rewritten)
+        // Read the header from the end of the file
+        let header_offset = file_size - header_size as u64;
+        let mut header_buf = [0u8; 32]; // Max header size
+        file.read_at(header_offset, &mut header_buf[..header_size])
+            .map_err(ElfParseError::Io)?;
+
+        // Check magic
+        let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
+        if magic != TRAMPOLINE_MAGIC {
+            // No trampoline found, which is OK (not all binaries are rewritten)
+            return Ok(());
+        }
+
+        let (vaddr, code_size) = if cfg!(target_pointer_width = "64") {
+            // 64-bit: [0..8] magic, [8..16] entry, [16..24] vaddr, [24..32] code_size
+            let vaddr: usize = u64::from_le_bytes(header_buf[16..24].try_into().unwrap())
+                .try_into()
+                .map_err(|_| ElfParseError::BadTrampoline)?;
+            let code_size: usize = u64::from_le_bytes(header_buf[24..32].try_into().unwrap())
+                .try_into()
+                .map_err(|_| ElfParseError::BadTrampoline)?;
+            (vaddr, code_size)
+        } else {
+            // 32-bit: [0..8] magic, [8..12] entry, [12..16] vaddr, [16..20] code_size
+            let vaddr = u32::from_le_bytes(header_buf[12..16].try_into().unwrap()) as usize;
+            let code_size = u32::from_le_bytes(header_buf[16..20].try_into().unwrap()) as usize;
+            (vaddr, code_size)
+        };
+
+        // Validate code size bounds
+        if code_size == 0 || code_size > MAX_TRAMPOLINE_SIZE {
+            return Err(ElfParseError::BadTrampoline);
+        }
+
+        // Calculate trampoline code file offset (before header)
+        let code_file_offset = header_offset
+            .checked_sub(code_size as u64)
+            .ok_or(ElfParseError::BadTrampoline)?;
+
+        // Verify the code offset is page-aligned (as required by the rewriter)
+        if !code_file_offset.is_multiple_of(PAGE_SIZE as u64) {
+            return Err(ElfParseError::BadTrampoline);
+        }
+
+        self.trampoline = Some(TrampolineInfo {
+            vaddr,
+            size: code_size,
+            file_offset: code_file_offset,
+            syscall_entry_point,
+        });
         Ok(())
     }
 
@@ -482,16 +467,10 @@ impl ElfParsedFile {
             )
             .map_err(ElfLoadError::Map)?;
 
-        // Validate the trampoline magic number.
-        let mut magic = 0u64;
-        mem.read(trampoline_start, magic.as_mut_bytes())?;
-        if magic != TRAMPOLINE_MAGIC {
-            return Err(ElfLoadError::InvalidTrampolineMagic);
-        }
-
-        // Write the trampoline entry point.
+        // Write the trampoline entry point at the start of the trampoline code.
+        // The first 8 bytes (64-bit) or 4 bytes (32-bit) are reserved for the entry point.
         mem.write(
-            trampoline_start + 8,
+            trampoline_start,
             &trampoline.syscall_entry_point.to_ne_bytes(),
         )?;
 
