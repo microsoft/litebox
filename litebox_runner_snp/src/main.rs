@@ -118,6 +118,7 @@ const HOST_FILE_PATHS: &[&str] = &[
     "/out/hello",
     "/out/efault",
     "/out/thread_exit",
+    "/out/tcp_server",
     // Add more paths as needed
 ];
 
@@ -273,6 +274,32 @@ pub extern "C" fn sandbox_task_exit() {
 #[unsafe(no_mangle)]
 pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) {
     litebox_platform_linux_kernel::host::snp::snp_impl::handle_syscall(pt_regs);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sandbox_tun_read_write() {
+    let shim = &raw const SHIM;
+    // wait until shim is initialized
+    let shim = loop {
+        match unsafe { (*shim).as_ref() } {
+            Some(shim) => break shim,
+            None => {}
+        }
+    };
+    litebox::log_println!(
+        litebox_platform_multiplex::platform(),
+        "sandbox_tun_read_write started\n"
+    );
+    loop {
+        let _timeout = loop {
+            match shim
+                .perform_network_interaction() {
+                    litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {},
+                    litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => break timeout,
+                }
+        };
+        // TODO: use timeout to wait on host events
+    }
 }
 
 /// This function is called on panic.

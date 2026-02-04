@@ -59,6 +59,12 @@ _exit:
     jmp	1b
 
 sandbox_tun_read_write_start:
+    and    rsp, -16                   /* align stack to 16 bytes */
+    call   sandbox_tun_read_write
+1:  /* hlt the machine */
+    hlt
+    jmp	1b
+
 sandbox_mount_start:
 sandbox_signal_ret:
 rust_begin_unwind:
