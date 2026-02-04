@@ -1091,6 +1091,7 @@ dependencies = [
  "aes",
  "arrayvec",
  "bitflags 2.9.4",
+ "bitvec",
  "cfg-if",
  "ctr",
  "elf 0.8.0",

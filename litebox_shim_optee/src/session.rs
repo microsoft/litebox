@@ -91,9 +91,8 @@
 //!   - Indexing saved contexts by an identifier (passed via `a3-a7`)
 //!   - Restoring context when normal world calls `RETURN_FROM_RPC`
 
-use crate::{LoadedProgram, OpteeShim};
+use crate::{LoadedProgram, OpteeShim, SessionIdPool};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use hashbrown::HashMap;
 use litebox_common_optee::{TaFlags, TeeUuid};
 use spin::mutex::SpinMutex;
@@ -259,12 +258,18 @@ impl Default for SingleInstanceCache {
     }
 }
 
-/// Global session ID counter.
-static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(1);
-
 /// Allocate a new unique session ID.
+///
+/// Delegates to [`SessionIdPool::allocate`] for unified session ID management.
 pub fn allocate_session_id() -> u32 {
-    NEXT_SESSION_ID.fetch_add(1, SeqCst)
+    SessionIdPool::allocate()
+}
+
+/// Recycle a session ID for potential future reuse.
+///
+/// Delegates to [`SessionIdPool::recycle`].
+pub fn recycle_session_id(session_id: u32) {
+    SessionIdPool::recycle(session_id);
 }
 
 /// Session manager that coordinates session and instance lifecycle.
