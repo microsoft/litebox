@@ -214,7 +214,7 @@ After implementing changes:
 ### Analysis Document (Always Created)
 Create or update `litebox_skill_runner/GVISOR_SYSCALL_ANALYSIS.md`:
 ```markdown
-# gVisor Syscall Analysis - [Date]
+# gVisor Syscall Analysis - YYYY-MM-DD
 
 ## Summary
 [High-level summary of findings]
@@ -240,7 +240,7 @@ Create or update `litebox_skill_runner/GVISOR_SYSCALL_ANALYSIS.md`:
 ### Evaluation Document (If Changes Made)
 Create `litebox_skill_runner/EVALUATION_YYYY-MM-DD.md`:
 ```markdown
-# Evaluation - [Date]
+# Evaluation - YYYY-MM-DD
 
 ## gVisor Syscall Testing Analysis
 
