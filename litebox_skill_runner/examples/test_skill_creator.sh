@@ -1,4 +1,8 @@
-#!/usr/bin/env bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 #
 # Test script for skill-creator skill from Anthropic
 # This is a Tier 1 test - simple, stdlib-only Python with just PyYAML

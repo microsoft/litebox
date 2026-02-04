@@ -787,6 +787,8 @@ impl Task {
 // TODO: enforce the following limits:
 const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+const RLIMIT_NPROC_CUR: usize = 65536; // Default current limit for number of processes
+const RLIMIT_NPROC_MAX: usize = 65536; // Default max limit for number of processes
 
 struct AtomicRlimit {
     cur: core::sync::atomic::AtomicUsize,
@@ -822,6 +824,10 @@ impl ResourceLimits {
         limits[litebox_common_linux::RlimitResource::STACK as usize] = AtomicRlimit {
             cur: core::sync::atomic::AtomicUsize::new(crate::loader::DEFAULT_STACK_SIZE),
             max: core::sync::atomic::AtomicUsize::new(litebox_common_linux::rlim_t::MAX),
+        };
+        limits[litebox_common_linux::RlimitResource::NPROC as usize] = AtomicRlimit {
+            cur: core::sync::atomic::AtomicUsize::new(RLIMIT_NPROC_CUR),
+            max: core::sync::atomic::AtomicUsize::new(RLIMIT_NPROC_MAX),
         };
         Self { limits }
     }
@@ -862,7 +868,8 @@ impl Task {
     ) -> Result<litebox_common_linux::Rlimit, Errno> {
         let old_rlimit = match resource {
             litebox_common_linux::RlimitResource::NOFILE
-            | litebox_common_linux::RlimitResource::STACK => {
+            | litebox_common_linux::RlimitResource::STACK
+            | litebox_common_linux::RlimitResource::NPROC => {
                 self.thread.process.limits.get_rlimit(resource)
             }
             _ => unimplemented!("Unsupported resource for get_rlimit: {:?}", resource),

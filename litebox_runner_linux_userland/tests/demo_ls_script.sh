@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Test script that demonstrates script interpreter support
 # This script lists files in /tmp to validate that commands work within scripts
 
