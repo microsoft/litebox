@@ -588,6 +588,7 @@ pub struct Winsize {
 
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
@@ -601,6 +602,8 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TCGETS(Platform::RawMutPointer<Termios>),
     /// Set the current serial port settings.
     TCSETS(Platform::RawConstPointer<Termios>),
+    /// Get the process group ID of the foreground process group on the terminal.
+    TIOCGPGRP(Platform::RawMutPointer<i32>),
     /// Get window size.
     TIOCGWINSZ(Platform::RawMutPointer<Winsize>),
     /// Obtain device unit number, which can be used to generate
@@ -2409,6 +2412,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     match cmd {
                         TCGETS => IoctlArg::TCGETS(ctx.sys_req_ptr(2)),
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
+                        TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
