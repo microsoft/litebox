@@ -11,7 +11,6 @@ use crate::{
         hvcall::{HypervCallError, hv_do_rep_hypercall},
         vtl1_mem_layout::PAGE_SHIFT,
     },
-    serial_println,
 };
 
 /// Hyper-V Hypercall to prevent lower VTLs (i.e., VTL0) from accessing a specified range of
@@ -52,12 +51,7 @@ pub fn hv_modify_vtl_protection_mask(
             core::ptr::null_mut(),
         );
 
-        if let Ok(protected) = result {
-            total_protected += protected;
-        } else {
-            serial_println!("Err: {:?}", result);
-            return result;
-        }
+        total_protected += result?;
     }
 
     Ok(total_protected)

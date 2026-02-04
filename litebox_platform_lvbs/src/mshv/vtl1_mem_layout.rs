@@ -3,6 +3,8 @@
 
 //! VTL1 physical memory layout (LVBS-specific)
 
+use thiserror::Error;
+
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SHIFT: usize = 12;
 pub const PTES_PER_PAGE: usize = 512;
@@ -54,9 +56,12 @@ pub fn get_address_of_special_page(page: usize) -> u64 {
     get_memory_base_address() + (page as u64) * PAGE_SIZE as u64
 }
 
-/// Error for VSM memory
-#[derive(Debug, PartialEq)]
+/// Errors for VTL memory operations.
+#[derive(Debug, Error, PartialEq)]
+#[non_exhaustive]
 pub enum VtlMemoryError {
+    #[error("invalid boot parameters")]
     InvalidBootParams,
+    #[error("invalid command line")]
     InvalidCmdLine,
 }

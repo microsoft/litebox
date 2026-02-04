@@ -13,10 +13,9 @@ use crate::host::{
 use crate::mshv::{
     HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS,
     VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
-    hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
+    error::VsmError, hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
 };
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
-use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 
 // ============================================================================
@@ -277,14 +276,14 @@ enum VtlEntryReason {
     Interrupt = VTL_ENTRY_REASON_INTERRUPT,
 }
 
-pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), Errno> {
-    let value =
-        hvcall_get_vp_registers(HV_REGISTER_VSM_CODEPAGE_OFFSETS).map_err(|_| Errno::EIO)?;
+pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), VsmError> {
+    let value = hvcall_get_vp_registers(HV_REGISTER_VSM_CODEPAGE_OFFSETS)
+        .map_err(VsmError::HypercallFailed)?;
     let code_page_offsets = HvRegisterVsmCodePageOffsets::from_u64(value);
     let hvcall_page: usize = hv_hypercall_page_address().truncate();
     let vtl_return_address = hvcall_page
         .checked_add(usize::from(code_page_offsets.vtl_return_offset()))
-        .ok_or(Errno::EOVERFLOW)?;
+        .ok_or(VsmError::CodePageOffsetOverflow)?;
     with_per_cpu_variables_asm(|pcv_asm| {
         pcv_asm.set_vtl_return_addr(vtl_return_address);
     });

@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::{
+    debug_serial_println,
     host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
     mshv::{
         DEFAULT_REG_PIN_MASK, HV_REGISTER_PENDING_EVENT0, HV_X64_REGISTER_APIC_BASE,
@@ -15,7 +16,6 @@ use crate::{
         MSR_LSTAR, MSR_STAR, MSR_SYSCALL_MASK, X86Cr0Flags, X86Cr4Flags, hvcall::HypervCallError,
         hvcall_vp::hvcall_set_vp_vtl0_registers,
     },
-    serial_println,
 };
 use num_enum::TryFromPrimitive;
 
@@ -71,7 +71,7 @@ pub fn vsm_handle_intercept() {
             };
 
             let gpa = int_msg.gpa;
-            serial_println!("VSM: GPA intercept on {gpa:#x}");
+            debug_serial_println!("VSM: GPA intercept on {gpa:#x}");
             raise_vtl0_gp_fault().expect("Failed to raise VTL0 GP fault on GPA intercept");
         }
         HvMessageType::MsrIntercept => {
@@ -141,7 +141,9 @@ pub fn vsm_handle_intercept() {
             }
         }
         _ => {
-            serial_println!("VSM: Ignore unknown synthetic interrupt message type {msg_type:#x}");
+            debug_serial_println!(
+                "VSM: Ignore unknown synthetic interrupt message type {msg_type:#x}"
+            );
         }
     }
 }
@@ -181,7 +183,7 @@ fn validate_and_continue_vtl0_register_write(
             hvcall_set_vp_vtl0_registers(reg_name, value).expect("Failed to write VTL0 register");
             advance_vtl0_rip(int_msg_hdr).expect("Failed to advance VTL0 RIP");
         } else {
-            serial_println!("VSM: Writing {value:#x} to reg {reg_name:#x} is disallowed");
+            debug_serial_println!("VSM: Writing {value:#x} to reg {reg_name:#x} is disallowed");
             raise_vtl0_gp_fault().expect("Failed to raise VTL0 GP fault");
         }
     } else {

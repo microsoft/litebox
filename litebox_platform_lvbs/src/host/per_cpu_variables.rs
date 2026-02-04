@@ -17,6 +17,7 @@ use aligned_vec::avec;
 use alloc::boxed::Box;
 use core::cell::{Cell, RefCell};
 use core::mem::offset_of;
+use litebox::utils::TruncateExt;
 use litebox_common_linux::{rdgsbase, wrgsbase};
 use x86_64::VirtAddr;
 
@@ -444,8 +445,7 @@ where
 {
     let pcv_asm_addr = unsafe {
         let gsbase = rdgsbase();
-        let addr = VirtAddr::try_new(u64::try_from(gsbase).unwrap())
-            .expect("GS contains a non-canonical address");
+        let addr = VirtAddr::try_new(gsbase as u64).expect("GS contains a non-canonical address");
         addr.as_ptr::<RefCellWrapper<*mut PerCpuVariables>>()
             .cast::<PerCpuVariablesAsm>()
     };
@@ -482,13 +482,13 @@ fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut Pe
         } else {
             let addr = x86_64::VirtAddr::new(&raw const *refcell_wrapper as u64);
             unsafe {
-                wrgsbase(usize::try_from(addr.as_u64()).unwrap());
+                wrgsbase(addr.as_u64().truncate());
             }
             Some(refcell)
         }
     } else {
-        let addr = x86_64::VirtAddr::try_new(u64::try_from(gsbase).unwrap())
-            .expect("GS contains a non-canonical address");
+        let addr =
+            x86_64::VirtAddr::try_new(gsbase as u64).expect("GS contains a non-canonical address");
         let refcell_wrapper = unsafe { &*addr.as_ptr::<RefCellWrapper<*mut PerCpuVariables>>() };
         let refcell = refcell_wrapper.get_refcell();
         if refcell.borrow().is_null() {
@@ -549,15 +549,13 @@ pub fn allocate_per_cpu_variables() {
 pub fn init_per_cpu_variables() {
     const STACK_ALIGNMENT: usize = 16;
     with_per_cpu_variables_mut(|per_cpu_variables| {
-        let kernel_sp =
-            usize::try_from(per_cpu_variables.kernel_stack_top()).unwrap() & !(STACK_ALIGNMENT - 1);
-        let interrupt_sp = usize::try_from(per_cpu_variables.interrupt_stack_top()).unwrap()
+        let kernel_sp = TruncateExt::<usize>::truncate(per_cpu_variables.kernel_stack_top())
             & !(STACK_ALIGNMENT - 1);
-        let vtl0_state_top_addr = usize::try_from(
-            &raw const per_cpu_variables.vtl0_state as u64
-                + core::mem::size_of::<VtlState>() as u64,
-        )
-        .unwrap();
+        let interrupt_sp = TruncateExt::<usize>::truncate(per_cpu_variables.interrupt_stack_top())
+            & !(STACK_ALIGNMENT - 1);
+        let vtl0_state_top_addr =
+            TruncateExt::<usize>::truncate(&raw const per_cpu_variables.vtl0_state as u64)
+                + core::mem::size_of::<VtlState>();
         with_per_cpu_variables_asm(|pcv_asm| {
             pcv_asm.set_kernel_stack_ptr(kernel_sp);
             pcv_asm.set_interrupt_stack_ptr(interrupt_sp);
@@ -581,7 +579,7 @@ fn get_xsave_area_size() -> usize {
     let sinfo = cpuid
         .get_extended_state_info()
         .expect("Failed to get cpuid extended state info");
-    usize::try_from(sinfo.xsave_area_size_enabled_features()).unwrap()
+    sinfo.xsave_area_size_enabled_features() as usize
 }
 
 #[allow(clippy::inline_always)]

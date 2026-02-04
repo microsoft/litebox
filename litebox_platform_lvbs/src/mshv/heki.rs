@@ -3,10 +3,10 @@
 
 use crate::{
     host::linux::ListHead,
-    mshv::{HvPageProtFlags, vtl1_mem_layout::PAGE_SIZE},
+    mshv::{HvPageProtFlags, error::VsmError, vtl1_mem_layout::PAGE_SIZE},
 };
 use core::mem;
-use litebox_common_linux::errno::Errno;
+use litebox::utils::TruncateExt;
 use num_enum::TryFromPrimitive;
 use x86_64::{
     PhysAddr, VirtAddr,
@@ -291,7 +291,7 @@ impl HekiPatch {
             core::cmp::min(PAGE_SIZE, usize::from(self.size))
         } else {
             core::cmp::min(
-                usize::try_from(pa_0.align_up(Size4KiB::SIZE) - pa_0).unwrap(),
+                (pa_0.align_up(Size4KiB::SIZE) - pa_0).truncate(),
                 usize::from(self.size),
             )
         };
@@ -361,9 +361,9 @@ impl HekiKernelSymbol {
     pub const KSYM_LEN: usize = mem::size_of::<HekiKernelSymbol>();
     pub const KSY_NAME_LEN: usize = 512;
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Errno> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, VsmError> {
         if bytes.len() < Self::KSYM_LEN {
-            return Err(Errno::EINVAL);
+            return Err(VsmError::BufferTooSmall("HekiKernelSymbol"));
         }
 
         #[allow(clippy::cast_ptr_alignment)]
@@ -394,9 +394,9 @@ pub struct HekiKernelInfo {
 impl HekiKernelInfo {
     const KINFO_LEN: usize = mem::size_of::<HekiKernelInfo>();
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Errno> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, VsmError> {
         if bytes.len() < Self::KINFO_LEN {
-            return Err(Errno::EINVAL);
+            return Err(VsmError::BufferTooSmall("HekiKernelInfo"));
         }
 
         #[allow(clippy::cast_ptr_alignment)]

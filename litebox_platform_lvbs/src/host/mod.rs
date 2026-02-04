@@ -39,5 +39,5 @@ pub fn hv_hypercall_page_address() -> u64 {
         );
         NonZeroUsize::new(addr).expect("Failed to get non-zero hypercall page address")
     });
-    u64::try_from(hypercall_page_addr.get()).unwrap()
+    hypercall_page_addr.get() as u64
 }

@@ -14,6 +14,7 @@ use litebox::{
         linux::{PAGE_SIZE, PageFaultError, PageRange, VmFlags},
     },
     platform::RawConstPointer,
+    utils::TruncateExt,
 };
 use spin::mutex::SpinMutex;
 
@@ -82,8 +83,8 @@ impl super::MemoryProvider for MockKernel {
 
     fn pa_to_va(pa: PhysAddr) -> VirtAddr {
         let mapping = MAPPING.lock();
-        let idx = (pa.as_u64() - 0x1000_0000) / PAGE_SIZE as u64;
-        let va = mapping.get(usize::try_from(idx).unwrap());
+        let idx: usize = ((pa.as_u64() - 0x1000_0000) / PAGE_SIZE as u64).truncate();
+        let va = mapping.get(idx);
         assert!(va.is_some());
         let va = *va.unwrap();
         if va.is_null() {

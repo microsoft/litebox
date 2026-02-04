@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use litebox::mm::linux::PageFaultError;
 
 use crate::arch::{
-    Page, PageFaultErrorCode, PageSize, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, VirtAddr,
+    Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, VirtAddr,
 };
 
 /// Page table allocator
@@ -34,8 +35,7 @@ impl<M: super::MemoryProvider> PageTableAllocator<M> {
         M::mem_allocate_pages(0).map(|addr| {
             if clear {
                 unsafe {
-                    core::slice::from_raw_parts_mut(addr, usize::try_from(Size4KiB::SIZE).unwrap())
-                        .fill(0);
+                    core::slice::from_raw_parts_mut(addr, PAGE_SIZE).fill(0);
                 }
             }
             PhysFrame::from_start_address(M::make_pa_private(M::va_to_pa(VirtAddr::new(
