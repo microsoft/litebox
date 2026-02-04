@@ -6,6 +6,7 @@
 use crate::arch::{PhysAddr, VirtAddr};
 
 pub(crate) mod pgtable;
+pub mod vmap;
 
 #[cfg(test)]
 pub mod tests;
