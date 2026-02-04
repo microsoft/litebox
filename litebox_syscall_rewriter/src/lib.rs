@@ -358,10 +358,11 @@ fn hook_syscalls_in_section(
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
             // The offset should point to the entry at offset 0
-            // EAX contains the address after CALL instruction (offset from entry = current_len - 6)
-            // We want: EAX + offset = trampoline_base_addr + 0
-            // So: offset = -(trampoline_data.len() - 6 + 4) = -(trampoline_data.len() - 2)
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 2);
+            // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
+            // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
+            // We want: EAX + offset = base + 0
+            // So: offset = -(current_len - 3)
+            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
             trampoline_data.extend_from_slice(&disp32.to_le_bytes());
             // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
             // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
@@ -526,10 +527,11 @@ fn hook_syscall_and_after(
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
         // The offset should point to the entry at offset 0
-        // EAX contains the address after CALL instruction (offset 6)
-        // We want: EAX + offset = trampoline_base_addr + 0
-        // So: offset = -(trampoline_data.len() - 6 + 4) = -(trampoline_data.len() - 2)
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 2);
+        // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
+        // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
+        // We want: EAX + offset = base + 0
+        // So: offset = -(current_len - 3)
+        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
         trampoline_data.extend_from_slice(&disp32.to_le_bytes());
         // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
         // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
@@ -648,7 +650,12 @@ fn hook_syscall_before_and_after(
     trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
     trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
     trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-    let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 11);
+    // The offset should point to the entry at offset 0
+    // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
+    // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
+    // We want: EAX + offset = base + 0
+    // So: offset = -(current_len - 3)
+    let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
     trampoline_data.extend_from_slice(&disp32.to_le_bytes());
     // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
     // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
