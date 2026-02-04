@@ -13,5 +13,9 @@ pub const REWRITER_VERSION_NUMBER: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
 pub(crate) const DEFAULT_STACK_SIZE: usize = 1024 * 1024; // 1 MB
 
-// Re-export from litebox_common_optee for convenience
-pub(crate) use litebox_common_optee::TA_DEFAULT_LOW_ADDR as DEFAULT_LOW_ADDR;
+/// Default low address for loading TA binaries.
+///
+/// This must be >= `USER_ADDR_MIN` defined in the platform because user memory is
+/// mapped in the range [`USER_ADDR_MIN`, `USER_ADDR_MAX`) for easy identification
+/// during cleanup. The binary grows upwards from this address.
+pub const DEFAULT_LOW_ADDR: usize = 0x6FFF_FFFF_F000 + 0x1000;

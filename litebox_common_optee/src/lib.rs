@@ -10,6 +10,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use litebox::platform::RawConstPointer as _;
+use litebox::utils::TruncateExt;
 use litebox_common_linux::{PtRegs, errno::Errno};
 use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B8, B54};
@@ -18,28 +19,6 @@ use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
 use zerocopy::{FromBytes, IntoBytes};
 
 pub mod syscall_nr;
-
-/// Maximum virtual address (exclusive) for user-space allocations.
-/// This is set to (1 << 47) - PAGE_SIZE (upper limit of 4-level paging).
-pub const USER_ADDR_MAX: usize = 0x7FFF_FFFF_F000;
-
-/// Size of the user address space range.
-pub const USER_ADDR_RANGE_SIZE: usize = 0x1000_0000_0000; // 16 TiB
-
-/// Minimum virtual address for user-space allocations.
-///
-/// Kernel memory uses low addresses (identity mapped: VA == PA).
-/// User memory uses addresses in range [`USER_ADDR_MIN`, `USER_ADDR_MAX`).
-/// This separation allows easy identification during cleanup and supports
-/// future designs where kernel VAs may be in higher addresses.
-pub const USER_ADDR_MIN: usize = USER_ADDR_MAX - USER_ADDR_RANGE_SIZE;
-
-/// Default low address for loading TA binaries.
-///
-/// This must be >= `USER_ADDR_MIN` because user memory is mapped in the
-/// range [`USER_ADDR_MIN`, `USER_ADDR_MAX`) for easy identification during cleanup.
-/// The binary grows upwards from this address.
-pub const TA_DEFAULT_LOW_ADDR: usize = USER_ADDR_MIN + 0x1000usize;
 
 // Based on `optee_os/lib/libutee/include/utee_syscalls.h`
 #[non_exhaustive]
@@ -1809,109 +1788,6 @@ impl From<OpteeSmcReturnCode> for litebox_common_linux::errno::Errno {
     }
 }
 
-/// Find an ELF section by name and return its offset and size.
-///
-/// This function searches for a section with the given name in the ELF and returns
-/// the section's file offset and size. Returns `None` if the section is not found
-/// or the ELF is malformed.
-///
-/// # Arguments
-/// * `elf_data` - Raw bytes of the ELF binary
-/// * `section_name` - Name of the section to find (e.g., ".ta_head")
-///
-/// # Returns
-/// `Some((offset, size))` if the section is found, `None` otherwise.
-#[allow(clippy::cast_possible_truncation)] // ELF offsets fit in usize on 64-bit
-fn find_elf_section(elf_data: &[u8], section_name: &str) -> Option<(usize, usize)> {
-    // Minimum ELF header size check
-    if elf_data.len() < 64 {
-        return None;
-    }
-
-    // Check ELF magic
-    if &elf_data[0..4] != b"\x7fELF" {
-        return None;
-    }
-
-    // Parse ELF header (assuming 64-bit little-endian for now)
-    let e_shoff = u64::from_le_bytes(elf_data[40..48].try_into().ok()?) as usize;
-    let e_shentsize = u16::from_le_bytes(elf_data[58..60].try_into().ok()?) as usize;
-    let e_shnum = u16::from_le_bytes(elf_data[60..62].try_into().ok()?) as usize;
-    let e_shstrndx = u16::from_le_bytes(elf_data[62..64].try_into().ok()?) as usize;
-
-    if e_shnum == 0 || e_shstrndx >= e_shnum {
-        return None;
-    }
-
-    // Validate section header table bounds
-    let sh_table_end = e_shoff.checked_add(e_shentsize.checked_mul(e_shnum)?)?;
-    if sh_table_end > elf_data.len() {
-        return None;
-    }
-
-    // Get string table section header
-    let shstrtab_off = e_shoff + e_shstrndx * e_shentsize;
-    if shstrtab_off + 64 > elf_data.len() {
-        return None;
-    }
-    let shstrtab_offset = u64::from_le_bytes(
-        elf_data[shstrtab_off + 24..shstrtab_off + 32]
-            .try_into()
-            .ok()?,
-    ) as usize;
-    let shstrtab_size = u64::from_le_bytes(
-        elf_data[shstrtab_off + 32..shstrtab_off + 40]
-            .try_into()
-            .ok()?,
-    ) as usize;
-
-    if shstrtab_offset.checked_add(shstrtab_size)? > elf_data.len() {
-        return None;
-    }
-
-    // Search for the requested section
-    for i in 0..e_shnum {
-        let sh_off = e_shoff + i * e_shentsize;
-        if sh_off + 64 > elf_data.len() {
-            continue;
-        }
-
-        // Get section name index
-        let sh_name = u32::from_le_bytes(elf_data[sh_off..sh_off + 4].try_into().ok()?) as usize;
-
-        // Get section name from string table
-        let name_start = shstrtab_offset + sh_name;
-        if name_start >= elf_data.len() {
-            continue;
-        }
-
-        let name_end = elf_data[name_start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map_or(elf_data.len(), |pos| name_start + pos);
-
-        let current_section_name = &elf_data[name_start..name_end];
-        if current_section_name != section_name.as_bytes() {
-            continue;
-        }
-
-        // Found the section, return its offset and size
-        let sh_offset =
-            u64::from_le_bytes(elf_data[sh_off + 24..sh_off + 32].try_into().ok()?) as usize;
-        let sh_size =
-            u64::from_le_bytes(elf_data[sh_off + 32..sh_off + 40].try_into().ok()?) as usize;
-
-        let section_end = sh_offset.checked_add(sh_size)?;
-        if section_end > elf_data.len() {
-            return None;
-        }
-
-        return Some((sh_offset, sh_size));
-    }
-
-    None
-}
-
 /// Parse the `.ta_head` section from a raw ELF binary.
 ///
 /// This function searches for the `.ta_head` section in the ELF and parses the `TaHead`
@@ -1921,16 +1797,27 @@ fn find_elf_section(elf_data: &[u8], section_name: &str) -> Option<(usize, usize
 /// * `elf_data` - Raw bytes of the ELF binary
 pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
     use core::mem::size_of;
+    use elf::{ElfBytes, endian::AnyEndian};
 
-    let (offset, size) = find_elf_section(elf_data, TA_HEAD_SECTION_NAME)?;
+    let elf = ElfBytes::<AnyEndian>::minimal_parse(elf_data).ok()?;
+    let (shdrs, strtab) = elf.section_headers_with_strtab().ok()?;
+    let shdrs = shdrs?;
+    let strtab = strtab?;
 
-    // Verify size is at least TaHead size
-    if size < size_of::<TaHead>() {
-        return None;
+    for shdr in shdrs {
+        let name = strtab.get(shdr.sh_name as usize).ok()?;
+        if name == TA_HEAD_SECTION_NAME {
+            let offset: usize = shdr.sh_offset.truncate();
+            let size: usize = shdr.sh_size.truncate();
+
+            if size < size_of::<TaHead>() {
+                return None;
+            }
+
+            return TaHead::read_from_bytes(&elf_data[offset..offset + size_of::<TaHead>()]).ok();
+        }
     }
-
-    // Parse TaHead structure
-    TaHead::read_from_bytes(&elf_data[offset..offset + size_of::<TaHead>()]).ok()
+    None
 }
 
 #[cfg(test)]

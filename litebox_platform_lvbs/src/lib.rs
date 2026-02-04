@@ -55,8 +55,20 @@ static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 /// Special page table ID for the base (kernel-only) page table.
 pub const BASE_PAGE_TABLE_ID: usize = 0;
 
-// Re-export user address range constants from litebox_common_optee
-use litebox_common_optee::{USER_ADDR_MAX, USER_ADDR_MIN};
+/// Maximum virtual address (exclusive) for user-space allocations.
+/// This is set to (1 << 47) - PAGE_SIZE (upper limit of 4-level paging).
+const USER_ADDR_MAX: usize = 0x7FFF_FFFF_F000;
+
+/// Size of the user address space range.
+const USER_ADDR_RANGE_SIZE: usize = 0x1000_0000_0000; // 16 TiB
+
+/// Minimum virtual address for user-space allocations.
+///
+/// Kernel memory uses low addresses (identity mapped: VA == PA).
+/// User memory uses addresses in range [`USER_ADDR_MIN`, `USER_ADDR_MAX`).
+/// This separation allows easy identification during cleanup and supports
+/// future designs where kernel VAs may be in higher addresses.
+const USER_ADDR_MIN: usize = USER_ADDR_MAX - USER_ADDR_RANGE_SIZE;
 
 /// Manages base and task page tables.
 ///

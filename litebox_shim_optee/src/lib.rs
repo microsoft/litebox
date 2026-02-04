@@ -10,9 +10,9 @@ extern crate alloc;
 
 use crate::loader::elf::ElfLoaderError;
 use aes::{Aes128, Aes192, Aes256};
-use alloc::{collections::vec_deque::VecDeque, sync::Arc, vec};
+use alloc::{sync::Arc, vec};
 use core::cell::Cell;
-use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use ctr::Ctr128BE;
 use hashbrown::HashMap;
 use litebox::{
@@ -20,7 +20,7 @@ use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{PunchthroughProvider, PunchthroughToken, RawConstPointer as _, RawMutPointer as _},
     shim::ContinueOperation,
-    utils::ReinterpretUnsignedExt,
+    utils::{ReinterpretUnsignedExt, TruncateExt},
 };
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 use litebox_common_optee::{
@@ -952,10 +952,17 @@ impl TeeObjMap {
             // TODO: support multiple attributes (e.g., two-key crypto algorithms like AES-XTS)
             match user_attrs[0].attribute_id {
                 TeeAttributeType::SecretValue => {
-                    let key_addr = user_attrs[0].a as *const u8;
+                    let key_addr: usize = user_attrs[0].a.truncate();
                     let key_len = usize::try_from(user_attrs[0].b).unwrap();
-                    let key_slice = unsafe { core::slice::from_raw_parts(key_addr, key_len) };
-                    tee_obj.set_key(key_slice);
+                    // TODO: revisit buffer size limits based on OP-TEE spec and deployment constraints
+                    if key_len > MAX_KERNEL_BUF_SIZE {
+                        return Err(TeeResult::BadParameters);
+                    }
+                    let key_ptr = UserConstPtr::<u8>::from_usize(key_addr);
+                    let key_slice = key_ptr
+                        .to_owned_slice(key_len)
+                        .ok_or(TeeResult::BadParameters)?;
+                    tee_obj.set_key(&key_slice);
                 }
                 _ => todo!(
                     "handle attribute ID: {}",
@@ -1290,36 +1297,102 @@ pub(crate) enum ThreadInitState {
 ///
 /// This is a global singleton that manages session IDs across all shim instances.
 /// Session IDs are globally unique and can be recycled after a session is closed.
+///
+/// To minimize duplicate session IDs, recycling is deferred until fresh IDs are
+/// nearly exhausted (after ~4 billion allocations). IDs freed before reaching
+/// the threshold are discarded and never reused.
 pub struct SessionIdPool;
 
 /// Global session ID counter shared across all shim instances.
 static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(1);
-/// Global recycle pool for reusing session IDs.
-static RECYCLE_POOL: spin::mutex::SpinMutex<VecDeque<u32>> =
-    spin::mutex::SpinMutex::new(VecDeque::new());
+/// Bitmap tracking recycled session IDs. Each bit represents whether that ID is available.
+/// Only populated after NEXT_SESSION_ID reaches RECYCLE_THRESHOLD.
+static RECYCLE_BITMAP: [AtomicU64; SessionIdPool::BITMAP_SIZE] =
+    [const { AtomicU64::new(0) }; SessionIdPool::BITMAP_SIZE];
+/// Hint for bitmap scan: index of first potentially non-empty chunk.
+/// Updated on recycle to speed up allocation searches.
+static RECYCLE_HINT: AtomicUsize = AtomicUsize::new(0);
 
 impl SessionIdPool {
     const PTA_SESSION_ID: u32 = 0xffff_fffe;
+    /// Threshold at which we start tracking and reusing recycled IDs.
+    /// Set to allow ~16M recyclable IDs after ~4B fresh allocations.
+    const RECYCLE_THRESHOLD: u32 = 0xff00_0000;
+    /// Number of u64s in the bitmap (supports up to BITMAP_SIZE * 64 recyclable IDs).
+    /// 262144 * 64 = 16,777,216 IDs (~16M), using 2MB of memory.
+    const BITMAP_SIZE: usize = 262144;
 
     /// Allocate a new session ID.
     ///
+    /// Prefers fresh IDs until reaching the threshold, then starts reusing recycled IDs.
+    ///
     /// # Panics
     /// Panics if session IDs are exhausted.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn allocate() -> u32 {
-        let mut pool = RECYCLE_POOL.lock();
-        if let Some(session_id) = pool.pop_front() {
-            session_id
-        } else {
-            let session_id = NEXT_SESSION_ID.fetch_add(1, SeqCst);
-            assert!(session_id != Self::PTA_SESSION_ID, "session ID exhausted");
-            session_id
+        loop {
+            let current = NEXT_SESSION_ID.load(SeqCst);
+
+            if current >= Self::RECYCLE_THRESHOLD {
+                // Start search from hint (likely location of available IDs)
+                let hint = RECYCLE_HINT.load(SeqCst);
+                for i in 0..Self::BITMAP_SIZE {
+                    let chunk_idx = (hint + i) % Self::BITMAP_SIZE;
+                    let chunk = &RECYCLE_BITMAP[chunk_idx];
+                    loop {
+                        let bits = chunk.load(SeqCst);
+                        if bits == 0 {
+                            break; // No available IDs in this chunk
+                        }
+                        let bit_idx = bits.trailing_zeros();
+                        let mask = 1u64 << bit_idx;
+                        if chunk
+                            .compare_exchange(bits, bits & !mask, SeqCst, SeqCst)
+                            .is_ok()
+                        {
+                            // Convert bitmap index back to session ID (relative to threshold)
+                            let session_id =
+                                Self::RECYCLE_THRESHOLD + (chunk_idx as u32) * 64 + bit_idx;
+                            return session_id;
+                        }
+                    }
+                }
+            }
+
+            // Check exhaustion before attempting to allocate
+            assert!(current < Self::PTA_SESSION_ID, "session ID exhausted");
+
+            // Use CAS to atomically claim this ID; retry if another thread raced us
+            if NEXT_SESSION_ID
+                .compare_exchange(current, current + 1, SeqCst, SeqCst)
+                .is_ok()
+            {
+                return current;
+            }
         }
     }
 
     /// Recycle a session ID for reuse.
+    ///
+    /// To avoid duplicate session IDs, recycling is only enabled after fresh IDs
+    /// are nearly exhausted. IDs freed before reaching the threshold are discarded.
     pub fn recycle(session_id: u32) {
-        let mut pool = RECYCLE_POOL.lock();
-        pool.push_back(session_id);
+        // Only track recycled IDs when we're approaching exhaustion
+        if NEXT_SESSION_ID.load(SeqCst) < Self::RECYCLE_THRESHOLD {
+            return;
+        }
+        // Only recycle IDs that are >= threshold (those allocated after threshold)
+        if session_id < Self::RECYCLE_THRESHOLD {
+            return;
+        }
+        let id = (session_id - Self::RECYCLE_THRESHOLD) as usize;
+        let chunk_idx = id / 64;
+        let bit_idx = id % 64;
+        if chunk_idx < Self::BITMAP_SIZE {
+            RECYCLE_BITMAP[chunk_idx].fetch_or(1u64 << bit_idx, SeqCst);
+            // Update hint to point to this chunk (likely has available IDs)
+            RECYCLE_HINT.store(chunk_idx, SeqCst);
+        }
     }
 
     /// Get the special PTA session ID.
