@@ -161,27 +161,6 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         return Err(Error::NoSyscallInstructionsFound);
     }
 
-    // Build the header (goes at the end of the file)
-    // Header format: magic(8) + entry(8/4) + vaddr(8/4) + code_size(8/4)
-    let code_size = trampoline_code.len();
-    let mut header = vec![];
-    header.extend_from_slice(TRAMPOLINE_MAGIC);
-    if arch == Arch::X86_64 {
-        header.extend_from_slice(&trampoline.to_le_bytes());
-        header.extend_from_slice(&trampoline_base_addr.to_le_bytes());
-        header.extend_from_slice(&(code_size as u64).to_le_bytes());
-    } else {
-        let trampoline_32 =
-            u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
-        let trampoline_base_addr_32 =
-            u32::try_from(trampoline_base_addr).map_err(|_| Error::TrampolineAddressTooLarge)?;
-        #[allow(clippy::cast_possible_truncation)]
-        let code_size_32 = code_size as u32;
-        header.extend_from_slice(&trampoline_32.to_le_bytes());
-        header.extend_from_slice(&trampoline_base_addr_32.to_le_bytes());
-        header.extend_from_slice(&code_size_32.to_le_bytes());
-    }
-
     // Write output: [ELF][padding][trampoline code][header]
     let mut out = vec![];
     builder
@@ -190,7 +169,34 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // ensure the start address of the trampoline code is page-aligned
     let remain = out.len() % 0x1000;
     out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { 0x1000 - remain }]);
+
+    // Calculate file offset where trampoline code starts
+    let trampoline_file_offset = out.len() as u64;
+    let code_size = trampoline_code.len();
+
+    // Append trampoline code
     out.extend_from_slice(&trampoline_code);
+
+    // Build the header (goes at the end of the file)
+    // Header format: magic(8) + file_offset(8/4) + vaddr(8/4) + code_size(8/4)
+    // The entry point placeholder is at offset 0 of the trampoline code, not in the header.
+    let mut header = vec![];
+    header.extend_from_slice(TRAMPOLINE_MAGIC);
+    if arch == Arch::X86_64 {
+        header.extend_from_slice(&trampoline_file_offset.to_le_bytes());
+        header.extend_from_slice(&trampoline_base_addr.to_le_bytes());
+        header.extend_from_slice(&(code_size as u64).to_le_bytes());
+    } else {
+        let file_offset_32 =
+            u32::try_from(trampoline_file_offset).map_err(|_| Error::TrampolineAddressTooLarge)?;
+        let trampoline_base_addr_32 =
+            u32::try_from(trampoline_base_addr).map_err(|_| Error::TrampolineAddressTooLarge)?;
+        #[allow(clippy::cast_possible_truncation)]
+        let code_size_32 = code_size as u32;
+        header.extend_from_slice(&file_offset_32.to_le_bytes());
+        header.extend_from_slice(&trampoline_base_addr_32.to_le_bytes());
+        header.extend_from_slice(&code_size_32.to_le_bytes());
+    }
     out.extend_from_slice(&header);
     Ok(out)
 }

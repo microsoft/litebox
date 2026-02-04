@@ -72,10 +72,10 @@ struct TrampolineInfo {
 /// This must match `TRAMPOLINE_MAGIC` in `litebox_syscall_rewriter`.
 const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
-/// Trampoline header size for 64-bit: 8 (magic) + 8 (entry) + 8 (vaddr) + 8 (size) = 32 bytes
+/// Trampoline header size for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 const TRAMPOLINE_HEADER_SIZE_64: usize = 32;
 
-/// Trampoline header size for 32-bit: 8 (magic) + 4 (entry) + 4 (vaddr) + 4 (size) = 20 bytes
+/// Trampoline header size for 32-bit: 8 (magic) + 4 (file_offset) + 4 (vaddr) + 4 (size) = 20 bytes
 const TRAMPOLINE_HEADER_SIZE_32: usize = 20;
 
 const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
@@ -246,20 +246,22 @@ impl ElfParsedFile {
             return Ok(());
         }
 
-        let (vaddr, code_size) = if cfg!(target_pointer_width = "64") {
-            // 64-bit: [0..8] magic, [8..16] entry, [16..24] vaddr, [24..32] code_size
+        let (file_offset, vaddr, code_size) = if cfg!(target_pointer_width = "64") {
+            // 64-bit: [0..8] magic, [8..16] file_offset, [16..24] vaddr, [24..32] code_size
+            let file_offset: u64 = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
             let vaddr: usize = u64::from_le_bytes(header_buf[16..24].try_into().unwrap())
                 .try_into()
                 .map_err(|_| ElfParseError::BadTrampoline)?;
             let code_size: usize = u64::from_le_bytes(header_buf[24..32].try_into().unwrap())
                 .try_into()
                 .map_err(|_| ElfParseError::BadTrampoline)?;
-            (vaddr, code_size)
+            (file_offset, vaddr, code_size)
         } else {
-            // 32-bit: [0..8] magic, [8..12] entry, [12..16] vaddr, [16..20] code_size
+            // 32-bit: [0..8] magic, [8..12] file_offset, [12..16] vaddr, [16..20] code_size
+            let file_offset = u64::from(u32::from_le_bytes(header_buf[8..12].try_into().unwrap()));
             let vaddr = u32::from_le_bytes(header_buf[12..16].try_into().unwrap()) as usize;
             let code_size = u32::from_le_bytes(header_buf[16..20].try_into().unwrap()) as usize;
-            (vaddr, code_size)
+            (file_offset, vaddr, code_size)
         };
 
         // Validate code size bounds
@@ -267,20 +269,20 @@ impl ElfParsedFile {
             return Err(ElfParseError::BadTrampoline);
         }
 
-        // Calculate trampoline code file offset (before header)
-        let code_file_offset = header_offset
-            .checked_sub(code_size as u64)
-            .ok_or(ElfParseError::BadTrampoline)?;
+        // Verify the file offset is page-aligned (as required by the rewriter)
+        if !file_offset.is_multiple_of(PAGE_SIZE as u64) {
+            return Err(ElfParseError::BadTrampoline);
+        }
 
-        // Verify the code offset is page-aligned (as required by the rewriter)
-        if !code_file_offset.is_multiple_of(PAGE_SIZE as u64) {
+        // Verify the trampoline code doesn't extend beyond the header
+        if file_offset + code_size as u64 > header_offset {
             return Err(ElfParseError::BadTrampoline);
         }
 
         self.trampoline = Some(TrampolineInfo {
             vaddr,
             size: code_size,
-            file_offset: code_file_offset,
+            file_offset,
             syscall_entry_point,
         });
         Ok(())

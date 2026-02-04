@@ -31,7 +31,7 @@
 #define MAX_SEARCH_PAGES 16
 // Maximum allowed trampoline size (must match Rust loader)
 #define MAX_TRAMP_SIZE (MAX_SEARCH_PAGES * 0x1000)
-// Trampoline header size for x86_64: 8 (magic) + 8 (entry) + 8 (vaddr) + 8 (size)
+// Trampoline header size for x86_64: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size)
 #define TRAMP_HEADER_SIZE 32
 // Maximum valid userspace address (48-bit address space)
 #define MAX_USERSPACE_ADDR 0x7FFFFFFFFFFFUL
@@ -312,7 +312,8 @@ unsigned int la_objopen(struct link_map *map,
     return 0;
   }
 
-  // Parse header (x86_64): [0..8]: magic, [8..16]: entry, [16..24]: vaddr, [24..32]: code_size
+  // Parse header (x86_64): [0..8]: magic, [8..16]: file_offset, [16..24]: vaddr, [24..32]: code_size
+  uint64_t tramp_file_offset = read_u64(header_ptr + 8);
   uint64_t tramp_vaddr = read_u64(header_ptr + 16);
   uint64_t code_size_raw = read_u64(header_ptr + 24);
 
@@ -326,17 +327,16 @@ unsigned int la_objopen(struct link_map *map,
     return 0;
   }
 
-  // Calculate trampoline code file offset (before header)
-  long code_file_offset = header_offset - (long)code_size_raw;
-  if (code_file_offset < 0) {
-    syscall_print("[audit] trampoline code offset underflow\n", 41);
+  // Verify file offset is page-aligned
+  if ((tramp_file_offset & 0xFFF) != 0) {
+    syscall_print("[audit] trampoline code not page-aligned\n", 41);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
   }
 
-  // Verify code offset is page-aligned
-  if ((code_file_offset & 0xFFF) != 0) {
-    syscall_print("[audit] trampoline code not page-aligned\n", 41);
+  // Verify trampoline code doesn't extend beyond header
+  if (tramp_file_offset + code_size_raw > (uint64_t)header_offset) {
+    syscall_print("[audit] trampoline extends beyond header\n", 41);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
   }
@@ -361,7 +361,7 @@ unsigned int la_objopen(struct link_map *map,
   // Use MAP_FIXED to place the trampoline at the exact required address.
   void *mapped =
       (void *)do_syscall(SYS_mmap, tramp_addr, tramp_size,
-                         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, code_file_offset);
+                         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, tramp_file_offset);
   if ((uintptr_t)mapped >= (uintptr_t)-4096) {
     syscall_print("[audit] mmap failed for trampoline\n", 35);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
