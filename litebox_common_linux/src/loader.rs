@@ -210,8 +210,8 @@ impl ElfParsedFile {
         syscall_entry_point: usize,
     ) -> Result<(), ElfParseError<F::Error>> {
         if syscall_entry_point == 0 {
-            // No syscall entry point; This may happen when running in kernel mode
-            // where we don't need a trampoline.
+            // Platform running in kernel mode does not need trampoline
+            // and may give zero as entry point.
             return Ok(());
         }
         let shent_size = if cfg!(target_pointer_width = "64") {

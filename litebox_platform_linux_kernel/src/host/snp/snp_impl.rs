@@ -377,20 +377,21 @@ impl HostSnpInterface {
         let mut chunk_buffer = Box::new(PageAlignedBuffer([0u8; CHUNK_SIZE]));
         loop {
             let bytes_read = Self::load_file(&path, &mut chunk_buffer.0, offset)?;
+            debug_assert!(bytes_read <= CHUNK_SIZE);
 
             if bytes_read == 0 {
                 // End of file reached
                 break;
             }
 
-            // Only append the bytes that were actually read
-            result.extend_from_slice(&chunk_buffer.0[..bytes_read]);
             offset += bytes_read as u64;
 
             // Check if file exceeds maximum size
-            if result.len() as u64 > MAX_FILE_SIZE {
+            if offset > MAX_FILE_SIZE {
                 return Err(Errno::EFBIG); // File too large
             }
+
+            result.extend_from_slice(&chunk_buffer.0[..bytes_read]);
 
             // If we read less than the chunk size, we've reached the end of the file
             if bytes_read < CHUNK_SIZE {
