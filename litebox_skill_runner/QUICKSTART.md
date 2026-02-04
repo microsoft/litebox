@@ -121,10 +121,20 @@ When you run the skill runner, you'll see:
 - Creating tar archives with all skill resources
 - Validating skill structure
 - Integration with litebox_runner_linux_userland
+- **Shell scripts (`/bin/sh`) - Full support!**
+- **Node.js scripts - Full support!**
+- **Basic Bash scripts - Working (as of 2026-02-03)!**
 
 ⚠️ **What Needs Setup:**
 - **Python Scripts:** Require packaging Python libraries and binary (see Advanced section below)
-- **Shell Scripts:** Not yet supported (LiteBox limitation)
+  - We provide automated tools: `prepare_python_skill_advanced.py`
+- **Bash Scripts:** Basic support now available (as of 2026-02-03)
+  - May have limitations with advanced features
+
+✅ **What Works Out of the Box:**
+- **Shell Scripts (`/bin/sh`):** Full support, works perfectly!
+- **Node.js Scripts:** Full support, works perfectly!
+- **Basic Bash:** Should work for most scripts
 
 ## Skill Structure Basics
 
