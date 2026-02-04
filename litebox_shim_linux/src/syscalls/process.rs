@@ -1148,8 +1148,20 @@ impl Task {
         self.pid
     }
 
+    /// Handle syscall `getppid`.
     pub(crate) fn sys_getppid(&self) -> i32 {
         self.ppid
+    }
+
+    /// Handle syscall `getpgrp`.
+    ///
+    /// Returns the process group ID. For simplicity, this implementation returns
+    /// the process ID, which is the default behavior for a process that hasn't
+    /// explicitly joined another process group via `setpgid`.
+    pub(crate) fn sys_getpgrp(&self) -> i32 {
+        // In a full implementation, we'd track pgid separately. For now, return pid
+        // which is the default pgid for a new process.
+        self.pid
     }
 
     /// Handle syscall `getuid`.
@@ -1604,6 +1616,19 @@ mod tests {
             &get_buf[..litebox_common_linux::TASK_COMM_LEN - 1],
             &long_name[..litebox_common_linux::TASK_COMM_LEN - 1],
             "prctl get_name returned unexpected comm for too long name"
+        );
+    }
+
+    #[test]
+    fn test_getpgrp() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // getpgrp should return the pid (default behavior for new processes)
+        let pgrp = task.sys_getpgrp();
+        let pid = task.sys_getpid();
+        assert_eq!(
+            pgrp, pid,
+            "getpgrp should return pid for a new process that hasn't joined another process group"
         );
     }
 }
