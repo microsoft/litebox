@@ -439,25 +439,19 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     let kdata_buf = &kdata_mem[..];
     let kinfo = HekiKernelInfo::from_bytes(kinfo_buf)?;
 
-    vtl0_info
-        .gpl_symbols
-        .build_from_container(
-            VirtAddr::from_ptr(kinfo.ksymtab_gpl_start),
-            VirtAddr::from_ptr(kinfo.ksymtab_gpl_end),
-            &kdata_mem,
-            kdata_buf,
-        )
-        .map_err(|_| VsmError::KernelSymbolTableNotFound)?;
+    vtl0_info.gpl_symbols.build_from_container(
+        VirtAddr::from_ptr(kinfo.ksymtab_gpl_start),
+        VirtAddr::from_ptr(kinfo.ksymtab_gpl_end),
+        &kdata_mem,
+        kdata_buf,
+    )?;
 
-    vtl0_info
-        .symbols
-        .build_from_container(
-            VirtAddr::from_ptr(kinfo.ksymtab_start),
-            VirtAddr::from_ptr(kinfo.ksymtab_end),
-            &kdata_mem,
-            kdata_buf,
-        )
-        .map_err(|_| VsmError::KernelSymbolTableNotFound)?;
+    vtl0_info.symbols.build_from_container(
+        VirtAddr::from_ptr(kinfo.ksymtab_start),
+        VirtAddr::from_ptr(kinfo.ksymtab_end),
+        &kdata_mem,
+        kdata_buf,
+    )?;
 
     Ok(0)
     // TODO: create blocklist keys
@@ -956,9 +950,7 @@ pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
             let size: usize = params[1].truncate();
             mshv_vsm_allocate_ringbuffer_memory(params[0], size)
         }
-        VsmFunction::OpteeMessage => {
-            unreachable!("VSM does not support OP-TEE communication");
-        }
+        VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
     };
     match result {
         Ok(value) => value,
@@ -1454,6 +1446,7 @@ impl MemoryContainer {
             && last_range.addr + last_range.len != addr
         {
             debug_serial_println!("Discontiguous address found {heki_range:?}");
+            // NOTE: Intentionally not returning an error here.
             // TODO: This should be an error once patch_info is fixed from VTL0
             // It will simplify patch_info and heki_range parsing as well
         }
@@ -1879,8 +1872,7 @@ impl SymbolTable {
         inner.reserve(ksym_count);
 
         for _ in 0..ksym_count {
-            let (name, sym) = Symbol::from_bytes(kinfo_offset, kinfo_addr, buf)
-                .map_err(|_| VsmError::SymbolParseFailed(kinfo_offset))?;
+            let (name, sym) = Symbol::from_bytes(kinfo_offset, kinfo_addr, buf)?;
             inner.insert(name, sym);
             kinfo_offset += HekiKernelSymbol::KSYM_LEN;
             kinfo_addr += HekiKernelSymbol::KSYM_LEN as u64;

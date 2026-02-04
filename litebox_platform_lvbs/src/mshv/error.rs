@@ -101,6 +101,10 @@ pub enum VsmError {
     #[error("text patch validation failed")]
     TextPatchSuspicious,
 
+    // Unsupported Operation Errors
+    #[error("{0} is not supported")]
+    OperationNotSupported(&'static str),
+
     // VTL0 Memory Copy Errors
     #[error("failed to copy data to VTL0")]
     Vtl0CopyFailed,
@@ -177,6 +181,9 @@ impl From<VsmError> for Errno {
 
             // Operation not permitted after end of boot
             VsmError::OperationAfterEndOfBoot(_) => Errno::EPERM,
+
+            // Unsupported operation
+            VsmError::OperationNotSupported(_) => Errno::ENOTSUP,
 
             // Security/verification failures - access denied
             VsmError::TextPatchSuspicious
