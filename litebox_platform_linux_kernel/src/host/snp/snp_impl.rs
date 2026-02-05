@@ -126,9 +126,6 @@ struct ThreadStartArgs {
         Box<dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>>,
 }
 
-const RIP_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, rip);
-const EFLAGS_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, eflags);
-
 struct ThreadState {
     shim: OnceCell<
         Box<dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>>,
@@ -150,39 +147,7 @@ extern "C" fn thread_start(
     // Set up thread-local storage for the new thread. This is done by
     // calling the actual thread callback with the unpacked arguments
     let shim = thread_start_args.init_thread.init();
-
-    init_thread(shim, regs);
-
-    // Restore the context
-    unsafe {
-        core::arch::asm!(
-            "mov     rsp, {0}",
-            "mov     rcx, [rsp + {rip_off}]",
-            "mov     r11, [rsp + {eflags_off}]",
-            "pop     r15",
-            "pop     r14",
-            "pop     r13",
-            "pop     r12",
-            "pop     rbp",
-            "pop     rbx",
-            "pop     rsi",        /* skip r11 */
-            "pop     r10",
-            "pop     r9",
-            "pop     r8",
-            "pop     rax",
-            "pop     rsi",        /* skip rcx */
-            "pop     rdx",
-            "pop     rsi",
-            "pop     rdi",
-            "mov     rsp, [rsp + 0x20]",   /* original rsp */
-            "swapgs",
-            "sysretq",
-            in(reg) regs,
-            rip_off = const RIP_OFFSET,
-            eflags_off = const EFLAGS_OFFSET,
-        );
-    }
-    unreachable!("Thread should not return");
+    unsafe { run_thread(shim, regs) }
 }
 
 fn get_tls() -> *const ThreadState {
@@ -199,22 +164,24 @@ fn get_tls() -> *const ThreadState {
     tls
 }
 
-/// Calls the shim's `init` method to initialize the thread and the register
-/// context, preparing the thread for calls to [`handle_syscall`].
+/// Runs a guest thread using the provided shim and the given initial context.
 ///
-/// # Panics
-/// Panics if the thread shim is initialized more than once.
-pub fn init_thread(
+/// # Safety
+///
+/// The context must be valid guest context.
+pub unsafe fn run_thread(
     shim: Box<dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>>,
-    pt_regs: &mut litebox_common_linux::PtRegs,
-) {
+    regs: &mut litebox_common_linux::PtRegs,
+) -> ! {
     let tls = unsafe { &*get_tls() };
     tls.shim
         .set(shim)
         .ok()
         .expect("thread shim should not be initialized twice");
-    match tls.shim.get().unwrap().init(pt_regs) {
-        litebox::shim::ContinueOperation::ResumeGuest => {}
+
+    let shim = tls.shim.get().unwrap().as_ref();
+    match shim.init(regs) {
+        litebox::shim::ContinueOperation::ResumeGuest => unsafe { crate::switch_to_guest(regs) },
         litebox::shim::ContinueOperation::ExitThread => exit_thread(),
     }
 }
@@ -232,11 +199,12 @@ fn exit_thread() -> ! {
 /// Handles a syscall from the guest.
 ///
 /// # Panics
+///
 /// Panics if the thread shim has not been initialized with [`init_thread`].
-pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) {
+pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) -> ! {
     let tls = unsafe { &*get_tls() };
     match tls.shim.get().unwrap().syscall(pt_regs) {
-        litebox::shim::ContinueOperation::ResumeGuest => {}
+        litebox::shim::ContinueOperation::ResumeGuest => unsafe { crate::switch_to_guest(pt_regs) },
         litebox::shim::ContinueOperation::ExitThread => exit_thread(),
     }
 }

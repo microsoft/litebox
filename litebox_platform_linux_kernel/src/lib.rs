@@ -490,3 +490,43 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
         None
     }
 }
+
+const RIP_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, rip);
+const EFLAGS_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, eflags);
+
+/// Switches to the guest context using sysretq.
+///
+/// # Safety
+///
+/// The context must be valid guest context.
+unsafe fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov     rsp, {0}",
+            "mov     rcx, [rsp + {rip_off}]",
+            "mov     r11, [rsp + {eflags_off}]",
+            "pop     r15",
+            "pop     r14",
+            "pop     r13",
+            "pop     r12",
+            "pop     rbp",
+            "pop     rbx",
+            "pop     rsi",        /* skip r11 */
+            "pop     r10",
+            "pop     r9",
+            "pop     r8",
+            "pop     rax",
+            "pop     rsi",        /* skip rcx */
+            "pop     rdx",
+            "pop     rsi",
+            "pop     rdi",
+            "mov     rsp, [rsp + 0x20]",   /* original rsp */
+            "swapgs",
+            "sysretq",
+            in(reg) ctx,
+            rip_off = const RIP_OFFSET,
+            eflags_off = const EFLAGS_OFFSET,
+            options(noreturn),
+        );
+    }
+}
