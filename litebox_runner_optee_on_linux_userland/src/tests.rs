@@ -6,6 +6,7 @@
 //! Instead, these tests use pre-defined JSON-formatted command sequences to test TAs.
 
 use litebox::platform::RawConstPointer;
+use litebox::utils::TruncateExt;
 use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};
 use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
@@ -122,12 +123,9 @@ fn handle_ta_command_output(params: &UteeParams) {
             }
             TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
                 if let Ok(Some((addr, len))) = params.get_values(idx) {
-                    let slice = unsafe {
-                        &*core::ptr::slice_from_raw_parts(
-                            addr as *const u8,
-                            usize::try_from(len).unwrap_or(0),
-                        )
-                    };
+                    let len: usize = len.truncate();
+                    let ptr: UserConstPtr<u8> = UserConstPtr::from_ptr(addr as *const u8);
+                    let slice = ptr.to_owned_slice(len).unwrap_or_default();
                     if slice.is_empty() {
                         litebox::log_println!(
                             litebox_platform_multiplex::platform(),

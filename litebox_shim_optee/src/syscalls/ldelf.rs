@@ -217,17 +217,14 @@ impl Task {
             return Err(TeeResult::BadFormat);
         }
 
-        // SAFETY: `read_ta_bin` writes to a valid, properly-sized memory region
-        // that was just mmap'd above with PROT_READ_WRITE permissions.
-        if unsafe {
-            self.read_ta_bin(
+        if self
+            .read_ta_bin(
                 handle,
                 UserMutPtr::from_usize(padded_start),
                 offs,
                 num_bytes,
             )
-        }
-        .is_none()
+            .is_none()
         {
             return Err(TeeResult::ShortBuffer);
         }
@@ -292,20 +289,15 @@ impl Task {
             handle,
         );
 
-        unsafe {
-            self.read_ta_bin(handle, UserMutPtr::from_usize(dst), offs, num_bytes)
-                .ok_or(TeeResult::ShortBuffer)?;
-        }
+        self.read_ta_bin(handle, UserMutPtr::from_usize(dst), offs, num_bytes)
+            .ok_or(TeeResult::ShortBuffer)?;
 
         Ok(())
     }
 
     /// Read `count` bytes of the TA binary of the current task from `offset` into
     /// userspace `dst`.
-    ///
-    /// # Safety
-    /// Ensure that `dst` is valid for `count` bytes.
-    unsafe fn read_ta_bin(
+    fn read_ta_bin(
         &self,
         handle: u32,
         dst: UserMutPtr<u8>,

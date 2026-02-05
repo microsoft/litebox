@@ -12,6 +12,7 @@ use litebox_common_optee::{
     UteeParams,
 };
 use num_enum::TryFromPrimitive;
+use zerocopy::IntoBytes;
 
 use crate::{
     Task, UserConstPtr, UserMutPtr,
@@ -82,12 +83,7 @@ impl Task {
                     return Err(TeeResult::ShortBuffer);
                 }
                 let identity = self.client_identity;
-                prop_buf.copy_from_slice(unsafe {
-                    core::slice::from_raw_parts(
-                        (&raw const identity).cast::<u8>(),
-                        core::mem::size_of::<TeeIdentity>(),
-                    )
-                });
+                prop_buf.copy_from_slice(identity.as_bytes());
                 prop_len
                     .write_at_offset(
                         0,
@@ -107,12 +103,7 @@ impl Task {
                     return Err(TeeResult::ShortBuffer);
                 }
                 let ta_uuid = self.ta_app_id;
-                prop_buf.copy_from_slice(unsafe {
-                    core::slice::from_raw_parts(
-                        (&raw const ta_uuid).cast::<u8>(),
-                        core::mem::size_of::<TeeUuid>(),
-                    )
-                });
+                prop_buf.copy_from_slice(ta_uuid.as_bytes());
                 prop_len
                     .write_at_offset(0, u32::try_from(core::mem::size_of::<TeeUuid>()).unwrap())
                     .ok_or(TeeResult::AccessDenied)?;

@@ -16,7 +16,7 @@ use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B8, B54};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub mod syscall_nr;
 
@@ -395,7 +395,7 @@ impl CommandId {
 /// `utee_params` from `optee_os/lib/libutee/include/utee_types.h`
 /// It contains up to 4 parameters where each of them is a collection of
 /// type (4 bits) and two 8-byte data (values or addresses).
-#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 #[repr(C)]
 pub struct UteeParams {
     pub types: UteeParamsTypes,
@@ -410,9 +410,9 @@ const TEE_NUM_PARAMS: usize = 4;
 mod workaround_identity_op_suppression {
     use modular_bitfield::prelude::*;
     use modular_bitfield::specifiers::{B4, B48};
-    use zerocopy::{FromBytes, IntoBytes};
+    use zerocopy::{FromBytes, Immutable, IntoBytes};
     #[bitfield]
-    #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+    #[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
     #[repr(C)]
     pub struct UteeParamsTypes {
         pub type_0: B4,
@@ -540,7 +540,7 @@ open_enum! {
 
 /// `TEE_UUID` from `optee_os/lib/libutee/include/tee_api_types.h`. It uniquely identifies
 /// TAs, cryptographic keys, and more.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug, FromBytes, Immutable, IntoBytes)]
 #[repr(C)]
 pub struct TeeUuid {
     pub time_low: u32,
@@ -666,7 +666,7 @@ pub struct TaHead {
 pub const TA_HEAD_SECTION_NAME: &str = ".ta_head";
 
 /// `TEE_Identity` from `optee_os/lib/libutee/include/tee_api_types.h`.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Immutable, IntoBytes)]
 #[repr(C)]
 pub struct TeeIdentity {
     pub login: TeeLogin,
@@ -750,7 +750,7 @@ const TEE_LOGIN_APPLICATION_GROUP: u32 = 0x6;
 const TEE_LOGIN_TRUSTED_APP: u32 = 0xf000_0000;
 
 /// `TEE Login type` from `optee_os/lib/libutee/include/tee_api_defines.h`
-#[derive(Clone, Copy, PartialEq, TryFromPrimitive)]
+#[derive(Clone, Copy, PartialEq, TryFromPrimitive, Immutable, IntoBytes)]
 #[repr(u32)]
 pub enum TeeLogin {
     Public = TEE_LOGIN_PUBLIC,
@@ -1187,7 +1187,7 @@ bitflags::bitflags! {
 }
 
 /// `ldef_arg` from `optee_os/ldelf/include/ldelf.h`
-#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 #[repr(C)]
 pub struct LdelfArg {
     pub uuid: TeeUuid,
