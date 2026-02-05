@@ -356,9 +356,9 @@ fn handle_open_session(
     let client_identity = ta_req_info.client_identity;
     let params = &ta_req_info.params;
 
-    // Try to reuse existing single-instance TA, or create a new instance
-    // If the TA is busy (lock held), return EThreadLimit - driver will wait and retry
     if let Some(existing) = session_manager().get_single_instance(&ta_uuid) {
+        // Try to reuse existing single-instance TA, or create a new instance
+        // If the TA is busy (lock held), return EThreadLimit - driver will wait and retry
         open_session_single_instance(
             msg_args,
             msg_args_phys_addr,
@@ -947,10 +947,9 @@ fn handle_close_session(
     let remaining_sessions = session_manager()
         .sessions()
         .count_sessions_for_instance(&instance_arc);
-    let is_last_session = remaining_sessions == 0;
 
     // If this was the last session using the TA instance, clean up (unless keep_alive is set)
-    if is_last_session {
+    if remaining_sessions == 0 {
         if let Some(entry) = removed_entry {
             // If this is a single-instance TA with keep_alive flag, don't remove it from memory.
             // Note: keep_alive is only meaningful for single-instance TAs.

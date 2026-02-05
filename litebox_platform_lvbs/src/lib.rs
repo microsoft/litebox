@@ -148,15 +148,16 @@ impl PageTableManager {
         if let Some(id) = task_pt_id {
             let task_pts = self.task_page_tables.lock();
             if let Some(pt) = task_pts.get(&id) {
-                // Safety: The page table won't be removed while it's the current CR3,
-                // and the PageTableManager lives for 'static.
-                // We extend the lifetime here because the lock prevents removal.
+                // SAFETY: This page table is the current CR3, so `delete_task_page_table`
+                // will refuse to remove it (returns EBUSY). The PageTableManager itself
+                // is 'static, so the HashMap won't be deallocated. Together, these
+                // guarantee the page table remains valid for the lifetime of the reference.
                 return unsafe { &*core::ptr::from_ref(pt) };
             }
         }
 
         // CR3 doesn't match any known page table - this shouldn't happen
-        panic!(
+        unreachable!(
             "CR3 contains unknown page table: {:?}",
             cr3_frame.start_address()
         );
@@ -186,7 +187,7 @@ impl PageTableManager {
         }
 
         // CR3 doesn't match any known page table - this shouldn't happen
-        panic!(
+        unreachable!(
             "CR3 contains unknown page table: {:?}",
             cr3_frame.start_address()
         );
@@ -222,13 +223,13 @@ impl PageTableManager {
     ///
     /// # Returns
     ///
-    /// `Ok(())` if the switch was successful, or `Err(Errno::ENOENT)` if the
-    /// specified page table ID does not exist.
+    /// -`Ok(())` if the switch was successful
+    /// - `Err(Errno::ENOENT)` if the specified page table ID does not exist.
+    /// - `Err(Errno::EINVAL)` if the specified page table ID is the base page table ID.
     pub unsafe fn load_task(&self, task_pt_id: usize) -> Result<(), Errno> {
         if task_pt_id == BASE_PAGE_TABLE_ID {
-            // Safety: caller guarantees safe switch conditions
-            unsafe { self.load_base() };
-            return Ok(());
+            // this function should not be used to load the base page table
+            return Err(Errno::EINVAL);
         }
 
         let task_pts = self.task_page_tables.lock();
@@ -664,18 +665,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
     /// Create a new task page table for VTL1 user space and returns its ID.
     ///
-    /// # Security Note: No KPTI
-    ///
-    /// Currently, this maps the **entire** VTL1 kernel memory into the task page table.
-    /// This allows direct syscall handling without page table switches, but exposes the
-    /// full kernel address space to user TAs (similar to pre-Meltdown Linux).
-    ///
-    /// A more secure design would implement KPTI (Kernel Page Table Isolation):
-    /// 1. Map only a minimal trampoline in task page tables
-    /// 2. Switch to base page table on syscall entry
-    /// 3. Switch back to task page table on syscall exit
-    ///
-    /// This would reduce side-channel attack surface but add overhead for CR3 switches.
+    /// See [`PageTableManager`] for security notes on KPTI.
     ///
     /// # Returns
     ///
@@ -712,7 +702,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         unsafe { self.page_table_manager.delete_task_page_table(task_pt_id) }
     }
 
-    /// Switches the current page table to the specified one.
+    /// Switch to the specified page table.
     ///
     /// Use `BASE_PAGE_TABLE_ID` (0) for the base page table.
     ///
@@ -1312,8 +1302,8 @@ where
 
 /// Run a user thread using a reference to the shim.
 ///
-/// Unlike `run_thread`, this version takes a reference instead of ownership,
-/// avoiding struct moves that could invalidate internal state.
+/// Unlike `run_thread`, this version takes a reference instead of ownership to do not
+/// move `shim` to the platform for re-entry later.
 ///
 /// # Safety
 /// The context must be valid user context.

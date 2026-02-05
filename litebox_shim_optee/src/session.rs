@@ -19,9 +19,8 @@
 //!
 //! OP-TEE OS uses RPC-based waiting: when a TA is busy, it returns to normal world
 //! via `mutex_lock()` issuing an RPC, allowing the Linux kernel to schedule other
-//! work while waiting. This is efficient but potentially insecure because:
-//! - Normal world is untrusted and could delay or never resume the waiting thread
-//! - It creates a denial-of-service vector where normal world controls secure world scheduling
+//! work while waiting. This is efficient but fundamentally insecure because normal
+//! world is untrusted.
 //!
 //! ### LiteBox Behavior
 //!
@@ -90,6 +89,8 @@
 //!   - Saving CPU context (registers, stack, etc.) when suspending for RPC
 //!   - Indexing saved contexts by an identifier (passed via `a3-a7`)
 //!   - Restoring context when normal world calls `RETURN_FROM_RPC`
+//!   - Encrypting the resume identifier (thread ID, etc.) with authenticated encryption
+//!     (e.g., AES-GCM) to detect tampering and replay attacks from normal world
 
 use crate::{LoadedProgram, OpteeShim, SessionIdPool};
 use alloc::sync::Arc;

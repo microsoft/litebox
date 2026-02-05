@@ -322,9 +322,17 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         Ok(())
     }
 
-    /// Compute byte offset, map the required pages, and return the pointer.
+    /// This is a helper function to map physical pages and get a pointer to the requested
+    /// data element at a given index.
     ///
-    /// `count` is the element index, `size` is the total byte size to map.
+    /// It bridges element-level access (used by `read_at_offset`, `write_at_offset`, etc.)
+    /// with page-level mapping. It determines which physical pages contain the requested
+    /// element, maps them into virtual memory, and returns a pointer adjusted for
+    /// the element's position.
+    ///
+    /// - `count`: Element index (0-based) within this physical pointer's range.
+    /// - `size`: Total byte size to map (must cover the data being accessed).
+    /// - `perms`: Required page permissions (read, write).
     ///
     /// # Safety
     ///
@@ -418,7 +426,11 @@ impl<T: Clone, const ALIGN: usize> Drop for PhysMutPtr<T, ALIGN> {
     fn drop(&mut self) {
         // SAFETY: The platform is expected to handle unmapping safely, including
         // the case where pages were never mapped (returns Unmapped error, ignored).
-        let _ = unsafe { self.unmap() };
+        let result = unsafe { self.unmap() };
+        debug_assert!(
+            result.is_ok() || matches!(result, Err(PhysPointerError::Unmapped(_))),
+            "unexpected error during unmap in drop: {result:?}",
+        );
     }
 }
 
