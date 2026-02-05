@@ -59,9 +59,9 @@ pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 ///
 /// The header at the end contains:
 /// - [`TRAMPOLINE_MAGIC`] (8 bytes)
-/// - syscall entry point placeholder (8 bytes for 64-bit, 4 bytes for 32-bit)
+/// - trampoline file offset (8 bytes for 64-bit, 4 bytes for 32-bit)
 /// - trampoline virtual address (8 bytes for 64-bit, 4 bytes for 32-bit)
-/// - trampoline code size (8 bytes for 64-bit, 4 bytes for 32-bit)
+/// - trampoline size (8 bytes for 64-bit, 4 bytes for 32-bit)
 ///
 /// This layout allows loaders to read just the last 32/20 bytes to get the metadata.
 #[expect(
@@ -125,13 +125,13 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
     // Build the trampoline code (without header - header goes at the end)
     // The code starts with the syscall entry point placeholder
-    let mut trampoline_code = vec![];
+    let mut trampoline_data = vec![];
     let trampoline = trampoline.unwrap_or(0);
     if arch == Arch::X86_64 {
-        trampoline_code.extend_from_slice(&trampoline.to_le_bytes());
+        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     } else {
         let trampoline = u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
-        trampoline_code.extend_from_slice(&trampoline.to_le_bytes());
+        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     }
 
     let mut syscall_insns_found = false;
@@ -147,7 +147,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             data.to_mut(),
             trampoline_base_addr,
             dl_sysinfo_int80,
-            &mut trampoline_code,
+            &mut trampoline_data,
         ) {
             Ok(()) => {
                 syscall_insns_found = true;
@@ -172,10 +172,10 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
     // Calculate file offset where trampoline code starts
     let trampoline_file_offset = out.len() as u64;
-    let code_size = trampoline_code.len();
+    let trampoline_size = trampoline_data.len();
 
     // Append trampoline code
-    out.extend_from_slice(&trampoline_code);
+    out.extend_from_slice(&trampoline_data);
 
     // Build the header (goes at the end of the file)
     // Header format: magic(8) + file_offset(8/4) + vaddr(8/4) + code_size(8/4)
@@ -185,14 +185,14 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     if arch == Arch::X86_64 {
         header.extend_from_slice(&trampoline_file_offset.to_le_bytes());
         header.extend_from_slice(&trampoline_base_addr.to_le_bytes());
-        header.extend_from_slice(&(code_size as u64).to_le_bytes());
+        header.extend_from_slice(&(trampoline_size as u64).to_le_bytes());
     } else {
         let file_offset_32 =
             u32::try_from(trampoline_file_offset).map_err(|_| Error::TrampolineAddressTooLarge)?;
         let trampoline_base_addr_32 =
             u32::try_from(trampoline_base_addr).map_err(|_| Error::TrampolineAddressTooLarge)?;
         #[allow(clippy::cast_possible_truncation)]
-        let code_size_32 = code_size as u32;
+        let code_size_32 = trampoline_size as u32;
         header.extend_from_slice(&file_offset_32.to_le_bytes());
         header.extend_from_slice(&trampoline_base_addr_32.to_le_bytes());
         header.extend_from_slice(&code_size_32.to_le_bytes());
@@ -233,31 +233,29 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
         return false;
     }
 
-    let file_size = input_binary.len() as u64;
-    let header_start = file_size - header_size as u64;
-    let header_start_usize = usize::try_from(header_start).unwrap_or(input_binary.len());
-    let header = &input_binary[header_start_usize..];
+    let header_start = input_binary.len() - header_size;
+    let header = &input_binary[header_start..];
 
     if &header[..TRAMPOLINE_MAGIC.len()] != TRAMPOLINE_MAGIC {
         return false;
     }
 
-    let (file_offset, vaddr, code_size) = match arch {
+    let (file_offset, vaddr, trampoline_size) = match arch {
         Arch::X86_64 => {
             let file_offset = u64::from_le_bytes(header[8..16].try_into().unwrap());
             let vaddr = u64::from_le_bytes(header[16..24].try_into().unwrap());
-            let code_size = u64::from_le_bytes(header[24..32].try_into().unwrap());
-            (file_offset, vaddr, code_size)
+            let trampoline_size = u64::from_le_bytes(header[24..32].try_into().unwrap());
+            (file_offset, vaddr, trampoline_size)
         }
         Arch::X86_32 => {
             let file_offset = u64::from(u32::from_le_bytes(header[8..12].try_into().unwrap()));
             let vaddr = u64::from(u32::from_le_bytes(header[12..16].try_into().unwrap()));
-            let code_size = u64::from(u32::from_le_bytes(header[16..20].try_into().unwrap()));
-            (file_offset, vaddr, code_size)
+            let trampoline_size = u64::from(u32::from_le_bytes(header[16..20].try_into().unwrap()));
+            (file_offset, vaddr, trampoline_size)
         }
     };
 
-    if code_size == 0 {
+    if trampoline_size == 0 {
         return false;
     }
     if file_offset % 0x1000 != 0 {
@@ -266,7 +264,7 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     if vaddr % 0x1000 != 0 {
         return false;
     }
-    if file_offset + code_size != header_start {
+    if file_offset + trampoline_size != header_start as u64 {
         return false;
     }
 

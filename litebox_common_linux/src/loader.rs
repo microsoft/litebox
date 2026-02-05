@@ -111,6 +111,8 @@ pub enum ElfParseError<E> {
     Io(#[source] E),
     #[error("Bad trampoline section")]
     BadTrampoline,
+    #[error("Invalid trampoline version")]
+    BadTrampolineVersion,
     #[error("Unsupported ELF type")]
     UnsupportedType,
     #[error("Bad interpreter")]
@@ -123,6 +125,7 @@ impl<E: Into<Errno>> From<ElfParseError<E>> for Errno {
             ElfParseError::Elf(_)
             | ElfParseError::BadFormat
             | ElfParseError::BadTrampoline
+            | ElfParseError::BadTrampolineVersion
             | ElfParseError::BadInterp
             | ElfParseError::UnsupportedType => Errno::ENOEXEC,
             ElfParseError::Io(err) => err.into(),
@@ -137,6 +140,8 @@ pub enum ElfLoadError<E> {
     Map(#[source] E),
     #[error("Invalid program header")]
     InvalidProgramHeader,
+    #[error("Invalid trampoline version")]
+    InvalidTrampolineVersion,
     #[error(transparent)]
     Fault(#[from] Fault),
 }
@@ -144,7 +149,9 @@ pub enum ElfLoadError<E> {
 impl<E: Into<Errno>> From<ElfLoadError<E>> for Errno {
     fn from(value: ElfLoadError<E>) -> Self {
         match value {
-            ElfLoadError::InvalidProgramHeader => Errno::ENOEXEC,
+            ElfLoadError::InvalidProgramHeader | ElfLoadError::InvalidTrampolineVersion => {
+                Errno::ENOEXEC
+            }
             ElfLoadError::Fault(Fault) => Errno::EFAULT,
             ElfLoadError::Map(err) => err.into(),
         }
@@ -235,37 +242,42 @@ impl ElfParsedFile {
 
         // Read the header from the end of the file
         let header_offset = file_size - header_size as u64;
-        let mut header_buf = [0u8; 32]; // Max header size
+        let mut header_buf = [0u8; TRAMPOLINE_HEADER_SIZE_64]; // Max header size
         file.read_at(header_offset, &mut header_buf[..header_size])
             .map_err(ElfParseError::Io)?;
 
-        // Check magic
+        // Check magic and version. Format: "LITEBOX" + version byte.
         let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
         if magic != TRAMPOLINE_MAGIC {
+            // If the prefix matches but the version differs, fail explicitly.
+            if &header_buf[0..7] == b"LITEBOX" {
+                return Err(ElfParseError::BadTrampolineVersion);
+            }
             // No trampoline found, which is OK (not all binaries are rewritten)
             return Ok(());
         }
 
-        let (file_offset, vaddr, code_size) = if cfg!(target_pointer_width = "64") {
+        let (file_offset, vaddr, trampoline_size) = if cfg!(target_pointer_width = "64") {
             // 64-bit: [0..8] magic, [8..16] file_offset, [16..24] vaddr, [24..32] code_size
             let file_offset: u64 = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
             let vaddr: usize = u64::from_le_bytes(header_buf[16..24].try_into().unwrap())
                 .try_into()
                 .map_err(|_| ElfParseError::BadTrampoline)?;
-            let code_size: usize = u64::from_le_bytes(header_buf[24..32].try_into().unwrap())
+            let trampoline_size: usize = u64::from_le_bytes(header_buf[24..32].try_into().unwrap())
                 .try_into()
                 .map_err(|_| ElfParseError::BadTrampoline)?;
-            (file_offset, vaddr, code_size)
+            (file_offset, vaddr, trampoline_size)
         } else {
             // 32-bit: [0..8] magic, [8..12] file_offset, [12..16] vaddr, [16..20] code_size
             let file_offset = u64::from(u32::from_le_bytes(header_buf[8..12].try_into().unwrap()));
             let vaddr = u32::from_le_bytes(header_buf[12..16].try_into().unwrap()) as usize;
-            let code_size = u32::from_le_bytes(header_buf[16..20].try_into().unwrap()) as usize;
-            (file_offset, vaddr, code_size)
+            let trampoline_size =
+                u32::from_le_bytes(header_buf[16..20].try_into().unwrap()) as usize;
+            (file_offset, vaddr, trampoline_size)
         };
 
-        // Validate code size bounds
-        if code_size == 0 || code_size > MAX_TRAMPOLINE_SIZE {
+        // Validate trampoline size bounds
+        if trampoline_size == 0 || trampoline_size > MAX_TRAMPOLINE_SIZE {
             return Err(ElfParseError::BadTrampoline);
         }
 
@@ -280,13 +292,13 @@ impl ElfParsedFile {
         }
 
         // The trampoline code should immediately precede the header.
-        if file_offset + code_size as u64 != header_offset {
+        if file_offset + trampoline_size as u64 != header_offset {
             return Err(ElfParseError::BadTrampoline);
         }
 
         self.trampoline = Some(TrampolineInfo {
             vaddr,
-            size: code_size,
+            size: trampoline_size,
             file_offset,
             syscall_entry_point,
         });

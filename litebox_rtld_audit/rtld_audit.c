@@ -302,6 +302,13 @@ unsigned int la_objopen(struct link_map *map,
   // Check magic
   uint64_t magic = read_u64(header_ptr);
   if (magic != TRAMPOLINE_MAGIC) {
+    // If the prefix matches but the version differs, fail explicitly.
+    if (memcmp(header_ptr, "LITEBOX", 7) == 0) {
+      syscall_print("[audit] invalid trampoline version\n", 36);
+      do_syscall(SYS_munmap, (long)header_page, 0x1000, 0, 0, 0, 0);
+      do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+      return 0;
+    }
     // No trampoline found
     do_syscall(SYS_munmap, (long)header_page, 0x1000, 0, 0, 0, 0);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
@@ -311,13 +318,13 @@ unsigned int la_objopen(struct link_map *map,
   // Parse header (x86_64): [0..8]: magic, [8..16]: file_offset, [16..24]: vaddr, [24..32]: code_size
   uint64_t tramp_file_offset = read_u64(header_ptr + 8);
   uint64_t tramp_vaddr = read_u64(header_ptr + 16);
-  uint64_t code_size_raw = read_u64(header_ptr + 24);
+  uint64_t tramp_size_raw = read_u64(header_ptr + 24);
 
   do_syscall(SYS_munmap, (long)header_page, 0x1000, 0, 0, 0, 0);
   syscall_print("[audit] found trampoline header at end of file\n", 47);
 
-  // Validate code size upper bound
-  if (code_size_raw == 0 || code_size_raw > MAX_TRAMP_SIZE) {
+  // Validate trampoline size upper bound
+  if (tramp_size_raw == 0 || tramp_size_raw > MAX_TRAMP_SIZE) {
     syscall_print("[audit] trampoline code size invalid\n", 37);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
@@ -331,7 +338,7 @@ unsigned int la_objopen(struct link_map *map,
   }
 
   // The trampoline code should immediately precede the header.
-  if (tramp_file_offset + code_size_raw != (uint64_t)header_offset) {
+  if (tramp_file_offset + tramp_size_raw != (uint64_t)header_offset) {
     syscall_print("[audit] trampoline extends beyond header\n", 41);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
@@ -345,7 +352,7 @@ unsigned int la_objopen(struct link_map *map,
   }
 
   uint64_t tramp_addr = map->l_addr + tramp_vaddr;
-  uint64_t tramp_size = align_up(code_size_raw, 0x1000);
+  uint64_t tramp_size = align_up(tramp_size_raw, 0x1000);
 
   // Check for overflow in align_up or address calculation
   if (tramp_size == (size_t)-1 || tramp_addr < map->l_addr) {
