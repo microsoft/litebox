@@ -235,7 +235,7 @@ impl LinuxShim {
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
                 ppid,
-                pgrp: Cell::new(pid),
+                pgrp: Arc::new(core::sync::atomic::AtomicI32::new(pid)),
                 tid: pid,
                 credentials: syscalls::process::Credentials {
                     uid,
@@ -250,6 +250,10 @@ impl LinuxShim {
                 signals: syscalls::signal::SignalState::new_process(),
             },
         };
+        // Default foreground process group to the initial process.
+        self.0
+            .fg_pgrp
+            .store(pid, core::sync::atomic::Ordering::Relaxed);
         entrypoints.task.load_program(
             loader::elf::ElfLoader::new(&entrypoints.task, path)?,
             argv,
@@ -1183,7 +1187,7 @@ struct Task {
     /// Parent Process ID
     ppid: i32,
     /// Process group ID. Defaults to `pid`.
-    pgrp: Cell<i32>,
+    pgrp: Arc<core::sync::atomic::AtomicI32>,
     /// Thread ID
     tid: i32,
     /// Task credentials. These are set per task but are Arc'd to save space
@@ -1225,7 +1229,7 @@ mod test_utils {
                 thread: syscalls::process::ThreadState::new_process(pid),
                 pid,
                 ppid: 0,
-                pgrp: Cell::new(pid),
+                pgrp: Arc::new(core::sync::atomic::AtomicI32::new(pid)),
                 tid: pid,
                 credentials: Arc::new(syscalls::process::Credentials {
                     uid: 0,
