@@ -113,7 +113,9 @@ pub extern "C" fn sandbox_kernel_init(
     litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::return_to_host();
 }
 
-/// Pre-defined file paths to load from host
+/// Pre-defined file paths to load from host for testing purposes.
+/// Will remove this after we migrate 9p fs from VSBox to LiteBox, as we can directly access host files then.
+#[cfg(debug_assertions)]
 const HOST_FILE_PATHS: &[&str] = &[
     "/out/hello",
     "/out/efault",
@@ -122,6 +124,9 @@ const HOST_FILE_PATHS: &[&str] = &[
 ];
 
 /// Load pre-set files from host into the in-memory filesystem
+///
+/// This is a temporary solution before we migrate 9p fs from VSBox to LiteBox.
+#[cfg(debug_assertions)]
 fn load_host_files_into_fs<Platform: litebox::sync::RawSyncPrimitivesProvider>(
     in_mem_fs: &mut litebox::fs::in_mem::FileSystem<Platform>,
 ) {
@@ -190,9 +195,18 @@ pub extern "C" fn sandbox_process_init(
     litebox_platform_multiplex::set_platform(platform);
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
-    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
-    load_host_files_into_fs(&mut in_mem_fs);
-
+    let in_mem_fs = {
+        #[cfg(debug_assertions)]
+        {
+            let mut fs = litebox::fs::in_mem::FileSystem::new(litebox);
+            load_host_files_into_fs(&mut fs);
+            fs
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            litebox::fs::in_mem::FileSystem::new(litebox)
+        }
+    };
     let tar_ro =
         litebox::fs::tar_ro::FileSystem::new(litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
     shim_builder.set_fs(shim_builder.default_fs(in_mem_fs, tar_ro));
