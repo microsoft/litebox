@@ -1,5 +1,5 @@
 ---
-description: Autonomous agent that implements support for shell scripts, Node.js, and Python in LiteBox to run all Anthropic skills
+description: Autonomous agent that implements support for shell scripts, Node.js, and Python in LiteBox to run all Anthropic skills. Runs four times per day with a full rust/crate development environment and GitHub integration for PR creation and commenting.
 on:
   schedule:
     - cron: "0 0,6,12,18 * * *"
@@ -17,6 +17,7 @@ network:
     - github.com
     - api.github.com
     - raw.githubusercontent.com
+    - crates.io
 safe-outputs:
   create-pull-request:
     title-prefix: "[litebox-skills] "
