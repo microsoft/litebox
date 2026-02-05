@@ -194,6 +194,7 @@ impl LinuxShimBuilder {
             boot_time: self.platform.now(),
             load_filter: self.load_filter,
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
+            fg_pgrp: core::sync::atomic::AtomicI32::new(1),
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
         });
@@ -234,6 +235,7 @@ impl LinuxShim {
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
                 ppid,
+                pgrp: Cell::new(pid),
                 tid: pid,
                 credentials: syscalls::process::Credentials {
                     uid,
@@ -1089,6 +1091,10 @@ impl Task {
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getpgrp => Ok(self.sys_getpgrp().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Setpgid { pid, pgid } => self.sys_setpgid(pid, pgid),
+            SyscallRequest::Getpgid { pid } => self
+                .sys_getpgid(pid)
+                .map(|v| v.reinterpret_as_unsigned() as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
@@ -1162,6 +1168,8 @@ struct GlobalState {
     /// Next thread ID to assign.
     // TODO: better management of thread IDs
     next_thread_id: core::sync::atomic::AtomicI32,
+    /// Foreground process group ID for the terminal.
+    fg_pgrp: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable>,
 }
@@ -1174,6 +1182,8 @@ struct Task {
     pid: i32,
     /// Parent Process ID
     ppid: i32,
+    /// Process group ID. Defaults to `pid`.
+    pgrp: Cell<i32>,
     /// Thread ID
     tid: i32,
     /// Task credentials. These are set per task but are Arc'd to save space
@@ -1215,6 +1225,7 @@ mod test_utils {
                 thread: syscalls::process::ThreadState::new_process(pid),
                 pid,
                 ppid: 0,
+                pgrp: Cell::new(pid),
                 tid: pid,
                 credentials: Arc::new(syscalls::process::Credentials {
                     uid: 0,
@@ -1244,6 +1255,7 @@ mod test_utils {
                 thread: self.thread.new_thread(tid)?,
                 pid: self.pid,
                 ppid: self.ppid,
+                pgrp: self.pgrp.clone(),
                 tid,
                 credentials: self.credentials.clone(),
                 comm: self.comm.clone(),

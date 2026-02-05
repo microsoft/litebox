@@ -1276,12 +1276,21 @@ impl Task {
             }
             IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
             IoctlArg::TIOCGPGRP(pgrp) => {
-                // Get the process group ID of the foreground process group on the terminal.
-                // In LiteBox, processes are simplified: each process forms its own process group
-                // where the process group ID equals the process ID. This is a simplification
-                // compared to standard Unix where processes can explicitly join different groups.
-                let pid = self.sys_getpid();
-                pgrp.write_at_offset(0, pid).ok_or(Errno::EFAULT)?;
+                let fg = self
+                    .global
+                    .fg_pgrp
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                pgrp.write_at_offset(0, fg).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPGRP(pgrp) => {
+                let pgid: i32 = pgrp.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                if pgid <= 0 {
+                    return Err(Errno::EINVAL);
+                }
+                self.global
+                    .fg_pgrp
+                    .store(pgid, core::sync::atomic::Ordering::Relaxed);
                 Ok(0)
             }
             IoctlArg::TIOCGWINSZ(ws) => {
@@ -1399,6 +1408,7 @@ impl Task {
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
             | IoctlArg::TIOCGPGRP(..)
+            | IoctlArg::TIOCSPGRP(..)
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCGWINSZ(..) => match desc {
                 Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(

@@ -752,6 +752,7 @@ impl Task {
                         pid: self.pid,
                         tid: child_tid,
                         ppid: self.ppid,
+                        pgrp: self.pgrp.clone(),
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: fs.into(),
@@ -1154,14 +1155,32 @@ impl Task {
     }
 
     /// Handle syscall `getpgrp`.
-    ///
-    /// Returns the process group ID. For simplicity, this implementation returns
-    /// the process ID, which is the default behavior for a process that hasn't
-    /// explicitly joined another process group via `setpgid`.
     pub(crate) fn sys_getpgrp(&self) -> i32 {
-        // In a full implementation, we'd track pgid separately. For now, return pid
-        // which is the default pgid for a new process.
-        self.pid
+        self.pgrp.get()
+    }
+
+    /// Handle syscall `getpgid`.
+    pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<i32, Errno> {
+        if pid == 0 || pid == self.pid {
+            Ok(self.pgrp.get())
+        } else {
+            Err(Errno::ESRCH)
+        }
+    }
+
+    /// Handle syscall `setpgid`.
+    #[allow(clippy::similar_names)]
+    pub(crate) fn sys_setpgid(&self, pid: i32, pgid: i32) -> Result<usize, Errno> {
+        let target_pid = if pid == 0 { self.pid } else { pid };
+        let target_pgid = if pgid == 0 { target_pid } else { pgid };
+        if target_pgid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        if target_pid != self.pid {
+            return Err(Errno::ESRCH);
+        }
+        self.pgrp.set(target_pgid);
+        Ok(0)
     }
 
     /// Handle syscall `getuid`.
@@ -1630,5 +1649,70 @@ mod tests {
             pgrp, pid,
             "getpgrp should return pid for a new process that hasn't joined another process group"
         );
+
+        // After setpgid, getpgrp should reflect the new value
+        task.sys_setpgid(0, 42).expect("setpgid failed");
+        assert_eq!(task.sys_getpgrp(), 42);
+    }
+
+    #[test]
+    fn test_getpgid_self() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let pid = task.sys_getpid();
+
+        // getpgid(0) should return own pgrp
+        assert_eq!(task.sys_getpgid(0).unwrap(), pid);
+        // getpgid(own_pid) should return own pgrp
+        assert_eq!(task.sys_getpgid(pid).unwrap(), pid);
+    }
+
+    #[test]
+    fn test_getpgid_unknown() {
+        use crate::Errno;
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // getpgid for an unknown pid should return ESRCH
+        assert_eq!(task.sys_getpgid(99999), Err(Errno::ESRCH));
+    }
+
+    #[test]
+    fn test_setpgid() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let pid = task.sys_getpid();
+
+        // setpgid(0, 0) is equivalent to setpgrp: sets pgrp to own pid
+        task.sys_setpgid(0, 0).expect("setpgid(0, 0) failed");
+        assert_eq!(task.sys_getpgrp(), pid);
+        assert_eq!(task.sys_getpgid(0).unwrap(), pid);
+
+        // setpgid(0, 42) sets pgrp to 42
+        task.sys_setpgid(0, 42).expect("setpgid(0, 42) failed");
+        assert_eq!(task.sys_getpgrp(), 42);
+        assert_eq!(task.sys_getpgid(pid).unwrap(), 42);
+    }
+
+    #[test]
+    fn test_setpgid_invalid() {
+        use crate::Errno;
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Negative pgid should return EINVAL
+        assert_eq!(task.sys_setpgid(0, -1), Err(Errno::EINVAL));
+
+        // Unknown pid should return ESRCH
+        assert_eq!(task.sys_setpgid(99999, 1), Err(Errno::ESRCH));
+    }
+
+    #[test]
+    fn test_pgrp_inherited() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Set pgrp to a custom value
+        task.sys_setpgid(0, 42).expect("setpgid failed");
+        assert_eq!(task.sys_getpgrp(), 42);
+
+        // Clone and verify child inherits the pgrp
+        let child = task.clone_for_test().expect("clone_for_test failed");
+        assert_eq!(child.sys_getpgrp(), 42);
     }
 }
