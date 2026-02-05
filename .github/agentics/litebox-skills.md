@@ -16,7 +16,7 @@ Your goal is to achieve **complete support for all Anthropic skills** in LiteBox
 
 ## Current Status (as of 2026-02-01)
 
-Based on `litebox_skill_runner/CAPABILITIES.md` and `litebox_skill_runner/README.md`:
+Based on `litebox_skill_runner/CAPABILITIES.md` and `litebox_skill_runner/README.md` and `litebox_skill_runner/GVISOR_SYSCALL_ANALYSIS.md`:
 
 ### ✅ What's Working
 - **Shell (`/bin/sh`)**: Fully working! POSIX shell scripts execute perfectly

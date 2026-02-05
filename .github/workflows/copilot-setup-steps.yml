@@ -16,9 +16,9 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
     - name: Install gh-aw extension
-      uses: githubnext/gh-aw/actions/setup-cli@v0.38.5
+      uses: github/gh-aw/actions/setup-cli@v0.41.1
       with:
-        version: v0.38.5
+        version: v0.41.1
     - name: Checkout code
       uses: actions/checkout@v4
     - name: Set up Rust

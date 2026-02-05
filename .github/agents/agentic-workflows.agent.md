@@ -17,12 +17,17 @@ This is a **dispatcher agent** that routes your request to the appropriate speci
 - **Upgrading workflows**: Routes to `upgrade-agentic-workflows` prompt
 - **Creating shared components**: Routes to `create-shared-agentic-workflow` prompt
 
+Workflows may optionally include:
+
+- **Project tracking / monitoring** (GitHub Projects updates, status reporting)
+- **Orchestration / coordination** (one workflow assigning agents or dispatching and coordinating other workflows)
+
 ## Files This Applies To
 
 - Workflow files: `.github/workflows/*.md` and `.github/workflows/**/*.md`
 - Workflow lock files: `.github/workflows/*.lock.yml`
 - Shared components: `.github/workflows/shared/*.md`
-- Configuration: `.github/aw/github-agentic-workflows.md`
+- Configuration: https://github.com/github/gh-aw/blob/v0.41.1/.github/aw/github-agentic-workflows.md
 
 ## Problems This Solves
 
@@ -44,7 +49,7 @@ When you interact with this agent, it will:
 ### Create New Workflow
 **Load when**: User wants to create a new workflow from scratch, add automation, or design a workflow that doesn't exist yet
 
-**Prompt file**: `.github/aw/create-agentic-workflow.md`
+**Prompt file**: https://github.com/github/gh-aw/blob/v0.41.1/.github/aw/create-agentic-workflow.md
 
 **Use cases**:
 - "Create a workflow that triages issues"
@@ -54,7 +59,7 @@ When you interact with this agent, it will:
 ### Update Existing Workflow  
 **Load when**: User wants to modify, improve, or refactor an existing workflow
 
-**Prompt file**: `.github/aw/update-agentic-workflow.md`
+**Prompt file**: https://github.com/github/gh-aw/blob/v0.41.1/.github/aw/update-agentic-workflow.md
 
 **Use cases**:
 - "Add web-fetch tool to the issue-classifier workflow"
@@ -64,7 +69,7 @@ When you interact with this agent, it will:
 ### Debug Workflow  
 **Load when**: User needs to investigate, audit, debug, or understand a workflow, troubleshoot issues, analyze logs, or fix errors
 
-**Prompt file**: `.github/aw/debug-agentic-workflow.md`
+**Prompt file**: https://github.com/github/gh-aw/blob/v0.41.1/.github/aw/debug-agentic-workflow.md
 
 **Use cases**:
 - "Why is this workflow failing?"
@@ -74,7 +79,7 @@ When you interact with this agent, it will:
 ### Upgrade Agentic Workflows
 **Load when**: User wants to upgrade workflows to a new gh-aw version or fix deprecations
 
-**Prompt file**: `.github/aw/upgrade-agentic-workflows.md`
+**Prompt file**: https://github.com/github/gh-aw/blob/v0.41.1/.github/aw/upgrade-agentic-workflows.md
 
 **Use cases**:
 - "Upgrade all workflows to the latest version"
@@ -84,7 +89,7 @@ When you interact with this agent, it will:
 ### Create Shared Agentic Workflow
 **Load when**: User wants to create a reusable workflow component or wrap an MCP server
 
-**Prompt file**: `.github/aw/create-shared-agentic-workflow.md`
+**Prompt file**: https://github.com/github/gh-aw/blob/v0.41.1/.github/aw/create-shared-agentic-workflow.md
 
 **Use cases**:
 - "Create a shared component for Notion integration"
@@ -96,7 +101,7 @@ When you interact with this agent, it will:
 When a user interacts with you:
 
 1. **Identify the task type** from the user's request
-2. **Load the appropriate prompt** using `.github/aw/<prompt-name>.md`
+2. **Load the appropriate prompt** from the GitHub repository URLs listed above
 3. **Follow the loaded prompt's instructions** exactly
 4. **If uncertain**, ask clarifying questions to determine the right prompt
 
@@ -133,7 +138,7 @@ gh aw compile --validate
 
 ## Important Notes
 
-- Always reference the instructions file at `.github/aw/github-agentic-workflows.md` for complete documentation
+- Always reference the instructions file at https://github.com/github/gh-aw/blob/v0.41.1/.github/aw/github-agentic-workflows.md for complete documentation
 - Use the MCP tool `agentic-workflows` when running in GitHub Copilot Cloud
 - Workflows must be compiled to `.lock.yml` files before running in GitHub Actions
 - Follow security best practices: minimal permissions, explicit network access, no template injection

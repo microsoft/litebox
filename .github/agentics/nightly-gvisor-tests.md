@@ -109,6 +109,7 @@ Future iterations can work on actually integrating and running the gVisor test s
 
 3. **Document findings**:
    - Create comprehensive analysis in `litebox_skill_runner/GVISOR_SYSCALL_ANALYSIS.md`
+   - Update `litebox_skill_runner/GVISOR_SYSCALL_ANALYSIS.md` to reflect an new analysis
    - Include specific gaps, priorities, and recommendations
    - Reference specific gVisor tests that could validate each syscall
 

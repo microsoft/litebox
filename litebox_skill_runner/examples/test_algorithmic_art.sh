@@ -1,4 +1,8 @@
-#!/usr/bin/env bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 #
 # Test script for algorithmic-art skill from Anthropic
 # This is a Tier 1 test - Node.js script (already proven to work)

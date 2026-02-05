@@ -787,6 +787,8 @@ impl Task {
 // TODO: enforce the following limits:
 const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+const RLIMIT_NPROC_CUR: usize = 1024 * 1024;
+const RLIMIT_NPROC_MAX: usize = 1024 * 1024;
 
 struct AtomicRlimit {
     cur: core::sync::atomic::AtomicUsize,
@@ -818,6 +820,10 @@ impl ResourceLimits {
         limits[litebox_common_linux::RlimitResource::NOFILE as usize] = AtomicRlimit {
             cur: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_CUR),
             max: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_MAX),
+        };
+        limits[litebox_common_linux::RlimitResource::NPROC as usize] = AtomicRlimit {
+            cur: core::sync::atomic::AtomicUsize::new(RLIMIT_NPROC_CUR),
+            max: core::sync::atomic::AtomicUsize::new(RLIMIT_NPROC_MAX),
         };
         limits[litebox_common_linux::RlimitResource::STACK as usize] = AtomicRlimit {
             cur: core::sync::atomic::AtomicUsize::new(crate::loader::DEFAULT_STACK_SIZE),
@@ -862,6 +868,7 @@ impl Task {
     ) -> Result<litebox_common_linux::Rlimit, Errno> {
         let old_rlimit = match resource {
             litebox_common_linux::RlimitResource::NOFILE
+            | litebox_common_linux::RlimitResource::NPROC
             | litebox_common_linux::RlimitResource::STACK => {
                 self.thread.process.limits.get_rlimit(resource)
             }
@@ -876,13 +883,19 @@ impl Task {
             {
                 return Err(Errno::EPERM);
             }
+            if let litebox_common_linux::RlimitResource::NPROC = resource
+                && new_limit.rlim_max > RLIMIT_NPROC_MAX
+            {
+                return Err(Errno::EPERM);
+            }
             // Note process with `CAP_SYS_RESOURCE` can increase the hard limit, but we don't
             // support capabilities in LiteBox, so we don't check for that here.
             if new_limit.rlim_max > old_rlimit.rlim_max {
                 return Err(Errno::EPERM);
             }
             match resource {
-                litebox_common_linux::RlimitResource::NOFILE => {
+                litebox_common_linux::RlimitResource::NOFILE
+                | litebox_common_linux::RlimitResource::NPROC => {
                     self.thread.process.limits.set_rlimit(resource, new_limit);
                 }
                 _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),

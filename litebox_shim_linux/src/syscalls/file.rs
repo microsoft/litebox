@@ -1275,6 +1275,17 @@ impl Task {
                 Ok(0)
             }
             IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
+            IoctlArg::TIOCGPGRP(pgrp) => {
+                // Return the process group ID. For now, we return the process ID
+                // as we don't have full process group support.
+                pgrp.write_at_offset(0, self.pid).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPGRP(_pgrp) => {
+                // Setting the process group ID. For now, we accept it but don't
+                // actually change anything as we don't have full process group support.
+                Ok(0)
+            }
             IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset(
                     0,
@@ -1390,6 +1401,8 @@ impl Task {
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
             | IoctlArg::TIOCGPTN(..)
+            | IoctlArg::TIOCGPGRP(..)
+            | IoctlArg::TIOCSPGRP(..)
             | IoctlArg::TIOCGWINSZ(..) => match desc {
                 Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                     *raw_fd,
