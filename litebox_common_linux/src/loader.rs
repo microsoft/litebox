@@ -274,8 +274,13 @@ impl ElfParsedFile {
             return Err(ElfParseError::BadTrampoline);
         }
 
-        // Verify the trampoline code doesn't extend beyond the header
-        if file_offset + code_size as u64 > header_offset {
+        // Verify the trampoline virtual address is page-aligned
+        if vaddr % PAGE_SIZE != 0 {
+            return Err(ElfParseError::BadTrampoline);
+        }
+
+        // The trampoline code should immediately precede the header.
+        if file_offset + code_size as u64 != header_offset {
             return Err(ElfParseError::BadTrampoline);
         }
 

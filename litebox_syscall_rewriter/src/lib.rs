@@ -233,9 +233,44 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
         return false;
     }
 
-    // Check if the last header_size bytes start with TRAMPOLINE_MAGIC
-    let header_start = input_binary.len() - header_size;
-    &input_binary[header_start..header_start + TRAMPOLINE_MAGIC.len()] == TRAMPOLINE_MAGIC
+    let file_size = input_binary.len() as u64;
+    let header_start = file_size - header_size as u64;
+    let header_start_usize = usize::try_from(header_start).unwrap_or(input_binary.len());
+    let header = &input_binary[header_start_usize..];
+
+    if &header[..TRAMPOLINE_MAGIC.len()] != TRAMPOLINE_MAGIC {
+        return false;
+    }
+
+    let (file_offset, vaddr, code_size) = match arch {
+        Arch::X86_64 => {
+            let file_offset = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            let vaddr = u64::from_le_bytes(header[16..24].try_into().unwrap());
+            let code_size = u64::from_le_bytes(header[24..32].try_into().unwrap());
+            (file_offset, vaddr, code_size)
+        }
+        Arch::X86_32 => {
+            let file_offset = u64::from(u32::from_le_bytes(header[8..12].try_into().unwrap()));
+            let vaddr = u64::from(u32::from_le_bytes(header[12..16].try_into().unwrap()));
+            let code_size = u64::from(u32::from_le_bytes(header[16..20].try_into().unwrap()));
+            (file_offset, vaddr, code_size)
+        }
+    };
+
+    if code_size == 0 {
+        return false;
+    }
+    if file_offset % 0x1000 != 0 {
+        return false;
+    }
+    if vaddr % 0x1000 != 0 {
+        return false;
+    }
+    if file_offset + code_size != header_start {
+        return false;
+    }
+
+    true
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]

@@ -39,10 +39,6 @@
 // Linux flags
 #define MAP_PRIVATE 0x02
 #define MAP_FIXED 0x10
-// MAP_FIXED_NOREPLACE (Linux 4.17+): Like MAP_FIXED but fails if address is already mapped
-// This prevents silently overwriting existing mappings
-#define MAP_FIXED_NOREPLACE 0x100000
-
 #define PROT_READ 0x1
 #define PROT_WRITE 0x2
 #define PROT_EXEC 0x4
@@ -334,15 +330,15 @@ unsigned int la_objopen(struct link_map *map,
     return 0;
   }
 
-  // Verify trampoline code doesn't extend beyond header
-  if (tramp_file_offset + code_size_raw > (uint64_t)header_offset) {
+  // The trampoline code should immediately precede the header.
+  if (tramp_file_offset + code_size_raw != (uint64_t)header_offset) {
     syscall_print("[audit] trampoline extends beyond header\n", 41);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
   }
 
-  // Validate tramp_vaddr is within reasonable userspace bounds
-  if (tramp_vaddr > MAX_USERSPACE_ADDR) {
+  // Validate tramp_vaddr is within reasonable userspace bounds and page-aligned
+  if (tramp_vaddr > MAX_USERSPACE_ADDR || (tramp_vaddr & 0xFFF) != 0) {
     syscall_print("[audit] trampoline vaddr out of bounds\n", 39);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
@@ -359,6 +355,7 @@ unsigned int la_objopen(struct link_map *map,
   }
 
   // Use MAP_FIXED to place the trampoline at the exact required address.
+  // The loader ensures this range is not used by other mappings.
   void *mapped =
       (void *)do_syscall(SYS_mmap, tramp_addr, tramp_size,
                          PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, tramp_file_offset);
