@@ -183,12 +183,18 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let src = unsafe {
+        let src = match unsafe {
             self.map_and_get_ptr(
                 count,
                 core::mem::size_of::<T>(),
                 PhysPageMapPermissions::READ,
-            )?
+            )
+        } {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = unsafe { self.unmap() };
+                return Err(e);
+            }
         };
         let val = {
             let mut buffer = core::mem::MaybeUninit::<T>::uninit();
@@ -207,6 +213,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             }
             unsafe { buffer.assume_init() }
         };
+        let _ = unsafe { self.unmap() };
         Ok(alloc::boxed::Box::new(val))
     }
 
@@ -228,12 +235,18 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let src = unsafe {
+        let src = match unsafe {
             self.map_and_get_ptr(
                 count,
                 core::mem::size_of_val(values),
                 PhysPageMapPermissions::READ,
-            )?
+            )
+        } {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = unsafe { self.unmap() };
+                return Err(e);
+            }
         };
         if (src as usize).is_multiple_of(core::mem::align_of::<T>()) {
             unsafe {
@@ -248,6 +261,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 );
             }
         }
+        let _ = unsafe { self.unmap() };
         Ok(())
     }
 
@@ -266,18 +280,25 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let dst = unsafe {
+        let dst = match unsafe {
             self.map_and_get_ptr(
                 count,
                 core::mem::size_of::<T>(),
                 PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
-            )?
+            )
+        } {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = unsafe { self.unmap() };
+                return Err(e);
+            }
         };
         if (dst as usize).is_multiple_of(core::mem::align_of::<T>()) {
             unsafe { core::ptr::write(dst, value) };
         } else {
             unsafe { core::ptr::write_unaligned(dst, value) };
         }
+        let _ = unsafe { self.unmap() };
         Ok(())
     }
 
@@ -299,12 +320,18 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let dst = unsafe {
+        let dst = match unsafe {
             self.map_and_get_ptr(
                 count,
                 core::mem::size_of_val(values),
                 PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
-            )?
+            )
+        } {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = unsafe { self.unmap() };
+                return Err(e);
+            }
         };
         if (dst as usize).is_multiple_of(core::mem::align_of::<T>()) {
             unsafe {
@@ -319,6 +346,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 );
             }
         }
+        let _ = unsafe { self.unmap() };
         Ok(())
     }
 

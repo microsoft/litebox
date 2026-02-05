@@ -1445,6 +1445,9 @@ pub struct OpteeMsgArgs {
     /// a TA UUID and they are not delivered to the TA.
     /// Note that, originally, the length of this array is variable. We fix it to `TEE_NUM_PARAMS + 2` to
     /// simplify the implementation (our OP-TEE Shim supports up to four parameters as well).
+    ///
+    /// TODO: To support OP-TEE RPC, we should make this array length dynamic. Consider to use
+    /// a trailing unsized slice (DST) or other mechanisms.
     pub params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
 }
 
