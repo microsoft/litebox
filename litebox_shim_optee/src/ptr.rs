@@ -193,38 +193,19 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             .ok_or(PhysPointerError::Overflow)?;
         let start = skip / ALIGN;
         let end = (skip + core::mem::size_of::<T>()).div_ceil(ALIGN);
+        let guard = unsafe { self.map_guard(start, end, PhysPageMapPermissions::READ)? };
+        let src = guard.ptr_at(count);
+        let mut buffer = core::mem::MaybeUninit::<T>::uninit();
         unsafe {
-            self.map_range(start, end, PhysPageMapPermissions::READ)?;
+            litebox::mm::exception_table::memcpy_fallible(
+                buffer.as_mut_ptr().cast::<u8>(),
+                src.cast::<u8>(),
+                core::mem::size_of::<T>(),
+            )
+            .map_err(|_| PhysPointerError::CopyFailed)?;
         }
-        // Don't forget to call unmap() before returning to the caller
-        let Some(src) = self.base_ptr() else {
-            unsafe {
-                self.unmap()?;
-            }
-            return Err(PhysPointerError::NoMappingInfo);
-        };
-        let src = src.wrapping_add(count);
-        let val = {
-            let mut buffer = core::mem::MaybeUninit::<T>::uninit();
-            if (src as usize).is_multiple_of(core::mem::align_of::<T>()) {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(src, buffer.as_mut_ptr(), 1);
-                }
-            } else {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        src.cast::<u8>(),
-                        buffer.as_mut_ptr().cast::<u8>(),
-                        core::mem::size_of::<T>(),
-                    );
-                }
-            }
-            unsafe { buffer.assume_init() }
-        };
-        unsafe {
-            self.unmap()?;
-        }
-        Ok(alloc::boxed::Box::new(val))
+        // Safety: memcpy_fallible fully initialized the buffer on success.
+        Ok(alloc::boxed::Box::new(unsafe { buffer.assume_init() }))
     }
 
     /// Read a slice of values at the given offset from the physical pointer.
@@ -255,32 +236,15 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             .ok_or(PhysPointerError::Overflow)?;
         let start = skip / ALIGN;
         let end = (skip + core::mem::size_of_val(values)).div_ceil(ALIGN);
+        let guard = unsafe { self.map_guard(start, end, PhysPageMapPermissions::READ)? };
+        let src = guard.ptr_at(count);
         unsafe {
-            self.map_range(start, end, PhysPageMapPermissions::READ)?;
-        }
-        // Don't forget to call unmap() before returning to the caller
-        let Some(src) = self.base_ptr() else {
-            unsafe {
-                self.unmap()?;
-            }
-            return Err(PhysPointerError::NoMappingInfo);
-        };
-        let src = src.wrapping_add(count);
-        if (src as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            unsafe {
-                core::ptr::copy_nonoverlapping(src, values.as_mut_ptr(), values.len());
-            }
-        } else {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src.cast::<u8>(),
-                    values.as_mut_ptr().cast::<u8>(),
-                    core::mem::size_of_val(values),
-                );
-            }
-        }
-        unsafe {
-            self.unmap()?;
+            litebox::mm::exception_table::memcpy_fallible(
+                values.as_mut_ptr().cast::<u8>(),
+                src.cast::<u8>(),
+                core::mem::size_of_val(values),
+            )
+            .map_err(|_| PhysPointerError::CopyFailed)?;
         }
         Ok(())
     }
@@ -310,28 +274,21 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             .ok_or(PhysPointerError::Overflow)?;
         let start = skip / ALIGN;
         let end = (skip + core::mem::size_of::<T>()).div_ceil(ALIGN);
-        unsafe {
-            self.map_range(
+        let guard = unsafe {
+            self.map_guard(
                 start,
                 end,
                 PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
-            )?;
-        }
-        // Don't forget to call unmap() before returning to the caller
-        let Some(dst) = self.base_ptr() else {
-            unsafe {
-                self.unmap()?;
-            }
-            return Err(PhysPointerError::NoMappingInfo);
+            )?
         };
-        let dst = dst.wrapping_add(count);
-        if (dst as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            unsafe { core::ptr::write(dst, value) };
-        } else {
-            unsafe { core::ptr::write_unaligned(dst, value) };
-        }
+        let dst = guard.ptr_at(count);
         unsafe {
-            self.unmap()?;
+            litebox::mm::exception_table::memcpy_fallible(
+                dst.cast::<u8>(),
+                core::ptr::from_ref(&value).cast::<u8>(),
+                core::mem::size_of::<T>(),
+            )
+            .map_err(|_| PhysPointerError::CopyFailed)?;
         }
         Ok(())
     }
@@ -364,38 +321,45 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             .ok_or(PhysPointerError::Overflow)?;
         let start = skip / ALIGN;
         let end = (skip + core::mem::size_of_val(values)).div_ceil(ALIGN);
-        unsafe {
-            self.map_range(
+        let guard = unsafe {
+            self.map_guard(
                 start,
                 end,
                 PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
-            )?;
-        }
-        // Don't forget to call unmap() before returning to the caller
-        let Some(dst) = self.base_ptr() else {
-            unsafe {
-                self.unmap()?;
-            }
-            return Err(PhysPointerError::NoMappingInfo);
+            )?
         };
-        let dst = dst.wrapping_add(count);
-        if (dst as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            unsafe {
-                core::ptr::copy_nonoverlapping(values.as_ptr(), dst, values.len());
-            }
-        } else {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    values.as_ptr().cast::<u8>(),
-                    dst.cast::<u8>(),
-                    core::mem::size_of_val(values),
-                );
-            }
-        }
+        let dst = guard.ptr_at(count);
         unsafe {
-            self.unmap()?;
+            litebox::mm::exception_table::memcpy_fallible(
+                dst.cast::<u8>(),
+                values.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(values),
+            )
+            .map_err(|_| PhysPointerError::CopyFailed)?;
         }
         Ok(())
+    }
+
+    /// Map the specified range and return a guard that unmaps on drop.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::map_range`]. The returned guard borrows `self` mutably, ensuring
+    /// the mapping is released when the guard goes out of scope.
+    unsafe fn map_guard(
+        &mut self,
+        start: usize,
+        end: usize,
+        perms: PhysPageMapPermissions,
+    ) -> Result<MappedGuard<'_, T, ALIGN>, PhysPointerError> {
+        unsafe {
+            self.map_range(start, end, perms)?;
+        }
+        let base = self.base_ptr().ok_or_else(|| {
+            let _ = unsafe { self.unmap() };
+            PhysPointerError::NoMappingInfo
+        })?;
+        Ok(MappedGuard { owner: self, base })
     }
 
     /// Map the physical pages from `start` to `end` indexes.
@@ -462,9 +426,25 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     }
 }
 
-impl<T: Clone, const ALIGN: usize> Drop for PhysMutPtr<T, ALIGN> {
+/// RAII guard that unmaps physical pages when dropped.
+///
+/// Created by [`PhysMutPtr::map_guard`]. Holds a mutable borrow on the parent
+/// `PhysMutPtr` and provides the mapped base pointer for the duration of the mapping.
+struct MappedGuard<'a, T: Clone, const ALIGN: usize> {
+    owner: &'a mut PhysMutPtr<T, ALIGN>,
+    base: *mut T,
+}
+
+impl<T: Clone, const ALIGN: usize> MappedGuard<'_, T, ALIGN> {
+    /// Returns the mapped base pointer offset by `count` elements.
+    fn ptr_at(&self, count: usize) -> *mut T {
+        self.base.wrapping_add(count)
+    }
+}
+
+impl<T: Clone, const ALIGN: usize> Drop for MappedGuard<'_, T, ALIGN> {
     fn drop(&mut self) {
-        let _ = unsafe { self.unmap() };
+        let _ = unsafe { self.owner.unmap() };
     }
 }
 
@@ -548,12 +528,6 @@ impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
         values: &mut [T],
     ) -> Result<(), PhysPointerError> {
         unsafe { self.inner.read_slice_at_offset(count, values) }
-    }
-}
-
-impl<T: Clone, const ALIGN: usize> Drop for PhysConstPtr<T, ALIGN> {
-    fn drop(&mut self) {
-        let _ = unsafe { self.inner.unmap() };
     }
 }
 

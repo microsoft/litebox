@@ -20,7 +20,7 @@
 use crate::{MutPtr, Task, ThreadInitState, UserMutPtr};
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE},
-    platform::{RawConstPointer as _, SystemInfoProvider as _},
+    platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _},
     utils::TruncateExt,
 };
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, loader::ElfParsedFile};
@@ -85,7 +85,7 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
                 super::DEFAULT_LOW_ADDR,
                 mapping_len,
                 ProtFlags::PROT_NONE,
-                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_POPULATE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
                 -1,
                 0,
             )?
@@ -129,9 +129,13 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
                 offset.truncate(),
             )?
             .as_usize();
-        let mapped_slice: &mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut(mapped_addr as *mut u8, len) };
-        self.read_at(offset, mapped_slice)?;
+        // Copy ELF data to user memory through a kernel buffer.
+        let mut kernel_buf = alloc::vec![0u8; len];
+        self.read_at(offset, &mut kernel_buf)?;
+        let dst = UserMutPtr::<u8>::from_usize(mapped_addr);
+        if dst.copy_from_slice(0, &kernel_buf).is_none() {
+            return Err(Errno::EFAULT);
+        }
         self.task
             .sys_mprotect(UserMutPtr::from_usize(mapped_addr), len, prot.flags())
             .expect("sys_mprotect failed");
