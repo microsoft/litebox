@@ -196,20 +196,16 @@ impl<Host: HostInterface> RawMutex<Host> {
                 Ok(()) => {
                     return Ok(UnblockedOrTimedOut::Unblocked);
                 }
-                Err(Errno::EAGAIN) => {
+                Err(Errno::EAGAIN | Errno::EINTR) => {
                     // If the futex value does not match val, then the call fails
                     // immediately with the error EAGAIN.
                     return Err(ImmediatelyWokenUp);
-                }
-                Err(Errno::EINTR) => {
-                    // return Err(ImmediatelyWokenUp);
-                    todo!("EINTR");
                 }
                 Err(Errno::ETIMEDOUT) => {
                     return Ok(UnblockedOrTimedOut::TimedOut);
                 }
                 Err(e) => {
-                    panic!("Error: {:?}", e);
+                    todo!("Error: {:?}", e);
                 }
             }
         }
@@ -485,7 +481,9 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
 
 impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
     fn get_syscall_entry_point(&self) -> usize {
-        todo!()
+        // Currently this is only used in ELF loader to fix trampoline code.
+        // When running in kernel mode, we don't need a syscall trampoline.
+        0
     }
 
     fn get_vdso_address(&self) -> Option<usize> {

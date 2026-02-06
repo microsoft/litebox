@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! An implementation of [`HostInterface`] for SNP VMM
-use ::alloc::boxed::Box;
+use ::alloc::{boxed::Box, ffi::CString, vec::Vec};
 use core::{
     arch::asm,
     cell::{Cell, OnceCell},
@@ -244,7 +244,7 @@ pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) {
 impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
-    type ThreadHandle = ();
+    type ThreadHandle = u32;
 
     unsafe fn spawn_thread(
         &self,
@@ -275,11 +275,11 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     }
 
     fn current_thread(&self) -> Self::ThreadHandle {
-        // TODO
+        current().unwrap().pid
     }
 
-    fn interrupt_thread(&self, &(): &Self::ThreadHandle) {
-        // TODO
+    fn interrupt_thread(&self, tid: &Self::ThreadHandle) {
+        let _ = HostSnpInterface::interrupt(*tid);
     }
 }
 
@@ -338,7 +338,71 @@ pub struct SyscallN<const N: usize, const ID: u32> {
     args: [u64; N],
 }
 
+/// Page-aligned buffer for reading file chunks from host
+#[repr(C, align(4096))]
+struct PageAlignedBuffer([u8; 4096]);
+
+/// Maximum file size that can be loaded (4MB)
+/// This is limited by the maximum contiguous memory allocation size.
+const MAX_FILE_SIZE: u64 = PAGE_SIZE << bindings::SNP_VMPL_ALLOC_MAX_ORDER;
+
 impl HostSnpInterface {
+    #[cfg(debug_assertions)]
+    pub fn dump_stack(rsp: usize, count: usize) {
+        let mut req = bindings::SnpVmplRequestArgs::new_request(
+            bindings::SNP_VMPL_PRINT_REQ,
+            3,
+            [
+                u64::from(bindings::SNP_VMPL_PRINT_STACK),
+                rsp as u64,
+                count as u64,
+                0,
+                0,
+                0,
+            ],
+        );
+        Self::request(&mut req);
+    }
+
+    /// Load a file from host by path
+    ///
+    /// Note that the maximum file size is limited to 4MB.
+    pub fn load_file_from_host(path: &str) -> Result<Vec<u8>, Errno> {
+        const CHUNK_SIZE: usize = 4096;
+        let mut result = Vec::new();
+        let mut offset = 0u64;
+
+        // Host only accept heap or stack memory with null-terminated string
+        let path = CString::new(path).map_err(|_| Errno::EINVAL)?;
+        let mut chunk_buffer = Box::new(PageAlignedBuffer([0u8; CHUNK_SIZE]));
+        loop {
+            let bytes_read = Self::load_file(&path, &mut chunk_buffer.0, offset)?;
+            debug_assert!(bytes_read <= CHUNK_SIZE);
+
+            if bytes_read == 0 {
+                // End of file reached
+                break;
+            }
+
+            offset += bytes_read as u64;
+
+            // Check if file exceeds maximum size
+            if offset > MAX_FILE_SIZE {
+                return Err(Errno::EFBIG); // File too large
+            }
+
+            result.extend_from_slice(&chunk_buffer.0[..bytes_read]);
+
+            // If we read less than the chunk size, we've reached the end of the file
+            if bytes_read < CHUNK_SIZE {
+                break;
+            }
+        }
+
+        result.shrink_to_fit();
+        Ok(result)
+    }
+
     /// [VTL CALL](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/vsm#vtl-call) via VMMCALL
     fn request(arg: &mut bindings::SnpVmplRequestArgs) {
         unsafe {
@@ -361,11 +425,60 @@ impl HostSnpInterface {
         Self::parse_result(req.ret)
     }
 
+    fn interrupt(tid: u32) -> Result<(), Errno> {
+        let mut req = bindings::SnpVmplRequestArgs::new_request(
+            bindings::SNP_VMPL_SEND_INTERRUPT_REQ,
+            1, // number of arguments
+            [u64::from(tid), 0, 0, 0, 0, 0],
+        );
+        Self::request(&mut req);
+        Self::parse_result(req.ret).map(|_| ())
+    }
+
+    /// Load a file from host by path
+    ///
+    /// The host provides files at fixed, predetermined locations identified by path.
+    ///
+    /// # Parameters
+    /// - `path`: Path of the file to load
+    /// - `buffer`: Buffer to store the file content (must be page-aligned, max 4KB)
+    /// - `offset`: Byte offset in the file to start reading from
+    ///
+    /// # Returns
+    /// The number of bytes read on success, or an error
+    fn load_file(path: &CString, buffer: &mut [u8], offset: u64) -> Result<usize, Errno> {
+        let path_bytes = path.as_bytes_with_nul();
+        let mut req = bindings::SnpVmplRequestArgs::new_request(
+            bindings::SNP_VMPL_LOAD_FILE_REQ,
+            4, // number of arguments
+            [
+                path_bytes.as_ptr() as u64,
+                buffer.as_mut_ptr() as u64,
+                buffer.len() as u64,
+                offset,
+                0,
+                0,
+            ],
+        );
+        Self::request(&mut req);
+        Self::parse_result(req.ret)
+    }
+
     fn parse_result(res: u64) -> Result<usize, Errno> {
+        const ERESTARTSYS: i64 = 512;
+        const ERESTARTNOHAND: i64 = 514;
+        const ERESTART_RESTARTBLOCK: i64 = 516;
+
         if is_err_value(res) {
             #[expect(clippy::cast_possible_wrap)]
             let v = res as i64;
-            Err(Errno::try_from(i32::try_from(v.abs()).unwrap()).unwrap())
+            // ERESTARTSYS and other restart codes are kernel-internal and should
+            // be converted to EINTR when returned back.
+            let errno = match v.abs() {
+                ERESTARTSYS | ERESTARTNOHAND | ERESTART_RESTARTBLOCK => Errno::EINTR,
+                e => Errno::try_from(i32::try_from(e).unwrap()).unwrap(),
+            };
+            Err(errno)
         } else {
             Ok(usize::try_from(res).unwrap())
         }
@@ -463,7 +576,6 @@ impl HostInterface for HostSnpInterface {
     }
 
     fn wake_many(mutex: &core::sync::atomic::AtomicU32, n: usize) -> Result<usize, Errno> {
-        // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
             args: [mutex.as_ptr() as u64, FUTEX_WAKE as u64, n as u64, 0, 0, 0],
         })
@@ -478,7 +590,6 @@ impl HostInterface for HostSnpInterface {
             tv_sec: i64::try_from(t.as_secs()).unwrap(),
             tv_nsec: u64::from(t.subsec_nanos()),
         });
-        // TODO: sandbox driver needs to be updated to accept a kernel pointer from the guest
         Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
             args: [
                 mutex.as_ptr() as u64,

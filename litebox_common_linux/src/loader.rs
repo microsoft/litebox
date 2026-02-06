@@ -209,6 +209,11 @@ impl ElfParsedFile {
         file: &mut F,
         syscall_entry_point: usize,
     ) -> Result<(), ElfParseError<F::Error>> {
+        if syscall_entry_point == 0 {
+            // Platform running in kernel mode does not need trampoline
+            // and may give zero as entry point.
+            return Ok(());
+        }
         let shent_size = if cfg!(target_pointer_width = "64") {
             size_of::<elf::section::Elf64_Shdr>()
         } else {
