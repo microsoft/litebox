@@ -210,13 +210,14 @@ impl OpteeShim {
         ta_uuid: TeeUuid,
         ta_bin: Option<&[u8]>,
         client: Option<TeeIdentity>,
+        session_id: u32,
     ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
                 thread: ThreadState::new(),
-                session_id: SessionIdPool::allocate(),
+                session_id,
                 ta_app_id: ta_uuid,
                 client_identity: client.unwrap_or(TeeIdentity {
                     login: TeeLogin::User,
@@ -1294,10 +1295,25 @@ pub(crate) enum ThreadInitState {
 
 /// Global session ID pool (Linux pidmap style).
 ///
-/// Uses spinlock-protected bitmap for recyclable IDs.
+/// Uses spinlock-protected bitmap for recyclable IDs (1..=MAX_RECYCLABLE_SESSION_ID),
 /// with fallback to one-time IDs beyond that range.
+///
+/// With MAX_RECYCLABLE_SESSION_ID = 65535:
+/// - Bitmap memory usage: (65535 + 1) bits = 8 KB
+/// - Recyclable IDs: 1..=65535 (65535 IDs)
+/// - Fallback (non-recyclable) IDs: 65536..=0xffff_fffd (~4.3B IDs, excluding PTA_SESSION_ID)
+/// - PTA_SESSION_ID (0xffff_fffe) is reserved and never allocated
+///
+/// Design notes:
+/// - A single TA instance can serve many concurrent sessions (no per-instance cap),
+///   so the bitmap must cover realistic peak concurrency.
+/// - Allocation uses `last_id` as a hint for O(1) amortized scans; worst-case O(n)
+///   full scan only occurs when the bitmap is nearly full.
+/// - 8 KB is modest for the secure world (with a small amount of memory) and avoids falling
+///   into the non-recyclable fallback path under normal workloads. Fallback IDs are
+///   a one-way leak (never recycled).
 pub(crate) struct SessionIdPool {
-    bitmap: bitvec::vec::BitVec, // bit[id] set = in use; bit 0 unused (ID 0 is invalid)
+    bitmap: bitvec::vec::BitVec, // bit[id] set = in use; bit 0 unused (session ID 0 is invalid)
     last_id: u32,                // for wrap-around scanning
     fallback_next: u32,          // one-time IDs when bitmap exhausted
 }
@@ -1306,61 +1322,52 @@ fn session_id_pool() -> &'static spin::mutex::SpinMutex<SessionIdPool> {
     static POOL: spin::once::Once<spin::mutex::SpinMutex<SessionIdPool>> = spin::once::Once::new();
     POOL.call_once(|| {
         spin::mutex::SpinMutex::new(SessionIdPool {
-            bitmap: bitvec::bitvec![0; SessionIdPool::MAX_SESSION_ID as usize + 1],
+            bitmap: bitvec::bitvec![0; SessionIdPool::MAX_RECYCLABLE_SESSION_ID as usize + 1],
             last_id: 0,
-            fallback_next: SessionIdPool::MAX_SESSION_ID + 1,
+            fallback_next: SessionIdPool::MAX_RECYCLABLE_SESSION_ID + 1,
         })
     })
 }
 
 impl SessionIdPool {
-    /// Maximum session ID in bitmap. Bitmap size is MAX_SESSION_ID + 1 = 8KB.
-    const MAX_SESSION_ID: u32 = 65535;
+    /// Maximum recyclable session ID tracked by the bitmap.
+    const MAX_RECYCLABLE_SESSION_ID: u32 = 65535;
     /// Reserved session ID for PTA.
     const PTA_SESSION_ID: u32 = 0xffff_fffe;
 
     /// Allocate a new session ID.
     ///
-    /// # Panics
-    ///
-    /// Panics if all session IDs are exhausted.
-    pub fn allocate() -> u32 {
+    /// Returns `None` if all recyclable session IDs are currently in use and
+    /// the fallback one-time IDs are exhausted.
+    pub fn allocate() -> Option<u32> {
         let mut pool = session_id_pool().lock();
 
-        let start = if pool.last_id >= Self::MAX_SESSION_ID {
+        let start = if pool.last_id >= Self::MAX_RECYCLABLE_SESSION_ID {
             1
         } else {
             pool.last_id + 1
         };
 
-        for id in (start..=Self::MAX_SESSION_ID).chain(1..start) {
-            if id == Self::PTA_SESSION_ID {
-                continue;
-            }
-
+        for id in (start..=Self::MAX_RECYCLABLE_SESSION_ID).chain(1..start) {
             if !pool.bitmap[id as usize] {
                 pool.bitmap.set(id as usize, true);
                 pool.last_id = id;
-                return id;
+                return Some(id);
             }
         }
 
-        // Bitmap exhausted - use fallback one-time IDs
+        // Bitmap exhausted - use fallback one-time IDs if available
         let fallback_id = pool.fallback_next;
-        assert!(fallback_id < Self::PTA_SESSION_ID, "session ID exhausted");
-        pool.fallback_next += 1;
-        if pool.fallback_next == Self::PTA_SESSION_ID {
-            pool.fallback_next += 1;
+        if fallback_id >= Self::PTA_SESSION_ID {
+            return None;
         }
-        fallback_id
+        pool.fallback_next = fallback_id + 1;
+        Some(fallback_id)
     }
 
     /// Recycle a session ID for reuse. Fallback IDs are not recycled.
     pub fn recycle(session_id: u32) {
-        if session_id == 0 || session_id == Self::PTA_SESSION_ID {
-            return;
-        }
-        if session_id > Self::MAX_SESSION_ID {
+        if session_id == 0 || session_id > Self::MAX_RECYCLABLE_SESSION_ID {
             return;
         }
 
@@ -1386,7 +1393,7 @@ mod test_utils {
             Task {
                 global: self.clone(),
                 thread: ThreadState::new(),
-                session_id: SessionIdPool::allocate(),
+                session_id: SessionIdPool::allocate().unwrap(),
                 ta_app_id: TeeUuid::default(),
                 client_identity: TeeIdentity {
                     login: TeeLogin::User,

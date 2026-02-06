@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
+use litebox_shim_optee::session::allocate_session_id;
 use std::path::PathBuf;
 
 mod tests;
@@ -124,7 +125,13 @@ fn run_ta_with_default_commands(
 
         if func_id == UteeEntryFunc::OpenSession {
             let loaded_program = shim
-                .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin), None)
+                .load_ldelf(
+                    ldelf_bin,
+                    TeeUuid::default(),
+                    Some(ta_bin),
+                    None,
+                    allocate_session_id().unwrap(),
+                )
                 .map_err(|_| {
                     panic!("Failed to load ldelf");
                 })

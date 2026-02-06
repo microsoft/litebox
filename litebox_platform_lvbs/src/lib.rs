@@ -483,11 +483,13 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         ))
     }
 
-    /// This unmaps VTL0 pages from the page table. Allocator does not allocate frames
-    /// for VTL0 pages (i.e., it is always shared mapping), so it must not attempt to deallocate them.
+    /// This function unmaps VTL0 pages from the page table.
     ///
-    /// Note: VTL0 physical memory is external/remote memory that this Rust binary doesn't own,
-    /// so unmapping it doesn't create use-after-free issues within the Rust memory model.
+    /// Allocator does not allocate memory frames for VTL0 pages, so frame deallocation is not needed.
+    ///
+    /// Note: VTL0 physical memory is external memory not owned by LiteBox (similar to MMIO).
+    /// LiteBox accesses it by creating a temporary non-shared mapping, copying data to/from a
+    /// LiteBox-owned buffer, and unmapping immediately.
     fn unmap_vtl0_pages(
         &self,
         page_addr: *const u8,

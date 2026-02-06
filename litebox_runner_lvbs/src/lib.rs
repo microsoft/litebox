@@ -402,7 +402,7 @@ fn open_session_single_instance(
         .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
 
     // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID
-    let runner_session_id = allocate_session_id();
+    let runner_session_id = allocate_session_id().ok_or(OpteeSmcReturnCode::EBusy)?;
 
     debug_serial_println!(
         "Reusing single-instance TA: uuid={:?}, task_pt_id={}, session_id={}",
@@ -566,16 +566,30 @@ fn open_session_new_instance(
         })?;
     }
 
+    // Allocate session ID before loading - return EBusy to normal world if exhausted
+    let runner_session_id = allocate_session_id().ok_or_else(|| {
+        unsafe { switch_to_base_page_table() };
+        // Safety: We've switched to the base page table above.
+        let _ = unsafe { delete_task_page_table(task_pt_id) };
+        OpteeSmcReturnCode::EBusy
+    })?;
+
     // Load ldelf and TA - Box immediately to keep at fixed heap address
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
     let loaded_program = Box::new(
-        shim.load_ldelf(LDELF_BINARY, ta_uuid, Some(TA_BINARY), client_identity)
-            .map_err(|_| {
-                unsafe { switch_to_base_page_table() };
-                // Safety: We've switched to the base page table above.
-                let _ = unsafe { delete_task_page_table(task_pt_id) };
-                OpteeSmcReturnCode::ENomem
-            })?,
+        shim.load_ldelf(
+            LDELF_BINARY,
+            ta_uuid,
+            Some(TA_BINARY),
+            client_identity,
+            runner_session_id,
+        )
+        .map_err(|_| {
+            unsafe { switch_to_base_page_table() };
+            // Safety: We've switched to the base page table above.
+            let _ = unsafe { delete_task_page_table(task_pt_id) };
+            OpteeSmcReturnCode::ENomem
+        })?,
     );
 
     let ta_flags = loaded_program.ta_flags;
@@ -620,9 +634,6 @@ fn open_session_new_instance(
 
         return Ok(());
     }
-
-    // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID
-    let runner_session_id = allocate_session_id();
 
     // Load TA context with parameters for OpenSession - pass actual session_id
     loaded_program.entrypoints.as_ref().ok_or_else(|| {

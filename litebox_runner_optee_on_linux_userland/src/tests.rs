@@ -8,6 +8,7 @@
 use litebox::platform::RawConstPointer;
 use litebox::utils::TruncateExt;
 use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};
+use litebox_shim_optee::session::allocate_session_id;
 use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -49,7 +50,13 @@ pub fn run_ta_with_test_commands(
             let ta_head = litebox_common_optee::parse_ta_head(ta_bin)
                 .expect("Failed to parse TA header from ta_bin");
             let loaded = shim
-                .load_ldelf(ldelf_bin, ta_head.uuid, Some(ta_bin), None)
+                .load_ldelf(
+                    ldelf_bin,
+                    ta_head.uuid,
+                    Some(ta_bin),
+                    None,
+                    allocate_session_id().unwrap(),
+                )
                 .map_err(|_| {
                     panic!("Failed to load TA");
                 })
