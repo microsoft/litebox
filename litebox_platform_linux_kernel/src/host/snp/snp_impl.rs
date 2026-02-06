@@ -217,7 +217,7 @@ fn exit_thread() -> ! {
 ///
 /// # Panics
 ///
-/// Panics if the thread shim has not been initialized with [`init_thread`].
+/// Panics if the thread shim has not been initialized with [`run_thread`].
 pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) -> ! {
     let tls = unsafe { &*get_tls() };
     match tls.shim.get().unwrap().syscall(pt_regs) {
