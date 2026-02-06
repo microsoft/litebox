@@ -261,7 +261,7 @@ impl Default for SingleInstanceCache {
 
 /// Allocate a new unique session ID.
 ///
-/// Delegates to [`SessionIdPool::allocate`] for unified session ID management.
+/// Delegates to `SessionIdPool::allocate` for unified session ID management.
 /// Returns `None` if all session IDs are exhausted.
 pub fn allocate_session_id() -> Option<u32> {
     SessionIdPool::allocate()
@@ -269,7 +269,7 @@ pub fn allocate_session_id() -> Option<u32> {
 
 /// Recycle a session ID for potential future reuse.
 ///
-/// Delegates to [`SessionIdPool::recycle`].
+/// Delegates to `SessionIdPool::recycle`.
 pub fn recycle_session_id(session_id: u32) {
     SessionIdPool::recycle(session_id);
 }

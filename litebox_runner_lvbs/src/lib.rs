@@ -18,7 +18,7 @@ use litebox_common_optee::{
     TeeResult, UteeEntryFunc, UteeParams,
 };
 use litebox_platform_lvbs::{
-    arch::{gdt, get_core_id, interrupts},
+    arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
     debug_serial_println,
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
     mm::MemoryProvider,
@@ -1074,5 +1074,5 @@ fn panic(info: &PanicInfo) -> ! {
     // We assume that once this VTL1 kernel panics, we don't try to resume its execution.
     // This is because, after the panic, the kernel is in an undefined state.
     // Switch back to VTL0, do crash dump, and reboot the machine.
-    unreachable!()
+    hlt_loop()
 }

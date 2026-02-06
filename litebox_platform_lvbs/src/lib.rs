@@ -94,7 +94,7 @@ pub struct PageTableManager {
     base_page_table_frame: PhysFrame<Size4KiB>,
     /// Task page tables indexed by their ID (starting from 1).
     /// Each contains kernel mappings + task-specific user-space mappings.
-    task_page_tables: spin::Mutex<HashMap<usize, mm::PageTable<PAGE_SIZE>>>,
+    task_page_tables: spin::Mutex<HashMap<usize, alloc::boxed::Box<mm::PageTable<PAGE_SIZE>>>>,
     /// Reverse lookup: physical frame -> page table ID (for O(1) CR3 lookup).
     /// Only contains task page tables (base page table is checked separately).
     frame_to_id: spin::Mutex<HashMap<PhysFrame<Size4KiB>, usize>>,
@@ -148,11 +148,15 @@ impl PageTableManager {
         if let Some(id) = task_pt_id {
             let task_pts = self.task_page_tables.lock();
             if let Some(pt) = task_pts.get(&id) {
-                // SAFETY: This page table is the current CR3, so `delete_task_page_table`
-                // will refuse to remove it (returns EBUSY). The PageTableManager itself
-                // is 'static, so the HashMap won't be deallocated. Together, these
-                // guarantee the page table remains valid for the lifetime of the reference.
-                return unsafe { &*core::ptr::from_ref(pt) };
+                // SAFETY: Three invariants guarantee this reference remains valid:
+                // 1. The PageTable is Box-allocated, so HashMap rehashing does not
+                //    move the PageTable itself (only the Box pointer moves).
+                // 2. This page table is the current CR3, so `delete_task_page_table`
+                //    will refuse to remove it (returns EBUSY).
+                // 3. The PageTableManager is 'static, so neither it nor the HashMap
+                //    will be deallocated.
+                let pt_ref: &mm::PageTable<PAGE_SIZE> = pt;
+                return unsafe { &*core::ptr::from_ref(pt_ref) };
             }
         }
 
@@ -275,6 +279,7 @@ impl PageTableManager {
             return Err(Errno::ENOMEM);
         }
 
+        let pt = alloc::boxed::Box::new(pt);
         let phys_frame = pt.get_physical_frame();
 
         let mut task_pts = self.task_page_tables.lock();
@@ -489,7 +494,9 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// Note: VTL0 physical memory is external memory not owned by LiteBox (similar to MMIO).
     /// LiteBox accesses it by creating a temporary non-shared mapping, copying data to/from a
-    /// LiteBox-owned buffer, and unmapping immediately.
+    /// LiteBox-owned buffer, and unmapping immediately. No Rust references are created to the
+    /// mapped VTL0 memory; all accesses use raw pointer operations (read_volatile /
+    /// copy_nonoverlapping) to avoid violating Rust's aliasing model.
     fn unmap_vtl0_pages(
         &self,
         page_addr: *const u8,
@@ -612,9 +619,13 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             let dst_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(dst_ptr.is_aligned(), "dst_ptr is not properly aligned");
 
-            // Safety: dst_ptr points to valid VTL0 memory that was just mapped
-            let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, value.len()) };
-            dst.copy_from_slice(value);
+            // Safety: dst_ptr points to mapped VTL0 memory with enough space for value.len()
+            // elements. We use copy_nonoverlapping instead of creating a slice reference
+            // because VTL0 memory is external (similar to MMIO/DMA) and may be concurrently
+            // modified, which would violate Rust's aliasing model for references.
+            unsafe {
+                core::ptr::copy_nonoverlapping(value.as_ptr(), dst_ptr, value.len());
+            }
 
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),
@@ -650,9 +661,11 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             let src_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(src_ptr.is_aligned(), "src_ptr is not properly aligned");
 
-            // Safety: src_ptr points to valid VTL0 memory that was just mapped
-            let src = unsafe { core::slice::from_raw_parts(src_ptr, buf.len()) };
-            buf.copy_from_slice(src);
+            // Safety: see copy_slice_to_vtl0_phys for why we use copy_nonoverlapping
+            // instead of creating a slice reference to VTL0 memory.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_ptr, buf.as_mut_ptr(), buf.len());
+            }
 
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),
