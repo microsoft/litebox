@@ -2228,6 +2228,25 @@ impl litebox::platform::CrngProvider for LinuxUserland {
 /// testing, or use a kernel module to provide this functionality (if needed).
 impl<const ALIGN: usize> VmapManager<ALIGN> for LinuxUserland {}
 
+/// Dummy `VmemPageFaultHandler`.
+///
+/// Page faults are handled transparently by the host Linux kernel.
+/// Provided to satisfy trait bounds for `PageManager::handle_page_fault`.
+impl litebox::mm::linux::VmemPageFaultHandler for LinuxUserland {
+    unsafe fn handle_page_fault(
+        &self,
+        _fault_addr: usize,
+        _flags: litebox::mm::linux::VmFlags,
+        _error_code: u64,
+    ) -> Result<(), litebox::mm::linux::PageFaultError> {
+        unreachable!("host kernel handles page faults for Linux userland")
+    }
+
+    fn access_error(_error_code: u64, _flags: litebox::mm::linux::VmFlags) -> bool {
+        unreachable!("host kernel handles page faults for Linux userland")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;

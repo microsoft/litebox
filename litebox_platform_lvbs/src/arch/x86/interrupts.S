@@ -143,8 +143,7 @@ isr_with_err_code isr_stack_segment_fault stack_segment_fault_handler_impl
 /* Vector 13: General Protection Fault (#GP) - Error code */
 isr_with_err_code isr_general_protection_fault general_protection_fault_handler_impl
 
-/* Vector 14: Page Fault (#PF) - Error code */
-isr_with_err_code isr_page_fault page_fault_handler_impl
+/* Vector 14: Page Fault (#PF) - Custom stub defined in interrupts.rs */
 
 /* Vector 16: x87 Floating-Point Exception (#MF) - No error code */
 isr_no_err_code isr_x87_floating_point x87_floating_point_handler_impl

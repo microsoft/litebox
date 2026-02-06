@@ -289,8 +289,9 @@ pub(crate) fn allocate_stack(task: &crate::Task, stack_base: Option<usize>) -> O
                 .create_stack_pages(
                     None,
                     length,
-                    // Use POPULATE_PAGES_IMMEDIATELY since some platforms (e.g., LVBS)
-                    // do not support demand paging yet.
+                    // Pre-populate because the shim writes to the stack from kernel mode
+                    // (e.g., push_bytes via memcpy_fallible) before the TA runs, and
+                    // kernel-mode demand paging is not yet supported.
                     CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                 )
                 .ok()?

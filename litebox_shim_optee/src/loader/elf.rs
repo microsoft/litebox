@@ -81,7 +81,7 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
                 super::DEFAULT_LOW_ADDR,
                 mapping_len,
                 ProtFlags::PROT_NONE,
-                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_POPULATE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
                 -1,
                 0,
             )?

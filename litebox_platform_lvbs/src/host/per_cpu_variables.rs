@@ -231,6 +231,12 @@ pub struct PerCpuVariablesAsm {
     vtl1_kernel_xsaved: Cell<u8>,
     /// XSAVE/XRSTOR state tracking for VTL1 user (see `vtl1_kernel_xsaved` for state values and reset).
     vtl1_user_xsaved: Cell<u8>,
+    /// Exception info: exception vector number
+    exception_trapno: Cell<u8>,
+    /// Exception info: hardware error code
+    exception_error_code: Cell<u32>,
+    /// Exception info: faulting address (CR2)
+    exception_cr2: Cell<usize>,
 }
 
 impl PerCpuVariablesAsm {
@@ -319,6 +325,37 @@ impl PerCpuVariablesAsm {
     pub const fn vtl1_user_xsaved_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, vtl1_user_xsaved)
     }
+    pub const fn exception_trapno_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, exception_trapno)
+    }
+    pub const fn exception_error_code_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, exception_error_code)
+    }
+    pub const fn exception_cr2_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, exception_cr2)
+    }
+    pub fn set_exception_info(
+        &self,
+        exception: litebox::shim::Exception,
+        error_code: u32,
+        cr2: usize,
+    ) {
+        self.exception_trapno.set(exception.0);
+        self.exception_error_code.set(error_code);
+        self.exception_cr2.set(cr2);
+    }
+    pub fn get_exception(&self) -> litebox::shim::Exception {
+        litebox::shim::Exception(self.exception_trapno.get())
+    }
+    pub fn get_exception_error_code(&self) -> u32 {
+        self.exception_error_code.get()
+    }
+    pub fn get_exception_cr2(&self) -> usize {
+        self.exception_cr2.get()
+    }
+    pub fn get_user_context_top_addr(&self) -> usize {
+        self.user_context_top_addr.get()
+    }
     /// Reset VTL1 xsaved flags to 0 at each VTL1 entry (OP-TEE SMC call).
     /// This ensures:
     /// - XRSTOR is skipped until XSAVE populates valid data (no spurious restores on fresh entry)
@@ -366,6 +403,9 @@ impl<T> RefCellWrapper<T> {
                 vtl1_xsave_mask_hi: Cell::new(0),
                 vtl1_kernel_xsaved: Cell::new(0),
                 vtl1_user_xsaved: Cell::new(0),
+                exception_trapno: Cell::new(0),
+                exception_error_code: Cell::new(0),
+                exception_cr2: Cell::new(0),
             },
             inner: RefCell::new(value),
         }

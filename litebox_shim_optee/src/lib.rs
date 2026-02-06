@@ -71,7 +71,18 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
         _ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        todo!("Handle exception in OP-TEE shim: {:?}", info,);
+        if info.exception == litebox::shim::Exception::PAGE_FAULT {
+            match unsafe {
+                self.task
+                    .global
+                    .pm
+                    .handle_page_fault(info.cr2, info.error_code.into())
+            } {
+                Ok(()) => return ContinueOperation::ResumeGuest,
+                Err(_) => return ContinueOperation::ExitThread,
+            }
+        }
+        todo!("Handle exception in OP-TEE shim: {:?}", info);
     }
 
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -742,7 +753,7 @@ impl Task {
             0,
             tls_size,
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_POPULATE,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
             -1,
             0,
         )?;
@@ -953,16 +964,16 @@ impl TeeObjMap {
             match user_attrs[0].attribute_id {
                 TeeAttributeType::SecretValue => {
                     let key_addr: usize = user_attrs[0].a.truncate();
-                    let key_len = usize::try_from(user_attrs[0].b).unwrap();
+                    let key_len: usize = user_attrs[0].b.truncate();
                     // TODO: revisit buffer size limits based on OP-TEE spec and deployment constraints
                     if key_len > MAX_KERNEL_BUF_SIZE {
                         return Err(TeeResult::BadParameters);
                     }
                     let key_ptr = UserConstPtr::<u8>::from_usize(key_addr);
-                    let key_slice = key_ptr
-                        .to_owned_slice(key_len)
-                        .ok_or(TeeResult::BadParameters)?;
-                    tee_obj.set_key(&key_slice);
+                    let Some(key_box) = key_ptr.to_owned_slice(key_len) else {
+                        return Err(TeeResult::BadParameters);
+                    };
+                    tee_obj.set_key(&key_box);
                 }
                 _ => todo!(
                     "handle attribute ID: {}",

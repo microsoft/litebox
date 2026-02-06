@@ -57,13 +57,12 @@ impl Task {
         if addr.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
-        // `sys_map_zi` always creates read/writeable mapping
-        // Use MAP_POPULATE to ensure pages are allocated immediately (required for platforms
-        // that don't support demand paging, e.g., LVBS).
+        // `sys_map_zi` always creates read/writeable mapping.
         //
         // We map with PROT_READ_WRITE first, then mprotect padding regions to PROT_NONE.
-        // This is because our mmap with MAP_POPULATE and PROT_NONE create pages without
-        // USER_ACCESSIBLE bit, making them inaccessible even to mprotect.
+        // Pre-populate because ldelf (user mode) accesses these pages immediately after
+        // mapping, and kernel-mode demand paging is not yet supported for the
+        // exception_callback path during early TA loading.
         let mut flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_POPULATE;
         if addr != 0 {
             flags |= MapFlags::MAP_FIXED;
@@ -187,11 +186,10 @@ impl Task {
         if addr.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
-        // Use MAP_POPULATE to ensure pages are allocated immediately (required for platforms
-        // that don't support demand paging, e.g., LVBS).
-        //
         // We map with PROT_READ_WRITE first, then mprotect padding regions to PROT_NONE as
         // explained in `sys_map_zi`.
+        // Pre-populate because `read_ta_bin` writes to these pages from kernel mode
+        // via memcpy_fallible, and kernel-mode demand paging is not yet supported.
         let mut flags_internal =
             MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_POPULATE;
         if addr != 0 {

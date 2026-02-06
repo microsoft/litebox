@@ -25,6 +25,85 @@ use x86_64::{VirtAddr, structures::idt::InterruptDescriptorTable};
 // Include assembly ISR stubs
 core::arch::global_asm!(include_str!("interrupts.S"));
 
+// Custom page fault ISR stub.
+//
+// This stub splits user-mode and kernel-mode page faults at the assembly level:
+//
+// - **User-mode faults**: jumps directly to exception_callback in run_thread_arch,
+//   which handles swapgs, saves exception info (CR2, error code), saves user
+//   registers and extended states, and calls the **shim's exception handler**.
+//
+// - **Kernel-mode faults**: standard push_regs/call/pop_regs/iretq flow into a
+//   minimal Rust handler that only does exception table fixup or panics.
+//
+// # User-mode ISR stack cleanup
+//
+// The user-mode path (`jmp exception_callback`) leaves the CPU-pushed iret frame
+// and error code (48 bytes) on the ISR stack without popping them. This is safe
+// because:
+//
+// 1. The page fault IDT entry does not use IST (IST index = 0). On a user→kernel
+//    privilege-level change, the CPU unconditionally loads RSP from TSS.RSP0
+//    (Intel SDM Vol. 3A, §6.12.1 "Exception- or Interrupt-Handler Procedures").
+//
+// 2. TSS.RSP0 always points to the top of the kernel stack. Each subsequent
+//    user→kernel transition (syscall, interrupt, or exception) causes the CPU
+//    to reload RSP from TSS.RSP0, overwriting any stale data from previous
+//    entries.
+//
+// Reference: Intel SDM Vol. 3A, §6.12.1
+// https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+core::arch::global_asm!(
+    ".global isr_page_fault",
+    "isr_page_fault:",
+    "cld",
+    // Check if fault came from user mode by testing CS RPL bits.
+    // On ISR entry the CPU pushed: [rsp+40]=SS, [rsp+32]=RSP, [rsp+24]=RFLAGS,
+    //                              [rsp+16]=CS, [rsp+8]=RIP, [rsp+0]=error_code
+    "test qword ptr [rsp + 16], 0x3",
+    "jnz .Lpf_user_mode",
+    // --- Kernel-mode page fault: standard ISR flow ---
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "push rcx",
+    "push rax",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov rbp, rsp",
+    "and rsp, -16",
+    "mov rdi, rbp",
+    "call kernel_page_fault_handler_impl",
+    "mov rsp, rbp",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rbp",
+    "pop rbx",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rax",
+    "pop rcx",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
+    "add rsp, 8", // skip error code
+    "iretq",
+    ".Lpf_user_mode:",
+    "jmp exception_callback",
+);
+
 // External symbols for assembly ISR stubs
 unsafe extern "C" {
     fn isr_divide_error();
@@ -218,18 +297,32 @@ extern "C" fn general_protection_fault_handler_impl(regs: &PtRegs) {
     );
 }
 
-/// Rust handler for page fault exception (vector 14).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode page fault handler.
+/// Called from the `isr_page_fault` assembly stub only for kernel-mode faults.
 #[unsafe(no_mangle)]
-extern "C" fn page_fault_handler_impl(regs: &PtRegs) {
+extern "C" fn kernel_page_fault_handler_impl(regs: &mut PtRegs) {
+    use litebox::mm::exception_table::search_exception_tables;
+    use litebox::utils::TruncateExt as _;
     use x86_64::registers::control::Cr2;
 
-    todo!(
-        "EXCEPTION [{}]: PAGE FAULT\nAccessed Address: {:?}\nError Code: {:#x}\n{:#x?}",
-        mode_str(regs),
-        Cr2::read(),
-        regs.orig_rax,
-        regs
+    let fault_addr: usize = Cr2::read_raw().truncate();
+    let error_code = regs.orig_rax;
+
+    // Check the exception table for a recovery address.
+    // This handles fallible memory operations like memcpy_fallible that access
+    // user-space or VTL0 addresses which might be unmapped.
+    //
+    // TODO: Add kernel-mode demand paging for user-space addresses. Demand paging
+    // a shim using its exception handler is a chicken-and-egg problem. Some
+    // pre-population is unavoidable.
+    if let Some(fixup_addr) = search_exception_tables(regs.rip) {
+        regs.rip = fixup_addr;
+        return;
+    }
+
+    panic!(
+        "EXCEPTION [KERNEL]: PAGE FAULT\nAccessed Address: {:#x}\nError Code: {:#x}\n{:#x?}",
+        fault_addr, error_code, regs
     );
 }
 
