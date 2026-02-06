@@ -177,6 +177,10 @@ fn get_tls() -> *const ThreadState {
 
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
+/// # Panics
+///
+/// Panics if `shim` has been set in the TLS.
+///
 /// # Safety
 ///
 /// The context must be valid guest context.

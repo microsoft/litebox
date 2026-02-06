@@ -298,9 +298,8 @@ pub extern "C" fn sandbox_tun_read_write() {
     let shim = &raw const SHIM;
     // wait until shim is initialized
     let shim = loop {
-        match unsafe { (*shim).as_ref() } {
-            Some(shim) => break shim,
-            None => {}
+        if let Some(shim) = unsafe { (*shim).as_ref() } {
+            break shim;
         }
     };
     #[cfg(debug_assertions)]
