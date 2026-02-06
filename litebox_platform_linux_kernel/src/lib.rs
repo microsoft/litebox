@@ -295,7 +295,9 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
                 Ok(())
             }
             Err(e) => {
-                unimplemented!("Error: {:?}", e)
+                // Avoid allocation for error message
+                crate::print_str_and_int!("Error sending IP packet: ", e.as_neg().abs() as u64, 16);
+                unimplemented!()
             }
         }
     }
@@ -306,8 +308,15 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
     ) -> Result<usize, litebox::platform::ReceiveError> {
         match Host::receive_ip_packet(packet) {
             Ok(n) => Ok(n),
+            Err(Errno::EAGAIN) => Err(litebox::platform::ReceiveError::WouldBlock),
             Err(e) => {
-                unimplemented!("Error: {:?}", e)
+                // Avoid allocation for error message
+                crate::print_str_and_int!(
+                    "Error receiving IP packet: ",
+                    e.as_neg().abs() as u64,
+                    16
+                );
+                unimplemented!()
             }
         }
     }

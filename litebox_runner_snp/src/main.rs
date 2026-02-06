@@ -191,6 +191,7 @@ pub extern "C" fn sandbox_process_init(
             & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
     );
     let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
+    #[cfg(debug_assertions)]
     litebox::log_println!(platform, "sandbox_process_init called\n");
 
     litebox_platform_multiplex::set_platform(platform);
@@ -302,11 +303,12 @@ pub extern "C" fn sandbox_tun_read_write() {
             None => {}
         }
     };
+    #[cfg(debug_assertions)]
     litebox::log_println!(
         litebox_platform_multiplex::platform(),
         "sandbox_tun_read_write started\n"
     );
-    loop {
+    while !litebox_platform_linux_kernel::host::snp::snp_impl::all_threads_exited() {
         let _timeout = loop {
             match shim
                 .perform_network_interaction() {
@@ -316,6 +318,8 @@ pub extern "C" fn sandbox_tun_read_write() {
         };
         // TODO: use timeout to wait on host events
     }
+
+    litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::return_to_host();
 }
 
 /// This function is called on panic.
