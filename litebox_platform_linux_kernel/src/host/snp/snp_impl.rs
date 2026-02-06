@@ -6,6 +6,7 @@ use ::alloc::{boxed::Box, ffi::CString, vec::Vec};
 use core::{
     arch::asm,
     cell::{Cell, OnceCell},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use litebox::utils::ReinterpretUnsignedExt as _;
@@ -13,6 +14,14 @@ use litebox_common_linux::CloneFlags;
 
 use super::ghcb::ghcb_prints;
 use crate::{Errno, HostInterface};
+
+/// Counter for active guest threads. Starts at 1 for the main thread.
+static ACTIVE_THREAD_COUNT: AtomicU32 = AtomicU32::new(1);
+
+/// Returns true if all guest threads have exited.
+pub fn all_threads_exited() -> bool {
+    ACTIVE_THREAD_COUNT.load(Ordering::Acquire) == 0
+}
 
 #[expect(dead_code, reason = "bindings are generated from C header files")]
 mod bindings {
@@ -142,6 +151,8 @@ extern "C" fn thread_start(
     regs: &mut litebox_common_linux::PtRegs,
     thread_start_args: Box<ThreadStartArgs>,
 ) -> ! {
+    ACTIVE_THREAD_COUNT.fetch_add(1, Ordering::Relaxed);
+
     *regs = thread_start_args.ctx;
 
     // Set up thread-local storage for the new thread. This is done by
@@ -187,6 +198,8 @@ pub unsafe fn run_thread(
 }
 
 fn exit_thread() -> ! {
+    ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::Release);
+
     let tls = current().unwrap().tls.cast::<ThreadState>();
     if !tls.is_null() {
         let tls = unsafe { Box::from_raw(tls) };
