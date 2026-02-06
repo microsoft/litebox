@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use litebox::platform::CrngProvider;
 use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
 use std::path::PathBuf;
@@ -96,6 +97,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
         InterceptionBackend::Rewriter => {}
     }
+
+    // For now, we use a random UPK for this runner. We can get one via command line if needed.
+    let mut upk = [0u8; litebox_platform_linux_userland::UPK_LEN];
+    platform.fill_bytes_crng(&mut upk);
+    litebox_platform_linux_userland::set_unique_platform_key(&upk);
 
     if cli_args.command_sequence.is_empty() {
         run_ta_with_default_commands(&shim, ldelf_data.as_slice(), prog_data.as_slice());

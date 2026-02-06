@@ -2206,11 +2206,48 @@ unsafe fn interrupt_signal_handler(
     set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
 }
 
+#[cfg(all(target_arch = "x86_64", feature = "optee_syscall"))]
+/// Length of the Unique Platform Key in bytes.
+pub const UPK_LEN: usize = 32;
+
+#[cfg(all(target_arch = "x86_64", feature = "optee_syscall"))]
+static UPK_ONCE: std::sync::OnceLock<[u8; UPK_LEN]> = std::sync::OnceLock::new();
+
+/// Sets the Unique Platform Key (UPK) for this platform.
+///
+/// This should be called once during platform initialization with a key derived
+/// from hardware or a boot nonce.
+///
+/// # Panics
+/// Panics if `key` length does not match `UPK_LEN`.
+#[cfg(all(target_arch = "x86_64", feature = "optee_syscall"))]
+pub fn set_unique_platform_key(key: &[u8]) {
+    assert_eq!(key.len(), UPK_LEN, "Unique Platform Key length mismatch");
+    UPK_ONCE.get_or_init(|| {
+        let mut upk = [0u8; UPK_LEN];
+        upk.copy_from_slice(key);
+        upk
+    });
+}
+
 impl litebox::platform::CrngProvider for LinuxUserland {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
         getrandom::fill(buf).expect("getrandom failed");
     }
 }
+
+#[cfg(all(target_arch = "x86_64", feature = "optee_syscall"))]
+impl litebox::platform::UniquePlatformKeyProvider for LinuxUserland {
+    fn unique_platform_key(&self) -> Result<&[u8], litebox::platform::UniquePlatformKeyError> {
+        UPK_ONCE
+            .get()
+            .map(<[u8; UPK_LEN]>::as_slice)
+            .ok_or(litebox::platform::UniquePlatformKeyError)
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "optee_syscall")))]
+impl litebox::platform::UniquePlatformKeyProvider for LinuxUserland {}
 
 /// Dummy `VmapManager`.
 ///

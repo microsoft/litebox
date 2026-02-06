@@ -670,3 +670,38 @@ pub trait CrngProvider {
     /// failures.
     fn fill_bytes_crng(&self, buf: &mut [u8]);
 }
+
+/// A provider of the Unique Platform Key (UPK).
+///
+/// The UPK is a platform-wide secret used to derive security-critical keys
+/// (e.g., TA unique keys, secure storage keys). It serves as the root of trust
+/// for cryptographic operations within the trusted execution environment.
+///
+/// Trusted hardware devices provide similar funtionalities under various names:
+/// - OP-TEE's Hardware Unique Key (HUK)
+/// - DICE's Unique Device Secret (UDS)
+/// - TPM 2.0's Primary Seeds (e.g., Storage Primary Seed)
+///
+/// Ideally, the platform features a persistent, hardware-backed key (e.g., fused
+/// OTP, PUF-derived). The key should be unique per device, inaccessible outside
+/// the trusted environment, and never directly exposed—only used to derive other
+/// keys.
+///
+/// If hardware support is unavailable, the platform may generate an ephemeral key
+/// from a boot nonce and CRNG, valid only for the current boot session.
+pub trait UniquePlatformKeyProvider {
+    /// Returns a reference to the Unique Platform Key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UniquePlatformKeyError`] if the UPK is not supported or not
+    /// initialized.
+    fn unique_platform_key(&self) -> Result<&[u8], UniquePlatformKeyError> {
+        Err(UniquePlatformKeyError)
+    }
+}
+
+/// Error returned when unique platform key is not supported on the platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("unique platform key is not supported on this platform")]
+pub struct UniquePlatformKeyError;

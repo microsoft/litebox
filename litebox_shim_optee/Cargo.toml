@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 aes = { version = "0.7", default-features = false }
 arrayvec = { version = "0.7.6", default-features = false }
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 bitflags = "2.9.0"
 cfg-if = "1.0.0"
 ctr = { version = "0.8", default-features = false }
@@ -37,4 +40,5 @@ platform_lvbs = ["litebox_platform_multiplex/platform_lvbs_with_optee_syscall"]
 workspace = true
 
 [dev-dependencies]
+litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0", features = ["optee_syscall"] }
 litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", default-features = false, features = ["platform_linux_userland_with_optee_syscall"] }
