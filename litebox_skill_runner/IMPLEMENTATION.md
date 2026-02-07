@@ -331,3 +331,178 @@ This implementation provides a strong foundation for Agent Skills support in Lit
 **Next Steps:** Testing and validation with real skills in a build environment
 
 The implementation is production-ready for shell and Node.js skills, and has the infrastructure in place for Python skills pending validation of automation tools.
+
+## Concrete Testing Plan
+
+### Quick Testing Reference
+
+For detailed testing instructions, see **[QUICKSTART_TESTING.md](QUICKSTART_TESTING.md)**.
+
+For skill compatibility analysis, see **[SKILLS_COMPATIBILITY_MATRIX.md](SKILLS_COMPATIBILITY_MATRIX.md)**.
+
+### Immediate Next Steps (Build Environment)
+
+#### 1. Build Release Binaries
+```bash
+cd /path/to/aw-litebox
+cargo build --release -p litebox_runner_linux_userland
+cargo build --release -p litebox_syscall_rewriter
+```
+
+#### 2. Test Tier 1 Skills (Quick Wins)
+
+**A. skill-creator (Python + PyYAML) - TOP PRIORITY**
+```bash
+# Clone skills repo
+git clone https://github.com/anthropics/skills.git
+
+# Install dependencies
+cd skills/skill-creator
+pip install pyyaml
+
+# Package the skill
+cd /path/to/aw-litebox
+./litebox_skill_runner/examples/prepare_python_skill_advanced.py \
+    /path/to/skills/skill-creator \
+    -o /tmp/skill-creator.tar \
+    --rewriter-path ./target/release/litebox_syscall_rewriter
+
+# Test init_skill.py
+./target/release/litebox_runner_linux_userland \
+    --tar /tmp/skill-creator.tar \
+    -- /usr/bin/python3 /skill/scripts/init_skill.py test-skill /tmp/output
+
+# Expected output: "Created skill directory: /tmp/output/test-skill"
+```
+
+**B. web-artifacts-builder (Shell)**
+```bash
+# Package the skill
+tar -czf /tmp/web-artifacts.tar -C /path/to/skills/web-artifacts-builder .
+
+# Test init-artifact.sh
+./target/release/litebox_runner_linux_userland \
+    --tar /tmp/web-artifacts.tar \
+    -- /bin/sh /skill/scripts/init-artifact.sh "Test Artifact" /tmp/output
+
+# Expected output: "Creating artifact: Test Artifact"
+```
+
+**C. algorithmic-art (Node.js)**
+```bash
+# Package the skill
+tar -czf /tmp/algorithmic-art.tar -C /path/to/skills/algorithmic-art .
+
+# Test generator_template.js
+./target/release/litebox_runner_linux_userland \
+    --tar /tmp/algorithmic-art.tar \
+    -- node /skill/templates/generator_template.js
+
+# Expected output: JavaScript code for art generation
+```
+
+#### 3. Document Results
+
+After testing, update the following files:
+
+1. **CAPABILITIES.md**
+   - Update test results for each skill
+   - Mark skills as ✅ PASS, ❌ FAIL, or 🟡 PARTIAL
+   - Document any issues found
+
+2. **EVALUATION_YYYY-MM-DD.md**
+   - Create new evaluation file with current date
+   - Document all test results
+   - List next steps based on findings
+
+3. **SKILLS_COMPATIBILITY_MATRIX.md**
+   - Update expected vs. actual compatibility rates
+   - Move from theory to data
+
+### Success Criteria
+
+#### Minimum Success (Week 1)
+✅ skill-creator works (95% confidence)  
+✅ web-artifacts-builder works (100% confidence)  
+✅ algorithmic-art works (100% confidence)  
+✅ Documentation updated with actual results
+
+**Impact:** Proves foundation works, 3/16 skills (19%) validated
+
+#### Good Progress (Week 2)
+✅ All Tier 1 skills passing  
+✅ 2-3 Tier 2 skills tested (pdf pypdf subset, docx)  
+✅ Python automation validated  
+✅ C extension packaging process documented
+
+**Impact:** 6/16 skills (38%) working, automation proven
+
+#### Excellent Progress (Week 3-4)
+✅ 8-9 skills working including C extensions (pdf, pptx)  
+✅ Comprehensive documentation updated  
+✅ Integration tests added to CI  
+✅ Clear process for adding new skills
+
+**Impact:** 50-60% of skills working, production-ready
+
+### Troubleshooting Commands
+
+#### Check tar contents
+```bash
+tar -tf /tmp/skill.tar | head -50
+```
+
+#### Verify Python packaging
+```bash
+tar -tf /tmp/skill.tar | grep -E '\.(so|py)$' | head -20
+```
+
+#### Debug Python imports
+```bash
+# Add verbose flag to see import paths
+PYTHONVERBOSE=1 ./target/release/litebox_runner_linux_userland \
+    --tar /tmp/skill.tar \
+    -- /usr/bin/python3 -c "import sys; print(sys.path)"
+```
+
+#### Check rewriter output
+```bash
+# Verify .so files were rewritten
+./target/release/litebox_syscall_rewriter --help
+```
+
+### Performance Benchmarks
+
+After testing, document execution times:
+
+| Skill | Interpreter | First Run | Cached Run | Notes |
+|-------|------------|-----------|------------|-------|
+| skill-creator | Python | TBD | TBD | With PyYAML |
+| web-artifacts-builder | Shell | ~0.5s | ~0.3s | Proven in tests |
+| algorithmic-art | Node.js | ~13.9s | ~0.5s | Proven in tests |
+| pdf | Python | TBD | TBD | With Pillow |
+| pptx | Python | TBD | TBD | With python-pptx |
+
+### Bug Reporting Template
+
+If a skill fails, document:
+
+```markdown
+**Skill Name:** [e.g., skill-creator]
+**Script:** [e.g., init_skill.py]
+**Interpreter:** [e.g., Python 3.12]
+**Error Message:**
+```
+[Paste full error output]
+```
+**Expected Behavior:** [What should happen]
+**Actual Behavior:** [What actually happened]
+**Reproduction Steps:**
+1. [Step 1]
+2. [Step 2]
+...
+**Environment:**
+- LiteBox commit: [git rev-parse HEAD]
+- Python version: [python3 --version]
+- OS: [uname -a]
+```
