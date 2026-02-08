@@ -22,6 +22,7 @@ use litebox_common_linux::{rdgsbase, wrgsbase};
 use x86_64::VirtAddr;
 
 pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
+pub const PAGE_FAULT_STACK_SIZE: usize = PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
 
 /// Per-CPU VTL1 kernel variables
@@ -32,6 +33,7 @@ pub struct PerCpuVariables {
     hv_simp_page: [u8; PAGE_SIZE],
     interrupt_stack: [u8; INTERRUPT_STACK_SIZE],
     _guard_page_0: [u8; PAGE_SIZE],
+    page_fault_stack: [u8; PAGE_FAULT_STACK_SIZE],
     kernel_stack: [u8; KERNEL_STACK_SIZE],
     _guard_page_1: [u8; PAGE_SIZE],
     hvcall_input: [u8; PAGE_SIZE],
@@ -54,6 +56,10 @@ impl PerCpuVariables {
 
     pub(crate) fn interrupt_stack_top(&self) -> u64 {
         &raw const self.interrupt_stack as u64 + (self.interrupt_stack.len() - 1) as u64
+    }
+
+    pub(crate) fn page_fault_stack_top(&self) -> u64 {
+        &raw const self.page_fault_stack as u64 + (self.page_fault_stack.len() - 1) as u64
     }
 
     pub fn hv_vp_assist_page_as_ptr(&self) -> *const HvVpAssistPage {
@@ -148,6 +154,7 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     hv_simp_page: [0u8; PAGE_SIZE],
     interrupt_stack: [0u8; INTERRUPT_STACK_SIZE],
     _guard_page_0: [0u8; PAGE_SIZE],
+    page_fault_stack: [0u8; PAGE_FAULT_STACK_SIZE],
     kernel_stack: [0u8; KERNEL_STACK_SIZE],
     _guard_page_1: [0u8; PAGE_SIZE],
     hvcall_input: [0u8; PAGE_SIZE],
@@ -195,8 +202,10 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 pub struct PerCpuVariablesAsm {
     /// Initial kernel stack pointer to reset the kernel stack on VTL switch
     kernel_stack_ptr: Cell<usize>,
-    /// Initial interrupt stack pointer for x86 IST
+    /// Initial interrupt stack pointer for x86 IST (double fault)
     interrupt_stack_ptr: Cell<usize>,
+    /// Page fault IST stack pointer
+    page_fault_stack_ptr: Cell<usize>,
     /// Return address for call-based VTL switching
     vtl_return_addr: Cell<usize>,
     /// Scratch pad
@@ -249,6 +258,12 @@ impl PerCpuVariablesAsm {
     pub fn get_interrupt_stack_ptr(&self) -> usize {
         self.interrupt_stack_ptr.get()
     }
+    pub fn set_page_fault_stack_ptr(&self, sp: usize) {
+        self.page_fault_stack_ptr.set(sp);
+    }
+    pub fn get_page_fault_stack_ptr(&self) -> usize {
+        self.page_fault_stack_ptr.get()
+    }
     pub fn set_vtl_return_addr(&self, addr: usize) {
         self.vtl_return_addr.set(addr);
     }
@@ -279,6 +294,9 @@ impl PerCpuVariablesAsm {
     }
     pub const fn interrupt_stack_ptr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, interrupt_stack_ptr)
+    }
+    pub const fn page_fault_stack_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, page_fault_stack_ptr)
     }
     pub const fn vtl_return_addr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, vtl_return_addr)
@@ -388,6 +406,7 @@ impl<T> RefCellWrapper<T> {
             pcv_asm: PerCpuVariablesAsm {
                 kernel_stack_ptr: Cell::new(0),
                 interrupt_stack_ptr: Cell::new(0),
+                page_fault_stack_ptr: Cell::new(0),
                 vtl_return_addr: Cell::new(0),
                 scratch: Cell::new(0),
                 vtl0_state_top_addr: Cell::new(0),
@@ -593,12 +612,16 @@ pub fn init_per_cpu_variables() {
             & !(STACK_ALIGNMENT - 1);
         let interrupt_sp = TruncateExt::<usize>::truncate(per_cpu_variables.interrupt_stack_top())
             & !(STACK_ALIGNMENT - 1);
+        let page_fault_sp =
+            TruncateExt::<usize>::truncate(per_cpu_variables.page_fault_stack_top())
+                & !(STACK_ALIGNMENT - 1);
         let vtl0_state_top_addr =
             TruncateExt::<usize>::truncate(&raw const per_cpu_variables.vtl0_state as u64)
                 + core::mem::size_of::<VtlState>();
         with_per_cpu_variables_asm(|pcv_asm| {
             pcv_asm.set_kernel_stack_ptr(kernel_sp);
             pcv_asm.set_interrupt_stack_ptr(interrupt_sp);
+            pcv_asm.set_page_fault_stack_ptr(page_fault_sp);
             pcv_asm.set_vtl0_state_top_addr(vtl0_state_top_addr);
         });
     });

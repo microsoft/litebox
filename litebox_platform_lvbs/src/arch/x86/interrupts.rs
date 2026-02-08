@@ -29,30 +29,30 @@ core::arch::global_asm!(include_str!("interrupts.S"));
 //
 // This stub splits user-mode and kernel-mode page faults at the assembly level:
 //
-// - **User-mode faults**: jumps directly to exception_callback in run_thread_arch,
-//   which handles swapgs, saves exception info (CR2, error code), saves user
-//   registers and extended states, and calls the **shim's exception handler**.
+// - **User-mode faults**: jump to exception_callback in run_thread_arch which
+//   swaps GS, saves exception info and CPU registers, and calls the shim's
+//   exception handler.
 //
 // - **Kernel-mode faults**: standard push_regs/call/pop_regs/iretq flow into a
-//   minimal Rust handler that only does exception table fixup or panics.
+//   minimal handler that does exception table fixup or panics.
 //
-// # User-mode ISR stack cleanup
+// # Stacks for page fault handling
 //
-// The user-mode path (`jmp exception_callback`) leaves the CPU-pushed iret frame
-// and error code (48 bytes) on the ISR stack without popping them. This is safe
-// because:
+// We do not use an IST entry for page faults (check the below idt setup). This
+// results in two different stacks for user-mode vs kernel-mode page faults:
 //
-// 1. The page fault IDT entry does not use IST (IST index = 0). On a user→kernel
-//    privilege-level change, the CPU unconditionally loads RSP from TSS.RSP0
-//    (Intel SDM Vol. 3A, §6.12.1 "Exception- or Interrupt-Handler Procedures").
+// - **User-mode faults**: the CPU automatically switches to the RSP0 stack from
+//   TSS on the transition. We set a dedicated per-CPU stack for it. Since it is
+//   always reloaded, don't need to wipe out stale data from previous faults
+//   (i.e., iret frame and error code).
 //
-// 2. TSS.RSP0 always points to the top of the kernel stack. Each subsequent
-//    user→kernel transition (syscall, interrupt, or exception) causes the CPU
-//    to reload RSP from TSS.RSP0, overwriting any stale data from previous
-//    entries.
+// - **Kernel-mode faults**: the CPU does not switch stacks. The ISR stub pushes
+//   registers onto the current stack before calling the page-fault handler.
+//   This implies that the kernel-mode code should ensure there is enough stack
+//   space before performing any operations that might fault. Otherwise, the
+//   fault handler might overwrite existing data or cause a double fault.
 //
 // Reference: Intel SDM Vol. 3A, §6.12.1
-// https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
 core::arch::global_asm!(
     ".global isr_page_fault",
     "isr_page_fault:",
