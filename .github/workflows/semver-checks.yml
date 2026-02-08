@@ -27,7 +27,7 @@ jobs:
           echo "This PR does not target the 'main' branch. Exiting."
           exit 1
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Ensure that the main branch is fetched
         run: git fetch origin main:main
       - name: Set up Rust
