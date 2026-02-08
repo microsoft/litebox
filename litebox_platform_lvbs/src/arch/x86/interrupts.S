@@ -9,6 +9,31 @@
  * 2. Call the appropriate Rust handler
  * 3. Restore registers and return via iretq
  *
+ * Each stub checks the saved CS RPL bits to determine whether the exception
+ * came from user mode (ring 3) or kernel mode (ring 0):
+ *
+ * - User-mode exceptions: push the vector number and jump to
+ *   exception_callback (run_thread_arch), which swaps GS, saves the full
+ *   CPU context, and routes to the shim's exception handler.
+ *
+ * - Kernel-mode exceptions: standard push_regs/call/pop_regs/iretq flow
+ *   into a per-vector Rust handler.
+ *
+ * Stacks (Reference: Intel SDM Vol. 3A, §6.12.1):
+ *
+ * Unless an IST entry is configured for the vector (i.e., #DF in our case),
+ * the CPU selects the stack based on the privilege transition:
+ *
+ * - User-mode (CPL change): the CPU loads RSP from TSS.RSP0. We set a
+ *   dedicated per-CPU stack for this (see gdt.rs). Since RSP0 is always
+ *   reloaded from the TSS, stale data from previous exceptions does not
+ *   need to be cleaned up.
+ *
+ * - Kernel-mode (no CPL change): the CPU continues on the current stack.
+ *   The ISR stub pushes registers onto it. Kernel code must ensure enough
+ *   stack space before performing operations that might fault; otherwise
+ *   the fault handler may overwrite live data or trigger a double fault.
+ *
  * The x86_64 interrupt frame pushed by CPU:
  *   [rsp+40] SS
  *   [rsp+32] RSP
@@ -74,13 +99,16 @@
 
 /*
  * ISR stub for interrupts WITHOUT an error code.
- * The CPU does not push an error code, so we push a dummy 0.
+ * Kernel-mode: standard push_regs/call/pop_regs/iretq flow.
+ * User-mode: push vector number, then jump to exception_callback.
  */
-.macro isr_no_err_code name:req handler:req
+.macro isr_no_err_code name:req handler:req vector:req
 .global \name
 \name:
     cld
     push    0                   /* Push dummy error code */
+    test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
+    jnz     .Luser_\name
     push_regs
     mov     rbp, rsp            /* Save stack pointer */
     and     rsp, -16            /* Align stack to 16 bytes for call */
@@ -90,16 +118,20 @@
     pop_regs
     add     rsp, 8              /* Skip error code */
     iretq
+.Luser_\name:
+    push    \vector             /* Pass vector number to exception_callback */
+    jmp     exception_callback
 .endm
 
 /*
  * ISR stub for interrupts WITH an error code.
- * The CPU pushes the error code automatically.
  */
-.macro isr_with_err_code name:req handler:req
+.macro isr_with_err_code name:req handler:req vector:req
 .global \name
 \name:
     cld
+    test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
+    jnz     .Luser_\name
     push_regs
     mov     rbp, rsp            /* Save stack pointer */
     and     rsp, -16            /* Align stack to 16 bytes for call */
@@ -109,50 +141,54 @@
     pop_regs
     add     rsp, 8              /* Skip error code */
     iretq
+.Luser_\name:
+    push    \vector             /* Pass vector number to exception_callback */
+    jmp     exception_callback
 .endm
 
 /* Exception handlers (vectors 0-31) */
 
 /* Vector 0: Divide Error (#DE) - No error code */
-isr_no_err_code isr_divide_error divide_error_handler_impl
+isr_no_err_code isr_divide_error divide_error_handler_impl 0
 
 /* Vector 1: Debug (#DB) - No error code */
-isr_no_err_code isr_debug debug_handler_impl
+isr_no_err_code isr_debug debug_handler_impl 1
 
 /* Vector 3: Breakpoint (#BP) - No error code */
-isr_no_err_code isr_breakpoint breakpoint_handler_impl
+isr_no_err_code isr_breakpoint breakpoint_handler_impl 3
 
 /* Vector 4: Overflow (#OF) - No error code */
-isr_no_err_code isr_overflow overflow_handler_impl
+isr_no_err_code isr_overflow overflow_handler_impl 4
 
 /* Vector 5: Bound Range Exceeded (#BR) - No error code */
-isr_no_err_code isr_bound_range_exceeded bound_range_exceeded_handler_impl
+isr_no_err_code isr_bound_range_exceeded bound_range_exceeded_handler_impl 5
 
 /* Vector 6: Invalid Opcode (#UD) - No error code */
-isr_no_err_code isr_invalid_opcode invalid_opcode_handler_impl
+isr_no_err_code isr_invalid_opcode invalid_opcode_handler_impl 6
 
 /* Vector 7: Device Not Available (#NM) - No error code */
-isr_no_err_code isr_device_not_available device_not_available_handler_impl
+isr_no_err_code isr_device_not_available device_not_available_handler_impl 7
 
 /* Vector 8: Double Fault (#DF) - Error code (always 0) */
-isr_with_err_code isr_double_fault double_fault_handler_impl
+isr_with_err_code isr_double_fault double_fault_handler_impl 8
 
 /* Vector 12: Stack-Segment Fault (#SS) - Error code */
-isr_with_err_code isr_stack_segment_fault stack_segment_fault_handler_impl
+isr_with_err_code isr_stack_segment_fault stack_segment_fault_handler_impl 12
 
 /* Vector 13: General Protection Fault (#GP) - Error code */
-isr_with_err_code isr_general_protection_fault general_protection_fault_handler_impl
+isr_with_err_code isr_general_protection_fault general_protection_fault_handler_impl 13
 
-/* Vector 14: Page Fault (#PF) - Custom stub defined in interrupts.rs */
+/* Vector 14: Page Fault (#PF) - Error code */
+isr_with_err_code isr_page_fault page_fault_handler_impl 14
 
 /* Vector 16: x87 Floating-Point Exception (#MF) - No error code */
-isr_no_err_code isr_x87_floating_point x87_floating_point_handler_impl
+isr_no_err_code isr_x87_floating_point x87_floating_point_handler_impl 16
 
 /* Vector 17: Alignment Check (#AC) - Error code */
-isr_with_err_code isr_alignment_check alignment_check_handler_impl
+isr_with_err_code isr_alignment_check alignment_check_handler_impl 17
 
 /* Vector 19: SIMD Floating-Point Exception (#XM) - No error code */
-isr_no_err_code isr_simd_floating_point simd_floating_point_handler_impl
+isr_no_err_code isr_simd_floating_point simd_floating_point_handler_impl 19
 
 /*
  * Hypervisor synthetic interrupt handler (vector 0xf3)

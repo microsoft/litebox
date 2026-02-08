@@ -68,21 +68,24 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
 
     fn exception(
         &self,
-        _ctx: &mut Self::ExecutionContext,
+        ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        if info.exception == litebox::shim::Exception::PAGE_FAULT {
-            match unsafe {
+        if info.exception == litebox::shim::Exception::PAGE_FAULT
+            && unsafe {
                 self.task
                     .global
                     .pm
                     .handle_page_fault(info.cr2, info.error_code.into())
-            } {
-                Ok(()) => return ContinueOperation::ResumeGuest,
-                Err(_) => return ContinueOperation::ExitThread,
             }
+            .is_ok()
+        {
+            return ContinueOperation::ResumeGuest;
         }
-        todo!("Handle exception in OP-TEE shim: {:?}", info);
+        // Note: OP-TEE OS doesn't have a concept of signal handling. It kills
+        // the TA on CPU exceptions except for pageable page faults.
+        ctx.rax = (TeeResult::TargetDead as u32) as usize;
+        ContinueOperation::ExitThread
     }
 
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {

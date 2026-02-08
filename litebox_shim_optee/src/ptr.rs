@@ -426,7 +426,25 @@ impl<T: Clone, const ALIGN: usize> MappedGuard<'_, T, ALIGN> {
 
 impl<T: Clone, const ALIGN: usize> Drop for MappedGuard<'_, T, ALIGN> {
     fn drop(&mut self) {
-        let _ = unsafe { self.owner.unmap() };
+        // SAFETY: The platform is expected to handle unmapping safely, including
+        // the case where pages were never mapped (returns Unmapped error, ignored).
+        let result = unsafe { self.owner.unmap() };
+        debug_assert!(
+            result.is_ok() || matches!(result, Err(PhysPointerError::Unmapped(_))),
+            "unexpected error during unmap in drop: {result:?}",
+        );
+    }
+}
+
+impl<T: Clone, const ALIGN: usize> Drop for PhysMutPtr<T, ALIGN> {
+    fn drop(&mut self) {
+        // SAFETY: The platform is expected to handle unmapping safely, including
+        // the case where pages were never mapped (returns Unmapped error, ignored).
+        let result = unsafe { self.unmap() };
+        debug_assert!(
+            result.is_ok() || matches!(result, Err(PhysPointerError::Unmapped(_))),
+            "unexpected error during unmap in drop: {result:?}",
+        );
     }
 }
 

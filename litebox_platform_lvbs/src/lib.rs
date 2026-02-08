@@ -1526,16 +1526,17 @@ macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
     };
 }
 
-/// Save user context after a page fault ISR into the user context area.
+/// Save user context after an ISR exception into the user context area.
 ///
 /// Similar to `SAVE_SYSCALL_USER_CONTEXT_ASM` but it preserves all GPRs.
-/// The iret frame (SS, RSP, RFLAGS, CS, RIP) and error code are on
-/// the ISR stack. This macro saves them via a saved ISR stack pointer.
+/// The ISR stub pushes the vector number on top of the CPU-pushed error code
+/// and iret frame. This macro copies them via a saved ISR stack pointer.
 ///
 /// Prerequisites:
 /// - `rsp` points to the top of the user context area (push target)
-/// - `rax` points to the ISR stack: `[rax]`=error_code, `[rax+8]`=RIP,
-///   `[rax+16]`=CS, `[rax+24]`=RFLAGS, `[rax+32]`=RSP, `[rax+40]`=SS
+/// - `rax` points to the ISR stack: `[rax]`=vector, `[rax+8]`=error_code,
+///   `[rax+16]`=RIP, `[rax+24]`=CS, `[rax+32]`=RFLAGS, `[rax+40]`=RSP,
+///   `[rax+48]`=SS
 /// - All GPRs except `rax` contain user-mode values
 /// - User `rax` has been saved to per-CPU scratch
 /// - `swapgs` has already been executed (GS = kernel)
@@ -1545,12 +1546,12 @@ macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
 macro_rules! SAVE_PF_USER_CONTEXT_ASM {
     () => {
         "
-        push [rax + 40]   // pt_regs->ss
-        push [rax + 32]   // pt_regs->rsp
-        push [rax + 24]   // pt_regs->eflags
-        push [rax + 16]   // pt_regs->cs
-        push [rax + 8]    // pt_regs->rip
-        push [rax]        // pt_regs->orig_rax (error code)
+        push [rax + 48]   // pt_regs->ss
+        push [rax + 40]   // pt_regs->rsp
+        push [rax + 32]   // pt_regs->eflags
+        push [rax + 24]   // pt_regs->cs
+        push [rax + 16]   // pt_regs->rip
+        push [rax + 8]    // pt_regs->orig_rax (error code)
         push rdi          // pt_regs->rdi
         push rsi          // pt_regs->rsi
         push rdx          // pt_regs->rdx
@@ -1645,9 +1646,9 @@ unsafe extern "C" fn run_thread_arch(
         "mov rdi, [rsp]", // pass `thread_ctx`
         "call {syscall_handler}",
         "jmp done",
-        // Exception callback: entered from isr_page_fault for user-mode page faults.
+        // Exception callback: entered from ISR stubs for user-mode exceptions.
         // At this point:
-        // - rsp = ISR stack (error_code at top, iret frame above)
+        // - rsp points to ISR stack: [rsp]=vector, [rsp+8]=error_code, then iret frame
         // - All GPRs contain user-mode values
         // - Interrupts are disabled (IDT gate clears IF)
         // - GS = user (swapgs has NOT happened yet)
@@ -1656,10 +1657,11 @@ unsafe extern "C" fn run_thread_arch(
         "swapgs",
         "mov gs:[{scratch_off}], rax", // Save `rax` to per-CPU scratch
         "mov rax, cr2",
-        "mov gs:[{exception_cr2_off}], rax", // Save `CR2` (faulting address)
-        "mov byte ptr gs:[{exception_trapno_off}], 14", // Exception: page fault (14)
-        "mov eax, [rsp]",
-        "mov gs:[{exception_error_code_off}], eax", // error code (32-bit) from ISR stack
+        "mov gs:[{exception_cr2_off}], rax", // Save `CR2` (only meaningful for #PF)
+        "mov al, [rsp]",
+        "mov gs:[{exception_trapno_off}], al", // vector number from ISR stack
+        "mov eax, [rsp + 8]",
+        "mov gs:[{exception_error_code_off}], eax", // error code from ISR stack
         "mov rax, rsp", // store ISR `rsp` in `rax`
         "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
         SAVE_PF_USER_CONTEXT_ASM!(),

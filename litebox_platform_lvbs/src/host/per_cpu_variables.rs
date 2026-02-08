@@ -21,8 +21,8 @@ use litebox::utils::TruncateExt;
 use litebox_common_linux::{rdgsbase, wrgsbase};
 use x86_64::VirtAddr;
 
-pub const INTERRUPT_STACK_SIZE: usize = 2 * PAGE_SIZE;
-pub const PAGE_FAULT_STACK_SIZE: usize = PAGE_SIZE;
+pub const DOUBLE_FAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;
+pub const EXCEPTION_STACK_SIZE: usize = PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
 
 /// Per-CPU VTL1 kernel variables
@@ -31,9 +31,9 @@ pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
 pub struct PerCpuVariables {
     hv_vp_assist_page: [u8; PAGE_SIZE],
     hv_simp_page: [u8; PAGE_SIZE],
-    interrupt_stack: [u8; INTERRUPT_STACK_SIZE],
+    double_fault_stack: [u8; DOUBLE_FAULT_STACK_SIZE],
     _guard_page_0: [u8; PAGE_SIZE],
-    page_fault_stack: [u8; PAGE_FAULT_STACK_SIZE],
+    exception_stack: [u8; EXCEPTION_STACK_SIZE],
     kernel_stack: [u8; KERNEL_STACK_SIZE],
     _guard_page_1: [u8; PAGE_SIZE],
     hvcall_input: [u8; PAGE_SIZE],
@@ -54,12 +54,12 @@ impl PerCpuVariables {
         &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
     }
 
-    pub(crate) fn interrupt_stack_top(&self) -> u64 {
-        &raw const self.interrupt_stack as u64 + (self.interrupt_stack.len() - 1) as u64
+    pub(crate) fn double_fault_stack_top(&self) -> u64 {
+        &raw const self.double_fault_stack as u64 + (self.double_fault_stack.len() - 1) as u64
     }
 
-    pub(crate) fn page_fault_stack_top(&self) -> u64 {
-        &raw const self.page_fault_stack as u64 + (self.page_fault_stack.len() - 1) as u64
+    pub(crate) fn exception_stack_top(&self) -> u64 {
+        &raw const self.exception_stack as u64 + (self.exception_stack.len() - 1) as u64
     }
 
     pub fn hv_vp_assist_page_as_ptr(&self) -> *const HvVpAssistPage {
@@ -152,9 +152,9 @@ impl PerCpuVariables {
 static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     hv_vp_assist_page: [0u8; PAGE_SIZE],
     hv_simp_page: [0u8; PAGE_SIZE],
-    interrupt_stack: [0u8; INTERRUPT_STACK_SIZE],
+    double_fault_stack: [0u8; DOUBLE_FAULT_STACK_SIZE],
     _guard_page_0: [0u8; PAGE_SIZE],
-    page_fault_stack: [0u8; PAGE_FAULT_STACK_SIZE],
+    exception_stack: [0u8; EXCEPTION_STACK_SIZE],
     kernel_stack: [0u8; KERNEL_STACK_SIZE],
     _guard_page_1: [0u8; PAGE_SIZE],
     hvcall_input: [0u8; PAGE_SIZE],
@@ -202,10 +202,10 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
 pub struct PerCpuVariablesAsm {
     /// Initial kernel stack pointer to reset the kernel stack on VTL switch
     kernel_stack_ptr: Cell<usize>,
-    /// Initial interrupt stack pointer for x86 IST (double fault)
-    interrupt_stack_ptr: Cell<usize>,
-    /// Page fault IST stack pointer
-    page_fault_stack_ptr: Cell<usize>,
+    /// Double fault stack pointer (TSS.IST1)
+    double_fault_stack_ptr: Cell<usize>,
+    /// Exception stack pointer (TSS.RSP0)
+    exception_stack_ptr: Cell<usize>,
     /// Return address for call-based VTL switching
     vtl_return_addr: Cell<usize>,
     /// Scratch pad
@@ -252,17 +252,17 @@ impl PerCpuVariablesAsm {
     pub fn set_kernel_stack_ptr(&self, sp: usize) {
         self.kernel_stack_ptr.set(sp);
     }
-    pub fn set_interrupt_stack_ptr(&self, sp: usize) {
-        self.interrupt_stack_ptr.set(sp);
+    pub fn set_double_fault_stack_ptr(&self, sp: usize) {
+        self.double_fault_stack_ptr.set(sp);
     }
-    pub fn get_interrupt_stack_ptr(&self) -> usize {
-        self.interrupt_stack_ptr.get()
+    pub fn get_double_fault_stack_ptr(&self) -> usize {
+        self.double_fault_stack_ptr.get()
     }
-    pub fn set_page_fault_stack_ptr(&self, sp: usize) {
-        self.page_fault_stack_ptr.set(sp);
+    pub fn set_exception_stack_ptr(&self, sp: usize) {
+        self.exception_stack_ptr.set(sp);
     }
-    pub fn get_page_fault_stack_ptr(&self) -> usize {
-        self.page_fault_stack_ptr.get()
+    pub fn get_exception_stack_ptr(&self) -> usize {
+        self.exception_stack_ptr.get()
     }
     pub fn set_vtl_return_addr(&self, addr: usize) {
         self.vtl_return_addr.set(addr);
@@ -292,11 +292,11 @@ impl PerCpuVariablesAsm {
     pub const fn kernel_stack_ptr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, kernel_stack_ptr)
     }
-    pub const fn interrupt_stack_ptr_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, interrupt_stack_ptr)
+    pub const fn double_fault_stack_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, double_fault_stack_ptr)
     }
-    pub const fn page_fault_stack_ptr_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, page_fault_stack_ptr)
+    pub const fn exception_stack_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, exception_stack_ptr)
     }
     pub const fn vtl_return_addr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, vtl_return_addr)
@@ -405,8 +405,8 @@ impl<T> RefCellWrapper<T> {
         Self {
             pcv_asm: PerCpuVariablesAsm {
                 kernel_stack_ptr: Cell::new(0),
-                interrupt_stack_ptr: Cell::new(0),
-                page_fault_stack_ptr: Cell::new(0),
+                double_fault_stack_ptr: Cell::new(0),
+                exception_stack_ptr: Cell::new(0),
                 vtl_return_addr: Cell::new(0),
                 scratch: Cell::new(0),
                 vtl0_state_top_addr: Cell::new(0),
@@ -610,18 +610,18 @@ pub fn init_per_cpu_variables() {
     with_per_cpu_variables_mut(|per_cpu_variables| {
         let kernel_sp = TruncateExt::<usize>::truncate(per_cpu_variables.kernel_stack_top())
             & !(STACK_ALIGNMENT - 1);
-        let interrupt_sp = TruncateExt::<usize>::truncate(per_cpu_variables.interrupt_stack_top())
-            & !(STACK_ALIGNMENT - 1);
-        let page_fault_sp =
-            TruncateExt::<usize>::truncate(per_cpu_variables.page_fault_stack_top())
+        let double_fault_sp =
+            TruncateExt::<usize>::truncate(per_cpu_variables.double_fault_stack_top())
                 & !(STACK_ALIGNMENT - 1);
+        let exception_sp = TruncateExt::<usize>::truncate(per_cpu_variables.exception_stack_top())
+            & !(STACK_ALIGNMENT - 1);
         let vtl0_state_top_addr =
             TruncateExt::<usize>::truncate(&raw const per_cpu_variables.vtl0_state as u64)
                 + core::mem::size_of::<VtlState>();
         with_per_cpu_variables_asm(|pcv_asm| {
             pcv_asm.set_kernel_stack_ptr(kernel_sp);
-            pcv_asm.set_interrupt_stack_ptr(interrupt_sp);
-            pcv_asm.set_page_fault_stack_ptr(page_fault_sp);
+            pcv_asm.set_double_fault_stack_ptr(double_fault_sp);
+            pcv_asm.set_exception_stack_ptr(exception_sp);
             pcv_asm.set_vtl0_state_top_addr(vtl0_state_top_addr);
         });
     });

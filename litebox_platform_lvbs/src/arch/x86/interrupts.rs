@@ -25,85 +25,6 @@ use x86_64::{VirtAddr, structures::idt::InterruptDescriptorTable};
 // Include assembly ISR stubs
 core::arch::global_asm!(include_str!("interrupts.S"));
 
-// Custom page fault ISR stub.
-//
-// This stub splits user-mode and kernel-mode page faults at the assembly level:
-//
-// - **User-mode faults**: jump to exception_callback in run_thread_arch which
-//   swaps GS, saves exception info and CPU registers, and calls the shim's
-//   exception handler.
-//
-// - **Kernel-mode faults**: standard push_regs/call/pop_regs/iretq flow into a
-//   minimal handler that does exception table fixup or panics.
-//
-// # Stacks for page fault handling
-//
-// We do not use an IST entry for page faults (check the below idt setup). This
-// results in two different stacks for user-mode vs kernel-mode page faults:
-//
-// - **User-mode faults**: the CPU automatically switches to the RSP0 stack from
-//   TSS on the transition. We set a dedicated per-CPU stack for it. Since it is
-//   always reloaded, don't need to wipe out stale data from previous faults
-//   (i.e., iret frame and error code).
-//
-// - **Kernel-mode faults**: the CPU does not switch stacks. The ISR stub pushes
-//   registers onto the current stack before calling the page-fault handler.
-//   This implies that the kernel-mode code should ensure there is enough stack
-//   space before performing any operations that might fault. Otherwise, the
-//   fault handler might overwrite existing data or cause a double fault.
-//
-// Reference: Intel SDM Vol. 3A, §6.12.1
-core::arch::global_asm!(
-    ".global isr_page_fault",
-    "isr_page_fault:",
-    "cld",
-    // Check if fault came from user mode by testing CS RPL bits.
-    // On ISR entry the CPU pushed: [rsp+40]=SS, [rsp+32]=RSP, [rsp+24]=RFLAGS,
-    //                              [rsp+16]=CS, [rsp+8]=RIP, [rsp+0]=error_code
-    "test qword ptr [rsp + 16], 0x3",
-    "jnz .Lpf_user_mode",
-    // --- Kernel-mode page fault: standard ISR flow ---
-    "push rdi",
-    "push rsi",
-    "push rdx",
-    "push rcx",
-    "push rax",
-    "push r8",
-    "push r9",
-    "push r10",
-    "push r11",
-    "push rbx",
-    "push rbp",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    "mov rbp, rsp",
-    "and rsp, -16",
-    "mov rdi, rbp",
-    "call kernel_page_fault_handler_impl",
-    "mov rsp, rbp",
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop rbp",
-    "pop rbx",
-    "pop r11",
-    "pop r10",
-    "pop r9",
-    "pop r8",
-    "pop rax",
-    "pop rcx",
-    "pop rdx",
-    "pop rsi",
-    "pop rdi",
-    "add rsp, 8", // skip error code
-    "iretq",
-    ".Lpf_user_mode:",
-    "jmp exception_callback",
-);
-
 // External symbols for assembly ISR stubs
 unsafe extern "C" {
     fn isr_divide_error();
@@ -176,188 +97,129 @@ pub fn init_idt() {
     idt().load();
 }
 
-// TODO: carefully handle exceptions/interrupts. If an exception or interrupt is due to userspace code,
-// we should destroy the corresponding user context rather than halt the entire kernel.
+// TODO: Let's consider whether we can recover some of the below exceptions instead of panicking.
 
-/// User-mode CS selector has RPL=3 (bits 0-1 set)
-const USER_MODE_RPL_MASK: usize = 0x3;
-
-/// Check if the exception occurred in user mode by examining the saved CS register.
-#[inline]
-fn is_user_mode(regs: &PtRegs) -> bool {
-    (regs.cs & USER_MODE_RPL_MASK) == USER_MODE_RPL_MASK
-}
-
-/// Get a string indicating the execution context (kernel or user mode).
-#[inline]
-fn mode_str(regs: &PtRegs) -> &'static str {
-    if is_user_mode(regs) { "USER" } else { "KERNEL" }
-}
-
-/// Rust handler for divide error exception (vector 0).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for divide error exception (vector 0).
 #[unsafe(no_mangle)]
 extern "C" fn divide_error_handler_impl(regs: &PtRegs) {
-    todo!(
-        "EXCEPTION [{}]: DIVIDE BY ZERO\n{:#x?}",
-        mode_str(regs),
-        regs
-    );
+    panic!("EXCEPTION: DIVIDE BY ZERO\n{:#x?}", regs);
 }
 
-/// Rust handler for debug exception (vector 1).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for debug exception (vector 1).
 #[unsafe(no_mangle)]
 extern "C" fn debug_handler_impl(regs: &PtRegs) {
-    todo!("EXCEPTION [{}]: DEBUG\n{:#x?}", mode_str(regs), regs);
+    panic!("EXCEPTION: DEBUG\n{:#x?}", regs);
 }
 
-/// Rust handler for breakpoint exception (vector 3).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for breakpoint exception (vector 3).
 #[unsafe(no_mangle)]
 extern "C" fn breakpoint_handler_impl(regs: &PtRegs) {
-    todo!("EXCEPTION [{}]: BREAKPOINT\n{:#x?}", mode_str(regs), regs);
+    panic!("EXCEPTION: BREAKPOINT\n{:#x?}", regs);
 }
 
-/// Rust handler for overflow exception (vector 4).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for overflow exception (vector 4).
 #[unsafe(no_mangle)]
 extern "C" fn overflow_handler_impl(regs: &PtRegs) {
-    todo!("EXCEPTION [{}]: OVERFLOW\n{:#x?}", mode_str(regs), regs);
+    panic!("EXCEPTION: OVERFLOW\n{:#x?}", regs);
 }
 
-/// Rust handler for bound range exceeded exception (vector 5).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for bound range exceeded exception (vector 5).
 #[unsafe(no_mangle)]
 extern "C" fn bound_range_exceeded_handler_impl(regs: &PtRegs) {
-    todo!(
-        "EXCEPTION [{}]: BOUND RANGE EXCEEDED\n{:#x?}",
-        mode_str(regs),
-        regs
-    );
+    panic!("EXCEPTION: BOUND RANGE EXCEEDED\n{:#x?}", regs);
 }
 
-/// Rust handler for invalid opcode exception (vector 6).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for invalid opcode exception (vector 6).
 #[unsafe(no_mangle)]
 extern "C" fn invalid_opcode_handler_impl(regs: &PtRegs) {
-    todo!(
-        "EXCEPTION [{}]: INVALID OPCODE at RIP {:#x}\n{:#x?}",
-        mode_str(regs),
-        regs.rip,
-        regs
+    panic!(
+        "EXCEPTION: INVALID OPCODE at RIP {:#x}\n{:#x?}",
+        regs.rip, regs
     );
 }
 
-/// Rust handler for device not available exception (vector 7).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for device not available exception (vector 7).
 #[unsafe(no_mangle)]
 extern "C" fn device_not_available_handler_impl(regs: &PtRegs) {
-    todo!(
-        "EXCEPTION [{}]: DEVICE NOT AVAILABLE (FPU/SSE)\n{:#x?}",
-        mode_str(regs),
-        regs
-    );
+    panic!("EXCEPTION: DEVICE NOT AVAILABLE (FPU/SSE)\n{:#x?}", regs);
 }
 
-/// Rust handler for double fault exception (vector 8).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for double fault exception (vector 8).
 #[unsafe(no_mangle)]
 extern "C" fn double_fault_handler_impl(regs: &PtRegs) {
-    // Double faults are always fatal - no recovery possible
     panic!(
-        "EXCEPTION [{}]: DOUBLE FAULT (Error Code: {:#x})\n{:#x?}",
-        mode_str(regs),
-        regs.orig_rax,
-        regs
+        "EXCEPTION: DOUBLE FAULT (Error Code: {:#x})\n{:#x?}",
+        regs.orig_rax, regs
     );
 }
 
-/// Rust handler for stack-segment fault exception (vector 12).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for stack-segment fault exception (vector 12).
 #[unsafe(no_mangle)]
 extern "C" fn stack_segment_fault_handler_impl(regs: &PtRegs) {
-    todo!(
-        "EXCEPTION [{}]: STACK-SEGMENT FAULT (Error Code: {:#x})\n{:#x?}",
-        mode_str(regs),
-        regs.orig_rax,
-        regs
+    panic!(
+        "EXCEPTION: STACK-SEGMENT FAULT (Error Code: {:#x})\n{:#x?}",
+        regs.orig_rax, regs
     );
 }
 
-/// Rust handler for general protection fault exception (vector 13).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for general protection fault exception (vector 13).
 #[unsafe(no_mangle)]
 extern "C" fn general_protection_fault_handler_impl(regs: &PtRegs) {
-    todo!(
-        "EXCEPTION [{}]: GENERAL PROTECTION FAULT (Error Code: {:#x})\n{:#x?}",
-        mode_str(regs),
-        regs.orig_rax,
-        regs
+    panic!(
+        "EXCEPTION: GENERAL PROTECTION FAULT (Error Code: {:#x})\n{:#x?}",
+        regs.orig_rax, regs
     );
 }
 
-/// Kernel-mode page fault handler.
-/// Called from the `isr_page_fault` assembly stub only for kernel-mode faults.
+/// Kernel-mode page fault handler (vector 14).
 #[unsafe(no_mangle)]
-extern "C" fn kernel_page_fault_handler_impl(regs: &mut PtRegs) {
+extern "C" fn page_fault_handler_impl(regs: &mut PtRegs) {
     use litebox::mm::exception_table::search_exception_tables;
     use litebox::utils::TruncateExt as _;
     use x86_64::registers::control::Cr2;
 
-    let fault_addr: usize = Cr2::read_raw().truncate();
-    let error_code = regs.orig_rax;
-
     // Check the exception table for a recovery address.
     // This handles fallible memory operations like memcpy_fallible that access
     // user-space or VTL0 addresses which might be unmapped.
-    //
-    // TODO: Add kernel-mode demand paging for user-space addresses. Demand paging
-    // a shim using its exception handler is a chicken-and-egg problem. Some
-    // pre-population is unavoidable.
     if let Some(fixup_addr) = search_exception_tables(regs.rip) {
         regs.rip = fixup_addr;
         return;
     }
 
+    // TODO: Add kernel-mode demand paging for user-space addresses. We cannot
+    // rely on the exception_callback logic which aims to return to user-space
+    // faulting instructions. Here, we need to return to kernel-space faulting
+    // instruction after handling the page fault. We still require the shim's
+    // support to handle this page fault along with the `VmArea` information.
+
+    // Kernel-mode page fault at kernel-space addresses
+    let fault_addr: usize = Cr2::read_raw().truncate();
+    let error_code = regs.orig_rax;
     panic!(
-        "EXCEPTION [KERNEL]: PAGE FAULT\nAccessed Address: {:#x}\nError Code: {:#x}\n{:#x?}",
+        "EXCEPTION: PAGE FAULT\nAccessed Address: {:#x}\nError Code: {:#x}\n{:#x?}",
         fault_addr, error_code, regs
     );
 }
 
-/// Rust handler for x87 floating-point exception (vector 16).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for x87 floating-point exception (vector 16).
 #[unsafe(no_mangle)]
 extern "C" fn x87_floating_point_handler_impl(regs: &PtRegs) {
-    todo!(
-        "EXCEPTION [{}]: x87 FLOATING-POINT ERROR\n{:#x?}",
-        mode_str(regs),
-        regs
-    );
+    panic!("EXCEPTION: x87 FLOATING-POINT ERROR\n{:#x?}", regs);
 }
 
-/// Rust handler for alignment check exception (vector 17).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for alignment check exception (vector 17).
 #[unsafe(no_mangle)]
 extern "C" fn alignment_check_handler_impl(regs: &PtRegs) {
-    todo!(
-        "EXCEPTION [{}]: ALIGNMENT CHECK (Error Code: {:#x})\n{:#x?}",
-        mode_str(regs),
-        regs.orig_rax,
-        regs
+    panic!(
+        "EXCEPTION: ALIGNMENT CHECK (Error Code: {:#x})\n{:#x?}",
+        regs.orig_rax, regs
     );
 }
 
-/// Rust handler for SIMD floating-point exception (vector 19).
-/// Called from assembly stub with pointer to saved register state.
+/// Kernel-mode handler for SIMD floating-point exception (vector 19).
 #[unsafe(no_mangle)]
 extern "C" fn simd_floating_point_handler_impl(regs: &PtRegs) {
-    todo!(
-        "EXCEPTION [{}]: SIMD FLOATING-POINT ERROR\n{:#x?}",
-        mode_str(regs),
-        regs
-    );
+    panic!("EXCEPTION: SIMD FLOATING-POINT ERROR\n{:#x?}", regs);
 }
 
 // Note: isr_hyperv_sint is defined in interrupts.S as a minimal stub that only
