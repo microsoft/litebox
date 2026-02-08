@@ -12,7 +12,7 @@ use x86_64::{
             PageTableFlags, PhysFrame, Size4KiB, Translate,
             frame::PhysFrameRange,
             mapper::{
-                CleanUp, FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
+                FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
                 UnmapError as X64UnmapError,
             },
         },
@@ -104,6 +104,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
     /// Unmap 4KiB pages from the page table
     /// Set `dealloc_frames` to `true` to free the corresponding physical frames.
+    /// Set `flush_tlb` to `true` to flush TLB entries after unmapping (not needed when
+    /// the page table is being destroyed).
     ///
     /// Note it does not free the allocated frames for page table itself (only those allocated to
     /// user space).
@@ -111,6 +113,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         &self,
         range: PageRange<ALIGN>,
         dealloc_frames: bool,
+        flush_tlb: bool,
     ) -> Result<(), page_mgmt::DeallocationError> {
         let start_va = VirtAddr::new(range.start as _);
         let start = Page::<Size4KiB>::from_start_address(start_va)
@@ -129,7 +132,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     if dealloc_frames {
                         unsafe { allocator.deallocate_frame(frame) };
                     }
-                    if FLUSH_TLB {
+                    if flush_tlb && FLUSH_TLB {
                         fl.flush();
                     }
                 }
@@ -143,6 +146,48 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             }
         }
         Ok(())
+    }
+
+    /// Unmap and deallocate all user pages and their page table frames.
+    ///
+    /// User pages are identified by their virtual address being in range
+    /// [user_addr_min, user_addr_max). This works because:
+    /// - Kernel memory uses addresses outside this range (e.g., low addresses for
+    ///   identity mapped VA == PA, or future designs with high kernel addresses)
+    /// - User memory uses addresses in [user_addr_min, user_addr_max), allocated via mmap
+    ///
+    /// This method deallocates:
+    /// 1. All user data frames (pages with VA in [user_addr_min, user_addr_max))
+    /// 2. ALL page table frames (P1/P2/P3) regardless of address range
+    ///    (because each user page table has its own PT frame allocations,
+    ///    including for the kernel identity mapping)
+    ///
+    /// Kernel data frames (physical memory) are NOT deallocated - only their
+    /// page table entries are cleaned up.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no references to the unmapped pages exist.
+    /// Once we implement page fault handling for user pages with memcpy_fallible in the LVBS platform,
+    /// this safety requirement can be relaxed.
+    pub(crate) unsafe fn cleanup_user_mappings(&self, user_addr_min: usize, user_addr_max: usize) {
+        use x86_64::structures::paging::mapper::CleanUp;
+
+        // Unmap and deallocate user data pages
+        // No TLB flush needed - this page table is being destroyed and will never be reused
+        let user_range = PageRange::<ALIGN> {
+            start: user_addr_min,
+            end: user_addr_max,
+        };
+        // Safety: The caller ensures no references to the unmapped pages exist.
+        let _ = unsafe { self.unmap_pages(user_range, true, false) };
+
+        // Clean up all empty P1 - P3 tables
+        let mut allocator = PageTableAllocator::<M>::new();
+        // Safety: The page table is being destroyed and will not be reused.
+        unsafe {
+            self.inner.lock().clean_up(&mut allocator);
+        }
     }
 
     pub(crate) unsafe fn remap_pages(
@@ -338,8 +383,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// # Panics
     /// Panics if the page table is invalid
     #[allow(clippy::similar_names)]
-    #[expect(dead_code)]
-    pub(crate) fn change_address_space(&self) -> PhysFrame {
+    pub(crate) fn load(&self) -> PhysFrame {
         let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
         let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
         let p4_frame = PhysFrame::containing_address(p4_pa);
@@ -358,27 +402,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// To this end, we use this function to match the physical frame of the page table contained in each user
     /// context structure with the CR3 value in a system call context (before changing the page table).
     #[allow(clippy::similar_names)]
-    #[expect(dead_code)]
     pub(crate) fn get_physical_frame(&self) -> PhysFrame {
         let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
         let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
         PhysFrame::containing_address(p4_pa)
-    }
-
-    /// Deallocate physical frames of all level 1--3 page tables except for the top-level page table.
-    /// This is a wrapper function for `MappedPageTable::clean_up()`.
-    ///
-    /// # Safety
-    /// The caller is expected to unmap all non-page-table pages before calling this function.
-    /// Also, the caller must ensure no page table frame is shared with other page tables.
-    /// This function expects that `Drop` will deallocate the top-level page table frame. It does not
-    /// deallocate the top-level page table frame because this can result in an undefined behavior.
-    #[allow(dead_code)]
-    pub(crate) unsafe fn clean_up(&self) {
-        let mut allocator = PageTableAllocator::<M>::new();
-        unsafe {
-            self.inner.lock().clean_up(&mut allocator);
-        }
     }
 }
 

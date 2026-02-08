@@ -4,7 +4,11 @@
 //! Implementation of pseudo TAs (PTAs) which export system services as
 //! the functions of built-in TAs.
 
-use crate::Task;
+use crate::{Task, UserConstPtr, UserMutPtr};
+use litebox::{
+    platform::{RawConstPointer as _, RawMutPointer as _},
+    utils::TruncateExt,
+};
 use litebox_common_optee::{TeeParamType, TeeResult, TeeUuid, UteeParams};
 use num_enum::TryFromPrimitive;
 
@@ -91,30 +95,41 @@ impl Task {
                     && let Ok(Some(output)) =
                         params.get_values(1).map_err(|_| TeeResult::BadParameters)
                 {
-                    let _extra_data = unsafe {
-                        &*core::ptr::slice_from_raw_parts(
-                            input.0 as *const u8,
-                            usize::try_from(input.1).map_err(|_| TeeResult::BadParameters)?,
-                        )
-                    };
-                    let key_slice = unsafe {
-                        &mut *core::ptr::slice_from_raw_parts_mut(
-                            output.0 as *mut u8,
-                            usize::try_from(output.1).map_err(|_| TeeResult::BadParameters)?,
-                        )
-                    };
+                    // TODO: revisit buffer size limits based on OP-TEE spec and deployment constraints
+                    let input_len =
+                        usize::try_from(input.1).map_err(|_| TeeResult::BadParameters)?;
+                    if input_len > crate::MAX_KERNEL_BUF_SIZE {
+                        return Err(TeeResult::BadParameters);
+                    }
+                    let input_addr: usize = input.0.truncate();
+                    let input_ptr = UserConstPtr::<u8>::from_usize(input_addr);
+                    let _extra_data = input_ptr
+                        .to_owned_slice(input_len)
+                        .ok_or(TeeResult::BadParameters)?;
 
-                    // TODO: checks whether `key_slice` is within the secure memory
+                    let output_len =
+                        usize::try_from(output.1).map_err(|_| TeeResult::BadParameters)?;
+                    if output_len > crate::MAX_KERNEL_BUF_SIZE {
+                        return Err(TeeResult::BadParameters);
+                    }
+                    let output_addr: usize = output.0.truncate();
+                    let output_ptr = UserMutPtr::<u8>::from_usize(output_addr);
+
+                    // TODO: checks whether output is within the secure memory
 
                     // TODO: derive a TA unique key using the hardware unique key (HUK), TA's UUID, and `extra_data`
                     litebox::log_println!(
                         self.global.platform,
                         "derive a key and store it in the secure memory (ptr: {:#x}, size: {})",
-                        key_slice.as_ptr() as usize,
-                        key_slice.len()
+                        output_addr,
+                        output_len
                     );
                     // TODO: replace below with a secure key derivation function
-                    self.sys_cryp_random_number_generate(key_slice)?;
+                    let mut key_buf = alloc::vec![0u8; output_len];
+                    self.sys_cryp_random_number_generate(&mut key_buf)?;
+                    output_ptr
+                        .copy_from_slice(0, &key_buf)
+                        .ok_or(TeeResult::BadParameters)?;
 
                     Ok(())
                 } else {

@@ -6,14 +6,12 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
-use crate::{
-    host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo,
-    user_context::UserContextMap,
-};
+use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
 use core::{
     arch::asm,
-    sync::atomic::{AtomicU32, AtomicU64},
+    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
+use hashbrown::HashMap;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
     Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutex as _, RawMutexProvider,
@@ -51,19 +49,309 @@ pub mod mm;
 pub mod mshv;
 
 pub mod syscall_entry;
-pub(crate) mod user_context;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
+
+/// Special page table ID for the base (kernel-only) page table.
+pub const BASE_PAGE_TABLE_ID: usize = 0;
+
+/// Maximum virtual address (exclusive) for user-space allocations.
+/// This is set to (1 << 47) - PAGE_SIZE (upper limit of 4-level paging).
+const USER_ADDR_MAX: usize = 0x7FFF_FFFF_F000;
+
+/// Size of the user address space range.
+const USER_ADDR_RANGE_SIZE: usize = 0x1000_0000_0000; // 16 TiB
+
+/// Minimum virtual address for user-space allocations.
+///
+/// Kernel memory uses low addresses (identity mapped: VA == PA).
+/// User memory uses addresses in range [`USER_ADDR_MIN`, `USER_ADDR_MAX`).
+/// This separation allows easy identification during cleanup and supports
+/// future designs where kernel VAs may be in higher addresses.
+const USER_ADDR_MIN: usize = USER_ADDR_MAX - USER_ADDR_RANGE_SIZE;
+
+/// Manages base and task page tables.
+///
+/// This struct maintains:
+/// - A base page table (ID = 0) containing only kernel mappings
+/// - Multiple task page tables (ID > 0) containing kernel + user-space mappings
+/// - The current page table is determined by reading the CR3 register
+///
+/// # Security Note: No KPTI
+///
+/// Currently, task page tables include full VTL1 kernel mappings for syscall handling.
+/// This is similar to pre-Meltdown Linux kernels. We do NOT implement Kernel Page Table
+/// Isolation (KPTI), which would use separate page tables:
+/// - **User PT**: User mappings + minimal kernel trampoline (entry/exit code only)
+/// - **Kernel PT**: Full kernel mappings + user mappings
+///
+/// Future work could implement KPTI-style isolation to reduce the kernel attack surface
+/// exposed to user TAs, mitigating potential side-channel attacks.
+pub struct PageTableManager {
+    /// The base page table, containing only VTL1 kernel mappings (no user-space).
+    base_page_table: mm::PageTable<PAGE_SIZE>,
+    /// Cached physical frame of the base page table (for fast CR3 comparison).
+    base_page_table_frame: PhysFrame<Size4KiB>,
+    /// Task page tables indexed by their ID (starting from 1).
+    /// Each contains kernel mappings + task-specific user-space mappings.
+    task_page_tables: spin::Mutex<HashMap<usize, alloc::boxed::Box<mm::PageTable<PAGE_SIZE>>>>,
+    /// Reverse lookup: physical frame -> page table ID (for O(1) CR3 lookup).
+    /// Only contains task page tables (base page table is checked separately).
+    frame_to_id: spin::Mutex<HashMap<PhysFrame<Size4KiB>, usize>>,
+    /// Next available task page table ID.
+    next_task_pt_id: AtomicUsize,
+}
+
+impl PageTableManager {
+    /// The minimum virtual address for user-space allocations.
+    pub const USER_ADDR_MIN: usize = USER_ADDR_MIN;
+    /// The maximum virtual address (exclusive) for user-space allocations.
+    pub const USER_ADDR_MAX: usize = USER_ADDR_MAX;
+
+    /// Creates a new page table manager with the given base page table.
+    fn new(base_pt: mm::PageTable<PAGE_SIZE>) -> Self {
+        let base_frame = base_pt.get_physical_frame();
+        Self {
+            base_page_table: base_pt,
+            base_page_table_frame: base_frame,
+            task_page_tables: spin::Mutex::new(HashMap::new()),
+            frame_to_id: spin::Mutex::new(HashMap::new()),
+            next_task_pt_id: AtomicUsize::new(1),
+        }
+    }
+
+    /// Returns a reference to the current page table based on the CR3 register.
+    ///
+    /// This reads the current CR3 value and finds the matching page table.
+    /// If CR3 matches the base page table, returns that. Otherwise, it
+    /// looks up the task page table by physical frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if CR3 contains an unknown page table address (should never happen
+    /// in normal operation).
+    #[inline]
+    pub fn current_page_table(&self) -> &mm::PageTable<PAGE_SIZE> {
+        let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
+
+        // Fast path: check base page table first (most common case)
+        if self.base_page_table_frame == cr3_frame {
+            return &self.base_page_table;
+        }
+
+        // Look up task page table by frame using the reverse lookup map
+        let task_pt_id = {
+            let frame_to_id = self.frame_to_id.lock();
+            frame_to_id.get(&cr3_frame).copied()
+        };
+
+        if let Some(id) = task_pt_id {
+            let task_pts = self.task_page_tables.lock();
+            if let Some(pt) = task_pts.get(&id) {
+                // SAFETY: Three invariants guarantee this reference remains valid:
+                // 1. The PageTable is Box-allocated, so HashMap rehashing does not
+                //    move the PageTable itself (only the Box pointer moves).
+                // 2. This page table is the current CR3, so `delete_task_page_table`
+                //    will refuse to remove it (returns EBUSY).
+                // 3. The PageTableManager is 'static, so neither it nor the HashMap
+                //    will be deallocated.
+                let pt_ref: &mm::PageTable<PAGE_SIZE> = pt;
+                return unsafe { &*core::ptr::from_ref(pt_ref) };
+            }
+        }
+
+        // CR3 doesn't match any known page table - this shouldn't happen
+        unreachable!(
+            "CR3 contains unknown page table: {:?}",
+            cr3_frame.start_address()
+        );
+    }
+
+    /// Returns the ID of the current page table based on the CR3 register.
+    ///
+    /// Returns `BASE_PAGE_TABLE_ID` (0) if the base page table is active,
+    /// or the task page table ID if a task page table is active.
+    ///
+    /// # Panics
+    ///
+    /// Panics if CR3 contains an unknown page table address (should never happen
+    /// in normal operation).
+    #[inline]
+    pub fn current_page_table_id(&self) -> usize {
+        let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
+
+        // Fast path: check base page table first
+        if self.base_page_table_frame == cr3_frame {
+            return BASE_PAGE_TABLE_ID;
+        }
+
+        let frame_to_id = self.frame_to_id.lock();
+        if let Some(&id) = frame_to_id.get(&cr3_frame) {
+            return id;
+        }
+
+        // CR3 doesn't match any known page table - this shouldn't happen
+        unreachable!(
+            "CR3 contains unknown page table: {:?}",
+            cr3_frame.start_address()
+        );
+    }
+
+    /// Returns `true` if the base page table is currently active.
+    #[inline]
+    pub fn is_base_page_table_active(&self) -> bool {
+        let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
+        self.base_page_table_frame == cr3_frame
+    }
+
+    /// Loads the base page table by updating CR3.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    /// - The base page table contains valid mappings for all memory that will be accessed
+    ///   after the switch (including the code being executed and stack)
+    /// - No references to user-space memory are held across the switch
+    pub unsafe fn load_base(&self) {
+        self.base_page_table.load();
+    }
+
+    /// Loads the specified task page table by updating CR3.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    /// - The target page table contains valid mappings for all memory that will be accessed
+    ///   after the switch (including the code being executed and stack)
+    /// - No references to the previous address space's memory are held across the switch
+    ///
+    /// # Returns
+    ///
+    /// -`Ok(())` if the switch was successful
+    /// - `Err(Errno::ENOENT)` if the specified page table ID does not exist.
+    /// - `Err(Errno::EINVAL)` if the specified page table ID is the base page table ID.
+    pub unsafe fn load_task(&self, task_pt_id: usize) -> Result<(), Errno> {
+        if task_pt_id == BASE_PAGE_TABLE_ID {
+            // this function should not be used to load the base page table
+            return Err(Errno::EINVAL);
+        }
+
+        let task_pts = self.task_page_tables.lock();
+        if let Some(pt) = task_pts.get(&task_pt_id) {
+            pt.load();
+            Ok(())
+        } else {
+            Err(Errno::ENOENT)
+        }
+    }
+
+    /// Creates a new task page table and returns its ID.
+    ///
+    /// The new page table is initialized with the VTL1 kernel memory mapped
+    /// for proper syscall handling.
+    ///
+    /// # Arguments
+    ///
+    /// * `vtl1_phys_frame_range` - The physical frame range of VTL1 kernel memory to map
+    ///
+    /// # Returns
+    ///
+    /// The ID of the newly created task page table, or `Err(Errno::ENOMEM)` if
+    /// allocation fails or the ID space is exhausted.
+    pub fn create_task_page_table(
+        &self,
+        vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
+    ) -> Result<usize, Errno> {
+        let pt = unsafe { mm::PageTable::new_top_level() };
+        if pt
+            .map_phys_frame_range(
+                vtl1_phys_frame_range,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+            )
+            .is_err()
+        {
+            return Err(Errno::ENOMEM);
+        }
+
+        let task_pt_id = self.next_task_pt_id.fetch_add(1, Ordering::Relaxed);
+        if task_pt_id == 0 {
+            // Wrapped around, which shouldn't happen in practice
+            return Err(Errno::ENOMEM);
+        }
+
+        let pt = alloc::boxed::Box::new(pt);
+        let phys_frame = pt.get_physical_frame();
+
+        let mut task_pts = self.task_page_tables.lock();
+        task_pts.insert(task_pt_id, pt);
+        drop(task_pts);
+
+        let mut frame_to_id = self.frame_to_id.lock();
+        frame_to_id.insert(phys_frame, task_pt_id);
+
+        Ok(task_pt_id)
+    }
+
+    /// Deletes a task page table by its ID.
+    ///
+    /// This function:
+    /// 1. Unmaps all non-kernel pages (returning physical frames to the allocator)
+    /// 2. Cleans up page table structure frames
+    /// 3. Drops the page table (deallocating the top-level frame)
+    ///
+    /// # Arguments
+    ///
+    /// * `task_pt_id` - The ID of the task page table to delete
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no references or pointers to memory mapped
+    /// by this page table are held after deletion.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if the page table was successfully deleted
+    /// - `Err(Errno::EINVAL)` if the page table ID is the base page table
+    /// - `Err(Errno::ENOENT)` if the page table ID does not exist
+    /// - `Err(Errno::EBUSY)` if the page table is currently active (switch away first)
+    pub unsafe fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
+        if task_pt_id == BASE_PAGE_TABLE_ID {
+            return Err(Errno::EINVAL);
+        }
+
+        // Ensure we're not deleting the current page table (check CR3)
+        if self.current_page_table_id() == task_pt_id {
+            return Err(Errno::EBUSY);
+        }
+
+        let mut task_pts = self.task_page_tables.lock();
+        if let Some(pt) = task_pts.remove(&task_pt_id) {
+            let phys_frame = pt.get_physical_frame();
+            drop(task_pts);
+
+            let mut frame_to_id = self.frame_to_id.lock();
+            frame_to_id.remove(&phys_frame);
+            drop(frame_to_id);
+
+            // Safety: We're about to delete this page table, so it's safe to unmap all pages.
+            unsafe {
+                pt.cleanup_user_mappings(Self::USER_ADDR_MIN, Self::USER_ADDR_MAX);
+            }
+            // The PageTable's Drop impl will deallocate the top-level (P4) frame
+            Ok(())
+        } else {
+            Err(Errno::ENOENT)
+        }
+    }
+}
 
 /// This is the platform for running LiteBox in kernel mode.
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
-    page_table: mm::PageTable<PAGE_SIZE>,
+    page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
     vtl0_kernel_info: Vtl0KernelInfo,
-    #[expect(dead_code)]
-    user_contexts: UserContextMap,
 }
 
 pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
@@ -157,10 +445,9 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         // order to simplify usage of the platform.
         alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
             host_and_task: core::marker::PhantomData,
-            page_table: pt,
+            page_table_manager: PageTableManager::new(pt),
             vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
             vtl0_kernel_info: Vtl0KernelInfo::new(),
-            user_contexts: UserContextMap::new(),
         }))
     }
 
@@ -172,6 +459,9 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// from `phys_start` to `phys_end` to the VTL1 kernel page table. It internally page aligns
     /// the input addresses to ensure the mapped memory area covers the entire input addresses
     /// at the page level. It returns a page-aligned address (as `mmap` does) and the length of the mapped memory.
+    ///
+    /// Note: VTL0 physical memory is external/remote memory that this Rust binary doesn't own,
+    /// so mapping it doesn't create aliasing issues within the Rust memory model.
     fn map_vtl0_phys_range(
         &self,
         phys_start: x86_64::PhysAddr,
@@ -191,13 +481,22 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         }
 
         Ok((
-            self.page_table.map_phys_frame_range(frame_range, flags)?,
-            TruncateExt::<usize>::truncate(frame_range.len()) * PAGE_SIZE,
+            self.page_table_manager
+                .current_page_table()
+                .map_phys_frame_range(frame_range, flags)?,
+            usize::try_from(frame_range.len()).unwrap() * PAGE_SIZE,
         ))
     }
 
-    /// This unmaps VTL0 pages from the page table. Allocator does not allocate frames
-    /// for VTL0 pages (i.e., it is always shared mapping), so it must not attempt to deallocate them.
+    /// This function unmaps VTL0 pages from the page table.
+    ///
+    /// Allocator does not allocate memory frames for VTL0 pages, so frame deallocation is not needed.
+    ///
+    /// Note: VTL0 physical memory is external memory not owned by LiteBox (similar to MMIO).
+    /// LiteBox accesses it by creating a temporary non-shared mapping, copying data to/from a
+    /// LiteBox-owned buffer, and unmapping immediately. No Rust references are created to the
+    /// mapped VTL0 memory; all accesses use raw pointer operations (read_volatile /
+    /// copy_nonoverlapping) to avoid violating Rust's aliasing model.
     fn unmap_vtl0_pages(
         &self,
         page_addr: *const u8,
@@ -208,7 +507,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             return Err(DeallocationError::Unaligned);
         }
         unsafe {
-            self.page_table.unmap_pages(
+            self.page_table_manager.current_page_table().unmap_pages(
                 PageRange::<PAGE_SIZE>::new(
                     page_addr.as_u64().truncate(),
                     (page_addr + length as u64)
@@ -218,6 +517,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
                 )
                 .ok_or(DeallocationError::Unaligned)?,
                 false,
+                true,
             )
         }
     }
@@ -246,6 +546,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             let src_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(src_ptr.is_aligned(), "src_ptr is not properly aligned");
 
+            // Safety: src_ptr points to valid VTL0 memory that was just mapped
             let boxed = Box::<T>::new(unsafe { core::ptr::read_volatile(src_ptr) });
 
             assert!(
@@ -281,6 +582,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             let dst_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(dst_ptr.is_aligned(), "dst_ptr is not properly aligned");
 
+            // Safety: dst_ptr points to valid VTL0 memory that was just mapped
             unsafe { core::ptr::write_volatile(dst_ptr, *value) };
 
             assert!(
@@ -317,8 +619,13 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             let dst_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(dst_ptr.is_aligned(), "dst_ptr is not properly aligned");
 
-            let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, value.len()) };
-            dst.copy_from_slice(value);
+            // Safety: dst_ptr points to mapped VTL0 memory with enough space for value.len()
+            // elements. We use copy_nonoverlapping instead of creating a slice reference
+            // because VTL0 memory is external (similar to MMIO/DMA) and may be concurrently
+            // modified, which would violate Rust's aliasing model for references.
+            unsafe {
+                core::ptr::copy_nonoverlapping(value.as_ptr(), dst_ptr, value.len());
+            }
 
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),
@@ -354,8 +661,11 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             let src_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
             assert!(src_ptr.is_aligned(), "src_ptr is not properly aligned");
 
-            let src = unsafe { core::slice::from_raw_parts(src_ptr, buf.len()) };
-            buf.copy_from_slice(src);
+            // Safety: see copy_slice_to_vtl0_phys for why we use copy_nonoverlapping
+            // instead of creating a slice reference to VTL0 memory.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_ptr, buf.as_mut_ptr(), buf.len());
+            }
 
             assert!(
                 self.unmap_vtl0_pages(page_addr, length).is_ok(),
@@ -368,24 +678,79 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         false
     }
 
-    /// Create a new page table for VTL1 user space. Currently, it maps the entire VTL1 kernel memory for
-    /// proper operations (e.g., syscall handling). We should consider implementing
-    /// partial mapping to mitigate side-channel attacks and shallow copying to get rid of redudant
-    /// page table data structures for kernel space.
-    #[allow(dead_code)]
-    pub(crate) fn new_user_page_table(&self) -> mm::PageTable<PAGE_SIZE> {
-        let pt = unsafe { mm::PageTable::new_top_level() };
-        if pt
-            .map_phys_frame_range(
-                self.vtl1_phys_frame_range,
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-            )
-            .is_err()
-        {
-            panic!("Failed to map VTL1 physical memory");
-        }
+    /// Create a new task page table for VTL1 user space and returns its ID.
+    ///
+    /// See [`PageTableManager`] for security notes on KPTI.
+    ///
+    /// # Returns
+    ///
+    /// The ID of the newly created task page table, or `Err(Errno)` on failure.
+    pub fn create_task_page_table(&self) -> Result<usize, Errno> {
+        self.page_table_manager
+            .create_task_page_table(self.vtl1_phys_frame_range)
+    }
 
-        pt
+    /// Deletes a task page table by its ID.
+    ///
+    /// This function:
+    /// 1. Unmaps all non-kernel pages (returning physical frames to the allocator)
+    /// 2. Cleans up page table structure frames
+    /// 3. Drops the page table (deallocating the top-level frame)
+    ///
+    /// Frames within the VTL1 kernel physical memory range are not deallocated
+    /// (they belong to the kernel). Only user-allocated frames are returned to
+    /// the allocator.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no references or pointers to memory mapped
+    /// by this page table are held after deletion.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if successful
+    /// - `Err(Errno::EINVAL)` if the page table is the base page table
+    /// - `Err(Errno::ENOENT)` if the page table doesn't exist
+    /// - `Err(Errno::EBUSY)` if the page table is currently active
+    pub unsafe fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
+        // Safety: caller guarantees no dangling references
+        unsafe { self.page_table_manager.delete_task_page_table(task_pt_id) }
+    }
+
+    /// Switch to the specified page table.
+    ///
+    /// Use `BASE_PAGE_TABLE_ID` (0) for the base page table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    /// - The target page table contains valid mappings for all memory that will be accessed
+    ///   after the switch (including the code being executed and stack)
+    /// - No references to the previous address space's memory are held across the switch
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the switch was successful, or `Err(Errno::ENOENT)` if the page table
+    /// ID does not exist.
+    pub unsafe fn switch_page_table(&self, pt_id: usize) -> Result<(), Errno> {
+        if pt_id == BASE_PAGE_TABLE_ID {
+            // Safety: caller guarantees safe switch conditions
+            unsafe { self.page_table_manager.load_base() };
+            Ok(())
+        } else {
+            // Safety: caller guarantees safe switch conditions
+            unsafe { self.page_table_manager.load_task(pt_id) }
+        }
+    }
+
+    /// Returns the ID of the current page table.
+    pub fn current_page_table_id(&self) -> usize {
+        self.page_table_manager.current_page_table_id()
+    }
+
+    /// Returns a reference to the page table manager.
+    pub fn page_table_manager(&self) -> &PageTableManager {
+        &self.page_table_manager
     }
 
     /// Enable syscall support in the platform.
@@ -648,8 +1013,12 @@ pub trait HostInterface: 'static {
 }
 
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
-    const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
-    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    // Use a high address for user space to separate from kernel identity-mapped memory.
+    // Kernel memory uses low addresses (identity mapped: VA == PA).
+    // User memory allocated via mmap uses high addresses (VA >= TASK_ADDR_MIN).
+    // This allows easy identification of user vs kernel pages during cleanup.
+    const TASK_ADDR_MIN: usize = USER_ADDR_MIN;
+    const TASK_ADDR_MAX: usize = USER_ADDR_MAX;
 
     fn allocate_pages(
         &self,
@@ -661,11 +1030,12 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let range = PageRange::new(suggested_range.start, suggested_range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
+        let current_pt = self.page_table_manager.current_page_table();
         match fixed_address_behavior {
             FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Clear the existing mappings first.
-                unsafe { self.page_table.unmap_pages(range, true).unwrap() };
+                unsafe { current_pt.unmap_pages(range, true, true).unwrap() };
             }
         }
         let flags = u32::from(initial_permissions.bits())
@@ -675,9 +1045,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
                 0
             };
         let flags = litebox::mm::linux::VmFlags::from_bits(flags).unwrap();
-        Ok(self
-            .page_table
-            .map_pages(range, flags, populate_pages_immediately))
+        Ok(current_pt.map_pages(range, flags, populate_pages_immediately))
     }
 
     unsafe fn deallocate_pages(
@@ -686,7 +1054,11 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::DeallocationError::Unaligned)?;
-        unsafe { self.page_table.unmap_pages(range, true) }
+        unsafe {
+            self.page_table_manager
+                .current_page_table()
+                .unmap_pages(range, true, true)
+        }
     }
 
     unsafe fn remap_pages(
@@ -702,7 +1074,11 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         if old_range.start.max(new_range.start) <= old_range.end.min(new_range.end) {
             return Err(litebox::platform::page_mgmt::RemapError::Overlapping);
         }
-        unsafe { self.page_table.remap_pages(old_range, new_range) }
+        unsafe {
+            self.page_table_manager
+                .current_page_table()
+                .remap_pages(old_range, new_range)
+        }
     }
 
     unsafe fn update_permissions(
@@ -714,7 +1090,11 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             .ok_or(litebox::platform::page_mgmt::PermissionUpdateError::Unaligned)?;
         let new_flags =
             litebox::mm::linux::VmFlags::from_bits(new_permissions.bits().into()).unwrap();
-        unsafe { self.page_table.mprotect_pages(range, new_flags) }
+        unsafe {
+            self.page_table_manager
+                .current_page_table()
+                .mprotect_pages(range, new_flags)
+        }
     }
 
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
@@ -730,7 +1110,8 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
         error_code: u64,
     ) -> Result<(), litebox::mm::linux::PageFaultError> {
         unsafe {
-            self.page_table
+            self.page_table_manager
+                .current_page_table()
                 .handle_page_fault(fault_addr, flags, error_code)
         }
     }
@@ -824,7 +1205,11 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             flags |= PageTableFlags::WRITABLE;
         }
 
-        if let Ok(page_addr) = self.page_table.map_phys_frame_range(frame_range, flags) {
+        if let Ok(page_addr) = self
+            .page_table_manager
+            .current_page_table()
+            .map_phys_frame_range(frame_range, flags)
+        {
             Ok(PhysPageMapInfo {
                 base: page_addr,
                 size: pages.len() * ALIGN,
@@ -848,8 +1233,9 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                 ));
             };
             unsafe {
-                self.page_table
-                    .unmap_pages(page_range, false)
+                self.page_table_manager
+                    .current_page_table()
+                    .unmap_pages(page_range, false, true)
                     .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))
             }
         } else {
@@ -917,7 +1303,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
 ///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs) -> T
+pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
@@ -927,26 +1313,36 @@ where
     // we clear the `KernelGsBase` MSR before running the user thread.
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
     run_thread_inner(&shim, ctx, false);
-    shim
 }
 
-/// Re-enters a user thread using the provided shim and the given initial context.
+/// Run a user thread using a reference to the shim.
 ///
-/// This will run until the thread terminates or returns.
-///
-/// # Arguments
-/// * `shim` - The shim to use for handling syscalls and other events.
-/// * `ctx` - The initial execution context for the thread.
+/// Unlike `run_thread`, this version takes a reference instead of ownership to do not
+/// move `shim` to the platform for re-entry later.
 ///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn reenter_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs) -> T
+pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
-    run_thread_inner(&shim, ctx, true);
-    shim
+    run_thread_inner(shim, ctx, false);
+}
+
+/// Re-enter a user thread using a reference to the shim.
+///
+/// This version takes a reference instead of ownership, avoiding struct moves
+/// that could invalidate internal state.
+///
+/// # Safety
+/// The context must be valid user context.
+pub unsafe fn reenter_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
+where
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+{
+    crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
+    run_thread_inner(shim, ctx, true);
 }
 
 struct ThreadContext<'a> {
@@ -1166,6 +1562,8 @@ unsafe extern "C" fn run_thread_arch(
 ) {
     core::arch::naked_asm!(
         SAVE_CALLEE_SAVED_REGISTERS_ASM!(),
+        // Save reenter flag (in dl) before XSAVE clobbers edx
+        "mov r9b, dl",
         // Extended states are callee-saved. Save all extended states for now because
         // we don't know whether the caller touched any of them.
         XSAVE_VTL1_ASM!({vtl1_kernel_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_kernel_xsaved_off}),
@@ -1176,7 +1574,7 @@ unsafe extern "C" fn run_thread_arch(
         "lea r8, [rsi + {USER_CONTEXT_SIZE}]",
         "mov gs:[{user_context_top_off}], r8",
         // Call init_handler or reenter_handler based on reenter flag (in dl)
-        "test dl, dl",
+        "test r9b, r9b",
         "jnz 1f",
         "call {init_handler}",
         "jmp done",
@@ -1295,13 +1693,6 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
     );
 }
-
-// Note on user page table management:
-// The legacy platform code creates a new page table to load a program in a separate
-// address space and destroys it when the program terminates. This is why the old syscall
-// handler invokes `change_address_space()`. Previously, the platform does all these because
-// it is the one running the event loop. Once we have an `upcall` mechanism, the runner
-// should be the one manage all these.
 
 // NOTE: The below code is a naive workaround to let LVBS code to access the platform.
 // Rather than doing this, we should implement LVBS interface/provider for the platform.

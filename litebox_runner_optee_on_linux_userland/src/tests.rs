@@ -6,7 +6,9 @@
 //! Instead, these tests use pre-defined JSON-formatted command sequences to test TAs.
 
 use litebox::platform::RawConstPointer;
-use litebox_common_optee::{TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams};
+use litebox::utils::TruncateExt;
+use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};
+use litebox_shim_optee::session::allocate_session_id;
 use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -16,14 +18,13 @@ pub fn run_ta_with_test_commands(
     shim: &litebox_shim_optee::OpteeShim,
     ldelf_bin: &[u8],
     ta_bin: &[u8],
-    prog_name: &str,
+    _prog_name: &str,
     json_path: &PathBuf,
 ) {
     let ta_commands: Vec<TaCommandBase64> = {
         let json_str = std::fs::read_to_string(json_path).unwrap();
         serde_json::from_str(&json_str).unwrap()
     };
-    let is_kmpp_ta = prog_name.contains("kmpp-ta.elf.hooked");
     let mut ta_info: Option<LoadedProgram> = None;
 
     for cmd in ta_commands {
@@ -46,8 +47,16 @@ pub fn run_ta_with_test_commands(
             continue;
         }
         if func_id == UteeEntryFunc::OpenSession {
+            let ta_head = litebox_common_optee::parse_ta_head(ta_bin)
+                .expect("Failed to parse TA header from ta_bin");
             let loaded = shim
-                .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin), None)
+                .load_ldelf(
+                    ldelf_bin,
+                    ta_head.uuid,
+                    Some(ta_bin),
+                    None,
+                    allocate_session_id().unwrap(),
+                )
                 .map_err(|_| {
                     panic!("Failed to load TA");
                 })
@@ -55,35 +64,17 @@ pub fn run_ta_with_test_commands(
             ta_info = Some(loaded);
             let info = ta_info.as_mut().unwrap();
             let mut ctx = litebox_common_linux::PtRegs::default();
-            info.entrypoints = Some(unsafe {
-                litebox_platform_linux_userland::run_thread(
-                    info.entrypoints.take().unwrap(),
+            unsafe {
+                litebox_platform_linux_userland::run_thread_ref(
+                    info.entrypoints.as_ref().unwrap(),
                     &mut ctx,
-                )
-            });
+                );
+            }
             assert!(
                 ctx.rax == 0,
                 "ldelf exits with error: return_code={:#x}",
                 ctx.rax
             );
-
-            // special handling for the KMPP TA whose `OpenSession` expects a session ID that we cannot determine in advance
-            if is_kmpp_ta
-                && let UteeParamOwned::ValueInput {
-                    ref mut value_a,
-                    value_b: _,
-                } = params[0]
-            {
-                *value_a = u64::from(
-                    ta_info
-                        .as_ref()
-                        .unwrap()
-                        .entrypoints
-                        .as_ref()
-                        .unwrap()
-                        .get_session_id(),
-                );
-            }
         }
 
         if let Some(info) = ta_info.as_mut() {
@@ -99,12 +90,12 @@ pub fn run_ta_with_test_commands(
                     panic!("Failed to load TA context");
                 });
             let mut ctx = litebox_common_linux::PtRegs::default();
-            info.entrypoints = Some(unsafe {
+            unsafe {
                 litebox_platform_linux_userland::reenter_thread(
-                    info.entrypoints.take().unwrap(),
+                    info.entrypoints.as_ref().unwrap(),
                     &mut ctx,
-                )
-            });
+                );
+            }
             assert!(
                 ctx.rax == 0,
                 "TA exits with error: return_code={:#x}",
@@ -139,12 +130,9 @@ fn handle_ta_command_output(params: &UteeParams) {
             }
             TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
                 if let Ok(Some((addr, len))) = params.get_values(idx) {
-                    let slice = unsafe {
-                        &*core::ptr::slice_from_raw_parts(
-                            addr as *const u8,
-                            usize::try_from(len).unwrap_or(0),
-                        )
-                    };
+                    let len: usize = len.truncate();
+                    let ptr: UserConstPtr<u8> = UserConstPtr::from_ptr(addr as *const u8);
+                    let slice = ptr.to_owned_slice(len).unwrap_or_default();
                     if slice.is_empty() {
                         litebox::log_println!(
                             litebox_platform_multiplex::platform(),

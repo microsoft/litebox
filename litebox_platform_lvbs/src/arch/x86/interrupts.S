@@ -80,12 +80,15 @@
 .global \name
 \name:
     cld
-    push    0           /* Push dummy error code */
+    push    0                   /* Push dummy error code */
     push_regs
-    mov     rdi, rsp    /* Pass pointer to saved registers as first arg */
+    mov     rbp, rsp            /* Save stack pointer */
+    and     rsp, -16            /* Align stack to 16 bytes for call */
+    mov     rdi, rbp            /* Pass pointer to saved registers as first arg */
     call    \handler
+    mov     rsp, rbp            /* Restore stack pointer */
     pop_regs
-    add     rsp, 8      /* Skip error code */
+    add     rsp, 8              /* Skip error code */
     iretq
 .endm
 
@@ -98,10 +101,13 @@
 \name:
     cld
     push_regs
-    mov     rdi, rsp    /* Pass pointer to saved registers as first arg */
+    mov     rbp, rsp            /* Save stack pointer */
+    and     rsp, -16            /* Align stack to 16 bytes for call */
+    mov     rdi, rbp            /* Pass pointer to saved registers as first arg */
     call    \handler
+    mov     rsp, rbp            /* Restore stack pointer */
     pop_regs
-    add     rsp, 8      /* Skip error code */
+    add     rsp, 8              /* Skip error code */
     iretq
 .endm
 

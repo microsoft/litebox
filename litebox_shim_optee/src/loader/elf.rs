@@ -20,7 +20,7 @@
 use crate::{MutPtr, Task, ThreadInitState, UserMutPtr};
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE},
-    platform::{RawConstPointer as _, SystemInfoProvider as _},
+    platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _},
     utils::TruncateExt,
 };
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, loader::ElfParsedFile};
@@ -53,10 +53,6 @@ impl<'a> ElfFileInMemory<'a> {
             task,
             buffer: elf_buf.into(),
         }
-    }
-
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), Errno> {
-        read_at(self, offset, buf)
     }
 }
 
@@ -129,9 +125,19 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
                 offset.truncate(),
             )?
             .as_usize();
-        let mapped_slice: &mut [u8] =
-            unsafe { core::slice::from_raw_parts_mut(mapped_addr as *mut u8, len) };
-        self.read_at(offset, mapped_slice)?;
+
+        // Copy ELF data directly to user memory without intermediate buffer.
+        // MAP_ANONYMOUS ensures remaining bytes are zero if src is shorter than len.
+        let offset: usize = offset.truncate();
+        if len > 0 && offset < self.buffer.len() {
+            let end = core::cmp::min(offset + len, self.buffer.len());
+            let src = &self.buffer[offset..end];
+            let user_ptr = UserMutPtr::<u8>::from_usize(mapped_addr);
+            user_ptr
+                .copy_from_slice(0, src)
+                .ok_or(ElfLoaderError::MappingError(MappingError::OutOfMemory))?;
+        }
+
         self.task
             .sys_mprotect(UserMutPtr::from_usize(mapped_addr), len, prot.flags())
             .expect("sys_mprotect failed");
@@ -257,6 +263,8 @@ pub enum ElfLoaderError {
     InvalidStackAddr,
     #[error("failed to mmap")]
     MappingError(#[from] MappingError),
+    #[error("TA binary UUID does not match expected UUID")]
+    InvalidUuid,
 }
 
 impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
@@ -268,6 +276,7 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
                 litebox_common_linux::errno::Errno::ENOMEM
             }
             ElfLoaderError::LoadError(e) => e.into(),
+            ElfLoaderError::InvalidUuid => litebox_common_linux::errno::Errno::EINVAL,
         }
     }
 }

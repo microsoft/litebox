@@ -878,6 +878,7 @@ name = "litebox_common_optee"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.9.4",
+ "elf 0.8.0",
  "litebox",
  "litebox_common_linux",
  "modular-bitfield",
@@ -1090,6 +1091,7 @@ dependencies = [
  "aes",
  "arrayvec",
  "bitflags 2.9.4",
+ "bitvec",
  "cfg-if",
  "ctr",
  "elf 0.8.0",
@@ -1103,6 +1105,7 @@ dependencies = [
  "once_cell",
  "spin 0.10.0",
  "thiserror",
+ "zerocopy",
 ]
 
 [[package]]

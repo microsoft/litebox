@@ -183,27 +183,19 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let skip = self
-            .offset
-            .checked_add(
-                count
-                    .checked_mul(core::mem::size_of::<T>())
-                    .ok_or(PhysPointerError::Overflow)?,
+        let src = match unsafe {
+            self.map_and_get_ptr(
+                count,
+                core::mem::size_of::<T>(),
+                PhysPageMapPermissions::READ,
             )
-            .ok_or(PhysPointerError::Overflow)?;
-        let start = skip / ALIGN;
-        let end = (skip + core::mem::size_of::<T>()).div_ceil(ALIGN);
-        unsafe {
-            self.map_range(start, end, PhysPageMapPermissions::READ)?;
-        }
-        // Don't forget to call unmap() before returning to the caller
-        let Some(src) = self.base_ptr() else {
-            unsafe {
-                self.unmap()?;
+        } {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = unsafe { self.unmap() };
+                return Err(e);
             }
-            return Err(PhysPointerError::NoMappingInfo);
         };
-        let src = src.wrapping_add(count);
         let val = {
             let mut buffer = core::mem::MaybeUninit::<T>::uninit();
             if (src as usize).is_multiple_of(core::mem::align_of::<T>()) {
@@ -221,9 +213,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             }
             unsafe { buffer.assume_init() }
         };
-        unsafe {
-            self.unmap()?;
-        }
+        let _ = unsafe { self.unmap() };
         Ok(alloc::boxed::Box::new(val))
     }
 
@@ -245,27 +235,19 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let skip = self
-            .offset
-            .checked_add(
-                count
-                    .checked_mul(core::mem::size_of::<T>())
-                    .ok_or(PhysPointerError::Overflow)?,
+        let src = match unsafe {
+            self.map_and_get_ptr(
+                count,
+                core::mem::size_of_val(values),
+                PhysPageMapPermissions::READ,
             )
-            .ok_or(PhysPointerError::Overflow)?;
-        let start = skip / ALIGN;
-        let end = (skip + core::mem::size_of_val(values)).div_ceil(ALIGN);
-        unsafe {
-            self.map_range(start, end, PhysPageMapPermissions::READ)?;
-        }
-        // Don't forget to call unmap() before returning to the caller
-        let Some(src) = self.base_ptr() else {
-            unsafe {
-                self.unmap()?;
+        } {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = unsafe { self.unmap() };
+                return Err(e);
             }
-            return Err(PhysPointerError::NoMappingInfo);
         };
-        let src = src.wrapping_add(count);
         if (src as usize).is_multiple_of(core::mem::align_of::<T>()) {
             unsafe {
                 core::ptr::copy_nonoverlapping(src, values.as_mut_ptr(), values.len());
@@ -279,9 +261,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 );
             }
         }
-        unsafe {
-            self.unmap()?;
-        }
+        let _ = unsafe { self.unmap() };
         Ok(())
     }
 
@@ -300,39 +280,25 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let skip = self
-            .offset
-            .checked_add(
-                count
-                    .checked_mul(core::mem::size_of::<T>())
-                    .ok_or(PhysPointerError::Overflow)?,
-            )
-            .ok_or(PhysPointerError::Overflow)?;
-        let start = skip / ALIGN;
-        let end = (skip + core::mem::size_of::<T>()).div_ceil(ALIGN);
-        unsafe {
-            self.map_range(
-                start,
-                end,
+        let dst = match unsafe {
+            self.map_and_get_ptr(
+                count,
+                core::mem::size_of::<T>(),
                 PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
-            )?;
-        }
-        // Don't forget to call unmap() before returning to the caller
-        let Some(dst) = self.base_ptr() else {
-            unsafe {
-                self.unmap()?;
+            )
+        } {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = unsafe { self.unmap() };
+                return Err(e);
             }
-            return Err(PhysPointerError::NoMappingInfo);
         };
-        let dst = dst.wrapping_add(count);
         if (dst as usize).is_multiple_of(core::mem::align_of::<T>()) {
             unsafe { core::ptr::write(dst, value) };
         } else {
             unsafe { core::ptr::write_unaligned(dst, value) };
         }
-        unsafe {
-            self.unmap()?;
-        }
+        let _ = unsafe { self.unmap() };
         Ok(())
     }
 
@@ -354,31 +320,19 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let skip = self
-            .offset
-            .checked_add(
-                count
-                    .checked_mul(core::mem::size_of::<T>())
-                    .ok_or(PhysPointerError::Overflow)?,
-            )
-            .ok_or(PhysPointerError::Overflow)?;
-        let start = skip / ALIGN;
-        let end = (skip + core::mem::size_of_val(values)).div_ceil(ALIGN);
-        unsafe {
-            self.map_range(
-                start,
-                end,
+        let dst = match unsafe {
+            self.map_and_get_ptr(
+                count,
+                core::mem::size_of_val(values),
                 PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
-            )?;
-        }
-        // Don't forget to call unmap() before returning to the caller
-        let Some(dst) = self.base_ptr() else {
-            unsafe {
-                self.unmap()?;
+            )
+        } {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = unsafe { self.unmap() };
+                return Err(e);
             }
-            return Err(PhysPointerError::NoMappingInfo);
         };
-        let dst = dst.wrapping_add(count);
         if (dst as usize).is_multiple_of(core::mem::align_of::<T>()) {
             unsafe {
                 core::ptr::copy_nonoverlapping(values.as_ptr(), dst, values.len());
@@ -392,10 +346,49 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 );
             }
         }
-        unsafe {
-            self.unmap()?;
-        }
+        let _ = unsafe { self.unmap() };
         Ok(())
+    }
+
+    /// This is a helper function to map physical pages and get a pointer to the requested
+    /// data element at a given index.
+    ///
+    /// It bridges element-level access (used by `read_at_offset`, `write_at_offset`, etc.)
+    /// with page-level mapping. It determines which physical pages contain the requested
+    /// element, maps them into virtual memory, and returns a pointer adjusted for
+    /// the element's position.
+    ///
+    /// - `count`: Element index (0-based) within this physical pointer's range.
+    /// - `size`: Total byte size to map (must cover the data being accessed).
+    /// - `perms`: Required page permissions (read, write).
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as `map_range`.
+    unsafe fn map_and_get_ptr(
+        &mut self,
+        count: usize,
+        size: usize,
+        perms: PhysPageMapPermissions,
+    ) -> Result<*mut T, PhysPointerError> {
+        let skip = self
+            .offset
+            .checked_add(
+                count
+                    .checked_mul(core::mem::size_of::<T>())
+                    .ok_or(PhysPointerError::Overflow)?,
+            )
+            .ok_or(PhysPointerError::Overflow)?;
+        let start = skip / ALIGN;
+        let end = (skip + size).div_ceil(ALIGN);
+        unsafe {
+            self.map_range(start, end, perms)?;
+        }
+        let map_info = self
+            .map_info
+            .as_ref()
+            .ok_or(PhysPointerError::NoMappingInfo)?;
+        Ok(map_info.base.wrapping_add(skip % ALIGN).cast::<T>())
     }
 
     /// Map the physical pages from `start` to `end` indexes.
@@ -420,9 +413,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         if self.map_info.is_none() {
             let sub_pages = &self.pages[start..end];
             unsafe {
-                platform().vmap(sub_pages, perms).map(|info| {
-                    self.map_info = Some(info);
-                })?;
+                self.map_info = Some(platform().vmap(sub_pages, perms)?);
             }
             Ok(())
         } else {
@@ -443,7 +434,6 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             unsafe {
                 platform().vunmap(map_info)?;
             }
-            self.map_info = None;
             Ok(())
         } else {
             Err(PhysPointerError::Unmapped(
@@ -451,20 +441,24 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             ))
         }
     }
-
-    /// Get the base virtual pointer if mapped.
-    #[inline]
-    fn base_ptr(&self) -> Option<*mut T> {
-        let Some(map_info) = &self.map_info else {
-            return None;
-        };
-        Some(map_info.base.wrapping_add(self.offset).cast::<T>())
-    }
 }
 
+/// Ensures physical pages are unmapped when `PhysMutPtr` goes out of scope.
+///
+/// This type is designed for single-use access: create, read/write once, then drop.
+/// The `Drop` implementation guarantees that mapped pages are always released,
+/// preventing resource leaks and adhering to the "minimize persistent mapping"
+/// security principle. Errors during unmapping are silently ignored since we
+/// cannot propagate errors from `drop`.
 impl<T: Clone, const ALIGN: usize> Drop for PhysMutPtr<T, ALIGN> {
     fn drop(&mut self) {
-        let _ = unsafe { self.unmap() };
+        // SAFETY: The platform is expected to handle unmapping safely, including
+        // the case where pages were never mapped (returns Unmapped error, ignored).
+        let result = unsafe { self.unmap() };
+        debug_assert!(
+            result.is_ok() || matches!(result, Err(PhysPointerError::Unmapped(_))),
+            "unexpected error during unmap in drop: {result:?}",
+        );
     }
 }
 
@@ -551,6 +545,7 @@ impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     }
 }
 
+/// See [`Drop`] implementation for [`PhysMutPtr`] for details.
 impl<T: Clone, const ALIGN: usize> Drop for PhysConstPtr<T, ALIGN> {
     fn drop(&mut self) {
         let _ = unsafe { self.inner.unmap() };

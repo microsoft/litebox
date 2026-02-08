@@ -10,9 +10,8 @@ extern crate alloc;
 
 use crate::loader::elf::ElfLoaderError;
 use aes::{Aes128, Aes192, Aes256};
-use alloc::{collections::vec_deque::VecDeque, sync::Arc, vec};
+use alloc::{sync::Arc, vec};
 use core::cell::Cell;
-use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use ctr::Ctr128BE;
 use hashbrown::HashMap;
 use litebox::{
@@ -20,21 +19,28 @@ use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{PunchthroughProvider, PunchthroughToken, RawConstPointer as _, RawMutPointer as _},
     shim::ContinueOperation,
-    utils::ReinterpretUnsignedExt,
+    utils::{ReinterpretUnsignedExt, TruncateExt},
 };
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 use litebox_common_optee::{
-    LdelfArg, LdelfSyscallRequest, SyscallRequest, TeeAlgorithm, TeeAlgorithmClass,
+    LdelfArg, LdelfSyscallRequest, SyscallRequest, TaFlags, TeeAlgorithm, TeeAlgorithmClass,
     TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle,
     TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
 };
 use litebox_platform_multiplex::Platform;
 
 pub mod loader;
+pub mod session;
 pub(crate) mod syscalls;
 
 pub mod msg_handler;
 pub mod ptr;
+
+// Re-export session management types for convenience
+pub use session::{
+    MAX_TA_INSTANCES, SessionEntry, SessionManager, SessionMap, SingleInstanceCache, TaInstance,
+    allocate_session_id, recycle_session_id,
+};
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
@@ -117,7 +123,6 @@ impl OpteeShimBuilder {
             platform: self.platform,
             pm: PageManager::new(&self.litebox),
             _litebox: self.litebox,
-            session_id_pool: SessionIdPool::new(),
             ta_uuid_map: TaUuidMap::new(),
         });
         OpteeShim(global)
@@ -132,16 +137,17 @@ struct GlobalState {
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The LiteBox instance used throughout the shim.
     _litebox: litebox::LiteBox<Platform>,
-    /// Session ID pool.
-    session_id_pool: SessionIdPool,
     /// The TA UUID to binary map for TA loading.
     ta_uuid_map: TaUuidMap,
 }
 
 impl GlobalState {
     /// Store the TA binary associated with the given TA UUID.
-    pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) {
-        self.ta_uuid_map.insert(*ta_uuid, ta_bin.into());
+    ///
+    /// Returns `true` if the binary was successfully stored, `false` if the binary's
+    /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
+    pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
+        self.ta_uuid_map.insert(*ta_uuid, ta_bin.into())
     }
 
     /// Get the TA binary associated with the given TA UUID.
@@ -150,9 +156,16 @@ impl GlobalState {
             Some(ta_bin)
         } else {
             let ta_bin = Self::rpc_get_ta_bin(ta_uuid)?;
-            self.store_ta_bin(ta_uuid, &ta_bin);
+            if !self.store_ta_bin(ta_uuid, &ta_bin) {
+                return None;
+            }
             Some(ta_bin)
         }
+    }
+
+    /// Get the TA flags associated with the given TA UUID.
+    pub(crate) fn get_ta_flags(&self, ta_uuid: &TeeUuid) -> TaFlags {
+        self.ta_uuid_map.get_flags(ta_uuid).unwrap_or_default()
     }
 
     /// Remove the TA binary associated with the given TA UUID.
@@ -197,13 +210,14 @@ impl OpteeShim {
         ta_uuid: TeeUuid,
         ta_bin: Option<&[u8]>,
         client: Option<TeeIdentity>,
+        session_id: u32,
     ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
                 thread: ThreadState::new(),
-                session_id: self.0.session_id_pool.allocate(),
+                session_id,
                 ta_app_id: ta_uuid,
                 client_identity: client.unwrap_or(TeeIdentity {
                     login: TeeLogin::User,
@@ -215,10 +229,14 @@ impl OpteeShim {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
+                #[cfg(target_arch = "x86_64")]
+                tls_base_addr: Cell::new(0),
             },
         };
-        if let Some(ta_bin) = ta_bin {
-            entrypoints.task.global.store_ta_bin(&ta_uuid, ta_bin);
+        if let Some(ta_bin) = ta_bin
+            && !entrypoints.task.global.store_ta_bin(&ta_uuid, ta_bin)
+        {
+            return Err(loader::elf::ElfLoaderError::InvalidUuid);
         }
         let elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin, true)?;
         entrypoints.task.load_ldelf(elf_loader, ta_uuid)?;
@@ -234,9 +252,12 @@ impl OpteeShim {
         } else {
             None
         };
+        // Get TA flags from the stored binary
+        let ta_flags = entrypoints.task.global.get_ta_flags(&ta_uuid);
         Ok(LoadedProgram {
             entrypoints: Some(entrypoints),
             params_address,
+            ta_flags,
         })
     }
 
@@ -267,9 +288,23 @@ impl OpteeShimEntrypoints {
     }
 }
 
+/// Information about a loaded TA program.
 pub struct LoadedProgram {
+    /// The entrypoints for the TA (syscall handling, context loading, etc.)
     pub entrypoints: Option<OpteeShimEntrypoints>,
+    /// Address where TA parameters (`UteeParams`) are stored on the stack.
+    ///
+    /// This address is constant for the lifetime of the TA instance because:
+    /// 1. The stack buffer is allocated once during initial loading (for ldelf)
+    /// 2. Subsequent TA invocations reuse the same stack buffer
+    /// 3. `UteeParams` is always placed at a fixed offset from the stack base
+    ///    (`stack_top + stack_len - sizeof(UteeParams)`)
+    ///
+    /// The stack contents (including `UteeParams` values) are reinitialized on each
+    /// `load_ta_context` call, but the address remains the same.
     pub params_address: Option<usize>,
+    /// TA flags parsed from the `.ta_head` section
+    pub ta_flags: TaFlags,
 }
 
 impl Task {
@@ -498,6 +533,7 @@ impl Task {
                     ctx.rsp = stack_top;
                     ctx.cs = 0x33; // __USER_CS
                     ctx.ss = 0x2b; // __USER_DS
+                    ctx.eflags = 0x202; // IF (interrupt enable) and reserved bit 1
                 }
                 ContinueOperation::ResumeGuest
             }
@@ -512,7 +548,8 @@ impl Task {
     /// TODO: We can re-enter `ldelf` as well to use its extra functions
     /// such as ftrace. Let's revisit this later.
     fn handle_reenter_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
-        match self.thread.init_state.get() {
+        let state = self.thread.init_state.get();
+        match state {
             ThreadInitState::None | ThreadInitState::Ldelf { .. } => ContinueOperation::ExitThread,
             ThreadInitState::Ta {
                 cmd_id,
@@ -532,6 +569,7 @@ impl Task {
                     ctx.rsp = stack_top;
                     ctx.cs = 0x33; // __USER_CS
                     ctx.ss = 0x2b; // __USER_DS
+                    ctx.eflags = 0x202; // IF (interrupt enable) and reserved bit 1
                 }
                 ContinueOperation::ResumeGuest
             }
@@ -661,6 +699,9 @@ impl Task {
             self.ta_prepared.set(true);
         }
 
+        #[cfg(target_arch = "x86_64")]
+        self.restore_guest_tls();
+
         let mut ta_stack =
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
                 ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
@@ -705,9 +746,23 @@ impl Task {
             -1,
             0,
         )?;
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase {
-            addr: addr.as_usize(),
-        };
+        // Store TLS address for later restoration
+        self.tls_base_addr.set(addr.as_usize());
+        self.restore_guest_tls();
+        Ok(())
+    }
+
+    /// Restore the guest TLS (FS base) before entering the TA.
+    ///
+    /// FS base is cleared across VTL switches, so we must restore it before
+    /// every TA entry.
+    #[cfg(target_arch = "x86_64")]
+    fn restore_guest_tls(&self) {
+        let addr = self.tls_base_addr.get();
+        if addr == 0 {
+            return; // TLS not allocated yet
+        }
+        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr };
         let token = litebox_platform_multiplex::platform()
             .get_punchthrough_token_for(punchthrough)
             .expect("Failed to get punchthrough token for SET_FS");
@@ -715,7 +770,6 @@ impl Task {
             litebox::platform::PunchthroughError::Failure(errno) => errno,
             _ => unimplemented!("Unsupported punchthrough error {:?}", e),
         });
-        Ok(())
     }
 
     /// Retrieve the result of the `ldelf` execution.
@@ -898,10 +952,17 @@ impl TeeObjMap {
             // TODO: support multiple attributes (e.g., two-key crypto algorithms like AES-XTS)
             match user_attrs[0].attribute_id {
                 TeeAttributeType::SecretValue => {
-                    let key_addr = user_attrs[0].a as *const u8;
+                    let key_addr: usize = user_attrs[0].a.truncate();
                     let key_len = usize::try_from(user_attrs[0].b).unwrap();
-                    let key_slice = unsafe { core::slice::from_raw_parts(key_addr, key_len) };
-                    tee_obj.set_key(key_slice);
+                    // TODO: revisit buffer size limits based on OP-TEE spec and deployment constraints
+                    if key_len > MAX_KERNEL_BUF_SIZE {
+                        return Err(TeeResult::BadParameters);
+                    }
+                    let key_ptr = UserConstPtr::<u8>::from_usize(key_addr);
+                    let key_slice = key_ptr
+                        .to_owned_slice(key_len)
+                        .ok_or(TeeResult::BadParameters)?;
+                    tee_obj.set_key(&key_slice);
                 }
                 _ => todo!(
                     "handle attribute ID: {}",
@@ -1106,9 +1167,17 @@ impl TaHandleMap {
     }
 }
 
-/// Data structure to maintain a mapping from TA UUIDs to their binary data.
+/// Entry in the TA UUID map containing binary data and parsed flags.
+struct TaInfo {
+    /// The raw TA binary
+    binary: alloc::boxed::Box<[u8]>,
+    /// Parsed TA flags from .ta_head section
+    flags: TaFlags,
+}
+
+/// Data structure to maintain a mapping from TA UUIDs to their binary data and flags.
 pub(crate) struct TaUuidMap {
-    inner: spin::mutex::SpinMutex<HashMap<TeeUuid, alloc::boxed::Box<[u8]>>>,
+    inner: spin::mutex::SpinMutex<HashMap<TeeUuid, TaInfo>>,
 }
 
 impl TaUuidMap {
@@ -1118,18 +1187,40 @@ impl TaUuidMap {
         }
     }
 
-    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: alloc::boxed::Box<[u8]>) {
+    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: alloc::boxed::Box<[u8]>) -> bool {
+        // Parse TA head from the binary's .ta_head section
+        let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
+            return false;
+        };
+
+        // Verify that the TA binary's UUID matches the expected UUID
+        if ta_head.uuid != uuid {
+            return false;
+        }
+
         let mut inner = self.inner.lock();
-        inner.insert(uuid, ta_bin);
+        inner.insert(
+            uuid,
+            TaInfo {
+                binary: ta_bin,
+                flags: ta_head.flags,
+            },
+        );
+        true
     }
 
     pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
-        self.inner.lock().get(uuid).cloned()
+        self.inner.lock().get(uuid).map(|info| info.binary.clone())
+    }
+
+    /// Get the TA flags for a given UUID.
+    pub(crate) fn get_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
+        self.inner.lock().get(uuid).map(|info| info.flags)
     }
 
     // Lazy removal of TA binaries when they are no longer needed.
     pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
-        self.inner.lock().remove(uuid)
+        self.inner.lock().remove(uuid).map(|info| info.binary)
     }
 }
 
@@ -1155,12 +1246,15 @@ struct Task {
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
+    /// TLS base address for x86_64 (stored to restore FS before each TA entry)
+    #[cfg(target_arch = "x86_64")]
+    tls_base_addr: Cell<usize>,
     // TODO: OP-TEE supports global, persistent objects across sessions. Add these maps if needed.
 }
 
 impl Drop for Task {
     fn drop(&mut self) {
-        self.global.session_id_pool.recycle(self.session_id);
+        SessionIdPool::recycle(self.session_id);
     }
 }
 
@@ -1199,47 +1293,90 @@ pub(crate) enum ThreadInitState {
     },
 }
 
-pub struct SessionIdPool {
-    inner: spin::mutex::SpinMutex<VecDeque<u32>>,
-    next_session_id: AtomicU32,
+/// Global session ID pool (Linux pidmap style).
+///
+/// Uses spinlock-protected bitmap for recyclable IDs (1..=MAX_RECYCLABLE_SESSION_ID),
+/// with fallback to one-time IDs beyond that range.
+///
+/// With MAX_RECYCLABLE_SESSION_ID = 65535:
+/// - Bitmap memory usage: (65535 + 1) bits = 8 KB
+/// - Recyclable IDs: 1..=65535 (65535 IDs)
+/// - Fallback (non-recyclable) IDs: 65536..=0xffff_fffd (~4.3B IDs, excluding PTA_SESSION_ID)
+/// - PTA_SESSION_ID (0xffff_fffe) is reserved and never allocated
+///
+/// Design notes:
+/// - A single TA instance can serve many concurrent sessions (no per-instance cap),
+///   so the bitmap must cover realistic peak concurrency.
+/// - Allocation uses `last_id` as a hint for O(1) amortized scans; worst-case O(n)
+///   full scan only occurs when the bitmap is nearly full.
+/// - 8 KB is modest for the secure world (with a small amount of memory) and avoids falling
+///   into the non-recyclable fallback path under normal workloads. Fallback IDs are
+///   a one-way leak (never recycled).
+pub(crate) struct SessionIdPool {
+    bitmap: bitvec::vec::BitVec, // bit[id] set = in use; bit 0 unused (session ID 0 is invalid)
+    last_id: u32,                // for wrap-around scanning
+    fallback_next: u32,          // one-time IDs when bitmap exhausted
+}
+
+fn session_id_pool() -> &'static spin::mutex::SpinMutex<SessionIdPool> {
+    static POOL: spin::once::Once<spin::mutex::SpinMutex<SessionIdPool>> = spin::once::Once::new();
+    POOL.call_once(|| {
+        spin::mutex::SpinMutex::new(SessionIdPool {
+            bitmap: bitvec::bitvec![0; SessionIdPool::MAX_RECYCLABLE_SESSION_ID as usize + 1],
+            last_id: 0,
+            fallback_next: SessionIdPool::MAX_RECYCLABLE_SESSION_ID + 1,
+        })
+    })
 }
 
 impl SessionIdPool {
+    /// Maximum recyclable session ID tracked by the bitmap.
+    const MAX_RECYCLABLE_SESSION_ID: u32 = 65535;
+    /// Reserved session ID for PTA.
     const PTA_SESSION_ID: u32 = 0xffff_fffe;
 
-    pub fn new() -> Self {
-        Self {
-            inner: spin::mutex::SpinMutex::new(VecDeque::new()),
-            next_session_id: 1.into(),
-        }
-    }
+    /// Allocate a new session ID.
+    ///
+    /// Returns `None` if all recyclable session IDs are currently in use and
+    /// the fallback one-time IDs are exhausted.
+    pub fn allocate() -> Option<u32> {
+        let mut pool = session_id_pool().lock();
 
-    /// # Panics
-    /// Panics if session IDs are exhausted.
-    pub fn allocate(&self) -> u32 {
-        let mut inner = self.inner.lock();
-        if let Some(session_id) = inner.pop_front() {
-            session_id
+        let start = if pool.last_id >= Self::MAX_RECYCLABLE_SESSION_ID {
+            1
         } else {
-            let session_id = self.next_session_id.fetch_add(1, SeqCst);
-            assert!(session_id != Self::PTA_SESSION_ID, "session ID exhausted");
-            session_id
+            pool.last_id + 1
+        };
+
+        for id in (start..=Self::MAX_RECYCLABLE_SESSION_ID).chain(1..start) {
+            if !pool.bitmap[id as usize] {
+                pool.bitmap.set(id as usize, true);
+                pool.last_id = id;
+                return Some(id);
+            }
         }
+
+        // Bitmap exhausted - use fallback one-time IDs if available
+        let fallback_id = pool.fallback_next;
+        if fallback_id >= Self::PTA_SESSION_ID {
+            return None;
+        }
+        pool.fallback_next = fallback_id + 1;
+        Some(fallback_id)
     }
 
-    pub fn recycle(&self, session_id: u32) {
-        let mut inner = self.inner.lock();
-        inner.push_back(session_id);
+    /// Recycle a session ID for reuse. Fallback IDs are not recycled.
+    pub fn recycle(session_id: u32) {
+        if session_id == 0 || session_id > Self::MAX_RECYCLABLE_SESSION_ID {
+            return;
+        }
+
+        let mut pool = session_id_pool().lock();
+        pool.bitmap.set(session_id as usize, false);
     }
 
     pub fn get_pta_session_id() -> u32 {
         Self::PTA_SESSION_ID
-    }
-}
-
-impl Default for SessionIdPool {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1256,7 +1393,7 @@ mod test_utils {
             Task {
                 global: self.clone(),
                 thread: ThreadState::new(),
-                session_id: self.session_id_pool.allocate(),
+                session_id: SessionIdPool::allocate().unwrap(),
                 ta_app_id: TeeUuid::default(),
                 client_identity: TeeIdentity {
                     login: TeeLogin::User,
@@ -1268,6 +1405,8 @@ mod test_utils {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
+                #[cfg(target_arch = "x86_64")]
+                tls_base_addr: Cell::new(0),
             }
         }
     }

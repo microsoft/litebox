@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
+use litebox_shim_optee::session::allocate_session_id;
 use std::path::PathBuf;
 
 mod tests;
@@ -123,36 +124,40 @@ fn run_ta_with_default_commands(
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
         if func_id == UteeEntryFunc::OpenSession {
-            let mut loaded_program = shim
-                .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin), None)
+            let loaded_program = shim
+                .load_ldelf(
+                    ldelf_bin,
+                    TeeUuid::default(),
+                    Some(ta_bin),
+                    None,
+                    allocate_session_id().unwrap(),
+                )
                 .map_err(|_| {
                     panic!("Failed to load ldelf");
                 })
                 .unwrap();
-            loaded_program.entrypoints = Some(unsafe {
-                litebox_platform_linux_userland::run_thread(
-                    loaded_program.entrypoints.take().unwrap(),
+            let entrypoints = loaded_program.entrypoints.as_ref().unwrap();
+            unsafe {
+                litebox_platform_linux_userland::run_thread_ref(
+                    entrypoints,
                     &mut litebox_common_linux::PtRegs::default(),
-                )
-            });
+                );
+            }
 
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
-            let _ = loaded_program
-                .entrypoints
-                .as_ref()
-                .unwrap()
+            let _ = entrypoints
                 .load_ta_context(params.as_slice(), None, func_id as u32, None)
                 .map_err(|_| {
                     panic!("Failed to load TA context");
                 });
-            loaded_program.entrypoints = Some(unsafe {
+            unsafe {
                 litebox_platform_linux_userland::reenter_thread(
-                    loaded_program.entrypoints.take().unwrap(),
+                    entrypoints,
                     &mut litebox_common_linux::PtRegs::default(),
-                )
-            });
+                );
+            }
         } else if func_id == UteeEntryFunc::CloseSession {
         }
     }

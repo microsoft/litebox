@@ -8,6 +8,7 @@ use litebox::{
     platform::{RawConstPointer, RawMutPointer},
 };
 use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
+use zerocopy::IntoBytes;
 
 use crate::UserMutPtr;
 
@@ -212,10 +213,8 @@ impl TaStack {
     /// Set `UteeParams` on the stack.
     fn set_utee_params(&mut self) -> Option<()> {
         let size = core::mem::size_of::<UteeParams>();
-        let bytes = unsafe {
-            core::slice::from_raw_parts(core::ptr::from_ref(&self.params).cast::<u8>(), size)
-        };
-        self.stack_top.copy_from_slice(self.len - size, bytes)?;
+        self.stack_top
+            .copy_from_slice(self.len - size, self.params.as_bytes())?;
         Some(())
     }
 
@@ -262,12 +261,7 @@ impl TaStack {
     }
 
     pub(crate) fn init_with_ldelf_arg(&mut self, ldelf_arg: &LdelfArg) -> Option<()> {
-        self.push_bytes(unsafe {
-            core::slice::from_raw_parts(
-                core::ptr::from_ref(ldelf_arg).cast::<u8>(),
-                core::mem::size_of::<LdelfArg>(),
-            )
-        })?;
+        self.push_bytes(ldelf_arg.as_bytes())?;
 
         // Track where LdelfArg was pushed so get_ldelf_arg_address returns the correct address
         self.ldelf_arg_pos = Some(self.pos);

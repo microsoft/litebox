@@ -10,12 +10,13 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use litebox::platform::RawConstPointer as _;
+use litebox::utils::TruncateExt;
 use litebox_common_linux::{PtRegs, errno::Errno};
 use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B8, B54};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub mod syscall_nr;
 
@@ -394,7 +395,7 @@ impl CommandId {
 /// `utee_params` from `optee_os/lib/libutee/include/utee_types.h`
 /// It contains up to 4 parameters where each of them is a collection of
 /// type (4 bits) and two 8-byte data (values or addresses).
-#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 #[repr(C)]
 pub struct UteeParams {
     pub types: UteeParamsTypes,
@@ -409,9 +410,9 @@ const TEE_NUM_PARAMS: usize = 4;
 mod workaround_identity_op_suppression {
     use modular_bitfield::prelude::*;
     use modular_bitfield::specifiers::{B4, B48};
-    use zerocopy::{FromBytes, IntoBytes};
+    use zerocopy::{FromBytes, Immutable, IntoBytes};
     #[bitfield]
-    #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+    #[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
     #[repr(C)]
     pub struct UteeParamsTypes {
         pub type_0: B4,
@@ -539,7 +540,7 @@ open_enum! {
 
 /// `TEE_UUID` from `optee_os/lib/libutee/include/tee_api_types.h`. It uniquely identifies
 /// TAs, cryptographic keys, and more.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug, FromBytes, Immutable, IntoBytes)]
 #[repr(C)]
 pub struct TeeUuid {
     pub time_low: u32,
@@ -571,35 +572,101 @@ impl TeeUuid {
         }
     }
 
-    /// Converts a UUID from OP-TEE's u32 array representation.
+    /// Converts a UUID from OP-TEE's u64 array representation (Linux kernel format).
     ///
-    /// OP-TEE passes UUIDs in SMC calls as 4 u32 values where:
-    /// - `data[0]` = `time_low` (u32)
-    /// - `data[1]` = `(time_mid << 16) | time_hi_and_version`
-    /// - `data[2..3]` = `clock_seq_and_node` (8 bytes as 2 u32s, big-endian byte order)
-    ///
-    /// For example, UUID `384fb3e0-e7f8-11e3-af63-0002a5d5c51b` is represented as:
-    /// `[0x384fb3e0, 0xe7f811e3, 0xaf630002, 0xa5d5c51b]`
-    pub fn from_u32_array(data: [u32; 4]) -> Self {
-        let mut bytes = [0u8; 16];
-        bytes[0..4].copy_from_slice(&data[0].to_be_bytes());
-        bytes[4..8].copy_from_slice(&data[1].to_be_bytes());
-        bytes[8..12].copy_from_slice(&data[2].to_be_bytes());
-        bytes[12..16].copy_from_slice(&data[3].to_be_bytes());
-        Self::from_bytes(bytes)
-    }
-
-    /// Converts a UUID from OP-TEE's u64 array representation.
+    /// The Linux kernel packs UUIDs as two little-endian u64 values via `export_uuid()`:
+    /// ```c
+    /// *a = get_unaligned_le64(p);      // bytes[0..8] as little-endian u64
+    /// *b = get_unaligned_le64(p + 8);  // bytes[8..16] as little-endian u64
+    /// ```
     pub fn from_u64_array(data: [u64; 2]) -> Self {
         let mut bytes = [0u8; 16];
-        bytes[0..8].copy_from_slice(&data[0].to_be_bytes());
-        bytes[8..16].copy_from_slice(&data[1].to_be_bytes());
+        bytes[0..8].copy_from_slice(&data[0].to_le_bytes());
+        bytes[8..16].copy_from_slice(&data[1].to_le_bytes());
         Self::from_bytes(bytes)
     }
 }
 
+/// TA flags from `optee_os/lib/libutee/include/user_ta_header.h`.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, FromBytes, IntoBytes)]
+#[repr(transparent)]
+pub struct TaFlags(u32);
+
+bitflags::bitflags! {
+    impl TaFlags: u32 {
+        /// TA has only one instance (deprecated flag, was USER_MODE)
+        const USER_MODE = 0;
+        /// TA executes from DDR (deprecated flag)
+        const EXEC_DDR = 0;
+        /// Only one TA instance exists at a time
+        const SINGLE_INSTANCE = 0x0000_0004;
+        /// Multiple sessions can share the instance
+        const MULTI_SESSION = 0x0000_0008;
+        /// Instance remains after last session closes
+        const INSTANCE_KEEP_ALIVE = 0x0000_0010;
+        /// TA accesses SDP memory
+        const SECURE_DATA_PATH = 0x0000_0020;
+        /// TA uses cache flush syscall
+        const CACHE_MAINTENANCE = 0x0000_0080;
+        /// TA can execute multiple sessions concurrently (pseudo-TAs only)
+        const CONCURRENT = 0x0000_0100;
+        /// Device enumeration at stage 1 (kernel driver init)
+        const DEVICE_ENUM = 0x0000_0200;
+        /// Device enumeration at stage 3 (with tee-supplicant)
+        const DEVICE_ENUM_SUPP = 0x0000_0400;
+        /// Don't close handle on corrupt object
+        const DONT_CLOSE_HANDLE_ON_CORRUPT_OBJECT = 0x0000_0800;
+        /// Device enumeration when TEE_STORAGE_PRIVATE is available
+        const DEVICE_ENUM_TEE_STORAGE_PRIVATE = 0x0000_1000;
+        /// Don't restart keep-alive TA if it crashed
+        const INSTANCE_KEEP_CRASHED = 0x0000_2000;
+    }
+}
+
+impl TaFlags {
+    /// Returns true if this TA should only have one instance.
+    pub fn is_single_instance(&self) -> bool {
+        self.contains(TaFlags::SINGLE_INSTANCE)
+    }
+
+    /// Returns true if multiple sessions can share the TA instance.
+    ///
+    /// Note: This flag is only meaningful when `SINGLE_INSTANCE` is also set.
+    /// For non-single-instance TAs, each session gets its own instance anyway.
+    pub fn is_multi_session(&self) -> bool {
+        self.contains(TaFlags::MULTI_SESSION)
+    }
+
+    /// Returns true if the TA instance should persist after all sessions close.
+    ///
+    /// Note: This flag is only meaningful when `SINGLE_INSTANCE` is also set.
+    /// For non-single-instance TAs, instances are always destroyed when their session closes.
+    pub fn is_keep_alive(&self) -> bool {
+        self.contains(TaFlags::INSTANCE_KEEP_ALIVE)
+    }
+}
+
+/// TA header structure from `optee_os/lib/libutee/include/user_ta_header.h`.
+///
+/// This structure is placed at the beginning of the `.ta_head` section in TA ELF binaries.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[repr(C)]
+pub struct TaHead {
+    /// TA UUID
+    pub uuid: TeeUuid,
+    /// Stack size in bytes
+    pub stack_size: u32,
+    /// TA flags (see `TaFlags`)
+    pub flags: TaFlags,
+    /// Deprecated entry point field
+    pub depr_entry: u64,
+}
+
+/// Name of the ELF section containing the TA header.
+pub const TA_HEAD_SECTION_NAME: &str = ".ta_head";
+
 /// `TEE_Identity` from `optee_os/lib/libutee/include/tee_api_types.h`.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Immutable, IntoBytes)]
 #[repr(C)]
 pub struct TeeIdentity {
     pub login: TeeLogin,
@@ -683,7 +750,7 @@ const TEE_LOGIN_APPLICATION_GROUP: u32 = 0x6;
 const TEE_LOGIN_TRUSTED_APP: u32 = 0xf000_0000;
 
 /// `TEE Login type` from `optee_os/lib/libutee/include/tee_api_defines.h`
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, TryFromPrimitive, Immutable, IntoBytes)]
 #[repr(u32)]
 pub enum TeeLogin {
     Public = TEE_LOGIN_PUBLIC,
@@ -727,10 +794,10 @@ impl TeeOperationMode {
 open_enum! {
     /// Origin code constants from `optee_os/lib/libutee/include/tee_api_defines.h`
     pub enum TeeOrigin: u32 {
-        Api = 0,
-        Comms = 1,
-        Tee = 2,
-        TrustedApp = 3,
+        Api = 1,
+        Comms = 2,
+        Tee = 3,
+        TrustedApp = 4,
     }
 }
 
@@ -897,7 +964,7 @@ const TEE_ERROR_TIME_NOT_SET: u32 = 0xffff_5000;
 const TEE_ERROR_TIME_NEEDS_RESET: u32 = 0xffff_5001;
 
 /// `TEE_Result` (API error codes) from `optee_os/lib/libutee/include/tee_api_defines.h`
-#[derive(Clone, Copy, TryFromPrimitive)]
+#[derive(Clone, Copy, TryFromPrimitive, PartialEq, Debug)]
 #[repr(u32)]
 pub enum TeeResult {
     Success = TEE_SUCCESS,
@@ -931,7 +998,6 @@ pub enum TeeResult {
     SignatureInvalid = TEE_ERROR_SIGNATURE_INVALID,
     TimeNotSet = TEE_ERROR_TIME_NOT_SET,
     TimeNeedsReset = TEE_ERROR_TIME_NEEDS_RESET,
-    Unknown = 0xffff_ffff,
 }
 
 impl From<TeeResult> for u32 {
@@ -1121,7 +1187,7 @@ bitflags::bitflags! {
 }
 
 /// `ldef_arg` from `optee_os/ldelf/include/ldelf.h`
-#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 #[repr(C)]
 pub struct LdelfArg {
     pub uuid: TeeUuid,
@@ -1220,7 +1286,7 @@ pub struct OpteeMsgParamFmem {
     /// Lower bits of offset into shared memory reference
     pub offs_low: u32,
     /// Higher bits of offset into shared memory reference
-    pub offs_high: u32,
+    pub offs_high: u16,
     /// Internal offset into the first page of shared memory reference
     pub internal_offs: u16,
     /// Size of the buffer
@@ -1370,7 +1436,7 @@ pub struct OpteeMsgArgs {
     pub cancel_id: u32,
     pad: u32,
     /// Return value from the secure world
-    pub ret: u32,
+    pub ret: TeeResult,
     /// Origin of the return value
     pub ret_origin: TeeOrigin,
     /// Number of parameters contained in `params`
@@ -1379,6 +1445,9 @@ pub struct OpteeMsgArgs {
     /// a TA UUID and they are not delivered to the TA.
     /// Note that, originally, the length of this array is variable. We fix it to `TEE_NUM_PARAMS + 2` to
     /// simplify the implementation (our OP-TEE Shim supports up to four parameters as well).
+    ///
+    /// TODO: To support OP-TEE RPC, we should make this array length dynamic. Consider to use
+    /// a trailing unsized slice (DST) or other mechanisms.
     pub params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
 }
 
@@ -1444,6 +1513,22 @@ impl OpteeMsgArgs {
             Ok(())
         }
     }
+
+    /// Set the size field for a memref parameter (rmem or tmem).
+    /// This updates `rmem.size` or `tmem.size` which share the same offset as `value.b` in the union.
+    pub fn set_param_memref_size(
+        &mut self,
+        index: usize,
+        size: u64,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            // rmem.size and tmem.size are at the same offset as value.b in the union
+            self.params[index].u.rmem.size = size;
+            Ok(())
+        }
+    }
 }
 
 /// A memory page to exchange OP-TEE SMC call arguments.
@@ -1493,7 +1578,7 @@ impl OpteeSmcArgs {
 
     /// Get the physical address of `OpteeMsgArgs`. The secure world is expected to map and copy
     /// this structure.
-    pub fn optee_msg_arg_phys_addr(&self) -> Result<u64, OpteeSmcReturnCode> {
+    pub fn optee_msg_args_phys_addr(&self) -> Result<u64, OpteeSmcReturnCode> {
         // To avoid potential sign extension and overflow issues, OP-TEE stores the low and
         // high 32 bits of a 64-bit address in `args[2]` and `args[1]`, respectively.
         if self.args[1] & 0xffff_ffff_0000_0000 == 0 && self.args[2] & 0xffff_ffff_0000_0000 == 0 {
@@ -1502,6 +1587,11 @@ impl OpteeSmcArgs {
         } else {
             Err(OpteeSmcReturnCode::EBadAddr)
         }
+    }
+
+    /// Set the return code of an OP-TEE SMC call
+    pub fn set_return_code(&mut self, code: OpteeSmcReturnCode) {
+        self.args[0] = code as usize;
     }
 }
 
@@ -1568,7 +1658,7 @@ pub enum OpteeSmcResult<'a> {
         shm_lower32: usize,
     },
     CallWithArg {
-        msg_arg: Box<OpteeMsgArgs>,
+        msg_args: Box<OpteeMsgArgs>,
     },
 }
 
@@ -1701,19 +1791,51 @@ impl From<OpteeSmcReturnCode> for litebox_common_linux::errno::Errno {
     }
 }
 
+/// Parse the `.ta_head` section from a raw ELF binary.
+///
+/// This function searches for the `.ta_head` section in the ELF and parses the `TaHead`
+/// structure from it. Returns `None` if the section is not found or cannot be parsed.
+///
+/// # Arguments
+/// * `elf_data` - Raw bytes of the ELF binary
+pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
+    use core::mem::size_of;
+    use elf::{ElfBytes, endian::AnyEndian};
+
+    let elf = ElfBytes::<AnyEndian>::minimal_parse(elf_data).ok()?;
+    let (shdrs, strtab) = elf.section_headers_with_strtab().ok()?;
+    let shdrs = shdrs?;
+    let strtab = strtab?;
+
+    for shdr in shdrs {
+        let name = strtab.get(shdr.sh_name as usize).ok()?;
+        if name == TA_HEAD_SECTION_NAME {
+            let offset: usize = shdr.sh_offset.truncate();
+            let size: usize = shdr.sh_size.truncate();
+
+            if size < size_of::<TaHead>() {
+                return None;
+            }
+
+            return TaHead::read_from_bytes(&elf_data[offset..offset + size_of::<TaHead>()]).ok();
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_tee_uuid_from_u32_array() {
+    fn test_tee_uuid_from_u64_array() {
         // Test with OP-TEE's well-known UUID: 384fb3e0-e7f8-11e3-af63-0002a5d5c51b
-        // As documented in optee_msg.h:
-        // OPTEE_MSG_UID_0 = 0x384fb3e0
-        // OPTEE_MSG_UID_1 = 0xe7f811e3
-        // OPTEE_MSG_UID_2 = 0xaf630002
-        // OPTEE_MSG_UID_3 = 0xa5d5c51b
-        let uuid = TeeUuid::from_u32_array([0x384fb3e0, 0xe7f811e3, 0xaf630002, 0xa5d5c51b]);
+        // UUID bytes (big-endian for time fields):
+        // [0x38, 0x4f, 0xb3, 0xe0, 0xe7, 0xf8, 0x11, 0xe3, 0xaf, 0x63, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b]
+        // When read as two little-endian u64 values:
+        // data[0] = bytes[0..8] as LE u64 = 0xe311f8e7_e0b34f38
+        // data[1] = bytes[8..16] as LE u64 = 0x1bc5d5a5_020063af
+        let uuid = TeeUuid::from_u64_array([0xe311f8e7_e0b34f38, 0x1bc5d5a5_020063af]);
 
         assert_eq!(uuid.time_low, 0x384fb3e0);
         assert_eq!(uuid.time_mid, 0xe7f8);

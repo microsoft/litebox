@@ -7,6 +7,7 @@ edition = "2024"
 aes = { version = "0.7", default-features = false }
 arrayvec = { version = "0.7.6", default-features = false }
 bitflags = "2.9.0"
+bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
 cfg-if = "1.0.0"
 ctr = { version = "0.8", default-features = false }
 elf = { version = "0.8.0", default-features = false }
@@ -17,8 +18,9 @@ litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0" }
 litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", default-features = false }
 num_enum = { version = "0.7.3", default-features = false }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
-spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
+spin = { version = "0.10.0", default-features = false, features = ["spin_mutex", "once"] }
 thiserror = { version = "2.0.6", default-features = false }
+zerocopy = { version = "0.8", default-features = false }
 
 [target.'cfg(target_arch = "x86")'.dependencies]
 # ELF loader requires us to enable the `rel` dependency on 32-bit to work.
