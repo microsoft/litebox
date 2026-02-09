@@ -36,6 +36,9 @@ mod fcall;
 
 pub mod transport;
 
+#[cfg(test)]
+mod tests;
+
 const DEVICE_ID: usize = u32::from_le_bytes(*b"NINE") as usize;
 
 /// Error type for 9P operations
