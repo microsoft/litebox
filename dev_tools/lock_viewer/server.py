@@ -191,35 +191,41 @@ def find_rust_function_bounds(
 
 def resolve_file_path(file_path: str) -> str | None:
     """
-    Resolve a file path, handling both absolute and relative paths.
+    Securely resolve a file path within the current working directory only.
+    
+    Prevents directory traversal attacks by rejecting paths with ".." and 
+    ensuring the resolved path stays within the allowed base directory.
 
-    For relative paths, tries to find the file by searching cwd and parent directories.
-
-    Returns the resolved absolute path, or None if file not found.
+    Returns the resolved absolute path, or None if file not found or invalid.
     """
-    # If it's already an absolute path and exists, return it
-    if os.path.isabs(file_path) and os.path.exists(file_path):
-        return file_path
+    # Security: Reject paths with directory traversal sequences
+    if ".." in file_path or file_path.startswith("/"):
+        return None
+    
+    # Security: Normalize the path to prevent traversal attacks
+    file_path = os.path.normpath(file_path)
+    
+    # Security: Double-check after normalization
+    if ".." in file_path or os.path.isabs(file_path):
+        return None
 
-    # Build list of directories to search: cwd and parent directories
-    search_dirs = []
-
-    # Start from current working directory and go up
+    # Security: Only search within current working directory (no parent directory access)
     cwd = os.getcwd()
-    search_dirs.append(cwd)
-    parent = cwd
-    for _ in range(5):  # Check up to 5 levels up
-        parent = os.path.dirname(parent)
-        if parent and parent != "/":
-            search_dirs.append(parent)
-        else:
-            break
-
-    # Try each search directory
-    for base_dir in search_dirs:
-        candidate = os.path.join(base_dir, file_path)
+    candidate = os.path.join(cwd, file_path)
+    
+    # Security: Ensure the resolved path stays within the current working directory
+    try:
+        candidate_real = os.path.realpath(candidate)
+        cwd_real = os.path.realpath(cwd)
+        
+        # Verify path is within cwd using realpath to handle symlinks
+        if not candidate_real.startswith(cwd_real + os.sep) and candidate_real != cwd_real:
+            return None
+            
         if os.path.exists(candidate):
             return candidate
+    except (OSError, ValueError):
+        return None
 
     return None
 
@@ -232,12 +238,35 @@ def get_snippet():
     file_path = request.args.get("file", "")
     line = request.args.get("line", type=int, default=1)
 
+    # Security: Path validation and sanitization to prevent directory traversal attacks
     if not file_path:
         return jsonify({"error": "No file specified", "lines": [], "target_line": line})
+    
+    # Reject paths containing directory traversal sequences or absolute paths
+    if ".." in file_path or os.path.isabs(file_path):
+        return jsonify({"error": "Invalid file path", "lines": [], "target_line": line})
+    
+    # Normalize the path to remove any encoded traversal attempts
+    file_path = os.path.normpath(file_path).replace("\\", "/")
+    
+    # Double-check after normalization
+    if ".." in file_path or os.path.isabs(file_path):
+        return jsonify({"error": "Invalid file path", "lines": [], "target_line": line})
 
     resolved_path = resolve_file_path(file_path)
     if not resolved_path:
         return jsonify({"error": "File not found", "lines": [], "target_line": line})
+
+    # Security: Verify resolved path is within allowed directories before file access
+    try:
+        resolved_real = os.path.realpath(resolved_path)
+        cwd_real = os.path.realpath(os.getcwd())
+        
+        # Ensure the resolved path is within the current working directory tree
+        if not resolved_real.startswith(cwd_real + os.sep) and resolved_real != cwd_real:
+            return jsonify({"error": "Access denied", "lines": [], "target_line": line})
+    except (OSError, ValueError):
+        return jsonify({"error": "Invalid file path", "lines": [], "target_line": line})
 
     try:
         with open(resolved_path, "r") as f:
