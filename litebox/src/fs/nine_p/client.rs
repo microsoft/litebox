@@ -5,7 +5,6 @@
 //!
 //! This module provides a high-level client for the 9P2000.L protocol.
 
-use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -14,9 +13,6 @@ use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::transport::{self, Read, Write};
-
-/// Client identifier for lock operations
-pub(crate) const CLIENT_ID: &str = "litebox-9p";
 
 /// ID generator for fids
 struct IdGenerator {
@@ -48,7 +44,7 @@ impl IdGenerator {
 }
 
 /// Fid generator with thread-safe access
-pub(crate) struct FidGenerator<Platform: RawSyncPrimitivesProvider> {
+struct FidGenerator<Platform: RawSyncPrimitivesProvider> {
     inner: Mutex<Platform, IdGenerator>,
 }
 
@@ -60,25 +56,25 @@ impl<Platform: RawSyncPrimitivesProvider> Default for FidGenerator<Platform> {
 
 impl<Platform: RawSyncPrimitivesProvider> FidGenerator<Platform> {
     /// Create a new fid generator
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         FidGenerator {
             inner: Mutex::new(IdGenerator::new()),
         }
     }
 
     /// Allocate a new fid
-    pub(crate) fn next(&self) -> u32 {
+    fn next(&self) -> u32 {
         self.inner.lock().next()
     }
 
     /// Release a fid for reuse
-    pub(crate) fn free(&self, id: u32) {
+    fn free(&self, id: u32) {
         self.inner.lock().free(id);
     }
 }
 
 /// 9P client state for writing to the connection
-pub(crate) struct ClientWriteState<T> {
+struct ClientWriteState<T> {
     /// The underlying transport
     transport: T,
     /// Write buffer
@@ -89,7 +85,7 @@ pub(crate) struct ClientWriteState<T> {
 ///
 /// This client provides synchronous 9P protocol operations. It uses a transport
 /// that implements both Read and Write traits.
-pub(crate) struct Client<Platform: RawSyncPrimitivesProvider, T: Read + Write> {
+pub(super) struct Client<Platform: RawSyncPrimitivesProvider, T: Read + Write> {
     /// Maximum message size negotiated with server
     msize: u32,
     /// Write state protected by a mutex
@@ -108,7 +104,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// # Arguments
     /// * `transport` - The underlying transport for read/write operations
     /// * `max_msize` - Maximum message size to request
-    pub(crate) fn new(mut transport: T, max_msize: u32) -> Result<Self, Error> {
+    pub(super) fn new(mut transport: T, max_msize: u32) -> Result<Self, Error> {
         const MIN_MSIZE: u32 = 4096 + fcall::READDIRHDRSZ;
         let bufsize = max_msize.max(MIN_MSIZE) as usize;
 
@@ -144,7 +140,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             TaggedFcall {
                 fcall: Fcall::Rlerror(e),
                 ..
-            } => return Err(Error::Remote(e)),
+            } => return Err(Error::from(e)),
             _ => return Err(Error::InvalidResponse),
         };
 
@@ -161,11 +157,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Get the negotiated message size
-    pub(crate) fn msize(&self) -> u32 {
+    pub(super) fn msize(&self) -> u32 {
         self.msize
     }
 
     /// Send a request and wait for the response
+    ///
+    /// TODO: support async operations
     fn fcall(&self, fcall: Fcall<'_>) -> Result<Fcall<'static>, Error> {
         let tag = self.next_tag.fetch_add(1, Ordering::Relaxed) as u16;
 
@@ -186,7 +184,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Attach to a remote filesystem
-    pub(crate) fn attach(
+    pub(super) fn attach(
         &self,
         uname: &str,
         aname: &str,
@@ -202,7 +200,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             Fcall::Rattach(fcall::Rattach { qid }) => Ok((qid, fid)),
             Fcall::Rlerror(e) => {
                 self.fids.free(fid);
-                Err(Error::Remote(e))
+                Err(Error::from(e))
             }
             _ => {
                 self.fids.free(fid);
@@ -231,7 +229,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             wnames: wnames.to_vec(),
         }))? {
             Fcall::Rwalk(fcall::Rwalk { wqids }) => Ok((wqids, new_fid)),
-            Fcall::Rlerror(err) => Err(Error::Remote(err)),
+            Fcall::Rlerror(err) => Err(Error::from(err)),
             _ => Err(Error::InvalidResponse),
         };
         if ret.is_err() {
@@ -296,7 +294,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     ) -> Result<fcall::Qid, Error> {
         match self.fcall(Fcall::Tlopen(fcall::Tlopen { fid, flags }))? {
             Fcall::Rlopen(fcall::Rlopen { qid, .. }) => Ok(qid),
-            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
             _ => Err(Error::InvalidResponse),
         }
     }
@@ -321,13 +319,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             gid,
         }))? {
             Fcall::Rlcreate(fcall::Rlcreate { qid, iounit: _ }) => Ok((qid, dfid)),
-            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
             _ => Err(Error::InvalidResponse),
         }
     }
 
     /// Read from a file
-    pub(crate) fn read(
+    pub(super) fn read(
         &self,
         fid: fcall::Fid,
         offset: u64,
@@ -343,13 +341,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 buf[..data.len()].copy_from_slice(&data);
                 Ok(data.len())
             }
-            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
             _ => Err(Error::InvalidResponse),
         }
     }
 
     /// Write to a file
-    pub(crate) fn write(&self, fid: fcall::Fid, offset: u64, data: &[u8]) -> Result<usize, Error> {
+    pub(super) fn write(&self, fid: fcall::Fid, offset: u64, data: &[u8]) -> Result<usize, Error> {
         let count = data.len().min((self.msize - fcall::IOHDRSZ) as usize);
         match self.fcall(Fcall::Twrite(fcall::Twrite {
             fid,
@@ -357,26 +355,26 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             data: alloc::borrow::Cow::Borrowed(&data[..count]),
         }))? {
             Fcall::Rwrite(fcall::Rwrite { count }) => Ok(count as usize),
-            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
             _ => Err(Error::InvalidResponse),
         }
     }
 
     /// Get file attributes
-    pub(crate) fn getattr(
+    pub(super) fn getattr(
         &self,
         fid: fcall::Fid,
         req_mask: GetattrMask,
     ) -> Result<fcall::Rgetattr, Error> {
         match self.fcall(Fcall::Tgetattr(fcall::Tgetattr { fid, req_mask }))? {
             Fcall::Rgetattr(r) => Ok(r),
-            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
             _ => Err(Error::InvalidResponse),
         }
     }
 
     /// Set file attributes
-    pub(crate) fn setattr(
+    pub(super) fn setattr(
         &self,
         fid: fcall::Fid,
         valid: fcall::SetattrMask,
@@ -384,13 +382,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     ) -> Result<(), Error> {
         match self.fcall(Fcall::Tsetattr(fcall::Tsetattr { fid, valid, stat }))? {
             Fcall::Rsetattr(_) => Ok(()),
-            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
             _ => Err(Error::InvalidResponse),
         }
     }
 
     /// Read directory entries
-    pub(crate) fn readdir(
+    pub(super) fn readdir(
         &self,
         fid: fcall::Fid,
         offset: u64,
@@ -401,13 +399,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 // Clone the directory entries to owned versions
                 Ok(data.data)
             }
-            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
             _ => Err(Error::InvalidResponse),
         }
     }
 
     /// Read all directory entries
-    pub(crate) fn readdir_all(
+    pub(super) fn readdir_all(
         &self,
         fid: fcall::Fid,
     ) -> Result<Vec<fcall::DirEntry<'static>>, Error> {
@@ -425,7 +423,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Create a directory
-    pub(crate) fn mkdir(
+    pub(super) fn mkdir(
         &self,
         dfid: fcall::Fid,
         name: &str,
@@ -439,13 +437,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             gid,
         }))? {
             Fcall::Rmkdir(fcall::Rmkdir { qid }) => Ok(qid),
-            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
             _ => Err(Error::InvalidResponse),
         }
     }
 
     /// Remove the file represented by fid and clunk the fid, even if the remove fails
-    pub(crate) fn remove(&self, fid: fcall::Fid) -> Result<(), Error> {
+    pub(super) fn remove(&self, fid: fcall::Fid) -> Result<(), Error> {
         match self.fcall(Fcall::Tremove(fcall::Tremove { fid }))? {
             Fcall::Rremove(_) => Ok(()),
             Fcall::Rlerror(e) => Err(Error::from(e)),
@@ -454,7 +452,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Remove (unlink) a file or directory
-    pub(crate) fn unlinkat(&self, dfid: fcall::Fid, name: &str, flags: u32) -> Result<(), Error> {
+    pub(super) fn unlinkat(&self, dfid: fcall::Fid, name: &str, flags: u32) -> Result<(), Error> {
         match self.fcall(Fcall::Tunlinkat(fcall::Tunlinkat {
             dfid,
             name: name.into(),
@@ -467,7 +465,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Rename a file
-    pub(crate) fn rename(
+    #[expect(dead_code)]
+    pub(super) fn rename(
         &self,
         fid: fcall::Fid,
         dfid: fcall::Fid,
@@ -479,28 +478,29 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             name: name.into(),
         }))? {
             Fcall::Rrename(_) => Ok(()),
-            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
             _ => Err(Error::InvalidResponse),
         }
     }
 
     /// Fsync a file
-    pub(crate) fn fsync(&self, fid: fcall::Fid, datasync: bool) -> Result<(), Error> {
+    #[expect(dead_code)]
+    pub(super) fn fsync(&self, fid: fcall::Fid, datasync: bool) -> Result<(), Error> {
         match self.fcall(Fcall::Tfsync(fcall::Tfsync {
             fid,
             datasync: u32::from(datasync),
         }))? {
             Fcall::Rfsync(_) => Ok(()),
-            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
             _ => Err(Error::InvalidResponse),
         }
     }
 
     /// Clunk (close) a fid
-    pub(crate) fn clunk(&self, fid: fcall::Fid) -> Result<(), Error> {
+    pub(super) fn clunk(&self, fid: fcall::Fid) -> Result<(), Error> {
         let result = match self.fcall(Fcall::Tclunk(fcall::Tclunk { fid }))? {
             Fcall::Rclunk(_) => Ok(()),
-            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
             _ => Err(Error::InvalidResponse),
         };
         self.fids.free(fid);
@@ -508,7 +508,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Clone a fid (walk with empty path)
-    pub(crate) fn clone_fid(&self, fid: fcall::Fid) -> Result<fcall::Fid, Error> {
+    pub(super) fn clone_fid(&self, fid: fcall::Fid) -> Result<fcall::Fid, Error> {
         let empty: [&str; 0] = [];
         let (_, new_fid) = self.walk(fid, &empty)?;
         Ok(new_fid)
@@ -517,7 +517,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Release a fid back to the pool without clunking
     ///
     /// Use this when the fid has already been invalidated (e.g., after remove)
-    pub(crate) fn free_fid(&self, fid: fcall::Fid) {
+    pub(super) fn free_fid(&self, fid: fcall::Fid) {
         self.fids.free(fid);
     }
 }

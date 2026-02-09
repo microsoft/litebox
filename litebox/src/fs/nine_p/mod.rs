@@ -25,7 +25,8 @@ use thiserror::Error;
 
 use crate::fs::OFlags;
 use crate::fs::errors::{
-    MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError, UnlinkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
+    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
@@ -55,10 +56,6 @@ pub enum Error {
 
     #[error("Invalid pathname")]
     InvalidPathname,
-
-    /// Remote error from the 9P server
-    #[error("Remote error: {0}")]
-    Remote(Rlerror),
 
     /// Path not found
     #[error("Path not found")]
@@ -162,6 +159,52 @@ impl From<Error> for RmdirError {
             Error::NotADirectory => RmdirError::NotADirectory,
             Error::PermissionDenied => RmdirError::NoWritePerms,
             _ => unimplemented!("convert {e:?} to RmdirError"),
+        }
+    }
+}
+
+impl From<Error> for FileStatusError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::NotFound => FileStatusError::PathError(PathError::NoSuchFileOrDirectory),
+            _ => unimplemented!("convert {e:?} to FileStatusError"),
+        }
+    }
+}
+
+impl From<Error> for SeekError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::NotFound => SeekError::ClosedFd,
+            _ => unimplemented!("convert {e:?} to SeekError"),
+        }
+    }
+}
+
+impl From<Error> for TruncateError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::NotFound => TruncateError::ClosedFd,
+            Error::IsADirectory => TruncateError::IsDirectory,
+            _ => unimplemented!("convert {e:?} to TruncateError"),
+        }
+    }
+}
+
+impl From<Error> for ChmodError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::NotFound => ChmodError::PathError(PathError::NoSuchFileOrDirectory),
+            _ => unimplemented!("convert {e:?} to ChmodError"),
+        }
+    }
+}
+
+impl From<Error> for ChownError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::NotFound => ChownError::PathError(PathError::NoSuchFileOrDirectory),
+            _ => unimplemented!("convert {e:?} to ChownError"),
         }
     }
 }
@@ -274,13 +317,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
     }
 
-    /// Parse a path string and split it into path components
-    fn parse_path(path: &str) -> Vec<&str> {
-        path.split('/')
-            .filter(|s| !s.is_empty() && *s != ".")
-            .collect()
-    }
-
     /// Walk to a path and return the fid
     fn walk_to(&self, path: &str) -> Result<fcall::Fid, Error> {
         let components: Vec<&str> = path
@@ -380,20 +416,62 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     fn rgetattr_to_file_status(attr: &fcall::Rgetattr) -> super::FileStatus {
         let file_type = Self::qid_type_to_file_type(attr.qid.typ);
 
-        super::FileStatus {
-            file_type,
-            mode: super::Mode::from_bits_truncate(attr.stat.mode),
-            size: attr.stat.size as usize,
-            owner: super::UserInfo {
-                user: attr.stat.uid as u16,
-                group: attr.stat.gid as u16,
-            },
-            node_info: super::NodeInfo {
-                dev: attr.stat.rdev as usize,
-                ino: attr.qid.path as usize,
-                rdev: NonZeroUsize::new(attr.stat.rdev as usize),
-            },
-            blksize: attr.stat.blksize as usize,
+        if attr.valid.contains(fcall::GetattrMask::BASIC) {
+            super::FileStatus {
+                file_type,
+                mode: super::Mode::from_bits_truncate(attr.stat.mode),
+                size: attr.stat.size as usize,
+                owner: super::UserInfo {
+                    user: attr.stat.uid as u16,
+                    group: attr.stat.gid as u16,
+                },
+                node_info: super::NodeInfo {
+                    dev: DEVICE_ID,
+                    ino: attr.qid.path as usize,
+                    rdev: NonZeroUsize::new(attr.stat.rdev as usize),
+                },
+                blksize: attr.stat.blksize as usize,
+            }
+        } else {
+            super::FileStatus {
+                file_type,
+                mode: if attr.valid.contains(fcall::GetattrMask::MODE) {
+                    super::Mode::from_bits_truncate(attr.stat.mode)
+                } else {
+                    super::Mode::empty()
+                },
+                size: if attr.valid.contains(fcall::GetattrMask::SIZE) {
+                    attr.stat.size as usize
+                } else {
+                    0
+                },
+                owner: super::UserInfo {
+                    user: if attr.valid.contains(fcall::GetattrMask::UID) {
+                        attr.stat.uid as u16
+                    } else {
+                        0
+                    },
+                    group: if attr.valid.contains(fcall::GetattrMask::GID) {
+                        attr.stat.gid as u16
+                    } else {
+                        0
+                    },
+                },
+                node_info: super::NodeInfo {
+                    dev: DEVICE_ID,
+                    ino: attr.qid.path as usize,
+                    rdev: if attr.valid.contains(fcall::GetattrMask::RDEV) {
+                        NonZeroUsize::new(attr.stat.rdev as usize)
+                    } else {
+                        None
+                    },
+                },
+                blksize: if attr.valid.contains(fcall::GetattrMask::BLOCKS) {
+                    attr.stat.blksize as usize
+                } else {
+                    0
+                },
+            }
         }
     }
 
@@ -552,52 +630,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         fd: &FileFd<Platform, T>,
         offset: isize,
         whence: super::SeekWhence,
-    ) -> Result<usize, super::errors::SeekError> {
+    ) -> Result<usize, SeekError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table
-            .get_entry(fd)
-            .ok_or(super::errors::SeekError::ClosedFd)?;
+        let entry = descriptor_table.get_entry(fd).ok_or(SeekError::ClosedFd)?;
         let desc = &entry.entry;
 
         let current_offset = desc.offset.load(Ordering::SeqCst);
 
-        let new_offset = match whence {
-            super::SeekWhence::RelativeToBeginning => {
-                if offset < 0 {
-                    return Err(super::errors::SeekError::InvalidOffset);
-                }
-                offset as u64
-            }
-            super::SeekWhence::RelativeToCurrentOffset => {
-                if offset < 0 {
-                    let neg_offset = (-offset) as u64;
-                    if neg_offset > current_offset {
-                        return Err(super::errors::SeekError::InvalidOffset);
-                    }
-                    current_offset - neg_offset
-                } else {
-                    current_offset + offset as u64
-                }
-            }
+        let base = match whence {
+            super::SeekWhence::RelativeToBeginning => 0,
+            super::SeekWhence::RelativeToCurrentOffset => current_offset,
             super::SeekWhence::RelativeToEnd => {
                 // Need to get file size
-                let attr = self
-                    .client
-                    .getattr(desc.fid, fcall::GetattrMask::SIZE)
-                    .map_err(|_| super::errors::SeekError::ClosedFd)?;
-                let size = attr.stat.size;
-
-                if offset < 0 {
-                    let neg_offset = (-offset) as u64;
-                    if neg_offset > size {
-                        return Err(super::errors::SeekError::InvalidOffset);
-                    }
-                    size - neg_offset
-                } else {
-                    size + offset as u64
-                }
+                let attr = self.client.getattr(desc.fid, fcall::GetattrMask::SIZE)?;
+                attr.stat.size
             }
         };
+        let new_offset = base
+            .checked_add_signed(offset as i64)
+            .ok_or(SeekError::InvalidOffset)?;
 
         desc.offset.store(new_offset, Ordering::SeqCst);
         Ok(new_offset as usize)
@@ -615,10 +666,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .ok_or(super::errors::TruncateError::ClosedFd)?;
         let desc = &entry.entry;
 
-        // if !desc.write_allowed {
-        //     return Err(super::errors::TruncateError::NotForWriting);
-        // }
-
         if desc.qid.typ.contains(fcall::QidType::DIR) {
             return Err(super::errors::TruncateError::IsDirectory);
         }
@@ -633,8 +680,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         };
 
         self.client
-            .setattr(desc.fid, fcall::SetattrMask::SIZE, stat)
-            .map_err(|_| super::errors::TruncateError::ClosedFd)?;
+            .setattr(desc.fid, fcall::SetattrMask::SIZE, stat)?;
 
         if reset_offset {
             desc.offset.store(0, Ordering::SeqCst);
@@ -648,14 +694,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         path: impl crate::path::Arg,
         mode: super::Mode,
     ) -> Result<(), super::errors::ChmodError> {
-        let path_str = path
-            .as_rust_str()
-            .map_err(|_| super::errors::PathError::InvalidPathname)?;
-
-        let fid = self.walk_to(path_str).map_err(|e| match e {
-            Error::NotFound => super::errors::PathError::NoSuchFileOrDirectory.into(),
-            _ => super::errors::ChmodError::ReadOnlyFileSystem,
-        })?;
+        let path = self.absolute_path(path)?;
+        let fid = self.walk_to(&path)?;
 
         let stat = fcall::SetAttr {
             mode: mode.bits(),
@@ -669,7 +709,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let result = self.client.setattr(fid, fcall::SetattrMask::MODE, stat);
         let _ = self.client.clunk(fid);
 
-        result.map_err(|_| super::errors::ChmodError::NotTheOwner)
+        result.map_err(ChmodError::from)
     }
 
     fn chown(
@@ -678,14 +718,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), super::errors::ChownError> {
-        let path_str = path
-            .as_rust_str()
-            .map_err(|_| super::errors::PathError::InvalidPathname)?;
-
-        let fid = self.walk_to(path_str).map_err(|e| match e {
-            Error::NotFound => super::errors::PathError::NoSuchFileOrDirectory.into(),
-            _ => super::errors::ChownError::ReadOnlyFileSystem,
-        })?;
+        let path = self.absolute_path(path)?;
+        let fid = self.walk_to(&path)?;
 
         let mut valid = fcall::SetattrMask::empty();
         let uid = match user {
@@ -714,7 +748,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let result = self.client.setattr(fid, valid, stat);
         let _ = self.client.clunk(fid);
 
-        result.map_err(|_| super::errors::ChownError::NotTheOwner)
+        result.map_err(ChownError::from)
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {
@@ -783,20 +817,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     fn file_status(
         &self,
         path: impl crate::path::Arg,
-    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let path_str = path
-            .as_rust_str()
-            .map_err(|_| super::errors::PathError::InvalidPathname)?;
-
-        let fid = self
-            .walk_to(path_str)
-            .map_err(|_| super::errors::PathError::NoSuchFileOrDirectory)?;
+    ) -> Result<super::FileStatus, FileStatusError> {
+        let path = self.absolute_path(path)?;
+        let fid = self.walk_to(&path)?;
 
         let result = self.client.getattr(fid, fcall::GetattrMask::ALL);
         let _ = self.client.clunk(fid);
 
-        let attr = result.map_err(|_| super::errors::PathError::NoSuchFileOrDirectory)?;
-        Ok(Self::rgetattr_to_file_status(&attr))
+        result
+            .map(|attr| Self::rgetattr_to_file_status(&attr))
+            .map_err(FileStatusError::from)
     }
 
     fn fd_file_status(
@@ -809,10 +839,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .ok_or(super::errors::FileStatusError::ClosedFd)?;
         let desc = &entry.entry;
 
-        let attr = self
-            .client
-            .getattr(desc.fid, fcall::GetattrMask::ALL)
-            .map_err(|_| super::errors::FileStatusError::ClosedFd)?;
+        let attr = self.client.getattr(desc.fid, fcall::GetattrMask::ALL)?;
 
         Ok(Self::rgetattr_to_file_status(&attr))
     }

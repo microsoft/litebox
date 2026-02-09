@@ -54,7 +54,7 @@ pub trait Write {
 }
 
 /// Write a 9P message to a transport
-pub(crate) fn write_message<W: Write>(
+pub(super) fn write_message<W: Write>(
     w: &mut W,
     buf: &mut Vec<u8>,
     fcall: &super::fcall::TaggedFcall<'_>,
@@ -64,7 +64,7 @@ pub(crate) fn write_message<W: Write>(
 }
 
 /// Read a 9P message size header (4 bytes) and then the full message
-pub(crate) fn read_to_buf<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), super::Error> {
+pub(super) fn read_to_buf<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), super::Error> {
     buf.resize(4, 0);
     r.read_exact(&mut buf[..]).map_err(|_| super::Error::Io)?;
     let sz = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
@@ -80,7 +80,7 @@ pub(crate) fn read_to_buf<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), s
 }
 
 /// Read a 9P message from a transport
-pub(crate) fn read_message<'a, R: Read>(
+pub(super) fn read_message<'a, R: Read>(
     r: &mut R,
     buf: &'a mut Vec<u8>,
 ) -> Result<super::fcall::TaggedFcall<'a>, super::Error> {
