@@ -3,8 +3,6 @@
 
 //! VTL1 physical memory layout (LVBS-specific)
 
-use thiserror::Error;
-
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SHIFT: usize = 12;
 pub const PTES_PER_PAGE: usize = 512;
@@ -13,7 +11,6 @@ pub const VSM_PMD_SIZE: usize = PAGE_SIZE * PTES_PER_PAGE;
 pub const VSM_SK_INITIAL_MAP_SIZE: usize = 16 * 1024 * 1024;
 pub const VSM_SK_PTE_PAGES_COUNT: usize = VSM_SK_INITIAL_MAP_SIZE / VSM_PMD_SIZE;
 
-pub const VTL1_TOTAL_MEMORY_SIZE: usize = 128 * 1024 * 1024;
 pub const VTL1_PRE_POPULATED_MEMORY_SIZE: usize = VSM_SK_INITIAL_MAP_SIZE;
 
 // physical page frames specified by VTL0 kernel
@@ -24,12 +21,15 @@ pub const VTL1_PDPE_PAGE: usize = 3;
 pub const VTL1_PDE_PAGE: usize = 4;
 pub const VTL1_PTE_0_PAGE: usize = 5;
 
+// use this stack only for per-core VTL startup
+pub const VTL1_KERNEL_STACK_PAGE: usize = VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT;
+
 /// PDPT page for the Phase 1 high-canonical PML4 entry. Placed after the
 /// VTL0-reserved special pages (GDT, TSS, PT pages, stack, boot params,
 /// cmdline) so that all 8 VTL0 PTE pages remain available for the
 /// high-canonical mapping. This page is within the VTL0 identity-mapped
 /// 16 MiB region but is otherwise unused memory.
-pub const VTL1_REMAP_PDPT_PAGE: usize = VTL1_CMDLINE_PAGE + 1;
+pub const VTL1_REMAP_PDPT_PAGE: usize = VTL1_KERNEL_STACK_PAGE + 1;
 
 /// PDE page for the Phase 1 high-canonical mapping. PDE entries point to
 /// all 8 VTL0 PTE pages (pages 5–12) to establish 4KB-granularity mappings
@@ -46,16 +46,6 @@ const _: () = assert!(
     VTL1_REMAP_PTE_COUNT <= PTES_PER_PAGE,
     "Phase 1 remap assumes all PTE pages fit in a single PDE page"
 );
-
-// use this stack only for per-core VTL startup
-pub const VTL1_KERNEL_STACK_PAGE: usize = VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT;
-
-// TODO: VTL1_BOOT_PARAMS_PAGE and VTL1_CMDLINE_PAGE will be removed in an
-// upcoming PR: boot parameters will be passed as arguments to _start() instead.
-// When that lands, VTL1_REMAP_PDPT_PAGE should follow VTL1_KERNEL_STACK_PAGE
-// directly.
-pub const VTL1_BOOT_PARAMS_PAGE: usize = VTL1_KERNEL_STACK_PAGE + 1;
-pub const VTL1_CMDLINE_PAGE: usize = VTL1_BOOT_PARAMS_PAGE + 1;
 
 // initial heap to add the entire VTL1 physical memory to the kernel page table
 // We need ~256 KiB to cover the entire VTL1 physical memory (128 MiB)
@@ -115,14 +105,4 @@ pub fn get_rela_start_address() -> u64 {
 #[inline]
 pub fn get_rela_end_address() -> u64 {
     &raw const _rela_end as u64
-}
-
-/// Errors for VTL memory operations.
-#[derive(Debug, Error, PartialEq)]
-#[non_exhaustive]
-pub enum VtlMemoryError {
-    #[error("invalid boot parameters")]
-    InvalidBootParams,
-    #[error("invalid command line")]
-    InvalidCmdLine,
 }
