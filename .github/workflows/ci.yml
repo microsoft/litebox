@@ -29,9 +29,9 @@ jobs:
       RUSTDOCFLAGS: -Dwarnings
     steps:
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Use Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-linux-gnu
@@ -47,7 +47,7 @@ jobs:
           sudo apt install -y iperf3
       - uses: Swatinem/rust-cache@v2
       - name: Cache custom out directories
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
@@ -81,7 +81,7 @@ jobs:
       RUSTFLAGS: -Dwarnings
     steps:
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - run: sudo apt update && sudo apt install -y gcc-multilib
       - name: Set up Rust
         run: |
@@ -95,7 +95,7 @@ jobs:
           sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
       - uses: Swatinem/rust-cache@v2
       - name: Cache custom out directories
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
@@ -115,7 +115,7 @@ jobs:
       RUSTFLAGS: -Dwarnings
     steps:
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       # LVBS requires a nightly toolchain because:
       # 1. It uses a custom target (x86_64_vtl1.json) for bare-metal VTL1 kernel development
       # 2. The custom target requires `-Z build-std` to build core/alloc from source
@@ -143,7 +143,7 @@ jobs:
           sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
       - uses: Swatinem/rust-cache@v2
       - name: Cache custom out directories
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
@@ -172,7 +172,7 @@ jobs:
       RUSTDOCFLAGS: -Dwarnings
     steps:
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-pc-windows-msvc
@@ -200,7 +200,7 @@ jobs:
       RUSTFLAGS: -Dwarnings
     steps:
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Set up Rust
         run: |
           RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_snp/rust-toolchain.toml)
@@ -221,7 +221,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-none
