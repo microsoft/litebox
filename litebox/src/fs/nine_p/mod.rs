@@ -12,7 +12,6 @@
 //!
 //! The 9P implementation is split into several submodules:
 //! - `fcall` - Protocol message definitions and encoding/decoding
-//! - `cursor` - Write cursor utilities for message encoding
 //! - `transport` - Transport layer traits and message I/O
 //! - `client` - High-level 9P client for protocol operations
 
@@ -33,7 +32,6 @@ use crate::path::Arg;
 use crate::{LiteBox, sync};
 
 mod client;
-// mod cursor;
 mod fcall;
 
 pub mod transport;
@@ -99,7 +97,15 @@ impl From<Error> for OpenError {
             Error::NotFound => OpenError::PathError(PathError::NoSuchFileOrDirectory),
             Error::AlreadyExists => OpenError::AlreadyExists,
             Error::PermissionDenied => OpenError::AccessNotAllowed,
-            _ => unimplemented!("convert {e:?} to OpenError"),
+            Error::NotADirectory => OpenError::PathError(PathError::ComponentNotADirectory),
+            Error::InvalidPathname => OpenError::PathError(PathError::InvalidPathname),
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::IsADirectory
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to OpenError"),
         }
     }
 }
@@ -109,7 +115,16 @@ impl From<Error> for ReadError {
         match e {
             Error::NotFound => ReadError::NotAFile,
             Error::PermissionDenied => ReadError::NotForReading,
-            _ => unimplemented!("convert {e:?} to ReadError"),
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::InvalidPathname
+            | Error::AlreadyExists
+            | Error::NotADirectory
+            | Error::IsADirectory
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to ReadError"),
         }
     }
 }
@@ -119,7 +134,16 @@ impl From<Error> for WriteError {
         match e {
             Error::NotFound => WriteError::NotAFile,
             Error::PermissionDenied => WriteError::NotForWriting,
-            _ => unimplemented!("convert {e:?} to WriteError"),
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::InvalidPathname
+            | Error::AlreadyExists
+            | Error::NotADirectory
+            | Error::IsADirectory
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to WriteError"),
         }
     }
 }
@@ -130,7 +154,15 @@ impl From<Error> for MkdirError {
             Error::NotFound => MkdirError::PathError(PathError::NoSuchFileOrDirectory),
             Error::AlreadyExists => MkdirError::AlreadyExists,
             Error::PermissionDenied => MkdirError::NoWritePerms,
-            _ => unimplemented!("convert {e:?} to MkdirError"),
+            Error::NotADirectory => MkdirError::PathError(PathError::ComponentNotADirectory),
+            Error::InvalidPathname => MkdirError::PathError(PathError::InvalidPathname),
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::IsADirectory
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to MkdirError"),
         }
     }
 }
@@ -139,7 +171,17 @@ impl From<Error> for ReadDirError {
     fn from(e: Error) -> Self {
         match e {
             Error::NotFound => ReadDirError::NotADirectory,
-            _ => unimplemented!("convert {e:?} to ReadDirError"),
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::InvalidPathname
+            | Error::AlreadyExists
+            | Error::PermissionDenied
+            | Error::NotADirectory
+            | Error::IsADirectory
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to ReadDirError"),
         }
     }
 }
@@ -150,7 +192,15 @@ impl From<Error> for UnlinkError {
             Error::NotFound => UnlinkError::PathError(PathError::NoSuchFileOrDirectory),
             Error::IsADirectory => UnlinkError::IsADirectory,
             Error::PermissionDenied => UnlinkError::NoWritePerms,
-            _ => unimplemented!("convert {e:?} to UnlinkError"),
+            Error::NotADirectory => UnlinkError::PathError(PathError::ComponentNotADirectory),
+            Error::InvalidPathname => UnlinkError::PathError(PathError::InvalidPathname),
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::AlreadyExists
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to UnlinkError"),
         }
     }
 }
@@ -161,7 +211,15 @@ impl From<Error> for RmdirError {
             Error::NotFound => RmdirError::PathError(PathError::NoSuchFileOrDirectory),
             Error::NotADirectory => RmdirError::NotADirectory,
             Error::PermissionDenied => RmdirError::NoWritePerms,
-            _ => unimplemented!("convert {e:?} to RmdirError"),
+            Error::InvalidPathname => RmdirError::PathError(PathError::InvalidPathname),
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::AlreadyExists
+            | Error::IsADirectory
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to RmdirError"),
         }
     }
 }
@@ -170,7 +228,17 @@ impl From<Error> for FileStatusError {
     fn from(e: Error) -> Self {
         match e {
             Error::NotFound => FileStatusError::PathError(PathError::NoSuchFileOrDirectory),
-            _ => unimplemented!("convert {e:?} to FileStatusError"),
+            Error::InvalidPathname => FileStatusError::PathError(PathError::InvalidPathname),
+            Error::NotADirectory => FileStatusError::PathError(PathError::ComponentNotADirectory),
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::AlreadyExists
+            | Error::PermissionDenied
+            | Error::IsADirectory
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to FileStatusError"),
         }
     }
 }
@@ -179,7 +247,17 @@ impl From<Error> for SeekError {
     fn from(e: Error) -> Self {
         match e {
             Error::NotFound => SeekError::ClosedFd,
-            _ => unimplemented!("convert {e:?} to SeekError"),
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::InvalidPathname
+            | Error::AlreadyExists
+            | Error::PermissionDenied
+            | Error::NotADirectory
+            | Error::IsADirectory
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to SeekError"),
         }
     }
 }
@@ -189,7 +267,16 @@ impl From<Error> for TruncateError {
         match e {
             Error::NotFound => TruncateError::ClosedFd,
             Error::IsADirectory => TruncateError::IsDirectory,
-            _ => unimplemented!("convert {e:?} to TruncateError"),
+            Error::PermissionDenied => TruncateError::NotForWriting,
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::InvalidPathname
+            | Error::AlreadyExists
+            | Error::NotADirectory
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to TruncateError"),
         }
     }
 }
@@ -198,7 +285,17 @@ impl From<Error> for ChmodError {
     fn from(e: Error) -> Self {
         match e {
             Error::NotFound => ChmodError::PathError(PathError::NoSuchFileOrDirectory),
-            _ => unimplemented!("convert {e:?} to ChmodError"),
+            Error::InvalidPathname => ChmodError::PathError(PathError::InvalidPathname),
+            Error::NotADirectory => ChmodError::PathError(PathError::ComponentNotADirectory),
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::AlreadyExists
+            | Error::PermissionDenied
+            | Error::IsADirectory
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to ChmodError"),
         }
     }
 }
@@ -207,7 +304,17 @@ impl From<Error> for ChownError {
     fn from(e: Error) -> Self {
         match e {
             Error::NotFound => ChownError::PathError(PathError::NoSuchFileOrDirectory),
-            _ => unimplemented!("convert {e:?} to ChownError"),
+            Error::InvalidPathname => ChownError::PathError(PathError::InvalidPathname),
+            Error::NotADirectory => ChownError::PathError(PathError::ComponentNotADirectory),
+            Error::Io
+            | Error::InvalidInput
+            | Error::InvalidResponse
+            | Error::AlreadyExists
+            | Error::PermissionDenied
+            | Error::IsADirectory
+            | Error::NameTooLong
+            | Error::Connection
+            | Error::NotSupported => unimplemented!("convert {e:?} to ChownError"),
         }
     }
 }
@@ -233,7 +340,9 @@ impl From<Rlerror> for Error {
             EISDIR => Error::IsADirectory,
             ENAMETOOLONG => Error::NameTooLong,
             ENOSYS | EOPNOTSUPP => Error::NotSupported,
-            _ => unimplemented!("convert remote error code {} to Error", err),
+            // Unrecognized remote error codes are mapped to a generic I/O error.
+            // This loses the specific error code but avoids panicking at runtime.
+            _ => Error::Io,
         }
     }
 }
@@ -293,12 +402,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         path: &str,
     ) -> Result<Self, Error> {
         let client = client::Client::new(transport, msize)?;
-        let (root_qid, root_fid) = client.attach(username, path)?;
+        let (qid, fid) = client.attach(username, path)?;
 
         Ok(Self {
             litebox: litebox.clone(),
             client,
-            root: (root_qid, root_fid, String::from(path)),
+            root: (qid, fid, String::from(path)),
             current_working_dir: String::from("/"),
             unlinkat_supported: AtomicBool::new(true),
         })
@@ -514,6 +623,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
     super::FileSystem for FileSystem<Platform, T>
 {
+    #[expect(clippy::similar_names)]
     fn open(
         &self,
         path: impl crate::path::Arg,
@@ -533,26 +643,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
 
         let path = self.absolute_path(path)?;
-        let components: Vec<&str> = path.split("/").collect();
+        let components: Vec<&str> = path.normalized_components().map_err(|_| OpenError::PathError(PathError::InvalidPathname))?.collect();
         let lflags = Self::oflags_to_lopen(flags);
         let needs_create = flags.contains(super::OFlags::CREAT);
 
-        let (newqid, newfid) = if needs_create {
+        let (new_qid, new_fid) = if needs_create {
             let (_, dfid) = self
                 .client
                 .walk(self.root.1, &components[..components.len() - 1])?;
             self.client
                 .create(dfid, components.last().unwrap(), lflags, mode.bits(), 0)?
         } else {
-            let (_, newfid) = self.client.walk(self.root.1, &components)?;
-            let qid = self.client.open(newfid, lflags)?;
-            (qid, newfid)
+            let (_, new_fid) = self.client.walk(self.root.1, &components)?;
+            let qid = self.client.open(new_fid, lflags)?;
+            (qid, new_fid)
         };
 
         let descriptor = Descriptor {
-            fid: newfid,
+            fid: new_fid,
             offset: AtomicU64::new(0),
-            qid: newqid,
+            qid: new_qid,
         };
 
         let fd = self.litebox.descriptor_table_mut().insert(descriptor);

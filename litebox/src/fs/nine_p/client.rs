@@ -106,10 +106,10 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// * `max_msize` - Maximum message size to request
     pub(super) fn new(mut transport: T, max_msize: u32) -> Result<Self, Error> {
         const MIN_MSIZE: u32 = 4096 + fcall::READDIRHDRSZ;
-        let bufsize = max_msize.max(MIN_MSIZE) as usize;
+        let bufsize = max_msize.max(MIN_MSIZE);
 
-        let mut wbuf = Vec::with_capacity(bufsize);
-        let mut rbuf = Vec::with_capacity(bufsize);
+        let mut wbuf = Vec::with_capacity(bufsize as usize);
+        let mut rbuf = Vec::with_capacity(bufsize as usize);
 
         // Perform version handshake
         transport::write_message(
@@ -118,7 +118,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             &TaggedFcall {
                 tag: fcall::NOTAG,
                 fcall: Fcall::Tversion(fcall::Tversion {
-                    msize: bufsize as u32,
+                    msize: bufsize,
                     version: "9P2000.L".into(),
                 }),
             },
@@ -135,7 +135,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 if version.as_bytes() != b"9P2000.L" {
                     return Err(Error::InvalidResponse);
                 }
-                msize.min(bufsize as u32)
+                msize.min(bufsize)
             }
             TaggedFcall {
                 fcall: Fcall::Rlerror(e),
@@ -154,11 +154,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             fids: FidGenerator::new(),
             next_tag: AtomicU32::new(1),
         })
-    }
-
-    /// Get the negotiated message size
-    pub(super) fn msize(&self) -> u32 {
-        self.msize
     }
 
     /// Send a request and wait for the response
@@ -213,8 +208,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     ///
     /// The given wnames should not exceed the maximum number of elements (fcall::MAXWELEM),
     /// which is checked at the beginning of the function. This is an internal function that
-    /// is used by [`_walk`](Client::_walk), which handles the case where the number of elements exceeds the limit.
-    fn _walk1(
+    /// is used by [`walk_chunked`](Client::walk_chunked), which handles the case where the number of elements exceeds the limit.
+    fn walk_once(
         &self,
         fid: fcall::Fid,
         wnames: &[FcallStr],
@@ -241,18 +236,18 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Walks the path from the given fid, handling paths longer than fcall::MAXWELEM by walking in chunks.
     ///
     /// Returns the qids for each path component and a new fid for the final location on success.
-    fn _walk(
+    fn walk_chunked(
         &self,
         fid: fcall::Fid,
         wnames: &[FcallStr],
     ) -> Result<(Vec<fcall::Qid>, fcall::Fid), Error> {
         if wnames.is_empty() {
-            return self._walk1(fid, wnames);
+            return self.walk_once(fid, wnames);
         }
         let mut wqids = Vec::with_capacity(fcall::MAXWELEM);
         let mut f = fid;
         for wnames in wnames.chunks(fcall::MAXWELEM) {
-            let (mut new_wqids, new_f) = self._walk1(f, wnames)?;
+            let (mut new_wqids, new_f) = self.walk_once(f, wnames)?;
             let new_len = new_wqids.len();
             wqids.append(&mut new_wqids);
             // Clunk the old fid if it's not the original fid
@@ -262,10 +257,11 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             f = new_f;
             // It means that the walk failed at the nwqid-th element
             if new_len < wnames.len() {
-                if let Some(e) = wqids.last() {
-                    if e.typ == fcall::QidType::SYMLINK {
-                        todo!("symlink");
-                    }
+                if wqids
+                    .last()
+                    .is_some_and(|e| e.typ == fcall::QidType::SYMLINK)
+                {
+                    todo!("symlink");
                 }
                 let _ = self.clunk(f);
                 return Err(Error::NotFound);
@@ -282,8 +278,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         fid: fcall::Fid,
         wnames: &[S],
     ) -> Result<(Vec<fcall::Qid>, fcall::Fid), Error> {
-        let wnames: Vec<FcallStr> = wnames.iter().map(|s| s.into()).collect();
-        self._walk(fid, &wnames)
+        let wnames: Vec<FcallStr> = wnames.iter().map(Into::into).collect();
+        self.walk_chunked(fid, &wnames)
     }
 
     /// Open a file

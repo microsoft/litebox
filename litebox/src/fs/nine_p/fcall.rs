@@ -8,9 +8,7 @@
 
 use core::fmt::Display;
 
-use crate::fs::nine_p::transport::Write;
-
-use super::transport;
+use super::transport::{self, Write};
 use alloc::{borrow::Cow, vec::Vec};
 use bitflags::bitflags;
 
@@ -209,10 +207,6 @@ impl<'a> FcallStr<'a> {
         self.as_bytes().len()
     }
 
-    /// Check if the string is empty
-    pub fn is_empty(&self) -> bool {
-        self.as_bytes().is_empty()
-    }
 }
 
 impl<'a, T: ?Sized + AsRef<[u8]>> From<&'a T> for FcallStr<'a> {
@@ -472,12 +466,12 @@ impl DirEntry<'_> {
 /// File lock request
 #[derive(Clone, Debug)]
 pub(super) struct Flock<'a> {
-    pub typ: LockType,
-    pub flags: LockFlag,
-    pub start: u64,
-    pub length: u64,
-    pub proc_id: u32,
-    pub client_id: FcallStr<'a>,
+    typ: LockType,
+    flags: LockFlag,
+    start: u64,
+    length: u64,
+    proc_id: u32,
+    client_id: FcallStr<'a>,
 }
 
 /// Get lock request
@@ -1053,7 +1047,7 @@ impl<'a> Twalk<'a> {
         Twalk {
             fid: self.fid,
             new_fid: self.new_fid,
-            wnames: self.wnames.iter().map(|n| n.clone_static()).collect(),
+            wnames: self.wnames.iter().map(FcallStr::clone_static).collect(),
         }
     }
 }
@@ -1447,8 +1441,8 @@ impl<'a> From<Twrite<'a>> for Fcall<'a> {
 /// Tagged 9P message
 #[derive(Clone, Debug)]
 pub(super) struct TaggedFcall<'a> {
-    pub tag: u16,
-    pub fcall: Fcall<'a>,
+    pub(super) tag: u16,
+    pub(super) fcall: Fcall<'a>,
 }
 
 impl<'a> TaggedFcall<'a> {
