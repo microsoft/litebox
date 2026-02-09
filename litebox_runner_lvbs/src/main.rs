@@ -118,11 +118,17 @@ unsafe fn apply_relocations() {
 
 #[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
+pub unsafe extern "C" fn _start(possible_cpus: u64, mem_pa: u64, mem_size: u64) -> ! {
+    // possible_cpus and start memory address and vtl1 memory size are captured
+    // from rdi/rsi/rdx immediately as function parameters, before any code runs.
+    // They're stored on the stack and survive relocations (which only patch binary
+    // addresses, not stack).
+
     let core_id = get_core_id();
     if core_id == 0 {
         unsafe {
             apply_relocations();
+            parse_boot_info(possible_cpus as u32, mem_pa, mem_size);
         }
     }
 
@@ -148,10 +154,7 @@ unsafe extern "C" fn kernel_main() -> ! {
         serial_println!("==============================");
         serial_println!(" Hello from LiteBox for LVBS! ");
         serial_println!("==============================");
-
-        parse_boot_info();
     }
-
     let platform = litebox_runner_lvbs::init();
     litebox_runner_lvbs::run(platform)
 }
