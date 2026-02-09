@@ -206,7 +206,6 @@ impl<'a> FcallStr<'a> {
     pub fn len(&self) -> usize {
         self.as_bytes().len()
     }
-
 }
 
 impl<'a, T: ?Sized + AsRef<[u8]>> From<&'a T> for FcallStr<'a> {
@@ -1464,7 +1463,7 @@ impl<'a> TaggedFcall<'a> {
     /// Decode a message from a buffer
     pub fn decode(buf: &'a [u8]) -> Result<TaggedFcall<'a>, super::Error> {
         if buf.len() < 7 {
-            return Err(super::Error::InvalidInput);
+            return Err(super::Error::InvalidResponse);
         }
 
         let mut decoder = FcallDecoder { buf: &buf[4..] };
@@ -1990,7 +1989,7 @@ impl<'b> FcallDecoder<'b> {
             self.buf = &self.buf[1..];
             Ok(*v)
         } else {
-            Err(super::Error::InvalidInput)
+            Err(super::Error::InvalidResponse)
         }
     }
 
@@ -2000,7 +1999,7 @@ impl<'b> FcallDecoder<'b> {
             self.buf = &self.buf[2..];
             Ok(v)
         } else {
-            Err(super::Error::InvalidInput)
+            Err(super::Error::InvalidResponse)
         }
     }
 
@@ -2010,7 +2009,7 @@ impl<'b> FcallDecoder<'b> {
             self.buf = &self.buf[4..];
             Ok(v)
         } else {
-            Err(super::Error::InvalidInput)
+            Err(super::Error::InvalidResponse)
         }
     }
 
@@ -2020,7 +2019,7 @@ impl<'b> FcallDecoder<'b> {
             self.buf = &self.buf[8..];
             Ok(v)
         } else {
-            Err(super::Error::InvalidInput)
+            Err(super::Error::InvalidResponse)
         }
     }
 
@@ -2031,7 +2030,7 @@ impl<'b> FcallDecoder<'b> {
             self.buf = &self.buf[n..];
             Ok(v)
         } else {
-            Err(super::Error::InvalidInput)
+            Err(super::Error::InvalidResponse)
         }
     }
 
@@ -2042,7 +2041,7 @@ impl<'b> FcallDecoder<'b> {
             self.buf = &self.buf[n..];
             Ok(Cow::from(v))
         } else {
-            Err(super::Error::InvalidInput)
+            Err(super::Error::InvalidResponse)
         }
     }
 
@@ -2396,7 +2395,7 @@ impl<'b> FcallDecoder<'b> {
                 fid: self.decode_u32()?,
             }),
             Some(FcallType::Rremove) => Fcall::Rremove(Rremove {}),
-            None => return Err(super::Error::InvalidInput),
+            None => return Err(super::Error::InvalidResponse),
         };
         Ok(TaggedFcall { tag, fcall })
     }
