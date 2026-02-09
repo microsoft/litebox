@@ -78,22 +78,17 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
                     .pm
                     .handle_page_fault(info.cr2, info.error_code.into())
             };
-            return if info.kernel_mode {
-                if result.is_ok() {
+            if info.kernel_mode {
+                return if result.is_ok() {
                     ContinueOperation::ExceptionHandled
                 } else {
                     ContinueOperation::ExceptionFixup
-                }
-            } else if result.is_ok() {
-                ContinueOperation::ResumeGuest
-            } else {
-                // User-mode page fault that couldn't be resolved;
-                // fall through to kill the TA below.
-                return {
-                    ctx.rax = (TeeResult::TargetDead as u32) as usize;
-                    ContinueOperation::ExitThread
                 };
-            };
+            } else if result.is_ok() {
+                return ContinueOperation::ResumeGuest;
+            }
+            // User-mode page fault that couldn't be resolved;
+            // fall through to kill the TA below.
         }
         // OP-TEE has no signal handling. Kill the TA on any non-PF exception.
         ctx.rax = (TeeResult::TargetDead as u32) as usize;

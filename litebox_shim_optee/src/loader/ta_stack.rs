@@ -289,9 +289,8 @@ pub(crate) fn allocate_stack(task: &crate::Task, stack_base: Option<usize>) -> O
                 .create_stack_pages(
                     None,
                     length,
-                    // Pre-populate because the shim writes to the stack from kernel mode
-                    // (e.g., push_bytes via memcpy_fallible) before the TA runs, and
-                    // kernel-mode demand paging is not yet supported.
+                    // Pre-populate: stack initialization runs before run_thread_arch
+                    // sets up the kernel-mode demand paging infrastructure.
                     CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                 )
                 .ok()?

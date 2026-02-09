@@ -120,6 +120,8 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
                 MapFlags::MAP_ANONYMOUS
                     | MapFlags::MAP_PRIVATE
                     | MapFlags::MAP_FIXED
+                    // Pre-populate: ELF loading runs before run_thread_arch sets up
+                    // the kernel-mode demand paging infrastructure.
                     | MapFlags::MAP_POPULATE,
                 -1,
                 offset.truncate(),
@@ -157,6 +159,8 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
             MapFlags::MAP_ANONYMOUS
                 | MapFlags::MAP_PRIVATE
                 | MapFlags::MAP_FIXED
+                // Pre-populate: ELF loading runs before run_thread_arch sets up
+                // the kernel-mode demand paging infrastructure.
                 | MapFlags::MAP_POPULATE,
             -1,
             0,

@@ -1713,6 +1713,7 @@ unsafe extern "C-unwind" fn exception_handler(
         exception,
         error_code,
         cr2,
+        kernel_mode: false,
     };
 
     thread_ctx.call_shim(|shim, ctx, _interrupt| shim.exception(ctx, &info));
@@ -1753,6 +1754,12 @@ impl ThreadContext<'_> {
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
             ContinueOperation::ExitThread => {}
+            ContinueOperation::ExceptionHandled => {
+                panic!("ExceptionHandled not expected in windows_userland")
+            }
+            ContinueOperation::ExceptionFixup => {
+                panic!("ExceptionFixup not expected in windows_userland")
+            }
         }
     }
 }
@@ -1792,6 +1799,25 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 impl litebox::platform::CrngProvider for WindowsUserland {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
         getrandom::fill(buf).expect("getrandom failed");
+    }
+}
+
+/// Dummy `VmemPageFaultHandler`.
+///
+/// Page faults are handled transparently by the host Windows kernel.
+/// Provided to satisfy trait bounds for `PageManager::handle_page_fault`.
+impl litebox::mm::linux::VmemPageFaultHandler for WindowsUserland {
+    unsafe fn handle_page_fault(
+        &self,
+        _fault_addr: usize,
+        _flags: litebox::mm::linux::VmFlags,
+        _error_code: u64,
+    ) -> Result<(), litebox::mm::linux::PageFaultError> {
+        unreachable!("host kernel handles page faults for Windows userland")
+    }
+
+    fn access_error(_error_code: u64, _flags: litebox::mm::linux::VmFlags) -> bool {
+        unreachable!("host kernel handles page faults for Windows userland")
     }
 }
 

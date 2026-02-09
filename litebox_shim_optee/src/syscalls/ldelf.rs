@@ -60,10 +60,7 @@ impl Task {
         // `sys_map_zi` always creates read/writeable mapping.
         //
         // We map with PROT_READ_WRITE first, then mprotect padding regions to PROT_NONE.
-        // Pre-populate because ldelf (user mode) accesses these pages immediately after
-        // mapping, and kernel-mode demand paging is not yet supported for the
-        // exception_callback path during early TA loading.
-        let mut flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_POPULATE;
+        let mut flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
         if addr != 0 {
             flags |= MapFlags::MAP_FIXED;
         }
@@ -188,10 +185,7 @@ impl Task {
         }
         // We map with PROT_READ_WRITE first, then mprotect padding regions to PROT_NONE as
         // explained in `sys_map_zi`.
-        // Pre-populate because `read_ta_bin` writes to these pages from kernel mode
-        // via memcpy_fallible, and kernel-mode demand paging is not yet supported.
-        let mut flags_internal =
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_POPULATE;
+        let mut flags_internal = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
         if addr != 0 {
             flags_internal |= MapFlags::MAP_FIXED;
         }

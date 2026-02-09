@@ -94,27 +94,19 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        if info.exception == litebox::shim::Exception::PAGE_FAULT {
-            let result = unsafe {
+        if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
+            if unsafe {
                 self.task
                     .global
                     .pm
                     .handle_page_fault(info.cr2, info.error_code.into())
-            };
-            return if info.kernel_mode {
-                if result.is_ok() {
-                    ContinueOperation::ExceptionHandled
-                } else {
-                    ContinueOperation::ExceptionFixup
-                }
-            } else if result.is_ok() {
-                ContinueOperation::ResumeGuest
+            }
+            .is_ok()
+            {
+                return ContinueOperation::ExceptionHandled;
             } else {
-                // User-mode page fault that couldn't be resolved;
-                // fall through to signal delivery below.
-                return self
-                    .enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info));
-            };
+                return ContinueOperation::ResumeGuest;
+            }
         }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
