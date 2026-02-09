@@ -16,12 +16,12 @@ use crate::{
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
-        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN, HV_X64_REGISTER_APIC_BASE,
-        HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER,
-        HV_X64_REGISTER_LSTAR, HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR,
-        HV_X64_REGISTER_SYSENTER_CS, HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
-        HvCrInterceptControlFlags, HvPageProtFlags, HvRegisterVsmPartitionConfig,
-        HvRegisterVsmVpSecureVtlConfig, VsmFunction, X86Cr0Flags, X86Cr4Flags,
+        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_X64_REGISTER_APIC_BASE, HV_X64_REGISTER_CR0,
+        HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER, HV_X64_REGISTER_LSTAR,
+        HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR, HV_X64_REGISTER_SYSENTER_CS,
+        HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP, HvCrInterceptControlFlags,
+        HvPageProtFlags, HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig, VsmFunction,
+        X86Cr0Flags, X86Cr4Flags,
         error::VsmError,
         heki::{
             HekiKdataType, HekiKernelInfo, HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch,
@@ -112,12 +112,9 @@ pub fn mshv_vsm_enable_aps(_cpu_present_mask_pfn: u64) -> Result<i64, VsmError> 
 
 /// VSM function for enabling VTL and booting APs
 /// `cpu_online_mask_pfn` indicates the page containing the VTL0's CPU online mask.
-/// `boot_signal_pfn` indicates the boot signal page to let VTL0 know that VTL1 is ready.
-pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i64, VsmError> {
+pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Boot APs");
     let cpu_online_mask_page_addr = PhysAddr::try_new(cpu_online_mask_pfn << PAGE_SHIFT)
-        .map_err(|_| VsmError::InvalidPhysicalAddress)?;
-    let boot_signal_page_addr = PhysAddr::try_new(boot_signal_pfn << PAGE_SHIFT)
         .map_err(|_| VsmError::InvalidPhysicalAddress)?;
 
     let Some(cpu_mask) = (unsafe {
@@ -135,26 +132,14 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
         debug_serial_println!("");
     }
 
-    // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
-    let Some(mut boot_signal_page_buf) = (unsafe {
-        crate::platform_low().copy_from_vtl0_phys::<AlignedPage>(boot_signal_page_addr)
-    }) else {
-        return Err(VsmError::BootSignalPageCopyFailed);
-    };
-
     let mut error = None;
 
     // Initialize VTL for each online CPU and update its boot signal byte
     cpu_mask.for_each_cpu(|cpu_id| {
-        if cpu_id > boot_signal_page_buf.0.len() - 1 {
-            error = Some(HypervCallError::InvalidInput);
-            return;
-        }
         let cpu_id_u32: u32 = cpu_id.truncate();
         if let Err(e) = init_vtl_ap(cpu_id_u32) {
             error = Some(e);
         }
-        boot_signal_page_buf.0[cpu_id] = HV_SECURE_VTL_BOOT_TOKEN;
     });
 
     if let Some(e) = error {
@@ -164,14 +149,7 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
     // Store the cpu_online_mask for later use
     CPU_ONLINE_MASK.call_once(|| cpu_mask);
 
-    if unsafe {
-        crate::platform_low()
-            .copy_to_vtl0_phys::<AlignedPage>(boot_signal_page_addr, &boot_signal_page_buf)
-    } {
-        Ok(0)
-    } else {
-        Err(VsmError::BootSignalWriteFailed)
-    }
+    Ok(0)
 }
 
 /// VSM function for enforcing certain security features of VTL0
@@ -920,7 +898,7 @@ fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i6
 pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
     let result: Result<i64, VsmError> = match func_id {
         VsmFunction::EnableAPsVtl => mshv_vsm_enable_aps(params[0]),
-        VsmFunction::BootAPs => mshv_vsm_boot_aps(params[0], params[1]),
+        VsmFunction::BootAPs => mshv_vsm_boot_aps(params[0]),
         VsmFunction::LockRegs => mshv_vsm_lock_regs(),
         VsmFunction::SignalEndOfBoot => Ok(mshv_vsm_end_of_boot()),
         VsmFunction::ProtectMemory => mshv_vsm_protect_memory(params[0], params[1]),
