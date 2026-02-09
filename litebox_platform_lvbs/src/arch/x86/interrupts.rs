@@ -171,30 +171,51 @@ extern "C" fn general_protection_fault_handler_impl(regs: &PtRegs) {
     );
 }
 
+/// Fault was handled via exception table fixup. The ISR stub should
+/// `pop_regs + iretq` to resume at the fixup address.
+const PF_HANDLED: usize = 0;
+
+/// Demand paging is needed for a user-space address. Exception info has been
+/// stored in per-CPU variables.
+const PF_DEMAND_PAGE: usize = 1;
+
 /// Kernel-mode page fault handler (vector 14).
+///
+/// Returns [`PF_HANDLED`] or [`PF_DEMAND_PAGE`] to the ISR stub.
+/// For unrecoverable faults, this function panics and never returns.
 #[unsafe(no_mangle)]
-extern "C" fn page_fault_handler_impl(regs: &mut PtRegs) {
+extern "C" fn page_fault_handler_impl(regs: &mut PtRegs) -> usize {
+    use crate::host::per_cpu_variables::with_per_cpu_variables_asm;
+    use crate::{USER_ADDR_MAX, USER_ADDR_MIN};
     use litebox::mm::exception_table::search_exception_tables;
     use litebox::utils::TruncateExt as _;
     use x86_64::registers::control::Cr2;
 
-    // Check the exception table for a recovery address.
-    // This handles fallible memory operations like memcpy_fallible that access
-    // user-space or VTL0 addresses which might be unmapped.
-    if let Some(fixup_addr) = search_exception_tables(regs.rip) {
-        regs.rip = fixup_addr;
-        return;
-    }
-
-    // TODO: Add kernel-mode demand paging for user-space addresses. We cannot
-    // rely on the exception_callback logic which aims to return to user-space
-    // faulting instructions. Here, we need to return to kernel-space faulting
-    // instruction after handling the page fault. We still require the shim's
-    // support to handle this page fault along with the `VmArea` information.
-
-    // Kernel-mode page fault at kernel-space addresses
     let fault_addr: usize = Cr2::read_raw().truncate();
     let error_code = regs.orig_rax;
+
+    // Kernel-mode page fault at a user-space address: route to the shim's
+    // exception handler for demand paging (and exception table fixup on failure).
+    if (USER_ADDR_MIN..USER_ADDR_MAX).contains(&fault_addr) {
+        with_per_cpu_variables_asm(|pcv| {
+            pcv.set_exception_info(
+                litebox::shim::Exception::PAGE_FAULT,
+                error_code.truncate(),
+                fault_addr,
+                regs.rip,
+            );
+        });
+        return PF_DEMAND_PAGE;
+    }
+
+    // Handle fallible memory operations like memcpy_fallible that access
+    // non-user-space addresses (e.g., VTL0 addresses) which might be unmapped.
+    if let Some(fixup_addr) = search_exception_tables(regs.rip) {
+        regs.rip = fixup_addr;
+        return PF_HANDLED;
+    }
+
+    // Kernel-mode page fault at kernel-space addresses — unrecoverable
     panic!(
         "EXCEPTION: PAGE FAULT\nAccessed Address: {:#x}\nError Code: {:#x}\n{:#x?}",
         fault_addr, error_code, regs

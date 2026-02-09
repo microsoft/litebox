@@ -71,19 +71,31 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        if info.exception == litebox::shim::Exception::PAGE_FAULT
-            && unsafe {
+        if info.exception == litebox::shim::Exception::PAGE_FAULT {
+            let result = unsafe {
                 self.task
                     .global
                     .pm
                     .handle_page_fault(info.cr2, info.error_code.into())
-            }
-            .is_ok()
-        {
-            return ContinueOperation::ResumeGuest;
+            };
+            return if info.kernel_mode {
+                if result.is_ok() {
+                    ContinueOperation::ExceptionHandled
+                } else {
+                    ContinueOperation::ExceptionFixup
+                }
+            } else if result.is_ok() {
+                ContinueOperation::ResumeGuest
+            } else {
+                // User-mode page fault that couldn't be resolved;
+                // fall through to kill the TA below.
+                return {
+                    ctx.rax = (TeeResult::TargetDead as u32) as usize;
+                    ContinueOperation::ExitThread
+                };
+            };
         }
-        // Note: OP-TEE OS doesn't have a concept of signal handling. It kills
-        // the TA on CPU exceptions except for pageable page faults.
+        // OP-TEE has no signal handling. Kill the TA on any non-PF exception.
         ctx.rax = (TeeResult::TargetDead as u32) as usize;
         ContinueOperation::ExitThread
     }

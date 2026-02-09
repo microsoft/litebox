@@ -63,6 +63,7 @@ impl SignalState {
                 exception: litebox::shim::Exception(0),
                 error_code: 0,
                 cr2: 0,
+                kernel_mode: false,
             }),
         }
     }

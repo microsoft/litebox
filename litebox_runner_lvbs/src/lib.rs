@@ -1061,8 +1061,12 @@ fn write_msg_args_to_normal_world(
 }
 
 // use include_bytes! to include ldelf and (KMPP) TA binaries
-const LDELF_BINARY: &[u8] = &[0u8; 0];
-const TA_BINARY: &[u8] = &[0u8; 0];
+// const LDELF_BINARY: &[u8] = &[0u8; 0];
+// const TA_BINARY: &[u8] = &[0u8; 0];
+const LDELF_BINARY: &[u8] =
+    include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/ldelf.elf");
+const TA_BINARY: &[u8] =
+    include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/kmpp-ta.elf");
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

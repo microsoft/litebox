@@ -1607,14 +1607,33 @@ macro_rules! SAVE_PF_USER_CONTEXT_ASM {
     };
 }
 
-/// Restore user context from the memory area pointed by the current `rsp`.
-///
-/// This macro uses the `pop` instructions (i.e., from low addresses up to high ones) such that
-/// it requires the start address of the memory area (not the top one).
-///
-/// Prerequisite: The memory area has `PtRegs` structure containing user context.
+/// Save all general-purpose registers onto the stack.
 #[cfg(target_arch = "x86_64")]
-macro_rules! RESTORE_USER_CONTEXT_ASM {
+macro_rules! SAVE_CPU_CONTEXT_ASM {
+    () => {
+        "
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push rax
+        push r8
+        push r9
+        push r10
+        push r11
+        push rbx
+        push rbp
+        push r12
+        push r13
+        push r14
+        push r15
+        "
+    };
+}
+
+/// Restore all general-purpose registers and skip `orig_rax` from the stack.
+#[cfg(target_arch = "x86_64")]
+macro_rules! RESTORE_CPU_CONTEXT_ASM {
     () => {
         "
         pop r15
@@ -1704,8 +1723,40 @@ unsafe extern "C" fn run_thread_arch(
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
         "mov rdi, [rsp]", // pass `thread_ctx`
+        "xor esi, esi",   // kernel_mode = false
         "call {exception_handler}",
         "jmp done",
+        // Kernel-mode page fault callback: demand paging for user-space addresses.
+        // At this point:
+        // - rsp points to ISR stack with GPRs already saved
+        // - Exception info already stored in per-CPU variables
+        // - GS = kernel (no swapgs needed)
+        // - User extended states already saved by the enclosing syscall/exception path
+        //
+        // Two entry points:
+        //   kernel_exception_callback      - saves GPRs first (for callers without prior push_regs)
+        //   kernel_exception_regs_saved    - GPRs already on stack (from ISR stub's push_regs)
+        ".globl kernel_exception_callback",
+        "kernel_exception_callback:",
+        SAVE_CPU_CONTEXT_ASM!(),
+        ".globl kernel_exception_regs_saved",
+        "kernel_exception_regs_saved:",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "mov rdi, gs:[{cur_kernel_sp_off}]",
+        "mov rdi, [rdi]", // thread_ctx
+        "mov esi, 1",     // kernel_mode = true
+        "call {exception_handler}",
+        // If demand paging failed, rax contains the exception table fixup
+        // address. Patch the saved RIP on the ISR stack so iretq resumes
+        // at the fixup instead of re-faulting.
+        "test rax, rax",
+        "jz 5f",
+        "mov [rbp + 128], rax",     // patch saved RIP (15 GPRs + error_code = 128)
+        "5:",
+        "mov rsp, rbp",
+        RESTORE_CPU_CONTEXT_ASM!(),
+        "iretq",
         ".globl interrupt_callback",
         "interrupt_callback:",
         "jmp done",
@@ -1740,16 +1791,42 @@ unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
-/// Handles user-mode exceptions by reading exception info from per-CPU variables
+/// Handles exceptions by reading exception info from per-CPU variables
 /// and routing to the shim's exception handler.
-unsafe extern "C" fn exception_handler(thread_ctx: &mut ThreadContext) {
-    use crate::host::per_cpu_variables::with_per_cpu_variables_asm;
+///
+/// Returns 0 for normal flow (user-mode or successful demand paging), or
+/// a fixup address when kernel-mode demand paging fails and an exception
+/// table entry exists.
+unsafe extern "C" fn exception_handler(thread_ctx: &mut ThreadContext, kernel_mode: bool) -> usize {
+    use crate::host::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables_asm};
     let info = with_per_cpu_variables_asm(|pcv| litebox::shim::ExceptionInfo {
         exception: pcv.get_exception(),
         error_code: pcv.get_exception_error_code(),
         cr2: pcv.get_exception_cr2(),
+        kernel_mode,
     });
-    thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
+
+    if kernel_mode {
+        // Call the shim directly instead of using `call_shim` because:
+        // - `ExceptionFixup` requires post-processing (exception table lookup)
+        // - Must return a fixup address to the asm caller (not resume user mode)
+        let op = thread_ctx.shim.exception(thread_ctx.ctx, &info);
+        match op {
+            ContinueOperation::ExceptionHandled => 0,
+            ContinueOperation::ExceptionFixup => {
+                let faulting_rip =
+                    with_per_cpu_variables_asm(PerCpuVariablesAsm::get_exception_rip);
+                litebox::mm::exception_table::search_exception_tables(faulting_rip)
+                    .expect("kernel-mode page fault with no exception table fixup")
+            }
+            ContinueOperation::ExitThread | ContinueOperation::ResumeGuest => {
+                panic!("unexpected {op:?} for kernel-mode exception")
+            }
+        }
+    } else {
+        thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
+        0
+    }
 }
 
 /// Calls `f` in order to call into a shim entrypoint.
@@ -1765,6 +1842,12 @@ impl ThreadContext<'_> {
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_user(self.ctx) },
             ContinueOperation::ExitThread => {}
+            ContinueOperation::ExceptionHandled => {
+                panic!("ExceptionHandled not expected in user-mode call_shim path")
+            }
+            ContinueOperation::ExceptionFixup => {
+                panic!("ExceptionFixup not expected in user-mode call_shim path")
+            }
         }
     }
 }
@@ -1802,7 +1885,7 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         XRSTOR_VTL1_ASM!({vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
         // Restore user context from ctx.
         "mov rsp, rdi",
-        RESTORE_USER_CONTEXT_ASM!(),
+        RESTORE_CPU_CONTEXT_ASM!(),
         // clear the GS base register (as the `KernelGsBase` MSR contains 0)
         // while writing the current GS base value to `KernelGsBase`.
         "swapgs",

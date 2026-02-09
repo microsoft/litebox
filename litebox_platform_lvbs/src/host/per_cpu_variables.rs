@@ -246,6 +246,8 @@ pub struct PerCpuVariablesAsm {
     exception_error_code: Cell<u32>,
     /// Exception info: faulting address (CR2)
     exception_cr2: Cell<usize>,
+    /// Exception info: faulting kernel RIP (for exception table fixup)
+    exception_rip: Cell<usize>,
 }
 
 impl PerCpuVariablesAsm {
@@ -357,10 +359,12 @@ impl PerCpuVariablesAsm {
         exception: litebox::shim::Exception,
         error_code: u32,
         cr2: usize,
+        rip: usize,
     ) {
         self.exception_trapno.set(exception.0);
         self.exception_error_code.set(error_code);
         self.exception_cr2.set(cr2);
+        self.exception_rip.set(rip);
     }
     pub fn get_exception(&self) -> litebox::shim::Exception {
         litebox::shim::Exception(self.exception_trapno.get())
@@ -370,6 +374,9 @@ impl PerCpuVariablesAsm {
     }
     pub fn get_exception_cr2(&self) -> usize {
         self.exception_cr2.get()
+    }
+    pub fn get_exception_rip(&self) -> usize {
+        self.exception_rip.get()
     }
     pub fn get_user_context_top_addr(&self) -> usize {
         self.user_context_top_addr.get()
@@ -425,6 +432,7 @@ impl<T> RefCellWrapper<T> {
                 exception_trapno: Cell::new(0),
                 exception_error_code: Cell::new(0),
                 exception_cr2: Cell::new(0),
+                exception_rip: Cell::new(0),
             },
             inner: RefCell::new(value),
         }

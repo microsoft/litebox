@@ -166,8 +166,52 @@ isr_with_err_code isr_stack_segment_fault stack_segment_fault_handler_impl 12
 /* Vector 13: General Protection Fault (#GP) - Error code */
 isr_with_err_code isr_general_protection_fault general_protection_fault_handler_impl 13
 
-/* Vector 14: Page Fault (#PF) - Error code */
-isr_with_err_code isr_page_fault page_fault_handler_impl 14
+/* Vector 14: Page Fault (#PF) - Error code
+ *
+ * Custom ISR stub to support kernel-mode demand paging for user-space addresses.
+ *
+ * For kernel-mode page faults, page_fault_handler_impl returns:
+ *   0 = handled (exception table fixup applied)
+ *   1 = demand paging needed for a user-space address
+ *   (panics for unrecoverable faults — never returns)
+ *
+ * When demand paging is needed, the stub restores GPRs and jumps to
+ * kernel_exception_callback (in run_thread_arch), which calls the shim's
+ * exception handler and then iretq back to the faulting kernel instruction.
+ */
+.global isr_page_fault
+isr_page_fault:
+    cld
+    test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
+    jnz     .Luser_isr_page_fault
+
+    /* --- Kernel-mode page fault --- */
+    push_regs
+    mov     rbp, rsp            /* Save stack pointer */
+    and     rsp, -16            /* Align stack to 16 bytes for call */
+    mov     rdi, rbp            /* Pass pointer to saved registers as first arg */
+    call    page_fault_handler_impl
+    test    eax, eax
+    jnz     .Lkernel_demand_page
+
+    /* Handled (exception table fixup) — return to fixed-up instruction */
+    mov     rsp, rbp
+    pop_regs
+    add     rsp, 8              /* Skip error code */
+    iretq
+
+.Lkernel_demand_page:
+    /* Demand paging needed. Exception info already stored in per-CPU vars by
+     * page_fault_handler_impl. GPRs are already saved on the stack by push_regs
+     * (same layout as SAVE_CPU_CONTEXT_ASM). Jump directly to
+     * kernel_exception_regs_saved, skipping the redundant pop_regs/push cycle.
+     */
+    mov     rsp, rbp
+    jmp     kernel_exception_regs_saved
+
+.Luser_isr_page_fault:
+    push    14                  /* Pass vector number to exception_callback */
+    jmp     exception_callback
 
 /* Vector 16: x87 Floating-Point Exception (#MF) - No error code */
 isr_no_err_code isr_x87_floating_point x87_floating_point_handler_impl 16

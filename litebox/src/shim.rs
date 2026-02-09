@@ -96,6 +96,11 @@ pub enum ContinueOperation {
     ResumeGuest,
     /// Exit the current thread.
     ExitThread,
+    /// The exception was handled in kernel mode; resume kernel execution.
+    ExceptionHandled,
+    /// The exception was not handled. The platform should apply an
+    /// exception-table fixup if one exists.
+    ExceptionFixup,
 }
 
 /// Information about a hardware exception.
@@ -109,6 +114,9 @@ pub struct ExceptionInfo {
     /// The value of the CR2 register at the time of the exception, if
     /// applicable (e.g., for page faults).
     pub cr2: usize,
+    /// Whether the exception occurred in kernel mode (e.g., a demand page
+    /// fault during a kernel-mode access to a user-space address).
+    pub kernel_mode: bool,
 }
 
 /// An x86 exception type.

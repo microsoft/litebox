@@ -1596,6 +1596,7 @@ extern "C-unwind" fn exception_handler(
         exception: litebox::shim::Exception(trapno.try_into().unwrap()),
         error_code: error.try_into().unwrap(),
         cr2,
+        kernel_mode: false,
     };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
 }
@@ -1632,6 +1633,12 @@ impl ThreadContext<'_> {
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
             ContinueOperation::ExitThread => {}
+            ContinueOperation::ExceptionHandled => {
+                panic!("ExceptionHandled not expected in linux_userland")
+            }
+            ContinueOperation::ExceptionFixup => {
+                panic!("ExceptionFixup not expected in linux_userland")
+            }
         }
     }
 }
