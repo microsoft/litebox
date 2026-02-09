@@ -126,7 +126,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                     version: "9P2000.L".into(),
                 }),
             },
-        )?;
+        )
+        .map_err(|_| Error::Io)?;
 
         let response = transport::read_message(&mut transport, &mut rbuf)?;
 
@@ -136,15 +137,15 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 fcall: Fcall::Rversion(fcall::Rversion { msize, version }),
             } => {
                 if version.as_bytes() != b"9P2000.L" {
-                    return Err(Error::InvalidInput);
+                    return Err(Error::InvalidResponse);
                 }
                 msize.min(bufsize as u32)
             }
             TaggedFcall {
                 fcall: Fcall::Rlerror(e),
                 ..
-            } => return Err(e.into_error()),
-            _ => return Err(Error::InvalidInput),
+            } => return Err(Error::Remote(e)),
+            _ => return Err(Error::InvalidResponse),
         };
 
         wbuf.truncate(msize as usize);
@@ -170,7 +171,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
         let mut write_state = self.write_state.lock();
         let ClientWriteState { transport, wbuf } = &mut *write_state;
-        transport::write_message(transport, wbuf, &TaggedFcall { tag, fcall })?;
+        transport::write_message(transport, wbuf, &TaggedFcall { tag, fcall })
+            .map_err(|_| Error::Io)?;
 
         let mut rbuf = self.rbuf.lock();
 
@@ -200,118 +202,117 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             Fcall::Rattach(fcall::Rattach { qid }) => Ok((qid, fid)),
             Fcall::Rlerror(e) => {
                 self.fids.free(fid);
-                Err(e.into_error())
+                Err(Error::Remote(e))
             }
             _ => {
                 self.fids.free(fid);
-                Err(Error::InvalidInput)
+                Err(Error::InvalidResponse)
             }
         }
+    }
+
+    /// Walks the path from the given fid.
+    ///
+    /// The given wnames should not exceed the maximum number of elements (fcall::MAXWELEM),
+    /// which is checked at the beginning of the function. This is an internal function that
+    /// is used by [`_walk`](Client::_walk), which handles the case where the number of elements exceeds the limit.
+    fn _walk1(
+        &self,
+        fid: fcall::Fid,
+        wnames: &[FcallStr],
+    ) -> Result<(Vec<fcall::Qid>, fcall::Fid), Error> {
+        if wnames.len() > fcall::MAXWELEM {
+            return Err(Error::NameTooLong);
+        }
+        let new_fid = self.fids.next();
+        let ret = match self.fcall(Fcall::Twalk(fcall::Twalk {
+            fid,
+            new_fid,
+            wnames: wnames.to_vec(),
+        }))? {
+            Fcall::Rwalk(fcall::Rwalk { wqids }) => Ok((wqids, new_fid)),
+            Fcall::Rlerror(err) => Err(Error::Remote(err)),
+            _ => Err(Error::InvalidResponse),
+        };
+        if ret.is_err() {
+            self.fids.free(new_fid);
+        }
+        ret
+    }
+
+    /// Walks the path from the given fid, handling paths longer than fcall::MAXWELEM by walking in chunks.
+    ///
+    /// Returns the qids for each path component and a new fid for the final location on success.
+    fn _walk(
+        &self,
+        fid: fcall::Fid,
+        wnames: &[FcallStr],
+    ) -> Result<(Vec<fcall::Qid>, fcall::Fid), Error> {
+        if wnames.is_empty() {
+            return self._walk1(fid, wnames);
+        }
+        let mut wqids = Vec::with_capacity(fcall::MAXWELEM);
+        let mut f = fid;
+        for wnames in wnames.chunks(fcall::MAXWELEM) {
+            let (mut new_wqids, new_f) = self._walk1(f, wnames)?;
+            let new_len = new_wqids.len();
+            wqids.append(&mut new_wqids);
+            // Clunk the old fid if it's not the original fid
+            if f != fid {
+                let _ = self.clunk(f);
+            }
+            f = new_f;
+            // It means that the walk failed at the nwqid-th element
+            if new_len < wnames.len() {
+                if let Some(e) = wqids.last() {
+                    if e.typ == fcall::QidType::SYMLINK {
+                        todo!("symlink");
+                    }
+                }
+                let _ = self.clunk(f);
+                return Err(Error::NotFound);
+            }
+        }
+        Ok((wqids, f))
     }
 
     /// Walk to a path from a given fid
     ///
     /// Returns the qids for each path component and a new fid for the final location
-    pub(crate) fn walk<'a, S: Into<FcallStr<'a>> + Clone>(
+    pub(super) fn walk<'a, S: Into<FcallStr<'a>> + AsRef<[u8]>>(
         &self,
         fid: fcall::Fid,
         wnames: &[S],
     ) -> Result<(Vec<fcall::Qid>, fcall::Fid), Error> {
-        if wnames.is_empty() {
-            // Clone the fid
-            let new_fid = self.fids.next();
-            match self.fcall(Fcall::Twalk(fcall::Twalk {
-                fid,
-                new_fid,
-                wnames: vec![],
-            }))? {
-                Fcall::Rwalk(fcall::Rwalk { wqids }) => Ok((wqids, new_fid)),
-                Fcall::Rlerror(e) => {
-                    self.fids.free(new_fid);
-                    Err(e.into_error())
-                }
-                _ => {
-                    self.fids.free(new_fid);
-                    Err(Error::InvalidInput)
-                }
-            }
-        } else {
-            // Walk in chunks of MAXWELEM
-            let mut current_fid = fid;
-            let mut all_qids = Vec::with_capacity(wnames.len());
-            let mut new_fid = fid;
-
-            for chunk in wnames.chunks(fcall::MAXWELEM) {
-                new_fid = self.fids.next();
-                let wnames_vec: Vec<FcallStr<'_>> =
-                    chunk.iter().map(|s| s.clone().into()).collect();
-
-                match self.fcall(Fcall::Twalk(fcall::Twalk {
-                    fid: current_fid,
-                    new_fid,
-                    wnames: wnames_vec,
-                }))? {
-                    Fcall::Rwalk(fcall::Rwalk { mut wqids }) => {
-                        let expected_len = chunk.len();
-                        let actual_len = wqids.len();
-                        all_qids.append(&mut wqids);
-
-                        // Clunk intermediate fid if not the original
-                        if current_fid != fid {
-                            let _ = self.clunk(current_fid);
-                        }
-
-                        if actual_len < expected_len {
-                            // Walk failed partway
-                            self.fids.free(new_fid);
-                            return Err(Error::NotFound);
-                        }
-
-                        current_fid = new_fid;
-                    }
-                    Fcall::Rlerror(e) => {
-                        self.fids.free(new_fid);
-                        if current_fid != fid {
-                            let _ = self.clunk(current_fid);
-                        }
-                        return Err(e.into_error());
-                    }
-                    _ => {
-                        self.fids.free(new_fid);
-                        if current_fid != fid {
-                            let _ = self.clunk(current_fid);
-                        }
-                        return Err(Error::InvalidInput);
-                    }
-                }
-            }
-
-            Ok((all_qids, new_fid))
-        }
+        let wnames: Vec<FcallStr> = wnames.iter().map(|s| s.into()).collect();
+        self._walk(fid, &wnames)
     }
 
     /// Open a file
-    pub(crate) fn open(
+    pub(super) fn open(
         &self,
         fid: fcall::Fid,
         flags: fcall::LOpenFlags,
-    ) -> Result<fcall::Rlopen, Error> {
+    ) -> Result<fcall::Qid, Error> {
         match self.fcall(Fcall::Tlopen(fcall::Tlopen { fid, flags }))? {
-            Fcall::Rlopen(r) => Ok(r),
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+            Fcall::Rlopen(fcall::Rlopen { qid, .. }) => Ok(qid),
+            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            _ => Err(Error::InvalidResponse),
         }
     }
 
-    /// Create a file
-    pub(crate) fn create(
+    /// Create a file with the given name and flags.
+    ///
+    /// The input dfid initially represents the parent directory of the new file.
+    /// After the call it represents the new file.
+    pub(super) fn create(
         &self,
         dfid: fcall::Fid,
         name: &str,
         flags: fcall::LOpenFlags,
         mode: u32,
         gid: u32,
-    ) -> Result<fcall::Rlcreate, Error> {
+    ) -> Result<(fcall::Qid, fcall::Fid), Error> {
         match self.fcall(Fcall::Tlcreate(fcall::Tlcreate {
             fid: dfid,
             name: name.into(),
@@ -319,33 +320,45 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             mode,
             gid,
         }))? {
-            Fcall::Rlcreate(r) => Ok(r),
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+            Fcall::Rlcreate(fcall::Rlcreate { qid, iounit: _ }) => Ok((qid, dfid)),
+            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            _ => Err(Error::InvalidResponse),
         }
     }
 
     /// Read from a file
-    pub(crate) fn read(&self, fid: fcall::Fid, offset: u64, count: u32) -> Result<Vec<u8>, Error> {
-        let count = count.min(self.msize - fcall::IOHDRSZ);
-        match self.fcall(Fcall::Tread(fcall::Tread { fid, offset, count }))? {
-            Fcall::Rread(fcall::Rread { data }) => Ok(data.into_owned()),
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+    pub(crate) fn read(
+        &self,
+        fid: fcall::Fid,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, Error> {
+        let count = buf.len().min((self.msize - fcall::IOHDRSZ) as usize);
+        match self.fcall(Fcall::Tread(fcall::Tread {
+            fid,
+            offset,
+            count: count as u32,
+        }))? {
+            Fcall::Rread(fcall::Rread { data }) => {
+                buf[..data.len()].copy_from_slice(&data);
+                Ok(data.len())
+            }
+            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            _ => Err(Error::InvalidResponse),
         }
     }
 
     /// Write to a file
-    pub(crate) fn write(&self, fid: fcall::Fid, offset: u64, data: &[u8]) -> Result<u32, Error> {
+    pub(crate) fn write(&self, fid: fcall::Fid, offset: u64, data: &[u8]) -> Result<usize, Error> {
         let count = data.len().min((self.msize - fcall::IOHDRSZ) as usize);
         match self.fcall(Fcall::Twrite(fcall::Twrite {
             fid,
             offset,
             data: alloc::borrow::Cow::Borrowed(&data[..count]),
         }))? {
-            Fcall::Rwrite(fcall::Rwrite { count }) => Ok(count),
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+            Fcall::Rwrite(fcall::Rwrite { count }) => Ok(count as usize),
+            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            _ => Err(Error::InvalidResponse),
         }
     }
 
@@ -357,8 +370,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     ) -> Result<fcall::Rgetattr, Error> {
         match self.fcall(Fcall::Tgetattr(fcall::Tgetattr { fid, req_mask }))? {
             Fcall::Rgetattr(r) => Ok(r),
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            _ => Err(Error::InvalidResponse),
         }
     }
 
@@ -371,8 +384,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     ) -> Result<(), Error> {
         match self.fcall(Fcall::Tsetattr(fcall::Tsetattr { fid, valid, stat }))? {
             Fcall::Rsetattr(_) => Ok(()),
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            _ => Err(Error::InvalidResponse),
         }
     }
 
@@ -381,25 +394,15 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         &self,
         fid: fcall::Fid,
         offset: u64,
-        count: u32,
     ) -> Result<Vec<fcall::DirEntry<'static>>, Error> {
-        let count = count.min(self.msize - fcall::READDIRHDRSZ);
+        let count = self.msize - fcall::READDIRHDRSZ;
         match self.fcall(Fcall::Treaddir(fcall::Treaddir { fid, offset, count }))? {
             Fcall::Rreaddir(fcall::Rreaddir { data }) => {
                 // Clone the directory entries to owned versions
-                Ok(data
-                    .data
-                    .into_iter()
-                    .map(|e| fcall::DirEntry {
-                        qid: e.qid,
-                        offset: e.offset,
-                        typ: e.typ,
-                        name: e.name.clone_static(),
-                    })
-                    .collect())
+                Ok(data.data)
             }
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            _ => Err(Error::InvalidResponse),
         }
     }
 
@@ -411,7 +414,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         let mut all_entries = Vec::new();
         let mut offset = 0u64;
         loop {
-            let entries = self.readdir(fid, offset, self.msize - fcall::READDIRHDRSZ)?;
+            let entries = self.readdir(fid, offset)?;
             if entries.is_empty() {
                 break;
             }
@@ -436,8 +439,17 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             gid,
         }))? {
             Fcall::Rmkdir(fcall::Rmkdir { qid }) => Ok(qid),
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            _ => Err(Error::InvalidResponse),
+        }
+    }
+
+    /// Remove the file represented by fid and clunk the fid, even if the remove fails
+    pub(crate) fn remove(&self, fid: fcall::Fid) -> Result<(), Error> {
+        match self.fcall(Fcall::Tremove(fcall::Tremove { fid }))? {
+            Fcall::Rremove(_) => Ok(()),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
+            _ => Err(Error::InvalidResponse),
         }
     }
 
@@ -449,8 +461,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             flags,
         }))? {
             Fcall::Runlinkat(_) => Ok(()),
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+            Fcall::Rlerror(e) => Err(Error::from(e)),
+            _ => Err(Error::InvalidResponse),
         }
     }
 
@@ -467,8 +479,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             name: name.into(),
         }))? {
             Fcall::Rrename(_) => Ok(()),
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            _ => Err(Error::InvalidResponse),
         }
     }
 
@@ -479,8 +491,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             datasync: u32::from(datasync),
         }))? {
             Fcall::Rfsync(_) => Ok(()),
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            _ => Err(Error::InvalidResponse),
         }
     }
 
@@ -488,8 +500,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     pub(crate) fn clunk(&self, fid: fcall::Fid) -> Result<(), Error> {
         let result = match self.fcall(Fcall::Tclunk(fcall::Tclunk { fid }))? {
             Fcall::Rclunk(_) => Ok(()),
-            Fcall::Rlerror(e) => Err(e.into_error()),
-            _ => Err(Error::InvalidInput),
+            Fcall::Rlerror(e) => Err(Error::Remote(e)),
+            _ => Err(Error::InvalidResponse),
         };
         self.fids.free(fid);
         result

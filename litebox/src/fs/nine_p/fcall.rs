@@ -6,7 +6,11 @@
 //! This module implements the 9P2000.L protocol used for network filesystem access.
 //! See <https://9p.io/sys/man/5/intro> and <https://github.com/chaos/diod/blob/master/protocol.md>
 
-use super::cursor::Write;
+use core::fmt::Display;
+
+use crate::fs::nine_p::transport::Write;
+
+use super::transport;
 use alloc::{borrow::Cow, vec::Vec};
 use bitflags::bitflags;
 
@@ -492,14 +496,13 @@ pub(crate) struct Getlock<'a> {
 
 /// Error response
 #[derive(Clone, Debug)]
-pub(crate) struct Rlerror {
-    pub ecode: u32,
+pub(super) struct Rlerror {
+    pub(super) ecode: u32,
 }
 
-impl Rlerror {
-    /// Convert to an error code
-    pub fn into_error(self) -> super::Error {
-        super::Error::Remote(self.ecode)
+impl Display for Rlerror {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Remote error: {}", self.ecode)
     }
 }
 
@@ -1450,7 +1453,7 @@ pub(crate) struct TaggedFcall<'a> {
 
 impl<'a> TaggedFcall<'a> {
     /// Encode the message to a buffer
-    pub fn encode_to_buf(&self, buf: &mut Vec<u8>) -> Result<(), super::Error> {
+    pub fn encode_to_buf(&self, buf: &mut Vec<u8>) -> Result<(), transport::WriteError> {
         buf.clear();
         buf.resize(4, 0); // Reserve space for size
 
@@ -1479,33 +1482,33 @@ impl<'a> TaggedFcall<'a> {
 // Encoding functions
 // ============================================================================
 
-fn encode_u8<W: Write>(w: &mut W, v: u8) -> Result<(), super::Error> {
+fn encode_u8<W: Write>(w: &mut W, v: u8) -> Result<(), transport::WriteError> {
     w.write_all(&[v])
 }
 
-fn encode_u16<W: Write>(w: &mut W, v: u16) -> Result<(), super::Error> {
+fn encode_u16<W: Write>(w: &mut W, v: u16) -> Result<(), transport::WriteError> {
     w.write_all(&v.to_le_bytes())
 }
 
-fn encode_u32<W: Write>(w: &mut W, v: u32) -> Result<(), super::Error> {
+fn encode_u32<W: Write>(w: &mut W, v: u32) -> Result<(), transport::WriteError> {
     w.write_all(&v.to_le_bytes())
 }
 
-fn encode_u64<W: Write>(w: &mut W, v: u64) -> Result<(), super::Error> {
+fn encode_u64<W: Write>(w: &mut W, v: u64) -> Result<(), transport::WriteError> {
     w.write_all(&v.to_le_bytes())
 }
 
-fn encode_str<W: Write>(w: &mut W, v: &FcallStr<'_>) -> Result<(), super::Error> {
+fn encode_str<W: Write>(w: &mut W, v: &FcallStr<'_>) -> Result<(), transport::WriteError> {
     encode_u16(w, v.len() as u16)?;
     w.write_all(v.as_bytes())
 }
 
-fn encode_data_buf<W: Write>(w: &mut W, v: &[u8]) -> Result<(), super::Error> {
+fn encode_data_buf<W: Write>(w: &mut W, v: &[u8]) -> Result<(), transport::WriteError> {
     encode_u32(w, v.len() as u32)?;
     w.write_all(v)
 }
 
-fn encode_vec_str<W: Write>(w: &mut W, v: &[FcallStr<'_>]) -> Result<(), super::Error> {
+fn encode_vec_str<W: Write>(w: &mut W, v: &[FcallStr<'_>]) -> Result<(), transport::WriteError> {
     encode_u16(w, v.len() as u16)?;
     for s in v {
         encode_str(w, s)?;
@@ -1513,7 +1516,7 @@ fn encode_vec_str<W: Write>(w: &mut W, v: &[FcallStr<'_>]) -> Result<(), super::
     Ok(())
 }
 
-fn encode_vec_qid<W: Write>(w: &mut W, v: &[Qid]) -> Result<(), super::Error> {
+fn encode_vec_qid<W: Write>(w: &mut W, v: &[Qid]) -> Result<(), transport::WriteError> {
     encode_u16(w, v.len() as u16)?;
     for q in v {
         encode_qid(w, q)?;
@@ -1521,38 +1524,38 @@ fn encode_vec_qid<W: Write>(w: &mut W, v: &[Qid]) -> Result<(), super::Error> {
     Ok(())
 }
 
-fn encode_qidtype<W: Write>(w: &mut W, v: &QidType) -> Result<(), super::Error> {
+fn encode_qidtype<W: Write>(w: &mut W, v: &QidType) -> Result<(), transport::WriteError> {
     encode_u8(w, v.bits())
 }
 
-fn encode_locktype<W: Write>(w: &mut W, v: &LockType) -> Result<(), super::Error> {
+fn encode_locktype<W: Write>(w: &mut W, v: &LockType) -> Result<(), transport::WriteError> {
     encode_u8(w, v.bits())
 }
 
-fn encode_lockstatus<W: Write>(w: &mut W, v: &LockStatus) -> Result<(), super::Error> {
+fn encode_lockstatus<W: Write>(w: &mut W, v: &LockStatus) -> Result<(), transport::WriteError> {
     encode_u8(w, v.bits())
 }
 
-fn encode_lockflag<W: Write>(w: &mut W, v: &LockFlag) -> Result<(), super::Error> {
+fn encode_lockflag<W: Write>(w: &mut W, v: &LockFlag) -> Result<(), transport::WriteError> {
     encode_u32(w, v.bits())
 }
 
-fn encode_getattrmask<W: Write>(w: &mut W, v: &GetattrMask) -> Result<(), super::Error> {
+fn encode_getattrmask<W: Write>(w: &mut W, v: &GetattrMask) -> Result<(), transport::WriteError> {
     encode_u64(w, v.bits())
 }
 
-fn encode_setattrmask<W: Write>(w: &mut W, v: &SetattrMask) -> Result<(), super::Error> {
+fn encode_setattrmask<W: Write>(w: &mut W, v: &SetattrMask) -> Result<(), transport::WriteError> {
     encode_u32(w, v.bits())
 }
 
-fn encode_qid<W: Write>(w: &mut W, v: &Qid) -> Result<(), super::Error> {
+fn encode_qid<W: Write>(w: &mut W, v: &Qid) -> Result<(), transport::WriteError> {
     encode_qidtype(w, &v.typ)?;
     encode_u32(w, v.version)?;
     encode_u64(w, v.path)?;
     Ok(())
 }
 
-fn encode_statfs<W: Write>(w: &mut W, v: &Statfs) -> Result<(), super::Error> {
+fn encode_statfs<W: Write>(w: &mut W, v: &Statfs) -> Result<(), transport::WriteError> {
     encode_u32(w, v.typ)?;
     encode_u32(w, v.bsize)?;
     encode_u64(w, v.blocks)?;
@@ -1565,13 +1568,13 @@ fn encode_statfs<W: Write>(w: &mut W, v: &Statfs) -> Result<(), super::Error> {
     Ok(())
 }
 
-fn encode_time<W: Write>(w: &mut W, v: &Time) -> Result<(), super::Error> {
+fn encode_time<W: Write>(w: &mut W, v: &Time) -> Result<(), transport::WriteError> {
     encode_u64(w, v.sec)?;
     encode_u64(w, v.nsec)?;
     Ok(())
 }
 
-fn encode_stat<W: Write>(w: &mut W, v: &Stat) -> Result<(), super::Error> {
+fn encode_stat<W: Write>(w: &mut W, v: &Stat) -> Result<(), transport::WriteError> {
     encode_u32(w, v.mode)?;
     encode_u32(w, v.uid)?;
     encode_u32(w, v.gid)?;
@@ -1589,7 +1592,7 @@ fn encode_stat<W: Write>(w: &mut W, v: &Stat) -> Result<(), super::Error> {
     Ok(())
 }
 
-fn encode_setattr<W: Write>(w: &mut W, v: &SetAttr) -> Result<(), super::Error> {
+fn encode_setattr<W: Write>(w: &mut W, v: &SetAttr) -> Result<(), transport::WriteError> {
     encode_u32(w, v.mode)?;
     encode_u32(w, v.uid)?;
     encode_u32(w, v.gid)?;
@@ -1599,7 +1602,10 @@ fn encode_setattr<W: Write>(w: &mut W, v: &SetAttr) -> Result<(), super::Error> 
     Ok(())
 }
 
-fn encode_direntrydata<W: Write>(w: &mut W, v: &DirEntryData<'_>) -> Result<(), super::Error> {
+fn encode_direntrydata<W: Write>(
+    w: &mut W,
+    v: &DirEntryData<'_>,
+) -> Result<(), transport::WriteError> {
     encode_u32(w, v.size() as u32)?;
     for e in &v.data {
         encode_direntry(w, e)?;
@@ -1607,7 +1613,7 @@ fn encode_direntrydata<W: Write>(w: &mut W, v: &DirEntryData<'_>) -> Result<(), 
     Ok(())
 }
 
-fn encode_direntry<W: Write>(w: &mut W, v: &DirEntry<'_>) -> Result<(), super::Error> {
+fn encode_direntry<W: Write>(w: &mut W, v: &DirEntry<'_>) -> Result<(), transport::WriteError> {
     encode_qid(w, &v.qid)?;
     encode_u64(w, v.offset)?;
     encode_u8(w, v.typ)?;
@@ -1615,7 +1621,7 @@ fn encode_direntry<W: Write>(w: &mut W, v: &DirEntry<'_>) -> Result<(), super::E
     Ok(())
 }
 
-fn encode_flock<W: Write>(w: &mut W, v: &Flock<'_>) -> Result<(), super::Error> {
+fn encode_flock<W: Write>(w: &mut W, v: &Flock<'_>) -> Result<(), transport::WriteError> {
     encode_locktype(w, &v.typ)?;
     encode_lockflag(w, &v.flags)?;
     encode_u64(w, v.start)?;
@@ -1625,7 +1631,7 @@ fn encode_flock<W: Write>(w: &mut W, v: &Flock<'_>) -> Result<(), super::Error> 
     Ok(())
 }
 
-fn encode_getlock<W: Write>(w: &mut W, v: &Getlock<'_>) -> Result<(), super::Error> {
+fn encode_getlock<W: Write>(w: &mut W, v: &Getlock<'_>) -> Result<(), transport::WriteError> {
     encode_locktype(w, &v.typ)?;
     encode_u64(w, v.start)?;
     encode_u64(w, v.length)?;
@@ -1634,7 +1640,11 @@ fn encode_getlock<W: Write>(w: &mut W, v: &Getlock<'_>) -> Result<(), super::Err
     Ok(())
 }
 
-fn encode_fcall<W: Write>(w: &mut W, tag: &u16, fcall: &Fcall<'_>) -> Result<(), super::Error> {
+fn encode_fcall<W: Write>(
+    w: &mut W,
+    tag: &u16,
+    fcall: &Fcall<'_>,
+) -> Result<(), transport::WriteError> {
     match fcall {
         Fcall::Rlerror(v) => {
             encode_u8(w, FcallType::Rlerror as u8)?;
