@@ -103,8 +103,6 @@ pub const HV_REGISTER_CR_INTERCEPT_CR0_MASK: u32 = 0x000e_0001;
 pub const HV_REGISTER_CR_INTERCEPT_CR4_MASK: u32 = 0x000e_0002;
 pub const HV_REGISTER_PENDING_EVENT0: u32 = 0x0001_0004;
 
-pub const HV_SECURE_VTL_BOOT_TOKEN: u8 = 0xdc;
-
 /// VTL call parameters (`param[0]`: function ID, `param[1..4]`: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
 
