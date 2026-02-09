@@ -50,6 +50,31 @@ pub mod mshv;
 
 pub mod syscall_entry;
 
+/// Allocate a zeroed `Box<T>` directly on the heap, avoiding stack intermediaries
+/// for large types (e.g., 4096-byte `HekiPage`).
+///
+/// This is safe because `T: FromBytes` guarantees that all-zero bytes are a valid `T`.
+///
+/// # Panics
+///
+/// Panics if `T` is a zero-sized type, since `alloc_zeroed` with a zero-sized
+/// layout is undefined behavior.
+fn box_new_zeroed<T: FromBytes>() -> alloc::boxed::Box<T> {
+    assert!(
+        core::mem::size_of::<T>() > 0,
+        "box_new_zeroed does not support zero-sized types"
+    );
+    let layout = core::alloc::Layout::new::<T>();
+    // Safety: layout has a non-zero size and correct alignment for T.
+    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) }.cast::<T>();
+    if ptr.is_null() {
+        alloc::alloc::handle_alloc_error(layout);
+    }
+    // Safety: ptr is a valid, zeroed, properly aligned heap allocation for T.
+    // T: FromBytes guarantees all-zero is a valid bit pattern.
+    unsafe { alloc::boxed::Box::from_raw(ptr) }
+}
+
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
 /// Special page table ID for the base (kernel-only) page table.
@@ -543,16 +568,17 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
     /// This function copies data from VTL0 physical memory to the VTL1 kernel through `Box`.
     /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
-    /// Better to replace this function with `<data type>::from_bytes()` or similar
     ///
     /// # Safety
     ///
     /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
-    pub unsafe fn copy_from_vtl0_phys<T: Copy>(
+    pub unsafe fn copy_from_vtl0_phys<T: FromBytes + Copy>(
         &self,
         phys_addr: x86_64::PhysAddr,
     ) -> Option<alloc::boxed::Box<T>> {
-        use alloc::boxed::Box;
+        if core::mem::size_of::<T>() == 0 {
+            return Some(alloc::boxed::Box::new(T::new_zeroed()));
+        }
 
         let guard = self.map_vtl0_guard(
             phys_addr,
@@ -560,19 +586,16 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             PageTableFlags::PRESENT,
         )?;
 
-        let mut value = core::mem::MaybeUninit::<T>::uninit();
+        let mut boxed = box_new_zeroed::<T>();
         let result = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
-                value.as_mut_ptr().cast(),
+                core::ptr::from_mut::<T>(boxed.as_mut()).cast(),
                 guard.ptr,
                 core::mem::size_of::<T>(),
             )
         };
 
-        // Safety: the value was fully initialized on success.
-        result
-            .ok()
-            .map(|()| Box::new(unsafe { value.assume_init() }))
+        result.ok().map(|()| boxed)
     }
 
     /// This function copies data from the VTL1 kernel to VTL0 physical memory.
@@ -585,6 +608,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         phys_addr: x86_64::PhysAddr,
         value: &T,
     ) -> bool {
+        if core::mem::size_of::<T>() == 0 {
+            return true;
+        }
+
         let Some(guard) = self.map_vtl0_guard(
             phys_addr,
             core::mem::size_of::<T>() as u64,
@@ -615,6 +642,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         phys_addr: x86_64::PhysAddr,
         value: &[T],
     ) -> bool {
+        if core::mem::size_of_val(value) == 0 {
+            return true;
+        }
+
         let Some(guard) = self.map_vtl0_guard(
             phys_addr,
             core::mem::size_of_val(value) as u64,
@@ -645,6 +676,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         phys_addr: x86_64::PhysAddr,
         buf: &mut [T],
     ) -> bool {
+        if core::mem::size_of_val(buf) == 0 {
+            return true;
+        }
+
         let Some(guard) = self.map_vtl0_guard(
             phys_addr,
             core::mem::size_of_val(buf) as u64,

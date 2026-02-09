@@ -410,7 +410,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
 
 /// RAII guard that unmaps physical pages when dropped.
 ///
-/// Created by [`PhysMutPtr::map_guard`]. Holds a mutable borrow on the parent
+/// Created by `map_and_get_ptr_guard`. Holds a mutable borrow on the parent
 /// `PhysMutPtr` and provides the mapped base pointer for the duration of the mapping.
 struct MappedGuard<'a, T: Clone, const ALIGN: usize> {
     owner: &'a mut PhysMutPtr<T, ALIGN>,

@@ -4,11 +4,6 @@
 /*
  * Interrupt Service Routine (ISR) stubs for x86_64
  *
- * This file provides assembly stubs for interrupt handlers that:
- * 1. Save all general-purpose registers in PtRegs layout
- * 2. Call the appropriate Rust handler
- * 3. Restore registers and return via iretq
- *
  * Each stub checks the saved CS RPL bits to determine whether the exception
  * came from user mode (ring 3) or kernel mode (ring 0):
  *
@@ -25,9 +20,8 @@
  * the CPU selects the stack based on the privilege transition:
  *
  * - User-mode (CPL change): the CPU loads RSP from TSS.RSP0. We set a
- *   dedicated per-CPU stack for this (see gdt.rs). Since RSP0 is always
- *   reloaded from the TSS, stale data from previous exceptions does not
- *   need to be cleaned up.
+ *   dedicated per-CPU stack for this (gdt.rs). Since RSP0 is always
+ *   reloaded from the TSS, we do not wipe stale data from old exceptions.
  *
  * - Kernel-mode (no CPL change): the CPU continues on the current stack.
  *   The ISR stub pushes registers onto it. Kernel code must ensure enough
@@ -97,11 +91,7 @@
     pop     rdi
 .endm
 
-/*
- * ISR stub for interrupts WITHOUT an error code.
- * Kernel-mode: standard push_regs/call/pop_regs/iretq flow.
- * User-mode: push vector number, then jump to exception_callback.
- */
+/* ISR stub for interrupts WITHOUT an error code. */
 .macro isr_no_err_code name:req handler:req vector:req
 .global \name
 \name:
@@ -123,9 +113,7 @@
     jmp     exception_callback
 .endm
 
-/*
- * ISR stub for interrupts WITH an error code.
- */
+/* ISR stub for interrupts WITH an error code. */
 .macro isr_with_err_code name:req handler:req vector:req
 .global \name
 \name:

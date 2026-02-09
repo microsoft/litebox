@@ -12,6 +12,7 @@ use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{PageSize, Size4KiB},
 };
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -106,7 +107,7 @@ pub(crate) fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
 /// `HekiRange` is a generic container for various types of memory ranges.
 /// It has an `attributes` field which can be interpreted differently based on the context like
 /// `MemAttr`, `KdataType`, `ModMemType`, or `KexecType`.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C, packed)]
 pub struct HekiRange {
     pub va: u64,
@@ -194,11 +195,12 @@ impl core::fmt::Debug for HekiRange {
 pub const HEKI_MAX_RANGES: usize =
     ((PAGE_SIZE as u32 - u64::BITS * 3 / 8) / core::mem::size_of::<HekiRange>() as u32) as usize;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout)]
 #[repr(align(4096))]
 #[repr(C)]
 pub struct HekiPage {
-    pub next: *mut HekiPage,
+    /// Pointer to next page (stored as u64 since we don't dereference it)
+    pub next: u64,
     pub next_pa: u64,
     pub nranges: u64,
     pub ranges: [HekiRange; HEKI_MAX_RANGES],
@@ -207,10 +209,8 @@ pub struct HekiPage {
 
 impl HekiPage {
     pub fn new() -> Self {
-        HekiPage {
-            next: core::ptr::null_mut(),
-            ..Default::default()
-        }
+        // Safety: all fields are valid when zeroed (u64 zeros, array of zeroed HekiRange)
+        Self::new_zeroed()
     }
 
     pub fn is_valid(&self) -> bool {
@@ -234,7 +234,7 @@ impl HekiPage {
 
 impl Default for HekiPage {
     fn default() -> Self {
-        Self::new()
+        Self::new_zeroed()
     }
 }
 
@@ -247,30 +247,20 @@ impl<'a> IntoIterator for &'a HekiPage {
     }
 }
 
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Default, Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct HekiPatch {
     pub pa: [u64; 2],
     pub size: u8,
     pub code: [u8; POKE_MAX_OPCODE_SIZE],
+    _padding: [u8; 2],
 }
 pub const POKE_MAX_OPCODE_SIZE: usize = 5;
 
 impl HekiPatch {
     /// Creates a new `HekiPatch` with a given buffer. Returns `None` if any field is invalid.
     pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != core::mem::size_of::<HekiPatch>() {
-            return None;
-        }
-        let mut patch = core::mem::MaybeUninit::<HekiPatch>::uninit();
-        let patch = unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr().cast::<u8>(),
-                patch.as_mut_ptr().cast::<u8>(),
-                core::mem::size_of::<HekiPatch>(),
-            );
-            patch.assume_init()
-        };
+        let patch = Self::read_from_bytes(bytes).ok()?;
         if patch.is_valid() { Some(patch) } else { None }
     }
 
@@ -312,12 +302,14 @@ pub enum HekiPatchType {
     Unknown = 0xffff_ffff,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct HekiPatchInfo {
-    pub typ_: HekiPatchType,
+    /// Patch type stored as u32 for zerocopy compatibility (see `HekiPatchType`)
+    pub typ_: u32,
     list: ListHead,
-    mod_: *const core::ffi::c_void, // *const `struct module`
+    /// *const `struct module` (stored as u64 since we don't dereference it)
+    mod_: u64,
     pub patch_index: u64,
     pub max_patch_count: u64,
     // pub patch: [HekiPatch; *]
@@ -326,23 +318,12 @@ pub struct HekiPatchInfo {
 impl HekiPatchInfo {
     /// Creates a new `HekiPatchInfo` with a given buffer. Returns `None` if any field is invalid.
     pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != core::mem::size_of::<HekiPatchInfo>() {
-            return None;
-        }
-        let mut info = core::mem::MaybeUninit::<HekiPatchInfo>::uninit();
-        let info = unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr().cast::<u8>(),
-                info.as_mut_ptr().cast::<u8>(),
-                core::mem::size_of::<HekiPatchInfo>(),
-            );
-            info.assume_init()
-        };
+        let info = Self::read_from_bytes(bytes).ok()?;
         if info.is_valid() { Some(info) } else { None }
     }
 
     pub fn is_valid(&self) -> bool {
-        !(self.typ_ != HekiPatchType::JumpLabel
+        !(self.typ_ != HekiPatchType::JumpLabel as u32
             || self.patch_index == 0
             || self.patch_index > self.max_patch_count)
     }
