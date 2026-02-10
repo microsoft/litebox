@@ -10,6 +10,7 @@ iced-x86 = "1.21"
 memmap2 = "0.9"
 object = { version = "0.36.7", default-features = false, features = ["elf", "build", "std"] }
 thiserror = { version = "2.0.6", default-features = false }
+zerocopy = { version = "0.8", features = ["derive"] }
 
 [lints]
 workspace = true
