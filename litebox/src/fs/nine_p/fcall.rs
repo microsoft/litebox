@@ -398,7 +398,7 @@ pub(super) struct Time {
 /// File attributes
 #[derive(Clone, Debug, Copy)]
 pub(super) struct Stat {
-    pub(super)mode: u32,
+    pub(super) mode: u32,
     pub(super) uid: u32,
     pub(super) gid: u32,
     pub(super) nlink: u64,
@@ -435,6 +435,16 @@ pub(super) struct DirEntry<'a> {
 }
 
 impl DirEntry<'_> {
+    /// Create a static (owned) copy of this directory entry
+    pub(super) fn clone_static(&self) -> DirEntry<'static> {
+        DirEntry {
+            qid: self.qid,
+            offset: self.offset,
+            typ: self.typ,
+            name: self.name.clone_static(),
+        }
+    }
+
     /// Calculate the size of this entry when encoded
     fn size(&self) -> u64 {
         (13 + 8 + 1 + 2 + self.name.len()) as u64
@@ -488,18 +498,6 @@ pub(super) struct Tattach<'a> {
     pub(super) n_uname: u32,
 }
 
-impl Tattach<'_> {
-    fn clone_static(&self) -> Tattach<'static> {
-        Tattach {
-            afid: self.afid,
-            fid: self.fid,
-            n_uname: self.n_uname,
-            aname: self.aname.clone_static(),
-            uname: self.uname.clone_static(),
-        }
-    }
-}
-
 /// Attach response
 #[derive(Clone, Debug)]
 pub(super) struct Rattach {
@@ -542,18 +540,6 @@ pub(super) struct Tlcreate<'a> {
     pub(super) gid: u32,
 }
 
-impl<'a> Tlcreate<'a> {
-    fn clone_static(&self) -> Tlcreate<'static> {
-        Tlcreate {
-            fid: self.fid,
-            flags: self.flags,
-            gid: self.gid,
-            mode: self.mode,
-            name: self.name.clone_static(),
-        }
-    }
-}
-
 /// Create response
 #[derive(Clone, Debug)]
 pub(super) struct Rlcreate {
@@ -568,17 +554,6 @@ pub(super) struct Tsymlink<'a> {
     name: FcallStr<'a>,
     symtgt: FcallStr<'a>,
     gid: u32,
-}
-
-impl<'a> Tsymlink<'a> {
-    fn clone_static(&'a self) -> Tsymlink<'static> {
-        Tsymlink {
-            fid: self.fid,
-            name: self.name.clone_static(),
-            symtgt: self.symtgt.clone_static(),
-            gid: self.gid,
-        }
-    }
 }
 
 /// Symlink response
@@ -598,19 +573,6 @@ pub(super) struct Tmknod<'a> {
     gid: u32,
 }
 
-impl<'a> Tmknod<'a> {
-    fn clone_static(&'a self) -> Tmknod<'static> {
-        Tmknod {
-            dfid: self.dfid,
-            gid: self.gid,
-            major: self.major,
-            minor: self.minor,
-            mode: self.mode,
-            name: self.name.clone_static(),
-        }
-    }
-}
-
 /// Mknod response
 #[derive(Clone, Debug)]
 pub(super) struct Rmknod {
@@ -623,16 +585,6 @@ pub(super) struct Trename<'a> {
     pub(super) fid: u32,
     pub(super) dfid: u32,
     pub(super) name: FcallStr<'a>,
-}
-
-impl<'a> Trename<'a> {
-    fn clone_static(&self) -> Trename<'static> {
-        Trename {
-            fid: self.fid,
-            dfid: self.dfid,
-            name: self.name.clone_static(),
-        }
-    }
 }
 
 /// Rename response
@@ -649,14 +601,6 @@ pub(super) struct Treadlink {
 #[derive(Clone, Debug)]
 pub(super) struct Rreadlink<'a> {
     target: FcallStr<'a>,
-}
-
-impl<'a> Rreadlink<'a> {
-    fn clone_static(&'a self) -> Rreadlink<'static> {
-        Rreadlink {
-            target: self.target.clone_static(),
-        }
-    }
 }
 
 /// Getattr request
@@ -694,16 +638,6 @@ pub(super) struct Txattrwalk<'a> {
     name: FcallStr<'a>,
 }
 
-impl<'a> Txattrwalk<'a> {
-    fn clone_static(&'a self) -> Txattrwalk<'static> {
-        Txattrwalk {
-            fid: self.fid,
-            new_fid: self.new_fid,
-            name: self.name.clone_static(),
-        }
-    }
-}
-
 /// Xattr walk response
 #[derive(Clone, Debug)]
 pub(super) struct Rxattrwalk {
@@ -717,17 +651,6 @@ pub(super) struct Txattrcreate<'a> {
     name: FcallStr<'a>,
     attr_size: u64,
     flags: u32,
-}
-
-impl<'a> Txattrcreate<'a> {
-    fn clone_static(&'a self) -> Txattrcreate<'static> {
-        Txattrcreate {
-            fid: self.fid,
-            name: self.name.clone_static(),
-            attr_size: self.attr_size,
-            flags: self.flags,
-        }
-    }
 }
 
 /// Xattr create response
@@ -748,26 +671,6 @@ pub(super) struct Rreaddir<'a> {
     pub(super) data: DirEntryData<'a>,
 }
 
-impl<'a> Rreaddir<'a> {
-    fn clone_static(&'a self) -> Rreaddir<'static> {
-        Rreaddir {
-            data: DirEntryData {
-                data: self
-                    .data
-                    .data
-                    .iter()
-                    .map(|de| DirEntry {
-                        qid: de.qid,
-                        offset: de.offset,
-                        typ: de.typ,
-                        name: de.name.clone_static(),
-                    })
-                    .collect(),
-            },
-        }
-    }
-}
-
 /// Fsync request
 #[derive(Clone, Debug)]
 pub(super) struct Tfsync {
@@ -786,22 +689,6 @@ pub(super) struct Tlock<'a> {
     flock: Flock<'a>,
 }
 
-impl<'a> Tlock<'a> {
-    fn clone_static(&'a self) -> Tlock<'static> {
-        Tlock {
-            fid: self.fid,
-            flock: Flock {
-                typ: self.flock.typ,
-                flags: self.flock.flags,
-                start: self.flock.start,
-                length: self.flock.length,
-                proc_id: self.flock.proc_id,
-                client_id: self.flock.client_id.clone_static(),
-            },
-        }
-    }
-}
-
 /// Lock response
 #[derive(Clone, Debug)]
 pub(super) struct Rlock {
@@ -815,39 +702,10 @@ pub(super) struct Tgetlock<'a> {
     flock: Getlock<'a>,
 }
 
-impl<'a> Tgetlock<'a> {
-    fn clone_static(&'a self) -> Tgetlock<'static> {
-        Tgetlock {
-            fid: self.fid,
-            flock: Getlock {
-                typ: self.flock.typ,
-                start: self.flock.start,
-                length: self.flock.length,
-                proc_id: self.flock.proc_id,
-                client_id: self.flock.client_id.clone_static(),
-            },
-        }
-    }
-}
-
 /// Getlock response
 #[derive(Clone, Debug)]
 pub(super) struct Rgetlock<'a> {
     flock: Getlock<'a>,
-}
-
-impl<'a> Rgetlock<'a> {
-    fn clone_static(&'a self) -> Rgetlock<'static> {
-        Rgetlock {
-            flock: Getlock {
-                typ: self.flock.typ,
-                start: self.flock.start,
-                length: self.flock.length,
-                proc_id: self.flock.proc_id,
-                client_id: self.flock.client_id.clone_static(),
-            },
-        }
-    }
 }
 
 /// Link request
@@ -856,16 +714,6 @@ pub(super) struct Tlink<'a> {
     dfid: u32,
     fid: u32,
     name: FcallStr<'a>,
-}
-
-impl<'a> Tlink<'a> {
-    fn clone_static(&'a self) -> Tlink<'static> {
-        Tlink {
-            fid: self.fid,
-            dfid: self.dfid,
-            name: self.name.clone_static(),
-        }
-    }
 }
 
 /// Link response
@@ -879,17 +727,6 @@ pub(super) struct Tmkdir<'a> {
     pub(super) name: FcallStr<'a>,
     pub(super) mode: u32,
     pub(super) gid: u32,
-}
-
-impl<'a> Tmkdir<'a> {
-    fn clone_static(&'a self) -> Tmkdir<'static> {
-        Tmkdir {
-            dfid: self.dfid,
-            gid: self.gid,
-            mode: self.mode,
-            name: self.name.clone_static(),
-        }
-    }
 }
 
 /// Mkdir response
@@ -907,17 +744,6 @@ pub(super) struct Trenameat<'a> {
     newname: FcallStr<'a>,
 }
 
-impl<'a> Trenameat<'a> {
-    fn clone_static(&'a self) -> Trenameat<'static> {
-        Trenameat {
-            newdfid: self.newdfid,
-            olddfid: self.olddfid,
-            newname: self.newname.clone_static(),
-            oldname: self.oldname.clone_static(),
-        }
-    }
-}
-
 /// Renameat response
 #[derive(Clone, Debug)]
 pub(super) struct Rrenameat {}
@@ -928,16 +754,6 @@ pub(super) struct Tunlinkat<'a> {
     pub(super) dfid: u32,
     pub(super) name: FcallStr<'a>,
     pub(super) flags: u32,
-}
-
-impl<'a> Tunlinkat<'a> {
-    fn clone_static(&'a self) -> Tunlinkat<'static> {
-        Tunlinkat {
-            dfid: self.dfid,
-            flags: self.flags,
-            name: self.name.clone_static(),
-        }
-    }
 }
 
 /// Unlinkat response
@@ -953,17 +769,6 @@ pub(super) struct Tauth<'a> {
     n_uname: u32,
 }
 
-impl<'a> Tauth<'a> {
-    fn clone_static(&'a self) -> Tauth<'static> {
-        Tauth {
-            afid: self.afid,
-            n_uname: self.n_uname,
-            aname: self.aname.clone_static(),
-            uname: self.uname.clone_static(),
-        }
-    }
-}
-
 /// Auth response
 #[derive(Clone, Debug)]
 pub(super) struct Rauth {
@@ -977,29 +782,11 @@ pub(super) struct Tversion<'a> {
     pub(super) version: FcallStr<'a>,
 }
 
-impl<'a> Tversion<'a> {
-    fn clone_static(&'a self) -> Tversion<'static> {
-        Tversion {
-            msize: self.msize,
-            version: self.version.clone_static(),
-        }
-    }
-}
-
 /// Version response
 #[derive(Clone, Debug)]
 pub(super) struct Rversion<'a> {
     pub(super) msize: u32,
     pub(super) version: FcallStr<'a>,
-}
-
-impl<'a> Rversion<'a> {
-    fn clone_static(&'a self) -> Rversion<'static> {
-        Rversion {
-            msize: self.msize,
-            version: self.version.clone_static(),
-        }
-    }
 }
 
 /// Flush request
@@ -1018,16 +805,6 @@ pub(super) struct Twalk<'a> {
     pub(super) fid: u32,
     pub(super) new_fid: u32,
     pub(super) wnames: Vec<FcallStr<'a>>,
-}
-
-impl<'a> Twalk<'a> {
-    fn clone_static(&'a self) -> Twalk<'static> {
-        Twalk {
-            fid: self.fid,
-            new_fid: self.new_fid,
-            wnames: self.wnames.iter().map(FcallStr::clone_static).collect(),
-        }
-    }
 }
 
 /// Walk response
@@ -1050,30 +827,12 @@ pub(super) struct Rread<'a> {
     pub(super) data: Cow<'a, [u8]>,
 }
 
-impl<'a> Rread<'a> {
-    fn clone_static(&'a self) -> Rread<'static> {
-        Rread {
-            data: Cow::from(self.data.clone().into_owned()),
-        }
-    }
-}
-
 /// Write request
 #[derive(Clone, Debug)]
 pub(super) struct Twrite<'a> {
     pub(super) fid: u32,
     pub(super) offset: u64,
     pub(super) data: Cow<'a, [u8]>,
-}
-
-impl<'a> Twrite<'a> {
-    fn clone_static(&'a self) -> Twrite<'static> {
-        Twrite {
-            fid: self.fid,
-            offset: self.offset,
-            data: Cow::from(self.data.clone().into_owned()),
-        }
-    }
 }
 
 /// Write response
@@ -1166,71 +925,6 @@ pub(super) enum Fcall<'a> {
     Rclunk(Rclunk),
     Tremove(Tremove),
     Rremove(Rremove),
-}
-
-impl Fcall<'_> {
-    /// Create a static (owned) copy of this Fcall
-    pub(super) fn clone_static(&self) -> Fcall<'static> {
-        match self {
-            Fcall::Rlerror(v) => Fcall::Rlerror(v.clone()),
-            Fcall::Tattach(v) => Fcall::Tattach(v.clone_static()),
-            Fcall::Rattach(v) => Fcall::Rattach(v.clone()),
-            Fcall::Tstatfs(v) => Fcall::Tstatfs(v.clone()),
-            Fcall::Rstatfs(v) => Fcall::Rstatfs(v.clone()),
-            Fcall::Tlopen(v) => Fcall::Tlopen(v.clone()),
-            Fcall::Rlopen(v) => Fcall::Rlopen(v.clone()),
-            Fcall::Tlcreate(v) => Fcall::Tlcreate(v.clone_static()),
-            Fcall::Rlcreate(v) => Fcall::Rlcreate(v.clone()),
-            Fcall::Tsymlink(v) => Fcall::Tsymlink(v.clone_static()),
-            Fcall::Rsymlink(v) => Fcall::Rsymlink(v.clone()),
-            Fcall::Tmknod(v) => Fcall::Tmknod(v.clone_static()),
-            Fcall::Rmknod(v) => Fcall::Rmknod(v.clone()),
-            Fcall::Trename(v) => Fcall::Trename(v.clone_static()),
-            Fcall::Rrename(v) => Fcall::Rrename(v.clone()),
-            Fcall::Treadlink(v) => Fcall::Treadlink(v.clone()),
-            Fcall::Rreadlink(v) => Fcall::Rreadlink(v.clone_static()),
-            Fcall::Tgetattr(v) => Fcall::Tgetattr(v.clone()),
-            Fcall::Rgetattr(v) => Fcall::Rgetattr(v.clone()),
-            Fcall::Tsetattr(v) => Fcall::Tsetattr(v.clone()),
-            Fcall::Rsetattr(v) => Fcall::Rsetattr(v.clone()),
-            Fcall::Txattrwalk(v) => Fcall::Txattrwalk(v.clone_static()),
-            Fcall::Rxattrwalk(v) => Fcall::Rxattrwalk(v.clone()),
-            Fcall::Txattrcreate(v) => Fcall::Txattrcreate(v.clone_static()),
-            Fcall::Rxattrcreate(v) => Fcall::Rxattrcreate(v.clone()),
-            Fcall::Treaddir(v) => Fcall::Treaddir(v.clone()),
-            Fcall::Rreaddir(v) => Fcall::Rreaddir(v.clone_static()),
-            Fcall::Tfsync(v) => Fcall::Tfsync(v.clone()),
-            Fcall::Rfsync(v) => Fcall::Rfsync(v.clone()),
-            Fcall::Tlock(v) => Fcall::Tlock(v.clone_static()),
-            Fcall::Rlock(v) => Fcall::Rlock(v.clone()),
-            Fcall::Tgetlock(v) => Fcall::Tgetlock(v.clone_static()),
-            Fcall::Rgetlock(v) => Fcall::Rgetlock(v.clone_static()),
-            Fcall::Tlink(v) => Fcall::Tlink(v.clone_static()),
-            Fcall::Rlink(v) => Fcall::Rlink(v.clone()),
-            Fcall::Tmkdir(v) => Fcall::Tmkdir(v.clone_static()),
-            Fcall::Rmkdir(v) => Fcall::Rmkdir(v.clone()),
-            Fcall::Trenameat(v) => Fcall::Trenameat(v.clone_static()),
-            Fcall::Rrenameat(v) => Fcall::Rrenameat(v.clone()),
-            Fcall::Tunlinkat(v) => Fcall::Tunlinkat(v.clone_static()),
-            Fcall::Runlinkat(v) => Fcall::Runlinkat(v.clone()),
-            Fcall::Tauth(v) => Fcall::Tauth(v.clone_static()),
-            Fcall::Rauth(v) => Fcall::Rauth(v.clone()),
-            Fcall::Tversion(v) => Fcall::Tversion(v.clone_static()),
-            Fcall::Rversion(v) => Fcall::Rversion(v.clone_static()),
-            Fcall::Tflush(v) => Fcall::Tflush(v.clone()),
-            Fcall::Rflush(v) => Fcall::Rflush(v.clone()),
-            Fcall::Twalk(v) => Fcall::Twalk(v.clone_static()),
-            Fcall::Rwalk(v) => Fcall::Rwalk(v.clone()),
-            Fcall::Tread(v) => Fcall::Tread(v.clone()),
-            Fcall::Rread(v) => Fcall::Rread(v.clone_static()),
-            Fcall::Twrite(v) => Fcall::Twrite(v.clone_static()),
-            Fcall::Rwrite(v) => Fcall::Rwrite(v.clone()),
-            Fcall::Tclunk(v) => Fcall::Tclunk(v.clone()),
-            Fcall::Rclunk(v) => Fcall::Rclunk(v.clone()),
-            Fcall::Tremove(v) => Fcall::Tremove(v.clone()),
-            Fcall::Rremove(v) => Fcall::Rremove(v.clone()),
-        }
-    }
 }
 
 // Implement From for all message types
