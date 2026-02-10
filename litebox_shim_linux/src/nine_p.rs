@@ -13,10 +13,6 @@ use litebox_common_linux::{ReceiveFlags, SendFlags};
 use crate::Task;
 
 /// A 9P transport backed by litebox's syscall-level socket APIs.
-///
-/// This transport wraps a connected TCP socket (identified by a file descriptor)
-/// and implements blocking reads and writes using [`Task::do_recvfrom`] and
-/// [`Task::do_sendto`], which handle wait/poll internally.
 pub struct ShimTransport<'a> {
     task: &'a Task,
     sockfd: u32,

@@ -29,7 +29,6 @@ use crate::fs::errors::{
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
-use crate::platform::DebugLogProvider;
 use crate::{LiteBox, sync};
 
 mod client;
@@ -534,17 +533,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     }
 }
 
-impl<
-    Platform: sync::RawSyncPrimitivesProvider + DebugLogProvider,
-    T: transport::Read + transport::Write,
-> super::private::Sealed for FileSystem<Platform, T>
+impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
+    super::private::Sealed for FileSystem<Platform, T>
 {
 }
 
-impl<
-    Platform: sync::RawSyncPrimitivesProvider + DebugLogProvider,
-    T: transport::Read + transport::Write,
-> super::FileSystem for FileSystem<Platform, T>
+impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
+    super::FileSystem for FileSystem<Platform, T>
 {
     #[allow(clippy::similar_names)]
     fn open(
@@ -853,18 +848,11 @@ impl<
                 };
 
                 super::DirEntry {
-                    name: String::from_utf8_lossy(e.name.as_bytes()).into_owned(),
+                    name: String::from_utf8_lossy(&e.name).into_owned(),
                     file_type,
-                    #[allow(unused_imports)]
                     ino_info: Some(super::NodeInfo {
                         dev: DEVICE_ID,
-                        ino: usize::try_from(e.qid.path).unwrap_or_else(|_| {
-                            crate::log_println!(
-                                self.litebox.x.platform,
-                                "qid.path doesn't fit in usize, using 0 instead"
-                            );
-                            0
-                        }),
+                        ino: usize::try_from(e.qid.path).expect("inode number exceeds usize"),
                         rdev: None,
                     }),
                 }
