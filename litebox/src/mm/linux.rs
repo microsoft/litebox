@@ -417,8 +417,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let (start, end) = (suggested_range.start, suggested_range.end);
-        if start < Platform::TASK_ADDR_MIN || end > Platform::TASK_ADDR_MAX {
-            return Err(AllocationError::InvalidRange);
+        if start < Platform::TASK_ADDR_MIN {
+            return Err(AllocationError::BelowMinAddress);
+        }
+        if end > Platform::TASK_ADDR_MAX {
+            return Err(AllocationError::AboveMaxAddress);
         }
         let platform_fixed_address_behavior = match fixed_address_behavior {
             FixedAddressBehavior::Hint => FixedAddressBehavior::Hint,
@@ -626,7 +629,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     | AllocationError::AddressInUseByPlatform
                     | AllocationError::AddressPartiallyInUse,
                 ) => return Err(VmemResizeError::RangeOccupied(range.into())),
-                Err(AllocationError::Unaligned | AllocationError::InvalidRange) => unreachable!(),
+                Err(
+                    AllocationError::Unaligned
+                    | AllocationError::BelowMinAddress
+                    | AllocationError::AboveMaxAddress,
+                ) => unreachable!(),
             }
             return Ok(());
         }
@@ -859,6 +866,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             {
                 return Some(suggested_address.0);
             }
+        } else if fixed_addr {
+            // MAP_FIXED with addr=0: return 0 so insert_mapping rejects it
+            // via the TASK_ADDR_MIN check (BelowMinAddress → EPERM).
+            return Some(0);
         }
 
         // top down

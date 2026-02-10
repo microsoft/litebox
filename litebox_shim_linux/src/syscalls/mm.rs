@@ -126,10 +126,6 @@ impl Task {
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
         }
-        // MAP_FIXED_NOREPLACE requires a non-zero address
-        if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) && addr == 0 {
-            return Err(Errno::EPERM);
-        }
         if flags.intersects(
             MapFlags::MAP_SHARED
                 | MapFlags::MAP_32BIT
