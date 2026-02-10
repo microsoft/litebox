@@ -171,20 +171,21 @@ extern "C" fn general_protection_fault_handler_impl(regs: &PtRegs) {
     );
 }
 
-/// Fault was handled via exception table fixup. The ISR stub should
-/// `pop_regs + iretq` to resume at the fixup address.
-const PF_HANDLED: usize = 0;
-
-/// Demand paging is needed for a user-space address. Exception info has been
-/// stored in per-CPU variables.
-const PF_DEMAND_PAGE: usize = 1;
+/// Result from the kernel-mode page fault handler, consumed by the ISR stub.
+#[repr(u8)]
+enum PageFaultResult {
+    /// Fault was handled via exception table fixup.
+    Handled = 0,
+    /// Demand paging is needed for a user-space address.
+    DemandPage = 1,
+}
 
 /// Kernel-mode page fault handler (vector 14).
 ///
-/// Returns [`PF_HANDLED`] or [`PF_DEMAND_PAGE`] to the ISR stub.
+/// Returns [`PageFaultResult`] to the ISR stub.
 /// For unrecoverable faults, this function panics and never returns.
 #[unsafe(no_mangle)]
-extern "C" fn page_fault_handler_impl(regs: &mut PtRegs) -> usize {
+extern "C" fn page_fault_handler_impl(regs: &mut PtRegs) -> PageFaultResult {
     use crate::host::per_cpu_variables::with_per_cpu_variables_asm;
     use crate::{USER_ADDR_MAX, USER_ADDR_MIN};
     use litebox::mm::exception_table::search_exception_tables;
@@ -205,14 +206,14 @@ extern "C" fn page_fault_handler_impl(regs: &mut PtRegs) -> usize {
                 regs.rip,
             );
         });
-        return PF_DEMAND_PAGE;
+        return PageFaultResult::DemandPage;
     }
 
     // Handle fallible memory operations like memcpy_fallible that access
     // non-user-space addresses (e.g., VTL0 addresses) which might be unmapped.
     if let Some(fixup_addr) = search_exception_tables(regs.rip) {
         regs.rip = fixup_addr;
-        return PF_HANDLED;
+        return PageFaultResult::Handled;
     }
 
     // Kernel-mode page fault at kernel-space addresses — unrecoverable

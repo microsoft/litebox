@@ -9,7 +9,7 @@
 use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
 use core::{
     arch::asm,
-    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64},
 };
 use hashbrown::HashMap;
 use litebox::platform::{
@@ -78,6 +78,7 @@ fn box_new_zeroed<T: FromBytes>() -> alloc::boxed::Box<T> {
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
 /// Special page table ID for the base (kernel-only) page table.
+/// No real physical frame has address 0, so this is a safe sentinel.
 pub const BASE_PAGE_TABLE_ID: usize = 0;
 
 /// Maximum virtual address (exclusive) for user-space allocations.
@@ -117,14 +118,8 @@ pub struct PageTableManager {
     base_page_table: mm::PageTable<PAGE_SIZE>,
     /// Cached physical frame of the base page table (for fast CR3 comparison).
     base_page_table_frame: PhysFrame<Size4KiB>,
-    /// Task page tables indexed by their ID (starting from 1).
-    /// Each contains kernel mappings + task-specific user-space mappings.
+    /// Task page tables keyed by their P4 frame start address (the page table ID).
     task_page_tables: spin::Mutex<HashMap<usize, alloc::boxed::Box<mm::PageTable<PAGE_SIZE>>>>,
-    /// Reverse lookup: physical frame -> page table ID (for O(1) CR3 lookup).
-    /// Only contains task page tables (base page table is checked separately).
-    frame_to_id: spin::Mutex<HashMap<PhysFrame<Size4KiB>, usize>>,
-    /// Next available task page table ID.
-    next_task_pt_id: AtomicUsize,
 }
 
 impl PageTableManager {
@@ -140,8 +135,6 @@ impl PageTableManager {
             base_page_table: base_pt,
             base_page_table_frame: base_frame,
             task_page_tables: spin::Mutex::new(HashMap::new()),
-            frame_to_id: spin::Mutex::new(HashMap::new()),
-            next_task_pt_id: AtomicUsize::new(1),
         }
     }
 
@@ -164,25 +157,18 @@ impl PageTableManager {
             return &self.base_page_table;
         }
 
-        // Look up task page table by frame using the reverse lookup map
-        let task_pt_id = {
-            let frame_to_id = self.frame_to_id.lock();
-            frame_to_id.get(&cr3_frame).copied()
-        };
-
-        if let Some(id) = task_pt_id {
-            let task_pts = self.task_page_tables.lock();
-            if let Some(pt) = task_pts.get(&id) {
-                // SAFETY: Three invariants guarantee this reference remains valid:
-                // 1. The PageTable is Box-allocated, so HashMap rehashing does not
-                //    move the PageTable itself (only the Box pointer moves).
-                // 2. This page table is the current CR3, so `delete_task_page_table`
-                //    will refuse to remove it (returns EBUSY).
-                // 3. The PageTableManager is 'static, so neither it nor the HashMap
-                //    will be deallocated.
-                let pt_ref: &mm::PageTable<PAGE_SIZE> = pt;
-                return unsafe { &*core::ptr::from_ref(pt_ref) };
-            }
+        let cr3_id: usize = cr3_frame.start_address().as_u64().truncate();
+        let task_pts = self.task_page_tables.lock();
+        if let Some(pt) = task_pts.get(&cr3_id) {
+            // SAFETY: Three invariants guarantee this reference remains valid:
+            // 1. The PageTable is Box-allocated, so HashMap rehashing does not
+            //    move the PageTable itself (only the Box pointer moves).
+            // 2. This page table is the current CR3, so `delete_task_page_table`
+            //    will refuse to remove it (returns EBUSY).
+            // 3. The PageTableManager is 'static, so neither it nor the HashMap
+            //    will be deallocated.
+            let pt_ref: &mm::PageTable<PAGE_SIZE> = pt;
+            return unsafe { &*core::ptr::from_ref(pt_ref) };
         }
 
         // CR3 doesn't match any known page table - this shouldn't happen
@@ -210,16 +196,8 @@ impl PageTableManager {
             return BASE_PAGE_TABLE_ID;
         }
 
-        let frame_to_id = self.frame_to_id.lock();
-        if let Some(&id) = frame_to_id.get(&cr3_frame) {
-            return id;
-        }
-
-        // CR3 doesn't match any known page table - this shouldn't happen
-        unreachable!(
-            "CR3 contains unknown page table: {:?}",
-            cr3_frame.start_address()
-        );
+        // The task page table ID is the start address of the P4 frame.
+        cr3_frame.start_address().as_u64().truncate()
     }
 
     /// Returns `true` if the base page table is currently active.
@@ -281,8 +259,8 @@ impl PageTableManager {
     ///
     /// # Returns
     ///
-    /// The ID of the newly created task page table, or `Err(Errno::ENOMEM)` if
-    /// allocation fails or the ID space is exhausted.
+    /// The ID of the newly created task page table (its P4 frame start address),
+    /// or `Err(Errno::ENOMEM)` if allocation fails.
     pub fn create_task_page_table(
         &self,
         vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
@@ -298,21 +276,11 @@ impl PageTableManager {
             return Err(Errno::ENOMEM);
         }
 
-        let task_pt_id = self.next_task_pt_id.fetch_add(1, Ordering::Relaxed);
-        if task_pt_id == 0 {
-            // Wrapped around, which shouldn't happen in practice
-            return Err(Errno::ENOMEM);
-        }
-
         let pt = alloc::boxed::Box::new(pt);
-        let phys_frame = pt.get_physical_frame();
+        let task_pt_id: usize = pt.get_physical_frame().start_address().as_u64().truncate();
 
         let mut task_pts = self.task_page_tables.lock();
         task_pts.insert(task_pt_id, pt);
-        drop(task_pts);
-
-        let mut frame_to_id = self.frame_to_id.lock();
-        frame_to_id.insert(phys_frame, task_pt_id);
 
         Ok(task_pt_id)
     }
@@ -344,19 +312,17 @@ impl PageTableManager {
             return Err(Errno::EINVAL);
         }
 
-        // Ensure we're not deleting the current page table (check CR3)
-        if self.current_page_table_id() == task_pt_id {
+        let mut task_pts = self.task_page_tables.lock();
+
+        // Check CR3 under the same lock to avoid TOCTOU with the removal below.
+        let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
+        let cr3_id: usize = cr3_frame.start_address().as_u64().truncate();
+        if cr3_id == task_pt_id {
             return Err(Errno::EBUSY);
         }
 
-        let mut task_pts = self.task_page_tables.lock();
         if let Some(pt) = task_pts.remove(&task_pt_id) {
-            let phys_frame = pt.get_physical_frame();
             drop(task_pts);
-
-            let mut frame_to_id = self.frame_to_id.lock();
-            frame_to_id.remove(&phys_frame);
-            drop(frame_to_id);
 
             // Safety: We're about to delete this page table, so it's safe to unmap all pages.
             unsafe {
@@ -554,15 +520,16 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         size: u64,
         flags: PageTableFlags,
     ) -> Option<Vtl0MappedGuard<'_, Host>> {
-        let (page_addr, length) = self
+        let (page_addr, page_aligned_length) = self
             .map_vtl0_phys_range(phys_addr, phys_addr + size, flags)
             .ok()?;
         let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
         Some(Vtl0MappedGuard {
             owner: self,
             page_addr,
-            length,
+            page_aligned_length,
             ptr: page_addr.wrapping_add(page_offset),
+            size: size.truncate(),
         })
     }
 
@@ -580,7 +547,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             return Some(alloc::boxed::Box::new(T::new_zeroed()));
         }
 
-        let guard = self.map_vtl0_guard(
+        let src_guard = self.map_vtl0_guard(
             phys_addr,
             core::mem::size_of::<T>() as u64,
             PageTableFlags::PRESENT,
@@ -590,8 +557,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         let result = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 core::ptr::from_mut::<T>(boxed.as_mut()).cast(),
-                guard.ptr,
-                core::mem::size_of::<T>(),
+                src_guard.ptr,
+                src_guard.size,
             )
         };
 
@@ -612,20 +579,19 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             return true;
         }
 
-        let Some(guard) = self.map_vtl0_guard(
+        let Some(dst_guard) = self.map_vtl0_guard(
             phys_addr,
             core::mem::size_of::<T>() as u64,
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         ) else {
             return false;
         };
-        let dst_ptr = guard.ptr;
 
         unsafe {
             litebox::mm::exception_table::memcpy_fallible(
-                dst_ptr,
+                dst_guard.ptr,
                 core::ptr::from_ref::<T>(value).cast::<u8>(),
-                core::mem::size_of::<T>(),
+                dst_guard.size,
             )
         }
         .is_ok()
@@ -646,20 +612,19 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             return true;
         }
 
-        let Some(guard) = self.map_vtl0_guard(
+        let Some(dst_guard) = self.map_vtl0_guard(
             phys_addr,
             core::mem::size_of_val(value) as u64,
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         ) else {
             return false;
         };
-        let dst_ptr = guard.ptr;
 
         unsafe {
             litebox::mm::exception_table::memcpy_fallible(
-                dst_ptr,
+                dst_guard.ptr,
                 value.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(value),
+                dst_guard.size,
             )
         }
         .is_ok()
@@ -680,20 +645,19 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             return true;
         }
 
-        let Some(guard) = self.map_vtl0_guard(
+        let Some(src_guard) = self.map_vtl0_guard(
             phys_addr,
             core::mem::size_of_val(buf) as u64,
             PageTableFlags::PRESENT,
         ) else {
             return false;
         };
-        let src_ptr = guard.ptr;
 
         unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 buf.as_mut_ptr().cast::<u8>(),
-                src_ptr,
-                core::mem::size_of_val(buf),
+                src_guard.ptr,
+                src_guard.size,
             )
         }
         .is_ok()
@@ -784,15 +748,16 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 struct Vtl0MappedGuard<'a, Host: HostInterface> {
     owner: &'a LinuxKernel<Host>,
     page_addr: *mut u8,
-    length: usize,
+    page_aligned_length: usize,
     ptr: *mut u8,
+    size: usize,
 }
 
 impl<Host: HostInterface> Drop for Vtl0MappedGuard<'_, Host> {
     fn drop(&mut self) {
         assert!(
             self.owner
-                .unmap_vtl0_pages(self.page_addr, self.length)
+                .unmap_vtl0_pages(self.page_addr, self.page_aligned_length)
                 .is_ok(),
             "Failed to unmap VTL0 pages"
         );
@@ -1807,7 +1772,8 @@ unsafe extern "C" fn exception_handler(thread_ctx: &mut ThreadContext, kernel_mo
     });
 
     if kernel_mode {
-        // Call the shim directly instead of using `call_shim` because:
+        // We don't use `thread_ctx.call_shim()` here because:
+        // - `call_shim()` switches back to user mode after the call
         // - `ExceptionFixup` requires post-processing (exception table lookup)
         // - Must return a fixup address to the asm caller (not resume user mode)
         let op = thread_ctx.shim.exception(thread_ctx.ctx, &info);

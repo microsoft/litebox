@@ -190,13 +190,12 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 PhysPageMapPermissions::READ,
             )?
         };
-        let src = guard.ptr_at(count);
         let mut buffer = core::mem::MaybeUninit::<T>::uninit();
         unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 buffer.as_mut_ptr().cast::<u8>(),
-                src.cast::<u8>(),
-                core::mem::size_of::<T>(),
+                guard.ptr.cast::<u8>(),
+                guard.size,
             )
             .map_err(|_| PhysPointerError::CopyFailed)?;
         }
@@ -229,12 +228,11 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 PhysPageMapPermissions::READ,
             )?
         };
-        let src = guard.ptr_at(count);
         unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 values.as_mut_ptr().cast::<u8>(),
-                src.cast::<u8>(),
-                core::mem::size_of_val(values),
+                guard.ptr.cast::<u8>(),
+                guard.size,
             )
             .map_err(|_| PhysPointerError::CopyFailed)?;
         }
@@ -263,12 +261,11 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
             )?
         };
-        let dst = guard.ptr_at(count);
         unsafe {
             litebox::mm::exception_table::memcpy_fallible(
-                dst.cast::<u8>(),
+                guard.ptr.cast::<u8>(),
                 core::ptr::from_ref(&value).cast::<u8>(),
-                core::mem::size_of::<T>(),
+                guard.size,
             )
             .map_err(|_| PhysPointerError::CopyFailed)?;
         }
@@ -300,12 +297,11 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
             )?
         };
-        let dst = guard.ptr_at(count);
         unsafe {
             litebox::mm::exception_table::memcpy_fallible(
-                dst.cast::<u8>(),
+                guard.ptr.cast::<u8>(),
                 values.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(values),
+                guard.size,
             )
             .map_err(|_| PhysPointerError::CopyFailed)?;
         }
@@ -351,9 +347,13 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             .map_info
             .as_ref()
             .ok_or(PhysPointerError::NoMappingInfo)?;
-        let base = map_info.base.wrapping_add(skip % ALIGN).cast::<T>();
+        let ptr = map_info.base.wrapping_add(skip % ALIGN).cast::<T>();
         let _ = map_info;
-        Ok(MappedGuard { owner: self, base })
+        Ok(MappedGuard {
+            owner: self,
+            ptr,
+            size,
+        })
     }
 
     /// Map the physical pages from `start` to `end` indexes.
@@ -414,14 +414,8 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
 /// `PhysMutPtr` and provides the mapped base pointer for the duration of the mapping.
 struct MappedGuard<'a, T: Clone, const ALIGN: usize> {
     owner: &'a mut PhysMutPtr<T, ALIGN>,
-    base: *mut T,
-}
-
-impl<T: Clone, const ALIGN: usize> MappedGuard<'_, T, ALIGN> {
-    /// Returns the mapped base pointer offset by `count` elements.
-    fn ptr_at(&self, count: usize) -> *mut T {
-        self.base.wrapping_add(count)
-    }
+    ptr: *mut T,
+    size: usize,
 }
 
 impl<T: Clone, const ALIGN: usize> Drop for MappedGuard<'_, T, ALIGN> {

@@ -10,6 +10,7 @@ use alloc::sync::Arc;
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
     mm::linux::PAGE_SIZE,
+    platform::RawConstPointer,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::errno::Errno;
@@ -39,9 +40,9 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{
-    MAX_TA_INSTANCES, SessionManager, TaInstance, allocate_session_id,
+    MAX_TA_INSTANCES, SessionIdGuard, SessionManager, TaInstance, allocate_session_id,
 };
-use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
+use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
 
@@ -401,8 +402,13 @@ fn open_session_single_instance(
         .try_lock()
         .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
 
-    // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID
-    let runner_session_id = allocate_session_id().ok_or(OpteeSmcReturnCode::EBusy)?;
+    // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID.
+    // Use SessionIdGuard to ensure the ID is recycled on any error path
+    // (before it is registered with the session manager).
+    let session_id_guard =
+        SessionIdGuard::new(allocate_session_id().ok_or(OpteeSmcReturnCode::EBusy)?);
+    // Safe to unwrap: guard was just created with Some(id).
+    let runner_session_id = session_id_guard.id().unwrap();
 
     debug_serial_println!(
         "Reusing single-instance TA: uuid={:?}, task_pt_id={}, session_id={}",
@@ -445,7 +451,9 @@ fn open_session_single_instance(
         .loaded_program
         .params_address
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-    let ta_params = unsafe { *(params_address as *const UteeParams) };
+    let ta_params = UserConstPtr::<UteeParams>::from_usize(params_address)
+        .read_at_offset(0)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
     // Check the return code from the TA's OpenSession entry point
     let return_code: u32 = ctx.rax.truncate();
@@ -515,7 +523,9 @@ fn open_session_single_instance(
         return Ok(());
     }
 
-    // Success: register session
+    // Success: register session and disarm the guard (ownership transfers to session map)
+    // Safe to unwrap: guard has not been disarmed yet.
+    let runner_session_id = session_id_guard.disarm().unwrap();
     session_manager().register_session(runner_session_id, instance_arc.clone(), ta_uuid, ta_flags);
 
     write_msg_args_to_normal_world(
@@ -672,7 +682,9 @@ fn open_session_new_instance(
     let params_address = loaded_program
         .params_address
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-    let ta_params = unsafe { *(params_address as *const UteeParams) };
+    let ta_params = UserConstPtr::<UteeParams>::from_usize(params_address)
+        .read_at_offset(0)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
     // Check the return code from the TA's OpenSession entry point
     let return_code: u32 = ctx.rax.truncate();
@@ -804,7 +816,9 @@ fn handle_invoke_command(
         .loaded_program
         .params_address
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-    let ta_params = unsafe { *(params_address as *const UteeParams) };
+    let ta_params = UserConstPtr::<UteeParams>::from_usize(params_address)
+        .read_at_offset(0)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
     let return_code: u32 = ctx.rax.truncate();
     let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
@@ -1061,12 +1075,8 @@ fn write_msg_args_to_normal_world(
 }
 
 // use include_bytes! to include ldelf and (KMPP) TA binaries
-// const LDELF_BINARY: &[u8] = &[0u8; 0];
-// const TA_BINARY: &[u8] = &[0u8; 0];
-const LDELF_BINARY: &[u8] =
-    include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/ldelf.elf");
-const TA_BINARY: &[u8] =
-    include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/kmpp-ta.elf");
+const LDELF_BINARY: &[u8] = &[0u8; 0];
+const TA_BINARY: &[u8] = &[0u8; 0];
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

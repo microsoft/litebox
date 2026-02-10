@@ -194,7 +194,7 @@ isr_page_fault:
     test    eax, eax
     jnz     .Lkernel_demand_page
 
-    /* Handled (exception table fixup) — return to fixed-up instruction */
+    /* Handled (exception table fixup) — return to fixup address */
     mov     rsp, rbp
     pop_regs
     add     rsp, 8              /* Skip error code */

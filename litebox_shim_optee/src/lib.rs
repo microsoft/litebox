@@ -39,7 +39,7 @@ pub mod ptr;
 // Re-export session management types for convenience
 pub use session::{
     MAX_TA_INSTANCES, SessionEntry, SessionManager, SessionMap, SingleInstanceCache, TaInstance,
-    allocate_session_id, recycle_session_id,
+    allocate_session_id,
 };
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
@@ -1271,12 +1271,6 @@ struct Task {
     #[cfg(target_arch = "x86_64")]
     tls_base_addr: Cell<usize>,
     // TODO: OP-TEE supports global, persistent objects across sessions. Add these maps if needed.
-}
-
-impl Drop for Task {
-    fn drop(&mut self) {
-        SessionIdPool::recycle(self.session_id);
-    }
 }
 
 struct ThreadState {

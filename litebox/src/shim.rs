@@ -99,7 +99,7 @@ pub enum ContinueOperation {
     /// The exception was triggered in kernel mode; resume kernel execution.
     ResumeKernel,
     /// The exception was not handled. The platform should apply an
-    /// exception-table fixup if one exists.
+    /// exception-table fixup (e.g., advance the instruction pointer) if one exists.
     ExceptionFixup,
 }
 
