@@ -21,7 +21,7 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
     LiteBox,
-    fd::{ErrRawIntFd, TypedFd},
+    fd::TypedFd,
     mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
@@ -59,7 +59,14 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
     >,
 >;
 
-pub(crate) type FileFd = litebox::fd::TypedFd<LinuxFS>;
+pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
+
+/// A convenience supertrait alias for file system types used throughout the shim.
+///
+/// This combines [`litebox::fs::FileSystem`] with `Send`, `Sync`, and `'static`
+/// bounds that are required for sharing filesystem instances across threads via `Arc`.
+pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
+impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
@@ -71,14 +78,14 @@ fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     }
 }
 
-pub struct LinuxShimEntrypoints {
-    task: Task,
+pub struct LinuxShimEntrypoints<FS: ShimFS> {
+    task: Task<FS>,
     // The task should not be moved once it's bound to a platform thread so that
     // we preserve the ability to use TLS in the future.
     _not_send: core::marker::PhantomData<*const ()>,
 }
 
-impl litebox::shim::EnterShim for LinuxShimEntrypoints {
+impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -102,12 +109,12 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
     }
 }
 
-impl LinuxShimEntrypoints {
+impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
     fn enter_shim(
         &self,
         is_init: bool,
         ctx: &mut litebox_common_linux::PtRegs,
-        f: impl FnOnce(&Task, &mut litebox_common_linux::PtRegs),
+        f: impl FnOnce(&Task<FS>, &mut litebox_common_linux::PtRegs),
     ) -> ContinueOperation {
         if !is_init {
             self.task.enter_from_guest();
@@ -122,20 +129,20 @@ impl LinuxShimEntrypoints {
 }
 
 /// The shim entry point structure.
-pub struct LinuxShimBuilder {
+pub struct LinuxShimBuilder<FS: ShimFS> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
-    fs: Option<LinuxFS>,
+    fs: Option<FS>,
     load_filter: Option<LoadFilter>,
 }
 
-impl Default for LinuxShimBuilder {
+impl Default for LinuxShimBuilder<DefaultFS> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LinuxShimBuilder {
+impl LinuxShimBuilder<DefaultFS> {
     /// Returns a new shim builder.
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
@@ -145,11 +152,6 @@ impl LinuxShimBuilder {
             fs: None,
             load_filter: None,
         }
-    }
-
-    /// Returns the litebox object for the shim.
-    pub fn litebox(&self) -> &LiteBox<Platform> {
-        &self.litebox
     }
 
     /// Set the global file system
@@ -168,6 +170,24 @@ impl LinuxShimBuilder {
     ) -> DefaultFS {
         default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
     }
+}
+
+impl<FS: ShimFS> LinuxShimBuilder<FS> {
+    /// Create a new shim builder with the given filesystem.
+    pub fn with_fs(fs: FS) -> Self {
+        let platform = litebox_platform_multiplex::platform();
+        Self {
+            platform,
+            litebox: LiteBox::new(platform),
+            fs: Some(fs),
+            load_filter: None,
+        }
+    }
+
+    /// Returns the litebox object for the shim.
+    pub fn litebox(&self) -> &LiteBox<Platform> {
+        &self.litebox
+    }
 
     /// Set the load filter, which can augment envp or auxv when starting a new program.
     pub fn set_load_filter(&mut self, callback: LoadFilter) {
@@ -179,7 +199,7 @@ impl LinuxShimBuilder {
     /// # Panics
     /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
     /// before calling this method.
-    pub fn build(self) -> LinuxShim {
+    pub fn build(self) -> LinuxShim<FS> {
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
@@ -201,10 +221,14 @@ impl LinuxShimBuilder {
     }
 }
 
-#[derive(Clone)]
-pub struct LinuxShim(Arc<GlobalState>);
+pub struct LinuxShim<FS: ShimFS>(Arc<GlobalState<FS>>);
+impl<FS: ShimFS> Clone for LinuxShim<FS> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
-impl LinuxShim {
+impl<FS: ShimFS> LinuxShim<FS> {
     /// Loads the program at `path` as the shim's initial task, returning the
     /// initial register state.
     pub fn load_program(
@@ -213,7 +237,7 @@ impl LinuxShim {
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
-    ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
+    ) -> Result<LoadedProgram<FS>, loader::elf::ElfLoaderError> {
         let litebox_common_linux::TaskParams {
             pid,
             ppid,
@@ -275,8 +299,8 @@ impl LinuxShim {
     }
 }
 
-pub struct LoadedProgram {
-    pub entrypoints: LinuxShimEntrypoints,
+pub struct LoadedProgram<FS: ShimFS> {
+    pub entrypoints: LinuxShimEntrypoints<FS>,
     pub process: LinuxShimProcess,
 }
 
@@ -319,9 +343,9 @@ fn default_fs(
 // Special override so that `GETFL` can return stdio-specific flags
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
-impl syscalls::file::FilesState {
-    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState) {
-        use litebox::fs::{FileSystem as _, Mode, OFlags};
+impl<FS: ShimFS> syscalls::file::FilesState<FS> {
+    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<FS>) {
+        use litebox::fs::{Mode, OFlags};
         let stdin = global
             .fs
             .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
@@ -351,11 +375,11 @@ impl syscalls::file::FilesState {
 type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
-struct Descriptors {
-    descriptors: Vec<Option<Descriptor>>,
+struct Descriptors<FS: ShimFS> {
+    descriptors: Vec<Option<Descriptor<FS>>>,
 }
 
-impl Descriptors {
+impl<FS: ShimFS> Descriptors<FS> {
     fn new() -> Self {
         Self {
             descriptors: vec![
@@ -370,7 +394,11 @@ impl Descriptors {
     ///
     /// Returns the assigned file descriptor number, or the descriptor back on failure
     /// if the limit is exceeded.
-    fn insert(&mut self, task: &Task, descriptor: Descriptor) -> Result<u32, Descriptor> {
+    fn insert(
+        &mut self,
+        task: &Task<FS>,
+        descriptor: Descriptor<FS>,
+    ) -> Result<u32, Descriptor<FS>> {
         self.insert_in_range(
             descriptor,
             0,
@@ -385,10 +413,10 @@ impl Descriptors {
     /// or the descriptor back if no slot is found within the limit.
     fn insert_in_range(
         &mut self,
-        descriptor: Descriptor,
+        descriptor: Descriptor<FS>,
         min_idx: usize,
         max_idx: usize,
-    ) -> Result<u32, Descriptor> {
+    ) -> Result<u32, Descriptor<FS>> {
         let idx = self
             .descriptors
             .iter()
@@ -412,10 +440,10 @@ impl Descriptors {
     /// if the index exceeds the limit.
     fn insert_at(
         &mut self,
-        task: &Task,
-        descriptor: Descriptor,
+        task: &Task<FS>,
+        descriptor: Descriptor<FS>,
         idx: usize,
-    ) -> Result<Option<Descriptor>, Descriptor> {
+    ) -> Result<Option<Descriptor<FS>>, Descriptor<FS>> {
         if idx
             >= task
                 .process()
@@ -432,11 +460,11 @@ impl Descriptors {
             .get_mut(idx)
             .and_then(|v| v.replace(descriptor)))
     }
-    fn remove(&mut self, fd: u32) -> Option<Descriptor> {
+    fn remove(&mut self, fd: u32) -> Option<Descriptor<FS>> {
         let fd = fd as usize;
         self.descriptors.get_mut(fd)?.take()
     }
-    fn get_fd(&self, fd: u32) -> Option<&Descriptor> {
+    fn get_fd(&self, fd: u32) -> Option<&Descriptor<FS>> {
         self.descriptors.get(fd as usize)?.as_ref()
     }
 
@@ -445,7 +473,7 @@ impl Descriptors {
     }
 }
 
-impl Task {
+impl<FS: ShimFS> Task<FS> {
     fn close_on_exec(&self) {
         let files = self.files.borrow();
         files
@@ -467,18 +495,18 @@ impl Task {
     }
 }
 
-enum Descriptor {
+enum Descriptor<FS: ShimFS> {
     LiteBoxRawFd(usize),
     Eventfd {
         file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
     Epoll {
-        file: alloc::sync::Arc<syscalls::epoll::EpollFile>,
+        file: alloc::sync::Arc<syscalls::epoll::EpollFile<FS>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
     Unix {
-        file: alloc::sync::Arc<syscalls::unix::UnixSocket>,
+        file: alloc::sync::Arc<syscalls::unix::UnixSocket<FS>>,
         close_on_exec: core::sync::atomic::AtomicBool,
     },
 }
@@ -487,53 +515,36 @@ enum Descriptor {
 ///
 /// This enum only ever stores `Arc<TypedFd<..>>`s, and should not store any additional data
 /// alongside them (i.e., it is a trivial tagged union across the subsystems being used).
-enum StrongFd {
-    FileSystem(Arc<TypedFd<LinuxFS>>),
+enum StrongFd<FS: ShimFS> {
+    FileSystem(Arc<TypedFd<FS>>),
     Network(Arc<TypedFd<Network<Platform>>>),
     Pipes(Arc<TypedFd<Pipes<Platform>>>),
 }
-impl StrongFd {
-    fn from_raw(files: &syscalls::file::FilesState, fd: usize) -> Result<Self, Errno> {
-        match files
-            .raw_descriptor_store
-            .read()
-            .typed_fd_at_raw_3::<StrongFd, LinuxFS, Network<Platform>, Pipes<Platform>>(fd)
-        {
-            Ok(r) => Ok(r),
-            Err(ErrRawIntFd::InvalidSubsystem) => {
-                // We currently only have net and fs FDs at the moment, when we add more, we need to
-                // expand out `StrongFd` too.
-                unreachable!()
-            }
-            Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
+impl<FS: ShimFS> StrongFd<FS> {
+    fn from_raw(files: &syscalls::file::FilesState<FS>, fd: usize) -> Result<Self, Errno> {
+        let rds = files.raw_descriptor_store.read();
+        if let Ok(fd) = rds.fd_from_raw_integer::<FS>(fd) {
+            return Ok(StrongFd::FileSystem(fd));
         }
-    }
-}
-impl From<Arc<TypedFd<LinuxFS>>> for StrongFd {
-    fn from(v: Arc<TypedFd<LinuxFS>>) -> Self {
-        StrongFd::FileSystem(v)
-    }
-}
-impl From<Arc<TypedFd<Network<Platform>>>> for StrongFd {
-    fn from(v: Arc<TypedFd<Network<Platform>>>) -> Self {
-        StrongFd::Network(v)
-    }
-}
-impl From<Arc<TypedFd<Pipes<Platform>>>> for StrongFd {
-    fn from(v: Arc<TypedFd<Pipes<Platform>>>) -> Self {
-        StrongFd::Pipes(v)
+        if let Ok(fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd) {
+            return Ok(StrongFd::Network(fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer::<Pipes<Platform>>(fd) {
+            return Ok(StrongFd::Pipes(fd));
+        }
+        Err(Errno::EBADF)
     }
 }
 
-impl syscalls::file::FilesState {
+impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     pub(crate) fn run_on_raw_fd<R>(
         &self,
         fd: usize,
-        fs: impl FnOnce(&TypedFd<LinuxFS>) -> R,
+        fs: impl FnOnce(&TypedFd<FS>) -> R,
         net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
         pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
     ) -> Result<R, Errno> {
-        match StrongFd::from_raw(self, fd)? {
+        match StrongFd::<FS>::from_raw(self, fd)? {
             StrongFd::FileSystem(fd) => Ok(fs(&fd)),
             StrongFd::Network(fd) => Ok(net(&fd)),
             StrongFd::Pipes(fd) => Ok(pipes(&fd)),
@@ -567,7 +578,7 @@ impl ToSyscallResult for Result<u32, Errno> {
     }
 }
 
-impl Task {
+impl<FS: ShimFS> Task<FS> {
     /// A wrapper function around `sys_pread64` that copies data in chunks to avoid OOMing.
     fn pread_with_user_buf(
         &self,
@@ -1139,7 +1150,7 @@ impl Task {
 }
 
 /// Global shim state, shared across all tasks.
-struct GlobalState {
+struct GlobalState<FS: ShimFS> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
     /// The LiteBox instance used throughout the shim.
@@ -1147,7 +1158,7 @@ struct GlobalState {
     /// The page manager for managing virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The filesystem implementation.
-    fs: LinuxFS,
+    fs: FS,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
@@ -1162,11 +1173,11 @@ struct GlobalState {
     // TODO: better management of thread IDs
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
-    unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable>,
+    unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<FS>>,
 }
 
-struct Task {
-    global: Arc<GlobalState>,
+struct Task<FS: ShimFS> {
+    global: Arc<GlobalState<FS>>,
     wait_state: wait::WaitState,
     thread: syscalls::process::ThreadState,
     /// Process ID
@@ -1183,12 +1194,12 @@ struct Task {
     /// Filesystem state. `RefCell` to support `unshare` in the future.
     fs: RefCell<Arc<syscalls::file::FsState>>,
     /// File descriptors. `RefCell` to support `unshare` in the future.
-    files: RefCell<Arc<syscalls::file::FilesState>>,
+    files: RefCell<Arc<syscalls::file::FilesState<FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState,
 }
 
-impl Drop for Task {
+impl<FS: ShimFS> Drop for Task<FS> {
     fn drop(&mut self) {
         self.prepare_for_exit();
     }
@@ -1201,9 +1212,9 @@ mod test_utils {
     extern crate std;
     use super::*;
 
-    impl GlobalState {
+    impl<FS: ShimFS> GlobalState<FS> {
         /// Make a new task with default values for testing.
-        pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
+        pub(crate) fn new_test_task(self: Arc<Self>) -> Task<FS> {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1230,7 +1241,7 @@ mod test_utils {
         }
     }
 
-    impl Task {
+    impl<FS: ShimFS> Task<FS> {
         /// Returns a clone of this task with a new TID for testing.
         pub(crate) fn clone_for_test(&self) -> Option<Self> {
             let tid = self
@@ -1259,7 +1270,7 @@ mod test_utils {
         /// Panics if the test process is already terminating.
         pub(crate) fn spawn_clone_for_test<R>(
             &self,
-            f: impl 'static + Send + FnOnce(Task) -> R,
+            f: impl 'static + Send + FnOnce(Task<FS>) -> R,
         ) -> std::thread::JoinHandle<R>
         where
             R: 'static + Send,
