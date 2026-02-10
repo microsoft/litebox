@@ -51,7 +51,7 @@ impl Task {
         }
         // MAP_FIXED_NOREPLACE requires a non-zero address
         if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) && addr == 0 {
-            return Err(Errno::EINVAL);
+            return Err(Errno::EPERM);
         }
         if flags.intersects(
             MapFlags::MAP_SHARED

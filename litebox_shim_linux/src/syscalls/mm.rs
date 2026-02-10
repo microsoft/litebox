@@ -128,7 +128,7 @@ impl Task {
         }
         // MAP_FIXED_NOREPLACE requires a non-zero address
         if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) && addr == 0 {
-            return Err(Errno::EINVAL);
+            return Err(Errno::EPERM);
         }
         if flags.intersects(
             MapFlags::MAP_SHARED
@@ -399,7 +399,8 @@ mod tests {
             .unwrap();
         assert_eq!(addr3.as_usize(), addr1.as_usize() - 0x1000);
 
-        // Test 6: Zero address with MAP_FIXED_NOREPLACE - should fail with EINVAL
+        // Test 6: Zero address with MAP_FIXED_NOREPLACE - should fail with EPERM
+        // (matches Linux behavior where vm.mmap_min_addr prevents mapping at address 0)
         let err = task
             .sys_mmap(
                 0,
@@ -410,7 +411,7 @@ mod tests {
                 0,
             )
             .unwrap_err();
-        assert_eq!(err, Errno::EINVAL);
+        assert_eq!(err, Errno::EPERM);
 
         // Clean up
         task.sys_munmap(addr3, 0x1000).unwrap();
