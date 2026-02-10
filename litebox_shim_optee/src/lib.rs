@@ -80,7 +80,7 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
             };
             if info.kernel_mode {
                 return if result.is_ok() {
-                    ContinueOperation::ExceptionHandled
+                    ContinueOperation::ResumeKernel
                 } else {
                     ContinueOperation::ExceptionFixup
                 };

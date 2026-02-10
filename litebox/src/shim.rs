@@ -96,8 +96,8 @@ pub enum ContinueOperation {
     ResumeGuest,
     /// Exit the current thread.
     ExitThread,
-    /// The exception was handled in kernel mode; resume kernel execution.
-    ExceptionHandled,
+    /// The exception was triggered in kernel mode; resume kernel execution.
+    ResumeKernel,
     /// The exception was not handled. The platform should apply an
     /// exception-table fixup if one exists.
     ExceptionFixup,

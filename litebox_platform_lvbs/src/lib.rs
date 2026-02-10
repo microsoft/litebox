@@ -1812,7 +1812,7 @@ unsafe extern "C" fn exception_handler(thread_ctx: &mut ThreadContext, kernel_mo
         // - Must return a fixup address to the asm caller (not resume user mode)
         let op = thread_ctx.shim.exception(thread_ctx.ctx, &info);
         match op {
-            ContinueOperation::ExceptionHandled => 0,
+            ContinueOperation::ResumeKernel => 0,
             ContinueOperation::ExceptionFixup => {
                 let faulting_rip =
                     with_per_cpu_variables_asm(PerCpuVariablesAsm::get_exception_rip);
@@ -1842,8 +1842,8 @@ impl ThreadContext<'_> {
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_user(self.ctx) },
             ContinueOperation::ExitThread => {}
-            ContinueOperation::ExceptionHandled => {
-                panic!("ExceptionHandled not expected in user-mode call_shim path")
+            ContinueOperation::ResumeKernel => {
+                panic!("ResumeKernel not expected in user-mode call_shim path")
             }
             ContinueOperation::ExceptionFixup => {
                 panic!("ExceptionFixup not expected in user-mode call_shim path")
