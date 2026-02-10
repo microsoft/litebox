@@ -137,13 +137,13 @@ pub struct LinuxShimBuilder<FS: ShimFS> {
     load_filter: Option<LoadFilter>,
 }
 
-impl Default for LinuxShimBuilder<DefaultFS> {
+impl<FS: ShimFS> Default for LinuxShimBuilder<FS> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LinuxShimBuilder<DefaultFS> {
+impl<FS: ShimFS> LinuxShimBuilder<FS> {
     /// Returns a new shim builder.
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
@@ -159,7 +159,7 @@ impl LinuxShimBuilder<DefaultFS> {
     ///
     /// NOTE: This function signature might change as better parametricity is added to file systems.
     /// Related: <https://github.com/MSRSSP/litebox/issues/24>
-    pub fn set_fs(&mut self, fs: LinuxFS) {
+    pub fn set_fs(&mut self, fs: FS) {
         self.fs = Some(fs);
     }
 
