@@ -16,6 +16,7 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };
 use thiserror::Error;
+use zerocopy::FromBytes;
 
 use crate::errno::Errno;
 
@@ -72,11 +73,25 @@ struct TrampolineInfo {
 /// This must match `TRAMPOLINE_MAGIC` in `litebox_syscall_rewriter`.
 const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
-/// Trampoline header size for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
-const TRAMPOLINE_HEADER_SIZE_64: usize = 32;
+/// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
+#[repr(C, packed)]
+#[derive(FromBytes)]
+struct TrampolineHeader64 {
+    magic: u64,
+    file_offset: u64,
+    vaddr: u64,
+    trampoline_size: u64,
+}
 
-/// Trampoline header size for 32-bit: 8 (magic) + 4 (file_offset) + 4 (vaddr) + 4 (size) = 20 bytes
-const TRAMPOLINE_HEADER_SIZE_32: usize = 20;
+/// Trampoline header for 32-bit: 8 (magic) + 4 (file_offset) + 4 (vaddr) + 4 (size) = 20 bytes
+#[repr(C, packed)]
+#[derive(FromBytes)]
+struct TrampolineHeader32 {
+    magic: u64,
+    file_offset: u32,
+    vaddr: u32,
+    trampoline_size: u32,
+}
 
 const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
     elf::file::Class::ELF64
@@ -225,14 +240,13 @@ impl ElfParsedFile {
             // and may give zero as entry point.
             return Ok(());
         }
-        const MAX_TRAMPOLINE_SIZE: usize = 16 * PAGE_SIZE;
 
         let file_size = file.size().map_err(ElfParseError::Io)?;
 
         let header_size = if cfg!(target_pointer_width = "64") {
-            TRAMPOLINE_HEADER_SIZE_64
+            size_of::<TrampolineHeader64>()
         } else {
-            TRAMPOLINE_HEADER_SIZE_32
+            size_of::<TrampolineHeader32>()
         };
 
         // File must be large enough to contain the header
@@ -242,7 +256,7 @@ impl ElfParsedFile {
 
         // Read the header from the end of the file
         let header_offset = file_size - header_size as u64;
-        let mut header_buf = [0u8; TRAMPOLINE_HEADER_SIZE_64]; // Max header size
+        let mut header_buf = [0u8; size_of::<TrampolineHeader64>()]; // Max header size
         file.read_at(header_offset, &mut header_buf[..header_size])
             .map_err(ElfParseError::Io)?;
 
@@ -258,26 +272,29 @@ impl ElfParsedFile {
         }
 
         let (file_offset, vaddr, trampoline_size) = if cfg!(target_pointer_width = "64") {
-            // 64-bit: [0..8] magic, [8..16] file_offset, [16..24] vaddr, [24..32] code_size
-            let file_offset: u64 = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
-            let vaddr: usize = u64::from_le_bytes(header_buf[16..24].try_into().unwrap())
+            let header = TrampolineHeader64::read_from_bytes(&header_buf)
+                .map_err(|_| ElfParseError::BadTrampoline)?;
+            let vaddr: usize = header
+                .vaddr
                 .try_into()
                 .map_err(|_| ElfParseError::BadTrampoline)?;
-            let trampoline_size: usize = u64::from_le_bytes(header_buf[24..32].try_into().unwrap())
+            let trampoline_size: usize = header
+                .trampoline_size
                 .try_into()
                 .map_err(|_| ElfParseError::BadTrampoline)?;
-            (file_offset, vaddr, trampoline_size)
+            (header.file_offset, vaddr, trampoline_size)
         } else {
-            // 32-bit: [0..8] magic, [8..12] file_offset, [12..16] vaddr, [16..20] code_size
-            let file_offset = u64::from(u32::from_le_bytes(header_buf[8..12].try_into().unwrap()));
-            let vaddr = u32::from_le_bytes(header_buf[12..16].try_into().unwrap()) as usize;
-            let trampoline_size =
-                u32::from_le_bytes(header_buf[16..20].try_into().unwrap()) as usize;
-            (file_offset, vaddr, trampoline_size)
+            let header = TrampolineHeader32::read_from_bytes(&header_buf[..header_size])
+                .map_err(|_| ElfParseError::BadTrampoline)?;
+            (
+                u64::from(header.file_offset),
+                header.vaddr as usize,
+                header.trampoline_size as usize,
+            )
         };
 
-        // Validate trampoline size bounds
-        if trampoline_size == 0 || trampoline_size > MAX_TRAMPOLINE_SIZE {
+        // Validate trampoline size
+        if trampoline_size == 0 {
             return Err(ElfParseError::BadTrampoline);
         }
 

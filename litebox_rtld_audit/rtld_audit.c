@@ -27,14 +27,16 @@
 #define SYS_exit_group 231
 #define AT_FDCWD -100
 
-// Maximum number of pages to search for trampoline
-#define MAX_SEARCH_PAGES 16
-// Maximum allowed trampoline size (must match Rust loader)
-#define MAX_TRAMP_SIZE (MAX_SEARCH_PAGES * 0x1000)
-// Trampoline header size for x86_64: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size)
-#define TRAMP_HEADER_SIZE 32
 // Maximum valid userspace address (48-bit address space)
 #define MAX_USERSPACE_ADDR 0x7FFFFFFFFFFFUL
+
+// Trampoline header layout for x86_64: magic(8) + file_offset(8) + vaddr(8) + size(8) = 32 bytes
+struct __attribute__((packed)) TrampolineHeader {
+  uint64_t magic;
+  uint64_t file_offset;
+  uint64_t vaddr;
+  uint64_t trampoline_size;
+};
 
 // Linux flags
 #define MAP_PRIVATE 0x02
@@ -276,7 +278,7 @@ unsigned int la_objopen(struct link_map *map,
   long file_size = st.st_size;
 
   // File must be large enough to contain at least a trampoline header
-  if (file_size < TRAMP_HEADER_SIZE) {
+  if (file_size < (long)sizeof(struct TrampolineHeader)) {
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
   }
@@ -284,7 +286,7 @@ unsigned int la_objopen(struct link_map *map,
   // The trampoline header is at the end of the file (last 32 bytes for x86_64).
   // File layout: [ELF][padding][trampoline code][header]
   // Read the last page that contains the header.
-  long header_offset = file_size - TRAMP_HEADER_SIZE;
+  long header_offset = file_size - sizeof(struct TrampolineHeader);
   long header_page_offset = header_offset & ~0xFFFUL;
 
   // Map the page containing the header
@@ -297,13 +299,12 @@ unsigned int la_objopen(struct link_map *map,
 
   // Read header from the mapped page
   long header_in_page_offset = header_offset - header_page_offset;
-  const char *header_ptr = (const char *)header_page + header_in_page_offset;
+  const struct TrampolineHeader *header = (const struct TrampolineHeader *)((const char *)header_page + header_in_page_offset);
 
   // Check magic
-  uint64_t magic = read_u64(header_ptr);
-  if (magic != TRAMPOLINE_MAGIC) {
+  if (header->magic != TRAMPOLINE_MAGIC) {
     // If the prefix matches but the version differs, fail explicitly.
-    if (memcmp(header_ptr, "LITEBOX", 7) == 0) {
+    if (memcmp(header, "LITEBOX", 7) == 0) {
       syscall_print("[audit] invalid trampoline version\n", 36);
       do_syscall(SYS_munmap, (long)header_page, 0x1000, 0, 0, 0, 0);
       do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
@@ -315,16 +316,16 @@ unsigned int la_objopen(struct link_map *map,
     return 0;
   }
 
-  // Parse header (x86_64): [0..8]: magic, [8..16]: file_offset, [16..24]: vaddr, [24..32]: code_size
-  uint64_t tramp_file_offset = read_u64(header_ptr + 8);
-  uint64_t tramp_vaddr = read_u64(header_ptr + 16);
-  uint64_t tramp_size_raw = read_u64(header_ptr + 24);
+  // Copy fields before unmapping
+  uint64_t tramp_file_offset = header->file_offset;
+  uint64_t tramp_vaddr = header->vaddr;
+  uint64_t tramp_size_raw = header->trampoline_size;
 
   do_syscall(SYS_munmap, (long)header_page, 0x1000, 0, 0, 0, 0);
   syscall_print("[audit] found trampoline header at end of file\n", 47);
 
-  // Validate trampoline size upper bound
-  if (tramp_size_raw == 0 || tramp_size_raw > MAX_TRAMP_SIZE) {
+  // Validate trampoline size
+  if (tramp_size_raw == 0) {
     syscall_print("[audit] trampoline code size invalid\n", 37);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
