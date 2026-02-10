@@ -39,7 +39,7 @@ struct SignalFrameRt {
     ucontext: Ucontext,
 }
 
-impl Task {
+impl<FS: crate::ShimFS> Task<FS> {
     /// Legacy signal return syscall implementation for x86.
     pub(crate) fn sys_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
         let lctx_addr = ctx.esp.wrapping_sub(8);

@@ -11,7 +11,7 @@ use alloc::{
 use litebox::{
     event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
-    fs::{FileSystem as _, Mode, OFlags, SeekWhence},
+    fs::{Mode, OFlags, SeekWhence},
     path,
     platform::{RawConstPointer, RawMutPointer},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
@@ -22,7 +22,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
-use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, MutPtr, Task};
+use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, MutPtr, ShimFS, Task};
 use core::sync::atomic::Ordering;
 
 /// Task state shared by `CLONE_FS`.
@@ -51,12 +51,12 @@ impl FsState {
 }
 
 /// Task state shared by `CLONE_FILES`.
-pub(crate) struct FilesState {
-    pub file_descriptors: litebox::sync::RwLock<Platform, Descriptors>,
+pub(crate) struct FilesState<FS: ShimFS> {
+    pub file_descriptors: litebox::sync::RwLock<Platform, Descriptors<FS>>,
     pub raw_descriptor_store: litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
 }
 
-impl FilesState {
+impl<FS: ShimFS> FilesState<FS> {
     pub fn new() -> Self {
         Self {
             file_descriptors: litebox::sync::RwLock::new(Descriptors::new()),
@@ -113,7 +113,7 @@ impl<P: path::Arg> FsPath<P> {
     }
 }
 
-impl Task {
+impl<FS: ShimFS> Task<FS> {
     fn get_umask(&self) -> Mode {
         self.fs.borrow().umask()
     }
@@ -376,7 +376,7 @@ pub(crate) fn try_into_whence(value: i16) -> Result<SeekWhence, i16> {
     }
 }
 
-impl Task {
+impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `lseek`
     pub fn sys_lseek(&self, fd: i32, offset: isize, whence: SeekWhence) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd) else {
@@ -406,7 +406,7 @@ impl Task {
         self.global.fs.mkdir(pathname, mode).map_err(Errno::from)
     }
 
-    pub(crate) fn do_close(&self, desc: Descriptor) -> Result<(), Errno> {
+    pub(crate) fn do_close(&self, desc: Descriptor<FS>) -> Result<(), Errno> {
         let files = self.files.borrow();
         match desc {
             Descriptor::LiteBoxRawFd(raw_fd) => {
@@ -553,7 +553,7 @@ where
     Ok(total_written)
 }
 
-impl Task {
+impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `writev`
     pub fn sys_writev(
         &self,
@@ -690,8 +690,8 @@ impl Task {
     }
 }
 
-impl Descriptor {
-    fn stat(&self, task: &Task) -> Result<FileStat, Errno> {
+impl<FS: ShimFS> Descriptor<FS> {
+    fn stat(&self, task: &Task<FS>) -> Result<FileStat, Errno> {
         let fstat = match self {
             Descriptor::LiteBoxRawFd(raw_fd) => task
                 .files
@@ -798,13 +798,13 @@ impl Descriptor {
 
     pub(crate) fn get_file_descriptor_flags(
         &self,
-        global: &GlobalState,
-        files: &FilesState,
+        global: &GlobalState<FS>,
+        files: &FilesState<FS>,
     ) -> Result<FileDescriptorFlags, Errno> {
         // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
         // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
-        fn get_flags<S: FdEnabledSubsystem>(
-            global: &GlobalState,
+        fn get_flags<FS: ShimFS, S: FdEnabledSubsystem>(
+            global: &GlobalState<FS>,
             fd: &TypedFd<S>,
         ) -> FileDescriptorFlags {
             global
@@ -833,12 +833,12 @@ impl Descriptor {
     }
     fn set_file_descriptor_flags(
         &self,
-        global: &GlobalState,
-        files: &FilesState,
+        global: &GlobalState<FS>,
+        files: &FilesState<FS>,
         flags: FileDescriptorFlags,
     ) -> Result<(), Errno> {
-        fn set_flags<S: FdEnabledSubsystem>(
-            global: &GlobalState,
+        fn set_flags<FS: ShimFS, S: FdEnabledSubsystem>(
+            global: &GlobalState<FS>,
             fd: &TypedFd<S>,
             flags: FileDescriptorFlags,
         ) {
@@ -868,7 +868,7 @@ impl Descriptor {
     }
 }
 
-impl Task {
+impl<FS: ShimFS> Task<FS> {
     fn do_stat(&self, pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, Errno> {
         let normalized_path = pathname.normalized()?;
         let path = if follow_symlink {
@@ -1182,7 +1182,7 @@ impl Task {
 
 const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
 
-impl Task {
+impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
         let (pipe_flags, cloexec) = {
@@ -1293,7 +1293,7 @@ impl Task {
         }
     }
 
-    fn is_stdio(&self, fd: &TypedFd<crate::LinuxFS>) -> Result<bool, Errno> {
+    fn is_stdio(&self, fd: &TypedFd<FS>) -> Result<bool, Errno> {
         match self.global.fs.fd_file_status(fd) {
             Ok(status) => {
                 // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
@@ -1729,17 +1729,17 @@ impl Task {
         Ok(count)
     }
 
-    fn do_dup(&self, file: &Descriptor, flags: OFlags) -> Result<Descriptor, Errno> {
+    fn do_dup(&self, file: &Descriptor<FS>, flags: OFlags) -> Result<Descriptor<FS>, Errno> {
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
         let files = self.files.borrow();
         match file {
             Descriptor::LiteBoxRawFd(raw_fd) => {
-                fn dup<S: FdEnabledSubsystem>(
-                    global: &GlobalState,
-                    files: &FilesState,
+                fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
+                    global: &GlobalState<FS>,
+                    files: &FilesState<FS>,
                     fd: &TypedFd<S>,
                     close_on_exec: bool,
-                ) -> Result<Descriptor, Errno> {
+                ) -> Result<Descriptor<FS>, Errno> {
                     let mut dt = global.litebox.descriptor_table_mut();
                     let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
                     if close_on_exec {
@@ -1843,7 +1843,7 @@ struct Diroff(usize);
 const DIRENT_STRUCT_BYTES_WITHOUT_NAME: usize =
     core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
 
-impl Task {
+impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `getdents64`
     pub(crate) fn sys_getdirent64(
         &self,

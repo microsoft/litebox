@@ -11,7 +11,7 @@ use litebox_platform_multiplex::Platform;
 
 struct TestLauncher {
     platform: &'static Platform,
-    shim_builder: litebox_shim_linux::LinuxShimBuilder,
+    shim_builder: litebox_shim_linux::LinuxShimBuilder<litebox_shim_linux::DefaultFS>,
     fs: litebox_shim_linux::DefaultFS,
 }
 

@@ -10,21 +10,21 @@
 use litebox::fs::nine_p::transport;
 use litebox_common_linux::{ReceiveFlags, SendFlags};
 
-use crate::Task;
+use crate::{ShimFS, Task};
 
 /// A 9P transport backed by litebox's syscall-level socket APIs.
-pub struct ShimTransport<'a> {
-    task: &'a Task,
+pub struct ShimTransport<'a, FS: ShimFS> {
+    task: &'a Task<FS>,
     sockfd: u32,
 }
 
-impl Drop for ShimTransport<'_> {
+impl<FS: ShimFS> Drop for ShimTransport<'_, FS> {
     fn drop(&mut self) {
         let _ = self.task.sys_close(self.sockfd.cast_signed());
     }
 }
 
-impl transport::Read for ShimTransport<'_> {
+impl<FS: ShimFS> transport::Read for ShimTransport<'_, FS> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
         self.task
             .do_recvfrom(self.sockfd, buf, ReceiveFlags::empty(), None)
@@ -32,7 +32,7 @@ impl transport::Read for ShimTransport<'_> {
     }
 }
 
-impl transport::Write for ShimTransport<'_> {
+impl<FS: ShimFS> transport::Write for ShimTransport<'_, FS> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
         self.task
             .do_sendto(self.sockfd, buf, SendFlags::empty(), None)
@@ -146,7 +146,10 @@ mod tests {
     /// # Arguments
     /// * `task` - The task whose syscall APIs will be used for socket operations
     /// * `addr` - The socket address of the 9P server
-    fn connect(task: &Task, addr: core::net::SocketAddr) -> Result<ShimTransport<'_>, Errno> {
+    fn connect(
+        task: &Task<crate::DefaultFS>,
+        addr: core::net::SocketAddr,
+    ) -> Result<ShimTransport<'_, crate::DefaultFS>, Errno> {
         let sockfd =
             task.do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)?;
 
@@ -156,9 +159,9 @@ mod tests {
     }
 
     fn connect_9p<'a>(
-        task: &'a crate::Task,
+        task: &'a crate::Task<crate::DefaultFS>,
         server: &DiodServer,
-    ) -> nine_p::FileSystem<crate::Platform, ShimTransport<'a>> {
+    ) -> nine_p::FileSystem<crate::Platform, ShimTransport<'a, crate::DefaultFS>> {
         // The diod server is reachable at the gateway address (10.0.0.1) from the shim's
         // network perspective, since the TUN device bridges to the host.
         let addr = socket_addr([10, 0, 0, 1], server.port);
