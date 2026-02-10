@@ -9,7 +9,7 @@ expression: diff
   8049142:	c7 85 d0 39 00 00 01 	movl   $0x1,0x39d0(%ebp)
   8049149:	00 00 00
 - 804914c:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 804914c:	e9 bb de 09 00       	jmp    80e700c <_end+0x3c4>
++ 804914c:	e9 b3 de 09 00       	jmp    80e7004 <_end+0x3bc>
 + 8049151:	90                   	nop
 + 8049152:	90                   	nop
   8049153:	8b 85 d0 39 00 00    	mov    0x39d0(%ebp),%eax
@@ -22,7 +22,7 @@ expression: diff
 - 8049e00:	89 d0                	mov    %edx,%eax
 - 8049e02:	cd 80                	int    $0x80
 - 8049e04:	eb fa                	jmp    8049e00 <__libc_start_call_main+0x90>
-+ 8049e00:	e9 19 d2 09 00       	jmp    80e701e <_end+0x3d6>
++ 8049e00:	e9 11 d2 09 00       	jmp    80e7016 <_end+0x3ce>
 + 8049e05:	90                   	nop
   8049e06:	31 c0                	xor    %eax,%eax
   8049e08:	eb d0                	jmp    8049dda <__libc_start_call_main+0x6a>
@@ -34,7 +34,7 @@ expression: diff
 - 804bf8c:	c7 44 24 4c 51 00 00 	movl   $0x51,0x4c(%esp)
 - 804bf93:	00
 - 804bf94:	cd 80                	int    $0x80
-+ 804bf8c:	e9 9e b0 09 00       	jmp    80e702f <_end+0x3e7>
++ 804bf8c:	e9 96 b0 09 00       	jmp    80e7027 <_end+0x3df>
 + 804bf91:	90                   	nop
 + 804bf92:	90                   	nop
 + 804bf93:	90                   	nop
@@ -48,13 +48,13 @@ expression: diff
   804bfab:	8d 8e 20 e6 fc ff    	lea    -0x319e0(%esi),%ecx
 - 804bfb1:	ba 2d 00 00 00       	mov    $0x2d,%edx
 - 804bfb6:	cd 80                	int    $0x80
-+ 804bfb1:	e9 93 b0 09 00       	jmp    80e7049 <_end+0x401>
++ 804bfb1:	e9 8b b0 09 00       	jmp    80e7041 <_end+0x3f9>
 + 804bfb6:	90                   	nop
 + 804bfb7:	90                   	nop
   804bfb8:	b8 fc 00 00 00       	mov    $0xfc,%eax
 - 804bfbd:	bb 7f 00 00 00       	mov    $0x7f,%ebx
 - 804bfc2:	cd 80                	int    $0x80
-+ 804bfbd:	e9 9e b0 09 00       	jmp    80e7060 <_end+0x418>
++ 804bfbd:	e9 96 b0 09 00       	jmp    80e7058 <_end+0x410>
 + 804bfc2:	90                   	nop
 + 804bfc3:	90                   	nop
   804bfc4:	e8 67 ff 00 00       	call   805bf30 <__tls_init_tp>
@@ -66,13 +66,13 @@ expression: diff
   804c082:	8d 8e 20 e6 fc ff    	lea    -0x319e0(%esi),%ecx
 - 804c088:	ba 2d 00 00 00       	mov    $0x2d,%edx
 - 804c08d:	cd 80                	int    $0x80
-+ 804c088:	e9 ea af 09 00       	jmp    80e7077 <_end+0x42f>
++ 804c088:	e9 e2 af 09 00       	jmp    80e706f <_end+0x427>
 + 804c08d:	90                   	nop
 + 804c08e:	90                   	nop
   804c08f:	b8 fc 00 00 00       	mov    $0xfc,%eax
 - 804c094:	bb 7f 00 00 00       	mov    $0x7f,%ebx
 - 804c099:	cd 80                	int    $0x80
-+ 804c094:	e9 f5 af 09 00       	jmp    80e708e <_end+0x446>
++ 804c094:	e9 ed af 09 00       	jmp    80e7086 <_end+0x43e>
 + 804c099:	90                   	nop
 + 804c09a:	90                   	nop
   804c09b:	e9 46 fe ff ff       	jmp    804bee6 <__libc_setup_tls+0x126>
@@ -83,7 +83,7 @@ expression: diff
   8050f61:	8d b4 26 00 00 00 00 	lea    0x0(%esi,%eiz,1),%esi
   8050f68:	b8 92 00 00 00       	mov    $0x92,%eax
 - 8050f6d:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8050f6d:	e9 33 61 09 00       	jmp    80e70a5 <_end+0x45d>
++ 8050f6d:	e9 2b 61 09 00       	jmp    80e709d <_end+0x455>
 + 8050f72:	90                   	nop
 + 8050f73:	90                   	nop
   8050f74:	83 f8 fc             	cmp    $0xfffffffc,%eax
@@ -94,7 +94,7 @@ expression: diff
   805118e:	ba 02 00 00 00       	mov    $0x2,%edx
   8051193:	31 f6                	xor    %esi,%esi
 - 8051195:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8051195:	e9 1d 5f 09 00       	jmp    80e70b7 <_end+0x46f>
++ 8051195:	e9 15 5f 09 00       	jmp    80e70af <_end+0x467>
 + 805119a:	90                   	nop
 + 805119b:	90                   	nop
   805119c:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -105,7 +105,7 @@ expression: diff
   8051202:	31 f6                	xor    %esi,%esi
   8051204:	80 f1 80             	xor    $0x80,%cl
 - 8051207:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8051207:	e9 bd 5e 09 00       	jmp    80e70c9 <_end+0x481>
++ 8051207:	e9 b5 5e 09 00       	jmp    80e70c1 <_end+0x479>
 + 805120c:	90                   	nop
 + 805120d:	90                   	nop
   805120e:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -116,7 +116,7 @@ expression: diff
   8051251:	31 f6                	xor    %esi,%esi
   8051253:	8b 5c 24 0c          	mov    0xc(%esp),%ebx
 - 8051257:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8051257:	e9 7f 5e 09 00       	jmp    80e70db <_end+0x493>
++ 8051257:	e9 77 5e 09 00       	jmp    80e70d3 <_end+0x48b>
 + 805125c:	90                   	nop
 + 805125d:	90                   	nop
   805125e:	5b                   	pop    %ebx
@@ -127,7 +127,7 @@ expression: diff
   8051282:	8b 5c 24 0c          	mov    0xc(%esp),%ebx
   8051286:	80 f1 81             	xor    $0x81,%cl
 - 8051289:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8051289:	e9 5f 5e 09 00       	jmp    80e70ed <_end+0x4a5>
++ 8051289:	e9 57 5e 09 00       	jmp    80e70e5 <_end+0x49d>
 + 805128e:	90                   	nop
 + 805128f:	90                   	nop
   8051290:	5b                   	pop    %ebx
@@ -138,7 +138,7 @@ expression: diff
   805215c:	c6 86 fc 35 00 00 01 	movb   $0x1,0x35fc(%esi)
   8052163:	8d 9e f4 35 00 00    	lea    0x35f4(%esi),%ebx
 - 8052169:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8052169:	e9 91 4f 09 00       	jmp    80e70ff <_end+0x4b7>
++ 8052169:	e9 89 4f 09 00       	jmp    80e70f7 <_end+0x4af>
 + 805216e:	90                   	nop
 + 805216f:	90                   	nop
   8052170:	8d 7c 24 0c          	lea    0xc(%esp),%edi
@@ -149,7 +149,7 @@ expression: diff
   8059916:	b8 93 01 00 00       	mov    $0x193,%eax
   805991b:	89 f9                	mov    %edi,%ecx
 - 805991d:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805991d:	e9 ef d7 08 00       	jmp    80e7111 <_end+0x4c9>
++ 805991d:	e9 e7 d7 08 00       	jmp    80e7109 <_end+0x4c1>
 + 8059922:	90                   	nop
 + 8059923:	90                   	nop
   8059924:	85 c0                	test   %eax,%eax
@@ -159,7 +159,7 @@ expression: diff
   805992d:	8d 4c 24 04          	lea    0x4(%esp),%ecx
   8059931:	b8 09 01 00 00       	mov    $0x109,%eax
 - 8059936:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8059936:	e9 e8 d7 08 00       	jmp    80e7123 <_end+0x4db>
++ 8059936:	e9 e0 d7 08 00       	jmp    80e711b <_end+0x4d3>
 + 805993b:	90                   	nop
 + 805993c:	90                   	nop
   805993d:	85 c0                	test   %eax,%eax
@@ -170,7 +170,7 @@ expression: diff
   8059a70:	f4                   	hlt
   8059a71:	89 d0                	mov    %edx,%eax
 - 8059a73:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8059a73:	e9 bd d6 08 00       	jmp    80e7135 <_end+0x4ed>
++ 8059a73:	e9 b5 d6 08 00       	jmp    80e712d <_end+0x4e5>
 + 8059a78:	90                   	nop
 + 8059a79:	90                   	nop
   8059a7a:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -181,7 +181,7 @@ expression: diff
   8059bd0:	31 c0                	xor    %eax,%eax
   8059bd2:	b8 7f 01 00 00       	mov    $0x17f,%eax
 - 8059bd7:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8059bd7:	e9 6b d5 08 00       	jmp    80e7147 <_end+0x4ff>
++ 8059bd7:	e9 63 d5 08 00       	jmp    80e713f <_end+0x4f7>
 + 8059bdc:	90                   	nop
 + 8059bdd:	90                   	nop
   8059bde:	89 c6                	mov    %eax,%esi
@@ -192,7 +192,7 @@ expression: diff
   8059dc2:	8d 54 24 2c          	lea    0x2c(%esp),%edx
   8059dc6:	b8 2c 01 00 00       	mov    $0x12c,%eax
 - 8059dcb:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8059dcb:	e9 89 d3 08 00       	jmp    80e7159 <_end+0x511>
++ 8059dcb:	e9 81 d3 08 00       	jmp    80e7151 <_end+0x509>
 + 8059dd0:	90                   	nop
 + 8059dd1:	90                   	nop
   8059dd2:	89 c2                	mov    %eax,%edx
@@ -203,7 +203,7 @@ expression: diff
   8059f5c:	b8 06 00 00 00       	mov    $0x6,%eax
   8059f61:	8b 5c 24 08          	mov    0x8(%esp),%ebx
 - 8059f65:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8059f65:	e9 01 d2 08 00       	jmp    80e716b <_end+0x523>
++ 8059f65:	e9 f9 d1 08 00       	jmp    80e7163 <_end+0x51b>
 + 8059f6a:	90                   	nop
 + 8059f6b:	90                   	nop
   8059f6c:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -214,7 +214,7 @@ expression: diff
   8059fb9:	8b 5c 24 20          	mov    0x20(%esp),%ebx
   8059fbd:	b8 dd 00 00 00       	mov    $0xdd,%eax
 - 8059fc2:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8059fc2:	e9 b6 d1 08 00       	jmp    80e717d <_end+0x535>
++ 8059fc2:	e9 ae d1 08 00       	jmp    80e7175 <_end+0x52d>
 + 8059fc7:	90                   	nop
 + 8059fc8:	90                   	nop
   8059fc9:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -225,7 +225,7 @@ expression: diff
   8059ff0:	b8 dd 00 00 00       	mov    $0xdd,%eax
   8059ff5:	b9 10 00 00 00       	mov    $0x10,%ecx
 - 8059ffa:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8059ffa:	e9 90 d1 08 00       	jmp    80e718f <_end+0x547>
++ 8059ffa:	e9 88 d1 08 00       	jmp    80e7187 <_end+0x53f>
 + 8059fff:	90                   	nop
 + 805a000:	90                   	nop
   805a001:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -236,7 +236,7 @@ expression: diff
   805a069:	8b 5c 24 20          	mov    0x20(%esp),%ebx
   805a06d:	b8 dd 00 00 00       	mov    $0xdd,%eax
 - 805a072:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805a072:	e9 2a d1 08 00       	jmp    80e71a1 <_end+0x559>
++ 805a072:	e9 22 d1 08 00       	jmp    80e7199 <_end+0x551>
 + 805a077:	90                   	nop
 + 805a078:	90                   	nop
   805a079:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -247,7 +247,7 @@ expression: diff
   805a0a0:	b8 dd 00 00 00       	mov    $0xdd,%eax
   805a0a5:	b9 10 00 00 00       	mov    $0x10,%ecx
 - 805a0aa:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805a0aa:	e9 04 d1 08 00       	jmp    80e71b3 <_end+0x56b>
++ 805a0aa:	e9 fc d0 08 00       	jmp    80e71ab <_end+0x563>
 + 805a0af:	90                   	nop
 + 805a0b0:	90                   	nop
   805a0b1:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -258,7 +258,7 @@ expression: diff
   805a118:	b8 27 01 00 00       	mov    $0x127,%eax
   805a11d:	bb 9c ff ff ff       	mov    $0xffffff9c,%ebx
 - 805a122:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805a122:	e9 9e d0 08 00       	jmp    80e71c5 <_end+0x57d>
++ 805a122:	e9 96 d0 08 00       	jmp    80e71bd <_end+0x575>
 + 805a127:	90                   	nop
 + 805a128:	90                   	nop
   805a129:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -269,7 +269,7 @@ expression: diff
   805a176:	8b 54 24 14          	mov    0x14(%esp),%edx
   805a17a:	8b 5c 24 0c          	mov    0xc(%esp),%ebx
 - 805a17e:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805a17e:	e9 54 d0 08 00       	jmp    80e71d7 <_end+0x58f>
++ 805a17e:	e9 4c d0 08 00       	jmp    80e71cf <_end+0x587>
 + 805a183:	90                   	nop
 + 805a184:	90                   	nop
   805a185:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -281,7 +281,7 @@ expression: diff
   805a30c:	b8 2d 00 00 00       	mov    $0x2d,%eax
 - 805a311:	8b 5c 24 08          	mov    0x8(%esp),%ebx
 - 805a315:	cd 80                	int    $0x80
-+ 805a311:	e9 d3 ce 08 00       	jmp    80e71e9 <_end+0x5a1>
++ 805a311:	e9 cb ce 08 00       	jmp    80e71e1 <_end+0x599>
 + 805a316:	90                   	nop
   805a317:	89 82 28 36 00 00    	mov    %eax,0x3628(%edx)
   805a31d:	39 d8                	cmp    %ebx,%eax
@@ -291,7 +291,7 @@ expression: diff
   805a750:	8d 54 24 0c          	lea    0xc(%esp),%edx
   805a754:	b8 f2 00 00 00       	mov    $0xf2,%eax
 - 805a759:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805a759:	e9 a1 ca 08 00       	jmp    80e71ff <_end+0x5b7>
++ 805a759:	e9 99 ca 08 00       	jmp    80e71f7 <_end+0x5af>
 + 805a75e:	90                   	nop
 + 805a75f:	90                   	nop
   805a760:	85 c0                	test   %eax,%eax
@@ -302,7 +302,7 @@ expression: diff
   805a959:	8b 5c 24 08          	mov    0x8(%esp),%ebx
   805a95d:	b8 db 00 00 00       	mov    $0xdb,%eax
 - 805a962:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805a962:	e9 aa c8 08 00       	jmp    80e7211 <_end+0x5c9>
++ 805a962:	e9 a2 c8 08 00       	jmp    80e7209 <_end+0x5c1>
 + 805a967:	90                   	nop
 + 805a968:	90                   	nop
   805a969:	5b                   	pop    %ebx
@@ -313,7 +313,7 @@ expression: diff
   805aa29:	8b 5c 24 08          	mov    0x8(%esp),%ebx
   805aa2d:	b8 7d 00 00 00       	mov    $0x7d,%eax
 - 805aa32:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805aa32:	e9 ec c7 08 00       	jmp    80e7223 <_end+0x5db>
++ 805aa32:	e9 e4 c7 08 00       	jmp    80e721b <_end+0x5d3>
 + 805aa37:	90                   	nop
 + 805aa38:	90                   	nop
   805aa39:	5b                   	pop    %ebx
@@ -324,7 +324,7 @@ expression: diff
   805aa56:	8b 5c 24 04          	mov    0x4(%esp),%ebx
   805aa5a:	b8 5b 00 00 00       	mov    $0x5b,%eax
 - 805aa5f:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805aa5f:	e9 d1 c7 08 00       	jmp    80e7235 <_end+0x5ed>
++ 805aa5f:	e9 c9 c7 08 00       	jmp    80e722d <_end+0x5e5>
 + 805aa64:	90                   	nop
 + 805aa65:	90                   	nop
   805aa66:	89 d3                	mov    %edx,%ebx
@@ -335,7 +335,7 @@ expression: diff
   805ab29:	b8 a3 00 00 00       	mov    $0xa3,%eax
   805ab2e:	8b 5c 24 14          	mov    0x14(%esp),%ebx
 - 805ab32:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805ab32:	e9 10 c7 08 00       	jmp    80e7247 <_end+0x5ff>
++ 805ab32:	e9 08 c7 08 00       	jmp    80e723f <_end+0x5f7>
 + 805ab37:	90                   	nop
 + 805ab38:	90                   	nop
   805ab39:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -346,7 +346,7 @@ expression: diff
   805abdb:	bb 41 4d 56 53       	mov    $0x53564d41,%ebx
   805abe0:	31 c9                	xor    %ecx,%ecx
 - 805abe2:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805abe2:	e9 72 c6 08 00       	jmp    80e7259 <_end+0x611>
++ 805abe2:	e9 6a c6 08 00       	jmp    80e7251 <_end+0x609>
 + 805abe7:	90                   	nop
 + 805abe8:	90                   	nop
   805abe9:	83 f8 ea             	cmp    $0xffffffea,%eax
@@ -357,7 +357,7 @@ expression: diff
   805ac02:	8b 5c 24 04          	mov    0x4(%esp),%ebx
   805ac06:	b8 74 00 00 00       	mov    $0x74,%eax
 - 805ac0b:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805ac0b:	e9 5b c6 08 00       	jmp    80e726b <_end+0x623>
++ 805ac0b:	e9 53 c6 08 00       	jmp    80e7263 <_end+0x61b>
 + 805ac10:	90                   	nop
 + 805ac11:	90                   	nop
   805ac12:	89 d3                	mov    %edx,%ebx
@@ -368,7 +368,7 @@ expression: diff
   805bf5e:	8d 5e 68             	lea    0x68(%esi),%ebx
   805bf61:	b8 02 01 00 00       	mov    $0x102,%eax
 - 805bf66:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805bf66:	e9 12 b3 08 00       	jmp    80e727d <_end+0x635>
++ 805bf66:	e9 0a b3 08 00       	jmp    80e7275 <_end+0x62d>
 + 805bf6b:	90                   	nop
 + 805bf6c:	90                   	nop
   805bf6d:	89 46 68             	mov    %eax,0x68(%esi)
@@ -379,7 +379,7 @@ expression: diff
   805bfa0:	b9 0c 00 00 00       	mov    $0xc,%ecx
   805bfa5:	89 5e 6c             	mov    %ebx,0x6c(%esi)
 - 805bfa8:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805bfa8:	e9 e2 b2 08 00       	jmp    80e728f <_end+0x647>
++ 805bfa8:	e9 da b2 08 00       	jmp    80e7287 <_end+0x63f>
 + 805bfad:	90                   	nop
 + 805bfae:	90                   	nop
   805bfaf:	6a 00                	push   $0x0
@@ -390,7 +390,7 @@ expression: diff
   805bfda:	31 d2                	xor    %edx,%edx
   805bfdc:	be 53 30 05 53       	mov    $0x53053053,%esi
 - 805bfe1:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 805bfe1:	e9 bb b2 08 00       	jmp    80e72a1 <_end+0x659>
++ 805bfe1:	e9 b3 b2 08 00       	jmp    80e7299 <_end+0x651>
 + 805bfe6:	90                   	nop
 + 805bfe7:	90                   	nop
   805bfe8:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -403,13 +403,13 @@ expression: diff
 - 805c9b5:	31 db                	xor    %ebx,%ebx
 - 805c9b7:	89 c8                	mov    %ecx,%eax
 - 805c9b9:	cd 80                	int    $0x80
-+ 805c9b5:	e9 f9 a8 08 00       	jmp    80e72b3 <_end+0x66b>
++ 805c9b5:	e9 f1 a8 08 00       	jmp    80e72ab <_end+0x663>
 + 805c9ba:	90                   	nop
   805c9bb:	89 c2                	mov    %eax,%edx
 - 805c9bd:	8d 1c 28             	lea    (%eax,%ebp,1),%ebx
 - 805c9c0:	89 c8                	mov    %ecx,%eax
 - 805c9c2:	cd 80                	int    $0x80
-+ 805c9bd:	e9 07 a9 08 00       	jmp    80e72c9 <_end+0x681>
++ 805c9bd:	e9 ff a8 08 00       	jmp    80e72c1 <_end+0x679>
 + 805c9c2:	90                   	nop
 + 805c9c3:	90                   	nop
   805c9c4:	39 c2                	cmp    %eax,%edx
@@ -420,7 +420,7 @@ expression: diff
   807afc1:	f7 d1                	not    %ecx
   807afc3:	81 e1 80 00 00 00    	and    $0x80,%ecx
 - 807afc9:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807afc9:	e9 12 c3 06 00       	jmp    80e72e0 <_end+0x698>
++ 807afc9:	e9 0a c3 06 00       	jmp    80e72d8 <_end+0x690>
 + 807afce:	90                   	nop
 + 807afcf:	90                   	nop
   807afd0:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -431,7 +431,7 @@ expression: diff
   807b172:	b8 f0 00 00 00       	mov    $0xf0,%eax
   807b177:	89 ce                	mov    %ecx,%esi
 - 807b179:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807b179:	e9 74 c1 06 00       	jmp    80e72f2 <_end+0x6aa>
++ 807b179:	e9 6c c1 06 00       	jmp    80e72ea <_end+0x6a2>
 + 807b17e:	90                   	nop
 + 807b17f:	90                   	nop
   807b180:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -442,7 +442,7 @@ expression: diff
   807b340:	b9 07 00 00 00       	mov    $0x7,%ecx
   807b345:	89 d6                	mov    %edx,%esi
 - 807b347:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807b347:	e9 b8 bf 06 00       	jmp    80e7304 <_end+0x6bc>
++ 807b347:	e9 b0 bf 06 00       	jmp    80e72fc <_end+0x6b4>
 + 807b34c:	90                   	nop
 + 807b34d:	90                   	nop
   807b34e:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -453,7 +453,7 @@ expression: diff
   807b8fe:	81 e1 80 00 00 00    	and    $0x80,%ecx
   807b904:	80 f1 81             	xor    $0x81,%cl
 - 807b907:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807b907:	e9 0a ba 06 00       	jmp    80e7316 <_end+0x6ce>
++ 807b907:	e9 02 ba 06 00       	jmp    80e730e <_end+0x6c6>
 + 807b90c:	90                   	nop
 + 807b90d:	90                   	nop
   807b90e:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -464,7 +464,7 @@ expression: diff
   807bb85:	b8 f0 00 00 00       	mov    $0xf0,%eax
   807bb8a:	89 d1                	mov    %edx,%ecx
 - 807bb8c:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807bb8c:	e9 97 b7 06 00       	jmp    80e7328 <_end+0x6e0>
++ 807bb8c:	e9 8f b7 06 00       	jmp    80e7320 <_end+0x6d8>
 + 807bb91:	90                   	nop
 + 807bb92:	90                   	nop
   807bb93:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -475,7 +475,7 @@ expression: diff
   807bbb5:	b8 f0 00 00 00       	mov    $0xf0,%eax
   807bbba:	89 d6                	mov    %edx,%esi
 - 807bbbc:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807bbbc:	e9 79 b7 06 00       	jmp    80e733a <_end+0x6f2>
++ 807bbbc:	e9 71 b7 06 00       	jmp    80e7332 <_end+0x6ea>
 + 807bbc1:	90                   	nop
 + 807bbc2:	90                   	nop
   807bbc3:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -486,7 +486,7 @@ expression: diff
   807bddf:	b9 80 00 00 00       	mov    $0x80,%ecx
   807bde4:	89 fb                	mov    %edi,%ebx
 - 807bde6:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807bde6:	e9 61 b5 06 00       	jmp    80e734c <_end+0x704>
++ 807bde6:	e9 59 b5 06 00       	jmp    80e7344 <_end+0x6fc>
 + 807bdeb:	90                   	nop
 + 807bdec:	90                   	nop
   807bded:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -497,7 +497,7 @@ expression: diff
   807be90:	89 fb                	mov    %edi,%ebx
   807be92:	c7 07 02 00 00 00    	movl   $0x2,(%edi)
 - 807be98:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807be98:	e9 c1 b4 06 00       	jmp    80e735e <_end+0x716>
++ 807be98:	e9 b9 b4 06 00       	jmp    80e7356 <_end+0x70e>
 + 807be9d:	90                   	nop
 + 807be9e:	90                   	nop
   807be9f:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -508,7 +508,7 @@ expression: diff
   807bf1f:	8b 5c 24 10          	mov    0x10(%esp),%ebx
   807bf23:	c7 03 00 00 00 00    	movl   $0x0,(%ebx)
 - 807bf29:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807bf29:	e9 42 b4 06 00       	jmp    80e7370 <_end+0x728>
++ 807bf29:	e9 3a b4 06 00       	jmp    80e7368 <_end+0x720>
 + 807bf2e:	90                   	nop
 + 807bf2f:	90                   	nop
   807bf30:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -519,7 +519,7 @@ expression: diff
   807c11e:	c1 e1 07             	shl    $0x7,%ecx
   807c121:	80 f1 81             	xor    $0x81,%cl
 - 807c124:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807c124:	e9 59 b2 06 00       	jmp    80e7382 <_end+0x73a>
++ 807c124:	e9 51 b2 06 00       	jmp    80e737a <_end+0x732>
 + 807c129:	90                   	nop
 + 807c12a:	90                   	nop
   807c12b:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -530,7 +530,7 @@ expression: diff
   807c295:	89 eb                	mov    %ebp,%ebx
   807c297:	80 f1 81             	xor    $0x81,%cl
 - 807c29a:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807c29a:	e9 f5 b0 06 00       	jmp    80e7394 <_end+0x74c>
++ 807c29a:	e9 ed b0 06 00       	jmp    80e738c <_end+0x744>
 + 807c29f:	90                   	nop
 + 807c2a0:	90                   	nop
   807c2a1:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -541,7 +541,7 @@ expression: diff
   807c2f4:	31 f6                	xor    %esi,%esi
   807c2f6:	80 f1 81             	xor    $0x81,%cl
 - 807c2f9:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807c2f9:	e9 a8 b0 06 00       	jmp    80e73a6 <_end+0x75e>
++ 807c2f9:	e9 a0 b0 06 00       	jmp    80e739e <_end+0x756>
 + 807c2fe:	90                   	nop
 + 807c2ff:	90                   	nop
   807c300:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -552,7 +552,7 @@ expression: diff
   807c385:	89 fb                	mov    %edi,%ebx
   807c387:	80 f1 81             	xor    $0x81,%cl
 - 807c38a:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807c38a:	e9 29 b0 06 00       	jmp    80e73b8 <_end+0x770>
++ 807c38a:	e9 21 b0 06 00       	jmp    80e73b0 <_end+0x768>
 + 807c38f:	90                   	nop
 + 807c390:	90                   	nop
   807c391:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -563,7 +563,7 @@ expression: diff
   807c3fa:	ba ff ff ff 7f       	mov    $0x7fffffff,%edx
   807c3ff:	80 f1 81             	xor    $0x81,%cl
 - 807c402:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807c402:	e9 c3 af 06 00       	jmp    80e73ca <_end+0x782>
++ 807c402:	e9 bb af 06 00       	jmp    80e73c2 <_end+0x77a>
 + 807c407:	90                   	nop
 + 807c408:	90                   	nop
   807c409:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -574,7 +574,7 @@ expression: diff
   807c6af:	ba 01 00 00 00       	mov    $0x1,%edx
   807c6b4:	80 f1 81             	xor    $0x81,%cl
 - 807c6b7:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807c6b7:	e9 20 ad 06 00       	jmp    80e73dc <_end+0x794>
++ 807c6b7:	e9 18 ad 06 00       	jmp    80e73d4 <_end+0x78c>
 + 807c6bc:	90                   	nop
 + 807c6bd:	90                   	nop
   807c6be:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -585,7 +585,7 @@ expression: diff
   807c6de:	89 fb                	mov    %edi,%ebx
   807c6e0:	80 f1 81             	xor    $0x81,%cl
 - 807c6e3:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807c6e3:	e9 06 ad 06 00       	jmp    80e73ee <_end+0x7a6>
++ 807c6e3:	e9 fe ac 06 00       	jmp    80e73e6 <_end+0x79e>
 + 807c6e8:	90                   	nop
 + 807c6e9:	90                   	nop
   807c6ea:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -596,7 +596,7 @@ expression: diff
   807c75d:	31 f6                	xor    %esi,%esi
   807c75f:	80 f1 81             	xor    $0x81,%cl
 - 807c762:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 807c762:	e9 99 ac 06 00       	jmp    80e7400 <_end+0x7b8>
++ 807c762:	e9 91 ac 06 00       	jmp    80e73f8 <_end+0x7b0>
 + 807c767:	90                   	nop
 + 807c768:	90                   	nop
   807c769:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -607,7 +607,7 @@ expression: diff
   808a570:	0f 47 d0             	cmova  %eax,%edx
   808a573:	b8 dc 00 00 00       	mov    $0xdc,%eax
 - 808a578:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808a578:	e9 95 ce 05 00       	jmp    80e7412 <_end+0x7ca>
++ 808a578:	e9 8d ce 05 00       	jmp    80e740a <_end+0x7c2>
 + 808a57d:	90                   	nop
 + 808a57e:	90                   	nop
   808a57f:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -618,7 +618,7 @@ expression: diff
   808a706:	8b 5c 24 04          	mov    0x4(%esp),%ebx
   808a70a:	b8 9b 00 00 00       	mov    $0x9b,%eax
 - 808a70f:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808a70f:	e9 10 cd 05 00       	jmp    80e7424 <_end+0x7dc>
++ 808a70f:	e9 08 cd 05 00       	jmp    80e741c <_end+0x7d4>
 + 808a714:	90                   	nop
 + 808a715:	90                   	nop
   808a716:	89 d3                	mov    %edx,%ebx
@@ -629,7 +629,7 @@ expression: diff
   808a732:	8b 5c 24 04          	mov    0x4(%esp),%ebx
   808a736:	b8 9d 00 00 00       	mov    $0x9d,%eax
 - 808a73b:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808a73b:	e9 f6 cc 05 00       	jmp    80e7436 <_end+0x7ee>
++ 808a73b:	e9 ee cc 05 00       	jmp    80e742e <_end+0x7e6>
 + 808a740:	90                   	nop
 + 808a741:	90                   	nop
   808a742:	89 d3                	mov    %edx,%ebx
@@ -640,7 +640,7 @@ expression: diff
   808a752:	8b 5c 24 04          	mov    0x4(%esp),%ebx
   808a756:	b8 9f 00 00 00       	mov    $0x9f,%eax
 - 808a75b:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808a75b:	e9 e8 cc 05 00       	jmp    80e7448 <_end+0x800>
++ 808a75b:	e9 e0 cc 05 00       	jmp    80e7440 <_end+0x7f8>
 + 808a760:	90                   	nop
 + 808a761:	90                   	nop
   808a762:	89 d3                	mov    %edx,%ebx
@@ -651,7 +651,7 @@ expression: diff
   808a772:	8b 5c 24 04          	mov    0x4(%esp),%ebx
   808a776:	b8 a0 00 00 00       	mov    $0xa0,%eax
 - 808a77b:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808a77b:	e9 da cc 05 00       	jmp    80e745a <_end+0x812>
++ 808a77b:	e9 d2 cc 05 00       	jmp    80e7452 <_end+0x80a>
 + 808a780:	90                   	nop
 + 808a781:	90                   	nop
   808a782:	89 d3                	mov    %edx,%ebx
@@ -662,7 +662,7 @@ expression: diff
   808a799:	8b 5c 24 08          	mov    0x8(%esp),%ebx
   808a79d:	b8 9c 00 00 00       	mov    $0x9c,%eax
 - 808a7a2:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808a7a2:	e9 c5 cc 05 00       	jmp    80e746c <_end+0x824>
++ 808a7a2:	e9 bd cc 05 00       	jmp    80e7464 <_end+0x81c>
 + 808a7a7:	90                   	nop
 + 808a7a8:	90                   	nop
   808a7a9:	5b                   	pop    %ebx
@@ -673,7 +673,7 @@ expression: diff
   808a837:	b8 b7 00 00 00       	mov    $0xb7,%eax
   808a83c:	89 f1                	mov    %esi,%ecx
 - 808a83e:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808a83e:	e9 3b cc 05 00       	jmp    80e747e <_end+0x836>
++ 808a83e:	e9 33 cc 05 00       	jmp    80e7476 <_end+0x82e>
 + 808a843:	90                   	nop
 + 808a844:	90                   	nop
   808a845:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -684,7 +684,7 @@ expression: diff
   808b0ac:	8b 7c 24 3c          	mov    0x3c(%esp),%edi
   808b0b0:	b8 8c 00 00 00       	mov    $0x8c,%eax
 - 808b0b5:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b0b5:	e9 d6 c3 05 00       	jmp    80e7490 <_end+0x848>
++ 808b0b5:	e9 ce c3 05 00       	jmp    80e7488 <_end+0x840>
 + 808b0ba:	90                   	nop
 + 808b0bb:	90                   	nop
   808b0bc:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -695,7 +695,7 @@ expression: diff
   808b1fe:	bb 9c ff ff ff       	mov    $0xffffff9c,%ebx
   808b203:	89 ea                	mov    %ebp,%edx
 - 808b205:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b205:	e9 98 c2 05 00       	jmp    80e74a2 <_end+0x85a>
++ 808b205:	e9 90 c2 05 00       	jmp    80e749a <_end+0x852>
 + 808b20a:	90                   	nop
 + 808b20b:	90                   	nop
   808b20c:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -706,7 +706,7 @@ expression: diff
   808b242:	89 44 24 08          	mov    %eax,0x8(%esp)
   808b246:	b8 27 01 00 00       	mov    $0x127,%eax
 - 808b24b:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b24b:	e9 64 c2 05 00       	jmp    80e74b4 <_end+0x86c>
++ 808b24b:	e9 5c c2 05 00       	jmp    80e74ac <_end+0x864>
 + 808b250:	90                   	nop
 + 808b251:	90                   	nop
   808b252:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -717,7 +717,7 @@ expression: diff
   808b2f0:	b8 27 01 00 00       	mov    $0x127,%eax
   808b2f5:	89 ea                	mov    %ebp,%edx
 - 808b2f7:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b2f7:	e9 ca c1 05 00       	jmp    80e74c6 <_end+0x87e>
++ 808b2f7:	e9 c2 c1 05 00       	jmp    80e74be <_end+0x876>
 + 808b2fc:	90                   	nop
 + 808b2fd:	90                   	nop
   808b2fe:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -728,7 +728,7 @@ expression: diff
   808b331:	89 44 24 08          	mov    %eax,0x8(%esp)
   808b335:	b8 27 01 00 00       	mov    $0x127,%eax
 - 808b33a:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b33a:	e9 99 c1 05 00       	jmp    80e74d8 <_end+0x890>
++ 808b33a:	e9 91 c1 05 00       	jmp    80e74d0 <_end+0x888>
 + 808b33f:	90                   	nop
 + 808b340:	90                   	nop
   808b341:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -739,7 +739,7 @@ expression: diff
   808b3c3:	b8 03 00 00 00       	mov    $0x3,%eax
   808b3c8:	8b 54 24 28          	mov    0x28(%esp),%edx
 - 808b3cc:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b3cc:	e9 19 c1 05 00       	jmp    80e74ea <_end+0x8a2>
++ 808b3cc:	e9 11 c1 05 00       	jmp    80e74e2 <_end+0x89a>
 + 808b3d1:	90                   	nop
 + 808b3d2:	90                   	nop
   808b3d3:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -750,7 +750,7 @@ expression: diff
   808b3f9:	8b 54 24 28          	mov    0x28(%esp),%edx
   808b3fd:	b8 03 00 00 00       	mov    $0x3,%eax
 - 808b402:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b402:	e9 f5 c0 05 00       	jmp    80e74fc <_end+0x8b4>
++ 808b402:	e9 ed c0 05 00       	jmp    80e74f4 <_end+0x8ac>
 + 808b407:	90                   	nop
 + 808b408:	90                   	nop
   808b409:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -761,7 +761,7 @@ expression: diff
   808b483:	b8 04 00 00 00       	mov    $0x4,%eax
   808b488:	8b 54 24 28          	mov    0x28(%esp),%edx
 - 808b48c:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b48c:	e9 7d c0 05 00       	jmp    80e750e <_end+0x8c6>
++ 808b48c:	e9 75 c0 05 00       	jmp    80e7506 <_end+0x8be>
 + 808b491:	90                   	nop
 + 808b492:	90                   	nop
   808b493:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -772,7 +772,7 @@ expression: diff
   808b4b9:	8b 54 24 28          	mov    0x28(%esp),%edx
   808b4bd:	b8 04 00 00 00       	mov    $0x4,%eax
 - 808b4c2:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b4c2:	e9 59 c0 05 00       	jmp    80e7520 <_end+0x8d8>
++ 808b4c2:	e9 51 c0 05 00       	jmp    80e7518 <_end+0x8d0>
 + 808b4c7:	90                   	nop
 + 808b4c8:	90                   	nop
   808b4c9:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -783,7 +783,7 @@ expression: diff
   808b525:	8b 6f 08             	mov    0x8(%edi),%ebp
   808b528:	8b 7f 04             	mov    0x4(%edi),%edi
 - 808b52b:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b52b:	e9 02 c0 05 00       	jmp    80e7532 <_end+0x8ea>
++ 808b52b:	e9 fa bf 05 00       	jmp    80e752a <_end+0x8e2>
 + 808b530:	90                   	nop
 + 808b531:	90                   	nop
   808b532:	5d                   	pop    %ebp
@@ -795,7 +795,7 @@ expression: diff
   808b545:	8b 6f 08             	mov    0x8(%edi),%ebp
 - 808b548:	8b 7f 04             	mov    0x4(%edi),%edi
 - 808b54b:	cd 80                	int    $0x80
-+ 808b548:	e9 f7 bf 05 00       	jmp    80e7544 <_end+0x8fc>
++ 808b548:	e9 ef bf 05 00       	jmp    80e753c <_end+0x8f4>
   808b54d:	5d                   	pop    %ebp
   808b54e:	5f                   	pop    %edi
   808b54f:	5b                   	pop    %ebx
@@ -804,7 +804,7 @@ expression: diff
   808b58b:	b8 27 01 00 00       	mov    $0x127,%eax
   808b590:	bb 9c ff ff ff       	mov    $0xffffff9c,%ebx
 - 808b595:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b595:	e9 bf bf 05 00       	jmp    80e7559 <_end+0x911>
++ 808b595:	e9 b7 bf 05 00       	jmp    80e7551 <_end+0x909>
 + 808b59a:	90                   	nop
 + 808b59b:	90                   	nop
   808b59c:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -815,7 +815,7 @@ expression: diff
   808b608:	8b 5c 24 10          	mov    0x10(%esp),%ebx
   808b60c:	b8 27 01 00 00       	mov    $0x127,%eax
 - 808b611:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b611:	e9 55 bf 05 00       	jmp    80e756b <_end+0x923>
++ 808b611:	e9 4d bf 05 00       	jmp    80e7563 <_end+0x91b>
 + 808b616:	90                   	nop
 + 808b617:	90                   	nop
   808b618:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -826,7 +826,7 @@ expression: diff
   808b670:	8b 74 24 20          	mov    0x20(%esp),%esi
   808b674:	8b 7c 24 24          	mov    0x24(%esp),%edi
 - 808b678:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b678:	e9 00 bf 05 00       	jmp    80e757d <_end+0x935>
++ 808b678:	e9 f8 be 05 00       	jmp    80e7575 <_end+0x92d>
 + 808b67d:	90                   	nop
 + 808b67e:	90                   	nop
   808b67f:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -837,7 +837,7 @@ expression: diff
   808b6c6:	8b 54 24 14          	mov    0x14(%esp),%edx
   808b6ca:	8b 5c 24 0c          	mov    0xc(%esp),%ebx
 - 808b6ce:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b6ce:	e9 bc be 05 00       	jmp    80e758f <_end+0x947>
++ 808b6ce:	e9 b4 be 05 00       	jmp    80e7587 <_end+0x93f>
 + 808b6d3:	90                   	nop
 + 808b6d4:	90                   	nop
   808b6d5:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -848,7 +848,7 @@ expression: diff
   808b72a:	8d 54 24 08          	lea    0x8(%esp),%edx
   808b72e:	b8 36 00 00 00       	mov    $0x36,%eax
 - 808b733:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b733:	e9 69 be 05 00       	jmp    80e75a1 <_end+0x959>
++ 808b733:	e9 61 be 05 00       	jmp    80e7599 <_end+0x951>
 + 808b738:	90                   	nop
 + 808b739:	90                   	nop
   808b73a:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -859,7 +859,7 @@ expression: diff
   808b801:	8b 4c 24 0c          	mov    0xc(%esp),%ecx
   808b805:	8b 5c 24 08          	mov    0x8(%esp),%ebx
 - 808b809:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 808b809:	e9 a5 bd 05 00       	jmp    80e75b3 <_end+0x96b>
++ 808b809:	e9 9d bd 05 00       	jmp    80e75ab <_end+0x963>
 + 808b80e:	90                   	nop
 + 808b80f:	90                   	nop
   808b810:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -870,7 +870,7 @@ expression: diff
   8092201:	8d 58 1c             	lea    0x1c(%eax),%ebx
   8092204:	b8 f0 00 00 00       	mov    $0xf0,%eax
 - 8092209:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8092209:	e9 b7 53 05 00       	jmp    80e75c5 <_end+0x97d>
++ 8092209:	e9 af 53 05 00       	jmp    80e75bd <_end+0x975>
 + 809220e:	90                   	nop
 + 809220f:	90                   	nop
   8092210:	83 ec 0c             	sub    $0xc,%esp
@@ -881,7 +881,7 @@ expression: diff
   8092e5f:	8d 8d ea dc fc ff    	lea    -0x32316(%ebp),%ecx
   8092e65:	89 fa                	mov    %edi,%edx
 - 8092e67:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8092e67:	e9 6b 47 05 00       	jmp    80e75d7 <_end+0x98f>
++ 8092e67:	e9 63 47 05 00       	jmp    80e75cf <_end+0x987>
 + 8092e6c:	90                   	nop
 + 8092e6d:	90                   	nop
   8092e6e:	85 c0                	test   %eax,%eax
@@ -893,7 +893,7 @@ expression: diff
   80930a6:	8d 4c 24 30          	lea    0x30(%esp),%ecx
 - 80930aa:	b8 92 00 00 00       	mov    $0x92,%eax
 - 80930af:	cd 80                	int    $0x80
-+ 80930aa:	e9 3a 45 05 00       	jmp    80e75e9 <_end+0x9a1>
++ 80930aa:	e9 32 45 05 00       	jmp    80e75e1 <_end+0x999>
 + 80930af:	90                   	nop
 + 80930b0:	90                   	nop
   80930b1:	81 c4 bc 04 00 00    	add    $0x4bc,%esp
@@ -904,7 +904,7 @@ expression: diff
   809521e:	31 f6                	xor    %esi,%esi
   8095220:	89 f8                	mov    %edi,%eax
 - 8095222:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8095222:	e9 d9 23 05 00       	jmp    80e7600 <_end+0x9b8>
++ 8095222:	e9 d1 23 05 00       	jmp    80e75f8 <_end+0x9b0>
 + 8095227:	90                   	nop
 + 8095228:	90                   	nop
   8095229:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -915,7 +915,7 @@ expression: diff
   80952b6:	31 f6                	xor    %esi,%esi
   80952b8:	89 f8                	mov    %edi,%eax
 - 80952ba:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 80952ba:	e9 53 23 05 00       	jmp    80e7612 <_end+0x9ca>
++ 80952ba:	e9 4b 23 05 00       	jmp    80e760a <_end+0x9c2>
 + 80952bf:	90                   	nop
 + 80952c0:	90                   	nop
   80952c1:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -927,7 +927,7 @@ expression: diff
  08098e30 <__restore_rt>:
 - 8098e30:	b8 ad 00 00 00       	mov    $0xad,%eax
 - 8098e35:	cd 80                	int    $0x80
-+ 8098e30:	e9 ef e7 04 00       	jmp    80e7624 <_end+0x9dc>
++ 8098e30:	e9 e7 e7 04 00       	jmp    80e761c <_end+0x9d4>
 + 8098e35:	90                   	nop
 + 8098e36:	90                   	nop
   8098e37:	90                   	nop
@@ -936,7 +936,7 @@ expression: diff
   8098e38:	58                   	pop    %eax
 - 8098e39:	b8 77 00 00 00       	mov    $0x77,%eax
 - 8098e3e:	cd 80                	int    $0x80
-+ 8098e39:	e9 fd e7 04 00       	jmp    80e763b <_end+0x9f3>
++ 8098e39:	e9 f5 e7 04 00       	jmp    80e7633 <_end+0x9eb>
 + 8098e3e:	90                   	nop
 + 8098e3f:	90                   	nop
  
@@ -947,7 +947,7 @@ expression: diff
   8098eca:	be 08 00 00 00       	mov    $0x8,%esi
   8098ecf:	8d 94 24 a0 00 00 00 	lea    0xa0(%esp),%edx
 - 8098ed6:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8098ed6:	e9 77 e7 04 00       	jmp    80e7652 <_end+0xa0a>
++ 8098ed6:	e9 6f e7 04 00       	jmp    80e764a <_end+0xa02>
 + 8098edb:	90                   	nop
 + 8098edc:	90                   	nop
   8098edd:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -958,7 +958,7 @@ expression: diff
   8098f6c:	be 08 00 00 00       	mov    $0x8,%esi
   8098f71:	89 ea                	mov    %ebp,%edx
 - 8098f73:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 8098f73:	e9 ec e6 04 00       	jmp    80e7664 <_end+0xa1c>
++ 8098f73:	e9 e4 e6 04 00       	jmp    80e765c <_end+0xa14>
 + 8098f78:	90                   	nop
 + 8098f79:	90                   	nop
   8098f7a:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -969,7 +969,7 @@ expression: diff
   809e209:	31 f6                	xor    %esi,%esi
   809e20b:	89 e8                	mov    %ebp,%eax
 - 809e20d:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 809e20d:	e9 64 94 04 00       	jmp    80e7676 <_end+0xa2e>
++ 809e20d:	e9 5c 94 04 00       	jmp    80e766e <_end+0xa26>
 + 809e212:	90                   	nop
 + 809e213:	90                   	nop
   809e214:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -980,7 +980,7 @@ expression: diff
   809e753:	b8 a6 01 00 00       	mov    $0x1a6,%eax
   809e758:	31 d2                	xor    %edx,%edx
 - 809e75a:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 809e75a:	e9 29 8f 04 00       	jmp    80e7688 <_end+0xa40>
++ 809e75a:	e9 21 8f 04 00       	jmp    80e7680 <_end+0xa38>
 + 809e75f:	90                   	nop
 + 809e760:	90                   	nop
   809e761:	83 f8 da             	cmp    $0xffffffda,%eax
@@ -991,7 +991,7 @@ expression: diff
   809e7f3:	b8 f0 00 00 00       	mov    $0xf0,%eax
   809e7f8:	31 d2                	xor    %edx,%edx
 - 809e7fa:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 809e7fa:	e9 9b 8e 04 00       	jmp    80e769a <_end+0xa52>
++ 809e7fa:	e9 93 8e 04 00       	jmp    80e7692 <_end+0xa4a>
 + 809e7ff:	90                   	nop
 + 809e800:	90                   	nop
   809e801:	83 f8 da             	cmp    $0xffffffda,%eax
@@ -1002,7 +1002,7 @@ expression: diff
   809eae1:	89 54 24 08          	mov    %edx,0x8(%esp)
   809eae5:	8d 8d dc 73 fe ff    	lea    -0x18c24(%ebp),%ecx
 - 809eaeb:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 809eaeb:	e9 bc 8b 04 00       	jmp    80e76ac <_end+0xa64>
++ 809eaeb:	e9 b4 8b 04 00       	jmp    80e76a4 <_end+0xa5c>
 + 809eaf0:	90                   	nop
 + 809eaf1:	90                   	nop
   809eaf2:	ba 01 00 00 00       	mov    $0x1,%edx
@@ -1013,7 +1013,7 @@ expression: diff
   809eb2d:	8b 4c 24 08          	mov    0x8(%esp),%ecx
   809eb31:	be 08 00 00 00       	mov    $0x8,%esi
 - 809eb36:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 809eb36:	e9 83 8b 04 00       	jmp    80e76be <_end+0xa76>
++ 809eb36:	e9 7b 8b 04 00       	jmp    80e76b6 <_end+0xa6e>
 + 809eb3b:	90                   	nop
 + 809eb3c:	90                   	nop
   809eb3d:	8b 44 24 1c          	mov    0x1c(%esp),%eax
@@ -1024,7 +1024,7 @@ expression: diff
   809eb6e:	89 c3                	mov    %eax,%ebx
   809eb70:	b8 0e 01 00 00       	mov    $0x10e,%eax
 - 809eb75:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 809eb75:	e9 56 8b 04 00       	jmp    80e76d0 <_end+0xa88>
++ 809eb75:	e9 4e 8b 04 00       	jmp    80e76c8 <_end+0xa80>
 + 809eb7a:	90                   	nop
 + 809eb7b:	90                   	nop
   809eb7c:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -1035,7 +1035,7 @@ expression: diff
   809eb89:	8d b4 26 00 00 00 00 	lea    0x0(%esi,%eiz,1),%esi
   809eb90:	b8 e0 00 00 00       	mov    $0xe0,%eax
 - 809eb95:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 809eb95:	e9 48 8b 04 00       	jmp    80e76e2 <_end+0xa9a>
++ 809eb95:	e9 40 8b 04 00       	jmp    80e76da <_end+0xa92>
 + 809eb9a:	90                   	nop
 + 809eb9b:	90                   	nop
   809eb9c:	89 eb                	mov    %ebp,%ebx
@@ -1046,7 +1046,7 @@ expression: diff
   809ebab:	89 c3                	mov    %eax,%ebx
   809ebad:	b8 0e 01 00 00       	mov    $0x10e,%eax
 - 809ebb2:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 809ebb2:	e9 3d 8b 04 00       	jmp    80e76f4 <_end+0xaac>
++ 809ebb2:	e9 35 8b 04 00       	jmp    80e76ec <_end+0xaa4>
 + 809ebb7:	90                   	nop
 + 809ebb8:	90                   	nop
   809ebb9:	89 c7                	mov    %eax,%edi
@@ -1057,7 +1057,7 @@ expression: diff
   809ec91:	b8 af 00 00 00       	mov    $0xaf,%eax
   809ec96:	be 08 00 00 00       	mov    $0x8,%esi
 - 809ec9b:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 809ec9b:	e9 66 8a 04 00       	jmp    80e7706 <_end+0xabe>
++ 809ec9b:	e9 5e 8a 04 00       	jmp    80e76fe <_end+0xab6>
 + 809eca0:	90                   	nop
 + 809eca1:	90                   	nop
   809eca2:	89 c2                	mov    %eax,%edx
@@ -1068,7 +1068,7 @@ expression: diff
  0809f8e0 <__getpid>:
   809f8e0:	b8 14 00 00 00       	mov    $0x14,%eax
 - 809f8e5:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 809f8e5:	e9 2e 7e 04 00       	jmp    80e7718 <_end+0xad0>
++ 809f8e5:	e9 26 7e 04 00       	jmp    80e7710 <_end+0xac8>
 + 809f8ea:	90                   	nop
 + 809f8eb:	90                   	nop
   809f8ec:	c3                   	ret
@@ -1079,7 +1079,7 @@ expression: diff
   80a009b:	b8 8c 00 00 00       	mov    $0x8c,%eax
   80a00a0:	8b 4c 24 0c          	mov    0xc(%esp),%ecx
 - 80a00a4:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 80a00a4:	e9 81 76 04 00       	jmp    80e772a <_end+0xae2>
++ 80a00a4:	e9 79 76 04 00       	jmp    80e7722 <_end+0xada>
 + 80a00a9:	90                   	nop
 + 80a00aa:	90                   	nop
   80a00ab:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -1090,7 +1090,7 @@ expression: diff
   80a3578:	8d 58 1c             	lea    0x1c(%eax),%ebx
   80a357b:	b8 f0 00 00 00       	mov    $0xf0,%eax
 - 80a3580:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 80a3580:	e9 b7 41 04 00       	jmp    80e773c <_end+0xaf4>
++ 80a3580:	e9 af 41 04 00       	jmp    80e7734 <_end+0xaec>
 + 80a3585:	90                   	nop
 + 80a3586:	90                   	nop
   80a3587:	eb 87                	jmp    80a3510 <_dl_fixup+0xf0>
@@ -1101,7 +1101,7 @@ expression: diff
   80a718c:	8d 58 1c             	lea    0x1c(%eax),%ebx
   80a718f:	b8 f0 00 00 00       	mov    $0xf0,%eax
 - 80a7194:	65 ff 15 10 00 00 00 	call   *%gs:0x10
-+ 80a7194:	e9 b5 05 04 00       	jmp    80e774e <_end+0xb06>
++ 80a7194:	e9 ad 05 04 00       	jmp    80e7746 <_end+0xafe>
 + 80a7199:	90                   	nop
 + 80a719a:	90                   	nop
   80a719b:	8b 44 24 1c          	mov    0x1c(%esp),%eax

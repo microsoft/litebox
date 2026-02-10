@@ -2,14 +2,14 @@
 // Licensed under the MIT license.
 
 #define _GNU_SOURCE
-#include <assert.h>
 #include <elf.h>
 #include <link.h>
 #include <stdint.h>
 
-#define TARGET_SECTION_NAME ".trampolineLB0"
-#define HEADER_MAGIC ((uint32_t)0x5842544c) // "LTBX"
-#define TRAMP_MAGIC ((uint64_t)0x30584f424554494c)  // "LITEBOX0"
+// The magic number used to identify the LiteBox trampoline.
+// This must match `TRAMPOLINE_MAGIC` in `litebox_syscall_rewriter` and `litebox_common_linux`.
+// Value 0x30584f424554494c is "LITEBOX0" in little-endian (bytes: 'L','I','T','E','B','O','X','0')
+#define TRAMPOLINE_MAGIC ((uint64_t)0x30584f424554494c)
 
 #if !defined(__x86_64__)
 # error "rtld_audit.c: build target must be x86_64"
@@ -27,10 +27,20 @@
 #define SYS_exit_group 231
 #define AT_FDCWD -100
 
+// Maximum valid userspace address (48-bit address space)
+#define MAX_USERSPACE_ADDR 0x7FFFFFFFFFFFUL
+
+// Trampoline header layout for x86_64: magic(8) + file_offset(8) + vaddr(8) + size(8) = 32 bytes
+struct __attribute__((packed)) TrampolineHeader {
+  uint64_t magic;
+  uint64_t file_offset;
+  uint64_t vaddr;
+  uint64_t trampoline_size;
+};
+
 // Linux flags
 #define MAP_PRIVATE 0x02
 #define MAP_FIXED 0x10
-
 #define PROT_READ 0x1
 #define PROT_WRITE 0x2
 #define PROT_EXEC 0x4
@@ -136,7 +146,10 @@ static uint64_t read_u64(const void *p) {
 }
 
 static size_t align_up(size_t val, size_t align) {
-  return (val + align - 1) & ~(align - 1);
+  size_t result = (val + align - 1) & ~(align - 1);
+  // Check for overflow (result < val means we wrapped)
+  if (result < val) return (size_t)-1;
+  return result;
 }
 
 unsigned int la_version(unsigned int version __attribute__((unused))) {
@@ -161,13 +174,9 @@ void print_hex(uint64_t data) {
 /// @brief Parse object to find the syscall entry point and the interpreter
 /// path.
 ///
-/// Different from the elf loader in the `litebox_shim_linux` crate, this
-/// function does not read the trampoline section from the section headers
-/// because they were overwritten after the binary was completely loaded.
-/// Instead, since we know it's loaded right after the last loadable segment, we
-/// can read the trampoline section from the end of the binary. The trampoline
-/// section is expected to contain a magic number and the address of the syscall
-/// entry point.
+/// The trampoline is already mapped by the litebox loader at (base + vaddr).
+/// The entry point is at offset 0 of the mapped trampoline. The litebox loader
+/// already validated the magic when parsing the file header.
 int parse_object(const struct link_map *map) {
   unsigned long max_addr = 0;
   Elf64_Ehdr *eh = (Elf64_Ehdr *)map->l_addr;
@@ -193,11 +202,12 @@ int parse_object(const struct link_map *map) {
   }
   max_addr = align_up(max_addr, 0x1000);
   void *trampoline_addr = (void *)map->l_addr + max_addr;
-  if (read_u64(trampoline_addr) != TRAMP_MAGIC) {
-    syscall_print("[audit] invalid trampoline magic\n", 30);
+  // The trampoline code has the syscall entry point at offset 0.
+  syscall_entry = (syscall_stub_t)read_u64(trampoline_addr);
+  if (syscall_entry == 0) {
+    syscall_print("[audit] syscall entry is null\n", 30);
     return 1;
   }
-  syscall_entry = (syscall_stub_t)read_u64(trampoline_addr + 8);
   print_hex((uint64_t)syscall_entry);
   return 0;
 }
@@ -213,7 +223,10 @@ unsigned int la_objopen(struct link_map *map,
     if (map->l_addr != 0) {
       // `map->l_addr` is zero for the main binary if it is not position
       // independent.
-      assert(parse_object(map) == 0);
+      if (parse_object(map) != 0) {
+        syscall_print("[audit] failed to parse main binary\n", 36);
+        return 0;
+      }
       syscall_print("[audit] main binary is patched by libOS\n", 40);
       syscall_print("[audit] interp=", 15);
       syscall_print(interp, sizeof(interp) - 1);
@@ -225,7 +238,10 @@ unsigned int la_objopen(struct link_map *map,
   if (syscall_entry == 0) {
     // failed to get the syscall entry point from the main binary
     // fall back to get it from ld-*.so, which should be called next.
-    assert(parse_object(map) == 0);
+    if (parse_object(map) != 0) {
+      syscall_print("[audit] failed to parse ld\n", 27);
+      return 0;
+    }
     syscall_print("[audit] ld is patched by libOS: \n", 33);
     syscall_print(path, 32);
     syscall_print("\n", 1);
@@ -249,7 +265,7 @@ unsigned int la_objopen(struct link_map *map,
 
   int fd = do_syscall(SYS_openat, AT_FDCWD, (long)path, 0, 0, 0, 0);
   if (fd < 0) {
-    syscall_print("[audit] failed to open file\n", 26);
+    syscall_print("[audit] failed to open file\n", 28);
     return 0;
   }
 
@@ -261,75 +277,108 @@ unsigned int la_objopen(struct link_map *map,
   }
   long file_size = st.st_size;
 
-  void *map_base =
-      (void *)do_syscall(SYS_mmap, 0, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-  if ((uintptr_t)map_base >= (uintptr_t)-4096) {
-    syscall_print("[audit] mmap failed\n", 20);
+  // File must be large enough to contain at least a trampoline header
+  if (file_size < (long)sizeof(struct TrampolineHeader)) {
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
   }
 
-  Elf64_Ehdr *eh = (Elf64_Ehdr *)map_base;
-  if (memcmp(eh->e_ident,
-             "\x7f"
-             "ELF",
-             4) != 0) {
-    syscall_print("[audit] not an ELF file\n", 24);
+  // The trampoline header is at the end of the file (last 32 bytes for x86_64).
+  // File layout: [ELF][padding][trampoline code][header]
+  // Read the last page that contains the header.
+  long header_offset = file_size - sizeof(struct TrampolineHeader);
+  long header_page_offset = header_offset & ~0xFFFUL;
+
+  // Map the page containing the header
+  void *header_page = (void *)do_syscall(SYS_mmap, 0, 0x1000, PROT_READ, MAP_PRIVATE, fd, header_page_offset);
+  if ((uintptr_t)header_page >= (uintptr_t)-4096) {
+    syscall_print("[audit] mmap header page failed\n", 32);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
     return 0;
   }
 
-  Elf64_Shdr *shdrs = (Elf64_Shdr *)((char *)map_base + eh->e_shoff);
-  Elf64_Shdr *shstr = &shdrs[eh->e_shstrndx];
-  const char *shnames = (char *)map_base + shstr->sh_offset;
+  // Read header from the mapped page
+  long header_in_page_offset = header_offset - header_page_offset;
+  const struct TrampolineHeader *header = (const struct TrampolineHeader *)((const char *)header_page + header_in_page_offset);
 
-  for (int i = 0; i < eh->e_shnum; i++) {
-    const char *name = shnames + shdrs[i].sh_name;
-    if (strcmp(name, TARGET_SECTION_NAME) != 0)
-      continue;
-
-    syscall_print("[audit] found section\n", 22);
-    // Note sh_addr, sh_offset, and sh_entsize are repurposed to store our trampoline info.
-    // See litebox_syscall_rewriter for details.
-    if (shdrs[i].sh_addr != HEADER_MAGIC) {
-      syscall_print("[audit] invalid header magic\n", 29);
-      break;
+  // Check magic
+  if (header->magic != TRAMPOLINE_MAGIC) {
+    // If the prefix matches but the version differs, fail explicitly.
+    if (memcmp(header, "LITEBOX", 7) == 0) {
+      syscall_print("[audit] invalid trampoline version\n", 36);
+      do_syscall(SYS_munmap, (long)header_page, 0x1000, 0, 0, 0, 0);
+      do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+      return 0;
     }
-
-    uint64_t tramp_addr = map->l_addr + shdrs[i].sh_offset;
-    uint64_t tramp_size_raw = shdrs[i].sh_entsize;
-    uint64_t tramp_off = file_size - tramp_size_raw;
-    uint64_t tramp_size = align_up(tramp_size_raw, 0x1000);
-
-    void *mapped =
-        (void *)do_syscall(SYS_mmap, tramp_addr, tramp_size,
-                           PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, tramp_off);
-    if ((uintptr_t)mapped >= (uintptr_t)-4096) {
-      syscall_print("[audit] mmap failed for trampoline\n", 35);
-      break;
-    }
-    if ((uint64_t)mapped != tramp_addr) {
-      syscall_print("[audit] mmap returned unexpected address\n", 40);
-      print_hex((uint64_t)mapped);
-      syscall_print("\n", 1);
-      do_syscall(SYS_munmap, (long)mapped, tramp_size, 0, 0, 0, 0);
-      break;
-    }
-
-    const uint64_t *tramp = (const uint64_t *)tramp_addr;
-    if (tramp[0] != TRAMP_MAGIC) {
-      syscall_print("[audit] invalid trampoline magic\n", 33);
-      break;
-    }
-
-    __builtin_memcpy((char *)mapped + 8, (const void *)&syscall_entry, 8);
-    do_syscall(SYS_mprotect, (long)mapped, tramp_size, PROT_READ | PROT_EXEC, 0,
-               0, 0);
-    syscall_print("[audit] trampoline patched and protected\n", 41);
-    break;
+    // No trampoline found
+    do_syscall(SYS_munmap, (long)header_page, 0x1000, 0, 0, 0, 0);
+    do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+    return 0;
   }
+
+  // Copy fields before unmapping
+  uint64_t tramp_file_offset = header->file_offset;
+  uint64_t tramp_vaddr = header->vaddr;
+  uint64_t tramp_size_raw = header->trampoline_size;
+
+  do_syscall(SYS_munmap, (long)header_page, 0x1000, 0, 0, 0, 0);
+  syscall_print("[audit] found trampoline header at end of file\n", 47);
+
+  // Validate trampoline size
+  if (tramp_size_raw == 0) {
+    syscall_print("[audit] trampoline code size invalid\n", 37);
+    do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+    return 0;
+  }
+
+  // Verify file offset is page-aligned
+  if ((tramp_file_offset & 0xFFF) != 0) {
+    syscall_print("[audit] trampoline code not page-aligned\n", 41);
+    do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+    return 0;
+  }
+
+  // The trampoline code should immediately precede the header.
+  if (tramp_file_offset + tramp_size_raw != (uint64_t)header_offset) {
+    syscall_print("[audit] trampoline extends beyond header\n", 41);
+    do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+    return 0;
+  }
+
+  // Validate tramp_vaddr is within reasonable userspace bounds and page-aligned
+  if (tramp_vaddr > MAX_USERSPACE_ADDR || (tramp_vaddr & 0xFFF) != 0) {
+    syscall_print("[audit] trampoline vaddr out of bounds\n", 39);
+    do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+    return 0;
+  }
+
+  uint64_t tramp_addr = map->l_addr + tramp_vaddr;
+  uint64_t tramp_size = align_up(tramp_size_raw, 0x1000);
+
+  // Check for overflow in align_up or address calculation
+  if (tramp_size == (size_t)-1 || tramp_addr < map->l_addr) {
+    syscall_print("[audit] trampoline size/addr overflow\n", 38);
+    do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+    return 0;
+  }
+
+  // Use MAP_FIXED to place the trampoline at the exact required address.
+  // The loader ensures this range is not used by other mappings.
+  void *mapped =
+      (void *)do_syscall(SYS_mmap, tramp_addr, tramp_size,
+                         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, tramp_file_offset);
+  if ((uintptr_t)mapped >= (uintptr_t)-4096) {
+    syscall_print("[audit] mmap failed for trampoline\n", 35);
+    do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+    return 0;
+  }
+
+  // Write the syscall entry point at the start of the trampoline code
+  __builtin_memcpy((char *)mapped, (const void *)&syscall_entry, 8);
+  do_syscall(SYS_mprotect, (long)mapped, tramp_size, PROT_READ | PROT_EXEC, 0,
+             0, 0);
+  syscall_print("[audit] trampoline patched and protected\n", 41);
 
   do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
-  do_syscall(SYS_munmap, (long)map_base, file_size, 0, 0, 0, 0);
   return 0;
 }
