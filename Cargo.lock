@@ -853,6 +853,7 @@ dependencies = [
  "smoltcp",
  "spin 0.9.8",
  "tar-no-std",
+ "tempfile",
  "thiserror",
  "windows-sys 0.60.2",
  "zerocopy",
@@ -1079,6 +1080,7 @@ dependencies = [
  "seq-macro",
  "spin 0.9.8",
  "syscalls",
+ "tempfile",
  "thiserror",
  "zerocopy",
 ]
