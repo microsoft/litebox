@@ -38,7 +38,25 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
     });
     let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
     shim_builder.set_fs(shim_builder.default_fs(in_mem_fs, tar_ro_fs));
-    shim_builder.build().0.new_test_task()
+    let task = shim_builder.build().0.new_test_task();
+
+    let global = task.global.clone();
+    if tun_device_name.is_some() {
+        // Start a background thread to perform network interaction
+        // Naive implementation for testing purpose only
+        std::thread::spawn(move || {
+            loop {
+                while global
+                    .net
+                    .lock()
+                    .perform_platform_interaction()
+                    .call_again_immediately()
+                {}
+                core::hint::spin_loop();
+            }
+        });
+    }
+    task
 }
 
 #[test]

@@ -6,7 +6,7 @@
 //! This module provides a high-level client for the 9P2000.L protocol.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU16, Ordering};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
@@ -95,7 +95,7 @@ pub(super) struct Client<Platform: RawSyncPrimitivesProvider, T: Read + Write> {
     /// Fid generator
     fids: FidGenerator<Platform>,
     /// Next tag for synchronous operations
-    next_tag: AtomicU32,
+    next_tag: AtomicU16,
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
@@ -115,7 +115,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         transport::write_message(
             &mut transport,
             &mut wbuf,
-            &TaggedFcall {
+            TaggedFcall {
                 tag: fcall::NOTAG,
                 fcall: Fcall::Tversion(fcall::Tversion {
                     msize: bufsize,
@@ -152,7 +152,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             write_state: Mutex::new(ClientWriteState { transport, wbuf }),
             rbuf: Mutex::new(rbuf),
             fids: FidGenerator::new(),
-            next_tag: AtomicU32::new(1),
+            next_tag: AtomicU16::new(1),
         })
     }
 
@@ -160,11 +160,14 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     ///
     /// TODO: support async operations
     fn fcall(&self, fcall: Fcall<'_>) -> Result<Fcall<'static>, Error> {
-        let tag = self.next_tag.fetch_add(1, Ordering::Relaxed) as u16;
+        let tag = self.next_tag.fetch_add(1, Ordering::Relaxed);
+        if tag == fcall::NOTAG {
+            todo!("tag wraparound");
+        }
 
         let mut write_state = self.write_state.lock();
         let ClientWriteState { transport, wbuf } = &mut *write_state;
-        transport::write_message(transport, wbuf, &TaggedFcall { tag, fcall })
+        transport::write_message(transport, wbuf, TaggedFcall { tag, fcall })
             .map_err(|_| Error::Io)?;
 
         let mut rbuf = self.rbuf.lock();
@@ -331,7 +334,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         match self.fcall(Fcall::Tread(fcall::Tread {
             fid,
             offset,
-            count: count as u32,
+            count: u32::try_from(count).expect("count exceeds u32"),
         }))? {
             Fcall::Rread(fcall::Rread { data }) => {
                 buf[..data.len()].copy_from_slice(&data);
