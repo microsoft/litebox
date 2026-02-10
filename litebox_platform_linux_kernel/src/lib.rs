@@ -296,7 +296,11 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
             }
             Err(e) => {
                 // Avoid allocation for error message
-                crate::print_str_and_int!("Error sending IP packet: ", e.as_neg().abs() as u64, 16);
+                crate::print_str_and_int!(
+                    "Error sending IP packet: ",
+                    u64::from(e.as_neg().unsigned_abs()),
+                    16
+                );
                 unimplemented!()
             }
         }
@@ -313,7 +317,7 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
                 // Avoid allocation for error message
                 crate::print_str_and_int!(
                     "Error receiving IP packet: ",
-                    e.as_neg().abs() as u64,
+                    u64::from(e.as_neg().unsigned_abs()),
                     16
                 );
                 unimplemented!()
