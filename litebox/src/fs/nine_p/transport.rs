@@ -57,7 +57,7 @@ pub trait Write {
 pub(super) fn write_message<W: Write>(
     w: &mut W,
     buf: &mut Vec<u8>,
-    fcall: &super::fcall::TaggedFcall<'_>,
+    fcall: super::fcall::TaggedFcall<'_>,
 ) -> Result<(), WriteError> {
     fcall.encode_to_buf(buf)?;
     w.write_all(&buf[..])

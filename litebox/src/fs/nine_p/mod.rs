@@ -18,7 +18,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use thiserror::Error;
 
@@ -29,6 +29,7 @@ use crate::fs::errors::{
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
+use crate::platform::DebugLogProvider;
 use crate::{LiteBox, sync};
 
 mod client;
@@ -446,17 +447,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             super::FileStatus {
                 file_type,
                 mode: super::Mode::from_bits_truncate(attr.stat.mode),
-                size: attr.stat.size as usize,
+                size: usize::try_from(attr.stat.size).expect("file size exceeds usize"),
                 owner: super::UserInfo {
-                    user: attr.stat.uid as u16,
-                    group: attr.stat.gid as u16,
+                    user: u16::try_from(attr.stat.uid).expect("uid exceeds u16"),
+                    group: u16::try_from(attr.stat.gid).expect("gid exceeds u16"),
                 },
                 node_info: super::NodeInfo {
                     dev: DEVICE_ID,
-                    ino: attr.qid.path as usize,
-                    rdev: NonZeroUsize::new(attr.stat.rdev as usize),
+                    ino: usize::try_from(attr.qid.path).expect("inode number exceeds usize"),
+                    rdev: NonZeroUsize::new(
+                        usize::try_from(attr.stat.rdev).expect("rdev exceeds usize"),
+                    ),
                 },
-                blksize: attr.stat.blksize as usize,
+                blksize: usize::try_from(attr.stat.blksize).expect("block size exceeds usize"),
             }
         } else {
             super::FileStatus {
@@ -467,33 +470,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                     super::Mode::empty()
                 },
                 size: if attr.valid.contains(fcall::GetattrMask::SIZE) {
-                    attr.stat.size as usize
+                    usize::try_from(attr.stat.size).expect("file size exceeds usize")
                 } else {
                     0
                 },
                 owner: super::UserInfo {
                     user: if attr.valid.contains(fcall::GetattrMask::UID) {
-                        attr.stat.uid as u16
+                        u16::try_from(attr.stat.uid).expect("uid exceeds u16")
                     } else {
                         0
                     },
                     group: if attr.valid.contains(fcall::GetattrMask::GID) {
-                        attr.stat.gid as u16
+                        u16::try_from(attr.stat.gid).expect("gid exceeds u16")
                     } else {
                         0
                     },
                 },
                 node_info: super::NodeInfo {
                     dev: DEVICE_ID,
-                    ino: attr.qid.path as usize,
+                    ino: usize::try_from(attr.qid.path).expect("inode number exceeds usize"),
                     rdev: if attr.valid.contains(fcall::GetattrMask::RDEV) {
-                        NonZeroUsize::new(attr.stat.rdev as usize)
+                        NonZeroUsize::new(
+                            usize::try_from(attr.stat.rdev).expect("rdev exceeds usize"),
+                        )
                     } else {
                         None
                     },
                 },
                 blksize: if attr.valid.contains(fcall::GetattrMask::BLOCKS) {
-                    attr.stat.blksize as usize
+                    usize::try_from(attr.stat.blksize).expect("block size exceeds usize")
                 } else {
                     0
                 },
@@ -529,14 +534,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    super::private::Sealed for FileSystem<Platform, T>
+impl<
+    Platform: sync::RawSyncPrimitivesProvider + DebugLogProvider,
+    T: transport::Read + transport::Write,
+> super::private::Sealed for FileSystem<Platform, T>
 {
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    super::FileSystem for FileSystem<Platform, T>
+impl<
+    Platform: sync::RawSyncPrimitivesProvider + DebugLogProvider,
+    T: transport::Read + transport::Write,
+> super::FileSystem for FileSystem<Platform, T>
 {
+    #[allow(clippy::similar_names)]
     fn open(
         &self,
         path: impl crate::path::Arg,
@@ -577,7 +587,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         let descriptor = Descriptor {
             fid: new_fid,
-            offset: AtomicU64::new(0),
+            offset: AtomicUsize::new(0),
             qid: new_qid,
         };
 
@@ -599,25 +609,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::ReadError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table
-            .get_entry(fd)
+        // Extract fid and current offset, releasing the descriptor table lock
+        // before performing potentially blocking I/O.
+        let (fid, current_offset) = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| {
+                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
+            })
             .ok_or(super::errors::ReadError::ClosedFd)?;
-        let desc = &entry.entry;
 
-        // Determine offset to use
         let read_offset = match offset {
-            Some(o) => o as u64,
-            None => desc.offset.load(Ordering::SeqCst),
+            Some(o) => o,
+            None => current_offset,
         };
 
-        // TODO: read might be blocking while holding up the descriptor table lock.
-        // We should consider releasing the lock before doing the read.
-        let bytes_read = self.client.read(desc.fid, read_offset, buf)?;
+        let bytes_read = self.client.read(fid, read_offset as u64, buf)?;
 
         // Update offset if not using explicit offset
         if offset.is_none() {
-            desc.offset.fetch_add(bytes_read as u64, Ordering::SeqCst);
+            self.litebox.descriptor_table().with_entry(fd, |desc| {
+                desc.entry.offset.fetch_add(bytes_read, Ordering::SeqCst);
+            });
         }
 
         Ok(bytes_read)
@@ -629,29 +642,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::WriteError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table
-            .get_entry(fd)
+        // Extract fid and current offset, releasing the descriptor table lock
+        // before performing potentially blocking I/O.
+        let (fid, current_offset) = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| {
+                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
+            })
             .ok_or(super::errors::WriteError::ClosedFd)?;
-        let desc = &entry.entry;
 
-        // Determine offset to use
         let write_offset = match offset {
-            Some(o) => o as u64,
-            None => desc.offset.load(Ordering::SeqCst),
+            Some(o) => o,
+            None => current_offset,
         };
 
-        // TODO: write might be blocking while holding up the descriptor table lock.
-        // We should consider releasing the lock before doing the write.
-        let bytes_written = self.client.write(desc.fid, write_offset, buf)?;
+        let bytes_written = self.client.write(fid, write_offset as u64, buf)?;
 
         // Update offset if not using explicit offset
         if offset.is_none() {
-            desc.offset
-                .fetch_add(bytes_written as u64, Ordering::SeqCst);
+            self.litebox.descriptor_table().with_entry(fd, |desc| {
+                desc.entry.offset.fetch_add(bytes_written, Ordering::SeqCst);
+            });
         }
 
-        Ok(bytes_written as usize)
+        Ok(bytes_written)
     }
 
     fn seek(
@@ -660,27 +675,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table.get_entry(fd).ok_or(SeekError::ClosedFd)?;
-        let desc = &entry.entry;
-
-        let current_offset = desc.offset.load(Ordering::SeqCst);
+        // Extract fid and current offset, releasing the descriptor table lock
+        // before performing potentially blocking I/O (getattr for SeekWhence::RelativeToEnd).
+        let (fid, current_offset) = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| {
+                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
+            })
+            .ok_or(SeekError::ClosedFd)?;
 
         let base = match whence {
             super::SeekWhence::RelativeToBeginning => 0,
             super::SeekWhence::RelativeToCurrentOffset => current_offset,
             super::SeekWhence::RelativeToEnd => {
-                // Need to get file size
-                let attr = self.client.getattr(desc.fid, fcall::GetattrMask::SIZE)?;
-                attr.stat.size
+                let attr = self.client.getattr(fid, fcall::GetattrMask::SIZE)?;
+                usize::try_from(attr.stat.size).expect("file size exceeds usize")
             }
         };
         let new_offset = base
-            .checked_add_signed(offset as i64)
+            .checked_add_signed(offset)
             .ok_or(SeekError::InvalidOffset)?;
 
-        desc.offset.store(new_offset, Ordering::SeqCst);
-        Ok(new_offset as usize)
+        self.litebox.descriptor_table().with_entry(fd, |desc| {
+            desc.entry.offset.store(new_offset, Ordering::SeqCst);
+        });
+        Ok(new_offset)
     }
 
     fn truncate(
@@ -689,13 +709,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         length: usize,
         reset_offset: bool,
     ) -> Result<(), super::errors::TruncateError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table
-            .get_entry(fd)
+        // Extract fid and qid, releasing the descriptor table lock
+        // before performing potentially blocking I/O.
+        let (fid, qid) = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid))
             .ok_or(super::errors::TruncateError::ClosedFd)?;
-        let desc = &entry.entry;
 
-        if desc.qid.typ.contains(fcall::QidType::DIR) {
+        if qid.typ.contains(fcall::QidType::DIR) {
             return Err(super::errors::TruncateError::IsDirectory);
         }
 
@@ -708,11 +730,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             mtime: fcall::Time::default(),
         };
 
-        self.client
-            .setattr(desc.fid, fcall::SetattrMask::SIZE, stat)?;
+        self.client.setattr(fid, fcall::SetattrMask::SIZE, stat)?;
 
         if reset_offset {
-            desc.offset.store(0, Ordering::SeqCst);
+            self.litebox.descriptor_table().with_entry(fd, |desc| {
+                desc.entry.offset.store(0, Ordering::SeqCst);
+            });
         }
 
         Ok(())
@@ -754,14 +777,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let uid = match user {
             Some(u) => {
                 valid |= fcall::SetattrMask::UID;
-                u as u32
+                u32::from(u)
             }
             None => 0,
         };
         let gid = match group {
             Some(g) => {
                 valid |= fcall::SetattrMask::GID;
-                g as u32
+                u32::from(g)
             }
             None => 0,
         };
@@ -805,19 +828,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         &self,
         fd: &FileFd<Platform, T>,
     ) -> Result<Vec<crate::fs::DirEntry>, super::errors::ReadDirError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table
-            .get_entry(fd)
+        // Extract fid and qid, releasing the descriptor table lock
+        // before performing potentially blocking I/O.
+        let (fid, qid) = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid))
             .ok_or(super::errors::ReadDirError::ClosedFd)?;
-        let desc = &entry.entry;
 
-        if !desc.qid.typ.contains(fcall::QidType::DIR) {
+        if !qid.typ.contains(fcall::QidType::DIR) {
             return Err(super::errors::ReadDirError::NotADirectory);
         }
 
-        // TODO: read_dir might be blocking while holding up the descriptor table lock.
-        // We should consider releasing the lock before doing the read_dir.
-        let entries = self.client.readdir_all(desc.fid)?;
+        // Perform blocking I/O without holding any locks.
+        let entries = self.client.readdir_all(fid)?;
 
         let dir_entries: Vec<super::DirEntry> = entries
             .into_iter()
@@ -831,9 +855,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 super::DirEntry {
                     name: String::from_utf8_lossy(e.name.as_bytes()).into_owned(),
                     file_type,
+                    #[allow(unused_imports)]
                     ino_info: Some(super::NodeInfo {
                         dev: DEVICE_ID,
-                        ino: e.qid.path as usize,
+                        ino: usize::try_from(e.qid.path).unwrap_or_else(|_| {
+                            crate::log_println!(
+                                self.litebox.x.platform,
+                                "qid.path doesn't fit in usize, using 0 instead"
+                            );
+                            0
+                        }),
                         rdev: None,
                     }),
                 }
@@ -862,13 +893,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         &self,
         fd: &FileFd<Platform, T>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table
-            .get_entry(fd)
+        // Extract fid, releasing the descriptor table lock
+        // before performing potentially blocking I/O.
+        let fid = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| desc.entry.fid)
             .ok_or(super::errors::FileStatusError::ClosedFd)?;
-        let desc = &entry.entry;
 
-        let attr = self.client.getattr(desc.fid, fcall::GetattrMask::ALL)?;
+        // Perform blocking I/O without holding any locks.
+        let attr = self.client.getattr(fid, fcall::GetattrMask::ALL)?;
 
         Ok(Self::rgetattr_to_file_status(&attr))
     }
@@ -880,11 +914,7 @@ struct Descriptor {
     /// The 9P fid for this file
     fid: fcall::Fid,
     /// Current file offset (9P doesn't track this server-side)
-    offset: AtomicU64,
-    /// Whether this file is opened for reading
-    // read_allowed: bool,
-    /// Whether this file is opened for writing
-    // write_allowed: bool,
+    offset: AtomicUsize,
     /// The qid of the file (contains type and unique ID)
     qid: fcall::Qid,
 }
