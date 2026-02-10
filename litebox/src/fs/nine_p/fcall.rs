@@ -182,37 +182,7 @@ bitflags! {
 }
 
 /// String type used in 9P protocol messages
-#[derive(Clone, Debug)]
-pub(super) enum FcallStr<'a> {
-    Owned(Vec<u8>),
-    Borrowed(&'a [u8]),
-}
-
-impl<'a> FcallStr<'a> {
-    /// Get the bytes of the string
-    pub(super) fn as_bytes(&'a self) -> &'a [u8] {
-        match self {
-            FcallStr::Owned(b) => b,
-            FcallStr::Borrowed(b) => b,
-        }
-    }
-
-    /// Create a static (owned) copy of this string
-    fn clone_static(&self) -> FcallStr<'static> {
-        FcallStr::Owned(self.as_bytes().to_vec())
-    }
-
-    /// Get the length of the string
-    fn len(&self) -> usize {
-        self.as_bytes().len()
-    }
-}
-
-impl<'a, T: ?Sized + AsRef<[u8]>> From<&'a T> for FcallStr<'a> {
-    fn from(b: &'a T) -> FcallStr<'a> {
-        FcallStr::Borrowed(b.as_ref())
-    }
-}
+pub(super) type FcallStr<'a> = Cow<'a, [u8]>;
 
 /// Directory entry data container
 #[derive(Clone, Debug)]
@@ -441,7 +411,7 @@ impl DirEntry<'_> {
             qid: self.qid,
             offset: self.offset,
             typ: self.typ,
-            name: self.name.clone_static(),
+            name: FcallStr::Owned(self.name.clone().into_owned()),
         }
     }
 
@@ -1168,7 +1138,7 @@ fn encode_u64<W: Write>(w: &mut W, v: u64) -> Result<(), transport::WriteError> 
 
 fn encode_str<W: Write>(w: &mut W, v: &FcallStr<'_>) -> Result<(), transport::WriteError> {
     encode_u16(w, u16::try_from(v.len()).expect("str length exceeds u16"))?;
-    w.write_all(v.as_bytes())
+    w.write_all(v)
 }
 
 fn encode_data_buf<W: Write>(w: &mut W, v: &[u8]) -> Result<(), transport::WriteError> {

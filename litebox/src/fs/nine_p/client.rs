@@ -119,7 +119,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 tag: fcall::NOTAG,
                 fcall: Fcall::Tversion(fcall::Tversion {
                     msize: bufsize,
-                    version: "9P2000.L".into(),
+                    version: fcall::FcallStr::Borrowed(b"9P2000.L"),
                 }),
             },
         )
@@ -132,7 +132,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 tag: fcall::NOTAG,
                 fcall: Fcall::Rversion(fcall::Rversion { msize, version }),
             } => {
-                if version.as_bytes() != b"9P2000.L" {
+                if &*version != b"9P2000.L" {
                     return Err(Error::InvalidResponse);
                 }
                 msize.min(bufsize)
@@ -196,8 +196,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 afid: fcall::NOFID,
                 fid,
                 n_uname: fcall::NONUNAME,
-                uname: uname.into(),
-                aname: aname.into(),
+                uname: fcall::FcallStr::Borrowed(uname.as_bytes()),
+                aname: fcall::FcallStr::Borrowed(aname.as_bytes()),
             }),
             |response| match response {
                 Fcall::Rattach(fcall::Rattach { qid }) => Ok((qid, fid)),
@@ -283,12 +283,15 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Walk to a path from a given fid
     ///
     /// Returns the qids for each path component and a new fid for the final location
-    pub(super) fn walk<'a, S: Into<FcallStr<'a>> + AsRef<[u8]>>(
+    pub(super) fn walk<S: AsRef<[u8]>>(
         &self,
         fid: fcall::Fid,
         wnames: &[S],
     ) -> Result<(Vec<fcall::Qid>, fcall::Fid), Error> {
-        let wnames: Vec<FcallStr> = wnames.iter().map(Into::into).collect();
+        let wnames: Vec<fcall::FcallStr<'_>> = wnames
+            .iter()
+            .map(|s| fcall::FcallStr::Borrowed(s.as_ref()))
+            .collect();
         self.walk_chunked(fid, &wnames)
     }
 
@@ -323,7 +326,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         self.fcall(
             Fcall::Tlcreate(fcall::Tlcreate {
                 fid: dfid,
-                name: name.into(),
+                name: fcall::FcallStr::Borrowed(name.as_bytes()),
                 flags,
                 mode,
                 gid,
@@ -421,9 +424,11 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         self.fcall(
             Fcall::Treaddir(fcall::Treaddir { fid, offset, count }),
             |response| match response {
-                Fcall::Rreaddir(fcall::Rreaddir { data }) => {
-                    Ok(data.data.iter().map(|each| each.clone_static()).collect())
-                }
+                Fcall::Rreaddir(fcall::Rreaddir { data }) => Ok(data
+                    .data
+                    .iter()
+                    .map(super::fcall::DirEntry::clone_static)
+                    .collect()),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },
@@ -459,7 +464,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         self.fcall(
             Fcall::Tmkdir(fcall::Tmkdir {
                 dfid,
-                name: name.into(),
+                name: fcall::FcallStr::Borrowed(name.as_bytes()),
                 mode,
                 gid,
             }),
@@ -488,7 +493,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         self.fcall(
             Fcall::Tunlinkat(fcall::Tunlinkat {
                 dfid,
-                name: name.into(),
+                name: fcall::FcallStr::Borrowed(name.as_bytes()),
                 flags,
             }),
             |response| match response {
@@ -511,7 +516,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             Fcall::Trename(fcall::Trename {
                 fid,
                 dfid,
-                name: name.into(),
+                name: fcall::FcallStr::Borrowed(name.as_bytes()),
             }),
             |response| match response {
                 Fcall::Rrename(_) => Ok(()),
