@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 
 use thiserror::Error;
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// Possible errors during hooking of `syscall` instructions
 #[derive(Error, Debug)]
@@ -47,6 +48,26 @@ type Result<T> = std::result::Result<T, Error>;
 /// The magic bytes used to identify the trampoline data.
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
+
+/// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
+#[repr(C, packed)]
+#[derive(FromBytes, IntoBytes, Immutable)]
+struct TrampolineHeader64 {
+    magic: [u8; 8],
+    file_offset: u64,
+    vaddr: u64,
+    trampoline_size: u64,
+}
+
+/// Trampoline header for 32-bit: 8 (magic) + 4 (file_offset) + 4 (vaddr) + 4 (size) = 20 bytes
+#[repr(C, packed)]
+#[derive(FromBytes, IntoBytes, Immutable)]
+struct TrampolineHeader32 {
+    magic: [u8; 8],
+    file_offset: u32,
+    vaddr: u32,
+    trampoline_size: u32,
+}
 
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
 ///
@@ -178,26 +199,29 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     out.extend_from_slice(&trampoline_data);
 
     // Build the header (goes at the end of the file)
-    // Header format: magic(8) + file_offset(8/4) + vaddr(8/4) + code_size(8/4)
     // The entry point placeholder is at offset 0 of the trampoline code, not in the header.
-    let mut header = vec![];
-    header.extend_from_slice(TRAMPOLINE_MAGIC);
     if arch == Arch::X86_64 {
-        header.extend_from_slice(&trampoline_file_offset.to_le_bytes());
-        header.extend_from_slice(&trampoline_base_addr.to_le_bytes());
-        header.extend_from_slice(&(trampoline_size as u64).to_le_bytes());
+        let header = TrampolineHeader64 {
+            magic: *TRAMPOLINE_MAGIC,
+            file_offset: trampoline_file_offset,
+            vaddr: trampoline_base_addr,
+            trampoline_size: trampoline_size as u64,
+        };
+        out.extend_from_slice(header.as_bytes());
     } else {
         let file_offset_32 =
             u32::try_from(trampoline_file_offset).map_err(|_| Error::TrampolineAddressTooLarge)?;
         let trampoline_base_addr_32 =
             u32::try_from(trampoline_base_addr).map_err(|_| Error::TrampolineAddressTooLarge)?;
         #[allow(clippy::cast_possible_truncation)]
-        let code_size_32 = trampoline_size as u32;
-        header.extend_from_slice(&file_offset_32.to_le_bytes());
-        header.extend_from_slice(&trampoline_base_addr_32.to_le_bytes());
-        header.extend_from_slice(&code_size_32.to_le_bytes());
+        let header = TrampolineHeader32 {
+            magic: *TRAMPOLINE_MAGIC,
+            file_offset: file_offset_32,
+            vaddr: trampoline_base_addr_32,
+            trampoline_size: trampoline_size as u32,
+        };
+        out.extend_from_slice(header.as_bytes());
     }
-    out.extend_from_slice(&header);
     Ok(out)
 }
 
@@ -222,11 +246,10 @@ fn text_sections(
 }
 
 /// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
-/// The header is at the last 32 bytes (64-bit) or 20 bytes (32-bit) of the file.
 fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     let header_size = match arch {
-        Arch::X86_64 => 32,
-        Arch::X86_32 => 20,
+        Arch::X86_64 => size_of::<TrampolineHeader64>(),
+        Arch::X86_32 => size_of::<TrampolineHeader32>(),
     };
 
     if input_binary.len() < header_size {
@@ -242,16 +265,16 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
 
     let (file_offset, vaddr, trampoline_size) = match arch {
         Arch::X86_64 => {
-            let file_offset = u64::from_le_bytes(header[8..16].try_into().unwrap());
-            let vaddr = u64::from_le_bytes(header[16..24].try_into().unwrap());
-            let trampoline_size = u64::from_le_bytes(header[24..32].try_into().unwrap());
-            (file_offset, vaddr, trampoline_size)
+            let header = TrampolineHeader64::read_from_bytes(header).unwrap();
+            (header.file_offset, header.vaddr, header.trampoline_size)
         }
         Arch::X86_32 => {
-            let file_offset = u64::from(u32::from_le_bytes(header[8..12].try_into().unwrap()));
-            let vaddr = u64::from(u32::from_le_bytes(header[12..16].try_into().unwrap()));
-            let trampoline_size = u64::from(u32::from_le_bytes(header[16..20].try_into().unwrap()));
-            (file_offset, vaddr, trampoline_size)
+            let header = TrampolineHeader32::read_from_bytes(header).unwrap();
+            (
+                u64::from(header.file_offset),
+                u64::from(header.vaddr),
+                u64::from(header.trampoline_size),
+            )
         }
     };
 
