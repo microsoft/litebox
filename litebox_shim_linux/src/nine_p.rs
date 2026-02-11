@@ -9,6 +9,7 @@
 //! inserted into the guest-visible descriptor table, so it remains invisible to
 //! the guest program.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use litebox::fs::nine_p::transport;
@@ -18,6 +19,30 @@ use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
 use crate::syscalls::net::SocketFd;
 use crate::{GlobalState, Platform, ShimFS};
+
+/// Handles socket cleanup on drop without exposing the `FS` generic.
+///
+/// This is stored as `Box<dyn DropGuard>` inside [`ShimTransport`] so that the
+/// transport itself does not need to be generic over `FS`.
+trait DropGuard: Send + Sync {
+    fn close(&mut self);
+}
+
+/// Concrete, generic implementation of [`DropGuard`].
+struct SocketDropGuard<FS: ShimFS> {
+    global: Arc<GlobalState<FS>>,
+    sockfd: SocketFd,
+}
+
+impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
+    fn close(&mut self) {
+        let _ = self
+            .global
+            .net
+            .lock()
+            .close(&self.sockfd, litebox::net::CloseBehavior::Immediate);
+    }
+}
 
 /// A 9P transport backed by a raw [`SocketFd`] and its [`NetworkProxy`].
 ///
@@ -29,13 +54,15 @@ use crate::{GlobalState, Platform, ShimFS};
 /// (`try_read` / `try_write`), with spin-polling when data is not yet available.
 /// This avoids the need for a [`WaitState`](crate::wait::WaitState) or any
 /// association with a particular guest [`Task`](crate::Task).
-pub struct ShimTransport<FS: ShimFS> {
-    global: Arc<GlobalState<FS>>,
-    sockfd: SocketFd,
+///
+/// The type is **not** generic over `FS` — the `FS`-dependent cleanup logic is
+/// type-erased behind a boxed [`DropGuard`].
+pub struct ShimTransport {
+    _drop_guard: Box<dyn DropGuard>,
     proxy: Arc<NetworkProxy<Platform>>,
 }
 
-impl<FS: ShimFS> ShimTransport<FS> {
+impl ShimTransport {
     /// Create a TCP socket, connect it to `addr`, and return a transport.
     ///
     /// The socket is created via [`litebox::net::Network::socket`] and initialised
@@ -44,7 +71,7 @@ impl<FS: ShimFS> ShimTransport<FS> {
     ///
     /// Connection and all subsequent I/O use the [`NetworkProxy`] directly,
     /// spin-polling when the operation cannot complete immediately.
-    pub(crate) fn connect(
+    pub(crate) fn connect<FS: ShimFS>(
         global: Arc<GlobalState<FS>>,
         addr: core::net::SocketAddr,
     ) -> Result<Self, Errno> {
@@ -71,26 +98,22 @@ impl<FS: ShimFS> ShimTransport<FS> {
             }
         }
 
+        let drop_guard = Box::new(SocketDropGuard { global, sockfd });
+
         Ok(Self {
-            global,
-            sockfd,
+            _drop_guard: drop_guard,
             proxy,
         })
     }
 }
 
-impl<FS: ShimFS> Drop for ShimTransport<FS> {
+impl Drop for ShimTransport {
     fn drop(&mut self) {
-        // Close immediately – the 9P transport is internal, no graceful shutdown needed.
-        let _ = self
-            .global
-            .net
-            .lock()
-            .close(&self.sockfd, litebox::net::CloseBehavior::Immediate);
+        self._drop_guard.close();
     }
 }
 
-impl<FS: ShimFS> transport::Read for ShimTransport<FS> {
+impl transport::Read for ShimTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
         loop {
             match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
@@ -105,7 +128,7 @@ impl<FS: ShimFS> transport::Read for ShimTransport<FS> {
     }
 }
 
-impl<FS: ShimFS> transport::Write for ShimTransport<FS> {
+impl transport::Write for ShimTransport {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
         loop {
             match self.proxy.try_write(buf, SendFlags::empty(), None) {
@@ -217,7 +240,7 @@ mod tests {
     fn connect_9p(
         task: &crate::Task<crate::DefaultFS>,
         server: &DiodServer,
-    ) -> nine_p::FileSystem<crate::Platform, ShimTransport<crate::DefaultFS>> {
+    ) -> nine_p::FileSystem<crate::Platform, ShimTransport> {
         // The diod server is reachable at the gateway address (10.0.0.1) from the shim's
         // network perspective, since the TUN device bridges to the host.
         let addr = socket_addr([10, 0, 0, 1], server.port);
