@@ -120,6 +120,7 @@ const HOST_FILE_PATHS: &[&str] = &[
     "/out/hello",
     "/out/efault",
     "/out/thread_exit",
+    "/out/tcp_server",
     // Add more paths as needed
 ];
 
@@ -184,12 +185,13 @@ fn load_host_files_into_fs<Platform: litebox::sync::RawSyncPrimitivesProvider>(
 pub extern "C" fn sandbox_process_init(
     pt_regs: &mut litebox_common_linux::PtRegs,
     boot_params: &'static litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params,
-) {
+) -> ! {
     let pgd = litebox_platform_linux_kernel::arch::PhysAddr::new_truncate(
         litebox_platform_linux_kernel::arch::instructions::cr3()
             & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
     );
     let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
+    #[cfg(debug_assertions)]
     litebox::log_println!(platform, "sandbox_process_init called\n");
 
     litebox_platform_multiplex::set_platform(platform);
@@ -268,10 +270,12 @@ pub extern "C" fn sandbox_process_init(
             );
         }
     };
-    litebox_platform_linux_kernel::host::snp::snp_impl::init_thread(
-        alloc::boxed::Box::new(program.entrypoints),
-        pt_regs,
-    );
+    unsafe {
+        litebox_platform_linux_kernel::host::snp::snp_impl::run_thread(
+            alloc::boxed::Box::new(program.entrypoints),
+            pt_regs,
+        )
+    };
 }
 
 #[unsafe(no_mangle)]
@@ -285,8 +289,36 @@ pub extern "C" fn sandbox_task_exit() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) {
+pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) -> ! {
     litebox_platform_linux_kernel::host::snp::snp_impl::handle_syscall(pt_regs);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sandbox_tun_read_write() {
+    let shim = &raw const SHIM;
+    // wait until shim is initialized
+    let shim = loop {
+        if let Some(shim) = unsafe { (*shim).as_ref() } {
+            break shim;
+        }
+    };
+    #[cfg(debug_assertions)]
+    litebox::log_println!(
+        litebox_platform_multiplex::platform(),
+        "sandbox_tun_read_write started\n"
+    );
+    while !litebox_platform_linux_kernel::host::snp::snp_impl::all_threads_exited() {
+        let _timeout = loop {
+            match shim
+                .perform_network_interaction() {
+                    litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {},
+                    litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => break timeout,
+                }
+        };
+        // TODO: use timeout to wait on host events
+    }
+
+    litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::return_to_host();
 }
 
 /// This function is called on panic.

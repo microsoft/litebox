@@ -41,11 +41,8 @@ sandbox_kernel_start:
 
     .org 0x20
 sandbox_process_start:
-    mov     rbp, rsp                   /* save original rsp in rbp */
     and     rsp, -16                   /* align stack to 16 bytes */
     call    sandbox_process_init
-    mov     rsp, rbp                   /* restore rsp to pt_regs pointer */
-    jmp     swapgs_restore_regs_and_return_to_usermode
 
 1:  /* hlt the machine */
     hlt
@@ -59,6 +56,12 @@ _exit:
     jmp	1b
 
 sandbox_tun_read_write_start:
+    and    rsp, -16                   /* align stack to 16 bytes */
+    call   sandbox_tun_read_write
+1:  /* hlt the machine */
+    hlt
+    jmp	1b
+
 sandbox_mount_start:
 sandbox_signal_ret:
 rust_begin_unwind:
@@ -100,32 +103,8 @@ entry_SYSCALL_64:
     push    r15         /* pt_regs->r15 */
 
     mov     rdi, rsp
+    and     rsp, -16    /* align stack to 16 bytes */
     call    do_syscall_64
-
-swapgs_restore_regs_and_return_to_usermode:
-    mov     rcx, [rsp + 0x80]
-    mov     r11, [rsp + 0x90]
-
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbp
-    pop     rbx
-    pop     rsi         /* skip r11 */
-    pop     r10
-    pop     r9
-    pop     r8
-    pop     rax
-    pop     rsi         /* skip rcx */
-    pop     rdx
-    pop     rsi
-    pop     rdi
-
-    mov     rsp, [rsp + 0x20]   /* original rsp */
-    swapgs
-    sysretq
-
 1:  /* hlt the machine */
     hlt
     jmp	1b

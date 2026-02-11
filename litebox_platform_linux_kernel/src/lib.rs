@@ -295,7 +295,13 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
                 Ok(())
             }
             Err(e) => {
-                unimplemented!("Error: {:?}", e)
+                // Avoid allocation for error message
+                crate::print_str_and_int!(
+                    "Error sending IP packet: ",
+                    u64::from(e.as_neg().unsigned_abs()),
+                    16
+                );
+                unimplemented!()
             }
         }
     }
@@ -306,8 +312,15 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
     ) -> Result<usize, litebox::platform::ReceiveError> {
         match Host::receive_ip_packet(packet) {
             Ok(n) => Ok(n),
+            Err(Errno::EAGAIN) => Err(litebox::platform::ReceiveError::WouldBlock),
             Err(e) => {
-                unimplemented!("Error: {:?}", e)
+                // Avoid allocation for error message
+                crate::print_str_and_int!(
+                    "Error receiving IP packet: ",
+                    u64::from(e.as_neg().unsigned_abs()),
+                    16
+                );
+                unimplemented!()
             }
         }
     }
@@ -488,5 +501,45 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
 
     fn get_vdso_address(&self) -> Option<usize> {
         None
+    }
+}
+
+const RIP_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, rip);
+const EFLAGS_OFFSET: usize = core::mem::offset_of!(litebox_common_linux::PtRegs, eflags);
+
+/// Switches to the guest context using sysretq.
+///
+/// # Safety
+///
+/// The context must be valid guest context.
+unsafe fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov     rsp, {0}",
+            "mov     rcx, [rsp + {rip_off}]",
+            "mov     r11, [rsp + {eflags_off}]",
+            "pop     r15",
+            "pop     r14",
+            "pop     r13",
+            "pop     r12",
+            "pop     rbp",
+            "pop     rbx",
+            "pop     rsi",        /* skip r11 */
+            "pop     r10",
+            "pop     r9",
+            "pop     r8",
+            "pop     rax",
+            "pop     rsi",        /* skip rcx */
+            "pop     rdx",
+            "pop     rsi",
+            "pop     rdi",
+            "mov     rsp, [rsp + 0x20]",   /* original rsp */
+            "swapgs",
+            "sysretq",
+            in(reg) ctx,
+            rip_off = const RIP_OFFSET,
+            eflags_off = const EFLAGS_OFFSET,
+            options(noreturn),
+        );
     }
 }
