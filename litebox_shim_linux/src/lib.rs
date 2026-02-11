@@ -61,10 +61,7 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
 
 pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
 
-/// A convenience supertrait alias for file system types used throughout the shim.
-///
-/// This combines [`litebox::fs::FileSystem`] with `Send`, `Sync`, and `'static`
-/// bounds that are required for sharing filesystem instances across threads via `Arc`.
+/// A trait required for file systems to be used in the shim.
 pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
 impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
@@ -136,13 +133,13 @@ pub struct LinuxShimBuilder<FS: ShimFS> {
     load_filter: Option<LoadFilter>,
 }
 
-impl Default for LinuxShimBuilder<DefaultFS> {
+impl<FS: ShimFS> Default for LinuxShimBuilder<FS> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LinuxShimBuilder<DefaultFS> {
+impl<FS: ShimFS> LinuxShimBuilder<FS> {
     /// Returns a new shim builder.
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
@@ -154,11 +151,16 @@ impl LinuxShimBuilder<DefaultFS> {
         }
     }
 
+    /// Returns the litebox object for the shim.
+    pub fn litebox(&self) -> &LiteBox<Platform> {
+        &self.litebox
+    }
+
     /// Set the global file system
     ///
     /// NOTE: This function signature might change as better parametricity is added to file systems.
     /// Related: <https://github.com/MSRSSP/litebox/issues/24>
-    pub fn set_fs(&mut self, fs: LinuxFS) {
+    pub fn set_fs(&mut self, fs: FS) {
         self.fs = Some(fs);
     }
 
@@ -173,22 +175,6 @@ impl LinuxShimBuilder<DefaultFS> {
 }
 
 impl<FS: ShimFS> LinuxShimBuilder<FS> {
-    /// Create a new shim builder with the given filesystem.
-    pub fn with_fs(fs: FS) -> Self {
-        let platform = litebox_platform_multiplex::platform();
-        Self {
-            platform,
-            litebox: LiteBox::new(platform),
-            fs: Some(fs),
-            load_filter: None,
-        }
-    }
-
-    /// Returns the litebox object for the shim.
-    pub fn litebox(&self) -> &LiteBox<Platform> {
-        &self.litebox
-    }
-
     /// Set the load filter, which can augment envp or auxv when starting a new program.
     pub fn set_load_filter(&mut self, callback: LoadFilter) {
         self.load_filter = Some(callback);
