@@ -29,7 +29,7 @@ pub(super) const NONUNAME: u32 = !0;
 
 /// Room for `Twrite`/`Rread` header
 ///
-/// size[4] Tread/Twrite[2] tag[2] fid[4] offset[8] count[4]
+/// size\[4\] Tread/Twrite\[2\] tag\[2\] fid\[4\] offset\[8\] count\[4\]
 pub(super) const IOHDRSZ: u32 = 24;
 
 /// Room for readdir header
