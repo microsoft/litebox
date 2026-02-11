@@ -9,7 +9,7 @@
 > you need long-term stability, it may be best to wait for a stable release, or
 > be prepared to adapt to updates along the way.
 
-LiteBox is a sandboxing library OS that drastically cuts down the interface to the host, thereby reducing attack surface.  It focuses on easy interop of various "North" shims and "South" platforms.  LiteBox is designed for usage in both kernel and non-kernel scenarios.
+LiteBox is a [sandboxing library OS](./.faq/sandboxlibos.md) that drastically cuts down the interface to the host, thereby reducing attack surface.  It focuses on easy interop of various "North" shims and "South" platforms.  LiteBox is designed for usage in both kernel and non-kernel scenarios.
 
 LiteBox exposes a Rust-y [`nix`](https://docs.rs/nix)/[`rustix`](https://docs.rs/rustix)-inspired "North" interface when it is provided a `Platform` interface at its "South".  These interfaces allow for a wide variety of use-cases, easily allowing for connection between any of the North--South pairs.
 
@@ -21,6 +21,10 @@ Example use cases include:
 - Running on LVBS
 
 ![LiteBox and related projects](./.figures/litebox.svg)
+
+## FAQ
+
+Frequently Asked Questions: [](./.faq)
 
 ## Contributing
 
