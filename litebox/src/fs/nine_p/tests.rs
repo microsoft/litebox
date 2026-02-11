@@ -75,6 +75,8 @@ impl DiodServer {
                 &std::format!("127.0.0.1:{port}"),
                 "--nwthreads",
                 "1",
+                "-d",
+                "100000",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -107,6 +109,13 @@ impl Drop for DiodServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(mut stderr) = self.child.stderr.take() {
+            let mut output = std::string::String::new();
+            let _ = stderr.read_to_string(&mut output);
+            if !output.is_empty() {
+                std::eprintln!("--- diod stderr ---\n{output}\n--- end diod stderr ---");
+            }
+        }
     }
 }
 
