@@ -1,33 +1,80 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! 9P transport implementation using litebox's syscall-level network APIs.
+//! 9P transport implementation using litebox's network APIs.
 //!
 //! This module provides a [`ShimTransport`] that implements the 9P transport traits
-//! (`litebox::fs::nine_p::transport::{Read, Write}`) using the `Task::do_*` syscall
-//! methods (e.g., `do_socket`, `do_connect`, `do_sendto`, `do_recvfrom`).
+//! (`litebox::fs::nine_p::transport::{Read, Write}`) by operating directly on a
+//! [`SocketFd`] via the [`GlobalState`] network methods. The socket is **not**
+//! inserted into the guest-visible descriptor table, so it remains invisible to
+//! the guest program.
 
 use litebox::fs::nine_p::transport;
-use litebox_common_linux::{ReceiveFlags, SendFlags};
+use litebox_common_linux::{ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno};
 
+use crate::syscalls::net::SocketFd;
 use crate::{ShimFS, Task};
 
-/// A 9P transport backed by litebox's syscall-level socket APIs.
+/// A 9P transport backed by a raw [`SocketFd`].
+///
+/// The socket lives in the litebox descriptor table (for metadata / proxy) but is
+/// **not** registered in the guest's file-descriptor table, keeping it invisible
+/// to the guest program.
 pub struct ShimTransport<'a, FS: ShimFS> {
     task: &'a Task<FS>,
-    sockfd: u32,
+    sockfd: SocketFd,
+}
+
+impl<'a, FS: ShimFS> ShimTransport<'a, FS> {
+    /// Create a TCP socket, connect it to `addr`, and return a transport.
+    ///
+    /// The socket is created via [`litebox::net::Network::socket`] and initialised
+    /// with [`GlobalState::initialize_socket`] so that the channel-based proxy is
+    /// available for non-blocking I/O, but it is **not** assigned a guest fd
+    /// number.
+    pub(crate) fn connect(task: &'a Task<FS>, addr: core::net::SocketAddr) -> Result<Self, Errno> {
+        let global = &*task.global;
+
+        // 1. Create the raw socket.
+        let sockfd = global
+            .net
+            .lock()
+            .socket(litebox::net::Protocol::Tcp)
+            .map_err(Errno::from)?;
+
+        // 2. Initialise metadata / proxy in the litebox descriptor table.
+        let _ = global.initialize_socket(&sockfd, SockType::Stream, SockFlags::empty());
+
+        // 3. Connect.
+        global.connect(&task.wait_cx(), &sockfd, addr)?;
+
+        Ok(Self { task, sockfd })
+    }
 }
 
 impl<FS: ShimFS> Drop for ShimTransport<'_, FS> {
     fn drop(&mut self) {
-        let _ = self.task.sys_close(self.sockfd.cast_signed());
+        // Close immediately – the 9P transport is internal, no graceful shutdown needed.
+        let _ = self
+            .task
+            .global
+            .net
+            .lock()
+            .close(&self.sockfd, litebox::net::CloseBehavior::Immediate);
     }
 }
 
 impl<FS: ShimFS> transport::Read for ShimTransport<'_, FS> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
         self.task
-            .do_recvfrom(self.sockfd, buf, ReceiveFlags::empty(), None)
+            .global
+            .receive(
+                &self.task.wait_cx(),
+                &self.sockfd,
+                buf,
+                ReceiveFlags::empty(),
+                None,
+            )
             .map_err(|_| transport::ReadError)
     }
 }
@@ -35,7 +82,14 @@ impl<FS: ShimFS> transport::Read for ShimTransport<'_, FS> {
 impl<FS: ShimFS> transport::Write for ShimTransport<'_, FS> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
         self.task
-            .do_sendto(self.sockfd, buf, SendFlags::empty(), None)
+            .global
+            .sendto(
+                &self.task.wait_cx(),
+                &self.sockfd,
+                buf,
+                SendFlags::empty(),
+                None,
+            )
             .map_err(|_| transport::WriteError)
     }
 }
@@ -54,10 +108,7 @@ mod tests {
 
     use litebox::fs::nine_p;
     use litebox::fs::{FileSystem as _, Mode, OFlags};
-    use litebox_common_linux::errno::Errno;
-    use litebox_common_linux::{AddressFamily, SockFlags, SockType};
 
-    use crate::syscalls::net::SocketAddress;
     use crate::syscalls::tests::init_platform;
 
     use super::*;
@@ -137,27 +188,6 @@ mod tests {
         ))
     }
 
-    /// Connect to a 9P server and return a [`ShimTransport`].
-    ///
-    /// This function creates a TCP socket via [`Task::do_socket`], connects it to the
-    /// given address via [`Task::do_connect`], and returns a transport suitable for use
-    /// with `litebox::fs::nine_p::FileSystem`.
-    ///
-    /// # Arguments
-    /// * `task` - The task whose syscall APIs will be used for socket operations
-    /// * `addr` - The socket address of the 9P server
-    fn connect(
-        task: &Task<crate::DefaultFS>,
-        addr: core::net::SocketAddr,
-    ) -> Result<ShimTransport<'_, crate::DefaultFS>, Errno> {
-        let sockfd =
-            task.do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)?;
-
-        task.do_connect(sockfd, SocketAddress::Inet(addr))?;
-
-        Ok(ShimTransport { task, sockfd })
-    }
-
     fn connect_9p<'a>(
         task: &'a crate::Task<crate::DefaultFS>,
         server: &DiodServer,
@@ -165,8 +195,8 @@ mod tests {
         // The diod server is reachable at the gateway address (10.0.0.1) from the shim's
         // network perspective, since the TUN device bridges to the host.
         let addr = socket_addr([10, 0, 0, 1], server.port);
-        let transport =
-            connect(task, addr).expect("failed to connect to 9P server via shim network");
+        let transport = ShimTransport::connect(task, addr)
+            .expect("failed to connect to 9P server via shim network");
 
         let aname = server.export_path().to_str().unwrap();
         let username = std::env::var("USER")

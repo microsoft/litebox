@@ -54,7 +54,7 @@ macro_rules! convert_flags {
     };
 }
 
-pub(super) type SocketFd = litebox::net::SocketFd<Platform>;
+pub(crate) type SocketFd = litebox::net::SocketFd<Platform>;
 
 impl<FS: ShimFS> super::file::FilesState<FS> {
     fn with_socket_fd<R>(
@@ -192,7 +192,7 @@ pub(super) enum SocketOptionValue {
 /// change if the nature of the litebox descriptor table changes, or if network
 /// namespaces are implemented.
 impl<FS: ShimFS> GlobalState<FS> {
-    fn initialize_socket(
+    pub(crate) fn initialize_socket(
         &self,
         fd: &SocketFd,
         sock_type: SockType,
@@ -641,7 +641,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         self.net.lock().bind(fd, &sockaddr).map_err(Errno::from)
     }
 
-    fn connect(
+    pub(crate) fn connect(
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
@@ -1342,7 +1342,7 @@ impl<FS: ShimFS> Task<FS> {
         let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
         self.do_sendto(fd, &buf, flags, sockaddr)
     }
-    pub(crate) fn do_sendto(
+    fn do_sendto(
         &self,
         sockfd: u32,
         buf: &[u8],
@@ -1469,7 +1469,7 @@ impl<FS: ShimFS> Task<FS> {
         }
         Ok(size)
     }
-    pub(crate) fn do_recvfrom(
+    fn do_recvfrom(
         &self,
         sockfd: u32,
         buf: &mut [u8],
