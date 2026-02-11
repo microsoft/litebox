@@ -157,8 +157,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Send a request and wait for the response
-    ///
-    /// TODO: this is synchronous, will support async operations
     fn fcall<F, R>(&self, fcall: Fcall<'_>, f: F) -> Result<R, Error>
     where
         F: FnOnce(Fcall<'_>) -> Result<R, Error>,
@@ -176,6 +174,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         let mut rbuf = self.rbuf.lock();
 
         // Loop until we get a response with matching tag (in case of stale responses)
+        // TODO: support concurrent requests by allowing out-of-order responses and matching tags accordingly
         loop {
             let response = transport::read_message(transport, &mut rbuf)?;
             if response.tag == tag {
