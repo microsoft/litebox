@@ -16,7 +16,7 @@ use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints}
 
 // FUTURE: replace this with some kind of OnceLock, or just eliminate this
 // entirely (ideal).
-static mut SHIM: Option<litebox_shim_linux::LinuxShim> = None;
+static mut SHIM: Option<litebox_shim_linux::LinuxShim<litebox_shim_linux::DefaultFS>> = None;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn floating_point_handler(_pt_regs: &mut litebox_common_linux::PtRegs) {
@@ -190,14 +190,14 @@ pub extern "C" fn sandbox_process_init(
     litebox::log_println!(platform, "sandbox_process_init called\n");
 
     litebox_platform_multiplex::set_platform(platform);
-    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     load_host_files_into_fs(&mut in_mem_fs);
 
     let tar_ro =
         litebox::fs::tar_ro::FileSystem::new(litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
-    shim_builder.set_fs(shim_builder.default_fs(in_mem_fs, tar_ro));
+    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, tar_ro));
 
     let parse_args =
         |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
@@ -242,6 +242,7 @@ pub extern "C" fn sandbox_process_init(
     let shim = &raw const SHIM;
     #[allow(clippy::missing_panics_doc)]
     let program = match unsafe { (*shim).as_ref().expect("initialized") }.load_program(
+        fs,
         platform.init_task(boot_params),
         &program,
         argv,

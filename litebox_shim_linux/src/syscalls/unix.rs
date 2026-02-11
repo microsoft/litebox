@@ -62,7 +62,7 @@ pub(crate) enum UnixSocketAddr {
 /// the socket file remains accessible. The file is automatically closed
 /// when this structure is dropped.
 enum UnixBoundSocketAddr<FS: ShimFS> {
-    Path((String, FileFd<FS>, Arc<GlobalState<FS>>)),
+    Path((String, FileFd<FS>, Arc<FS>)),
     Abstract(Vec<u8>),
 }
 
@@ -110,7 +110,8 @@ impl UnixSocketAddr {
                 };
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
                 let file = task
-                    .global
+                    .files
+                    .borrow()
                     .fs
                     .open(
                         path.as_str(),
@@ -121,7 +122,11 @@ impl UnixSocketAddr {
                         OpenError::AlreadyExists => Errno::EADDRINUSE,
                         other => Errno::from(other),
                     })?;
-                Ok(UnixBoundSocketAddr::Path((path, file, task.global.clone())))
+                Ok(UnixBoundSocketAddr::Path((
+                    path,
+                    file,
+                    task.files.borrow().fs.clone(),
+                )))
             }
             UnixSocketAddr::Abstract(data) => {
                 // TODO: check if the abstract address is already in use
@@ -156,8 +161,8 @@ impl<FS: ShimFS> UnixBoundSocketAddr<FS> {
 impl<FS: ShimFS> Drop for UnixBoundSocketAddr<FS> {
     fn drop(&mut self) {
         match self {
-            Self::Path((_, file, global)) => {
-                let _ = global.fs.close(file);
+            Self::Path((_, file, fs)) => {
+                let _ = fs.close(file);
             }
             Self::Abstract(_) => {}
         }

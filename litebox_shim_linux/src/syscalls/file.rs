@@ -52,13 +52,16 @@ impl FsState {
 
 /// Task state shared by `CLONE_FILES`.
 pub(crate) struct FilesState<FS: ShimFS> {
+    /// The filesystem implementation, shared across tasks that share file system.
+    pub(crate) fs: alloc::sync::Arc<FS>,
     pub file_descriptors: litebox::sync::RwLock<Platform, Descriptors<FS>>,
     pub raw_descriptor_store: litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
 }
 
 impl<FS: ShimFS> FilesState<FS> {
-    pub fn new() -> Self {
+    pub fn new(fs: alloc::sync::Arc<FS>) -> Self {
         Self {
+            fs,
             file_descriptors: litebox::sync::RwLock::new(Descriptors::new()),
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
@@ -132,7 +135,11 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let mode = mode & !self.get_umask();
-        let file = self.global.fs.open(path, flags - OFlags::CLOEXEC, mode)?;
+        let file = self
+            .files
+            .borrow()
+            .fs
+            .open(path, flags - OFlags::CLOEXEC, mode)?;
         if flags.contains(OFlags::CLOEXEC) {
             let None = self
                 .global
@@ -186,14 +193,9 @@ impl<FS: ShimFS> Task<FS> {
         let file_table = files.file_descriptors.read();
         let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
         match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => self.files.borrow().run_on_raw_fd(
+            Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                 *raw_fd,
-                |fd| {
-                    self.global
-                        .fs
-                        .truncate(fd, length, false)
-                        .map_err(Errno::from)
-                },
+                |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
                 |_fd| todo!("net"),
                 |_fd| todo!("pipes"),
             ),
@@ -217,9 +219,9 @@ impl<FS: ShimFS> Task<FS> {
         match fs_path {
             FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
                 if flags.contains(AtFlags::AT_REMOVEDIR) {
-                    self.global.fs.rmdir(path).map_err(Errno::from)
+                    self.files.borrow().fs.rmdir(path).map_err(Errno::from)
                 } else {
-                    self.global.fs.unlink(path).map_err(Errno::from)
+                    self.files.borrow().fs.unlink(path).map_err(Errno::from)
                 }
             }
             FsPath::Cwd => Err(Errno::EINVAL),
@@ -249,7 +251,7 @@ impl<FS: ShimFS> Task<FS> {
                     .run_on_raw_fd(
                         raw_fd,
                         |fd| {
-                            self.global
+                            files
                                 .fs
                                 .read(fd, &mut buf.borrow_mut(), offset)
                                 .map_err(Errno::from)
@@ -310,7 +312,7 @@ impl<FS: ShimFS> Task<FS> {
                 files
                     .run_on_raw_fd(
                         raw_fd,
-                        |fd| self.global.fs.write(fd, buf, offset).map_err(Errno::from),
+                        |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
                         |fd| {
                             self.global.sendto(
                                 &self.wait_cx(),
@@ -389,7 +391,7 @@ impl<FS: ShimFS> Task<FS> {
             Descriptor::LiteBoxRawFd(raw_fd) => files
                 .run_on_raw_fd(
                     *raw_fd,
-                    |fd| self.global.fs.seek(fd, offset, whence).map_err(Errno::from),
+                    |fd| files.fs.seek(fd, offset, whence).map_err(Errno::from),
                     |_| Err(Errno::ESPIPE),
                     |_| Err(Errno::ESPIPE),
                 )
@@ -403,7 +405,11 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `mkdir`
     pub fn sys_mkdir(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
         let mode = Mode::from_bits_retain(mode) & !self.get_umask();
-        self.global.fs.mkdir(pathname, mode).map_err(Errno::from)
+        self.files
+            .borrow()
+            .fs
+            .mkdir(pathname, mode)
+            .map_err(Errno::from)
     }
 
     pub(crate) fn do_close(&self, desc: Descriptor<FS>) -> Result<(), Errno> {
@@ -414,7 +420,7 @@ impl<FS: ShimFS> Task<FS> {
                 match rds.fd_consume_raw_integer(raw_fd) {
                     Ok(fd) => {
                         drop(rds);
-                        self.global.fs.close(&fd).map_err(Errno::from)
+                        files.fs.close(&fd).map_err(Errno::from)
                     }
                     Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
                     Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
@@ -504,7 +510,7 @@ impl<FS: ShimFS> Task<FS> {
                     .run_on_raw_fd(
                         *raw_fd,
                         |fd| {
-                            self.global
+                            files
                                 .fs
                                 .read(fd, &mut kernel_buffer, None)
                                 .map_err(Errno::from)
@@ -581,7 +587,7 @@ impl<FS: ShimFS> Task<FS> {
                         raw_fd,
                         |fd| {
                             write_to_iovec(iovs, |buf: &[u8]| {
-                                self.global.fs.write(fd, buf, None).map_err(Errno::from)
+                                files.fs.write(fd, buf, None).map_err(Errno::from)
                             })
                         },
                         |fd| {
@@ -615,7 +621,7 @@ impl<FS: ShimFS> Task<FS> {
         pathname: impl path::Arg,
         mode: litebox_common_linux::AccessFlags,
     ) -> Result<(), Errno> {
-        let status = self.global.fs.file_status(pathname)?;
+        let status = self.files.borrow().fs.file_status(pathname)?;
         if mode == litebox_common_linux::AccessFlags::F_OK {
             return Ok(());
         }
@@ -693,61 +699,62 @@ impl<FS: ShimFS> Task<FS> {
 impl<FS: ShimFS> Descriptor<FS> {
     fn stat(&self, task: &Task<FS>) -> Result<FileStat, Errno> {
         let fstat = match self {
-            Descriptor::LiteBoxRawFd(raw_fd) => task
-                .files
-                .borrow()
-                .run_on_raw_fd(
-                    *raw_fd,
-                    |fd| {
-                        task.global
-                            .fs
-                            .fd_file_status(fd)
-                            .map(FileStat::from)
-                            .map_err(Errno::from)
-                    },
-                    |_fd| {
-                        Ok(FileStat {
-                            // TODO: give correct values
-                            st_dev: 0,
-                            st_ino: 0,
-                            st_nlink: 1,
-                            st_mode: (litebox_common_linux::InodeType::Socket as u32
-                                | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
-                            .truncate(),
-                            st_uid: 0,
-                            st_gid: 0,
-                            st_rdev: 0,
-                            st_size: 0,
-                            st_blksize: 4096,
-                            st_blocks: 0,
-                            ..Default::default()
-                        })
-                    },
-                    |fd| {
-                        let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
-                        let read_write_mode = match half_pipe_type {
-                            litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
-                            litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
-                        };
-                        Ok(FileStat {
-                            // TODO: give correct values
-                            st_dev: 0,
-                            st_ino: 0,
-                            st_nlink: 1,
-                            st_mode: (read_write_mode.bits()
-                                | litebox_common_linux::InodeType::NamedPipe as u32)
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                let files = task.files.borrow();
+                files
+                    .run_on_raw_fd(
+                        *raw_fd,
+                        |fd| {
+                            files
+                                .fs
+                                .fd_file_status(fd)
+                                .map(FileStat::from)
+                                .map_err(Errno::from)
+                        },
+                        |_fd| {
+                            Ok(FileStat {
+                                // TODO: give correct values
+                                st_dev: 0,
+                                st_ino: 0,
+                                st_nlink: 1,
+                                st_mode: (litebox_common_linux::InodeType::Socket as u32
+                                    | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
                                 .truncate(),
-                            st_uid: 0,
-                            st_gid: 0,
-                            st_rdev: 0,
-                            st_size: 0,
-                            st_blksize: 4096,
-                            st_blocks: 0,
-                            ..Default::default()
-                        })
-                    },
-                )
-                .flatten()?,
+                                st_uid: 0,
+                                st_gid: 0,
+                                st_rdev: 0,
+                                st_size: 0,
+                                st_blksize: 4096,
+                                st_blocks: 0,
+                                ..Default::default()
+                            })
+                        },
+                        |fd| {
+                            let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
+                            let read_write_mode = match half_pipe_type {
+                                litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
+                                litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
+                            };
+                            Ok(FileStat {
+                                // TODO: give correct values
+                                st_dev: 0,
+                                st_ino: 0,
+                                st_nlink: 1,
+                                st_mode: (read_write_mode.bits()
+                                    | litebox_common_linux::InodeType::NamedPipe as u32)
+                                    .truncate(),
+                                st_uid: 0,
+                                st_gid: 0,
+                                st_rdev: 0,
+                                st_size: 0,
+                                st_blksize: 4096,
+                                st_blocks: 0,
+                                ..Default::default()
+                            })
+                        },
+                    )
+                    .flatten()?
+            }
             Descriptor::Eventfd { .. } => FileStat {
                 // TODO: give correct values
                 st_dev: 0,
@@ -878,7 +885,7 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             normalized_path
         };
-        let status = self.global.fs.file_status(path)?;
+        let status = self.files.borrow().fs.file_status(path)?;
         Ok(FileStat::from(status))
     }
 
@@ -928,7 +935,7 @@ impl<FS: ShimFS> Task<FS> {
             FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
             }
-            FsPath::Cwd => self.global.fs.file_status("")?.into(),
+            FsPath::Cwd => files.fs.file_status("")?.into(),
             FsPath::Fd(fd) => files
                 .file_descriptors
                 .read()
@@ -1293,8 +1300,8 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    fn is_stdio(&self, fd: &TypedFd<FS>) -> Result<bool, Errno> {
-        match self.global.fs.fd_file_status(fd) {
+    fn is_stdio(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
+        match fs.fd_file_status(fd) {
             Ok(status) => {
                 // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
@@ -1394,7 +1401,7 @@ impl<FS: ShimFS> Task<FS> {
                 Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                     *raw_fd,
                     |fd| {
-                        if self.is_stdio(fd)? {
+                        if self.is_stdio(&files.fs, fd)? {
                             self.stdio_ioctl(&arg)
                         } else {
                             Err(Errno::ENOTTY)
@@ -1873,7 +1880,7 @@ impl<FS: ShimFS> Task<FS> {
                 let mut dir_off = dir_off.0;
                 let mut nbytes = 0;
 
-                let mut entries = self.global.fs.read_dir(file)?;
+                let mut entries = files.fs.read_dir(file)?;
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
 
                 for entry in entries.iter().skip(dir_off) {

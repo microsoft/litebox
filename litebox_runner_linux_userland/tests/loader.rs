@@ -11,7 +11,7 @@ use litebox_platform_multiplex::Platform;
 
 struct TestLauncher {
     platform: &'static Platform,
-    shim_builder: litebox_shim_linux::LinuxShimBuilder<litebox_shim_linux::DefaultFS>,
+    shim_builder: litebox_shim_linux::LinuxShimBuilder,
     fs: litebox_shim_linux::DefaultFS,
 }
 
@@ -81,7 +81,7 @@ impl TestLauncher {
         self.fs.close(&fd).unwrap();
     }
 
-    fn test_load_exec_common(mut self, executable_path: &str) {
+    fn test_load_exec_common(self, executable_path: &str) {
         let argv = vec![
             CString::new(executable_path).unwrap(),
             CString::new("hello").unwrap(),
@@ -90,10 +90,10 @@ impl TestLauncher {
             CString::new("PATH=/bin").unwrap(),
             CString::new("HOME=/").unwrap(),
         ];
-        self.shim_builder.set_fs(self.fs);
+        let fs = std::sync::Arc::new(self.fs);
         let shim = self.shim_builder.build();
         let program = shim
-            .load_program(self.platform.init_task(), executable_path, argv, envp)
+            .load_program(fs, self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
         let _ = unsafe {
             litebox_platform_linux_userland::run_thread(

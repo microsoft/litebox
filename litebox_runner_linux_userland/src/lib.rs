@@ -262,7 +262,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     })?;
 
-    shim_builder.set_fs(initial_file_system);
+    let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     shim_builder.set_load_filter(fixup_env);
     let shim = shim_builder.build();
@@ -329,7 +329,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let program = shim.load_program(platform.init_task(), prog_path, argv, envp)?;
+    let program = shim.load_program(
+        initial_file_system,
+        platform.init_task(),
+        prog_path,
+        argv,
+        envp,
+    )?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
