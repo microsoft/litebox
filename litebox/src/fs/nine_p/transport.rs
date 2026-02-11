@@ -70,7 +70,7 @@ pub(super) fn read_to_buf<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), s
     let sz = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
     if sz < 7 {
         // Minimum message size: size(4) + type(1) + tag(2)
-        return Err(super::Error::InvalidInput);
+        return Err(super::Error::InvalidResponse);
     }
     if sz > buf.capacity() {
         buf.reserve(sz - buf.len());

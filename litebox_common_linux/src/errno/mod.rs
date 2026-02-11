@@ -555,6 +555,7 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
             litebox::fs::errors::TruncateError::NotForWriting => Errno::EACCES,
             litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
             litebox::fs::errors::TruncateError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::TruncateError::Io => Errno::EIO,
         }
     }
 }

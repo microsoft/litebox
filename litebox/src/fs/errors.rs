@@ -25,6 +25,8 @@ pub enum OpenError {
     AlreadyExists,
     #[error("error when truncating: {0}")]
     TruncateError(#[from] TruncateError),
+    #[error("I/O error")]
+    Io,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -44,6 +46,8 @@ pub enum ReadError {
     NotAFile,
     #[error("file not open for reading")]
     NotForReading,
+    #[error("I/O error")]
+    Io,
 }
 
 /// Possible errors from [`FileSystem::write`]
@@ -56,6 +60,8 @@ pub enum WriteError {
     NotAFile,
     #[error("file not open for writing")]
     NotForWriting,
+    #[error("I/O error")]
+    Io,
 }
 
 /// Possible errors from [`FileSystem::seek`]
@@ -70,6 +76,8 @@ pub enum SeekError {
     InvalidOffset,
     #[error("non-seekable file")]
     NonSeekable,
+    #[error("I/O error")]
+    Io,
 }
 
 /// Possible errors from [`FileSystem::truncate`]
@@ -83,6 +91,8 @@ pub enum TruncateError {
     NotForWriting,
     #[error("file descriptor points to a terminal device")]
     IsTerminalDevice,
+    #[error("I/O error")]
+    Io,
 }
 
 /// Possible errors from [`FileSystem::chmod`]
@@ -96,6 +106,8 @@ pub enum ChmodError {
     NotTheOwner,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -111,6 +123,8 @@ pub enum ChownError {
     NotTheOwner,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -125,6 +139,8 @@ pub enum UnlinkError {
     IsADirectory,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -139,6 +155,8 @@ pub enum MkdirError {
     AlreadyExists,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -159,6 +177,8 @@ pub enum RmdirError {
     NotADirectory,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -171,6 +191,8 @@ pub enum ReadDirError {
     ClosedFd,
     #[error("fd does not point to a directory")]
     NotADirectory,
+    #[error("I/O error")]
+    Io,
 }
 
 /// Possible errors from [`FileSystem::file_status`]
@@ -179,6 +201,8 @@ pub enum ReadDirError {
 pub enum FileStatusError {
     #[error("fd has been closed already")]
     ClosedFd,
+    #[error("I/O error")]
+    Io,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
