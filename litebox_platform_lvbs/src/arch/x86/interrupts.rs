@@ -209,8 +209,8 @@ extern "C" fn page_fault_handler_impl(regs: &mut PtRegs) -> PageFaultResult {
         return PageFaultResult::DemandPage;
     }
 
-    // Handle fallible memory operations like memcpy_fallible that access
-    // non-user-space addresses (e.g., VTL0 addresses) which might be unmapped.
+    // Safety net for fallible kernel memory operations (e.g., copying to/from
+    // VTL0 addresses) where the target address may be unmapped due to bugs.
     if let Some(fixup_addr) = search_exception_tables(regs.rip) {
         regs.rip = fixup_addr;
         return PageFaultResult::Handled;

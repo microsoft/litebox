@@ -554,6 +554,14 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         )?;
 
         let mut boxed = box_new_zeroed::<T>();
+        // Use memcpy_fallible instead of ptr::copy_nonoverlapping to handle
+        // the race where another core unmaps this page (via a shared page
+        // table) between map_vtl0_guard and the copy.  The mapping is valid
+        // at this point, so a fault is not expected in the common case.
+        // TODO: Once VTL0 page-range locking is in place, this fallible copy
+        // may become unnecessary since the lock would prevent concurrent
+        // unmapping.  It could still serve as a safety net against callers
+        // that forget to acquire the lock.
         let result = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 core::ptr::from_mut::<T>(boxed.as_mut()).cast(),
@@ -561,6 +569,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
                 src_guard.size,
             )
         };
+        debug_assert!(result.is_ok(), "fault copying from VTL0 mapped page");
 
         result.ok().map(|()| boxed)
     }
@@ -587,14 +596,16 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             return false;
         };
 
-        unsafe {
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 dst_guard.ptr,
                 core::ptr::from_ref::<T>(value).cast::<u8>(),
                 dst_guard.size,
             )
-        }
-        .is_ok()
+        };
+        debug_assert!(result.is_ok(), "fault copying to VTL0 mapped page");
+        result.is_ok()
     }
 
     /// This function copies a slice from the VTL1 kernel to VTL0 physical memory.
@@ -620,14 +631,16 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             return false;
         };
 
-        unsafe {
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 dst_guard.ptr,
                 value.as_ptr().cast::<u8>(),
                 dst_guard.size,
             )
-        }
-        .is_ok()
+        };
+        debug_assert!(result.is_ok(), "fault copying to VTL0 mapped page");
+        result.is_ok()
     }
 
     /// This function copies a slice from VTL0 physical memory to the VTL1 kernel.
@@ -653,14 +666,16 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             return false;
         };
 
-        unsafe {
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 buf.as_mut_ptr().cast::<u8>(),
                 src_guard.ptr,
                 src_guard.size,
             )
-        }
-        .is_ok()
+        };
+        debug_assert!(result.is_ok(), "fault copying from VTL0 mapped page");
+        result.is_ok()
     }
 
     /// Create a new task page table for VTL1 user space and returns its ID.
@@ -1778,7 +1793,7 @@ unsafe extern "C" fn exception_handler(thread_ctx: &mut ThreadContext, kernel_mo
         // - Must return a fixup address to the asm caller (not resume user mode)
         let op = thread_ctx.shim.exception(thread_ctx.ctx, &info);
         match op {
-            ContinueOperation::ResumeKernel => 0,
+            ContinueOperation::ResumePlatform => 0,
             ContinueOperation::ExceptionFixup => {
                 let faulting_rip =
                     with_per_cpu_variables_asm(PerCpuVariablesAsm::get_exception_rip);
@@ -1808,8 +1823,8 @@ impl ThreadContext<'_> {
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_user(self.ctx) },
             ContinueOperation::ExitThread => {}
-            ContinueOperation::ResumeKernel => {
-                panic!("ResumeKernel not expected in user-mode call_shim path")
+            ContinueOperation::ResumePlatform => {
+                panic!("ResumePlatform not expected in user-mode call_shim path")
             }
             ContinueOperation::ExceptionFixup => {
                 panic!("ExceptionFixup not expected in user-mode call_shim path")

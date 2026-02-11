@@ -96,8 +96,8 @@ pub enum ContinueOperation {
     ResumeGuest,
     /// Exit the current thread.
     ExitThread,
-    /// The exception was triggered in kernel mode; resume kernel execution.
-    ResumeKernel,
+    /// The exception was triggered in platform mode; resume platform execution.
+    ResumePlatform,
     /// The exception was not handled. The platform should apply an
     /// exception-table fixup (e.g., advance the instruction pointer) if one exists.
     ExceptionFixup,

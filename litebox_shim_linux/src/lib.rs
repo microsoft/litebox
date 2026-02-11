@@ -103,7 +103,7 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
             }
             .is_ok()
             {
-                return ContinueOperation::ResumeKernel;
+                return ContinueOperation::ResumePlatform;
             } else {
                 return ContinueOperation::ResumeGuest;
             }

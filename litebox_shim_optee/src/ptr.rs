@@ -191,14 +191,16 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             )?
         };
         let mut buffer = core::mem::MaybeUninit::<T>::uninit();
-        unsafe {
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 buffer.as_mut_ptr().cast::<u8>(),
                 guard.ptr.cast::<u8>(),
                 guard.size,
             )
-            .map_err(|_| PhysPointerError::CopyFailed)?;
-        }
+        };
+        debug_assert!(result.is_ok(), "fault reading from mapped physical page");
+        result.map_err(|_| PhysPointerError::CopyFailed)?;
         // Safety: memcpy_fallible fully initialized the buffer on success.
         Ok(alloc::boxed::Box::new(unsafe { buffer.assume_init() }))
     }
@@ -228,14 +230,16 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 PhysPageMapPermissions::READ,
             )?
         };
-        unsafe {
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 values.as_mut_ptr().cast::<u8>(),
                 guard.ptr.cast::<u8>(),
                 guard.size,
             )
-            .map_err(|_| PhysPointerError::CopyFailed)?;
-        }
+        };
+        debug_assert!(result.is_ok(), "fault reading from mapped physical page");
+        result.map_err(|_| PhysPointerError::CopyFailed)?;
         Ok(())
     }
 
@@ -261,14 +265,16 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
             )?
         };
-        unsafe {
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 guard.ptr.cast::<u8>(),
                 core::ptr::from_ref(&value).cast::<u8>(),
                 guard.size,
             )
-            .map_err(|_| PhysPointerError::CopyFailed)?;
-        }
+        };
+        debug_assert!(result.is_ok(), "fault writing to mapped physical page");
+        result.map_err(|_| PhysPointerError::CopyFailed)?;
         Ok(())
     }
 
@@ -297,14 +303,16 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
             )?
         };
-        unsafe {
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
                 guard.ptr.cast::<u8>(),
                 values.as_ptr().cast::<u8>(),
                 guard.size,
             )
-            .map_err(|_| PhysPointerError::CopyFailed)?;
-        }
+        };
+        debug_assert!(result.is_ok(), "fault writing to mapped physical page");
+        result.map_err(|_| PhysPointerError::CopyFailed)?;
         Ok(())
     }
 

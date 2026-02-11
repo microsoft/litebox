@@ -1754,8 +1754,8 @@ impl ThreadContext<'_> {
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
             ContinueOperation::ExitThread => {}
-            ContinueOperation::ResumeKernel => {
-                panic!("ResumeKernel not expected in windows_userland")
+            ContinueOperation::ResumePlatform => {
+                panic!("ResumePlatform not expected in windows_userland")
             }
             ContinueOperation::ExceptionFixup => {
                 panic!("ExceptionFixup not expected in windows_userland")
