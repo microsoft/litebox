@@ -7,6 +7,10 @@ use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 
+use crate::fs::errors::{
+    FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
+    TruncateError, UnlinkError, WriteError,
+};
 use crate::fs::{FileSystem as _, Mode, OFlags};
 use crate::platform::mock::MockPlatform;
 
@@ -396,4 +400,276 @@ fn test_nine_p_host_files_visible() {
         names.contains(&"inner.txt"),
         "host_dir should contain 'inner.txt', got: {names:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Broken-connection transport: wraps TcpTransport and breaks after N writes
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// A transport wrapper that allows a fixed number of write-message calls to
+/// succeed, then fails all subsequent I/O. This simulates a connection that
+/// breaks in the middle of a session.
+///
+/// Reads are only failed once a write has actually been rejected, so the
+/// response to the last successful write is still received.
+struct BrokenTransport {
+    inner: TcpTransport,
+    /// Number of `write` calls remaining before the connection "breaks".
+    remaining_writes: AtomicUsize,
+    /// Set to `true` once a write has been rejected.
+    broken: AtomicBool,
+}
+
+impl BrokenTransport {
+    /// Create a new `BrokenTransport` that allows `allowed_writes` successful
+    /// `write` calls before all I/O starts failing.
+    fn new(inner: TcpTransport, allowed_writes: usize) -> Self {
+        Self {
+            inner,
+            remaining_writes: AtomicUsize::new(allowed_writes),
+            broken: AtomicBool::new(false),
+        }
+    }
+}
+
+impl transport::Read for BrokenTransport {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(transport::ReadError);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl transport::Write for BrokenTransport {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
+        if self.remaining_writes.load(Ordering::SeqCst) == 0 {
+            self.broken.store(true, Ordering::SeqCst);
+            return Err(transport::WriteError);
+        }
+        self.remaining_writes.fetch_sub(1, Ordering::SeqCst);
+        self.inner.write(buf)
+    }
+}
+
+/// Helper: connect to a diod server and build a `FileSystem` backed by
+/// `BrokenTransport` that will break after `allowed_writes` write calls.
+///
+/// The version handshake and attach each consume one write, so
+/// `allowed_writes` must be >= 2 for the filesystem to be constructed
+/// successfully. Any FS operation after construction will consume one
+/// additional write.
+fn connect_9p_broken(
+    litebox: &crate::LiteBox<MockPlatform>,
+    server: &DiodServer,
+    allowed_writes: usize,
+) -> super::FileSystem<MockPlatform, BrokenTransport> {
+    let tcp = TcpTransport::connect(&server.addr());
+    let transport = BrokenTransport::new(tcp, allowed_writes);
+    let aname = server.export_path().to_str().unwrap();
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| std::string::String::from("nobody"));
+    super::FileSystem::new(litebox, transport, 65536, &username, aname)
+        .expect("failed to create 9P filesystem (broken transport)")
+}
+
+// ---------------------------------------------------------------------------
+// Broken-connection failure tests
+// ---------------------------------------------------------------------------
+
+/// Opening a file should fail with an I/O-class error when the connection
+/// breaks after the filesystem has been attached.
+#[test]
+fn test_nine_p_broken_open() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    // 2 writes: version + attach. The next write (open's walk) will fail.
+    let fs = connect_9p_broken(&litebox, &server, 2);
+
+    let result = fs.open("/anything.txt", OFlags::RDONLY, Mode::empty());
+    assert!(matches!(result, Err(OpenError::Io)));
+}
+
+/// Creating a file should fail when the connection is broken.
+#[test]
+fn test_nine_p_broken_create() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    let fs = connect_9p_broken(&litebox, &server, 2);
+
+    let result = fs.open("/new.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU);
+    assert!(matches!(result, Err(OpenError::Io)));
+}
+
+/// Reading from an fd obtained before the break should fail.
+#[test]
+fn test_nine_p_broken_read() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+
+    // Pre-create a file via normal connection
+    {
+        let fs = connect_9p(&litebox, &server);
+        let fd = fs
+            .open("/read_me.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .unwrap();
+        fs.write(&fd, b"data", None).unwrap();
+        fs.close(&fd).unwrap();
+    }
+
+    // 4 writes: version + attach + walk + lopen. Then read will fail.
+    let fs = connect_9p_broken(&litebox, &server, 4);
+    let fd = fs
+        .open("/read_me.txt", OFlags::RDONLY, Mode::empty())
+        .expect("open should succeed before break");
+
+    let mut buf = alloc::vec![0u8; 64];
+    let result = fs.read(&fd, &mut buf, None);
+    assert!(matches!(result, Err(ReadError::Io)));
+}
+
+/// Writing to an fd obtained before the break should fail.
+#[test]
+fn test_nine_p_broken_write() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+
+    // 4 writes: version + attach + walk + lopen. Then write will fail.
+    let fs = connect_9p_broken(&litebox, &server, 4);
+    let fd = fs
+        .open("/write_me.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+        .expect("create should succeed before break");
+
+    let result = fs.write(&fd, b"data", None);
+    assert!(matches!(result, Err(WriteError::Io)));
+}
+
+/// mkdir should fail when the connection is broken.
+#[test]
+fn test_nine_p_broken_mkdir() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    let fs = connect_9p_broken(&litebox, &server, 2);
+
+    let result = fs.mkdir("/broken_dir", Mode::RWXU);
+    assert!(matches!(result, Err(MkdirError::Io)));
+}
+
+/// readdir should fail when the connection breaks during the directory read.
+#[test]
+fn test_nine_p_broken_readdir() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+
+    // 4 writes: version + attach + walk + lopen for the directory.
+    let fs = connect_9p_broken(&litebox, &server, 4);
+    let fd = fs
+        .open("/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .expect("open dir should succeed before break");
+
+    let result = fs.read_dir(&fd);
+    assert!(matches!(result, Err(ReadDirError::Io)));
+}
+
+/// unlink should fail when the connection is broken.
+#[test]
+fn test_nine_p_broken_unlink() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+
+    // Pre-create a file
+    {
+        let fs = connect_9p(&litebox, &server);
+        let fd = fs
+            .open("/to_unlink.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .unwrap();
+        fs.close(&fd).unwrap();
+    }
+
+    let fs = connect_9p_broken(&litebox, &server, 2);
+    let result = fs.unlink("/to_unlink.txt");
+    assert!(matches!(result, Err(UnlinkError::Io)));
+}
+
+/// rmdir should fail when the connection is broken.
+#[test]
+fn test_nine_p_broken_rmdir() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+
+    // Pre-create a directory
+    {
+        let fs = connect_9p(&litebox, &server);
+        fs.mkdir("/to_rmdir", Mode::RWXU).unwrap();
+    }
+
+    let fs = connect_9p_broken(&litebox, &server, 2);
+    let result = fs.rmdir("/to_rmdir");
+    assert!(matches!(result, Err(RmdirError::Io)));
+}
+
+/// file_status should fail when the connection is broken.
+#[test]
+fn test_nine_p_broken_file_status() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    let fs = connect_9p_broken(&litebox, &server, 2);
+
+    let result = fs.file_status("/");
+    assert!(matches!(result, Err(FileStatusError::Io)));
+}
+
+/// truncate should fail when the connection breaks after open.
+#[test]
+fn test_nine_p_broken_truncate() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+
+    // Pre-create a file
+    {
+        let fs = connect_9p(&litebox, &server);
+        let fd = fs
+            .open("/to_trunc.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .unwrap();
+        fs.write(&fd, b"some data", None).unwrap();
+        fs.close(&fd).unwrap();
+    }
+
+    // 4 writes: version + attach + walk + lopen. Then truncate will fail.
+    let fs = connect_9p_broken(&litebox, &server, 4);
+    let fd = fs
+        .open("/to_trunc.txt", OFlags::RDWR, Mode::empty())
+        .expect("open should succeed before break");
+
+    let result = fs.truncate(&fd, 0, true);
+    assert!(matches!(result, Err(TruncateError::Io)));
+}
+
+/// seek (RelativeToEnd, which requires a getattr) should fail when broken.
+#[test]
+fn test_nine_p_broken_seek() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+
+    // Pre-create a file
+    {
+        let fs = connect_9p(&litebox, &server);
+        let fd = fs
+            .open("/to_seek.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .unwrap();
+        fs.write(&fd, b"data", None).unwrap();
+        fs.close(&fd).unwrap();
+    }
+
+    // 4 writes: version + attach + walk + lopen. Then the getattr for seek will fail.
+    let fs = connect_9p_broken(&litebox, &server, 4);
+    let fd = fs
+        .open("/to_seek.txt", OFlags::RDONLY, Mode::empty())
+        .expect("open should succeed before break");
+
+    let result = fs.seek(&fd, -1, crate::fs::SeekWhence::RelativeToEnd);
+    assert!(matches!(result, Err(SeekError::Io)));
 }

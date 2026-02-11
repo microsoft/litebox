@@ -131,6 +131,7 @@ impl From<litebox::fs::errors::OpenError> for Errno {
             litebox::fs::errors::OpenError::PathError(path_error) => path_error.into(),
             litebox::fs::errors::OpenError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::OpenError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::OpenError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
     }
@@ -142,6 +143,7 @@ impl From<litebox::fs::errors::UnlinkError> for Errno {
             litebox::fs::errors::UnlinkError::NoWritePerms => Errno::EACCES,
             litebox::fs::errors::UnlinkError::IsADirectory => Errno::EISDIR,
             litebox::fs::errors::UnlinkError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::UnlinkError::Io => Errno::EIO,
             litebox::fs::errors::UnlinkError::PathError(path_error) => path_error.into(),
             _ => unimplemented!(),
         }
@@ -156,6 +158,7 @@ impl From<litebox::fs::errors::RmdirError> for Errno {
             litebox::fs::errors::RmdirError::NotEmpty => Errno::ENOTEMPTY,
             litebox::fs::errors::RmdirError::NotADirectory => Errno::ENOTDIR,
             litebox::fs::errors::RmdirError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::RmdirError::Io => Errno::EIO,
             litebox::fs::errors::RmdirError::PathError(path_error) => path_error.into(),
             _ => unimplemented!(),
         }
@@ -185,6 +188,7 @@ impl From<litebox::fs::errors::ReadError> for Errno {
         match value {
             litebox::fs::errors::ReadError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::ReadError::NotForReading => Errno::EACCES,
+            litebox::fs::errors::ReadError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
     }
@@ -195,6 +199,7 @@ impl From<litebox::fs::errors::WriteError> for Errno {
         match value {
             litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::WriteError::NotForWriting => Errno::EACCES,
+            litebox::fs::errors::WriteError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
     }
@@ -208,6 +213,7 @@ impl From<litebox::fs::errors::SeekError> for Errno {
             }
             litebox::fs::errors::SeekError::InvalidOffset => Errno::EINVAL,
             litebox::fs::errors::SeekError::NonSeekable => Errno::ESPIPE,
+            litebox::fs::errors::SeekError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
     }
@@ -220,6 +226,7 @@ impl From<litebox::fs::errors::MkdirError> for Errno {
             litebox::fs::errors::MkdirError::AlreadyExists => Errno::EEXIST,
             litebox::fs::errors::MkdirError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::MkdirError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::MkdirError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
     }
