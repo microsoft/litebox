@@ -158,7 +158,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
     /// Send a request and wait for the response
     ///
-    /// TODO: support async operations
+    /// TODO: this is synchronous, will support async operations
     fn fcall<F, R>(&self, fcall: Fcall<'_>, f: F) -> Result<R, Error>
     where
         F: FnOnce(Fcall<'_>) -> Result<R, Error>,
@@ -222,7 +222,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         wnames: &[FcallStr],
     ) -> Result<(Vec<fcall::Qid>, fcall::Fid), Error> {
         if wnames.len() > fcall::MAXWELEM {
-            return Err(Error::NameTooLong);
+            return Err(Error::InvalidPathname);
         }
         let new_fid = self.fids.next();
         let ret = self.fcall(
@@ -274,7 +274,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                     todo!("symlink");
                 }
                 let _ = self.clunk(f);
-                return Err(Error::NotFound);
+                return Err(Error::Remote(super::ENOENT));
             }
         }
         Ok((wqids, f))
@@ -426,8 +426,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             |response| match response {
                 Fcall::Rreaddir(fcall::Rreaddir { data }) => Ok(data
                     .data
-                    .iter()
-                    .map(super::fcall::DirEntry::clone_static)
+                    .into_iter()
+                    .map(fcall::DirEntry::into_owned)
                     .collect()),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),

@@ -41,6 +41,20 @@ mod tests;
 
 const DEVICE_ID: usize = u32::from_le_bytes(*b"NINE") as usize;
 
+// Common POSIX error codes used when converting remote errors to specific FS error types.
+const EPERM: u32 = 1;
+const ENOENT: u32 = 2;
+const EACCES: u32 = 13;
+const EEXIST: u32 = 17;
+const ENOTDIR: u32 = 20;
+const EISDIR: u32 = 21;
+const EINVAL: u32 = 22;
+const ESPIPE: u32 = 29;
+const ENAMETOOLONG: u32 = 36;
+const ENOSYS: u32 = 38;
+const ENOTEMPTY: u32 = 39;
+const EOPNOTSUPP: u32 = 95;
+
 /// Error type for 9P operations
 #[derive(Debug, Error)]
 pub enum Error {
@@ -53,45 +67,24 @@ pub enum Error {
     #[error("Invalid pathname")]
     InvalidPathname,
 
-    #[error("Path not found")]
-    NotFound,
-
-    #[error("File already exists")]
-    AlreadyExists,
-
-    #[error("Permission denied")]
-    PermissionDenied,
-
-    #[error("Not a directory")]
-    NotADirectory,
-
-    #[error("Is a directory")]
-    IsADirectory,
-
-    #[error("Directory not empty")]
-    NotEmpty,
-
-    #[error("Name too long")]
-    NameTooLong,
-
-    #[error("Operation not supported")]
-    NotSupported,
-
-    /// Unrecognized remote error code not mapped to a specific variant
+    /// Error reported by the 9P server, carrying the raw errno
     #[error("Remote error (errno={0})")]
-    RemoteError(u32),
+    Remote(u32),
 }
 
 impl From<Error> for OpenError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound => OpenError::PathError(PathError::NoSuchFileOrDirectory),
-            Error::AlreadyExists => OpenError::AlreadyExists,
-            Error::PermissionDenied => OpenError::AccessNotAllowed,
-            Error::NotADirectory => OpenError::PathError(PathError::ComponentNotADirectory),
             Error::InvalidPathname => OpenError::PathError(PathError::InvalidPathname),
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => OpenError::Io,
-            _ => unimplemented!("convert {e:?} to OpenError"),
+            Error::Remote(errno) => match errno {
+                ENOENT => OpenError::PathError(PathError::NoSuchFileOrDirectory),
+                EEXIST => OpenError::AlreadyExists,
+                EPERM | EACCES => OpenError::AccessNotAllowed,
+                ENOTDIR => OpenError::PathError(PathError::ComponentNotADirectory),
+                ENAMETOOLONG => OpenError::PathError(PathError::InvalidPathname),
+                _ => OpenError::Io,
+            },
+            Error::Io | Error::InvalidResponse => OpenError::Io,
         }
     }
 }
@@ -99,10 +92,12 @@ impl From<Error> for OpenError {
 impl From<Error> for ReadError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound | Error::IsADirectory => ReadError::NotAFile,
-            Error::PermissionDenied => ReadError::NotForReading,
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => ReadError::Io,
-            _ => unimplemented!("convert {e:?} to ReadError"),
+            Error::Remote(errno) => match errno {
+                ENOENT | EISDIR => ReadError::NotAFile,
+                EPERM | EACCES => ReadError::NotForReading,
+                _ => ReadError::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname => ReadError::Io,
         }
     }
 }
@@ -110,10 +105,12 @@ impl From<Error> for ReadError {
 impl From<Error> for WriteError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound | Error::IsADirectory => WriteError::NotAFile,
-            Error::PermissionDenied => WriteError::NotForWriting,
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => WriteError::Io,
-            _ => unimplemented!("convert {e:?} to WriteError"),
+            Error::Remote(errno) => match errno {
+                ENOENT | EISDIR => WriteError::NotAFile,
+                EPERM | EACCES => WriteError::NotForWriting,
+                _ => WriteError::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname => WriteError::Io,
         }
     }
 }
@@ -121,13 +118,16 @@ impl From<Error> for WriteError {
 impl From<Error> for MkdirError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound => MkdirError::PathError(PathError::NoSuchFileOrDirectory),
-            Error::AlreadyExists => MkdirError::AlreadyExists,
-            Error::PermissionDenied => MkdirError::NoWritePerms,
-            Error::NotADirectory => MkdirError::PathError(PathError::ComponentNotADirectory),
             Error::InvalidPathname => MkdirError::PathError(PathError::InvalidPathname),
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => MkdirError::Io,
-            _ => unimplemented!("convert {e:?} to MkdirError"),
+            Error::Remote(errno) => match errno {
+                ENOENT => MkdirError::PathError(PathError::NoSuchFileOrDirectory),
+                EEXIST => MkdirError::AlreadyExists,
+                EPERM | EACCES => MkdirError::NoWritePerms,
+                ENOTDIR => MkdirError::PathError(PathError::ComponentNotADirectory),
+                ENAMETOOLONG => MkdirError::PathError(PathError::InvalidPathname),
+                _ => MkdirError::Io,
+            },
+            Error::Io | Error::InvalidResponse => MkdirError::Io,
         }
     }
 }
@@ -135,9 +135,11 @@ impl From<Error> for MkdirError {
 impl From<Error> for ReadDirError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound | Error::NotADirectory => ReadDirError::NotADirectory,
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => ReadDirError::Io,
-            _ => unimplemented!("convert {e:?} to ReadDirError"),
+            Error::Remote(errno) => match errno {
+                ENOENT | ENOTDIR => ReadDirError::NotADirectory,
+                _ => ReadDirError::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname => ReadDirError::Io,
         }
     }
 }
@@ -145,13 +147,16 @@ impl From<Error> for ReadDirError {
 impl From<Error> for UnlinkError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound => UnlinkError::PathError(PathError::NoSuchFileOrDirectory),
-            Error::IsADirectory => UnlinkError::IsADirectory,
-            Error::PermissionDenied => UnlinkError::NoWritePerms,
-            Error::NotADirectory => UnlinkError::PathError(PathError::ComponentNotADirectory),
             Error::InvalidPathname => UnlinkError::PathError(PathError::InvalidPathname),
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => UnlinkError::Io,
-            _ => unimplemented!("convert {e:?} to UnlinkError"),
+            Error::Remote(errno) => match errno {
+                ENOENT => UnlinkError::PathError(PathError::NoSuchFileOrDirectory),
+                EISDIR => UnlinkError::IsADirectory,
+                EPERM | EACCES => UnlinkError::NoWritePerms,
+                ENOTDIR => UnlinkError::PathError(PathError::ComponentNotADirectory),
+                ENAMETOOLONG => UnlinkError::PathError(PathError::InvalidPathname),
+                _ => UnlinkError::Io,
+            },
+            Error::Io | Error::InvalidResponse => UnlinkError::Io,
         }
     }
 }
@@ -159,13 +164,16 @@ impl From<Error> for UnlinkError {
 impl From<Error> for RmdirError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound => RmdirError::PathError(PathError::NoSuchFileOrDirectory),
-            Error::NotADirectory => RmdirError::NotADirectory,
-            Error::PermissionDenied => RmdirError::NoWritePerms,
             Error::InvalidPathname => RmdirError::PathError(PathError::InvalidPathname),
-            Error::NotEmpty => RmdirError::NotEmpty,
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => RmdirError::Io,
-            _ => unimplemented!("convert {e:?} to RmdirError"),
+            Error::Remote(errno) => match errno {
+                ENOENT => RmdirError::PathError(PathError::NoSuchFileOrDirectory),
+                ENOTDIR => RmdirError::NotADirectory,
+                EPERM | EACCES => RmdirError::NoWritePerms,
+                ENAMETOOLONG => RmdirError::PathError(PathError::InvalidPathname),
+                ENOTEMPTY => RmdirError::NotEmpty,
+                _ => RmdirError::Io,
+            },
+            Error::Io | Error::InvalidResponse => RmdirError::Io,
         }
     }
 }
@@ -173,11 +181,20 @@ impl From<Error> for RmdirError {
 impl From<Error> for FileStatusError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound => FileStatusError::PathError(PathError::NoSuchFileOrDirectory),
             Error::InvalidPathname => FileStatusError::PathError(PathError::InvalidPathname),
-            Error::NotADirectory => FileStatusError::PathError(PathError::ComponentNotADirectory),
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => FileStatusError::Io,
-            _ => unimplemented!("convert {e:?} to FileStatusError"),
+            Error::Remote(errno) => match errno {
+                ENOENT => FileStatusError::PathError(PathError::NoSuchFileOrDirectory),
+                ENAMETOOLONG => FileStatusError::PathError(PathError::InvalidPathname),
+                ENOTDIR => FileStatusError::PathError(PathError::ComponentNotADirectory),
+                EPERM | EACCES => FileStatusError::PathError(PathError::NoSearchPerms {
+                    #[cfg(debug_assertions)]
+                    dir: String::new(),
+                    #[cfg(debug_assertions)]
+                    perms: super::Mode::empty(),
+                }),
+                _ => FileStatusError::Io,
+            },
+            Error::Io | Error::InvalidResponse => FileStatusError::Io,
         }
     }
 }
@@ -185,9 +202,13 @@ impl From<Error> for FileStatusError {
 impl From<Error> for SeekError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound => SeekError::ClosedFd,
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => SeekError::Io,
-            _ => unimplemented!("convert {e:?} to SeekError"),
+            Error::Remote(e) => match e {
+                ENOENT => SeekError::ClosedFd,
+                EINVAL => SeekError::InvalidOffset,
+                ESPIPE => SeekError::NonSeekable,
+                _ => SeekError::Io,
+            },
+            _ => SeekError::Io,
         }
     }
 }
@@ -195,11 +216,13 @@ impl From<Error> for SeekError {
 impl From<Error> for TruncateError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound => TruncateError::ClosedFd,
-            Error::IsADirectory => TruncateError::IsDirectory,
-            Error::PermissionDenied => TruncateError::NotForWriting,
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => TruncateError::Io,
-            _ => unimplemented!("convert {e:?} to TruncateError"),
+            Error::Remote(errno) => match errno {
+                ENOENT => TruncateError::ClosedFd,
+                EISDIR => TruncateError::IsDirectory,
+                EPERM | EACCES => TruncateError::NotForWriting,
+                _ => TruncateError::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname => TruncateError::Io,
         }
     }
 }
@@ -207,12 +230,14 @@ impl From<Error> for TruncateError {
 impl From<Error> for ChmodError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound => ChmodError::PathError(PathError::NoSuchFileOrDirectory),
             Error::InvalidPathname => ChmodError::PathError(PathError::InvalidPathname),
-            Error::NotADirectory => ChmodError::PathError(PathError::ComponentNotADirectory),
-            Error::PermissionDenied => ChmodError::NotTheOwner,
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => ChmodError::Io,
-            _ => unimplemented!("convert {e:?} to ChmodError"),
+            Error::Remote(errno) => match errno {
+                ENOENT => ChmodError::PathError(PathError::NoSuchFileOrDirectory),
+                ENOTDIR => ChmodError::PathError(PathError::ComponentNotADirectory),
+                EPERM | EACCES => ChmodError::NotTheOwner,
+                _ => ChmodError::Io,
+            },
+            Error::Io | Error::InvalidResponse => ChmodError::Io,
         }
     }
 }
@@ -220,44 +245,21 @@ impl From<Error> for ChmodError {
 impl From<Error> for ChownError {
     fn from(e: Error) -> Self {
         match e {
-            Error::NotFound => ChownError::PathError(PathError::NoSuchFileOrDirectory),
             Error::InvalidPathname => ChownError::PathError(PathError::InvalidPathname),
-            Error::NotADirectory => ChownError::PathError(PathError::ComponentNotADirectory),
-            Error::PermissionDenied => ChownError::NotTheOwner,
-            Error::Io | Error::InvalidResponse | Error::RemoteError(_) => ChownError::Io,
-            _ => unimplemented!("convert {e:?} to ChownError"),
+            Error::Remote(errno) => match errno {
+                ENOENT => ChownError::PathError(PathError::NoSuchFileOrDirectory),
+                ENOTDIR => ChownError::PathError(PathError::ComponentNotADirectory),
+                EPERM | EACCES => ChownError::NotTheOwner,
+                _ => ChownError::Io,
+            },
+            Error::Io | Error::InvalidResponse => ChownError::Io,
         }
     }
 }
 
-/// Convert remote error code to our Error type
 impl From<Rlerror> for Error {
     fn from(err: Rlerror) -> Self {
-        // Common POSIX error codes
-        const EPERM: u32 = 1;
-        const ENOENT: u32 = 2;
-        const EIO: u32 = 5;
-        const EACCES: u32 = 13;
-        const EEXIST: u32 = 17;
-        const ENOTDIR: u32 = 20;
-        const EISDIR: u32 = 21;
-        const ENAMETOOLONG: u32 = 36;
-        const ENOSYS: u32 = 38;
-        const ENOTEMPTY: u32 = 39;
-        const EOPNOTSUPP: u32 = 95;
-
-        match err.ecode {
-            EPERM | EACCES => Error::PermissionDenied,
-            ENOENT => Error::NotFound,
-            EIO => Error::Io,
-            EEXIST => Error::AlreadyExists,
-            ENOTDIR => Error::NotADirectory,
-            EISDIR => Error::IsADirectory,
-            ENAMETOOLONG => Error::NameTooLong,
-            ENOSYS | EOPNOTSUPP => Error::NotSupported,
-            ENOTEMPTY => Error::NotEmpty,
-            _ => Error::RemoteError(err.ecode),
-        }
+        Error::Remote(err.ecode)
     }
 }
 
@@ -518,9 +520,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 self.client
                     .unlinkat(parent_fid, name, if is_file { 0 } else { AT_REMOVEDIR });
             let _ = self.client.clunk(parent_fid);
-            if let Err(Error::NotSupported) = &result {
+            if let Err(Error::Remote(ENOSYS | EOPNOTSUPP)) = &result {
                 self.unlinkat_supported.store(false, Ordering::SeqCst);
-                // fall back to to `remove`
+                // fall back to `remove`
             } else {
                 return result;
             }
@@ -530,6 +532,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let result = self.client.remove(fid);
         self.client.free_fid(fid);
         result
+    }
+}
+
+impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write> Drop
+    for FileSystem<Platform, T>
+{
+    fn drop(&mut self) {
+        let _ = self.client.clunk(self.root.1);
     }
 }
 

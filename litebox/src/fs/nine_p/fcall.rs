@@ -202,137 +202,115 @@ impl<'a> DirEntryData<'a> {
     }
 }
 
-/// 9P message types
-#[derive(Copy, Clone, Debug)]
-enum FcallType {
-    // 9P2000.L
-    Rlerror = 7,
-    Tstatfs = 8,
-    Rstatfs = 9,
-    Tlopen = 12,
-    Rlopen = 13,
-    Tlcreate = 14,
-    Rlcreate = 15,
-    Tsymlink = 16,
-    Rsymlink = 17,
-    Tmknod = 18,
-    Rmknod = 19,
-    Trename = 20,
-    Rrename = 21,
-    Treadlink = 22,
-    Rreadlink = 23,
-    Tgetattr = 24,
-    Rgetattr = 25,
-    Tsetattr = 26,
-    Rsetattr = 27,
-    Txattrwalk = 30,
-    Rxattrwalk = 31,
-    Txattrcreate = 32,
-    Rxattrcreate = 33,
-    Treaddir = 40,
-    Rreaddir = 41,
-    Tfsync = 50,
-    Rfsync = 51,
-    Tlock = 52,
-    Rlock = 53,
-    Tgetlock = 54,
-    Rgetlock = 55,
-    Tlink = 70,
-    Rlink = 71,
-    Tmkdir = 72,
-    Rmkdir = 73,
-    Trenameat = 74,
-    Rrenameat = 75,
-    Tunlinkat = 76,
-    Runlinkat = 77,
+/// Define a `#[repr($int_ty)]` enum and auto-generate a typed conversion method.
+///
+/// # Example
+/// ```ignore
+/// repr_enum! {
+///     #[derive(Copy, Clone, Debug)]
+///     enum Color: u8, from_u8 {
+///         Red   = 1,
+///         Green = 2,
+///         Blue  = 3,
+///     }
+/// }
+/// assert_eq!(Color::from_u8(2), Some(Color::Green));
+/// ```
+macro_rules! repr_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident : $int_ty:ty, $from_fn:ident {
+            $(
+                $(#[$vmeta:meta])*
+                $variant:ident = $value:expr
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[repr($int_ty)]
+        $vis enum $name {
+            $(
+                $(#[$vmeta])*
+                $variant = $value,
+            )*
+        }
 
-    // 9P2000
-    Tversion = 100,
-    Rversion = 101,
-    Tauth = 102,
-    Rauth = 103,
-    Tattach = 104,
-    Rattach = 105,
-    Tflush = 108,
-    Rflush = 109,
-    Twalk = 110,
-    Rwalk = 111,
-    Tread = 116,
-    Rread = 117,
-    Twrite = 118,
-    Rwrite = 119,
-    Tclunk = 120,
-    Rclunk = 121,
-    Tremove = 122,
-    Rremove = 123,
+        impl $name {
+            /// Convert a raw integer to the enum, returning `None` for unknown values.
+            fn $from_fn(v: $int_ty) -> Option<Self> {
+                match v {
+                    $( $value => Some(Self::$variant), )*
+                    _ => None,
+                }
+            }
+        }
+    };
 }
 
-impl FcallType {
-    /// Convert a u8 to FcallType
-    fn from_u8(v: u8) -> Option<FcallType> {
-        match v {
-            // 9P2000.L
-            7 => Some(FcallType::Rlerror),
-            8 => Some(FcallType::Tstatfs),
-            9 => Some(FcallType::Rstatfs),
-            12 => Some(FcallType::Tlopen),
-            13 => Some(FcallType::Rlopen),
-            14 => Some(FcallType::Tlcreate),
-            15 => Some(FcallType::Rlcreate),
-            16 => Some(FcallType::Tsymlink),
-            17 => Some(FcallType::Rsymlink),
-            18 => Some(FcallType::Tmknod),
-            19 => Some(FcallType::Rmknod),
-            20 => Some(FcallType::Trename),
-            21 => Some(FcallType::Rrename),
-            22 => Some(FcallType::Treadlink),
-            23 => Some(FcallType::Rreadlink),
-            24 => Some(FcallType::Tgetattr),
-            25 => Some(FcallType::Rgetattr),
-            26 => Some(FcallType::Tsetattr),
-            27 => Some(FcallType::Rsetattr),
-            30 => Some(FcallType::Txattrwalk),
-            31 => Some(FcallType::Rxattrwalk),
-            32 => Some(FcallType::Txattrcreate),
-            33 => Some(FcallType::Rxattrcreate),
-            40 => Some(FcallType::Treaddir),
-            41 => Some(FcallType::Rreaddir),
-            50 => Some(FcallType::Tfsync),
-            51 => Some(FcallType::Rfsync),
-            52 => Some(FcallType::Tlock),
-            53 => Some(FcallType::Rlock),
-            54 => Some(FcallType::Tgetlock),
-            55 => Some(FcallType::Rgetlock),
-            70 => Some(FcallType::Tlink),
-            71 => Some(FcallType::Rlink),
-            72 => Some(FcallType::Tmkdir),
-            73 => Some(FcallType::Rmkdir),
-            74 => Some(FcallType::Trenameat),
-            75 => Some(FcallType::Rrenameat),
-            76 => Some(FcallType::Tunlinkat),
-            77 => Some(FcallType::Runlinkat),
+repr_enum! {
+    /// 9P message types
+    #[derive(Copy, Clone, Debug)]
+    enum FcallType: u8, from_u8 {
+        // 9P2000.L
+        Rlerror = 7,
+        Tstatfs = 8,
+        Rstatfs = 9,
+        Tlopen = 12,
+        Rlopen = 13,
+        Tlcreate = 14,
+        Rlcreate = 15,
+        Tsymlink = 16,
+        Rsymlink = 17,
+        Tmknod = 18,
+        Rmknod = 19,
+        Trename = 20,
+        Rrename = 21,
+        Treadlink = 22,
+        Rreadlink = 23,
+        Tgetattr = 24,
+        Rgetattr = 25,
+        Tsetattr = 26,
+        Rsetattr = 27,
+        Txattrwalk = 30,
+        Rxattrwalk = 31,
+        Txattrcreate = 32,
+        Rxattrcreate = 33,
+        Treaddir = 40,
+        Rreaddir = 41,
+        Tfsync = 50,
+        Rfsync = 51,
+        Tlock = 52,
+        Rlock = 53,
+        Tgetlock = 54,
+        Rgetlock = 55,
+        Tlink = 70,
+        Rlink = 71,
+        Tmkdir = 72,
+        Rmkdir = 73,
+        Trenameat = 74,
+        Rrenameat = 75,
+        Tunlinkat = 76,
+        Runlinkat = 77,
 
-            // 9P2000
-            100 => Some(FcallType::Tversion),
-            101 => Some(FcallType::Rversion),
-            102 => Some(FcallType::Tauth),
-            103 => Some(FcallType::Rauth),
-            104 => Some(FcallType::Tattach),
-            105 => Some(FcallType::Rattach),
-            108 => Some(FcallType::Tflush),
-            109 => Some(FcallType::Rflush),
-            110 => Some(FcallType::Twalk),
-            111 => Some(FcallType::Rwalk),
-            116 => Some(FcallType::Tread),
-            117 => Some(FcallType::Rread),
-            118 => Some(FcallType::Twrite),
-            119 => Some(FcallType::Rwrite),
-            120 => Some(FcallType::Tclunk),
-            121 => Some(FcallType::Rclunk),
-            122 => Some(FcallType::Tremove),
-            123 => Some(FcallType::Rremove),
-            _ => None,
-        }
+        // 9P2000
+        Tversion = 100,
+        Rversion = 101,
+        Tauth = 102,
+        Rauth = 103,
+        Tattach = 104,
+        Rattach = 105,
+        Tflush = 108,
+        Rflush = 109,
+        Twalk = 110,
+        Rwalk = 111,
+        Tread = 116,
+        Rread = 117,
+        Twrite = 118,
+        Rwrite = 119,
+        Tclunk = 120,
+        Rclunk = 121,
+        Tremove = 122,
+        Rremove = 123,
     }
 }
 
@@ -405,8 +383,8 @@ pub(super) struct DirEntry<'a> {
 }
 
 impl DirEntry<'_> {
-    /// Create a static (owned) copy of this directory entry
-    pub(super) fn clone_static(&self) -> DirEntry<'static> {
+    /// Create an owned copy of this directory entry.
+    pub(super) fn into_owned(self) -> DirEntry<'static> {
         DirEntry {
             qid: self.qid,
             offset: self.offset,
@@ -946,138 +924,28 @@ impl_from_for_fcall! {
     Rclunk(Rclunk),
     Tremove(Tremove),
     Rremove(Rremove),
-}
-
-impl<'a> From<Tattach<'a>> for Fcall<'a> {
-    fn from(v: Tattach<'a>) -> Fcall<'a> {
-        Fcall::Tattach(v)
-    }
-}
-
-impl<'a> From<Tlcreate<'a>> for Fcall<'a> {
-    fn from(v: Tlcreate<'a>) -> Fcall<'a> {
-        Fcall::Tlcreate(v)
-    }
-}
-
-impl<'a> From<Tsymlink<'a>> for Fcall<'a> {
-    fn from(v: Tsymlink<'a>) -> Fcall<'a> {
-        Fcall::Tsymlink(v)
-    }
-}
-
-impl<'a> From<Tmknod<'a>> for Fcall<'a> {
-    fn from(v: Tmknod<'a>) -> Fcall<'a> {
-        Fcall::Tmknod(v)
-    }
-}
-
-impl<'a> From<Trename<'a>> for Fcall<'a> {
-    fn from(v: Trename<'a>) -> Fcall<'a> {
-        Fcall::Trename(v)
-    }
-}
-
-impl<'a> From<Rreadlink<'a>> for Fcall<'a> {
-    fn from(v: Rreadlink<'a>) -> Fcall<'a> {
-        Fcall::Rreadlink(v)
-    }
-}
-
-impl<'a> From<Txattrwalk<'a>> for Fcall<'a> {
-    fn from(v: Txattrwalk<'a>) -> Fcall<'a> {
-        Fcall::Txattrwalk(v)
-    }
-}
-
-impl<'a> From<Txattrcreate<'a>> for Fcall<'a> {
-    fn from(v: Txattrcreate<'a>) -> Fcall<'a> {
-        Fcall::Txattrcreate(v)
-    }
-}
-
-impl<'a> From<Rreaddir<'a>> for Fcall<'a> {
-    fn from(v: Rreaddir<'a>) -> Fcall<'a> {
-        Fcall::Rreaddir(v)
-    }
-}
-
-impl<'a> From<Tlock<'a>> for Fcall<'a> {
-    fn from(v: Tlock<'a>) -> Fcall<'a> {
-        Fcall::Tlock(v)
-    }
-}
-
-impl<'a> From<Tgetlock<'a>> for Fcall<'a> {
-    fn from(v: Tgetlock<'a>) -> Fcall<'a> {
-        Fcall::Tgetlock(v)
-    }
-}
-
-impl<'a> From<Rgetlock<'a>> for Fcall<'a> {
-    fn from(v: Rgetlock<'a>) -> Fcall<'a> {
-        Fcall::Rgetlock(v)
-    }
-}
-
-impl<'a> From<Tlink<'a>> for Fcall<'a> {
-    fn from(v: Tlink<'a>) -> Fcall<'a> {
-        Fcall::Tlink(v)
-    }
-}
-
-impl<'a> From<Tmkdir<'a>> for Fcall<'a> {
-    fn from(v: Tmkdir<'a>) -> Fcall<'a> {
-        Fcall::Tmkdir(v)
-    }
-}
-
-impl<'a> From<Trenameat<'a>> for Fcall<'a> {
-    fn from(v: Trenameat<'a>) -> Fcall<'a> {
-        Fcall::Trenameat(v)
-    }
-}
-
-impl<'a> From<Tunlinkat<'a>> for Fcall<'a> {
-    fn from(v: Tunlinkat<'a>) -> Fcall<'a> {
-        Fcall::Tunlinkat(v)
-    }
-}
-
-impl<'a> From<Tauth<'a>> for Fcall<'a> {
-    fn from(v: Tauth<'a>) -> Fcall<'a> {
-        Fcall::Tauth(v)
-    }
-}
-
-impl<'a> From<Tversion<'a>> for Fcall<'a> {
-    fn from(v: Tversion<'a>) -> Fcall<'a> {
-        Fcall::Tversion(v)
-    }
-}
-
-impl<'a> From<Rversion<'a>> for Fcall<'a> {
-    fn from(v: Rversion<'a>) -> Fcall<'a> {
-        Fcall::Rversion(v)
-    }
-}
-
-impl<'a> From<Twalk<'a>> for Fcall<'a> {
-    fn from(v: Twalk<'a>) -> Fcall<'a> {
-        Fcall::Twalk(v)
-    }
-}
-
-impl<'a> From<Rread<'a>> for Fcall<'a> {
-    fn from(v: Rread<'a>) -> Fcall<'a> {
-        Fcall::Rread(v)
-    }
-}
-
-impl<'a> From<Twrite<'a>> for Fcall<'a> {
-    fn from(v: Twrite<'a>) -> Fcall<'a> {
-        Fcall::Twrite(v)
-    }
+    Tattach(Tattach<'a>),
+    Tlcreate(Tlcreate<'a>),
+    Tsymlink(Tsymlink<'a>),
+    Tmknod(Tmknod<'a>),
+    Trename(Trename<'a>),
+    Rreadlink(Rreadlink<'a>),
+    Txattrwalk(Txattrwalk<'a>),
+    Txattrcreate(Txattrcreate<'a>),
+    Rreaddir(Rreaddir<'a>),
+    Tlock(Tlock<'a>),
+    Tgetlock(Tgetlock<'a>),
+    Rgetlock(Rgetlock<'a>),
+    Tlink(Tlink<'a>),
+    Tmkdir(Tmkdir<'a>),
+    Trenameat(Trenameat<'a>),
+    Tunlinkat(Tunlinkat<'a>),
+    Tauth(Tauth<'a>),
+    Tversion(Tversion<'a>),
+    Rversion(Rversion<'a>),
+    Twalk(Twalk<'a>),
+    Rread(Rread<'a>),
+    Twrite(Twrite<'a>),
 }
 
 /// Tagged 9P message
