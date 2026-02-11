@@ -176,8 +176,9 @@ extern "C" fn general_protection_fault_handler_impl(regs: &PtRegs) {
 enum PageFaultResult {
     /// Fault was handled via exception table fixup.
     Handled = 0,
-    /// Demand paging is needed for a user-space address.
-    DemandPage = 1,
+    /// Fault at a user-space address; route to the shim's exception handler
+    /// for demand paging or exception-table fixup on invalid access.
+    RouteToShim = 1,
 }
 
 /// Kernel-mode page fault handler (vector 14).
@@ -195,8 +196,9 @@ extern "C" fn page_fault_handler_impl(regs: &mut PtRegs) -> PageFaultResult {
     let fault_addr: usize = Cr2::read_raw().truncate();
     let error_code = regs.orig_rax;
 
-    // Kernel-mode page fault at a user-space address: route to the shim's
-    // exception handler for demand paging (and exception table fixup on failure).
+    // Kernel-mode page fault at a user-space address (e.g., a syscall handler has accessed
+    // not-yet mapped or invalid user memory): route to the shim's exception handler for
+    // demand paging or exception table fixup.
     if (USER_ADDR_MIN..USER_ADDR_MAX).contains(&fault_addr) {
         with_per_cpu_variables_asm(|pcv| {
             pcv.set_exception_info(
@@ -206,7 +208,7 @@ extern "C" fn page_fault_handler_impl(regs: &mut PtRegs) -> PageFaultResult {
                 regs.rip,
             );
         });
-        return PageFaultResult::DemandPage;
+        return PageFaultResult::RouteToShim;
     }
 
     // Safety net for fallible kernel memory operations (e.g., copying to/from

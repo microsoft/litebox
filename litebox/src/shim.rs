@@ -90,16 +90,26 @@ pub trait EnterShim {
 }
 
 /// The operation to perform after returning from a shim handler
+///
+/// - `ResumeGuest` and `ExitThread` cover the cases where the platform enters the shim
+///   in response to events that occur during guest execution (e.g., a syscall).
+/// - `ResumeKernelPlatform` and `ExceptionFixup` cover the cases where the **kernel platform**
+///   enters the shim in response to events that occur during platform execution
+///   (e.g., a user-space page fault triggered by a syscall handler).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ContinueOperation {
     /// Resume execution of the guest.
     ResumeGuest,
     /// Exit the current thread.
     ExitThread,
-    /// The exception was triggered in platform mode; resume platform execution.
-    ResumePlatform,
-    /// The exception was not handled. The platform should apply an
-    /// exception-table fixup (e.g., advance the instruction pointer) if one exists.
+    /// The shim successfully handled an exception which was triggered by
+    /// the kernel platform (e.g., a syscall handler's copy_from_user against
+    /// demand-pageable user memory); Resume the kernel platform's execution.
+    ResumeKernelPlatform,
+    /// The shim failed to handle the exception (e.g., invalid memory access).
+    /// The kernel platform will apply a fixup via
+    /// [`search_exception_tables`](crate::mm::exception_table::search_exception_tables)
+    /// if one exists.
     ExceptionFixup,
 }
 

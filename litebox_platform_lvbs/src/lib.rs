@@ -1772,45 +1772,27 @@ unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
 }
 
 /// Handles exceptions by reading exception info from per-CPU variables
-/// and routing to the shim's exception handler.
+/// and routing to the shim's exception handler via `call_shim`.
 ///
 /// Returns 0 for normal flow (user-mode or successful demand paging), or
 /// a fixup address when kernel-mode demand paging fails and an exception
 /// table entry exists.
 unsafe extern "C" fn exception_handler(thread_ctx: &mut ThreadContext, kernel_mode: bool) -> usize {
-    use crate::host::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables_asm};
+    use crate::host::per_cpu_variables::with_per_cpu_variables_asm;
     let info = with_per_cpu_variables_asm(|pcv| litebox::shim::ExceptionInfo {
         exception: pcv.get_exception(),
         error_code: pcv.get_exception_error_code(),
         cr2: pcv.get_exception_cr2(),
         kernel_mode,
     });
-
-    if kernel_mode {
-        // We don't use `thread_ctx.call_shim()` here because:
-        // - `call_shim()` switches back to user mode after the call
-        // - `ExceptionFixup` requires post-processing (exception table lookup)
-        // - Must return a fixup address to the asm caller (not resume user mode)
-        let op = thread_ctx.shim.exception(thread_ctx.ctx, &info);
-        match op {
-            ContinueOperation::ResumePlatform => 0,
-            ContinueOperation::ExceptionFixup => {
-                let faulting_rip =
-                    with_per_cpu_variables_asm(PerCpuVariablesAsm::get_exception_rip);
-                litebox::mm::exception_table::search_exception_tables(faulting_rip)
-                    .expect("kernel-mode page fault with no exception table fixup")
-            }
-            ContinueOperation::ExitThread | ContinueOperation::ResumeGuest => {
-                panic!("unexpected {op:?} for kernel-mode exception")
-            }
-        }
-    } else {
-        thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
-        0
-    }
+    thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info))
 }
 
 /// Calls `f` in order to call into a shim entrypoint.
+///
+/// Returns 0 for most operations. For `ExceptionFixup`, returns the fixup
+/// address from the exception table. For `ResumeGuest`, does not return
+/// (switches directly to user mode).
 impl ThreadContext<'_> {
     fn call_shim(
         &mut self,
@@ -1818,16 +1800,19 @@ impl ThreadContext<'_> {
             &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
             &mut litebox_common_linux::PtRegs,
         ) -> ContinueOperation,
-    ) {
+    ) -> usize {
         let op = f(self.shim, self.ctx);
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_user(self.ctx) },
-            ContinueOperation::ExitThread => {}
-            ContinueOperation::ResumePlatform => {
-                panic!("ResumePlatform not expected in user-mode call_shim path")
-            }
+            ContinueOperation::ExitThread | ContinueOperation::ResumeKernelPlatform => 0,
             ContinueOperation::ExceptionFixup => {
-                panic!("ExceptionFixup not expected in user-mode call_shim path")
+                use crate::host::per_cpu_variables::{
+                    PerCpuVariablesAsm, with_per_cpu_variables_asm,
+                };
+                let faulting_rip =
+                    with_per_cpu_variables_asm(PerCpuVariablesAsm::get_exception_rip);
+                litebox::mm::exception_table::search_exception_tables(faulting_rip)
+                    .expect("kernel-mode page fault with no exception table fixup")
             }
         }
     }

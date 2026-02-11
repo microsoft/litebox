@@ -216,8 +216,8 @@ pub fn init_thread(
     match tls.shim.get().unwrap().init(pt_regs) {
         litebox::shim::ContinueOperation::ResumeGuest => {}
         litebox::shim::ContinueOperation::ExitThread => exit_thread(),
-        litebox::shim::ContinueOperation::ResumePlatform => {
-            panic!("ResumePlatform not expected in SNP init")
+        litebox::shim::ContinueOperation::ResumeKernelPlatform => {
+            panic!("ResumeKernelPlatform not expected in SNP init")
         }
         litebox::shim::ContinueOperation::ExceptionFixup => {
             panic!("ExceptionFixup not expected in SNP init")
@@ -244,8 +244,8 @@ pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) {
     match tls.shim.get().unwrap().syscall(pt_regs) {
         litebox::shim::ContinueOperation::ResumeGuest => {}
         litebox::shim::ContinueOperation::ExitThread => exit_thread(),
-        litebox::shim::ContinueOperation::ResumePlatform => {
-            panic!("ResumePlatform not expected in SNP syscall")
+        litebox::shim::ContinueOperation::ResumeKernelPlatform => {
+            panic!("ResumeKernelPlatform not expected in SNP syscall")
         }
         litebox::shim::ContinueOperation::ExceptionFixup => {
             panic!("ExceptionFixup not expected in SNP syscall")

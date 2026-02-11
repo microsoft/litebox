@@ -168,14 +168,14 @@ isr_with_err_code isr_general_protection_fault general_protection_fault_handler_
 
 /* Vector 14: Page Fault (#PF) - Error code
  *
- * Custom ISR stub to support kernel-mode demand paging for user-space addresses.
+ * Custom ISR stub to support kernel-mode page faults at user-space addresses.
  *
  * For kernel-mode page faults, page_fault_handler_impl returns:
  *   0 = handled (exception table fixup applied)
- *   1 = demand paging needed for a user-space address
+ *   1 = user-space address fault; route to shim for demand paging or fixup
  *   (panics for unrecoverable faults — never returns)
  *
- * When demand paging is needed, the stub restores GPRs and jumps to
+ * When routing to the shim is needed, the stub restores GPRs and jumps to
  * kernel_exception_callback (in run_thread_arch), which calls the shim's
  * exception handler and then iretq back to the faulting kernel instruction.
  */
@@ -201,7 +201,7 @@ isr_page_fault:
     iretq
 
 .Lkernel_demand_page:
-    /* Demand paging needed. Exception info already stored in per-CPU vars by
+    /* User-space address fault. Exception info already stored in per-CPU vars by
      * page_fault_handler_impl. GPRs are already saved on the stack by push_regs
      * (same layout as SAVE_CPU_CONTEXT_ASM). Jump directly to
      * kernel_exception_regs_saved, skipping the redundant pop_regs/push cycle.
