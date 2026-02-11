@@ -26,7 +26,6 @@ platform_linux_snp = ["litebox_platform_multiplex/platform_linux_snp"]
 [dev-dependencies]
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 libc = "0.2.177"
-tempfile = "3"
 
 [lints]
 workspace = true

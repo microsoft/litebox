@@ -43,7 +43,6 @@ macro_rules! log_unsupported {
 
 pub(crate) mod channel;
 pub mod loader;
-pub mod nine_p;
 pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;
