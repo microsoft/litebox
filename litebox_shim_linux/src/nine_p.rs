@@ -9,32 +9,45 @@
 //! inserted into the guest-visible descriptor table, so it remains invisible to
 //! the guest program.
 
+use alloc::sync::Arc;
+
 use litebox::fs::nine_p::transport;
-use litebox_common_linux::{ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno};
+use litebox::net::socket_channel::NetworkProxy;
+use litebox::net::{ReceiveFlags, SendFlags};
+use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
 use crate::syscalls::net::SocketFd;
-use crate::{ShimFS, Task};
+use crate::{GlobalState, Platform, ShimFS};
 
-/// A 9P transport backed by a raw [`SocketFd`].
+/// A 9P transport backed by a raw [`SocketFd`] and its [`NetworkProxy`].
 ///
 /// The socket lives in the litebox descriptor table (for metadata / proxy) but is
 /// **not** registered in the guest's file-descriptor table, keeping it invisible
 /// to the guest program.
-pub struct ShimTransport<'a, FS: ShimFS> {
-    task: &'a Task<FS>,
+///
+/// All I/O goes through the non-blocking [`NetworkProxy`] methods directly
+/// (`try_read` / `try_write`), with spin-polling when data is not yet available.
+/// This avoids the need for a [`WaitState`](crate::wait::WaitState) or any
+/// association with a particular guest [`Task`](crate::Task).
+pub struct ShimTransport<FS: ShimFS> {
+    global: Arc<GlobalState<FS>>,
     sockfd: SocketFd,
+    proxy: Arc<NetworkProxy<Platform>>,
 }
 
-impl<'a, FS: ShimFS> ShimTransport<'a, FS> {
+impl<FS: ShimFS> ShimTransport<FS> {
     /// Create a TCP socket, connect it to `addr`, and return a transport.
     ///
     /// The socket is created via [`litebox::net::Network::socket`] and initialised
     /// with [`GlobalState::initialize_socket`] so that the channel-based proxy is
-    /// available for non-blocking I/O, but it is **not** assigned a guest fd
-    /// number.
-    pub(crate) fn connect(task: &'a Task<FS>, addr: core::net::SocketAddr) -> Result<Self, Errno> {
-        let global = &*task.global;
-
+    /// set up, but the socket is **not** assigned a guest fd number.
+    ///
+    /// Connection and all subsequent I/O use the [`NetworkProxy`] directly,
+    /// spin-polling when the operation cannot complete immediately.
+    pub(crate) fn connect(
+        global: Arc<GlobalState<FS>>,
+        addr: core::net::SocketAddr,
+    ) -> Result<Self, Errno> {
         // 1. Create the raw socket.
         let sockfd = global
             .net
@@ -43,20 +56,33 @@ impl<'a, FS: ShimFS> ShimTransport<'a, FS> {
             .map_err(Errno::from)?;
 
         // 2. Initialise metadata / proxy in the litebox descriptor table.
-        let _ = global.initialize_socket(&sockfd, SockType::Stream, SockFlags::empty());
+        let proxy = global.initialize_socket(&sockfd, SockType::Stream, SockFlags::empty());
 
-        // 3. Connect.
-        global.connect(&task.wait_cx(), &sockfd, addr)?;
+        // 3. Initiate the TCP connection.
+        let mut check_progress = false;
+        loop {
+            match global.net.lock().connect(&sockfd, &addr, check_progress) {
+                Ok(()) => break,
+                Err(litebox::net::errors::ConnectError::InProgress) => {
+                    core::hint::spin_loop();
+                    check_progress = true;
+                }
+                Err(e) => return Err(Errno::from(e)),
+            }
+        }
 
-        Ok(Self { task, sockfd })
+        Ok(Self {
+            global,
+            sockfd,
+            proxy,
+        })
     }
 }
 
-impl<FS: ShimFS> Drop for ShimTransport<'_, FS> {
+impl<FS: ShimFS> Drop for ShimTransport<FS> {
     fn drop(&mut self) {
         // Close immediately – the 9P transport is internal, no graceful shutdown needed.
         let _ = self
-            .task
             .global
             .net
             .lock()
@@ -64,33 +90,33 @@ impl<FS: ShimFS> Drop for ShimTransport<'_, FS> {
     }
 }
 
-impl<FS: ShimFS> transport::Read for ShimTransport<'_, FS> {
+impl<FS: ShimFS> transport::Read for ShimTransport<FS> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
-        self.task
-            .global
-            .receive(
-                &self.task.wait_cx(),
-                &self.sockfd,
-                buf,
-                ReceiveFlags::empty(),
-                None,
-            )
-            .map_err(|_| transport::ReadError)
+        loop {
+            match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
+                Ok(0) => {
+                    // No data yet — spin until something arrives.
+                    core::hint::spin_loop();
+                }
+                Ok(n) => return Ok(n),
+                Err(_) => return Err(transport::ReadError),
+            }
+        }
     }
 }
 
-impl<FS: ShimFS> transport::Write for ShimTransport<'_, FS> {
+impl<FS: ShimFS> transport::Write for ShimTransport<FS> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
-        self.task
-            .global
-            .sendto(
-                &self.task.wait_cx(),
-                &self.sockfd,
-                buf,
-                SendFlags::empty(),
-                None,
-            )
-            .map_err(|_| transport::WriteError)
+        loop {
+            match self.proxy.try_write(buf, SendFlags::empty(), None) {
+                Ok(n) => return Ok(n),
+                Err(litebox::net::errors::SendError::BufferFull) => {
+                    // TX ring full — spin until space opens up.
+                    core::hint::spin_loop();
+                }
+                Err(_) => return Err(transport::WriteError),
+            }
+        }
     }
 }
 
@@ -188,14 +214,14 @@ mod tests {
         ))
     }
 
-    fn connect_9p<'a>(
-        task: &'a crate::Task<crate::DefaultFS>,
+    fn connect_9p(
+        task: &crate::Task<crate::DefaultFS>,
         server: &DiodServer,
-    ) -> nine_p::FileSystem<crate::Platform, ShimTransport<'a, crate::DefaultFS>> {
+    ) -> nine_p::FileSystem<crate::Platform, ShimTransport<crate::DefaultFS>> {
         // The diod server is reachable at the gateway address (10.0.0.1) from the shim's
         // network perspective, since the TUN device bridges to the host.
         let addr = socket_addr([10, 0, 0, 1], server.port);
-        let transport = ShimTransport::connect(task, addr)
+        let transport = ShimTransport::connect(task.global.clone(), addr)
             .expect("failed to connect to 9P server via shim network");
 
         let aname = server.export_path().to_str().unwrap();
