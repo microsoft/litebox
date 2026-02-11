@@ -16,7 +16,8 @@
 
 use std::collections::HashSet;
 
-use object::read::{Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _};
+use object::read::elf::{ElfFile, ProgramHeader as _};
+use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -95,50 +96,48 @@ struct TextSectionInfo {
 ///
 /// This layout allows loaders to read just the last 32/20 bytes to get the metadata.
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
-    // `object::File::parse` requires that its input is 8-byte aligned. If not, make an aligned
-    // copy. We use a Vec<u64> to guarantee 8-byte alignment, then view it as bytes.
-    let mut aligned_buf: Vec<u64>;
-    let input_binary: &[u8] = if (input_binary.as_ptr() as usize).is_multiple_of(8) {
-        input_binary
-    } else {
-        // JB: This is an ugly workaround to `object` requiring that its input binary being parsed
-        // is always aligned to 8-bytes (otherwise it throws an error); this is very surprising and
-        // probably should be corrected upstream in `object`, but for now, we just make a copy and
-        // re-run. Essentially, we use u64 to force a 8-byte alignment, but then we look at it as
-        // bytes instead.
-        aligned_buf = vec![0u64; input_binary.len().div_ceil(8)];
-        let bytes: &mut [u8] = zerocopy::IntoBytes::as_mut_bytes(aligned_buf.as_mut_slice());
-        bytes[..input_binary.len()].copy_from_slice(input_binary);
-        &bytes[..input_binary.len()]
+    // Make a single mutable, 8-byte-aligned copy of the input binary. This serves as both the
+    // parse buffer (object::File::parse requires 8-byte alignment) and the output buffer for
+    // in-place patching. We use a Vec<u64> to guarantee alignment, then view it as bytes.
+    let mut backing = vec![0u64; input_binary.len().div_ceil(8)];
+    let buf: &mut [u8] = zerocopy::IntoBytes::as_mut_bytes(backing.as_mut_slice());
+    buf[..input_binary.len()].copy_from_slice(input_binary);
+    let buf = &mut buf[..input_binary.len()];
+
+    // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
+    let (arch, dl_sysinfo_int80, text_sections, control_transfer_targets, trampoline_base_addr) = {
+        let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
+
+        let arch = match file {
+            object::File::Elf64(_) => Arch::X86_64,
+            object::File::Elf32(_) => Arch::X86_32,
+            _ => return Err(Error::UnsupportedObjectFile),
+        };
+
+        let dl_sysinfo_int80 = if arch == Arch::X86_32 {
+            get_symbols(&file)
+        } else {
+            None
+        };
+
+        let text_sections = text_sections(&file)?;
+
+        if is_already_hooked(&*buf, arch) {
+            return Err(Error::AlreadyHooked);
+        }
+
+        let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
+
+        let trampoline_base_addr = find_addr_for_trampoline_code(&file);
+
+        (
+            arch,
+            dl_sysinfo_int80,
+            text_sections,
+            control_transfer_targets,
+            trampoline_base_addr,
+        )
     };
-
-    let file = object::File::parse(input_binary).map_err(|e| Error::ParseError(e.to_string()))?;
-
-    let arch = match file {
-        object::File::Elf64(_) => Arch::X86_64,
-        object::File::Elf32(_) => Arch::X86_32,
-        _ => return Err(Error::UnsupportedObjectFile),
-    };
-
-    // Get symbols
-    let dl_sysinfo_int80 = if arch == Arch::X86_32 {
-        get_symbols(&file)
-    } else {
-        None
-    };
-
-    let text_sections = text_sections(&file)?;
-
-    // Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at end of file
-    if is_already_hooked(input_binary, arch) {
-        return Err(Error::AlreadyHooked);
-    }
-
-    // Get control transfer targets
-    let control_transfer_targets =
-        get_control_transfer_targets(arch, input_binary, &text_sections)?;
-
-    let trampoline_base_addr = find_addr_for_trampoline_code(&file);
 
     // Build the trampoline code (without header - header goes at the end)
     // The code starts with the syscall entry point placeholder
@@ -151,12 +150,10 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     }
 
-    // Make a mutable copy of the input binary for in-place patching
-    let mut out = input_binary.to_vec();
-
+    // Patch syscalls in-place in buf
     let mut syscall_insns_found = false;
     for s in &text_sections {
-        let section_data = section_slice_mut(&mut out, s)?;
+        let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
             arch,
             &control_transfer_targets,
@@ -178,7 +175,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         return Err(Error::NoSyscallInstructionsFound);
     }
 
-    // Append: [padding to page boundary][trampoline code][header]
+    // Build output: [patched ELF][padding to page boundary][trampoline code][header]
+    let mut out = buf.to_vec();
     let remain = out.len() % 0x1000;
     out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { 0x1000 - remain }]);
 
@@ -457,15 +455,29 @@ fn hook_syscalls_in_section(
 }
 
 fn find_addr_for_trampoline_code(file: &object::File<'_>) -> u64 {
-    // Find the highest virtual address among all loadable segments
-    let max_virtual_addr = file
-        .segments()
-        .map(|seg| seg.address() + seg.size())
-        .max()
-        .unwrap();
+    // Find the highest virtual address among all PT_LOAD segments
+    let max_virtual_addr = match file {
+        object::File::Elf64(elf) => max_load_segment_end(elf),
+        object::File::Elf32(elf) => max_load_segment_end(elf),
+        _ => unreachable!(),
+    };
 
     // Round up to the nearest page (assume 0x1000 page size)
     max_virtual_addr.next_multiple_of(0x1000)
+}
+
+/// Returns the highest `p_vaddr + p_memsz` among all `PT_LOAD` segments.
+fn max_load_segment_end<Elf: object::read::elf::FileHeader>(elf: &ElfFile<'_, Elf>) -> u64
+where
+    Elf::Word: Into<u64>,
+{
+    let endian = elf.endian();
+    elf.elf_program_headers()
+        .iter()
+        .filter(|ph| ph.p_type(endian) == object::elf::PT_LOAD)
+        .map(|ph| ph.p_vaddr(endian).into() + ph.p_memsz(endian).into())
+        .max()
+        .unwrap()
 }
 
 fn get_symbols(file: &object::File<'_>) -> Option<u64> {
