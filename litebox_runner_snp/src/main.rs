@@ -14,9 +14,20 @@ use alloc::{borrow::ToOwned, string::ToString};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
+type Platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel;
+type DefaultFS = litebox::fs::layered::FileSystem<
+    Platform,
+    litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::layered::FileSystem<
+        Platform,
+        litebox::fs::devices::FileSystem<Platform>,
+        litebox::fs::nine_p::FileSystem<Platform, litebox_shim_linux::nine_p::ShimTransport>,
+    >,
+>;
+
 // FUTURE: replace this with some kind of OnceLock, or just eliminate this
 // entirely (ideal).
-static mut SHIM: Option<litebox_shim_linux::LinuxShim<litebox_shim_linux::DefaultFS>> = None;
+static mut SHIM: Option<litebox_shim_linux::LinuxShim<DefaultFS>> = None;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn floating_point_handler(_pt_regs: &mut litebox_common_linux::PtRegs) {
@@ -191,13 +202,8 @@ pub extern "C" fn sandbox_process_init(
 
     litebox_platform_multiplex::set_platform(platform);
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    let litebox = shim_builder.litebox();
-    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
-    load_host_files_into_fs(&mut in_mem_fs);
-
-    let tar_ro =
-        litebox::fs::tar_ro::FileSystem::new(litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
-    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, tar_ro));
+    let shim = shim_builder.build();
+    unsafe { SHIM = Some(shim) };
 
     let parse_args =
         |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
@@ -235,19 +241,40 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_INVALID_PARAM,
         );
     };
-    let shim = shim_builder.build();
-    unsafe { SHIM = Some(shim) };
+
+    let shim = &raw const SHIM;
+    let shim = unsafe { (*shim).as_ref().expect("initialized") };
+    let litebox = shim.litebox();
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    load_host_files_into_fs(&mut in_mem_fs);
+
+    let socket_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+        core::net::Ipv4Addr::new(10, 0, 0, 1),
+        8888,
+    ));
+    let transport = shim
+        .tcp_connection(socket_addr)
+        .expect("failed to connect to 9p server");
+    let nine_p = litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/tmp")
+        .expect("failed to create 9P filesystem");
+    let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
+    let default_fs = litebox::fs::layered::FileSystem::new(
+        litebox,
+        in_mem_fs,
+        litebox::fs::layered::FileSystem::new(
+            litebox,
+            dev_stdio,
+            nine_p,
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+        ),
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    );
+    let fs = alloc::sync::Arc::new(default_fs);
 
     // Loading a program may trigger page faults, so we need to set SHIM before this.
-    let shim = &raw const SHIM;
     #[allow(clippy::missing_panics_doc)]
-    let program = match unsafe { (*shim).as_ref().expect("initialized") }.load_program(
-        fs,
-        platform.init_task(boot_params),
-        &program,
-        argv,
-        envp,
-    ) {
+    let program = match shim.load_program(fs, platform.init_task(boot_params), &program, argv, envp)
+    {
         Ok(program) => program,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);
