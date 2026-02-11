@@ -45,6 +45,9 @@ jobs:
       - name: Install iperf3
         run: |
           sudo apt install -y iperf3
+      - name: Install diod
+        run: |
+          sudo apt install -y diod
       - uses: Swatinem/rust-cache@v2
       - name: Cache custom out directories
         uses: actions/cache@v5
@@ -90,6 +93,9 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
+      - name: Install diod
+        run: |
+          sudo apt install -y diod
       - name: Set up tun
         run: |
           sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
