@@ -280,6 +280,17 @@ impl<FS: ShimFS> LinuxShim<FS> {
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
         self.0.net.lock().perform_platform_interaction()
     }
+
+    pub fn litebox(&self) -> &LiteBox<Platform> {
+        &self.0.litebox
+    }
+
+    pub fn tcp_connection(
+        &self,
+        addr: core::net::SocketAddr,
+    ) -> Result<nine_p::ShimTransport, Errno> {
+        nine_p::ShimTransport::connect(self.0.clone(), addr)
+    }
 }
 
 pub struct LoadedProgram<FS: ShimFS> {
