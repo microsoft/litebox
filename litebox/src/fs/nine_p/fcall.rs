@@ -6,35 +6,37 @@
 //! This module implements the 9P2000.L protocol used for network filesystem access.
 //! See <https://9p.io/sys/man/5/intro> and <https://github.com/chaos/diod/blob/master/protocol.md>
 
-use super::cursor::Write;
+use core::fmt::Display;
+
+use super::transport::{self, Write};
 use alloc::{borrow::Cow, vec::Vec};
 use bitflags::bitflags;
 
 /// File identifier type
-pub(crate) type Fid = u32;
+pub(super) type Fid = u32;
 
 /// Special tag which `Tversion`/`Rversion` must use as `tag`
-pub(crate) const NOTAG: u16 = !0;
+pub(super) const NOTAG: u16 = !0;
 
 /// Special value which `Tattach` with no auth must use as `afid`
 ///
 /// If the client does not wish to authenticate the connection, or knows that authentication is
 /// not required, the afid field in the attach message should be set to `NOFID`
-pub(crate) const NOFID: u32 = !0;
+pub(super) const NOFID: u32 = !0;
 
 /// Special uid which `Tauth`/`Tattach` use as `n_uname` to indicate no uid is specified
-pub(crate) const NONUNAME: u32 = !0;
+pub(super) const NONUNAME: u32 = !0;
 
 /// Room for `Twrite`/`Rread` header
 ///
 /// size[4] Tread/Twrite[2] tag[2] fid[4] offset[8] count[4]
-pub(crate) const IOHDRSZ: u32 = 24;
+pub(super) const IOHDRSZ: u32 = 24;
 
 /// Room for readdir header
-pub(crate) const READDIRHDRSZ: u32 = 24;
+pub(super) const READDIRHDRSZ: u32 = 24;
 
 /// Maximum elements in a single walk.
-pub(crate) const MAXWELEM: usize = 13;
+pub(super) const MAXWELEM: usize = 13;
 
 bitflags! {
     /// Flags passed to Tlopen.
@@ -181,7 +183,7 @@ bitflags! {
 
 /// String type used in 9P protocol messages
 #[derive(Clone, Debug)]
-pub(crate) enum FcallStr<'a> {
+pub(super) enum FcallStr<'a> {
     Owned(Vec<u8>),
     Borrowed(&'a [u8]),
 }
@@ -205,10 +207,6 @@ impl<'a> FcallStr<'a> {
         self.as_bytes().len()
     }
 
-    /// Check if the string is empty
-    pub fn is_empty(&self) -> bool {
-        self.as_bytes().is_empty()
-    }
 }
 
 impl<'a, T: ?Sized + AsRef<[u8]>> From<&'a T> for FcallStr<'a> {
@@ -219,7 +217,7 @@ impl<'a, T: ?Sized + AsRef<[u8]>> From<&'a T> for FcallStr<'a> {
 
 /// Directory entry data container
 #[derive(Clone, Debug)]
-pub(crate) struct DirEntryData<'a> {
+pub(super) struct DirEntryData<'a> {
     pub data: Vec<DirEntry<'a>>,
 }
 
@@ -258,7 +256,7 @@ impl Default for DirEntryData<'_> {
 
 /// 9P message types
 #[derive(Copy, Clone, Debug)]
-pub(crate) enum FcallType {
+pub(super) enum FcallType {
     // 9P2000.L
     Rlerror = 7,
     Tstatfs = 8,
@@ -392,7 +390,7 @@ impl FcallType {
 
 /// Unique identifier for a file
 #[derive(Clone, Debug, Copy)]
-pub(crate) struct Qid {
+pub(super) struct Qid {
     pub typ: QidType,
     pub version: u32,
     pub path: u64,
@@ -400,7 +398,7 @@ pub(crate) struct Qid {
 
 /// File system statistics
 #[derive(Clone, Debug, Copy)]
-pub(crate) struct Statfs {
+pub(super) struct Statfs {
     pub typ: u32,
     pub bsize: u32,
     pub blocks: u64,
@@ -414,14 +412,14 @@ pub(crate) struct Statfs {
 
 /// Time structure
 #[derive(Clone, Debug, Copy, Default)]
-pub(crate) struct Time {
+pub(super) struct Time {
     pub sec: u64,
     pub nsec: u64,
 }
 
 /// File attributes
 #[derive(Clone, Debug, Copy)]
-pub(crate) struct Stat {
+pub(super) struct Stat {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
@@ -440,7 +438,7 @@ pub(crate) struct Stat {
 
 /// Set file attributes
 #[derive(Clone, Debug, Copy, Default)]
-pub(crate) struct SetAttr {
+pub(super) struct SetAttr {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
@@ -451,7 +449,7 @@ pub(crate) struct SetAttr {
 
 /// Directory entry
 #[derive(Clone, Debug)]
-pub(crate) struct DirEntry<'a> {
+pub(super) struct DirEntry<'a> {
     pub qid: Qid,
     pub offset: u64,
     pub typ: u8,
@@ -467,18 +465,18 @@ impl DirEntry<'_> {
 
 /// File lock request
 #[derive(Clone, Debug)]
-pub(crate) struct Flock<'a> {
-    pub typ: LockType,
-    pub flags: LockFlag,
-    pub start: u64,
-    pub length: u64,
-    pub proc_id: u32,
-    pub client_id: FcallStr<'a>,
+pub(super) struct Flock<'a> {
+    typ: LockType,
+    flags: LockFlag,
+    start: u64,
+    length: u64,
+    proc_id: u32,
+    client_id: FcallStr<'a>,
 }
 
 /// Get lock request
 #[derive(Clone, Debug)]
-pub(crate) struct Getlock<'a> {
+pub(super) struct Getlock<'a> {
     pub typ: LockType,
     pub start: u64,
     pub length: u64,
@@ -492,20 +490,19 @@ pub(crate) struct Getlock<'a> {
 
 /// Error response
 #[derive(Clone, Debug)]
-pub(crate) struct Rlerror {
-    pub ecode: u32,
+pub(super) struct Rlerror {
+    pub(super) ecode: u32,
 }
 
-impl Rlerror {
-    /// Convert to an error code
-    pub fn into_error(self) -> super::Error {
-        super::Error::Remote(self.ecode)
+impl Display for Rlerror {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Remote error: {}", self.ecode)
     }
 }
 
 /// Attach request
 #[derive(Clone, Debug)]
-pub(crate) struct Tattach<'a> {
+pub(super) struct Tattach<'a> {
     pub fid: u32,
     pub afid: u32,
     pub uname: FcallStr<'a>,
@@ -527,39 +524,39 @@ impl Tattach<'_> {
 
 /// Attach response
 #[derive(Clone, Debug)]
-pub(crate) struct Rattach {
+pub(super) struct Rattach {
     pub qid: Qid,
 }
 
 /// Statfs request
 #[derive(Clone, Debug)]
-pub(crate) struct Tstatfs {
+pub(super) struct Tstatfs {
     pub fid: u32,
 }
 
 /// Statfs response
 #[derive(Clone, Debug)]
-pub(crate) struct Rstatfs {
+pub(super) struct Rstatfs {
     pub statfs: Statfs,
 }
 
 /// Open request
 #[derive(Clone, Debug)]
-pub(crate) struct Tlopen {
+pub(super) struct Tlopen {
     pub fid: u32,
     pub flags: LOpenFlags,
 }
 
 /// Open response
 #[derive(Clone, Debug)]
-pub(crate) struct Rlopen {
+pub(super) struct Rlopen {
     pub qid: Qid,
     pub iounit: u32,
 }
 
 /// Create request
 #[derive(Clone, Debug)]
-pub(crate) struct Tlcreate<'a> {
+pub(super) struct Tlcreate<'a> {
     pub fid: u32,
     pub name: FcallStr<'a>,
     pub flags: LOpenFlags,
@@ -581,14 +578,14 @@ impl<'a> Tlcreate<'a> {
 
 /// Create response
 #[derive(Clone, Debug)]
-pub(crate) struct Rlcreate {
+pub(super) struct Rlcreate {
     pub qid: Qid,
     pub iounit: u32,
 }
 
 /// Symlink request
 #[derive(Clone, Debug)]
-pub(crate) struct Tsymlink<'a> {
+pub(super) struct Tsymlink<'a> {
     pub fid: u32,
     pub name: FcallStr<'a>,
     pub symtgt: FcallStr<'a>,
@@ -608,13 +605,13 @@ impl<'a> Tsymlink<'a> {
 
 /// Symlink response
 #[derive(Clone, Debug)]
-pub(crate) struct Rsymlink {
+pub(super) struct Rsymlink {
     pub qid: Qid,
 }
 
 /// Mknod request
 #[derive(Clone, Debug)]
-pub(crate) struct Tmknod<'a> {
+pub(super) struct Tmknod<'a> {
     pub dfid: u32,
     pub name: FcallStr<'a>,
     pub mode: u32,
@@ -638,13 +635,13 @@ impl<'a> Tmknod<'a> {
 
 /// Mknod response
 #[derive(Clone, Debug)]
-pub(crate) struct Rmknod {
+pub(super) struct Rmknod {
     pub qid: Qid,
 }
 
 /// Rename request
 #[derive(Clone, Debug)]
-pub(crate) struct Trename<'a> {
+pub(super) struct Trename<'a> {
     pub fid: u32,
     pub dfid: u32,
     pub name: FcallStr<'a>,
@@ -662,17 +659,17 @@ impl<'a> Trename<'a> {
 
 /// Rename response
 #[derive(Clone, Debug)]
-pub(crate) struct Rrename {}
+pub(super) struct Rrename {}
 
 /// Readlink request
 #[derive(Clone, Debug)]
-pub(crate) struct Treadlink {
+pub(super) struct Treadlink {
     pub fid: u32,
 }
 
 /// Readlink response
 #[derive(Clone, Debug)]
-pub(crate) struct Rreadlink<'a> {
+pub(super) struct Rreadlink<'a> {
     pub target: FcallStr<'a>,
 }
 
@@ -686,14 +683,14 @@ impl<'a> Rreadlink<'a> {
 
 /// Getattr request
 #[derive(Clone, Debug)]
-pub(crate) struct Tgetattr {
+pub(super) struct Tgetattr {
     pub fid: u32,
     pub req_mask: GetattrMask,
 }
 
 /// Getattr response
 #[derive(Clone, Debug)]
-pub(crate) struct Rgetattr {
+pub(super) struct Rgetattr {
     pub valid: GetattrMask,
     pub qid: Qid,
     pub stat: Stat,
@@ -701,7 +698,7 @@ pub(crate) struct Rgetattr {
 
 /// Setattr request
 #[derive(Clone, Debug)]
-pub(crate) struct Tsetattr {
+pub(super) struct Tsetattr {
     pub fid: u32,
     pub valid: SetattrMask,
     pub stat: SetAttr,
@@ -709,11 +706,11 @@ pub(crate) struct Tsetattr {
 
 /// Setattr response
 #[derive(Clone, Debug)]
-pub(crate) struct Rsetattr {}
+pub(super) struct Rsetattr {}
 
 /// Xattr walk request
 #[derive(Clone, Debug)]
-pub(crate) struct Txattrwalk<'a> {
+pub(super) struct Txattrwalk<'a> {
     pub fid: u32,
     pub new_fid: u32,
     pub name: FcallStr<'a>,
@@ -731,13 +728,13 @@ impl<'a> Txattrwalk<'a> {
 
 /// Xattr walk response
 #[derive(Clone, Debug)]
-pub(crate) struct Rxattrwalk {
+pub(super) struct Rxattrwalk {
     pub size: u64,
 }
 
 /// Xattr create request
 #[derive(Clone, Debug)]
-pub(crate) struct Txattrcreate<'a> {
+pub(super) struct Txattrcreate<'a> {
     pub fid: u32,
     pub name: FcallStr<'a>,
     pub attr_size: u64,
@@ -757,11 +754,11 @@ impl<'a> Txattrcreate<'a> {
 
 /// Xattr create response
 #[derive(Clone, Debug)]
-pub(crate) struct Rxattrcreate {}
+pub(super) struct Rxattrcreate {}
 
 /// Readdir request
 #[derive(Clone, Debug)]
-pub(crate) struct Treaddir {
+pub(super) struct Treaddir {
     pub fid: u32,
     pub offset: u64,
     pub count: u32,
@@ -769,7 +766,7 @@ pub(crate) struct Treaddir {
 
 /// Readdir response
 #[derive(Clone, Debug)]
-pub(crate) struct Rreaddir<'a> {
+pub(super) struct Rreaddir<'a> {
     pub data: DirEntryData<'a>,
 }
 
@@ -795,18 +792,18 @@ impl<'a> Rreaddir<'a> {
 
 /// Fsync request
 #[derive(Clone, Debug)]
-pub(crate) struct Tfsync {
+pub(super) struct Tfsync {
     pub fid: u32,
     pub datasync: u32,
 }
 
 /// Fsync response
 #[derive(Clone, Debug)]
-pub(crate) struct Rfsync {}
+pub(super) struct Rfsync {}
 
 /// Lock request
 #[derive(Clone, Debug)]
-pub(crate) struct Tlock<'a> {
+pub(super) struct Tlock<'a> {
     pub fid: u32,
     pub flock: Flock<'a>,
 }
@@ -829,13 +826,13 @@ impl<'a> Tlock<'a> {
 
 /// Lock response
 #[derive(Clone, Debug)]
-pub(crate) struct Rlock {
+pub(super) struct Rlock {
     pub status: LockStatus,
 }
 
 /// Getlock request
 #[derive(Clone, Debug)]
-pub(crate) struct Tgetlock<'a> {
+pub(super) struct Tgetlock<'a> {
     pub fid: u32,
     pub flock: Getlock<'a>,
 }
@@ -857,7 +854,7 @@ impl<'a> Tgetlock<'a> {
 
 /// Getlock response
 #[derive(Clone, Debug)]
-pub(crate) struct Rgetlock<'a> {
+pub(super) struct Rgetlock<'a> {
     pub flock: Getlock<'a>,
 }
 
@@ -877,7 +874,7 @@ impl<'a> Rgetlock<'a> {
 
 /// Link request
 #[derive(Clone, Debug)]
-pub(crate) struct Tlink<'a> {
+pub(super) struct Tlink<'a> {
     pub dfid: u32,
     pub fid: u32,
     pub name: FcallStr<'a>,
@@ -895,11 +892,11 @@ impl<'a> Tlink<'a> {
 
 /// Link response
 #[derive(Clone, Debug)]
-pub(crate) struct Rlink {}
+pub(super) struct Rlink {}
 
 /// Mkdir request
 #[derive(Clone, Debug)]
-pub(crate) struct Tmkdir<'a> {
+pub(super) struct Tmkdir<'a> {
     pub dfid: u32,
     pub name: FcallStr<'a>,
     pub mode: u32,
@@ -919,13 +916,13 @@ impl<'a> Tmkdir<'a> {
 
 /// Mkdir response
 #[derive(Clone, Debug)]
-pub(crate) struct Rmkdir {
+pub(super) struct Rmkdir {
     pub qid: Qid,
 }
 
 /// Renameat request
 #[derive(Clone, Debug)]
-pub(crate) struct Trenameat<'a> {
+pub(super) struct Trenameat<'a> {
     pub olddfid: u32,
     pub oldname: FcallStr<'a>,
     pub newdfid: u32,
@@ -945,11 +942,11 @@ impl<'a> Trenameat<'a> {
 
 /// Renameat response
 #[derive(Clone, Debug)]
-pub(crate) struct Rrenameat {}
+pub(super) struct Rrenameat {}
 
 /// Unlinkat request
 #[derive(Clone, Debug)]
-pub(crate) struct Tunlinkat<'a> {
+pub(super) struct Tunlinkat<'a> {
     pub dfid: u32,
     pub name: FcallStr<'a>,
     pub flags: u32,
@@ -967,11 +964,11 @@ impl<'a> Tunlinkat<'a> {
 
 /// Unlinkat response
 #[derive(Clone, Debug)]
-pub(crate) struct Runlinkat {}
+pub(super) struct Runlinkat {}
 
 /// Auth request
 #[derive(Clone, Debug)]
-pub(crate) struct Tauth<'a> {
+pub(super) struct Tauth<'a> {
     pub afid: u32,
     pub uname: FcallStr<'a>,
     pub aname: FcallStr<'a>,
@@ -991,13 +988,13 @@ impl<'a> Tauth<'a> {
 
 /// Auth response
 #[derive(Clone, Debug)]
-pub(crate) struct Rauth {
+pub(super) struct Rauth {
     pub aqid: Qid,
 }
 
 /// Version request
 #[derive(Clone, Debug)]
-pub(crate) struct Tversion<'a> {
+pub(super) struct Tversion<'a> {
     pub msize: u32,
     pub version: FcallStr<'a>,
 }
@@ -1013,7 +1010,7 @@ impl<'a> Tversion<'a> {
 
 /// Version response
 #[derive(Clone, Debug)]
-pub(crate) struct Rversion<'a> {
+pub(super) struct Rversion<'a> {
     pub msize: u32,
     pub version: FcallStr<'a>,
 }
@@ -1029,17 +1026,17 @@ impl<'a> Rversion<'a> {
 
 /// Flush request
 #[derive(Clone, Debug)]
-pub(crate) struct Tflush {
+pub(super) struct Tflush {
     pub oldtag: u16,
 }
 
 /// Flush response
 #[derive(Clone, Debug)]
-pub(crate) struct Rflush {}
+pub(super) struct Rflush {}
 
 /// Walk request
 #[derive(Clone, Debug)]
-pub(crate) struct Twalk<'a> {
+pub(super) struct Twalk<'a> {
     pub fid: u32,
     pub new_fid: u32,
     pub wnames: Vec<FcallStr<'a>>,
@@ -1050,20 +1047,20 @@ impl<'a> Twalk<'a> {
         Twalk {
             fid: self.fid,
             new_fid: self.new_fid,
-            wnames: self.wnames.iter().map(|n| n.clone_static()).collect(),
+            wnames: self.wnames.iter().map(FcallStr::clone_static).collect(),
         }
     }
 }
 
 /// Walk response
 #[derive(Clone, Debug)]
-pub(crate) struct Rwalk {
+pub(super) struct Rwalk {
     pub wqids: Vec<Qid>,
 }
 
 /// Read request
 #[derive(Clone, Debug)]
-pub(crate) struct Tread {
+pub(super) struct Tread {
     pub fid: u32,
     pub offset: u64,
     pub count: u32,
@@ -1071,7 +1068,7 @@ pub(crate) struct Tread {
 
 /// Read response
 #[derive(Clone, Debug)]
-pub(crate) struct Rread<'a> {
+pub(super) struct Rread<'a> {
     pub data: Cow<'a, [u8]>,
 }
 
@@ -1085,7 +1082,7 @@ impl<'a> Rread<'a> {
 
 /// Write request
 #[derive(Clone, Debug)]
-pub(crate) struct Twrite<'a> {
+pub(super) struct Twrite<'a> {
     pub fid: u32,
     pub offset: u64,
     pub data: Cow<'a, [u8]>,
@@ -1103,29 +1100,29 @@ impl<'a> Twrite<'a> {
 
 /// Write response
 #[derive(Clone, Debug)]
-pub(crate) struct Rwrite {
+pub(super) struct Rwrite {
     pub count: u32,
 }
 
 /// Clunk request
 #[derive(Clone, Debug)]
-pub(crate) struct Tclunk {
+pub(super) struct Tclunk {
     pub fid: u32,
 }
 
 /// Clunk response
 #[derive(Clone, Debug)]
-pub(crate) struct Rclunk {}
+pub(super) struct Rclunk {}
 
 /// Remove request
 #[derive(Clone, Debug)]
-pub(crate) struct Tremove {
+pub(super) struct Tremove {
     pub fid: u32,
 }
 
 /// Remove response
 #[derive(Clone, Debug)]
-pub(crate) struct Rremove {}
+pub(super) struct Rremove {}
 
 // ============================================================================
 // Fcall enum and conversions
@@ -1133,7 +1130,7 @@ pub(crate) struct Rremove {}
 
 /// 9P protocol message
 #[derive(Clone, Debug)]
-pub(crate) enum Fcall<'a> {
+pub(super) enum Fcall<'a> {
     Rlerror(Rlerror),
     Tattach(Tattach<'a>),
     Rattach(Rattach),
@@ -1443,14 +1440,14 @@ impl<'a> From<Twrite<'a>> for Fcall<'a> {
 
 /// Tagged 9P message
 #[derive(Clone, Debug)]
-pub(crate) struct TaggedFcall<'a> {
-    pub tag: u16,
-    pub fcall: Fcall<'a>,
+pub(super) struct TaggedFcall<'a> {
+    pub(super) tag: u16,
+    pub(super) fcall: Fcall<'a>,
 }
 
 impl<'a> TaggedFcall<'a> {
     /// Encode the message to a buffer
-    pub fn encode_to_buf(&self, buf: &mut Vec<u8>) -> Result<(), super::Error> {
+    pub fn encode_to_buf(&self, buf: &mut Vec<u8>) -> Result<(), transport::WriteError> {
         buf.clear();
         buf.resize(4, 0); // Reserve space for size
 
@@ -1479,33 +1476,33 @@ impl<'a> TaggedFcall<'a> {
 // Encoding functions
 // ============================================================================
 
-fn encode_u8<W: Write>(w: &mut W, v: u8) -> Result<(), super::Error> {
+fn encode_u8<W: Write>(w: &mut W, v: u8) -> Result<(), transport::WriteError> {
     w.write_all(&[v])
 }
 
-fn encode_u16<W: Write>(w: &mut W, v: u16) -> Result<(), super::Error> {
+fn encode_u16<W: Write>(w: &mut W, v: u16) -> Result<(), transport::WriteError> {
     w.write_all(&v.to_le_bytes())
 }
 
-fn encode_u32<W: Write>(w: &mut W, v: u32) -> Result<(), super::Error> {
+fn encode_u32<W: Write>(w: &mut W, v: u32) -> Result<(), transport::WriteError> {
     w.write_all(&v.to_le_bytes())
 }
 
-fn encode_u64<W: Write>(w: &mut W, v: u64) -> Result<(), super::Error> {
+fn encode_u64<W: Write>(w: &mut W, v: u64) -> Result<(), transport::WriteError> {
     w.write_all(&v.to_le_bytes())
 }
 
-fn encode_str<W: Write>(w: &mut W, v: &FcallStr<'_>) -> Result<(), super::Error> {
+fn encode_str<W: Write>(w: &mut W, v: &FcallStr<'_>) -> Result<(), transport::WriteError> {
     encode_u16(w, v.len() as u16)?;
     w.write_all(v.as_bytes())
 }
 
-fn encode_data_buf<W: Write>(w: &mut W, v: &[u8]) -> Result<(), super::Error> {
+fn encode_data_buf<W: Write>(w: &mut W, v: &[u8]) -> Result<(), transport::WriteError> {
     encode_u32(w, v.len() as u32)?;
     w.write_all(v)
 }
 
-fn encode_vec_str<W: Write>(w: &mut W, v: &[FcallStr<'_>]) -> Result<(), super::Error> {
+fn encode_vec_str<W: Write>(w: &mut W, v: &[FcallStr<'_>]) -> Result<(), transport::WriteError> {
     encode_u16(w, v.len() as u16)?;
     for s in v {
         encode_str(w, s)?;
@@ -1513,7 +1510,7 @@ fn encode_vec_str<W: Write>(w: &mut W, v: &[FcallStr<'_>]) -> Result<(), super::
     Ok(())
 }
 
-fn encode_vec_qid<W: Write>(w: &mut W, v: &[Qid]) -> Result<(), super::Error> {
+fn encode_vec_qid<W: Write>(w: &mut W, v: &[Qid]) -> Result<(), transport::WriteError> {
     encode_u16(w, v.len() as u16)?;
     for q in v {
         encode_qid(w, q)?;
@@ -1521,38 +1518,38 @@ fn encode_vec_qid<W: Write>(w: &mut W, v: &[Qid]) -> Result<(), super::Error> {
     Ok(())
 }
 
-fn encode_qidtype<W: Write>(w: &mut W, v: &QidType) -> Result<(), super::Error> {
+fn encode_qidtype<W: Write>(w: &mut W, v: &QidType) -> Result<(), transport::WriteError> {
     encode_u8(w, v.bits())
 }
 
-fn encode_locktype<W: Write>(w: &mut W, v: &LockType) -> Result<(), super::Error> {
+fn encode_locktype<W: Write>(w: &mut W, v: &LockType) -> Result<(), transport::WriteError> {
     encode_u8(w, v.bits())
 }
 
-fn encode_lockstatus<W: Write>(w: &mut W, v: &LockStatus) -> Result<(), super::Error> {
+fn encode_lockstatus<W: Write>(w: &mut W, v: &LockStatus) -> Result<(), transport::WriteError> {
     encode_u8(w, v.bits())
 }
 
-fn encode_lockflag<W: Write>(w: &mut W, v: &LockFlag) -> Result<(), super::Error> {
+fn encode_lockflag<W: Write>(w: &mut W, v: &LockFlag) -> Result<(), transport::WriteError> {
     encode_u32(w, v.bits())
 }
 
-fn encode_getattrmask<W: Write>(w: &mut W, v: &GetattrMask) -> Result<(), super::Error> {
+fn encode_getattrmask<W: Write>(w: &mut W, v: &GetattrMask) -> Result<(), transport::WriteError> {
     encode_u64(w, v.bits())
 }
 
-fn encode_setattrmask<W: Write>(w: &mut W, v: &SetattrMask) -> Result<(), super::Error> {
+fn encode_setattrmask<W: Write>(w: &mut W, v: &SetattrMask) -> Result<(), transport::WriteError> {
     encode_u32(w, v.bits())
 }
 
-fn encode_qid<W: Write>(w: &mut W, v: &Qid) -> Result<(), super::Error> {
+fn encode_qid<W: Write>(w: &mut W, v: &Qid) -> Result<(), transport::WriteError> {
     encode_qidtype(w, &v.typ)?;
     encode_u32(w, v.version)?;
     encode_u64(w, v.path)?;
     Ok(())
 }
 
-fn encode_statfs<W: Write>(w: &mut W, v: &Statfs) -> Result<(), super::Error> {
+fn encode_statfs<W: Write>(w: &mut W, v: &Statfs) -> Result<(), transport::WriteError> {
     encode_u32(w, v.typ)?;
     encode_u32(w, v.bsize)?;
     encode_u64(w, v.blocks)?;
@@ -1565,13 +1562,13 @@ fn encode_statfs<W: Write>(w: &mut W, v: &Statfs) -> Result<(), super::Error> {
     Ok(())
 }
 
-fn encode_time<W: Write>(w: &mut W, v: &Time) -> Result<(), super::Error> {
+fn encode_time<W: Write>(w: &mut W, v: &Time) -> Result<(), transport::WriteError> {
     encode_u64(w, v.sec)?;
     encode_u64(w, v.nsec)?;
     Ok(())
 }
 
-fn encode_stat<W: Write>(w: &mut W, v: &Stat) -> Result<(), super::Error> {
+fn encode_stat<W: Write>(w: &mut W, v: &Stat) -> Result<(), transport::WriteError> {
     encode_u32(w, v.mode)?;
     encode_u32(w, v.uid)?;
     encode_u32(w, v.gid)?;
@@ -1589,7 +1586,7 @@ fn encode_stat<W: Write>(w: &mut W, v: &Stat) -> Result<(), super::Error> {
     Ok(())
 }
 
-fn encode_setattr<W: Write>(w: &mut W, v: &SetAttr) -> Result<(), super::Error> {
+fn encode_setattr<W: Write>(w: &mut W, v: &SetAttr) -> Result<(), transport::WriteError> {
     encode_u32(w, v.mode)?;
     encode_u32(w, v.uid)?;
     encode_u32(w, v.gid)?;
@@ -1599,7 +1596,10 @@ fn encode_setattr<W: Write>(w: &mut W, v: &SetAttr) -> Result<(), super::Error> 
     Ok(())
 }
 
-fn encode_direntrydata<W: Write>(w: &mut W, v: &DirEntryData<'_>) -> Result<(), super::Error> {
+fn encode_direntrydata<W: Write>(
+    w: &mut W,
+    v: &DirEntryData<'_>,
+) -> Result<(), transport::WriteError> {
     encode_u32(w, v.size() as u32)?;
     for e in &v.data {
         encode_direntry(w, e)?;
@@ -1607,7 +1607,7 @@ fn encode_direntrydata<W: Write>(w: &mut W, v: &DirEntryData<'_>) -> Result<(), 
     Ok(())
 }
 
-fn encode_direntry<W: Write>(w: &mut W, v: &DirEntry<'_>) -> Result<(), super::Error> {
+fn encode_direntry<W: Write>(w: &mut W, v: &DirEntry<'_>) -> Result<(), transport::WriteError> {
     encode_qid(w, &v.qid)?;
     encode_u64(w, v.offset)?;
     encode_u8(w, v.typ)?;
@@ -1615,7 +1615,7 @@ fn encode_direntry<W: Write>(w: &mut W, v: &DirEntry<'_>) -> Result<(), super::E
     Ok(())
 }
 
-fn encode_flock<W: Write>(w: &mut W, v: &Flock<'_>) -> Result<(), super::Error> {
+fn encode_flock<W: Write>(w: &mut W, v: &Flock<'_>) -> Result<(), transport::WriteError> {
     encode_locktype(w, &v.typ)?;
     encode_lockflag(w, &v.flags)?;
     encode_u64(w, v.start)?;
@@ -1625,7 +1625,7 @@ fn encode_flock<W: Write>(w: &mut W, v: &Flock<'_>) -> Result<(), super::Error> 
     Ok(())
 }
 
-fn encode_getlock<W: Write>(w: &mut W, v: &Getlock<'_>) -> Result<(), super::Error> {
+fn encode_getlock<W: Write>(w: &mut W, v: &Getlock<'_>) -> Result<(), transport::WriteError> {
     encode_locktype(w, &v.typ)?;
     encode_u64(w, v.start)?;
     encode_u64(w, v.length)?;
@@ -1634,7 +1634,11 @@ fn encode_getlock<W: Write>(w: &mut W, v: &Getlock<'_>) -> Result<(), super::Err
     Ok(())
 }
 
-fn encode_fcall<W: Write>(w: &mut W, tag: &u16, fcall: &Fcall<'_>) -> Result<(), super::Error> {
+fn encode_fcall<W: Write>(
+    w: &mut W,
+    tag: &u16,
+    fcall: &Fcall<'_>,
+) -> Result<(), transport::WriteError> {
     match fcall {
         Fcall::Rlerror(v) => {
             encode_u8(w, FcallType::Rlerror as u8)?;
