@@ -29,7 +29,7 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
         set_platform(platform);
     });
 
-    let mut shim_builder = crate::LinuxShimBuilder::new();
+    let shim_builder = crate::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
@@ -37,8 +37,8 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
             .expect("Failed to set permissions on root");
     });
     let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
-    shim_builder.set_fs(shim_builder.default_fs(in_mem_fs, tar_ro_fs));
-    shim_builder.build().0.new_test_task()
+    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, tar_ro_fs));
+    shim_builder.build().0.new_test_task(fs)
 }
 
 #[test]

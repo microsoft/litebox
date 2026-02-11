@@ -76,7 +76,7 @@ impl TestLauncher {
     }
 
     pub fn test_load_exec_common(mut self, executable_path: &str) {
-        self.shim_builder.set_fs(self.fs);
+        let fs = std::sync::Arc::new(self.fs);
         let argv = vec![
             CString::new(executable_path).unwrap(),
             CString::new("hello").unwrap(),
@@ -84,7 +84,7 @@ impl TestLauncher {
         let envp = vec![CString::new("PATH=/bin").unwrap()];
         let shim = self.shim_builder.build();
         let program = shim
-            .load_program(self.platform.init_task(), executable_path, argv, envp)
+            .load_program(fs, self.platform.init_task(), executable_path, argv, envp)
             .unwrap();
         unsafe {
             litebox_platform_windows_userland::run_thread(

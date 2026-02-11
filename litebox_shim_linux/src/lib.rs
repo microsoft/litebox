@@ -140,27 +140,25 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
 }
 
 /// The shim entry point structure.
-pub struct LinuxShimBuilder<FS: ShimFS> {
+pub struct LinuxShimBuilder {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
-    fs: Option<FS>,
     load_filter: Option<LoadFilter>,
 }
 
-impl<FS: ShimFS> Default for LinuxShimBuilder<FS> {
+impl Default for LinuxShimBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<FS: ShimFS> LinuxShimBuilder<FS> {
+impl LinuxShimBuilder {
     /// Returns a new shim builder.
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
         Self {
             platform,
             litebox: LiteBox::new(platform),
-            fs: None,
             load_filter: None,
         }
     }
@@ -168,14 +166,6 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
     /// Returns the litebox object for the shim.
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.litebox
-    }
-
-    /// Set the global file system
-    ///
-    /// NOTE: This function signature might change as better parametricity is added to file systems.
-    /// Related: <https://github.com/MSRSSP/litebox/issues/24>
-    pub fn set_fs(&mut self, fs: FS) {
-        self.fs = Some(fs);
     }
 
     /// Create a default layered file system with the given in-memory and tar read-only layers.
@@ -193,19 +183,12 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
     }
 
     /// Build the shim.
-    ///
-    /// # Panics
-    /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
-    /// before calling this method.
-    pub fn build(self) -> LinuxShim<FS> {
+    pub fn build<FS: ShimFS>(self) -> LinuxShim<FS> {
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
             platform: self.platform,
             pm: PageManager::new(&self.litebox),
-            fs: self
-                .fs
-                .expect("File system must be set before calling build"),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
@@ -231,6 +214,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
     /// initial register state.
     pub fn load_program(
         &self,
+        fs: alloc::sync::Arc<FS>,
         task: litebox_common_linux::TaskParams,
         path: &str,
         argv: Vec<alloc::ffi::CString>,
@@ -245,7 +229,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             egid,
         } = task;
 
-        let files = Arc::new(syscalls::file::FilesState::new());
+        let files = Arc::new(syscalls::file::FilesState::new(fs));
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
 
         let entrypoints = crate::LinuxShimEntrypoints {
@@ -344,15 +328,15 @@ pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<FS>) {
         use litebox::fs::{Mode, OFlags};
-        let stdin = global
+        let stdin = self
             .fs
             .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
             .unwrap();
-        let stdout = global
+        let stdout = self
             .fs
             .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
             .unwrap();
-        let stderr = global
+        let stderr = self
             .fs
             .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
             .unwrap();
@@ -1155,8 +1139,6 @@ struct GlobalState<FS: ShimFS> {
     litebox: litebox::LiteBox<Platform>,
     /// The page manager for managing virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
-    /// The filesystem implementation.
-    fs: FS,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
@@ -1212,11 +1194,11 @@ mod test_utils {
 
     impl<FS: ShimFS> GlobalState<FS> {
         /// Make a new task with default values for testing.
-        pub(crate) fn new_test_task(self: Arc<Self>) -> Task<FS> {
+        pub(crate) fn new_test_task(self: Arc<Self>, fs: alloc::sync::Arc<FS>) -> Task<FS> {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let files = Arc::new(syscalls::file::FilesState::new());
+            let files = Arc::new(syscalls::file::FilesState::new(fs));
             files.initialize_stdio_in_shared_descriptors_table(&self);
             Task {
                 wait_state: wait::WaitState::new(self.platform),
