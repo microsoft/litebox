@@ -99,7 +99,7 @@ impl Task {
             }
             Ok(copied)
         };
-        let fixed_addr = flags.contains(MapFlags::MAP_FIXED);
+        let fixed_addr = flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
         self.do_mmap(
             suggested_addr,
             len,
@@ -135,8 +135,7 @@ impl Task {
                 | MapFlags::MAP_SYNC
                 | MapFlags::MAP_HUGETLB
                 | MapFlags::MAP_HUGE_2MB
-                | MapFlags::MAP_HUGE_1GB
-                | MapFlags::MAP_FIXED_NOREPLACE,
+                | MapFlags::MAP_HUGE_1GB,
         ) {
             todo!("Unsupported flags {:?}", flags);
         }
@@ -305,6 +304,115 @@ mod tests {
             .unwrap();
         task.sys_munmap(addr, 0x2000).unwrap();
         task.sys_munmap(new_addr, 0x2000).unwrap();
+    }
+
+    #[test]
+    fn test_mmap_fixed_noreplace() {
+        let task = init_platform(None);
+
+        // First, create an initial mapping at a specific address away from boundaries
+        let base_addr = 0x1000_0000usize; // 256 MiB - safe middle ground
+        let addr1 = task
+            .sys_mmap(
+                base_addr,
+                0x2000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            addr1.as_usize(),
+            base_addr,
+            "First mapping should be at exact address"
+        );
+
+        // Test 1: Full overlap - should fail with EEXIST
+        let err = task
+            .sys_mmap(
+                addr1.as_usize(),
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::EEXIST);
+
+        // Test 2: Partial overlap at end - should fail with EEXIST
+        // Existing: [addr1, addr1 + 0x2000), New: [addr1 + 0x1000, addr1 + 0x3000)
+        let err = task
+            .sys_mmap(
+                addr1.as_usize() + 0x1000,
+                0x2000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::EEXIST);
+
+        // Test 3: Partial overlap at start - should fail with EEXIST
+        // Existing: [addr1, addr1 + 0x2000), New: [addr1 - 0x1000, addr1 + 0x1000)
+        let err = task
+            .sys_mmap(
+                addr1.as_usize() - 0x1000,
+                0x2000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::EEXIST);
+
+        // Test 4: Adjacent mapping (right after) - should succeed
+        let addr2 = task
+            .sys_mmap(
+                addr1.as_usize() + 0x2000,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(addr2.as_usize(), addr1.as_usize() + 0x2000);
+
+        // Test 5: Adjacent mapping (right before) - should succeed
+        let addr3 = task
+            .sys_mmap(
+                addr1.as_usize() - 0x1000,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(addr3.as_usize(), addr1.as_usize() - 0x1000);
+
+        // Test 6: Zero address with MAP_FIXED_NOREPLACE - should fail with EPERM
+        // (matches Linux behavior where vm.mmap_min_addr prevents mapping at address 0)
+        let err = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::EPERM);
+
+        // Clean up
+        task.sys_munmap(addr3, 0x1000).unwrap();
+        task.sys_munmap(addr1, 0x2000).unwrap();
+        task.sys_munmap(addr2, 0x1000).unwrap();
     }
 
     #[cfg(any(

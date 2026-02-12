@@ -41,9 +41,14 @@ pub fn do_mmap<
 ) -> Result<Platform::RawMutPointer<u8>, litebox::mm::linux::MappingError> {
     let flags = {
         let mut create_flags = CreatePagesFlags::empty();
+        // MAP_FIXED_NOREPLACE implies MAP_FIXED behavior (exact address, not a hint)
         create_flags.set(
             CreatePagesFlags::FIXED_ADDR,
-            flags.contains(MapFlags::MAP_FIXED),
+            flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
+        );
+        create_flags.set(
+            CreatePagesFlags::NOREPLACE,
+            flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
         );
         create_flags.set(
             CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,

@@ -58,8 +58,7 @@ impl Task {
                 | MapFlags::MAP_SYNC
                 | MapFlags::MAP_HUGETLB
                 | MapFlags::MAP_HUGE_2MB
-                | MapFlags::MAP_HUGE_1GB
-                | MapFlags::MAP_FIXED_NOREPLACE,
+                | MapFlags::MAP_HUGE_1GB,
         ) {
             todo!("Unsupported flags {:?}", flags);
         }

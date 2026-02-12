@@ -116,7 +116,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
                     RemapError::AlreadyAllocated
                 }
                 AllocationError::Unaligned
-                | AllocationError::InvalidRange
+                | AllocationError::BelowMinAddress
+                | AllocationError::AboveMaxAddress
                 | AllocationError::AddressPartiallyInUse => unreachable!(),
             })?;
 
@@ -193,8 +194,10 @@ pub enum FixedAddressBehavior {
 pub enum AllocationError {
     #[error("provided range is not page-aligned")]
     Unaligned,
-    #[error("provided range is invalid")]
-    InvalidRange,
+    #[error("provided address is below the minimum allowed address")]
+    BelowMinAddress,
+    #[error("provided address is above the maximum allowed address")]
+    AboveMaxAddress,
     #[error("out of memory")]
     OutOfMemory,
     #[error("provided fixed address range is in use")]

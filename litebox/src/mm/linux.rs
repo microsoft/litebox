@@ -117,6 +117,9 @@ bitflags::bitflags! {
         const ENSURE_SPACE_AFTER = 1 << 3;
         // This flag indicates that the mapping is backed by a file.
         const MAP_FILE = 1 << 4;
+        /// When combined with [`Self::FIXED_ADDR`], fail with [`AllocationError::AddressInUse`]
+        /// if any part of the range is already mapped, instead of replacing existing mappings.
+        const NOREPLACE = 1 << 5;
     }
 }
 
@@ -414,8 +417,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let (start, end) = (suggested_range.start, suggested_range.end);
-        if start < Platform::TASK_ADDR_MIN || end > Platform::TASK_ADDR_MAX {
-            return Err(AllocationError::InvalidRange);
+        if start < Platform::TASK_ADDR_MIN {
+            return Err(AllocationError::BelowMinAddress);
+        }
+        if end > Platform::TASK_ADDR_MAX {
+            return Err(AllocationError::AboveMaxAddress);
         }
         let platform_fixed_address_behavior = match fixed_address_behavior {
             FixedAddressBehavior::Hint => FixedAddressBehavior::Hint,
@@ -493,11 +499,23 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// Return `Some(new_addr)` if the mapping is created successfully.
     /// The returned address is `ALIGN`-aligned.
     ///
+    /// # Fixed Address Behavior
+    ///
+    /// - [`CreatePagesFlags::FIXED_ADDR`] alone: Forces allocation at the exact address, replacing
+    ///   any existing overlapping mappings. Caller must ensure overlapping mappings are not in use.
+    /// - [`CreatePagesFlags::FIXED_ADDR`] with [`CreatePagesFlags::NOREPLACE`]: Forces allocation at
+    ///   the exact address, but fails with [`AllocationError::AddressInUse`] if any part of the
+    ///   range is already mapped. This is safe to use without checking for existing mappings first.
+    /// - Without [`CreatePagesFlags::FIXED_ADDR`], the address is treated as a hint.
+    ///
+    /// Note: `NOREPLACE` error responses (`AddressInUse` / `EEXIST`) can be used to probe memory
+    /// layout. This matches Linux kernel behavior for `MAP_FIXED_NOREPLACE`.
+    ///
     /// # Safety
     ///
-    /// Note that if the suggested address is given and `fixed_addr` is set to `true`,
-    /// the kernel uses it directly without checking if it is available, causing overlapping
-    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    /// When using [`CreatePagesFlags::FIXED_ADDR`] without [`CreatePagesFlags::NOREPLACE`], the
+    /// caller must ensure any overlapping mappings are not used by any other code, as they will be
+    /// unmapped.
     pub(super) unsafe fn create_mapping(
         &mut self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -527,7 +545,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 vma,
                 flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
                 if flags.contains(CreatePagesFlags::FIXED_ADDR) {
-                    FixedAddressBehavior::Replace
+                    if flags.contains(CreatePagesFlags::NOREPLACE) {
+                        FixedAddressBehavior::NoReplace
+                    } else {
+                        FixedAddressBehavior::Replace
+                    }
                 } else {
                     FixedAddressBehavior::Hint
                 },
@@ -607,7 +629,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     | AllocationError::AddressInUseByPlatform
                     | AllocationError::AddressPartiallyInUse,
                 ) => return Err(VmemResizeError::RangeOccupied(range.into())),
-                Err(AllocationError::Unaligned | AllocationError::InvalidRange) => unreachable!(),
+                Err(
+                    AllocationError::Unaligned
+                    | AllocationError::BelowMinAddress
+                    | AllocationError::AboveMaxAddress,
+                ) => unreachable!(),
             }
             return Ok(());
         }
@@ -840,6 +866,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             {
                 return Some(suggested_address.0);
             }
+        } else if fixed_addr {
+            // MAP_FIXED with addr=0: return 0 so insert_mapping rejects it
+            // via the TASK_ADDR_MIN check (BelowMinAddress → EPERM).
+            return Some(0);
         }
 
         // top down
