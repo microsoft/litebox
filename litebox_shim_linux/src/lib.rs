@@ -94,6 +94,20 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
+        if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
+            if unsafe {
+                self.task
+                    .global
+                    .pm
+                    .handle_page_fault(info.cr2, info.error_code.into())
+            }
+            .is_ok()
+            {
+                return ContinueOperation::ResumeKernelPlatform;
+            } else {
+                return ContinueOperation::ExceptionFixup;
+            }
+        }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
 

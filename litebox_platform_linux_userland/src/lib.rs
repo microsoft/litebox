@@ -1596,6 +1596,7 @@ extern "C-unwind" fn exception_handler(
         exception: litebox::shim::Exception(trapno.try_into().unwrap()),
         error_code: error.try_into().unwrap(),
         cr2,
+        kernel_mode: false,
     };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
 }
@@ -1632,6 +1633,12 @@ impl ThreadContext<'_> {
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
             ContinueOperation::ExitThread => {}
+            ContinueOperation::ResumeKernelPlatform => {
+                panic!("ResumeKernelPlatform not expected in linux_userland")
+            }
+            ContinueOperation::ExceptionFixup => {
+                panic!("ExceptionFixup not expected in linux_userland")
+            }
         }
     }
 }
@@ -2227,6 +2234,25 @@ impl litebox::platform::CrngProvider for LinuxUserland {
 /// We might need to emulate these functions' behaviors using virtual addresses for development or
 /// testing, or use a kernel module to provide this functionality (if needed).
 impl<const ALIGN: usize> VmapManager<ALIGN> for LinuxUserland {}
+
+/// Dummy `VmemPageFaultHandler`.
+///
+/// Page faults are handled transparently by the host Linux kernel.
+/// Provided to satisfy trait bounds for `PageManager::handle_page_fault`.
+impl litebox::mm::linux::VmemPageFaultHandler for LinuxUserland {
+    unsafe fn handle_page_fault(
+        &self,
+        _fault_addr: usize,
+        _flags: litebox::mm::linux::VmFlags,
+        _error_code: u64,
+    ) -> Result<(), litebox::mm::linux::PageFaultError> {
+        unreachable!("host kernel handles page faults for Linux userland")
+    }
+
+    fn access_error(_error_code: u64, _flags: litebox::mm::linux::VmFlags) -> bool {
+        unreachable!("host kernel handles page faults for Linux userland")
+    }
+}
 
 #[cfg(test)]
 mod tests {

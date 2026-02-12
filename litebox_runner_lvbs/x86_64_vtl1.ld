@@ -23,6 +23,13 @@ SECTIONS
         _data_start = .;
         *(.rodata .rodata.*)
         *(.data .data.*)
+
+        /* Exception table for fallible memory operations (memcpy_fallible, etc.) */
+        . = ALIGN(4);
+        __start_ex_table = .;
+        KEEP(*(ex_table))
+        __stop_ex_table = .;
+
         _data_end = .;
 
         . = ALIGN(0x1000);

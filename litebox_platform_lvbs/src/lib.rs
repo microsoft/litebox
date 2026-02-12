@@ -9,7 +9,7 @@
 use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
 use core::{
     arch::asm,
-    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64},
 };
 use hashbrown::HashMap;
 use litebox::platform::{
@@ -50,9 +50,35 @@ pub mod mshv;
 
 pub mod syscall_entry;
 
+/// Allocate a zeroed `Box<T>` directly on the heap, avoiding stack intermediaries
+/// for large types (e.g., 4096-byte `HekiPage`).
+///
+/// This is safe because `T: FromBytes` guarantees that all-zero bytes are a valid `T`.
+///
+/// # Panics
+///
+/// Panics if `T` is a zero-sized type, since `alloc_zeroed` with a zero-sized
+/// layout is undefined behavior.
+fn box_new_zeroed<T: FromBytes>() -> alloc::boxed::Box<T> {
+    assert!(
+        core::mem::size_of::<T>() > 0,
+        "box_new_zeroed does not support zero-sized types"
+    );
+    let layout = core::alloc::Layout::new::<T>();
+    // Safety: layout has a non-zero size and correct alignment for T.
+    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) }.cast::<T>();
+    if ptr.is_null() {
+        alloc::alloc::handle_alloc_error(layout);
+    }
+    // Safety: ptr is a valid, zeroed, properly aligned heap allocation for T.
+    // T: FromBytes guarantees all-zero is a valid bit pattern.
+    unsafe { alloc::boxed::Box::from_raw(ptr) }
+}
+
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
 /// Special page table ID for the base (kernel-only) page table.
+/// No real physical frame has address 0, so this is a safe sentinel.
 pub const BASE_PAGE_TABLE_ID: usize = 0;
 
 /// Maximum virtual address (exclusive) for user-space allocations.
@@ -92,14 +118,8 @@ pub struct PageTableManager {
     base_page_table: mm::PageTable<PAGE_SIZE>,
     /// Cached physical frame of the base page table (for fast CR3 comparison).
     base_page_table_frame: PhysFrame<Size4KiB>,
-    /// Task page tables indexed by their ID (starting from 1).
-    /// Each contains kernel mappings + task-specific user-space mappings.
+    /// Task page tables keyed by their P4 frame start address (the page table ID).
     task_page_tables: spin::Mutex<HashMap<usize, alloc::boxed::Box<mm::PageTable<PAGE_SIZE>>>>,
-    /// Reverse lookup: physical frame -> page table ID (for O(1) CR3 lookup).
-    /// Only contains task page tables (base page table is checked separately).
-    frame_to_id: spin::Mutex<HashMap<PhysFrame<Size4KiB>, usize>>,
-    /// Next available task page table ID.
-    next_task_pt_id: AtomicUsize,
 }
 
 impl PageTableManager {
@@ -115,8 +135,6 @@ impl PageTableManager {
             base_page_table: base_pt,
             base_page_table_frame: base_frame,
             task_page_tables: spin::Mutex::new(HashMap::new()),
-            frame_to_id: spin::Mutex::new(HashMap::new()),
-            next_task_pt_id: AtomicUsize::new(1),
         }
     }
 
@@ -139,25 +157,18 @@ impl PageTableManager {
             return &self.base_page_table;
         }
 
-        // Look up task page table by frame using the reverse lookup map
-        let task_pt_id = {
-            let frame_to_id = self.frame_to_id.lock();
-            frame_to_id.get(&cr3_frame).copied()
-        };
-
-        if let Some(id) = task_pt_id {
-            let task_pts = self.task_page_tables.lock();
-            if let Some(pt) = task_pts.get(&id) {
-                // SAFETY: Three invariants guarantee this reference remains valid:
-                // 1. The PageTable is Box-allocated, so HashMap rehashing does not
-                //    move the PageTable itself (only the Box pointer moves).
-                // 2. This page table is the current CR3, so `delete_task_page_table`
-                //    will refuse to remove it (returns EBUSY).
-                // 3. The PageTableManager is 'static, so neither it nor the HashMap
-                //    will be deallocated.
-                let pt_ref: &mm::PageTable<PAGE_SIZE> = pt;
-                return unsafe { &*core::ptr::from_ref(pt_ref) };
-            }
+        let cr3_id: usize = cr3_frame.start_address().as_u64().truncate();
+        let task_pts = self.task_page_tables.lock();
+        if let Some(pt) = task_pts.get(&cr3_id) {
+            // SAFETY: Three invariants guarantee this reference remains valid:
+            // 1. The PageTable is Box-allocated, so HashMap rehashing does not
+            //    move the PageTable itself (only the Box pointer moves).
+            // 2. This page table is the current CR3, so `delete_task_page_table`
+            //    will refuse to remove it (returns EBUSY).
+            // 3. The PageTableManager is 'static, so neither it nor the HashMap
+            //    will be deallocated.
+            let pt_ref: &mm::PageTable<PAGE_SIZE> = pt;
+            return unsafe { &*core::ptr::from_ref(pt_ref) };
         }
 
         // CR3 doesn't match any known page table - this shouldn't happen
@@ -185,16 +196,8 @@ impl PageTableManager {
             return BASE_PAGE_TABLE_ID;
         }
 
-        let frame_to_id = self.frame_to_id.lock();
-        if let Some(&id) = frame_to_id.get(&cr3_frame) {
-            return id;
-        }
-
-        // CR3 doesn't match any known page table - this shouldn't happen
-        unreachable!(
-            "CR3 contains unknown page table: {:?}",
-            cr3_frame.start_address()
-        );
+        // The task page table ID is the start address of the P4 frame.
+        cr3_frame.start_address().as_u64().truncate()
     }
 
     /// Returns `true` if the base page table is currently active.
@@ -256,8 +259,8 @@ impl PageTableManager {
     ///
     /// # Returns
     ///
-    /// The ID of the newly created task page table, or `Err(Errno::ENOMEM)` if
-    /// allocation fails or the ID space is exhausted.
+    /// The ID of the newly created task page table (its P4 frame start address),
+    /// or `Err(Errno::ENOMEM)` if allocation fails.
     pub fn create_task_page_table(
         &self,
         vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
@@ -273,21 +276,11 @@ impl PageTableManager {
             return Err(Errno::ENOMEM);
         }
 
-        let task_pt_id = self.next_task_pt_id.fetch_add(1, Ordering::Relaxed);
-        if task_pt_id == 0 {
-            // Wrapped around, which shouldn't happen in practice
-            return Err(Errno::ENOMEM);
-        }
-
         let pt = alloc::boxed::Box::new(pt);
-        let phys_frame = pt.get_physical_frame();
+        let task_pt_id: usize = pt.get_physical_frame().start_address().as_u64().truncate();
 
         let mut task_pts = self.task_page_tables.lock();
         task_pts.insert(task_pt_id, pt);
-        drop(task_pts);
-
-        let mut frame_to_id = self.frame_to_id.lock();
-        frame_to_id.insert(phys_frame, task_pt_id);
 
         Ok(task_pt_id)
     }
@@ -319,19 +312,17 @@ impl PageTableManager {
             return Err(Errno::EINVAL);
         }
 
-        // Ensure we're not deleting the current page table (check CR3)
-        if self.current_page_table_id() == task_pt_id {
+        let mut task_pts = self.task_page_tables.lock();
+
+        // Check CR3 under the same lock to avoid TOCTOU with the removal below.
+        let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
+        let cr3_id: usize = cr3_frame.start_address().as_u64().truncate();
+        if cr3_id == task_pt_id {
             return Err(Errno::EBUSY);
         }
 
-        let mut task_pts = self.task_page_tables.lock();
         if let Some(pt) = task_pts.remove(&task_pt_id) {
-            let phys_frame = pt.get_physical_frame();
             drop(task_pts);
-
-            let mut frame_to_id = self.frame_to_id.lock();
-            frame_to_id.remove(&phys_frame);
-            drop(frame_to_id);
 
             // Safety: We're about to delete this page table, so it's safe to unmap all pages.
             unsafe {
@@ -522,42 +513,65 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         }
     }
 
+    /// Map a VTL0 physical range and return a guard that unmaps on drop.
+    fn map_vtl0_guard(
+        &self,
+        phys_addr: x86_64::PhysAddr,
+        size: u64,
+        flags: PageTableFlags,
+    ) -> Option<Vtl0MappedGuard<'_, Host>> {
+        let (page_addr, page_aligned_length) = self
+            .map_vtl0_phys_range(phys_addr, phys_addr + size, flags)
+            .ok()?;
+        let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
+        Some(Vtl0MappedGuard {
+            owner: self,
+            page_addr,
+            page_aligned_length,
+            ptr: page_addr.wrapping_add(page_offset),
+            size: size.truncate(),
+        })
+    }
+
     /// This function copies data from VTL0 physical memory to the VTL1 kernel through `Box`.
     /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
-    /// Better to replace this function with `<data type>::from_bytes()` or similar
+    ///
     /// # Safety
     ///
     /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
-    /// # Panics
-    ///
-    /// Panics if `phys_addr` is invalid or not properly aligned for `T`
-    pub unsafe fn copy_from_vtl0_phys<T: Copy>(
+    pub unsafe fn copy_from_vtl0_phys<T: FromBytes + Copy>(
         &self,
         phys_addr: x86_64::PhysAddr,
     ) -> Option<alloc::boxed::Box<T>> {
-        use alloc::boxed::Box;
-
-        if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
-            phys_addr,
-            phys_addr + core::mem::size_of::<T>() as u64,
-            PageTableFlags::PRESENT,
-        ) {
-            let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
-            let src_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
-            assert!(src_ptr.is_aligned(), "src_ptr is not properly aligned");
-
-            // Safety: src_ptr points to valid VTL0 memory that was just mapped
-            let boxed = Box::<T>::new(unsafe { core::ptr::read_volatile(src_ptr) });
-
-            assert!(
-                self.unmap_vtl0_pages(page_addr, length).is_ok(),
-                "Failed to unmap VTL0 pages"
-            );
-
-            Some(boxed)
-        } else {
-            None
+        if core::mem::size_of::<T>() == 0 {
+            return Some(alloc::boxed::Box::new(T::new_zeroed()));
         }
+
+        let src_guard = self.map_vtl0_guard(
+            phys_addr,
+            core::mem::size_of::<T>() as u64,
+            PageTableFlags::PRESENT,
+        )?;
+
+        let mut boxed = box_new_zeroed::<T>();
+        // Use memcpy_fallible instead of ptr::copy_nonoverlapping to handle
+        // the race where another core unmaps this page (via a shared page
+        // table) between map_vtl0_guard and the copy.  The mapping is valid
+        // at this point, so a fault is not expected in the common case.
+        // TODO: Once VTL0 page-range locking is in place, this fallible copy
+        // may become unnecessary since the lock would prevent concurrent
+        // unmapping.  It could still serve as a safety net against callers
+        // that forget to acquire the lock.
+        let result = unsafe {
+            litebox::mm::exception_table::memcpy_fallible(
+                core::ptr::from_mut::<T>(boxed.as_mut()).cast(),
+                src_guard.ptr,
+                src_guard.size,
+            )
+        };
+        debug_assert!(result.is_ok(), "fault copying from VTL0 mapped page");
+
+        result.ok().map(|()| boxed)
     }
 
     /// This function copies data from the VTL1 kernel to VTL0 physical memory.
@@ -565,34 +579,33 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// # Safety
     ///
     /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
-    /// # Panics
-    ///
-    /// Panics if phys_addr is invalid or not properly aligned for `T`
     pub unsafe fn copy_to_vtl0_phys<T: Copy>(
         &self,
         phys_addr: x86_64::PhysAddr,
         value: &T,
     ) -> bool {
-        if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
-            phys_addr,
-            phys_addr + core::mem::size_of::<T>() as u64,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-        ) {
-            let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
-            let dst_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
-            assert!(dst_ptr.is_aligned(), "dst_ptr is not properly aligned");
-
-            // Safety: dst_ptr points to valid VTL0 memory that was just mapped
-            unsafe { core::ptr::write_volatile(dst_ptr, *value) };
-
-            assert!(
-                self.unmap_vtl0_pages(page_addr, length).is_ok(),
-                "Failed to unmap VTL0 pages"
-            );
-            true
-        } else {
-            false
+        if core::mem::size_of::<T>() == 0 {
+            return true;
         }
+
+        let Some(dst_guard) = self.map_vtl0_guard(
+            phys_addr,
+            core::mem::size_of::<T>() as u64,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        ) else {
+            return false;
+        };
+
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
+            litebox::mm::exception_table::memcpy_fallible(
+                dst_guard.ptr,
+                core::ptr::from_ref::<T>(value).cast::<u8>(),
+                dst_guard.size,
+            )
+        };
+        debug_assert!(result.is_ok(), "fault copying to VTL0 mapped page");
+        result.is_ok()
     }
 
     /// This function copies a slice from the VTL1 kernel to VTL0 physical memory.
@@ -601,40 +614,33 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// # Safety
     ///
     /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address.
-    ///
-    /// # Panics
-    ///
-    /// Panics if phys_addr is invalid or not properly aligned for `T`
     pub unsafe fn copy_slice_to_vtl0_phys<T: Copy>(
         &self,
         phys_addr: x86_64::PhysAddr,
         value: &[T],
     ) -> bool {
-        if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
-            phys_addr,
-            phys_addr + core::mem::size_of_val(value) as u64,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-        ) {
-            let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
-            let dst_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
-            assert!(dst_ptr.is_aligned(), "dst_ptr is not properly aligned");
-
-            // Safety: dst_ptr points to mapped VTL0 memory with enough space for value.len()
-            // elements. We use copy_nonoverlapping instead of creating a slice reference
-            // because VTL0 memory is external (similar to MMIO/DMA) and may be concurrently
-            // modified, which would violate Rust's aliasing model for references.
-            unsafe {
-                core::ptr::copy_nonoverlapping(value.as_ptr(), dst_ptr, value.len());
-            }
-
-            assert!(
-                self.unmap_vtl0_pages(page_addr, length).is_ok(),
-                "Failed to unmap VTL0 pages"
-            );
-            true
-        } else {
-            false
+        if core::mem::size_of_val(value) == 0 {
+            return true;
         }
+
+        let Some(dst_guard) = self.map_vtl0_guard(
+            phys_addr,
+            core::mem::size_of_val(value) as u64,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        ) else {
+            return false;
+        };
+
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
+            litebox::mm::exception_table::memcpy_fallible(
+                dst_guard.ptr,
+                value.as_ptr().cast::<u8>(),
+                dst_guard.size,
+            )
+        };
+        debug_assert!(result.is_ok(), "fault copying to VTL0 mapped page");
+        result.is_ok()
     }
 
     /// This function copies a slice from VTL0 physical memory to the VTL1 kernel.
@@ -643,39 +649,33 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// # Safety
     ///
     /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address.
-    ///
-    /// # Panics
-    ///
-    /// Panics if phys_addr is invalid or not properly aligned for `T`
     pub unsafe fn copy_slice_from_vtl0_phys<T: Copy>(
         &self,
         phys_addr: x86_64::PhysAddr,
         buf: &mut [T],
     ) -> bool {
-        if let Ok((page_addr, length)) = self.map_vtl0_phys_range(
-            phys_addr,
-            phys_addr + core::mem::size_of_val(buf) as u64,
-            PageTableFlags::PRESENT,
-        ) {
-            let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
-            let src_ptr = page_addr.wrapping_add(page_offset).cast::<T>();
-            assert!(src_ptr.is_aligned(), "src_ptr is not properly aligned");
-
-            // Safety: see copy_slice_to_vtl0_phys for why we use copy_nonoverlapping
-            // instead of creating a slice reference to VTL0 memory.
-            unsafe {
-                core::ptr::copy_nonoverlapping(src_ptr, buf.as_mut_ptr(), buf.len());
-            }
-
-            assert!(
-                self.unmap_vtl0_pages(page_addr, length).is_ok(),
-                "Failed to unmap VTL0 pages"
-            );
-
+        if core::mem::size_of_val(buf) == 0 {
             return true;
         }
 
-        false
+        let Some(src_guard) = self.map_vtl0_guard(
+            phys_addr,
+            core::mem::size_of_val(buf) as u64,
+            PageTableFlags::PRESENT,
+        ) else {
+            return false;
+        };
+
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
+            litebox::mm::exception_table::memcpy_fallible(
+                buf.as_mut_ptr().cast::<u8>(),
+                src_guard.ptr,
+                src_guard.size,
+            )
+        };
+        debug_assert!(result.is_ok(), "fault copying from VTL0 mapped page");
+        result.is_ok()
     }
 
     /// Create a new task page table for VTL1 user space and returns its ID.
@@ -756,6 +756,26 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// Enable syscall support in the platform.
     pub fn enable_syscall_support() {
         syscall_entry::init();
+    }
+}
+
+/// RAII guard that unmaps VTL0 physical pages when dropped.
+struct Vtl0MappedGuard<'a, Host: HostInterface> {
+    owner: &'a LinuxKernel<Host>,
+    page_addr: *mut u8,
+    page_aligned_length: usize,
+    ptr: *mut u8,
+    size: usize,
+}
+
+impl<Host: HostInterface> Drop for Vtl0MappedGuard<'_, Host> {
+    fn drop(&mut self) {
+        assert!(
+            self.owner
+                .unmap_vtl0_pages(self.page_addr, self.page_aligned_length)
+                .is_ok(),
+            "Failed to unmap VTL0 pages"
+        );
     }
 }
 
@@ -1521,14 +1541,79 @@ macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
     };
 }
 
-/// Restore user context from the memory area pointed by the current `rsp`.
+/// Save user context after an ISR exception into the user context area.
 ///
-/// This macro uses the `pop` instructions (i.e., from low addresses up to high ones) such that
-/// it requires the start address of the memory area (not the top one).
+/// Similar to `SAVE_SYSCALL_USER_CONTEXT_ASM` but it preserves all GPRs.
+/// The ISR stub pushes the vector number on top of the CPU-pushed error code
+/// and iret frame. This macro copies them via a saved ISR stack pointer.
 ///
-/// Prerequisite: The memory area has `PtRegs` structure containing user context.
+/// Prerequisites:
+/// - `rsp` points to the top of the user context area (push target)
+/// - `rax` points to the ISR stack: `[rax]`=vector, `[rax+8]`=error_code,
+///   `[rax+16]`=RIP, `[rax+24]`=CS, `[rax+32]`=RFLAGS, `[rax+40]`=RSP,
+///   `[rax+48]`=SS
+/// - All GPRs except `rax` contain user-mode values
+/// - User `rax` has been saved to per-CPU scratch
+/// - `swapgs` has already been executed (GS = kernel)
+///
+/// Clobbers: rax
 #[cfg(target_arch = "x86_64")]
-macro_rules! RESTORE_USER_CONTEXT_ASM {
+macro_rules! SAVE_PF_USER_CONTEXT_ASM {
+    () => {
+        "
+        push [rax + 48]   // pt_regs->ss
+        push [rax + 40]   // pt_regs->rsp
+        push [rax + 32]   // pt_regs->eflags
+        push [rax + 24]   // pt_regs->cs
+        push [rax + 16]   // pt_regs->rip
+        push [rax + 8]    // pt_regs->orig_rax (error code)
+        push rdi          // pt_regs->rdi
+        push rsi          // pt_regs->rsi
+        push rdx          // pt_regs->rdx
+        push rcx          // pt_regs->rcx
+        mov rax, gs:[{scratch_off}]
+        push rax          // pt_regs->rax
+        push r8           // pt_regs->r8
+        push r9           // pt_regs->r9
+        push r10          // pt_regs->r10
+        push r11          // pt_regs->r11
+        push rbx          // pt_regs->rbx
+        push rbp          // pt_regs->rbp
+        push r12          // pt_regs->r12
+        push r13          // pt_regs->r13
+        push r14          // pt_regs->r14
+        push r15          // pt_regs->r15
+        "
+    };
+}
+
+/// Save all general-purpose registers onto the stack.
+#[cfg(target_arch = "x86_64")]
+macro_rules! SAVE_CPU_CONTEXT_ASM {
+    () => {
+        "
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push rax
+        push r8
+        push r9
+        push r10
+        push r11
+        push rbx
+        push rbp
+        push r12
+        push r13
+        push r14
+        push r15
+        "
+    };
+}
+
+/// Restore all general-purpose registers and skip `orig_rax` from the stack.
+#[cfg(target_arch = "x86_64")]
+macro_rules! RESTORE_CPU_CONTEXT_ASM {
     () => {
         "
         pop r15
@@ -1595,13 +1680,65 @@ unsafe extern "C" fn run_thread_arch(
         "mov rdi, [rsp]", // pass `thread_ctx`
         "call {syscall_handler}",
         "jmp done",
-        // Exception and interrupt callback placeholders
-        // IDT handler functions will jump to these labels to
-        // handle user-mode exceptions/interrupts.
-        // Note that these two callbacks are not yet implemented and no code path jumps to them.
+        // Exception callback: entered from ISR stubs for user-mode exceptions.
+        // At this point:
+        // - rsp = ISR stack: [vector, error_code, rip, cs, rflags, rsp, ss]
+        // - All GPRs contain user-mode values
+        // - Interrupts are disabled (IDT gate clears IF)
+        // - GS = user (swapgs has NOT happened yet)
         ".globl exception_callback",
         "exception_callback:",
+        "swapgs",
+        "mov gs:[{scratch_off}], rax", // Save `rax` to per-CPU scratch
+        "mov al, [rsp]",
+        "mov gs:[{exception_trapno_off}], al", // vector number from ISR stack
+        "mov rax, rsp", // store ISR `rsp` in `rax`
+        "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
+        SAVE_PF_USER_CONTEXT_ASM!(),
+        XSAVE_VTL1_ASM!({vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
+        "mov rbp, gs:[{cur_kernel_bp_off}]",
+        "mov rsp, gs:[{cur_kernel_sp_off}]",
+        "mov rdi, [rsp]", // pass `thread_ctx`
+        "xor esi, esi",   // kernel_mode = false
+        "mov rdx, cr2",   // cr2 (still valid — nothing overwrites it)
+        "call {exception_handler}",
         "jmp done",
+        // Kernel-mode exception callback (currently used for #PF demand paging
+        // and exception-table fixup).
+        // At entry:
+        // - rsp = ISR stack: [vector, error_code, rip, cs, rflags, rsp, ss]
+        // - All GPRs = kernel values at time of fault
+        // - Interrupts are disabled (IDT gate clears IF)
+        // - GS = kernel (no swapgs needed)
+        //
+        // Saves GPRs, then passes exception info (CR2, error code, faulting
+        // RIP) to exception_handler via registers. exception_handler will try
+        // demand paging, exception table fixup, and kernel panic in that order.
+        ".globl kernel_exception_callback",
+        "kernel_exception_callback:",
+        "add rsp, 8",                       // skip vector number
+        // Now stack: [error_code, rip, cs, rflags, rsp, ss]
+        SAVE_CPU_CONTEXT_ASM!(),
+        "mov rbp, rsp",
+        "and rsp, -16",
+        // Pass exception info via registers (SysV ABI args 1-5)
+        "mov rdi, gs:[{cur_kernel_sp_off}]",
+        "mov rdi, [rdi]",                   // arg1: thread_ctx
+        "mov esi, 1",                       // arg2: kernel_mode = true
+        "mov rdx, cr2",                     // arg3: cr2 (fault address)
+        "mov ecx, [rbp + 120]",             // arg4: error_code (orig_rax slot)
+        "mov r8, [rbp + 128]",              // arg5: faulting RIP (iret frame)
+        "call {exception_handler}",
+        // If demand paging failed, rax contains the exception table fixup
+        // address. Patch the saved RIP on the ISR stack so iretq resumes
+        // at the fixup instead of re-faulting.
+        "test rax, rax",
+        "jz 5f",
+        "mov [rbp + 128], rax",     // patch saved RIP (15 GPRs + error_code = 128)
+        "5:",
+        "mov rsp, rbp",
+        RESTORE_CPU_CONTEXT_ASM!(),
+        "iretq",
         ".globl interrupt_callback",
         "interrupt_callback:",
         "jmp done",
@@ -1621,9 +1758,12 @@ unsafe extern "C" fn run_thread_arch(
         vtl1_kernel_xsaved_off = const { PerCpuVariablesAsm::vtl1_kernel_xsaved_offset() },
         vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
         USER_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+        scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
+        exception_trapno_off = const { PerCpuVariablesAsm::exception_trapno_offset() },
         init_handler = sym init_handler,
         reenter_handler = sym reenter_handler,
         syscall_handler = sym syscall_handler,
+        exception_handler = sym exception_handler,
     );
 }
 
@@ -1631,7 +1771,67 @@ unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
+/// Handles exceptions and routes to the shim's exception handler via `call_shim`.
+///
+/// `cr2` is passed by both kernel- and user-mode assembly callbacks.
+/// For kernel-mode exceptions, `error_code` and `faulting_rip`
+/// are also passed from the ISR stack.
+/// For user-mode exceptions, `error_code` is read from the saved
+/// `orig_rax` in the user context and the vector number is read from
+/// the per-CPU trapno variable.
+///
+/// Returns 0 for normal flow (user-mode or successful demand paging), or
+/// a fixup address when kernel-mode user-space demand paging fails and
+/// an exception table entry exists. Panics if no fixup is found.
+unsafe extern "C" fn exception_handler(
+    thread_ctx: &mut ThreadContext,
+    kernel_mode: bool,
+    cr2: usize,
+    error_code: usize,
+    faulting_rip: usize,
+) -> usize {
+    let info = if kernel_mode {
+        use litebox::utils::TruncateExt as _;
+        litebox::shim::ExceptionInfo {
+            exception: litebox::shim::Exception::PAGE_FAULT,
+            error_code: error_code.truncate(),
+            cr2,
+            kernel_mode: true,
+        }
+    } else {
+        use crate::host::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables_asm};
+        use litebox::utils::TruncateExt as _;
+        litebox::shim::ExceptionInfo {
+            exception: with_per_cpu_variables_asm(PerCpuVariablesAsm::get_exception),
+            error_code: thread_ctx.ctx.orig_rax.truncate(),
+            cr2,
+            kernel_mode: false,
+        }
+    };
+    match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
+        Some(val) => val,
+        None => {
+            // ExceptionFixup: look up exception table, panic if not found.
+            litebox::mm::exception_table::search_exception_tables(faulting_rip).unwrap_or_else(
+                || {
+                    panic!(
+                        "EXCEPTION: PAGE FAULT\n\
+                         Accessed Address: {:#x}\n\
+                         Error Code: {:#x}\n\
+                         Faulting RIP: {:#x}",
+                        info.cr2, info.error_code, faulting_rip,
+                    )
+                },
+            )
+        }
+    }
+}
+
 /// Calls `f` in order to call into a shim entrypoint.
+///
+/// Returns `Some(0)` for most operations. Returns `None` for
+/// `ExceptionFixup` (caller is responsible for looking up the fixup).
+/// For `ResumeGuest`, does not return (switches directly to user mode).
 impl ThreadContext<'_> {
     fn call_shim(
         &mut self,
@@ -1639,11 +1839,12 @@ impl ThreadContext<'_> {
             &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
             &mut litebox_common_linux::PtRegs,
         ) -> ContinueOperation,
-    ) {
+    ) -> Option<usize> {
         let op = f(self.shim, self.ctx);
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_user(self.ctx) },
-            ContinueOperation::ExitThread => {}
+            ContinueOperation::ExitThread | ContinueOperation::ResumeKernelPlatform => Some(0),
+            ContinueOperation::ExceptionFixup => None,
         }
     }
 }
@@ -1681,7 +1882,7 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         XRSTOR_VTL1_ASM!({vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
         // Restore user context from ctx.
         "mov rsp, rdi",
-        RESTORE_USER_CONTEXT_ASM!(),
+        RESTORE_CPU_CONTEXT_ASM!(),
         // clear the GS base register (as the `KernelGsBase` MSR contains 0)
         // while writing the current GS base value to `KernelGsBase`.
         "swapgs",

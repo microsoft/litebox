@@ -172,4 +172,6 @@ pub enum PhysPointerError {
     UnsupportedOperation,
     #[error("Unsupported permissions: {0:#x}")]
     UnsupportedPermissions(u8),
+    #[error("Memory copy failed")]
+    CopyFailed,
 }
