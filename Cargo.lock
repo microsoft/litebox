@@ -361,15 +361,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc32fast"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -700,12 +691,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hashbrown"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
-
-[[package]]
 name = "heapless"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -744,16 +729,6 @@ dependencies = [
  "same-file",
  "walkdir",
  "winapi-util",
-]
-
-[[package]]
-name = "indexmap"
-version = "2.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b0f83760fb341a774ed326568e19f5a863af4a952def8c39f9ab92fd95b88e5"
-dependencies = [
- "equivalent",
- "hashbrown 0.16.0",
 ]
 
 [[package]]
@@ -845,7 +820,7 @@ dependencies = [
  "bitflags 2.9.4",
  "buddy_system_allocator",
  "either",
- "hashbrown 0.15.5",
+ "hashbrown",
  "rangemap",
  "ringbuf",
  "slabmalloc",
@@ -935,7 +910,7 @@ dependencies = [
  "const-oid",
  "digest",
  "elf 0.8.0",
- "hashbrown 0.15.5",
+ "hashbrown",
  "libc",
  "litebox",
  "litebox_common_linux",
@@ -1019,7 +994,7 @@ dependencies = [
 name = "litebox_runner_lvbs"
 version = "0.1.0"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown",
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
@@ -1096,7 +1071,7 @@ dependencies = [
  "ctr",
  "elf 0.8.0",
  "elf_loader",
- "hashbrown 0.15.5",
+ "hashbrown",
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
@@ -1288,9 +1263,6 @@ version = "0.36.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
- "crc32fast",
- "hashbrown 0.15.5",
- "indexmap",
  "memchr",
 ]
 

@@ -16,6 +16,8 @@
 
 use std::collections::HashSet;
 
+use object::read::elf::{ElfFile, ProgramHeader as _};
+use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -25,8 +27,6 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 pub enum Error {
     #[error("failed to parse: {0}")]
     ParseError(String),
-    #[error("failed to generate object file: {0}")]
-    GenerateObjFileError(String),
     #[error("unsupported executable")]
     UnsupportedObjectFile,
     #[error("executable is already hooked with trampoline")]
@@ -69,6 +69,16 @@ struct TrampolineHeader32 {
     trampoline_size: u32,
 }
 
+/// Metadata about an executable section, extracted from the read-only ELF parse.
+struct TextSectionInfo {
+    /// Virtual address of the section
+    vaddr: u64,
+    /// File offset where the section data starts
+    file_offset: u64,
+    /// Size of the section data in bytes
+    size: u64,
+}
+
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
 ///
 /// The `trampoline` must be an absolute address if specified; if unspecified, it will be set to
@@ -85,64 +95,49 @@ struct TrampolineHeader32 {
 /// - trampoline size (8 bytes for 64-bit, 4 bytes for 32-bit)
 ///
 /// This layout allows loaders to read just the last 32/20 bytes to get the metadata.
-#[expect(
-    clippy::missing_panics_doc,
-    reason = "any panics in here are not part of the public contract and should be fixed within this module"
-)]
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
-    let mut input_workaround: Vec<u64>;
-    let input_binary: &[u8] = if (&raw const input_binary[0] as usize).is_multiple_of(8) {
-        input_binary
-    } else {
-        // JB: This is an ugly workaround to `object` requiring that its input binary being parsed
-        // is always aligned to 8-bytes (otherwise it throws an error); this is very surprising and
-        // probably should be corrected upstream in `object`, but for now, we just make a copy and
-        // re-run. Essentially, we use u64 to force a 8-byte alignment, but then we look at it as
-        // bytes instead.
-        input_workaround = vec![0u64; input_binary.len() / 8 + 1];
-        let input_workaround_bytes: &mut [u8] = unsafe {
-            core::slice::from_raw_parts_mut(
-                input_workaround.as_mut_ptr().cast(),
-                input_workaround.len() * 8,
-            )
+    // Make a single mutable, 8-byte-aligned copy of the input binary. This serves as both the
+    // parse buffer (object::File::parse requires 8-byte alignment) and the output buffer for
+    // in-place patching. We use a Vec<u64> to guarantee alignment, then view it as bytes.
+    let mut backing = vec![0u64; input_binary.len().div_ceil(8)];
+    let buf: &mut [u8] = zerocopy::IntoBytes::as_mut_bytes(backing.as_mut_slice());
+    buf[..input_binary.len()].copy_from_slice(input_binary);
+    let buf = &mut buf[..input_binary.len()];
+
+    // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
+    let (arch, dl_sysinfo_int80, text_sections, control_transfer_targets, trampoline_base_addr) = {
+        let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
+
+        let arch = match file {
+            object::File::Elf64(_) => Arch::X86_64,
+            object::File::Elf32(_) => Arch::X86_32,
+            _ => return Err(Error::UnsupportedObjectFile),
         };
-        let input_workaround_bytes = &mut input_workaround_bytes[..input_binary.len()];
-        input_workaround_bytes.copy_from_slice(input_binary);
-        &*input_workaround_bytes
+
+        let dl_sysinfo_int80 = if arch == Arch::X86_32 {
+            get_symbols(&file)
+        } else {
+            None
+        };
+
+        let text_sections = text_sections(&file)?;
+
+        if is_already_hooked(&*buf, arch) {
+            return Err(Error::AlreadyHooked);
+        }
+
+        let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
+
+        let trampoline_base_addr = find_addr_for_trampoline_code(&file);
+
+        (
+            arch,
+            dl_sysinfo_int80,
+            text_sections,
+            control_transfer_targets,
+            trampoline_base_addr,
+        )
     };
-    assert_eq!((&raw const input_binary[0] as usize) % 8, 0);
-    let mut builder = match object::FileKind::parse(input_binary)
-        .map_err(|e| Error::ParseError(e.to_string()))?
-    {
-        object::FileKind::Elf64 => object::build::elf::Builder::read64(input_binary),
-        object::FileKind::Elf32 => object::build::elf::Builder::read32(input_binary),
-        _ => return Err(Error::UnsupportedObjectFile),
-    }
-    .map_err(|e| Error::ParseError(e.to_string()))?;
-    let arch = if builder.is_64 {
-        Arch::X86_64
-    } else {
-        Arch::X86_32
-    };
-
-    // Get symbols
-    let dl_sysinfo_int80 = if arch == Arch::X86_32 {
-        get_symbols(&builder)
-    } else {
-        None
-    };
-
-    let text_sections = text_sections(&builder)?;
-
-    // Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at end of file
-    if is_already_hooked(input_binary, arch) {
-        return Err(Error::AlreadyHooked);
-    }
-
-    // Get control transfer targets
-    let control_transfer_targets = get_control_transfer_targets(arch, &builder, &text_sections);
-
-    let trampoline_base_addr = find_addr_for_trampoline_code(&builder);
 
     // Build the trampoline code (without header - header goes at the end)
     // The code starts with the syscall entry point placeholder
@@ -155,17 +150,15 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     }
 
+    // Patch syscalls in-place in buf
     let mut syscall_insns_found = false;
     for s in &text_sections {
-        let s = builder.sections.get_mut(*s);
-        let object::build::elf::SectionData::Data(data) = &mut s.data else {
-            unimplemented!()
-        };
+        let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
             arch,
             &control_transfer_targets,
-            s.sh_addr,
-            data.to_mut(),
+            s.vaddr,
+            section_data,
             trampoline_base_addr,
             dl_sysinfo_int80,
             &mut trampoline_data,
@@ -182,12 +175,8 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         return Err(Error::NoSyscallInstructionsFound);
     }
 
-    // Write output: [ELF][padding][trampoline code][header]
-    let mut out = vec![];
-    builder
-        .write(&mut out)
-        .map_err(|e| Error::GenerateObjFileError(e.to_string()))?;
-    // ensure the start address of the trampoline code is page-aligned
+    // Build output: [patched ELF][padding to page boundary][trampoline code][header]
+    let mut out = buf.to_vec();
     let remain = out.len() % 0x1000;
     out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { 0x1000 - remain }]);
 
@@ -225,19 +214,30 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     Ok(out)
 }
 
-/// (private) Get the section IDs for the text sections
-fn text_sections(
-    builder: &object::build::elf::Builder<'_>,
-) -> Result<Vec<object::build::elf::SectionId>> {
-    let text_sections: Vec<_> = builder
-        .sections
-        .iter()
-        .filter(|s| {
-            s.sh_type == object::elf::SHT_PROGBITS
-                && s.sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
-                && s.sh_flags & u64::from(object::elf::SHF_EXECINSTR) != 0
+/// (private) Get metadata for executable sections
+fn text_sections(file: &object::File<'_>) -> Result<Vec<TextSectionInfo>> {
+    let text_sections: Vec<_> = file
+        .sections()
+        .filter_map(|s| {
+            let object::SectionFlags::Elf { sh_flags } = s.flags() else {
+                return None;
+            };
+            if s.kind() != object::SectionKind::Text {
+                return None;
+            }
+            if sh_flags & u64::from(object::elf::SHF_ALLOC) == 0 {
+                return None;
+            }
+            if sh_flags & u64::from(object::elf::SHF_EXECINSTR) == 0 {
+                return None;
+            }
+            let (file_offset, size) = s.file_range()?;
+            Some(TextSectionInfo {
+                vaddr: s.address(),
+                file_offset,
+                size,
+            })
         })
-        .map(object::build::elf::Section::id)
         .collect();
     if text_sections.is_empty() {
         return Err(Error::NoTextSectionFound);
@@ -454,44 +454,51 @@ fn hook_syscalls_in_section(
     Ok(())
 }
 
-fn find_addr_for_trampoline_code(builder: &object::build::elf::Builder<'_>) -> u64 {
-    // Find the highest virtual address among all sections in executable segments
-    let max_virtual_addr = builder
-        .segments
-        .iter()
-        .filter(|seg| seg.p_type == object::elf::PT_LOAD)
-        .map(|seg| seg.p_vaddr + seg.p_memsz)
-        .max()
-        .unwrap();
+fn find_addr_for_trampoline_code(file: &object::File<'_>) -> u64 {
+    // Find the highest virtual address among all PT_LOAD segments
+    let max_virtual_addr = match file {
+        object::File::Elf64(elf) => max_load_segment_end(elf),
+        object::File::Elf32(elf) => max_load_segment_end(elf),
+        _ => unreachable!(),
+    };
 
     // Round up to the nearest page (assume 0x1000 page size)
     max_virtual_addr.next_multiple_of(0x1000)
 }
 
-fn get_symbols(builder: &object::build::elf::Builder<'_>) -> Option<u64> {
-    let mut dl_sysinfo_int80 = None;
-    for sym in &builder.symbols {
-        if sym.st_type() == object::elf::STT_FUNC {
-            let name = sym.name.to_string();
-            if name == "_dl_sysinfo_int80" {
-                dl_sysinfo_int80 = Some(sym.st_value);
-            }
-        }
-    }
-    dl_sysinfo_int80
+/// Returns the highest `p_vaddr + p_memsz` among all `PT_LOAD` segments.
+fn max_load_segment_end<Elf: object::read::elf::FileHeader>(elf: &ElfFile<'_, Elf>) -> u64
+where
+    Elf::Word: Into<u64>,
+{
+    let endian = elf.endian();
+    elf.elf_program_headers()
+        .iter()
+        .filter(|ph| ph.p_type(endian) == object::elf::PT_LOAD)
+        .map(|ph| ph.p_vaddr(endian).into() + ph.p_memsz(endian).into())
+        .max()
+        .unwrap()
+}
+
+fn get_symbols(file: &object::File<'_>) -> Option<u64> {
+    file.symbols()
+        .filter(|sym| sym.kind() == object::SymbolKind::Text)
+        .find_map(|sym| {
+            sym.name()
+                .ok()
+                .filter(|name| *name == "_dl_sysinfo_int80")
+                .map(|_| sym.address())
+        })
 }
 
 fn get_control_transfer_targets(
     arch: Arch,
-    builder: &object::build::elf::Builder<'_>,
-    text_sections: &[object::build::elf::SectionId],
-) -> HashSet<u64> {
+    input_binary: &[u8],
+    text_sections: &[TextSectionInfo],
+) -> Result<HashSet<u64>> {
     let mut control_transfer_targets = HashSet::new();
     for s in text_sections {
-        let s = builder.sections.get(*s);
-        let object::build::elf::SectionData::Data(section_data) = &s.data else {
-            unimplemented!()
-        };
+        let section_data = section_slice(input_binary, s)?;
         // Disassemble the section
         let mut decoder = iced_x86::Decoder::new(
             match arch {
@@ -501,14 +508,40 @@ fn get_control_transfer_targets(
             section_data,
             iced_x86::DecoderOptions::NONE,
         );
-        decoder.set_ip(s.sh_addr);
+        decoder.set_ip(s.vaddr);
         control_transfer_targets.extend(decoder.into_iter().filter_map(|inst| {
             let target = inst.near_branch_target();
             (target != 0).then_some(target)
         }));
     }
 
-    control_transfer_targets
+    Ok(control_transfer_targets)
+}
+
+/// Returns the section data slice from `buf` corresponding to `section`, or an error if out of bounds.
+fn section_slice<'a>(buf: &'a [u8], section: &TextSectionInfo) -> Result<&'a [u8]> {
+    let offset = usize::try_from(section.file_offset)
+        .map_err(|_| Error::ParseError("section file offset too large".into()))?;
+    let size = usize::try_from(section.size)
+        .map_err(|_| Error::ParseError("section size too large".into()))?;
+    let end = offset
+        .checked_add(size)
+        .filter(|&e| e <= buf.len())
+        .ok_or_else(|| Error::ParseError("section extends beyond file".into()))?;
+    Ok(&buf[offset..end])
+}
+
+/// Returns a mutable section data slice from `buf` corresponding to `section`, or an error if out of bounds.
+fn section_slice_mut<'a>(buf: &'a mut [u8], section: &TextSectionInfo) -> Result<&'a mut [u8]> {
+    let offset = usize::try_from(section.file_offset)
+        .map_err(|_| Error::ParseError("section file offset too large".into()))?;
+    let size = usize::try_from(section.size)
+        .map_err(|_| Error::ParseError("section size too large".into()))?;
+    let end = offset
+        .checked_add(size)
+        .filter(|&e| e <= buf.len())
+        .ok_or_else(|| Error::ParseError("section extends beyond file".into()))?;
+    Ok(&mut buf[offset..end])
 }
 
 #[allow(clippy::too_many_arguments)]
