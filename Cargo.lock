@@ -829,6 +829,7 @@ dependencies = [
  "spin 0.9.8",
  "tar-no-std",
  "thiserror",
+ "tracing",
  "windows-sys 0.60.2",
  "zerocopy",
 ]
@@ -987,6 +988,8 @@ dependencies = [
  "litebox_syscall_rewriter",
  "memmap2",
  "sha2",
+ "tracing",
+ "tracing-subscriber",
  "walkdir",
 ]
 
