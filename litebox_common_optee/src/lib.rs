@@ -12,9 +12,9 @@ use alloc::boxed::Box;
 use core::mem::size_of;
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt;
-use litebox_common_linux::{errno::Errno, PtRegs};
+use litebox_common_linux::{PtRegs, errno::Errno};
 use modular_bitfield::prelude::*;
-use modular_bitfield::specifiers::{B54, B8};
+use modular_bitfield::specifiers::{B8, B54};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -402,12 +402,13 @@ pub struct UteeParams {
     pub types: UteeParamsTypes,
     pub vals: [u64; TEE_NUM_PARAMS * 2],
 }
+
+/// Number of TEE parameters to be passed to TAs.
 const TEE_NUM_PARAMS: usize = 4;
 
-/// Number of RPC parameters reported to the Linux driver during `EXCHANGE_CAPABILITIES`.
-/// The Linux driver allocates space for an appended RPC `optee_msg_arg` with this many
-/// params when `OPTEE_SMC_SEC_CAP_RPC_ARG` is set. Upstream OP-TEE typically uses 1-2;
-/// we use 4 to match `TEE_NUM_PARAMS` for flexibility.
+/// Number of RPC parameters that LiteBox defined and reported to the normal-world
+/// Linux kernel driver during `EXCHANGE_CAPABILITIES`. The Linux kernel driver is
+/// expected to allocate a shared buffer for this number of parameters.
 pub const NUM_RPC_PARAMS: usize = 4;
 
 #[expect(
@@ -1253,6 +1254,48 @@ impl TryFrom<OpteeMessageCommand> for UteeEntryFunc {
     }
 }
 
+// RPC command IDs from `optee_os/core/include/optee_msg.h`.
+// These occupy the `cmd` field of the RPC `optee_msg_arg`, which is a separate namespace
+// from `OPTEE_MSG_CMD_*` used for main messaging.
+const OPTEE_MSG_RPC_CMD_LOAD_TA: u32 = 0;
+const OPTEE_MSG_RPC_CMD_RPMB: u32 = 1;
+const OPTEE_MSG_RPC_CMD_FS: u32 = 2;
+const OPTEE_MSG_RPC_CMD_GET_TIME: u32 = 3;
+const OPTEE_MSG_RPC_CMD_WAIT_QUEUE: u32 = 4;
+const OPTEE_MSG_RPC_CMD_SUSPEND: u32 = 5;
+const OPTEE_MSG_RPC_CMD_SHM_ALLOC: u32 = 28;
+const OPTEE_MSG_RPC_CMD_SHM_FREE: u32 = 29;
+const OPTEE_MSG_RPC_CMD_NOTIFICATION: u32 = 30;
+
+/// `OPTEE_MSG_RPC_CMD_*` from `optee_os/core/include/optee_msg.h`
+///
+/// These are the command IDs used in the `cmd` field of the RPC `optee_msg_arg`.
+/// They live in a separate namespace from [`OpteeMessageCommand`] (which is for main
+/// messaging between the normal-world driver and OP-TEE OS).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive)]
+#[repr(u32)]
+pub enum OpteeRpcCommand {
+    /// Load a Trusted Application binary.
+    LoadTa = OPTEE_MSG_RPC_CMD_LOAD_TA,
+    /// Replay Protected Memory Block (RPMB) access.
+    Rpmb = OPTEE_MSG_RPC_CMD_RPMB,
+    /// REE file-system access.
+    Fs = OPTEE_MSG_RPC_CMD_FS,
+    /// Get REE time.
+    GetTime = OPTEE_MSG_RPC_CMD_GET_TIME,
+    /// Wait-queue sleep/wake.
+    WaitQueue = OPTEE_MSG_RPC_CMD_WAIT_QUEUE,
+    /// Suspend execution.
+    Suspend = OPTEE_MSG_RPC_CMD_SUSPEND,
+    /// Allocate shared memory for RPC output.
+    ShmAlloc = OPTEE_MSG_RPC_CMD_SHM_ALLOC,
+    /// Free previously allocated shared memory.
+    ShmFree = OPTEE_MSG_RPC_CMD_SHM_FREE,
+    /// Asynchronous notification.
+    Notification = OPTEE_MSG_RPC_CMD_NOTIFICATION,
+}
+
 /// Temporary memory reference parameter
 ///
 /// `optee_msg_param_tmem` from `optee_os/core/include/optee_msg.h`
@@ -1373,17 +1416,11 @@ pub struct OpteeMsgParam {
 
 impl OpteeMsgParam {
     /// Deserialize an `OpteeMsgParam` from a byte slice of exactly `size_of::<OpteeMsgParam>()` bytes.
-    ///
-    /// # Safety rationale
-    ///
-    /// `OpteeMsgParam` is `#[repr(C)]` and every bit pattern is valid (the attr is a bitfield
-    /// and the union's `octets` variant accepts any bytes), so `read_unaligned` is safe here.
-    /// Alignment is not required because we use `read_unaligned`.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < size_of::<Self>() {
             return None;
         }
-        // SAFETY: OpteeMsgParam is repr(C), 32 bytes, and any bit pattern is valid.
+        // SAFETY: OpteeMsgParam is repr(C) and 32 bytes, and we've checked the input slice is large enough.
         Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Self>()) })
     }
 
@@ -1449,23 +1486,23 @@ impl OpteeMsgParam {
 /// Compute the total byte size of an `optee_msg_arg` with `num_params` parameters.
 /// Equivalent to the C macro `OPTEE_MSG_GET_ARG_SIZE(num_params)`.
 ///
+/// Returns `size_of::<OpteeMsgArgsHeader>() + num_params * size_of::<OpteeMsgParam>()`
+/// (i.e. the 32-byte header plus N × 32-byte parameter slots).
+///
 /// `num_params` is the total count of entries in `params[]`, which includes both meta
 /// parameters and client parameters. For example, `OpenSession` uses `TEE_NUM_PARAMS + 2`
-/// (4 client + 2 meta), `InvokeCommand` uses up to `TEE_NUM_PARAMS` (4 client), and
-/// RPC args use the count negotiated during `EXCHANGE_CAPABILITIES`.
+/// (4 client + 2 meta) and `InvokeCommand` uses up to `TEE_NUM_PARAMS` (4 client).
 ///
 /// # Safety invariant
 ///
-/// Callers must ensure `num_params` has been validated against `OpteeMsgArgs::MAX_PARAMS`
-/// before calling this function. An unvalidated `num_params` from normal world memory
-/// could produce an oversized result, leading to out-of-bounds access on fixed-size arrays.
+/// Callers must ensure `num_params` has been validated against `OpteeMsgArgs::MAX_PARAMS`.
+/// An unvalidated `num_params` from normal world memory could produce an oversized result,
+/// leading to out-of-bounds access on fixed-size arrays.
 /// See CVE-2022-46152 (OP-TEE OOB via unvalidated `num_params`).
-pub const fn optee_msg_get_arg_size(num_params: u32) -> usize {
-    // Defense-in-depth: catch unvalidated num_params during development/testing.
-    // This cannot be a runtime check in a const fn, but will fire in non-const calls.
+pub const fn optee_msg_arg_total_size(num_params: u32) -> usize {
     debug_assert!(
         num_params as usize <= OpteeMsgArgs::MAX_PARAMS,
-        "optee_msg_get_arg_size: num_params exceeds MAX_PARAMS"
+        "optee_msg_arg_total_size: num_params exceeds MAX_PARAMS"
     );
     core::mem::size_of::<OpteeMsgArgsHeader>()
         + core::mem::size_of::<OpteeMsgParam>() * num_params as usize
@@ -1475,8 +1512,6 @@ pub const fn optee_msg_get_arg_size(num_params: u32) -> usize {
 ///
 /// This struct represents the fixed 32-byte header of the C `struct optee_msg_arg`.
 /// Unlike `OpteeMsgArgs`, all fields are plain `u32` so it can derive `FromBytes`/`IntoBytes`.
-/// Used as phase 1 of the two-phase read: read this header to learn `num_params`,
-/// then compute the total size and read the full blob.
 ///
 /// A single `optee_msg_arg` on the wire:
 ///
@@ -1513,7 +1548,7 @@ pub struct OpteeMsgArgsHeader {
 
 /// `optee_msg_arg` from `optee_os/core/include/optee_msg.h`
 /// OP-TEE message argument structure that the normal world (or VTL0) OP-TEE driver and OP-TEE OS use to
-/// exchange messages.
+/// exchange messages. This data structure is used for carrying RPC information as well.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct OpteeMsgArgs {
@@ -1731,6 +1766,160 @@ impl OpteeMsgArgs {
     }
 }
 
+/// OP-TEE RPC argument structure.
+///
+/// This is the RPC counterpart of [`OpteeMsgArgs`]. On the wire it shares the same
+/// 32-byte header layout (`optee_msg_arg`), but only a subset of the header fields
+/// are meaningful for RPC:
+///
+/// | Field                | RPC meaning                                                |
+/// |----------------------|------------------------------------------------------------|
+/// | `cmd`                | RPC command ([`OpteeRpcCommand`])                          |
+/// | `ret` / `ret_origin` | Return value written back by the normal-world RPC handler. |
+/// | `num_params`         | Number of RPC parameters (`EXCHANGE_CAPABILITIES`).        |
+/// | `params[]`           | RPC payload (e.g. TA load request).                        |
+///
+/// The remaining header fields (`func`, `session`, `cancel_id`) are **unused** for RPC
+/// and always zero on the wire. They are not exposed in this struct.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OpteeRpcArgs {
+    /// RPC command ID. Unlike main args, this uses [`OpteeRpcCommand`] (e.g. `LoadTa`,
+    /// `ShmAlloc`) rather than [`OpteeMessageCommand`].
+    pub cmd: OpteeRpcCommand,
+    /// unused for RPC. Corresponds to `func` in the main `optee_msg_arg`.
+    _reserved_func: u32,
+    /// unused for RPC. Corresponds to `session`.
+    _reserved_session: u32,
+    /// unused for RPC. Corresponds to `cancel_id`.
+    _reserved_cancel_id: u32,
+    /// Padding (matches `pad` in the wire format).
+    _pad: u32,
+    /// Return value from the normal-world RPC handler.
+    pub ret: TeeResult,
+    /// Origin of the return value.
+    pub ret_origin: TeeOrigin,
+    /// Number of parameters in `params`, negotiated during `EXCHANGE_CAPABILITIES`.
+    pub num_params: u32,
+    /// RPC parameters. Fixed to [`NUM_RPC_PARAMS`] entries.
+    pub params: [OpteeMsgParam; Self::MAX_PARAMS],
+}
+
+impl OpteeRpcArgs {
+    /// Maximum number of RPC parameters this struct can hold.
+    ///
+    /// This is [`NUM_RPC_PARAMS`], the count negotiated during `EXCHANGE_CAPABILITIES`.
+    pub const MAX_PARAMS: usize = NUM_RPC_PARAMS;
+
+    /// Construct an `OpteeRpcArgs` from a zerocopy header and a raw parameter byte slice.
+    ///
+    /// The `cmd` field is parsed as [`OpteeRpcCommand`]. Unlike
+    /// [`OpteeMsgArgs::from_header_and_raw_params`], `func`, `session`, and `cancel_id`
+    /// are stored as reserved zeros — they carry no meaning for RPC.
+    pub fn from_header_and_raw_params(
+        header: &OpteeMsgArgsHeader,
+        raw_params: &[u8],
+    ) -> Result<Self, OpteeSmcReturnCode> {
+        let num = header.num_params as usize;
+        if num > Self::MAX_PARAMS {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        let needed = num * size_of::<OpteeMsgParam>();
+        if raw_params.len() < needed {
+            return Err(OpteeSmcReturnCode::EBadAddr);
+        }
+
+        let cmd = OpteeRpcCommand::try_from(header.cmd).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+        let ret = TeeResult::try_from(header.ret).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+        let ret_origin = TeeOrigin::read_from_bytes(header.ret_origin.as_bytes())
+            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+        let mut params = [OpteeMsgParam {
+            attr: OpteeMsgAttr::default(),
+            u: OpteeMsgParamUnion { octets: [0u8; 24] },
+        }; Self::MAX_PARAMS];
+
+        for (i, param) in params.iter_mut().enumerate().take(num) {
+            let offset = i * size_of::<OpteeMsgParam>();
+            let param_bytes = &raw_params[offset..offset + size_of::<OpteeMsgParam>()];
+            *param = OpteeMsgParam::from_bytes(param_bytes).ok_or(OpteeSmcReturnCode::EBadAddr)?;
+        }
+
+        Ok(Self {
+            cmd,
+            _reserved_func: 0,
+            _reserved_session: 0,
+            _reserved_cancel_id: 0,
+            _pad: 0,
+            ret,
+            ret_origin,
+            num_params: header.num_params,
+            params,
+        })
+    }
+
+    /// Convert back to an [`OpteeMsgArgsHeader`] for wire serialization.
+    ///
+    /// The reserved fields (`func`, `session`, `cancel_id`) are written as 0.
+    pub fn to_header(&self) -> OpteeMsgArgsHeader {
+        OpteeMsgArgsHeader {
+            cmd: self.cmd as u32,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: self.ret as u32,
+            ret_origin: *self.ret_origin.value(),
+            num_params: self.num_params,
+        }
+    }
+
+    /// Serialize the params portion (up to `num_params`) as raw bytes into `buf`.
+    pub fn write_raw_params(&self, buf: &mut [u8]) -> Result<usize, OpteeSmcReturnCode> {
+        let num = self.num_params as usize;
+        if num > Self::MAX_PARAMS {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        let needed = num * size_of::<OpteeMsgParam>();
+        if buf.len() < needed {
+            return Err(OpteeSmcReturnCode::EBadAddr);
+        }
+        for i in 0..num {
+            let offset = i * size_of::<OpteeMsgParam>();
+            buf[offset..offset + size_of::<OpteeMsgParam>()]
+                .copy_from_slice(self.params[i].as_bytes());
+        }
+        Ok(needed)
+    }
+
+    /// Access a parameter by index with bounds checking against `num_params`.
+    pub fn get_param_value(&self, index: usize) -> Result<OpteeMsgParamValue, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index]
+                .get_param_value()
+                .ok_or(OpteeSmcReturnCode::EBadCmd)
+        }
+    }
+
+    /// Access a tmem parameter by index with bounds checking against `num_params`.
+    pub fn get_param_tmem(&self, index: usize) -> Result<OpteeMsgParamTmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index]
+                .get_param_tmem()
+                .ok_or(OpteeSmcReturnCode::EBadCmd)
+        }
+    }
+    // Note: RPC does not use rmem params. Rmem requires pre-registered shared memory
+    // references from the normal-world driver, which is a main-messaging-path concept.
+    // RPC uses tmem for buffer references since OP-TEE provides physical addresses directly.
+}
+
 /// A memory page to exchange OP-TEE SMC call arguments.
 /// OP-TEE assumes that the underlying architecture is Arm with TrustZone and
 /// thus it uses Secure Monitor Call (SMC) calling convention (SMCCC).
@@ -1859,7 +2048,7 @@ pub enum OpteeSmcResult<'a> {
     },
     CallWithArg {
         msg_args: Box<OpteeMsgArgs>,
-        rpc_args: Option<Box<OpteeMsgArgs>>,
+        rpc_args: Option<Box<OpteeRpcArgs>>,
     },
 }
 
@@ -1952,7 +2141,7 @@ const OPTEE_SMC_RETURN_ENOTAVAIL: usize = 0x7;
 const OPTEE_SMC_RETURN_UNKNOWN_FUNCTION: usize = 0xffff_ffff;
 
 #[non_exhaustive]
-#[derive(Copy, Clone, PartialEq, TryFromPrimitive)]
+#[derive(Copy, Clone, Debug, PartialEq, TryFromPrimitive)]
 #[repr(usize)]
 pub enum OpteeSmcReturnCode {
     Ok = OPTEE_SMC_RETURN_OK,
@@ -2001,7 +2190,7 @@ impl From<OpteeSmcReturnCode> for litebox_common_linux::errno::Errno {
 /// * `elf_data` - Raw bytes of the ELF binary
 pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
     use core::mem::size_of;
-    use elf::{endian::AnyEndian, ElfBytes};
+    use elf::{ElfBytes, endian::AnyEndian};
 
     let elf = ElfBytes::<AnyEndian>::minimal_parse(elf_data).ok()?;
     let (shdrs, strtab) = elf.section_headers_with_strtab().ok()?;
@@ -2193,5 +2382,87 @@ mod tests {
         };
         assert_eq!(written, 6 * size_of::<OpteeMsgParam>());
         assert_eq!(params_out, params);
+    }
+
+    #[test]
+    fn test_optee_rpc_args_roundtrip() {
+        use alloc::vec;
+
+        // ShmAlloc = 28
+        let header = OpteeMsgArgsHeader {
+            cmd: 28,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 2,
+        };
+        let mut params_in = vec![0u8; 2 * size_of::<OpteeMsgParam>()];
+        for (i, byte) in params_in.iter_mut().enumerate() {
+            *byte = (i & 0xFF) as u8;
+        }
+
+        let rpc_args = OpteeRpcArgs::from_header_and_raw_params(&header, &params_in)
+            .expect("should parse RPC args");
+        assert_eq!(rpc_args.cmd, OpteeRpcCommand::ShmAlloc);
+        assert_eq!(rpc_args.num_params, 2);
+
+        let header_out = rpc_args.to_header();
+        assert_eq!(header_out.cmd, 28);
+        assert_eq!(header_out.func, 0);
+        assert_eq!(header_out.session, 0);
+        assert_eq!(header_out.cancel_id, 0);
+        assert_eq!(header_out.num_params, 2);
+
+        let mut params_out = vec![0u8; 2 * size_of::<OpteeMsgParam>()];
+        let written = rpc_args
+            .write_raw_params(&mut params_out)
+            .expect("should serialize");
+        assert_eq!(written, 2 * size_of::<OpteeMsgParam>());
+        assert_eq!(&params_out[..written], &params_in[..written]);
+    }
+
+    #[test]
+    fn test_rpc_args_rejects_main_cmd() {
+        // OpenSession = 0 is a main command, but also happens to be LoadTa = 0 for RPC.
+        // InvokeCommand = 1 maps to Rpmb = 1 in RPC. So to test rejection we need a
+        // cmd value that's valid for main but not for RPC. RegisterShm = 4 has no
+        // RPC counterpart.
+        let header = OpteeMsgArgsHeader {
+            cmd: 4, // RegisterShm — not a valid OpteeRpcCommand
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 0,
+        };
+        assert!(OpteeRpcArgs::from_header_and_raw_params(&header, &[]).is_err());
+    }
+
+    #[test]
+    fn test_rpc_args_reserved_fields_zeroed() {
+        let header = OpteeMsgArgsHeader {
+            cmd: 29, // ShmFree
+            func: 0xDEAD,
+            session: 0xBEEF,
+            cancel_id: 0xCAFE,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 0,
+        };
+        let rpc_args =
+            OpteeRpcArgs::from_header_and_raw_params(&header, &[]).expect("should parse");
+        assert_eq!(rpc_args.cmd, OpteeRpcCommand::ShmFree);
+
+        // Reserved fields should be zeroed regardless of header input
+        let hdr_out = rpc_args.to_header();
+        assert_eq!(hdr_out.func, 0);
+        assert_eq!(hdr_out.session, 0);
+        assert_eq!(hdr_out.cancel_id, 0);
     }
 }

@@ -7,6 +7,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec;
 use core::mem::size_of;
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
@@ -16,9 +17,9 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
-    optee_msg_get_arg_size, OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgParam,
-    OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc,
-    UteeParams, NUM_RPC_PARAMS,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeRpcArgs, OpteeSmcArgs,
+    OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams,
+    optee_msg_arg_total_size,
 };
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
@@ -26,15 +27,14 @@ use litebox_platform_lvbs::{
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
     mm::MemoryProvider,
     mshv::{
-        hvcall,
+        NUM_VTLCALL_PARAMS, VsmFunction, hvcall,
         vsm::vsm_dispatch,
         vsm_intercept::raise_vtl0_gp_fault,
-        vtl1_mem_layout::{
-            get_heap_start_address, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE,
-            VTL1_PML4E_PAGE, VTL1_PRE_POPULATED_MEMORY_SIZE,
-        },
         vtl_switch::{vtl_switch, vtl_switch_init},
-        VsmFunction, NUM_VTLCALL_PARAMS,
+        vtl1_mem_layout::{
+            VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
+            VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
+        },
     },
     serial_println,
 };
@@ -43,7 +43,7 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{
-    allocate_session_id, SessionIdGuard, SessionManager, TaInstance, MAX_TA_INSTANCES,
+    MAX_TA_INSTANCES, SessionIdGuard, SessionManager, TaInstance, allocate_session_id,
 };
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;
@@ -1036,15 +1036,9 @@ fn handle_close_session(
     Ok(())
 }
 
-/// Maximum byte size of the serialized write-back stack buffer: main `optee_msg_arg` with
-/// `MAX_PARAMS` parameters plus RPC `optee_msg_arg` with `NUM_RPC_PARAMS` parameters.
-const MAX_WRITE_BLOB_SIZE: usize = (size_of::<OpteeMsgArgsHeader>()
-    + size_of::<OpteeMsgParam>() * OpteeMsgArgs::MAX_PARAMS)
-    + (size_of::<OpteeMsgArgsHeader>() + size_of::<OpteeMsgParam>() * NUM_RPC_PARAMS);
-
 /// Update msg_args with return values and write back to normal world memory.
 ///
-/// Serializes the main `OpteeMsgArgs` (and optional RPC args) into a contiguous byte
+/// Serializes the main `OpteeMsgArgs` (and optional `OpteeRpcArgs`) into a contiguous byte
 /// blob and writes it to the VTL0 physical address.
 ///
 /// Per OP-TEE OS semantics:
@@ -1083,7 +1077,7 @@ fn write_msg_args_to_normal_world(
     session_id: Option<u32>,
     ta_params: Option<&UteeParams>,
     ta_req_info: Option<&litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>>,
-    rpc_args: Option<&OpteeMsgArgs>,
+    rpc_args: Option<&OpteeRpcArgs>,
 ) -> Result<(), OpteeSmcReturnCode> {
     // Ensure we're on a task page table, not the base page table.
     // Accessing TA userspace memory requires the TA's page table to be active.
@@ -1109,50 +1103,32 @@ fn write_msg_args_to_normal_world(
         msg_args,
     )?;
 
-    // Compute variable-length sizes for the main args
-    let main_size = optee_msg_get_arg_size(msg_args.num_params);
-
-    // Compute total size including optional RPC args
-    let (total_size, rpc_size) = if let Some(rpc) = rpc_args {
-        let rs = optee_msg_get_arg_size(rpc.num_params);
-        (main_size + rs, Some(rs))
+    // Compute total size to write to the normal world memory including optional RPC args
+    let main_size = optee_msg_arg_total_size(msg_args.num_params);
+    let total_size = if let Some(rpc) = rpc_args {
+        main_size + optee_msg_arg_total_size(rpc.num_params)
     } else {
-        (main_size, None)
+        main_size
     };
 
-    // Use a stack-allocated buffer: max size is 2 × optee_msg_get_arg_size(MAX_PARAMS)
-    // = 2 × (32 + 6×32) = 448 bytes, well within stack limits.
-    assert!(total_size <= MAX_WRITE_BLOB_SIZE);
-    let mut blob = [0u8; MAX_WRITE_BLOB_SIZE];
-    let blob = &mut blob[..total_size];
+    let mut blob = vec![0u8; total_size];
 
-    // Serialize main args header
-    let header = msg_args.to_header();
-    let header_bytes = header.as_bytes();
-    blob[..size_of::<OpteeMsgArgsHeader>()].copy_from_slice(header_bytes);
-
-    // Serialize main args params
+    blob[..size_of::<OpteeMsgArgsHeader>()].copy_from_slice(msg_args.to_header().as_bytes());
     msg_args.write_raw_params(&mut blob[size_of::<OpteeMsgArgsHeader>()..main_size])?;
 
-    // Serialize optional RPC args after the main args
-    if let Some((rpc, rpc_size)) = rpc_args.zip(rpc_size) {
-        let rpc_header = rpc.to_header();
-        let rpc_header_bytes = rpc_header.as_bytes();
+    if let Some(rpc) = rpc_args {
         blob[main_size..main_size + size_of::<OpteeMsgArgsHeader>()]
-            .copy_from_slice(rpc_header_bytes);
-        rpc.write_raw_params(
-            &mut blob[main_size + size_of::<OpteeMsgArgsHeader>()..main_size + rpc_size],
-        )?;
+            .copy_from_slice(rpc.to_header().as_bytes());
+        rpc.write_raw_params(&mut blob[main_size + size_of::<OpteeMsgArgsHeader>()..total_size])?;
     }
 
-    // Write the blob to normal world physical memory
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
         msg_args_phys_addr.truncate(),
         total_size,
     )?;
     // SAFETY: Writing msg_args back to normal world memory at a valid physical address.
     // The blob contains the serialized variable-length optee_msg_arg structure(s).
-    unsafe { ptr.write_slice_at_offset(0, blob) }?;
+    unsafe { ptr.write_slice_at_offset(0, &blob) }?;
     Ok(())
 }
 
