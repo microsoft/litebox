@@ -4,6 +4,7 @@
 //! Linux Structs
 
 use crate::arch::MAX_CORES;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Context saved when entering the kernel
 ///
@@ -60,7 +61,7 @@ pub struct Timespec {
 const BITS_PER_LONG: usize = 64;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, KnownLayout)]
 pub struct CpuMask {
     bits: [u64; MAX_CORES.div_ceil(BITS_PER_LONG)],
 }
@@ -103,7 +104,7 @@ pub enum PkeyIdType {
 
 /// `module_signature` from [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/include/linux/module_signature.h#L33)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, KnownLayout)]
 pub struct ModuleSignature {
     pub algo: u8,
     pub hash: u8,
@@ -133,9 +134,10 @@ impl ModuleSignature {
 
 /// `kexec_segment` from [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/include/linux/kexec.h#L82)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct KexecSegment {
-    pub buf: *const core::ffi::c_void,
+    /// Pointer to buffer (stored as u64 since we don't dereference it)
+    pub buf: u64,
     pub bufsz: u64,
     pub mem: u64,
     pub memsz: u64,
@@ -146,16 +148,17 @@ pub struct KexecSegment {
 /// we need for our use case, such as `nr_segments` and `segment`, and
 /// are not affected by the kernel build configurations like `CONFIG_KEXEC_FILE` and `CONFIG_IMA_KEXEC`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct Kimage {
     head: u64,
-    entry: *const u64,
-    last_entry: *const u64,
+    /// Pointer fields stored as u64 since we don't dereference them
+    entry: u64,
+    last_entry: u64,
     start: u64,
-    control_code_page: *const core::ffi::c_void, // struct page*
-    swap_page: *const core::ffi::c_void,         // struct page*
-    vmcoreinfo_page: *const core::ffi::c_void,   // struct page*
-    vmcoreinfo_data_copy: *const core::ffi::c_void,
+    control_code_page: u64, // struct page*
+    swap_page: u64,         // struct page*
+    vmcoreinfo_page: u64,   // struct page*
+    vmcoreinfo_data_copy: u64,
     pub nr_segments: u64,
     pub segment: [KexecSegment; KEXEC_SEGMENT_MAX],
     // we do not need the rest of the fields for now
@@ -163,9 +166,10 @@ pub struct Kimage {
 pub const KEXEC_SEGMENT_MAX: usize = 16;
 
 /// `list_head` from [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/include/linux/types.h#L190)
-#[derive(Clone, Copy, Debug)]
+/// Pointer fields stored as u64 since we don't dereference them.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct ListHead {
-    pub next: *mut ListHead,
-    pub prev: *mut ListHead,
+    pub next: u64,
+    pub prev: u64,
 }

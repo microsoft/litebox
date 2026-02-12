@@ -289,8 +289,8 @@ pub(crate) fn allocate_stack(task: &crate::Task, stack_base: Option<usize>) -> O
                 .create_stack_pages(
                     None,
                     length,
-                    // Use POPULATE_PAGES_IMMEDIATELY since some platforms (e.g., LVBS)
-                    // do not support demand paging yet.
+                    // Pre-populate: stack initialization runs before run_thread_arch
+                    // sets up the kernel-mode demand paging infrastructure.
                     CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                 )
                 .ok()?

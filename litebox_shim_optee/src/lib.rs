@@ -39,7 +39,7 @@ pub mod ptr;
 // Re-export session management types for convenience
 pub use session::{
     MAX_TA_INSTANCES, SessionEntry, SessionManager, SessionMap, SingleInstanceCache, TaInstance,
-    allocate_session_id, recycle_session_id,
+    allocate_session_id,
 };
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
@@ -68,10 +68,31 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
 
     fn exception(
         &self,
-        _ctx: &mut Self::ExecutionContext,
+        ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        todo!("Handle exception in OP-TEE shim: {:?}", info,);
+        if info.exception == litebox::shim::Exception::PAGE_FAULT {
+            let result = unsafe {
+                self.task
+                    .global
+                    .pm
+                    .handle_page_fault(info.cr2, info.error_code.into())
+            };
+            if info.kernel_mode {
+                return if result.is_ok() {
+                    ContinueOperation::ResumeKernelPlatform
+                } else {
+                    ContinueOperation::ExceptionFixup
+                };
+            } else if result.is_ok() {
+                return ContinueOperation::ResumeGuest;
+            }
+            // User-mode page fault that couldn't be resolved;
+            // fall through to kill the TA below.
+        }
+        // OP-TEE has no signal handling. Kill the TA on any non-PF exception.
+        ctx.rax = (TeeResult::TargetDead as u32) as usize;
+        ContinueOperation::ExitThread
     }
 
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -742,7 +763,7 @@ impl Task {
             0,
             tls_size,
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_POPULATE,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
             -1,
             0,
         )?;
@@ -953,16 +974,16 @@ impl TeeObjMap {
             match user_attrs[0].attribute_id {
                 TeeAttributeType::SecretValue => {
                     let key_addr: usize = user_attrs[0].a.truncate();
-                    let key_len = usize::try_from(user_attrs[0].b).unwrap();
+                    let key_len: usize = user_attrs[0].b.truncate();
                     // TODO: revisit buffer size limits based on OP-TEE spec and deployment constraints
                     if key_len > MAX_KERNEL_BUF_SIZE {
                         return Err(TeeResult::BadParameters);
                     }
                     let key_ptr = UserConstPtr::<u8>::from_usize(key_addr);
-                    let key_slice = key_ptr
-                        .to_owned_slice(key_len)
-                        .ok_or(TeeResult::BadParameters)?;
-                    tee_obj.set_key(&key_slice);
+                    let Some(key_box) = key_ptr.to_owned_slice(key_len) else {
+                        return Err(TeeResult::BadParameters);
+                    };
+                    tee_obj.set_key(&key_box);
                 }
                 _ => todo!(
                     "handle attribute ID: {}",
@@ -1250,12 +1271,6 @@ struct Task {
     #[cfg(target_arch = "x86_64")]
     tls_base_addr: Cell<usize>,
     // TODO: OP-TEE supports global, persistent objects across sessions. Add these maps if needed.
-}
-
-impl Drop for Task {
-    fn drop(&mut self) {
-        SessionIdPool::recycle(self.session_id);
-    }
 }
 
 struct ThreadState {

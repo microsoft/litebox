@@ -56,8 +56,9 @@ use x86_64::{
     structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use x509_cert::{Certificate, der::Decode};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, FromBytes, Immutable, KnownLayout)]
 #[repr(align(4096))]
 struct AlignedPage([u8; PAGE_SIZE]);
 
@@ -753,20 +754,13 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
 
     // If this function is called for crash kexec, we protect its kimage segments as well.
     if is_crash {
-        let mut kimage = core::mem::MaybeUninit::<Kimage>::uninit();
-        let kimage_slice: &mut [u8] = unsafe {
-            core::slice::from_raw_parts_mut(
-                kimage.as_mut_ptr().cast::<u8>(),
-                core::mem::size_of::<Kimage>(),
-            )
-        };
-        kimage_slice.copy_from_slice(&kexec_image[..core::mem::size_of::<Kimage>()]);
-        let kimage = unsafe { kimage.assume_init() };
+        let kimage = Kimage::read_from_bytes(&kexec_image[..core::mem::size_of::<Kimage>()])
+            .map_err(|_| VsmError::KexecImageSegmentsInvalid)?;
         if kimage.nr_segments > KEXEC_SEGMENT_MAX as u64 {
             return Err(VsmError::KexecImageSegmentsInvalid);
         }
         for i in 0..usize::try_from(kimage.nr_segments).unwrap_or(0) {
-            let va = kimage.segment[i].buf as u64;
+            let va = kimage.segment[i].buf;
             let pa = kimage.segment[i].mem;
             if let Some(epa) = pa.checked_add(kimage.segment[i].memsz) {
                 kexec_memory_metadata.insert_memory_range(KexecMemoryRange::new(va, pa, epa));
@@ -850,25 +844,19 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
             .map(|boxed| *boxed)
             .ok_or(VsmError::Vtl0CopyFailed)
     } else {
-        let mut heki_patch = core::mem::MaybeUninit::<HekiPatch>::uninit();
-        let heki_patch_slice: &mut [u8] = unsafe {
-            core::slice::from_raw_parts_mut(
-                heki_patch.as_mut_ptr().cast::<u8>(),
-                core::mem::size_of::<HekiPatch>(),
-            )
-        };
+        let mut heki_patch = HekiPatch::new_zeroed();
+        let heki_patch_bytes = heki_patch.as_mut_bytes();
         unsafe {
             if !crate::platform_low().copy_slice_from_vtl0_phys(
                 patch_pa_0,
-                heki_patch_slice.get_unchecked_mut(..bytes_in_first_page),
+                heki_patch_bytes.get_unchecked_mut(..bytes_in_first_page),
             ) || !crate::platform_low().copy_slice_from_vtl0_phys(
                 patch_pa_1,
-                heki_patch_slice.get_unchecked_mut(bytes_in_first_page..),
+                heki_patch_bytes.get_unchecked_mut(bytes_in_first_page..),
             ) {
                 return Err(VsmError::Vtl0CopyFailed);
             }
         }
-        let heki_patch = unsafe { heki_patch.assume_init() };
         if heki_patch.is_valid() {
             Ok(heki_patch)
         } else {

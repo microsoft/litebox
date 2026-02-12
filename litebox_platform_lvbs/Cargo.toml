@@ -37,7 +37,7 @@ object = { version = "0.36.7", default-features = false, features = ["pe"] }
 digest = { version = "0.10.7", default-features = false }
 aligned-vec = { version = "0.6.4", default-features = false }
 raw-cpuid = "11.6.0"
-zerocopy = { version = "0.8", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }

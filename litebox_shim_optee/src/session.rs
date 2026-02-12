@@ -119,7 +119,7 @@ pub struct TaInstance {
     pub task_page_table_id: usize,
 }
 
-// SAFETY: The shim is designed to be used in single-threaded contexts per-CPU.
+// SAFETY: TaInstance is protected by SpinMutex and try_lock (`SessionEntry`)
 unsafe impl Send for TaInstance {}
 unsafe impl Sync for TaInstance {}
 
@@ -274,6 +274,47 @@ pub fn recycle_session_id(session_id: u32) {
     SessionIdPool::recycle(session_id);
 }
 
+/// RAII guard that recycles a session ID on drop unless disarmed.
+///
+/// Session IDs are allocated before the TA is invoked and only registered on
+/// success via [`SessionManager::register_session`]. This guard ensures it is
+/// recycled on all error paths before this registration.
+pub struct SessionIdGuard {
+    session_id: Option<u32>,
+}
+
+impl SessionIdGuard {
+    /// Create a new guard that will recycle `session_id` on drop.
+    pub fn new(session_id: u32) -> Self {
+        Self {
+            session_id: Some(session_id),
+        }
+    }
+
+    /// Return the guarded session ID, or `None` if already disarmed.
+    pub fn id(&self) -> Option<u32> {
+        self.session_id
+    }
+
+    /// Disarm the guard so the session ID is **not** recycled on drop.
+    ///
+    /// Call this after the session ID has been successfully registered.
+    /// Once registered, [`SessionManager::unregister_session`] owns recycling.
+    ///
+    /// Returns `None` if the guard was already disarmed.
+    pub fn disarm(mut self) -> Option<u32> {
+        self.session_id.take()
+    }
+}
+
+impl Drop for SessionIdGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.session_id {
+            recycle_session_id(id);
+        }
+    }
+}
+
 /// Session manager that coordinates session and instance lifecycle.
 ///
 /// This provides a unified interface for:
@@ -338,9 +379,13 @@ impl SessionManager {
             .insert(session_id, instance, ta_uuid, ta_flags);
     }
 
-    /// Unregister a session and return its entry.
+    /// Unregister a session, recycle its session ID, and return the entry.
     pub fn unregister_session(&self, session_id: u32) -> Option<SessionEntry> {
-        self.sessions.remove(session_id)
+        let entry = self.sessions.remove(session_id);
+        if entry.is_some() {
+            recycle_session_id(session_id);
+        }
+        entry
     }
 
     /// Remove a single-instance TA from the cache.

@@ -37,6 +37,7 @@ use x509_cert::{
     Certificate,
     der::{Decode, Encode, oid::ObjectIdentifier},
 };
+use zerocopy::FromBytes;
 
 /// This function validates the memory content of a loaded kernel module against the original ELF file.
 /// In particular, it checks whether the non-relocatable/patchable bytes of certain sections
@@ -447,18 +448,11 @@ fn extract_module_data_and_signature(
         })
         .ok_or(VerificationError::SignatureNotFound)?;
 
-    let mut module_signature = core::mem::MaybeUninit::<ModuleSignature>::uninit();
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            signed_module
-                .as_ptr()
-                .add(module_signature_offset)
-                .cast::<u8>(),
-            module_signature.as_mut_ptr().cast::<u8>(),
-            core::mem::size_of::<ModuleSignature>(),
-        );
-    }
-    let module_signature = unsafe { module_signature.assume_init() };
+    let module_signature = ModuleSignature::read_from_bytes(
+        &signed_module[module_signature_offset
+            ..module_signature_offset + core::mem::size_of::<ModuleSignature>()],
+    )
+    .map_err(|_| VerificationError::InvalidSignature)?;
     if !module_signature.is_valid() {
         return Err(VerificationError::InvalidSignature);
     }
