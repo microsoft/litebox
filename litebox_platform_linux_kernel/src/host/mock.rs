@@ -4,6 +4,7 @@
 use core::sync::atomic::AtomicU32;
 
 use litebox::utils::ReinterpretUnsignedExt as _;
+use litebox::utils::TruncateExt as _;
 
 use crate::HostInterface;
 
@@ -97,6 +98,20 @@ impl HostInterface for MockHostInterface {
         _buf: &[u8],
     ) -> Result<usize, litebox_common_linux::errno::Errno> {
         todo!()
+    }
+
+    fn current_realtime() -> core::time::Duration {
+        let mut t = core::mem::MaybeUninit::<litebox_common_linux::Timespec>::uninit();
+        let ret = unsafe {
+            syscalls::syscall2(
+                syscalls::Sysno::clock_gettime,
+                0, // CLOCK_REALTIME
+                t.as_mut_ptr() as usize,
+            )
+        };
+        assert!(ret.is_ok(), "clock_gettime failed");
+        let t = unsafe { t.assume_init() };
+        core::time::Duration::new(t.tv_sec.reinterpret_as_unsigned(), t.tv_nsec.truncate())
     }
 
     fn return_to_host() -> ! {
