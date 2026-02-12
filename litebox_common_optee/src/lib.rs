@@ -9,11 +9,12 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use core::mem::size_of;
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt;
-use litebox_common_linux::{PtRegs, errno::Errno};
+use litebox_common_linux::{errno::Errno, PtRegs};
 use modular_bitfield::prelude::*;
-use modular_bitfield::specifiers::{B8, B54};
+use modular_bitfield::specifiers::{B54, B8};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -402,6 +403,12 @@ pub struct UteeParams {
     pub vals: [u64; TEE_NUM_PARAMS * 2],
 }
 const TEE_NUM_PARAMS: usize = 4;
+
+/// Number of RPC parameters reported to the Linux driver during `EXCHANGE_CAPABILITIES`.
+/// The Linux driver allocates space for an appended RPC `optee_msg_arg` with this many
+/// params when `OPTEE_SMC_SEC_CAP_RPC_ARG` is set. Upstream OP-TEE typically uses 1-2;
+/// we use 4 to match `TEE_NUM_PARAMS` for flexibility.
+pub const NUM_RPC_PARAMS: usize = 4;
 
 #[expect(
     clippy::identity_op,
@@ -1365,6 +1372,27 @@ pub struct OpteeMsgParam {
 }
 
 impl OpteeMsgParam {
+    /// Deserialize an `OpteeMsgParam` from a byte slice of exactly `size_of::<OpteeMsgParam>()` bytes.
+    ///
+    /// # Safety rationale
+    ///
+    /// `OpteeMsgParam` is `#[repr(C)]` and every bit pattern is valid (the attr is a bitfield
+    /// and the union's `octets` variant accepts any bytes), so `read_unaligned` is safe here.
+    /// Alignment is not required because we use `read_unaligned`.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < size_of::<Self>() {
+            return None;
+        }
+        // SAFETY: OpteeMsgParam is repr(C), 32 bytes, and any bit pattern is valid.
+        Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Self>()) })
+    }
+
+    /// Serialize this `OpteeMsgParam` as a byte slice of `size_of::<OpteeMsgParam>()` bytes.
+    pub fn as_bytes(&self) -> &[u8; size_of::<Self>()] {
+        // SAFETY: OpteeMsgParam is repr(C) and 32 bytes. Reinterpreting as bytes is safe.
+        unsafe { &*(&raw const *self).cast::<[u8; size_of::<Self>()]>() }
+    }
+
     pub fn attr_type(&self) -> OpteeMsgAttrType {
         OpteeMsgAttrType::try_from(self.attr.typ()).unwrap_or(OpteeMsgAttrType::None)
     }
@@ -1418,6 +1446,71 @@ impl OpteeMsgParam {
     }
 }
 
+/// Compute the total byte size of an `optee_msg_arg` with `num_params` parameters.
+/// Equivalent to the C macro `OPTEE_MSG_GET_ARG_SIZE(num_params)`.
+///
+/// `num_params` is the total count of entries in `params[]`, which includes both meta
+/// parameters and client parameters. For example, `OpenSession` uses `TEE_NUM_PARAMS + 2`
+/// (4 client + 2 meta), `InvokeCommand` uses up to `TEE_NUM_PARAMS` (4 client), and
+/// RPC args use the count negotiated during `EXCHANGE_CAPABILITIES`.
+///
+/// # Safety invariant
+///
+/// Callers must ensure `num_params` has been validated against `OpteeMsgArgs::MAX_PARAMS`
+/// before calling this function. An unvalidated `num_params` from normal world memory
+/// could produce an oversized result, leading to out-of-bounds access on fixed-size arrays.
+/// See CVE-2022-46152 (OP-TEE OOB via unvalidated `num_params`).
+pub const fn optee_msg_get_arg_size(num_params: u32) -> usize {
+    // Defense-in-depth: catch unvalidated num_params during development/testing.
+    // This cannot be a runtime check in a const fn, but will fire in non-const calls.
+    debug_assert!(
+        num_params as usize <= OpteeMsgArgs::MAX_PARAMS,
+        "optee_msg_get_arg_size: num_params exceeds MAX_PARAMS"
+    );
+    core::mem::size_of::<OpteeMsgArgsHeader>()
+        + core::mem::size_of::<OpteeMsgParam>() * num_params as usize
+}
+
+/// Zerocopy-friendly header of `optee_msg_arg`.
+///
+/// This struct represents the fixed 32-byte header of the C `struct optee_msg_arg`.
+/// Unlike `OpteeMsgArgs`, all fields are plain `u32` so it can derive `FromBytes`/`IntoBytes`.
+/// Used as phase 1 of the two-phase read: read this header to learn `num_params`,
+/// then compute the total size and read the full blob.
+///
+/// A single `optee_msg_arg` on the wire:
+///
+/// ```text
+/// byte offset
+/// 0             cmd        (u32)
+/// 4             func       (u32)
+/// 8             session    (u32)
+/// 12            cancel_id  (u32)
+/// 16            pad        (u32)
+/// 20            ret        (u32)
+/// 24            ret_origin (u32)
+/// 28            num_params (u32)   N = num_params
+///               ---- header: 32 bytes (OpteeMsgArgsHeader) ----
+/// 32            params[0]  (32 bytes each, OpteeMsgParam)
+/// 64            params[1]
+///               ...
+/// 32 + N*32     (end)
+/// ```
+///
+/// Total size = `size_of::<OpteeMsgArgsHeader>() + N * size_of::<OpteeMsgParam>()`
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct OpteeMsgArgsHeader {
+    pub cmd: u32,
+    pub func: u32,
+    pub session: u32,
+    pub cancel_id: u32,
+    pub pad: u32,
+    pub ret: u32,
+    pub ret_origin: u32,
+    pub num_params: u32,
+}
+
 /// `optee_msg_arg` from `optee_os/core/include/optee_msg.h`
 /// OP-TEE message argument structure that the normal world (or VTL0) OP-TEE driver and OP-TEE OS use to
 /// exchange messages.
@@ -1439,15 +1532,21 @@ pub struct OpteeMsgArgs {
     pub ret: TeeResult,
     /// Origin of the return value
     pub ret_origin: TeeOrigin,
-    /// Number of parameters contained in `params`
-    pub num_params: u32,
-    /// Parameters to be passed to the secure world. If `cmd == OpenSession`, the first two params contain
-    /// a TA UUID and they are not delivered to the TA.
-    /// Note that, originally, the length of this array is variable. We fix it to `TEE_NUM_PARAMS + 2` to
-    /// simplify the implementation (our OP-TEE Shim supports up to four parameters as well).
+    /// Number of parameters contained in `params`.
     ///
-    /// TODO: To support OP-TEE RPC, we should make this array length dynamic. Consider to use
-    /// a trailing unsized slice (DST) or other mechanisms.
+    /// For main args: includes both meta parameters (e.g. TA UUID, client identity for
+    /// `OpenSession`) and client parameters. Typical values: 0 (close/cancel),
+    /// `TEE_NUM_PARAMS` (invoke), `TEE_NUM_PARAMS + 2` (open_session).
+    /// For RPC args: the count negotiated during `EXCHANGE_CAPABILITIES`.
+    pub num_params: u32,
+    /// Parameters to be passed to/from the secure world. If `cmd == OpenSession`, the first
+    /// two params are meta parameters (TA UUID and client identity, marked with
+    /// `OPTEE_MSG_ATTR_META`) and are not delivered to the TA.
+    ///
+    /// The C `struct optee_msg_arg` uses a flexible array member `params[]` whose length
+    /// is determined by `num_params`. We fix it to `TEE_NUM_PARAMS + 2` (= `MAX_PARAMS`)
+    /// to match the Linux driver's `MAX_ARG_PARAM_COUNT`. The variable-length wire format
+    /// is handled by the read/write proxy in `msg_handler.rs` and `write_msg_args_to_normal_world`.
     pub params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
 }
 
@@ -1528,6 +1627,107 @@ impl OpteeMsgArgs {
             self.params[index].u.rmem.size = size;
             Ok(())
         }
+    }
+
+    /// Maximum number of parameters that `OpteeMsgArgs` can hold.
+    ///
+    /// This is `TEE_NUM_PARAMS + 2` = 6, matching the Linux driver's `MAX_ARG_PARAM_COUNT`.
+    /// The `+2` accounts for the meta parameters (TA UUID + client identity) that the
+    /// Linux driver prepends for `OpenSession` commands. For `InvokeCommand`, only
+    /// `TEE_NUM_PARAMS` (4) client parameters are used. For RPC args, the actual
+    /// `num_params` is negotiated during `EXCHANGE_CAPABILITIES` (typically 1-2 in
+    /// upstream OP-TEE), but we cap it to this same array size.
+    pub const MAX_PARAMS: usize = TEE_NUM_PARAMS + 2;
+
+    /// Construct an `OpteeMsgArgs` from a zerocopy header and a raw parameter byte slice.
+    ///
+    /// `raw_params` must contain at least `header.num_params * size_of::<OpteeMsgParam>()` bytes.
+    /// `header.num_params` must not exceed `MAX_PARAMS` (6). Note that `num_params` counts
+    /// **all** entries in the `params[]` array, including meta parameters — e.g. for
+    /// `OpenSession`, the Linux driver sets `num_params = TEE_NUM_PARAMS + 2` (4 client
+    /// params + 2 meta params for TA UUID and client identity). For RPC args, `num_params`
+    /// is the count negotiated during `EXCHANGE_CAPABILITIES`.
+    ///
+    /// This bounds check is critical defense-in-depth against CVE-2022-46152-style attacks
+    /// where an unvalidated `num_params` from normal world causes OOB access on fixed arrays.
+    pub fn from_header_and_raw_params(
+        header: &OpteeMsgArgsHeader,
+        raw_params: &[u8],
+    ) -> Result<Self, OpteeSmcReturnCode> {
+        let num = header.num_params as usize;
+        if num > Self::MAX_PARAMS {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        let needed = num * size_of::<OpteeMsgParam>();
+        if raw_params.len() < needed {
+            return Err(OpteeSmcReturnCode::EBadAddr);
+        }
+
+        let cmd =
+            OpteeMessageCommand::try_from(header.cmd).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+        let ret = TeeResult::try_from(header.ret).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+        let ret_origin = TeeOrigin::read_from_bytes(header.ret_origin.as_bytes())
+            .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+        let mut params = [OpteeMsgParam {
+            attr: OpteeMsgAttr::default(),
+            u: OpteeMsgParamUnion { octets: [0u8; 24] },
+        }; Self::MAX_PARAMS];
+
+        for (i, param) in params.iter_mut().enumerate().take(num) {
+            let offset = i * size_of::<OpteeMsgParam>();
+            let param_bytes = &raw_params[offset..offset + size_of::<OpteeMsgParam>()];
+            *param = OpteeMsgParam::from_bytes(param_bytes).ok_or(OpteeSmcReturnCode::EBadAddr)?;
+        }
+
+        Ok(Self {
+            cmd,
+            func: header.func,
+            session: header.session,
+            cancel_id: header.cancel_id,
+            pad: header.pad,
+            ret,
+            ret_origin,
+            num_params: header.num_params,
+            params,
+        })
+    }
+
+    /// Convert the header portion of this `OpteeMsgArgs` back to an `OpteeMsgArgsHeader`.
+    pub fn to_header(&self) -> OpteeMsgArgsHeader {
+        OpteeMsgArgsHeader {
+            cmd: self.cmd as u32,
+            func: self.func,
+            session: self.session,
+            cancel_id: self.cancel_id,
+            pad: self.pad,
+            ret: self.ret as u32,
+            ret_origin: *self.ret_origin.value(),
+            num_params: self.num_params,
+        }
+    }
+
+    /// Serialize the params portion (up to `num_params`) as raw bytes into `buf`.
+    ///
+    /// Re-validates `num_params <= MAX_PARAMS` before using as loop bound.
+    /// See CVE-2022-46152 for why this defense-in-depth matters.
+    pub fn write_raw_params(&self, buf: &mut [u8]) -> Result<usize, OpteeSmcReturnCode> {
+        let num = self.num_params as usize;
+        if num > Self::MAX_PARAMS {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        let needed = num * size_of::<OpteeMsgParam>();
+        if buf.len() < needed {
+            return Err(OpteeSmcReturnCode::EBadAddr);
+        }
+        for i in 0..num {
+            let offset = i * size_of::<OpteeMsgParam>();
+            buf[offset..offset + size_of::<OpteeMsgParam>()]
+                .copy_from_slice(self.params[i].as_bytes());
+        }
+        Ok(needed)
     }
 }
 
@@ -1659,6 +1859,7 @@ pub enum OpteeSmcResult<'a> {
     },
     CallWithArg {
         msg_args: Box<OpteeMsgArgs>,
+        rpc_args: Option<Box<OpteeMsgArgs>>,
     },
 }
 
@@ -1800,7 +2001,7 @@ impl From<OpteeSmcReturnCode> for litebox_common_linux::errno::Errno {
 /// * `elf_data` - Raw bytes of the ELF binary
 pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
     use core::mem::size_of;
-    use elf::{ElfBytes, endian::AnyEndian};
+    use elf::{endian::AnyEndian, ElfBytes};
 
     let elf = ElfBytes::<AnyEndian>::minimal_parse(elf_data).ok()?;
     let (shdrs, strtab) = elf.section_headers_with_strtab().ok()?;
@@ -1828,6 +2029,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_optee_msg_args_header_size_and_layout() {
+        use core::mem::{offset_of, size_of};
+        assert_eq!(size_of::<OpteeMsgArgsHeader>(), 32);
+        assert_eq!(offset_of!(OpteeMsgArgsHeader, cmd), 0);
+        assert_eq!(offset_of!(OpteeMsgArgsHeader, func), 4);
+        assert_eq!(offset_of!(OpteeMsgArgsHeader, session), 8);
+        assert_eq!(offset_of!(OpteeMsgArgsHeader, cancel_id), 12);
+        assert_eq!(offset_of!(OpteeMsgArgsHeader, pad), 16);
+        assert_eq!(offset_of!(OpteeMsgArgsHeader, ret), 20);
+        assert_eq!(offset_of!(OpteeMsgArgsHeader, ret_origin), 24);
+        assert_eq!(offset_of!(OpteeMsgArgsHeader, num_params), 28);
+    }
+
+    #[test]
     fn test_tee_uuid_from_u64_array() {
         // Test with OP-TEE's well-known UUID: 384fb3e0-e7f8-11e3-af63-0002a5d5c51b
         // UUID bytes (big-endian for time fields):
@@ -1844,5 +2059,139 @@ mod tests {
             uuid.clock_seq_and_node,
             [0xaf, 0x63, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b]
         );
+    }
+
+    #[test]
+    fn test_header_to_msg_args_too_many_params() {
+        let header = OpteeMsgArgsHeader {
+            cmd: 0,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 7, // exceeds MAX_PARAMS = 6
+        };
+        let result = OpteeMsgArgs::from_header_and_raw_params(&header, &[0u8; 224]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_header_to_msg_args_raw_params_too_short() {
+        let header = OpteeMsgArgsHeader {
+            cmd: 0,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 4,
+        };
+        let result = OpteeMsgArgs::from_header_and_raw_params(&header, &[0u8; 64]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_roundtrip_header_params_write_read() {
+        use alloc::vec;
+
+        let header = OpteeMsgArgsHeader {
+            cmd: 1, // InvokeCommand
+            func: 0x1234,
+            session: 0xABCD,
+            cancel_id: 0,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 3,
+        };
+        let mut params_in = vec![0u8; 3 * size_of::<OpteeMsgParam>()];
+        for (i, byte) in params_in.iter_mut().enumerate() {
+            *byte = (i & 0xFF) as u8;
+        }
+
+        let msg_args = match OpteeMsgArgs::from_header_and_raw_params(&header, &params_in) {
+            Ok(m) => m,
+            Err(_) => panic!("expected Ok"),
+        };
+        assert_eq!(msg_args.func, 0x1234);
+        assert_eq!(msg_args.session, 0xABCD);
+        assert_eq!(msg_args.num_params, 3);
+
+        let header_out = msg_args.to_header();
+        assert_eq!(header_out.cmd, 1);
+        assert_eq!(header_out.func, 0x1234);
+        assert_eq!(header_out.session, 0xABCD);
+        assert_eq!(header_out.num_params, 3);
+
+        let mut params_out = vec![0u8; 3 * size_of::<OpteeMsgParam>()];
+        let written = match msg_args.write_raw_params(&mut params_out) {
+            Ok(n) => n,
+            Err(_) => panic!("expected Ok"),
+        };
+        assert_eq!(written, 3 * size_of::<OpteeMsgParam>());
+        assert_eq!(&params_out[..written], &params_in[..written]);
+    }
+
+    #[test]
+    fn test_zero_params() {
+        let header = OpteeMsgArgsHeader {
+            cmd: 3, // Cancel
+            func: 0,
+            session: 1,
+            cancel_id: 42,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 0,
+        };
+        let msg_args = match OpteeMsgArgs::from_header_and_raw_params(&header, &[]) {
+            Ok(m) => m,
+            Err(_) => panic!("expected Ok"),
+        };
+        assert_eq!(msg_args.num_params, 0);
+        assert_eq!(msg_args.cancel_id, 42);
+
+        let header_out = msg_args.to_header();
+        assert_eq!(header_out.num_params, 0);
+
+        let mut buf = [0u8; 0];
+        let written = match msg_args.write_raw_params(&mut buf) {
+            Ok(n) => n,
+            Err(_) => panic!("expected Ok"),
+        };
+        assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn test_max_params() {
+        use alloc::vec;
+
+        let header = OpteeMsgArgsHeader {
+            cmd: 0, // OpenSession
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 6, // MAX_PARAMS
+        };
+        let params = vec![0xABu8; 6 * size_of::<OpteeMsgParam>()];
+        let msg_args = match OpteeMsgArgs::from_header_and_raw_params(&header, &params) {
+            Ok(m) => m,
+            Err(_) => panic!("expected Ok"),
+        };
+        assert_eq!(msg_args.num_params, 6);
+
+        let mut params_out = vec![0u8; 6 * size_of::<OpteeMsgParam>()];
+        let written = match msg_args.write_raw_params(&mut params_out) {
+            Ok(n) => n,
+            Err(_) => panic!("expected Ok"),
+        };
+        assert_eq!(written, 6 * size_of::<OpteeMsgParam>());
+        assert_eq!(params_out, params);
     }
 }

@@ -17,16 +17,19 @@
 //! shared memory).
 use crate::{NormalWorldConstPtr, NormalWorldMutPtr};
 use alloc::{boxed::Box, vec::Vec};
+use core::mem::size_of;
 use hashbrown::HashMap;
 use litebox::{mm::linux::PAGE_SIZE, utils::TruncateExt};
 use litebox_common_linux::vmap::{PhysPageAddr, PhysPointerError};
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgAttrType, OpteeMsgParamRmem, OpteeMsgParamTmem,
-    OpteeMsgParamValue, OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction,
-    OpteeSmcResult, OpteeSmcReturnCode, TeeIdentity, TeeLogin, TeeOrigin, TeeParamType, TeeResult,
-    TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
+    optee_msg_get_arg_size, OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader,
+    OpteeMsgAttrType, OpteeMsgParam, OpteeMsgParamRmem, OpteeMsgParamTmem, OpteeMsgParamValue,
+    OpteeSecureWorldCapabilities, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult,
+    OpteeSmcReturnCode, TeeIdentity, TeeLogin, TeeOrigin, TeeParamType, TeeResult, TeeUuid,
+    UteeEntryFunc, UteeParamOwned, UteeParams, NUM_RPC_PARAMS,
 };
 use once_cell::race::OnceBox;
+use zerocopy::FromBytes;
 
 // OP-TEE version and build info (2.0)
 // TODO: Consider replacing it with our own version info
@@ -50,7 +53,6 @@ const OPTEE_MSG_OS_OPTEE_UUID_3: u32 = 0xa5d5_c51b;
 
 // We do not support notification for now
 const MAX_NOTIF_VALUE: usize = 0;
-const NUM_RPC_PARMS: usize = 4;
 
 #[inline]
 fn page_align_down(address: u64) -> u64 {
@@ -60,6 +62,142 @@ fn page_align_down(address: u64) -> u64 {
 #[inline]
 fn page_align_up(len: u64) -> u64 {
     len.next_multiple_of(PAGE_SIZE as u64)
+}
+
+/// Maximum byte size of a single-copy read buffer: main `optee_msg_arg` with `MAX_PARAMS`
+/// parameters plus RPC `optee_msg_arg` with `NUM_RPC_PARAMS` parameters.
+const MAX_COPY_SIZE: usize = (size_of::<OpteeMsgArgsHeader>()
+    + size_of::<OpteeMsgParam>() * OpteeMsgArgs::MAX_PARAMS)
+    + (size_of::<OpteeMsgArgsHeader>() + size_of::<OpteeMsgParam>() * NUM_RPC_PARAMS);
+
+/// Read `OpteeMsgArgs` from a VTL0 physical address using a single-copy approach.
+///
+/// Copies the maximum possible size in one shot into a private VTL1 buffer, then
+/// parses entirely from that buffer. This eliminates TOCTOU (double-fetch) issues:
+/// VTL0 cannot mutate the data between validation and use because we only touch
+/// our private copy after the single read.
+///
+/// The copy size is determined by known-good upper bounds, not by untrusted data:
+///   - Main args: `optee_msg_get_arg_size(MAX_PARAMS)` = 224 bytes (the Linux driver
+///     always allocates at least this much for the main arg).
+///   - RPC args (when present): `optee_msg_get_arg_size(rpc_num_params)`, where
+///     `rpc_num_params` is our own negotiated value from `EXCHANGE_CAPABILITIES`.
+///
+/// If `has_rpc_arg` is true, expects an appended RPC `optee_msg_arg` immediately after
+/// the main one at offset `optee_msg_get_arg_size(num_params)` (the *actual* `num_params`,
+/// not `MAX_PARAMS`). This matches the Linux driver's layout.
+///
+/// VTL0 physical memory layout at `phys_addr`:
+///
+/// ```text
+///  phys_addr
+///  |
+///  v                         main_size                  main_max
+///  |<---------------------->|                           |
+///  +--------+------+--------+--------+------+-----------+
+///  | header |par[0]|par[N-1]| header |par[0]|par[R-1]   |
+///  | 32B    | ...  |  32B   | 32B    | ...  |  32B       |
+///  +--------+------+--------+--------+------+-----------+
+///  |<-- main_size -------->|<--- rpc_size -->|           |
+///  |                       ^                            |
+///  |                RPC starts here              main_max + rpc_max
+///  |<----- copy_size = main_max + rpc_max ------------->|
+///
+///  N = actual num_params from header (validated <= MAX_PARAMS after copy)
+///  R = rpc_num_params (negotiated during OPTEE_SMC_EXCHANGE_CAPABILITIES)
+///
+///  We copy main_max + rpc_max bytes (the upper bound), which covers the
+///  actual data (main_size + rpc_size) plus some unused padding between
+///  main_size and main_max. We parse using main_size from our private
+///  snapshot, so the RPC arg is found at its correct offset.
+/// ```
+///
+/// Returns `(main_args, Option<rpc_args>)`.
+///
+/// # Panics
+///
+/// Panics if `copy_size` exceeds `MAX_COPY_SIZE` (448 bytes). This should never happen
+/// since `rpc_num_params` is validated against `MAX_PARAMS` before computing `copy_size`.
+pub fn read_optee_msg_args_from_phys(
+    phys_addr: usize,
+    has_rpc_arg: bool,
+    rpc_num_params: usize,
+) -> Result<(Box<OpteeMsgArgs>, Option<Box<OpteeMsgArgs>>), OpteeSmcReturnCode> {
+    // Validate rpc_num_params against our array capacity (this is our own value, not
+    // from VTL0, but defense-in-depth).
+    if has_rpc_arg && rpc_num_params > OpteeMsgArgs::MAX_PARAMS {
+        return Err(OpteeSmcReturnCode::EBadCmd);
+    }
+
+    // Compute copy size from known-good upper bounds — no untrusted data involved.
+    // The Linux driver always allocates optee_msg_get_arg_size(MAX_ARG_PARAM_COUNT=6)
+    // for the main arg, so we can safely read that much. The RPC arg in VTL0 sits at
+    // offset main_size (actual num_params), but we don't know num_params yet, so we
+    // copy main_max + rpc_max and index into the snapshot using validated num_params.
+    // Worst case we copy (MAX_PARAMS - actual_num_params) * 32 extra bytes of padding.
+    let main_max = optee_msg_get_arg_size(OpteeMsgArgs::MAX_PARAMS.truncate());
+    let copy_size = if has_rpc_arg {
+        let rpc_size = optee_msg_get_arg_size(rpc_num_params.truncate());
+        main_max
+            .checked_add(rpc_size)
+            .ok_or(OpteeSmcReturnCode::EBadAddr)?
+    } else {
+        main_max
+    };
+
+    // Single copy from VTL0 into private VTL1 buffer. After this point we never
+    // touch VTL0 memory again — all parsing is from our snapshot.
+    assert!(copy_size <= MAX_COPY_SIZE);
+    let mut blob = [0u8; MAX_COPY_SIZE];
+    let blob = &mut blob[..copy_size];
+
+    let mut blob_ptr =
+        NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(phys_addr, copy_size)
+            .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+    unsafe { blob_ptr.read_slice_at_offset(0, blob) }.map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+
+    // Parse main header from the private buffer.
+    let header_end = size_of::<OpteeMsgArgsHeader>();
+    if blob.len() < header_end {
+        return Err(OpteeSmcReturnCode::EBadAddr);
+    }
+    let main_header = OpteeMsgArgsHeader::read_from_bytes(&blob[..header_end])
+        .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+
+    // Validate num_params from the snapshot. See CVE-2022-46152: OP-TEE OOB read via
+    // unvalidated num_params allowed normal world to read beyond stack-allocated param arrays.
+    if main_header.num_params as usize > OpteeMsgArgs::MAX_PARAMS {
+        return Err(OpteeSmcReturnCode::EBadCmd);
+    }
+
+    let main_size = optee_msg_get_arg_size(main_header.num_params);
+    let main_params = &blob[size_of::<OpteeMsgArgsHeader>()..main_size];
+    let main_args = OpteeMsgArgs::from_header_and_raw_params(&main_header, main_params)?;
+
+    // Parse RPC args if present (from the same private buffer snapshot).
+    // The Linux driver places the RPC arg at offset main_size (based on the actual
+    // num_params, not MAX_PARAMS). Since we copied main_max bytes which is >= main_size,
+    // and main_size is computed from our own validated snapshot, this is safe.
+    let rpc_args = if has_rpc_arg {
+        let rpc_blob = &blob[main_size..];
+        let rpc_header_end = size_of::<OpteeMsgArgsHeader>();
+        if rpc_blob.len() < rpc_header_end {
+            return Err(OpteeSmcReturnCode::EBadAddr);
+        }
+        let rpc_header = OpteeMsgArgsHeader::read_from_bytes(&rpc_blob[..rpc_header_end])
+            .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+        // Re-validate RPC num_params from the snapshot against our negotiated limit.
+        if rpc_header.num_params as usize > NUM_RPC_PARAMS {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        let rpc_params = &rpc_blob[rpc_header_end..];
+        let rpc = OpteeMsgArgs::from_header_and_raw_params(&rpc_header, rpc_params)?;
+        Some(Box::new(rpc))
+    } else {
+        None
+    };
+
+    Ok((Box::new(main_args), rpc_args))
 }
 
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
@@ -77,18 +215,21 @@ pub fn handle_optee_smc_args(
         func_id
     );
     match func_id {
-        OpteeSmcFunction::CallWithArg
-        | OpteeSmcFunction::CallWithRpcArg
-        | OpteeSmcFunction::CallWithRegdArg => {
+        OpteeSmcFunction::CallWithArg => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
             let msg_args_addr: usize = msg_args_addr.truncate();
-            let mut ptr = NormalWorldConstPtr::<OpteeMsgArgs, PAGE_SIZE>::with_usize(msg_args_addr)
-                .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
-            let msg_args =
-                unsafe { ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+            let (msg_args, _) = read_optee_msg_args_from_phys(msg_args_addr, false, 0)?;
             Ok(OpteeSmcResult::CallWithArg {
-                msg_args: Box::new(*msg_args),
+                msg_args,
+                rpc_args: None,
             })
+        }
+        OpteeSmcFunction::CallWithRpcArg | OpteeSmcFunction::CallWithRegdArg => {
+            let msg_args_addr = smc.optee_msg_args_phys_addr()?;
+            let msg_args_addr: usize = msg_args_addr.truncate();
+            let (msg_args, rpc_args) =
+                read_optee_msg_args_from_phys(msg_args_addr, true, NUM_RPC_PARAMS)?;
+            Ok(OpteeSmcResult::CallWithArg { msg_args, rpc_args })
         }
         OpteeSmcFunction::ExchangeCapabilities => {
             // TODO: update the below when we support more features
@@ -99,7 +240,7 @@ pub fn handle_optee_smc_args(
                 status: OpteeSmcReturnCode::Ok,
                 capabilities: default_cap,
                 max_notif_value: MAX_NOTIF_VALUE,
-                data: NUM_RPC_PARMS,
+                data: NUM_RPC_PARAMS,
             })
         }
         OpteeSmcFunction::DisableShmCache => {
