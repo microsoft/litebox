@@ -1,0 +1,204 @@
+name: A3 Rust Verifier Action
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+# If a new commit is pushed to the branch before ongoing runs finish,
+# cancel the ongoing runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Run A3 Rust Verifier
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/microsoft/qsat-rust-verifier:latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        run: |
+          toolchain=$(awk -F'"' '/channel/{print $2}' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal \
+            --no-self-update
+
+      - name: Install build dependencies
+        run: |
+          apt-get update && apt-get install -y libclang-dev
+
+      - name: Build workspace
+        run: |
+          cargo build --locked --workspace \
+            --exclude litebox_runner_lvbs --exclude litebox_runner_snp \
+            2>&1 | tee /tmp/build-output.txt
+
+      - name: Generate MIR files
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "Generating MIR files from Rust source code..."
+          mkdir -p /tmp/mir_files /tmp/mir_errors
+
+          # Generate MIR for each crate in the workspace
+          # Use RUSTC_BOOTSTRAP to enable unstable features on stable Rust
+          echo "Generating MIR for workspace crates..."
+
+          # Get list of workspace crates (excluding problematic ones)
+          # Using explicit list to maintain control over which crates
+          # are analyzed
+          for crate in litebox litebox_common_linux \
+                       litebox_common_optee \
+                       litebox_platform_linux_kernel \
+                       litebox_platform_linux_userland \
+                       litebox_platform_windows_userland \
+                       litebox_platform_lvbs \
+                       litebox_platform_multiplex \
+                       litebox_runner_linux_userland \
+                       litebox_runner_linux_on_windows_userland \
+                       litebox_runner_optee_on_linux_userland \
+                       litebox_shim_linux litebox_shim_optee \
+                       litebox_syscall_rewriter dev_tests dev_bench; do
+            echo "Generating MIR for $crate..."
+            if RUSTC_BOOTSTRAP=1 cargo rustc --locked -p "$crate" \
+              -- -Z unpretty=mir -C overflow-checks=off \
+              > "/tmp/mir_files/${crate}.mir" \
+              2> "/tmp/mir_errors/${crate}.err"; then
+              echo "  ✓ MIR generated successfully for $crate"
+            else
+              echo "  ✗ Failed to generate MIR for $crate"
+              echo "  Check /tmp/mir_errors/${crate}.err for details"
+            fi
+          done
+
+          echo ""
+          echo "MIR generation summary:"
+          MIR_COUNT=$(find /tmp/mir_files -name "*.mir" -type f | wc -l)
+          echo "Successfully generated MIR files: $MIR_COUNT"
+          if [ "$MIR_COUNT" -eq 0 ]; then
+            echo "WARNING: No MIR files were generated!"
+            echo "Check error logs in /tmp/mir_errors/"
+          fi
+          echo ""
+          echo "Generated MIR files:"
+          ls -lh /tmp/mir_files/ || echo "No MIR files found"
+
+      - name: Run a3-rust
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "Running a3-rust on the generated MIR files..."
+
+          # Try to locate the qsat binary with different possible names
+          QSAT_BIN=""
+
+          # Try different binary names in PATH
+          for bin_name in qsat qsat-rust-verifier qsat-verifier; do
+            if command -v "$bin_name" >/dev/null 2>&1; then
+              QSAT_BIN="$bin_name"
+              echo "Found $bin_name in PATH"
+              break
+            fi
+          done
+
+          # If not found in PATH, try explicit locations
+          if [ -z "$QSAT_BIN" ]; then
+            for location in \
+              "/qsat/build/bin/qsat" \
+              "/qsat/qsat" \
+              "/usr/local/bin/qsat" \
+              "/opt/qsat"; do
+              if [ -x "$location" ]; then
+                QSAT_BIN="$location"
+                echo "Found qsat at: $QSAT_BIN"
+                break
+              fi
+            done
+          fi
+
+          # If still not found, try searching the filesystem
+          if [ -z "$QSAT_BIN" ]; then
+            echo "Searching for qsat binary..."
+            QSAT_BIN=$(find /qsat /usr /opt -maxdepth 3 -name "qsat" \
+              -type f -executable -print -quit 2>/dev/null)
+            if [ -n "$QSAT_BIN" ]; then
+              echo "Found qsat at: $QSAT_BIN"
+            fi
+          fi
+
+          if [ -n "$QSAT_BIN" ]; then
+            echo "QSAT binary found at: $QSAT_BIN"
+
+            # Check if any MIR files were generated
+            MIR_FILES=(/tmp/mir_files/*.mir)
+            if [ ! -e "${MIR_FILES[0]}" ]; then
+              echo "ERROR: No MIR files found in /tmp/mir_files/" | \
+                tee /tmp/verifier-output.txt
+              echo "MIR generation may have failed." | \
+                tee -a /tmp/verifier-output.txt
+              echo "Check the 'Generate MIR files' step output." | \
+                tee -a /tmp/verifier-output.txt
+              exit 0
+            fi
+
+            # Run qsat on the generated MIR files with multiple bug types
+            echo "Running QSAT with bug types:"
+            echo "  overflow,bounds,div_zero,panic,unwrap"
+            echo "================================" | \
+              tee /tmp/verifier-output.txt
+
+            for mir_file in "${MIR_FILES[@]}"; do
+              if [ -f "$mir_file" ]; then
+                echo "" | tee -a /tmp/verifier-output.txt
+                echo "Analyzing: $mir_file" | \
+                  tee -a /tmp/verifier-output.txt
+                echo "--------------------------------" | \
+                  tee -a /tmp/verifier-output.txt
+                "$QSAT_BIN" --bug-types \
+                  overflow,bounds,div_zero,panic,unwrap \
+                  "$mir_file" 2>&1 | tee -a /tmp/verifier-output.txt || true
+              fi
+            done
+          else
+            # Diagnostics for troubleshooting
+            echo "ERROR: qsat binary not found" | \
+              tee /tmp/verifier-output.txt
+            echo "" | tee -a /tmp/verifier-output.txt
+            echo "Searched locations:" | tee -a /tmp/verifier-output.txt
+            echo "  - PATH: $PATH" | tee -a /tmp/verifier-output.txt
+            echo "  - /qsat/build/bin/" | tee -a /tmp/verifier-output.txt
+            echo "  - /qsat/" | tee -a /tmp/verifier-output.txt
+            echo "  - /usr/local/bin/" | tee -a /tmp/verifier-output.txt
+            echo "  - /opt/" | tee -a /tmp/verifier-output.txt
+            echo "" | tee -a /tmp/verifier-output.txt
+            echo "Listing /qsat directory contents:" | \
+              tee -a /tmp/verifier-output.txt
+            ls -la /qsat 2>/dev/null | \
+              tee -a /tmp/verifier-output.txt || \
+              echo "  /qsat directory not found" | \
+              tee -a /tmp/verifier-output.txt
+            echo "" | tee -a /tmp/verifier-output.txt
+            echo "Searching for qsat binaries:" | \
+              tee -a /tmp/verifier-output.txt
+            find /qsat /usr /opt -maxdepth 3 -name "*qsat*" \
+              -type f -executable 2>/dev/null | head -20 | \
+              tee -a /tmp/verifier-output.txt || true
+          fi
+      - name: Upload verifier output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a3-rust-output
+          path: |
+            /tmp/verifier-output.txt
+            /tmp/build-output.txt
+            /tmp/mir_files/*.mir
+            /tmp/mir_errors/*.err
+          retention-days: 7
+          if-no-files-found: warn
+
