@@ -242,12 +242,6 @@ pub struct PerCpuVariablesAsm {
     vtl1_user_xsaved: Cell<u8>,
     /// Exception info: exception vector number
     exception_trapno: Cell<u8>,
-    /// Exception info: hardware error code
-    exception_error_code: Cell<u32>,
-    /// Exception info: faulting address (CR2)
-    exception_cr2: Cell<usize>,
-    /// Exception info: faulting kernel RIP (for exception table fixup)
-    exception_rip: Cell<usize>,
 }
 
 impl PerCpuVariablesAsm {
@@ -348,35 +342,8 @@ impl PerCpuVariablesAsm {
     pub const fn exception_trapno_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, exception_trapno)
     }
-    pub const fn exception_error_code_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, exception_error_code)
-    }
-    pub const fn exception_cr2_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, exception_cr2)
-    }
-    pub fn set_exception_info(
-        &self,
-        exception: litebox::shim::Exception,
-        error_code: u32,
-        cr2: usize,
-        rip: usize,
-    ) {
-        self.exception_trapno.set(exception.0);
-        self.exception_error_code.set(error_code);
-        self.exception_cr2.set(cr2);
-        self.exception_rip.set(rip);
-    }
     pub fn get_exception(&self) -> litebox::shim::Exception {
         litebox::shim::Exception(self.exception_trapno.get())
-    }
-    pub fn get_exception_error_code(&self) -> u32 {
-        self.exception_error_code.get()
-    }
-    pub fn get_exception_cr2(&self) -> usize {
-        self.exception_cr2.get()
-    }
-    pub fn get_exception_rip(&self) -> usize {
-        self.exception_rip.get()
     }
     pub fn get_user_context_top_addr(&self) -> usize {
         self.user_context_top_addr.get()
@@ -430,9 +397,6 @@ impl<T> RefCellWrapper<T> {
                 vtl1_kernel_xsaved: Cell::new(0),
                 vtl1_user_xsaved: Cell::new(0),
                 exception_trapno: Cell::new(0),
-                exception_error_code: Cell::new(0),
-                exception_cr2: Cell::new(0),
-                exception_rip: Cell::new(0),
             },
             inner: RefCell::new(value),
         }

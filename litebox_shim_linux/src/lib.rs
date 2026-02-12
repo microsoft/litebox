@@ -105,7 +105,7 @@ impl litebox::shim::EnterShim for LinuxShimEntrypoints {
             {
                 return ContinueOperation::ResumeKernelPlatform;
             } else {
-                return ContinueOperation::ResumeGuest;
+                return ContinueOperation::ExceptionFixup;
             }
         }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))

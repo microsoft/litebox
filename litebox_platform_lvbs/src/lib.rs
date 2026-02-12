@@ -1682,7 +1682,7 @@ unsafe extern "C" fn run_thread_arch(
         "jmp done",
         // Exception callback: entered from ISR stubs for user-mode exceptions.
         // At this point:
-        // - rsp points to ISR stack: [rsp]=vector, [rsp+8]=error_code, then iret frame
+        // - rsp = ISR stack: [vector, error_code, rip, cs, rflags, rsp, ss]
         // - All GPRs contain user-mode values
         // - Interrupts are disabled (IDT gate clears IF)
         // - GS = user (swapgs has NOT happened yet)
@@ -1690,12 +1690,8 @@ unsafe extern "C" fn run_thread_arch(
         "exception_callback:",
         "swapgs",
         "mov gs:[{scratch_off}], rax", // Save `rax` to per-CPU scratch
-        "mov rax, cr2",
-        "mov gs:[{exception_cr2_off}], rax", // Save `CR2` (only meaningful for #PF)
         "mov al, [rsp]",
         "mov gs:[{exception_trapno_off}], al", // vector number from ISR stack
-        "mov eax, [rsp + 8]",
-        "mov gs:[{exception_error_code_off}], eax", // error code from ISR stack
         "mov rax, rsp", // store ISR `rsp` in `rax`
         "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
         SAVE_PF_USER_CONTEXT_ASM!(),
@@ -1704,28 +1700,34 @@ unsafe extern "C" fn run_thread_arch(
         "mov rsp, gs:[{cur_kernel_sp_off}]",
         "mov rdi, [rsp]", // pass `thread_ctx`
         "xor esi, esi",   // kernel_mode = false
+        "mov rdx, cr2",   // cr2 (still valid — nothing overwrites it)
         "call {exception_handler}",
         "jmp done",
-        // Kernel-mode page fault callback: demand paging for user-space addresses.
-        // At this point:
-        // - rsp points to ISR stack with GPRs already saved
-        // - Exception info already stored in per-CPU variables
+        // Kernel-mode exception callback (currently used for #PF demand paging
+        // and exception-table fixup).
+        // At entry:
+        // - rsp = ISR stack: [vector, error_code, rip, cs, rflags, rsp, ss]
+        // - All GPRs = kernel values at time of fault
+        // - Interrupts are disabled (IDT gate clears IF)
         // - GS = kernel (no swapgs needed)
-        // - User extended states already saved by the enclosing syscall/exception path
         //
-        // Two entry points:
-        //   kernel_exception_callback      - saves GPRs first (for callers without prior push_regs)
-        //   kernel_exception_regs_saved    - GPRs already on stack (from ISR stub's push_regs)
+        // Saves GPRs, then passes exception info (CR2, error code, faulting
+        // RIP) to exception_handler via registers. exception_handler will try
+        // demand paging, exception table fixup, and kernel panic in that order.
         ".globl kernel_exception_callback",
         "kernel_exception_callback:",
+        "add rsp, 8",                       // skip vector number
+        // Now stack: [error_code, rip, cs, rflags, rsp, ss]
         SAVE_CPU_CONTEXT_ASM!(),
-        ".globl kernel_exception_regs_saved",
-        "kernel_exception_regs_saved:",
         "mov rbp, rsp",
         "and rsp, -16",
+        // Pass exception info via registers (SysV ABI args 1-5)
         "mov rdi, gs:[{cur_kernel_sp_off}]",
-        "mov rdi, [rdi]", // thread_ctx
-        "mov esi, 1",     // kernel_mode = true
+        "mov rdi, [rdi]",                   // arg1: thread_ctx
+        "mov esi, 1",                       // arg2: kernel_mode = true
+        "mov rdx, cr2",                     // arg3: cr2 (fault address)
+        "mov ecx, [rbp + 120]",             // arg4: error_code (orig_rax slot)
+        "mov r8, [rbp + 128]",              // arg5: faulting RIP (iret frame)
         "call {exception_handler}",
         // If demand paging failed, rax contains the exception table fixup
         // address. Patch the saved RIP on the ISR stack so iretq resumes
@@ -1758,8 +1760,6 @@ unsafe extern "C" fn run_thread_arch(
         USER_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
         scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
         exception_trapno_off = const { PerCpuVariablesAsm::exception_trapno_offset() },
-        exception_error_code_off = const { PerCpuVariablesAsm::exception_error_code_offset() },
-        exception_cr2_off = const { PerCpuVariablesAsm::exception_cr2_offset() },
         init_handler = sym init_handler,
         reenter_handler = sym reenter_handler,
         syscall_handler = sym syscall_handler,
@@ -1771,28 +1771,67 @@ unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
-/// Handles exceptions by reading exception info from per-CPU variables
-/// and routing to the shim's exception handler via `call_shim`.
+/// Handles exceptions and routes to the shim's exception handler via `call_shim`.
+///
+/// `cr2` is passed by both kernel- and user-mode assembly callbacks.
+/// For kernel-mode exceptions, `error_code` and `faulting_rip`
+/// are also passed from the ISR stack.
+/// For user-mode exceptions, `error_code` is read from the saved
+/// `orig_rax` in the user context and the vector number is read from
+/// the per-CPU trapno variable.
 ///
 /// Returns 0 for normal flow (user-mode or successful demand paging), or
-/// a fixup address when kernel-mode demand paging fails and an exception
-/// table entry exists.
-unsafe extern "C" fn exception_handler(thread_ctx: &mut ThreadContext, kernel_mode: bool) -> usize {
-    use crate::host::per_cpu_variables::with_per_cpu_variables_asm;
-    let info = with_per_cpu_variables_asm(|pcv| litebox::shim::ExceptionInfo {
-        exception: pcv.get_exception(),
-        error_code: pcv.get_exception_error_code(),
-        cr2: pcv.get_exception_cr2(),
-        kernel_mode,
-    });
-    thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info))
+/// a fixup address when kernel-mode user-space demand paging fails and
+/// an exception table entry exists. Panics if no fixup is found.
+unsafe extern "C" fn exception_handler(
+    thread_ctx: &mut ThreadContext,
+    kernel_mode: bool,
+    cr2: usize,
+    error_code: usize,
+    faulting_rip: usize,
+) -> usize {
+    let info = if kernel_mode {
+        use litebox::utils::TruncateExt as _;
+        litebox::shim::ExceptionInfo {
+            exception: litebox::shim::Exception::PAGE_FAULT,
+            error_code: error_code.truncate(),
+            cr2,
+            kernel_mode: true,
+        }
+    } else {
+        use crate::host::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables_asm};
+        use litebox::utils::TruncateExt as _;
+        litebox::shim::ExceptionInfo {
+            exception: with_per_cpu_variables_asm(PerCpuVariablesAsm::get_exception),
+            error_code: thread_ctx.ctx.orig_rax.truncate(),
+            cr2,
+            kernel_mode: false,
+        }
+    };
+    match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
+        Some(val) => val,
+        None => {
+            // ExceptionFixup: look up exception table, panic if not found.
+            litebox::mm::exception_table::search_exception_tables(faulting_rip).unwrap_or_else(
+                || {
+                    panic!(
+                        "EXCEPTION: PAGE FAULT\n\
+                         Accessed Address: {:#x}\n\
+                         Error Code: {:#x}\n\
+                         Faulting RIP: {:#x}",
+                        info.cr2, info.error_code, faulting_rip,
+                    )
+                },
+            )
+        }
+    }
 }
 
 /// Calls `f` in order to call into a shim entrypoint.
 ///
-/// Returns 0 for most operations. For `ExceptionFixup`, returns the fixup
-/// address from the exception table. For `ResumeGuest`, does not return
-/// (switches directly to user mode).
+/// Returns `Some(0)` for most operations. Returns `None` for
+/// `ExceptionFixup` (caller is responsible for looking up the fixup).
+/// For `ResumeGuest`, does not return (switches directly to user mode).
 impl ThreadContext<'_> {
     fn call_shim(
         &mut self,
@@ -1800,20 +1839,12 @@ impl ThreadContext<'_> {
             &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
             &mut litebox_common_linux::PtRegs,
         ) -> ContinueOperation,
-    ) -> usize {
+    ) -> Option<usize> {
         let op = f(self.shim, self.ctx);
         match op {
             ContinueOperation::ResumeGuest => unsafe { switch_to_user(self.ctx) },
-            ContinueOperation::ExitThread | ContinueOperation::ResumeKernelPlatform => 0,
-            ContinueOperation::ExceptionFixup => {
-                use crate::host::per_cpu_variables::{
-                    PerCpuVariablesAsm, with_per_cpu_variables_asm,
-                };
-                let faulting_rip =
-                    with_per_cpu_variables_asm(PerCpuVariablesAsm::get_exception_rip);
-                litebox::mm::exception_table::search_exception_tables(faulting_rip)
-                    .expect("kernel-mode page fault with no exception table fixup")
-            }
+            ContinueOperation::ExitThread | ContinueOperation::ResumeKernelPlatform => Some(0),
+            ContinueOperation::ExceptionFixup => None,
         }
     }
 }

@@ -171,60 +171,6 @@ extern "C" fn general_protection_fault_handler_impl(regs: &PtRegs) {
     );
 }
 
-/// Result from the kernel-mode page fault handler, consumed by the ISR stub.
-#[repr(u8)]
-enum PageFaultResult {
-    /// Fault was handled via exception table fixup.
-    Handled = 0,
-    /// Fault at a user-space address; route to the shim's exception handler
-    /// for demand paging or exception-table fixup on invalid access.
-    RouteToShim = 1,
-}
-
-/// Kernel-mode page fault handler (vector 14).
-///
-/// Returns [`PageFaultResult`] to the ISR stub.
-/// For unrecoverable faults, this function panics and never returns.
-#[unsafe(no_mangle)]
-extern "C" fn page_fault_handler_impl(regs: &mut PtRegs) -> PageFaultResult {
-    use crate::host::per_cpu_variables::with_per_cpu_variables_asm;
-    use crate::{USER_ADDR_MAX, USER_ADDR_MIN};
-    use litebox::mm::exception_table::search_exception_tables;
-    use litebox::utils::TruncateExt as _;
-    use x86_64::registers::control::Cr2;
-
-    let fault_addr: usize = Cr2::read_raw().truncate();
-    let error_code = regs.orig_rax;
-
-    // Kernel-mode page fault at a user-space address (e.g., a syscall handler has accessed
-    // not-yet mapped or invalid user memory): route to the shim's exception handler for
-    // demand paging or exception table fixup.
-    if (USER_ADDR_MIN..USER_ADDR_MAX).contains(&fault_addr) {
-        with_per_cpu_variables_asm(|pcv| {
-            pcv.set_exception_info(
-                litebox::shim::Exception::PAGE_FAULT,
-                error_code.truncate(),
-                fault_addr,
-                regs.rip,
-            );
-        });
-        return PageFaultResult::RouteToShim;
-    }
-
-    // Safety net for fallible kernel memory operations (e.g., copying to/from
-    // VTL0 addresses) where the target address may be unmapped due to bugs.
-    if let Some(fixup_addr) = search_exception_tables(regs.rip) {
-        regs.rip = fixup_addr;
-        return PageFaultResult::Handled;
-    }
-
-    // Kernel-mode page fault at kernel-space addresses — unrecoverable
-    panic!(
-        "EXCEPTION: PAGE FAULT\nAccessed Address: {:#x}\nError Code: {:#x}\n{:#x?}",
-        fault_addr, error_code, regs
-    );
-}
-
 /// Kernel-mode handler for x87 floating-point exception (vector 16).
 #[unsafe(no_mangle)]
 extern "C" fn x87_floating_point_handler_impl(regs: &PtRegs) {
