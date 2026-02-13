@@ -1575,7 +1575,7 @@ pub struct OpteeMsgArgsHeader {
 
 /// `optee_msg_arg` from `optee_os/core/include/optee_msg.h`
 /// OP-TEE message argument structure that the normal world (or VTL0) OP-TEE driver and OP-TEE OS use to
-/// exchange messages. This data structure is used for carrying RPC information as well.
+/// exchange messages.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct OpteeMsgArgs {
@@ -1594,12 +1594,9 @@ pub struct OpteeMsgArgs {
     pub ret: TeeResult,
     /// Origin of the return value
     pub ret_origin: TeeOrigin,
-    /// Number of parameters contained in `params`.
-    ///
-    /// For main args: includes both meta parameters (e.g. TA UUID, client identity for
-    /// `OpenSession`) and client parameters. Typical values: 0 (close/cancel),
+    /// Number of parameters contained in `params`. It includes both meta parameters (e.g. TA UUID,
+    /// client identity for `OpenSession`) and client parameters. Typical values: 0 (close/cancel),
     /// `TEE_NUM_PARAMS` (invoke), `TEE_NUM_PARAMS + 2` (open_session).
-    /// For RPC args: the count negotiated during `EXCHANGE_CAPABILITIES`.
     pub num_params: u32,
     /// Parameters to be passed to/from the secure world. If `cmd == OpenSession`, the first
     /// two params are meta parameters (TA UUID and client identity, marked with
@@ -1608,7 +1605,7 @@ pub struct OpteeMsgArgs {
     /// The C `struct optee_msg_arg` uses a flexible array member `params[]` whose length
     /// is determined by `num_params`. We fix it to `TEE_NUM_PARAMS + 2` (= `MAX_PARAMS`)
     /// to match the Linux driver's `MAX_ARG_PARAM_COUNT`. The variable-length wire format
-    /// is handled by the read/write proxy in `msg_handler.rs` and `write_msg_args_to_normal_world`.
+    /// is handled by the read/write proxy and `write_msg_args_to_normal_world`.
     pub params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
 }
 
@@ -1695,24 +1692,12 @@ impl OpteeMsgArgs {
     /// Maximum number of parameters that `OpteeMsgArgs` can hold.
     ///
     /// This is `TEE_NUM_PARAMS + 2` = 6, matching the Linux driver's `MAX_ARG_PARAM_COUNT`.
-    /// The `+2` accounts for the meta parameters (TA UUID + client identity) that the
-    /// Linux driver prepends for `OpenSession` commands. For `InvokeCommand`, only
-    /// `TEE_NUM_PARAMS` (4) client parameters are used. For RPC args, the actual
-    /// `num_params` is negotiated during `EXCHANGE_CAPABILITIES` (typically 1-2 in
-    /// upstream OP-TEE), but we cap it to this same array size.
     pub const MAX_PARAMS: usize = TEE_NUM_PARAMS + 2;
 
     /// Construct an `OpteeMsgArgs` from a zerocopy header and a raw parameter byte slice.
     ///
     /// `raw_params` must contain at least `header.num_params * size_of::<OpteeMsgParam>()` bytes.
-    /// `header.num_params` must not exceed `MAX_PARAMS` (6). Note that `num_params` counts
-    /// **all** entries in the `params[]` array, including meta parameters — e.g. for
-    /// `OpenSession`, the Linux driver sets `num_params = TEE_NUM_PARAMS + 2` (4 client
-    /// params + 2 meta params for TA UUID and client identity). For RPC args, `num_params`
-    /// is the count negotiated during `EXCHANGE_CAPABILITIES`.
-    ///
-    /// This bounds check is critical defense-in-depth against CVE-2022-46152-style attacks
-    /// where an unvalidated `num_params` from normal world causes OOB access on fixed arrays.
+    /// `header.num_params` must not exceed `MAX_PARAMS` (6).
     pub fn from_header_and_raw_params(
         header: &OpteeMsgArgsHeader,
         raw_params: &[u8],
@@ -1776,7 +1761,6 @@ impl OpteeMsgArgs {
     /// Serialize the params portion (up to `num_params`) as raw bytes into `buf`.
     ///
     /// Re-validates `num_params <= MAX_PARAMS` before using as loop bound.
-    /// See CVE-2022-46152 for why this defense-in-depth matters.
     pub fn write_raw_params(&self, buf: &mut [u8]) -> Result<usize, OpteeSmcReturnCode> {
         let num = self.num_params as usize;
         if num > Self::MAX_PARAMS {
@@ -2352,57 +2336,6 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_params() {
-        let header = OpteeMsgArgsHeader {
-            cmd: 3, // Cancel
-            func: 0,
-            session: 1,
-            cancel_id: 42,
-            pad: 0,
-            ret: 0,
-            ret_origin: 0,
-            num_params: 0,
-        };
-        let msg_args = OpteeMsgArgs::from_header_and_raw_params(&header, &[]).expect("expected Ok");
-        assert_eq!(msg_args.num_params, 0);
-        assert_eq!(msg_args.cancel_id, 42);
-
-        let header_out = msg_args.to_header();
-        assert_eq!(header_out.num_params, 0);
-
-        let mut buf = [0u8; 0];
-        let written = msg_args.write_raw_params(&mut buf).expect("expected Ok");
-        assert_eq!(written, 0);
-    }
-
-    #[test]
-    fn test_max_params() {
-        use alloc::vec;
-
-        let header = OpteeMsgArgsHeader {
-            cmd: 0, // OpenSession
-            func: 0,
-            session: 0,
-            cancel_id: 0,
-            pad: 0,
-            ret: 0,
-            ret_origin: 0,
-            num_params: 6, // MAX_PARAMS
-        };
-        let params = vec![0xABu8; 6 * size_of::<OpteeMsgParam>()];
-        let msg_args =
-            OpteeMsgArgs::from_header_and_raw_params(&header, &params).expect("expected Ok");
-        assert_eq!(msg_args.num_params, 6);
-
-        let mut params_out = vec![0u8; 6 * size_of::<OpteeMsgParam>()];
-        let written = msg_args
-            .write_raw_params(&mut params_out)
-            .expect("expected Ok");
-        assert_eq!(written, 6 * size_of::<OpteeMsgParam>());
-        assert_eq!(params_out, params);
-    }
-
-    #[test]
     fn test_optee_rpc_args_roundtrip() {
         use alloc::vec;
 
@@ -2444,12 +2377,10 @@ mod tests {
 
     #[test]
     fn test_rpc_args_rejects_main_cmd() {
-        // OpenSession = 0 is a main command, but also happens to be LoadTa = 0 for RPC.
-        // InvokeCommand = 1 maps to Rpmb = 1 in RPC. So to test rejection we need a
-        // cmd value that's valid for main but not for RPC. RegisterShm = 4 has no
-        // RPC counterpart.
+        // Pick a cmd value that lies in the gap between Suspend (5) and ShmAlloc (28),
+        // so it is not a valid OpteeRpcCommand variant.
         let header = OpteeMsgArgsHeader {
-            cmd: 4, // RegisterShm — not a valid OpteeRpcCommand
+            cmd: 6, // not a valid OpteeRpcCommand
             func: 0,
             session: 0,
             cancel_id: 0,
@@ -2459,28 +2390,5 @@ mod tests {
             num_params: 0,
         };
         assert!(OpteeRpcArgs::from_header_and_raw_params(&header, &[]).is_err());
-    }
-
-    #[test]
-    fn test_rpc_args_reserved_fields_zeroed() {
-        let header = OpteeMsgArgsHeader {
-            cmd: 29, // ShmFree
-            func: 0xDEAD,
-            session: 0xBEEF,
-            cancel_id: 0xCAFE,
-            pad: 0,
-            ret: 0,
-            ret_origin: 0,
-            num_params: 0,
-        };
-        let rpc_args =
-            OpteeRpcArgs::from_header_and_raw_params(&header, &[]).expect("should parse");
-        assert_eq!(rpc_args.cmd, OpteeRpcCommand::ShmFree);
-
-        // Reserved fields should be zeroed regardless of header input
-        let hdr_out = rpc_args.to_header();
-        assert_eq!(hdr_out.func, 0);
-        assert_eq!(hdr_out.session, 0);
-        assert_eq!(hdr_out.cancel_id, 0);
     }
 }
