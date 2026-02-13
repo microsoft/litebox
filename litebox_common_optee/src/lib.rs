@@ -404,10 +404,10 @@ pub struct UteeParams {
 /// Number of TEE parameters to be passed to TAs.
 const TEE_NUM_PARAMS: usize = 4;
 
-/// Number of RPC parameters that LiteBox defined and reported to the normal-world
+/// Number of RPC parameters that the OP-TEE Shim defined and reported to the normal-world
 /// Linux kernel driver during `EXCHANGE_CAPABILITIES`. The Linux kernel driver is
 /// expected to allocate a shared buffer for this number of parameters.
-pub const NUM_RPC_PARAMS: usize = 4;
+const NUM_RPC_PARAMS: usize = 4;
 
 /// Packed parameter types for [`UteeParams`].
 ///
@@ -1283,9 +1283,6 @@ impl TryFrom<OpteeMessageCommand> for UteeEntryFunc {
     }
 }
 
-// RPC command IDs from `optee_os/core/include/optee_msg.h`.
-// These occupy the `cmd` field of the RPC `optee_msg_arg`, which is a separate namespace
-// from `OPTEE_MSG_CMD_*` used for main messaging.
 const OPTEE_MSG_RPC_CMD_LOAD_TA: u32 = 0;
 const OPTEE_MSG_RPC_CMD_RPMB: u32 = 1;
 const OPTEE_MSG_RPC_CMD_FS: u32 = 2;
@@ -1296,7 +1293,7 @@ const OPTEE_MSG_RPC_CMD_SHM_ALLOC: u32 = 28;
 const OPTEE_MSG_RPC_CMD_SHM_FREE: u32 = 29;
 const OPTEE_MSG_RPC_CMD_NOTIFICATION: u32 = 30;
 
-/// `OPTEE_MSG_RPC_CMD_*` from `optee_os/core/include/optee_msg.h`
+/// RPC command IDs from `optee_os/core/include/optee_msg.h`
 ///
 /// These are the command IDs used in the `cmd` field of the RPC `optee_msg_arg`.
 /// They live in a separate namespace from [`OpteeMessageCommand`] (which is for main
@@ -1434,7 +1431,7 @@ pub struct OpteeMsgAttr(u64);
 impl OpteeMsgAttr {
     /// Returns the attribute type (bits 0–7).
     #[allow(clippy::cast_possible_truncation)]
-    pub fn typ(&self) -> u8 {
+    pub fn attr_type(&self) -> u8 {
         self.0 as u8
     }
 
@@ -1458,11 +1455,11 @@ pub struct OpteeMsgParam {
 
 impl OpteeMsgParam {
     pub fn attr_type(&self) -> OpteeMsgAttrType {
-        OpteeMsgAttrType::try_from(self.attr.typ()).unwrap_or(OpteeMsgAttrType::None)
+        OpteeMsgAttrType::try_from(self.attr.attr_type()).unwrap_or(OpteeMsgAttrType::None)
     }
     pub fn get_param_tmem(&self) -> Option<OpteeMsgParamTmem> {
         if matches!(
-            self.attr.typ(),
+            self.attr.attr_type(),
             OPTEE_MSG_ATTR_TYPE_TMEM_INPUT
                 | OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT
                 | OPTEE_MSG_ATTR_TYPE_TMEM_INOUT
@@ -1474,7 +1471,7 @@ impl OpteeMsgParam {
     }
     pub fn get_param_rmem(&self) -> Option<OpteeMsgParamRmem> {
         if matches!(
-            self.attr.typ(),
+            self.attr.attr_type(),
             OPTEE_MSG_ATTR_TYPE_RMEM_INPUT
                 | OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT
                 | OPTEE_MSG_ATTR_TYPE_RMEM_INOUT
@@ -1486,7 +1483,7 @@ impl OpteeMsgParam {
     }
     pub fn get_param_fmem(&self) -> Option<OpteeMsgParamFmem> {
         if matches!(
-            self.attr.typ(),
+            self.attr.attr_type(),
             OPTEE_MSG_ATTR_TYPE_RMEM_INPUT
                 | OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT
                 | OPTEE_MSG_ATTR_TYPE_RMEM_INOUT
@@ -1498,7 +1495,7 @@ impl OpteeMsgParam {
     }
     pub fn get_param_value(&self) -> Option<OpteeMsgParamValue> {
         if matches!(
-            self.attr.typ(),
+            self.attr.attr_type(),
             OPTEE_MSG_ATTR_TYPE_VALUE_INPUT
                 | OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT
                 | OPTEE_MSG_ATTR_TYPE_VALUE_INOUT
@@ -1522,14 +1519,14 @@ impl OpteeMsgParam {
 ///
 /// # Safety invariant
 ///
-/// Callers must ensure `num_params` has been validated against `OpteeMsgArgs::MAX_PARAMS`.
+/// Callers must ensure `num_params` has been validated against `OpteeMsgArgs::MAX_ARG_PARAM_COUNT`.
 /// An unvalidated `num_params` from normal world memory could produce an oversized result,
 /// leading to out-of-bounds access on fixed-size arrays.
 /// See CVE-2022-46152 (OP-TEE OOB via unvalidated `num_params`).
 pub const fn optee_msg_arg_total_size(num_params: u32) -> usize {
     debug_assert!(
-        num_params as usize <= OpteeMsgArgs::MAX_PARAMS,
-        "optee_msg_arg_total_size: num_params exceeds MAX_PARAMS"
+        num_params as usize <= OpteeMsgArgs::MAX_ARG_PARAM_COUNT,
+        "optee_msg_arg_total_size: num_params exceeds MAX_ARG_PARAM_COUNT"
     );
     core::mem::size_of::<OpteeMsgArgsHeader>()
         + core::mem::size_of::<OpteeMsgParam>() * num_params as usize
@@ -1603,7 +1600,7 @@ pub struct OpteeMsgArgs {
     /// `OPTEE_MSG_ATTR_META`) and are not delivered to the TA.
     ///
     /// The C `struct optee_msg_arg` uses a flexible array member `params[]` whose length
-    /// is determined by `num_params`. We fix it to `TEE_NUM_PARAMS + 2` (= `MAX_PARAMS`)
+    /// is determined by `num_params`. We fix it to `TEE_NUM_PARAMS + 2` (= `MAX_ARG_PARAM_COUNT`)
     /// to match the Linux driver's `MAX_ARG_PARAM_COUNT`. The variable-length wire format
     /// is handled by the read/write proxy and `write_msg_args_to_normal_world`.
     pub params: [OpteeMsgParam; TEE_NUM_PARAMS + 2],
@@ -1692,22 +1689,21 @@ impl OpteeMsgArgs {
     /// Maximum number of parameters that `OpteeMsgArgs` can hold.
     ///
     /// This is `TEE_NUM_PARAMS + 2` = 6, matching the Linux driver's `MAX_ARG_PARAM_COUNT`.
-    pub const MAX_PARAMS: usize = TEE_NUM_PARAMS + 2;
+    pub const MAX_ARG_PARAM_COUNT: usize = TEE_NUM_PARAMS + 2;
 
     /// Construct an `OpteeMsgArgs` from a zerocopy header and a raw parameter byte slice.
     ///
     /// `raw_params` must contain at least `header.num_params * size_of::<OpteeMsgParam>()` bytes.
-    /// `header.num_params` must not exceed `MAX_PARAMS` (6).
+    /// `header.num_params` must not exceed `MAX_ARG_PARAM_COUNT` (6).
     pub fn from_header_and_raw_params(
         header: &OpteeMsgArgsHeader,
         raw_params: &[u8],
     ) -> Result<Self, OpteeSmcReturnCode> {
         let num = header.num_params as usize;
-        if num > Self::MAX_PARAMS {
+        if num > Self::MAX_ARG_PARAM_COUNT {
             return Err(OpteeSmcReturnCode::EBadCmd);
         }
-        let needed = num * size_of::<OpteeMsgParam>();
-        if raw_params.len() < needed {
+        if raw_params.len() < num * size_of::<OpteeMsgParam>() {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
 
@@ -1722,7 +1718,7 @@ impl OpteeMsgArgs {
         let mut params = [OpteeMsgParam {
             attr: OpteeMsgAttr::default(),
             data: [0u8; OPTEE_MSG_PARAM_DATA_SIZE],
-        }; Self::MAX_PARAMS];
+        }; Self::MAX_ARG_PARAM_COUNT];
 
         for (i, param) in params.iter_mut().enumerate().take(num) {
             let offset = i * size_of::<OpteeMsgParam>();
@@ -1760,14 +1756,14 @@ impl OpteeMsgArgs {
 
     /// Serialize the params portion (up to `num_params`) as raw bytes into `buf`.
     ///
-    /// Re-validates `num_params <= MAX_PARAMS` before using as loop bound.
+    /// Re-validates `num_params <= MAX_ARG_PARAM_COUNT` before using as loop bound.
     pub fn write_raw_params(&self, buf: &mut [u8]) -> Result<usize, OpteeSmcReturnCode> {
         let num = self.num_params as usize;
-        if num > Self::MAX_PARAMS {
+        if num > Self::MAX_ARG_PARAM_COUNT {
             return Err(OpteeSmcReturnCode::EBadCmd);
         }
-        let needed = num * size_of::<OpteeMsgParam>();
-        if buf.len() < needed {
+        let out_buf_len = num * size_of::<OpteeMsgParam>();
+        if buf.len() < out_buf_len {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
         for i in 0..num {
@@ -1775,7 +1771,7 @@ impl OpteeMsgArgs {
             buf[offset..offset + size_of::<OpteeMsgParam>()]
                 .copy_from_slice(self.params[i].as_bytes());
         }
-        Ok(needed)
+        Ok(out_buf_len)
     }
 }
 
@@ -1814,15 +1810,15 @@ pub struct OpteeRpcArgs {
     pub ret_origin: TeeOrigin,
     /// Number of parameters in `params`, negotiated during `EXCHANGE_CAPABILITIES`.
     pub num_params: u32,
-    /// RPC parameters. Fixed to [`NUM_RPC_PARAMS`] entries.
-    pub params: [OpteeMsgParam; Self::MAX_PARAMS],
+    /// RPC parameters. Fixed to `NUM_RPC_PARAMS` entries.
+    pub params: [OpteeMsgParam; Self::MAX_RPC_ARG_PARAM_COUNT],
 }
 
 impl OpteeRpcArgs {
     /// Maximum number of RPC parameters this struct can hold.
     ///
-    /// This is [`NUM_RPC_PARAMS`], the count negotiated during `EXCHANGE_CAPABILITIES`.
-    pub const MAX_PARAMS: usize = NUM_RPC_PARAMS;
+    /// This is `NUM_RPC_PARAMS`, the count negotiated during `EXCHANGE_CAPABILITIES`.
+    pub const MAX_RPC_ARG_PARAM_COUNT: usize = NUM_RPC_PARAMS;
 
     /// Construct an `OpteeRpcArgs` from a zerocopy header and a raw parameter byte slice.
     ///
@@ -1834,11 +1830,10 @@ impl OpteeRpcArgs {
         raw_params: &[u8],
     ) -> Result<Self, OpteeSmcReturnCode> {
         let num = header.num_params as usize;
-        if num > Self::MAX_PARAMS {
+        if num > Self::MAX_RPC_ARG_PARAM_COUNT {
             return Err(OpteeSmcReturnCode::EBadCmd);
         }
-        let needed = num * size_of::<OpteeMsgParam>();
-        if raw_params.len() < needed {
+        if raw_params.len() < num * size_of::<OpteeMsgParam>() {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
 
@@ -1852,7 +1847,7 @@ impl OpteeRpcArgs {
         let mut params = [OpteeMsgParam {
             attr: OpteeMsgAttr::default(),
             data: [0u8; OPTEE_MSG_PARAM_DATA_SIZE],
-        }; Self::MAX_PARAMS];
+        }; Self::MAX_RPC_ARG_PARAM_COUNT];
 
         for (i, param) in params.iter_mut().enumerate().take(num) {
             let offset = i * size_of::<OpteeMsgParam>();
@@ -1893,11 +1888,11 @@ impl OpteeRpcArgs {
     /// Serialize the params portion (up to `num_params`) as raw bytes into `buf`.
     pub fn write_raw_params(&self, buf: &mut [u8]) -> Result<usize, OpteeSmcReturnCode> {
         let num = self.num_params as usize;
-        if num > Self::MAX_PARAMS {
+        if num > Self::MAX_RPC_ARG_PARAM_COUNT {
             return Err(OpteeSmcReturnCode::EBadCmd);
         }
-        let needed = num * size_of::<OpteeMsgParam>();
-        if buf.len() < needed {
+        let out_buf_len = num * size_of::<OpteeMsgParam>();
+        if buf.len() < out_buf_len {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
         for i in 0..num {
@@ -1905,7 +1900,7 @@ impl OpteeRpcArgs {
             buf[offset..offset + size_of::<OpteeMsgParam>()]
                 .copy_from_slice(self.params[i].as_bytes());
         }
-        Ok(needed)
+        Ok(out_buf_len)
     }
 
     /// Access a parameter by index with bounds checking against `num_params`.
@@ -2274,7 +2269,7 @@ mod tests {
             pad: 0,
             ret: 0,
             ret_origin: 0,
-            num_params: 7, // exceeds MAX_PARAMS = 6
+            num_params: 7, // exceeds MAX_ARG_PARAM_COUNT = 6
         };
         let result = OpteeMsgArgs::from_header_and_raw_params(&header, &[0u8; 224]);
         assert!(result.is_err());
