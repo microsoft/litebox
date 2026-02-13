@@ -7,8 +7,11 @@
 #![no_std]
 
 use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
+use alloc::vec::Vec;
 use core::{
     arch::asm,
+    mem::ManuallyDrop,
+    ops::Range,
     sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use hashbrown::HashMap;
@@ -16,11 +19,10 @@ use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
     Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutex as _, RawMutexProvider,
     RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
-    page_mgmt::DeallocationError,
+    page_mgmt::{DeallocationError, FixedAddressBehavior},
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
-    platform::page_mgmt::FixedAddressBehavior,
     shim::ContinueOperation,
     utils::TruncateExt,
 };
@@ -32,6 +34,7 @@ use litebox_common_linux::{
         VmapManager,
     },
 };
+use rangemap::set::RangeSet;
 use x86_64::{
     VirtAddr,
     structures::paging::{
@@ -42,10 +45,6 @@ use x86_64::{
 use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
-
-use alloc::vec::Vec;
-use core::ops::Range;
-use rangemap::set::RangeSet;
 
 pub mod arch;
 pub mod host;
@@ -340,6 +339,21 @@ impl PageTableManager {
     }
 }
 
+/// Maximum number of spin iterations before giving up on a frame lock.
+const FRAME_LOCK_SPIN_RETRIES: usize = 1000;
+
+/// Repeatedly calls `f` up to [`FRAME_LOCK_SPIN_RETRIES`] times, returning the
+/// first `Some` value. Returns `None` if every attempt returns `None`.
+fn spin_try<T>(f: impl Fn() -> Option<T>) -> Option<T> {
+    for _ in 0..FRAME_LOCK_SPIN_RETRIES {
+        if let Some(val) = f() {
+            return Some(val);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
 /// Sentinel value indicating no core currently holds the mutex.
 const NO_HOLDER: usize = usize::MAX;
 
@@ -409,10 +423,7 @@ impl<T> CoreTrackingMutex<T> {
             );
             if let Some(guard) = self.inner.try_lock() {
                 self.holder.store(token, Ordering::Relaxed);
-                return CoreTrackingMutexGuard {
-                    mutex: self,
-                    guard,
-                };
+                return CoreTrackingMutexGuard { mutex: self, guard };
             }
             core::hint::spin_loop();
         }
@@ -516,10 +527,12 @@ impl PhysFrameLock {
         })
     }
 
-    /// Converts a `PhysPageAddrArray` into a list of contiguous PFN ranges.
+    /// Converts a `PhysPageAddrArray` into a sorted, deduplicated list of
+    /// contiguous PFN ranges.
     ///
-    /// Adjacent pages whose PFNs are consecutive are coalesced into a single range
-    /// to minimize the number of entries in the `RangeSet`.
+    /// Pages are first converted to PFNs, sorted, and deduplicated. Consecutive
+    /// PFNs are then coalesced into a single range to minimize the number of
+    /// entries in the `RangeSet`.
     fn pages_to_pfn_ranges<const ALIGN: usize>(
         pages: &PhysPageAddrArray<ALIGN>,
     ) -> Vec<Range<u64>> {
@@ -528,11 +541,14 @@ impl PhysFrameLock {
             return ranges;
         }
         let pfn = |addr: usize| -> u64 { (addr as u64) / Size4KiB::SIZE };
-        let mut start = pfn(pages[0].as_usize());
+        let mut pfns: Vec<u64> = pages.iter().map(|p| pfn(p.as_usize())).collect();
+        pfns.sort_unstable();
+        pfns.dedup();
+
+        let mut start = pfns[0];
         let mut end = start + 1; // exclusive
 
-        for page in &pages[1..] {
-            let p = pfn(page.as_usize());
+        for &p in &pfns[1..] {
             if p == end {
                 // Contiguous — extend the current range.
                 end += 1;
@@ -554,7 +570,7 @@ impl PhysFrameLock {
     /// returned.
     ///
     /// On success, returns the locked PFN ranges.  The caller must either call
-    /// [`record_vmap`] (on successful mapping) or [`unlock_pfn_ranges`] (on
+    /// `record_vmap` (on successful mapping) or `unlock_pfn_ranges` (on
     /// mapping failure) to release the locks.
     fn try_lock_pages<const ALIGN: usize>(
         &self,
@@ -578,17 +594,17 @@ impl PhysFrameLock {
         Some(pfn_ranges)
     }
 
-    /// Records the VA → PFN-ranges association so that [`unlock_for_vunmap`] can
+    /// Records the VA → PFN-ranges association so that `unlock_for_vunmap` can
     /// recover the PFN ranges from a virtual base address.
     ///
     /// Called after a successful mapping while the PFN ranges are already held
-    /// via [`try_lock_pages`].
+    /// via `try_lock_pages`.
     fn record_vmap(&self, base_va: usize, pfn_ranges: Vec<Range<u64>>) {
         self.vmap_ranges.lock().insert(base_va, pfn_ranges);
     }
 
-    /// Releases PFN ranges previously acquired by [`try_lock_pages`] that were
-    /// never recorded with [`record_vmap`] (e.g. because the mapping failed).
+    /// Releases PFN ranges previously acquired by `try_lock_pages` that were
+    /// never recorded with `record_vmap` (e.g. because the mapping failed).
     fn unlock_pfn_ranges(&self, pfn_ranges: &[Range<u64>]) {
         let mut locked = self.locked.lock();
         for r in pfn_ranges {
@@ -814,8 +830,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// Acquires a frame lock on the PFN range before mapping. The lock is held
     /// for the lifetime of the returned guard and released when the guard is
-    /// dropped (after unmapping). Returns `None` if the frames are already
-    /// locked by another caller (all-or-nothing).
+    /// dropped (after unmapping). Returns `None` if the frames are still
+    /// locked after exhausting retry attempts.
     fn map_vtl0_guard(
         &self,
         phys_addr: x86_64::PhysAddr,
@@ -824,7 +840,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ) -> Option<Vtl0MappedGuard<'_, Host>> {
         let start_pfn = phys_addr.align_down(Size4KiB::SIZE).as_u64() / Size4KiB::SIZE;
         let end_pfn = (phys_addr + size).align_up(Size4KiB::SIZE).as_u64() / Size4KiB::SIZE;
-        let frame_lock_guard = self.phys_frame_lock.try_lock_frames(start_pfn..end_pfn)?;
+        let frame_lock_guard =
+            spin_try(|| self.phys_frame_lock.try_lock_frames(start_pfn..end_pfn))?;
 
         let (page_addr, page_aligned_length) = self
             .map_vtl0_phys_range(phys_addr, phys_addr + size, flags)
@@ -836,7 +853,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             page_aligned_length,
             ptr: page_addr.wrapping_add(page_offset),
             size: size.truncate(),
-            _frame_lock_guard: frame_lock_guard,
+            frame_lock_guard: ManuallyDrop::new(frame_lock_guard),
         })
     }
 
@@ -1068,17 +1085,17 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
 /// RAII guard that unmaps VTL0 physical pages when dropped.
 ///
-/// Holds a [`PhysFrameLockGuard`] that is released _after_ the pages are unmapped
-/// (Rust drops fields in declaration order).
+/// The frame lock is wrapped in [`ManuallyDrop`] and explicitly released in the
+/// `Drop` impl *after* unmapping, so the ordering is enforced by code rather
+/// than by struct field declaration order.
 struct Vtl0MappedGuard<'a, Host: HostInterface> {
     owner: &'a LinuxKernel<Host>,
     page_addr: *mut u8,
     page_aligned_length: usize,
     ptr: *mut u8,
     size: usize,
-    /// Dropped after the struct's `Drop` impl unmaps the pages, releasing the
-    /// frame lock. Field ordering ensures unmap happens before unlock.
-    _frame_lock_guard: PhysFrameLockGuard<'a>,
+    /// Explicitly dropped in the `Drop` impl after unmapping the pages.
+    frame_lock_guard: ManuallyDrop<PhysFrameLockGuard<'a>>,
 }
 
 impl<Host: HostInterface> Drop for Vtl0MappedGuard<'_, Host> {
@@ -1089,6 +1106,9 @@ impl<Host: HostInterface> Drop for Vtl0MappedGuard<'_, Host> {
                 .is_ok(),
             "Failed to unmap VTL0 pages"
         );
+        // Safety: frame_lock_guard is never accessed after this point and
+        // Drop is only called once.
+        unsafe { ManuallyDrop::drop(&mut self.frame_lock_guard) };
     }
 }
 
@@ -1536,9 +1556,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
         // Lock every PFN covered by the pages array (all-or-nothing).
         // Pages may be non-contiguous; they are coalesced into contiguous
         // sub-ranges for efficient locking.
-        let pfn_ranges = self
-            .phys_frame_lock
-            .try_lock_pages(pages)
+        let pfn_ranges = spin_try(|| self.phys_frame_lock.try_lock_pages(pages))
             .ok_or(PhysPointerError::FrameLockContention)?;
 
         let mut flags = PageTableFlags::PRESENT;
