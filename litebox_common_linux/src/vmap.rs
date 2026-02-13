@@ -174,4 +174,8 @@ pub enum PhysPointerError {
     UnsupportedPermissions(u8),
     #[error("Memory copy failed")]
     CopyFailed,
+    #[error("Physical frame range is currently locked by another mapping")]
+    FrameLockContention,
+    #[error("Duplicate physical pages in the array")]
+    DuplicatePages,
 }

@@ -9,6 +9,8 @@
 use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
 use core::{
     arch::asm,
+    mem::ManuallyDrop,
+    ops::Range,
     sync::atomic::{AtomicU32, AtomicU64},
 };
 use hashbrown::HashMap;
@@ -16,11 +18,10 @@ use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
     Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutex as _, RawMutexProvider,
     RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
-    page_mgmt::DeallocationError,
+    page_mgmt::{DeallocationError, FixedAddressBehavior},
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
-    platform::page_mgmt::FixedAddressBehavior,
     shim::ContinueOperation,
     utils::TruncateExt,
 };
@@ -32,6 +33,7 @@ use litebox_common_linux::{
         VmapManager,
     },
 };
+use rangemap::set::RangeSet;
 use x86_64::{
     VirtAddr,
     structures::paging::{
@@ -336,6 +338,197 @@ impl PageTableManager {
     }
 }
 
+/// Maximum number of spin iterations before giving up on a frame lock.
+const FRAME_LOCK_SPIN_RETRIES: usize = 1000;
+
+/// Repeatedly calls `f` up to [`FRAME_LOCK_SPIN_RETRIES`] times, returning the
+/// first `Some` value. Returns `None` if every attempt returns `None`.
+fn spin_try<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    for _ in 0..FRAME_LOCK_SPIN_RETRIES {
+        if let Some(val) = f() {
+            return Some(val);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// Tracks which (VTL0) physical addresses are currently mapped (locked) to prevent
+/// concurrent mapping of overlapping physical address ranges by different callers.
+///
+/// Both `map_vtl0_phys_range` (LVBS direct path) and `VmapManager::vmap` (OP-TEE shim
+/// path) create temporary mappings to copy data from/to VTL0. Without coordination,
+/// two callers could concurrently map overlapping addresses.
+///
+/// All-or-nothing semantics: `try_lock_range` and `try_lock_noncontiguous` lock
+/// the entire requested physical pages or fail without locking anything,
+/// preventing deadlocks from partial acquisitions.
+struct PhysFrameLock {
+    inner: spin::Mutex<PhysFrameLockState>,
+}
+
+/// Combined state protected by [`PhysFrameLock`]'s mutex.
+///
+/// Uses a `RangeSet<PhysAddr>` keyed by page-aligned physical address. The spinlock is
+/// held only briefly to check/insert/remove ranges, not for the entire duration of
+/// the mapping. A RAII guard ([`PhysFrameLockGuard`]) or explicit `unlock_ranges`
+/// ensures the range is removed when the mapping is released.
+struct PhysFrameLockState {
+    /// Set of currently mapped (locked) page-aligned physical address ranges.
+    mapped: RangeSet<x86_64::PhysAddr>,
+    /// Cache mappings from virtual base address (from `vmap`) to physical address
+    /// range set, so that `vunmap` can recover the ranges to unlock without
+    /// reverse-translating virtual addresses back to physical addresses.
+    vmap_ranges: HashMap<VirtAddr, RangeSet<x86_64::PhysAddr>>,
+}
+
+impl PhysFrameLock {
+    fn new() -> Self {
+        Self {
+            inner: spin::Mutex::new(PhysFrameLockState {
+                mapped: RangeSet::new(),
+                vmap_ranges: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Attempts to lock a contiguous physical address range before mapping.
+    ///
+    /// On success, returns `Some(PhysFrameLockGuard)`.
+    /// Returns `None` if any overlap exists (all-or-nothing).
+    fn try_lock_range(
+        &self,
+        phys_start: x86_64::PhysAddr,
+        phys_end: x86_64::PhysAddr,
+    ) -> Option<PhysFrameLockGuard<'_>> {
+        let addr_range = phys_start.align_down(Size4KiB::SIZE)..phys_end.align_up(Size4KiB::SIZE);
+        if addr_range.is_empty() {
+            return Some(PhysFrameLockGuard {
+                lock: self,
+                addr_range,
+            });
+        }
+        let mut state = self.inner.lock();
+        if state.mapped.overlaps(&addr_range) {
+            return None;
+        }
+        state.mapped.insert(addr_range.clone());
+        Some(PhysFrameLockGuard {
+            lock: self,
+            addr_range,
+        })
+    }
+
+    /// Attempts to lock all physical pages contained in the given page array before mapping.
+    ///
+    /// On success, returns a locked address range set. The caller must either
+    /// call `record_vmap` (on successful mapping) or `unlock_ranges` (on
+    /// mapping failure) to release the locks.
+    /// Returns `None` if any overlap exists (all-or-nothing).
+    fn try_lock_noncontiguous<const ALIGN: usize>(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+    ) -> Option<RangeSet<x86_64::PhysAddr>> {
+        // Coalesce an array of page addresses into a set of page ranges for
+        // efficient overlap checking and locking.
+        let addr_ranges = Self::pages_to_addr_ranges(pages);
+        if addr_ranges.is_empty() {
+            return Some(addr_ranges);
+        }
+        let mut state = self.inner.lock();
+        for r in addr_ranges.iter() {
+            if state.mapped.overlaps(r) {
+                return None;
+            }
+        }
+        for r in addr_ranges.iter() {
+            state.mapped.insert(r.clone());
+        }
+        Some(addr_ranges)
+    }
+
+    /// Converts a `PhysPageAddrArray` into a [`RangeSet`] of page-aligned
+    /// physical address ranges.
+    ///
+    /// Each page is aligned down to `Size4KiB` and inserted as a
+    /// `[addr..addr + 4KiB)` range. The `RangeSet` automatically coalesces
+    /// contiguous pages into larger ranges.
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts that no duplicate pages exist. Callers must ensure pages
+    /// are unique (enforced at the public `vmap` entry point).
+    #[inline]
+    fn pages_to_addr_ranges<const ALIGN: usize>(
+        pages: &PhysPageAddrArray<ALIGN>,
+    ) -> RangeSet<x86_64::PhysAddr> {
+        let addr_ranges: RangeSet<x86_64::PhysAddr> = pages
+            .iter()
+            .map(|p| {
+                let addr = x86_64::PhysAddr::new(p.as_usize() as u64).align_down(Size4KiB::SIZE);
+                addr..addr + Size4KiB::SIZE
+            })
+            .collect();
+        debug_assert_eq!(
+            addr_ranges.iter().map(|r| r.end - r.start).sum::<u64>(),
+            pages.len() as u64 * Size4KiB::SIZE,
+            "pages_to_addr_ranges: duplicate pages in input"
+        );
+        addr_ranges
+    }
+
+    /// Records the VA → physical-address-ranges association so that
+    /// `unlock_for_vunmap` can get the ranges from a virtual base address.
+    /// This function is called after a successful mapping.
+    fn record_vmap(&self, base_va: VirtAddr, addr_ranges: RangeSet<x86_64::PhysAddr>) {
+        self.inner.lock().vmap_ranges.insert(base_va, addr_ranges);
+    }
+
+    /// Releases address ranges previously acquired by `try_lock_noncontiguous`
+    /// that were never recorded with `record_vmap` (e.g., because the mapping
+    /// failed).
+    fn unlock_ranges(&self, addr_ranges: &RangeSet<x86_64::PhysAddr>) {
+        let mut state = self.inner.lock();
+        for r in addr_ranges.iter() {
+            state.mapped.remove(r.clone());
+        }
+    }
+
+    /// Unlocks all address ranges previously locked for a vmap operation,
+    /// looking up the ranges by virtual base address.
+    ///
+    /// Called by `VmapManager::vunmap` after unmapping.
+    fn unlock_for_vunmap(&self, base_va: VirtAddr) {
+        let mut state = self.inner.lock();
+        if let Some(addr_ranges) = state.vmap_ranges.remove(&base_va) {
+            for r in addr_ranges.iter() {
+                state.mapped.remove(r.clone());
+            }
+        }
+    }
+}
+
+/// RAII guard that unlocks a physical address range when dropped.
+///
+/// Created by [`PhysFrameLock::try_lock_range`]. The locked address range is
+/// removed from the lock set automatically on drop.
+struct PhysFrameLockGuard<'a> {
+    lock: &'a PhysFrameLock,
+    addr_range: Range<x86_64::PhysAddr>,
+}
+
+impl Drop for PhysFrameLockGuard<'_> {
+    fn drop(&mut self) {
+        if !self.addr_range.is_empty() {
+            self.lock
+                .inner
+                .lock()
+                .mapped
+                .remove(self.addr_range.clone());
+        }
+    }
+}
+
 /// This is the platform for running LiteBox in kernel mode.
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
@@ -343,6 +536,8 @@ pub struct LinuxKernel<Host: HostInterface> {
     page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
     vtl0_kernel_info: Vtl0KernelInfo,
+    /// Prevents concurrent mapping of overlapping VTL0 physical frame ranges.
+    phys_frame_lock: PhysFrameLock,
 }
 
 pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
@@ -439,6 +634,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             page_table_manager: PageTableManager::new(pt),
             vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
             vtl0_kernel_info: Vtl0KernelInfo::new(),
+            phys_frame_lock: PhysFrameLock::new(),
         }))
     }
 
@@ -514,12 +710,22 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     }
 
     /// Map a VTL0 physical range and return a guard that unmaps on drop.
+    ///
+    /// Acquires a frame lock on the physical address range before mapping.
+    /// The lock is held for the lifetime of the returned guard and released
+    /// when the guard is dropped (after unmapping). Returns `None` if the
+    /// frames are still locked after exhausting retry attempts.
     fn map_vtl0_guard(
         &self,
         phys_addr: x86_64::PhysAddr,
         size: u64,
         flags: PageTableFlags,
     ) -> Option<Vtl0MappedGuard<'_, Host>> {
+        let frame_lock_guard = spin_try(|| {
+            self.phys_frame_lock
+                .try_lock_range(phys_addr, phys_addr + size)
+        })?;
+
         let (page_addr, page_aligned_length) = self
             .map_vtl0_phys_range(phys_addr, phys_addr + size, flags)
             .ok()?;
@@ -530,6 +736,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             page_aligned_length,
             ptr: page_addr.wrapping_add(page_offset),
             size: size.truncate(),
+            frame_lock_guard: ManuallyDrop::new(frame_lock_guard),
         })
     }
 
@@ -760,12 +967,18 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 }
 
 /// RAII guard that unmaps VTL0 physical pages when dropped.
+///
+/// The frame lock is wrapped in [`ManuallyDrop`] and explicitly released in the
+/// `Drop` impl *after* unmapping, so the ordering is enforced by code rather
+/// than by struct field declaration order.
 struct Vtl0MappedGuard<'a, Host: HostInterface> {
     owner: &'a LinuxKernel<Host>,
     page_addr: *mut u8,
     page_aligned_length: usize,
     ptr: *mut u8,
     size: usize,
+    /// Explicitly dropped in the `Drop` impl after unmapping the pages.
+    frame_lock_guard: ManuallyDrop<PhysFrameLockGuard<'a>>,
 }
 
 impl<Host: HostInterface> Drop for Vtl0MappedGuard<'_, Host> {
@@ -776,6 +989,9 @@ impl<Host: HostInterface> Drop for Vtl0MappedGuard<'_, Host> {
                 .is_ok(),
             "Failed to unmap VTL0 pages"
         );
+        // Safety: frame_lock_guard is never accessed after this point and
+        // Drop is only called once.
+        unsafe { ManuallyDrop::drop(&mut self.frame_lock_guard) };
     }
 }
 
@@ -1195,6 +1411,19 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
+        // Reject duplicate pages.  The page array comes from the untrusted
+        // normal world; duplicates could cause double-mapping of the same
+        // physical frame, leading to use-after-unmap when one mapping is
+        // released.
+        {
+            let mut seen = hashbrown::HashSet::with_capacity(pages.len());
+            for p in pages {
+                if !seen.insert(p.as_usize()) {
+                    return Err(PhysPointerError::DuplicatePages);
+                }
+            }
+        }
+
         // TODO: Remove this check once this platform supports virtually contiguous
         // non-contiguous physical page mapping.
         check_contiguity(pages)?;
@@ -1220,6 +1449,12 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             unimplemented!("ALIGN other than 4KiB is not supported yet")
         };
 
+        // Lock every page covered by the pages array (all-or-nothing).
+        // Pages may be non-contiguous; they are coalesced into contiguous
+        // address sub-ranges for efficient locking.
+        let addr_ranges = spin_try(|| self.phys_frame_lock.try_lock_noncontiguous(pages))
+            .ok_or(PhysPointerError::FrameLockContention)?;
+
         let mut flags = PageTableFlags::PRESENT;
         if perms.contains(PhysPageMapPermissions::WRITE) {
             flags |= PageTableFlags::WRITABLE;
@@ -1230,11 +1465,16 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             .current_page_table()
             .map_phys_frame_range(frame_range, flags)
         {
+            // Record the base VA -> address ranges association for vunmap lookup.
+            self.phys_frame_lock
+                .record_vmap(VirtAddr::from_ptr(page_addr), addr_ranges);
             Ok(PhysPageMapInfo {
                 base: page_addr,
                 size: pages.len() * ALIGN,
             })
         } else {
+            // Mapping failed; release the frame locks.
+            self.phys_frame_lock.unlock_ranges(&addr_ranges);
             Err(PhysPointerError::InvalidPhysicalAddress(
                 pages[0].as_usize(),
             ))
@@ -1252,12 +1492,16 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                     ALIGN,
                 ));
             };
-            unsafe {
+            let result = unsafe {
                 self.page_table_manager
                     .current_page_table()
                     .unmap_pages(page_range, false, true)
                     .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))
-            }
+            };
+            // Release the frame lock after unmapping.
+            self.phys_frame_lock
+                .unlock_for_vunmap(VirtAddr::from_ptr(vmap_info.base));
+            result
         } else {
             unimplemented!("ALIGN other than 4KiB is not supported yet")
         }
