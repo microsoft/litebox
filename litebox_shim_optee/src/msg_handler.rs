@@ -64,7 +64,7 @@ fn page_align_up(len: u64) -> u64 {
     len.next_multiple_of(PAGE_SIZE as u64)
 }
 
-/// Read `OpteeMsgArgs` from a VTL0 physical address using a single-copy approach.
+/// Read `OpteeMsgArgs` (and optional `OpteeRpcArgs`) from a VTL0 physical address.
 ///
 /// Copies the maximum possible size in one shot into a private VTL1 buffer, then
 /// parses entirely from that buffer. This eliminates TOCTOU (double-fetch) issues:
@@ -86,16 +86,15 @@ fn page_align_up(len: u64) -> u64 {
 /// ```text
 ///  phys_addr
 ///  |
-///  v                         main_size                  main_max
-///  |<---------------------->|                           |
-///  +--------+------+--------+--------+------+-----------+
-///  | header |par[0]|par[N-1]| header |par[0]|par[R-1]|xx|
-///  | 32B    | ...  |  32B   | 32B    | ...  |  32B   |xx|
-///  +--------+------+--------+--------+------+-----------+
-///  |<--- main_size -------->|<--- rpc_size --------->|  |
-///  |                       ^                            |
-///  |                RPC starts here              main_max + rpc_max
-///  |<----- copy_size = main_max + rpc_max ------------->|
+///  v
+///  +--------+------+--------+--------+------+----------~-+
+///  | header |par[0]|par[N-1]| header |par[0]|par[R-1]|xxx|
+///  | 32B    | ...  |  32B   | 32B    | ...  |  32B   |xxx|
+///  +--------+------+--------+--------+------+----------~-+
+///  |<--- main_size -------->|<--- rpc_size --------->|   |
+///  |                        ^            ^               |
+///  |                 RPC starts here    main_max         |
+///  |<----- copy_size = main_max + rpc_max -------------~>|
 ///
 ///  N = actual num_params from header (validated <= MAX_PARAMS after copy)
 ///  R = rpc_num_params (negotiated during OPTEE_SMC_EXCHANGE_CAPABILITIES)
