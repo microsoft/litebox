@@ -9,7 +9,7 @@
 use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
 use core::{
     arch::asm,
-    sync::atomic::{AtomicU32, AtomicU64},
+    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use hashbrown::HashMap;
 use litebox::platform::{
@@ -42,6 +42,10 @@ use x86_64::{
 use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
+
+use alloc::vec::Vec;
+use core::ops::Range;
+use rangemap::set::RangeSet;
 
 pub mod arch;
 pub mod host;
@@ -336,6 +340,296 @@ impl PageTableManager {
     }
 }
 
+/// Sentinel value indicating no core currently holds the mutex.
+const NO_HOLDER: usize = usize::MAX;
+
+/// Returns a value that uniquely identifies the current core.
+///
+/// In production, this reads the GS base register, which points to per-CPU variables
+/// and is therefore unique per core. In tests, falls back to `get_core_id()` (CPUID)
+/// since GS base is not initialized in the test environment.
+#[inline]
+fn current_core_token() -> usize {
+    #[cfg(not(test))]
+    {
+        // Safety: CR4.FSGSBASE is enabled during boot (see `enable_fsgsbase`).
+        // GS base is set per-core during per-CPU variable initialization.
+        unsafe { litebox_common_linux::rdgsbase() }
+    }
+    #[cfg(test)]
+    {
+        crate::arch::get_core_id()
+    }
+}
+
+/// A spinlock wrapper that detects same-core reentrancy.
+///
+/// Wraps `spin::Mutex<T>` and tracks which core currently holds the lock using
+/// [`current_core_token`]. If the same core attempts to `.lock()` again (reentrancy),
+/// this panics immediately instead of silently deadlocking, which is the default
+/// `spin::Mutex` behavior on same-core reentrant acquisition.
+///
+/// # Panics
+///
+/// Panics if `.lock()` is called on a core that already holds this mutex.
+struct CoreTrackingMutex<T> {
+    inner: spin::Mutex<T>,
+    holder: AtomicUsize,
+}
+
+// Safety: CoreTrackingMutex is Send + Sync if T: Send, same as spin::Mutex<T>.
+// The AtomicUsize (holder) is inherently Sync. The spin::Mutex<T> is Sync if T: Send.
+unsafe impl<T: Send> Sync for CoreTrackingMutex<T> {}
+unsafe impl<T: Send> Send for CoreTrackingMutex<T> {}
+
+impl<T> CoreTrackingMutex<T> {
+    /// Creates a new `CoreTrackingMutex` wrapping the given value.
+    fn new(value: T) -> Self {
+        Self {
+            inner: spin::Mutex::new(value),
+            holder: AtomicUsize::new(NO_HOLDER),
+        }
+    }
+
+    /// Acquires the lock, returning a guard that releases it on drop.
+    ///
+    /// Spins using `try_lock` on the inner mutex, checking for reentrancy on
+    /// each iteration. This ensures that same-core reentrancy is caught even
+    /// if the holder check races with acquisition on another core.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the current core already holds this mutex (reentrancy).
+    fn lock(&self) -> CoreTrackingMutexGuard<'_, T> {
+        let token = current_core_token();
+        loop {
+            assert!(
+                self.holder.load(Ordering::Relaxed) != token,
+                "CoreTrackingMutex: reentrancy detected on core (token={token:#x})"
+            );
+            if let Some(guard) = self.inner.try_lock() {
+                self.holder.store(token, Ordering::Relaxed);
+                return CoreTrackingMutexGuard {
+                    mutex: self,
+                    guard,
+                };
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// RAII guard for [`CoreTrackingMutex`].  Clears the holder tracking on drop.
+struct CoreTrackingMutexGuard<'a, T> {
+    mutex: &'a CoreTrackingMutex<T>,
+    guard: spin::MutexGuard<'a, T>,
+}
+
+impl<T> core::ops::Deref for CoreTrackingMutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> core::ops::DerefMut for CoreTrackingMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for CoreTrackingMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.mutex.holder.store(NO_HOLDER, Ordering::Relaxed);
+    }
+}
+
+/// Tracks which physical page frame ranges are currently mapped (locked) to prevent
+/// concurrent mapping of the same frames by different callers.
+///
+/// Both `map_vtl0_phys_range` (LVBS direct path) and `VmapManager::vmap` (OP-TEE shim
+/// path) create temporary mappings to copy data from/to VTL0. Without coordination,
+/// two callers could concurrently map overlapping frame ranges, leading to one caller's
+/// unmap invalidating another caller's mapping mid-copy.
+///
+/// Uses a `RangeSet<u64>` keyed by physical frame number (PFN). The spinlock is held
+/// only briefly to check/insert/remove ranges, not for the entire duration of the
+/// mapping. Instead, a RAII guard ([`PhysFrameLockGuard`]) or explicit
+/// `unlock_frames` ensures the range is removed when the mapping is released.
+///
+/// All-or-nothing semantics: `try_lock_frames` either locks the entire requested range
+/// or fails without locking anything, preventing deadlocks from partial acquisitions.
+///
+/// # Deadlock safety
+///
+/// **Same-core:** The internal mutexes use [`CoreTrackingMutex`] which panics on
+/// reentrancy instead of silently deadlocking. No public method holds a spinlock
+/// across a call back into this struct or into the page table. Every lock acquisition
+/// is bounded within a single method with no recursion or callbacks. Future changes
+/// must preserve this invariant.
+///
+/// **Cross-core:** The two internal mutexes (`locked` and `vmap_ranges`) are never held
+/// simultaneously — each method acquires at most one at a time. The page table's own
+/// spinlock (`X64PageTable::inner`) is likewise never held while either of these is held.
+/// Future changes must not introduce nested acquisition of these locks.
+struct PhysFrameLock {
+    /// Set of currently locked PFN ranges.
+    locked: CoreTrackingMutex<RangeSet<u64>>,
+    /// Maps virtual base address (from `vmap`) -> locked PFN ranges, so that
+    /// `vunmap` can recover the PFN ranges to unlock without reverse-translating
+    /// the virtual address back to physical addresses.
+    ///
+    /// Each vmap operation may lock multiple non-contiguous PFN ranges when the
+    /// physical pages are not contiguous.
+    vmap_ranges: CoreTrackingMutex<HashMap<usize, Vec<Range<u64>>>>,
+}
+
+impl PhysFrameLock {
+    /// Creates a new, empty frame lock.
+    fn new() -> Self {
+        Self {
+            locked: CoreTrackingMutex::new(RangeSet::new()),
+            vmap_ranges: CoreTrackingMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Attempts to lock a range of physical frame numbers.
+    ///
+    /// Returns `Some(PhysFrameLockGuard)` if no frame in `pfn_range` is currently locked,
+    /// atomically inserting the entire range. Returns `None` if any overlap exists
+    /// (all-or-nothing).
+    fn try_lock_frames(&self, pfn_range: Range<u64>) -> Option<PhysFrameLockGuard<'_>> {
+        if pfn_range.is_empty() {
+            return Some(PhysFrameLockGuard {
+                lock: self,
+                pfn_range,
+            });
+        }
+        let mut locked = self.locked.lock();
+        if locked.overlaps(&pfn_range) {
+            return None;
+        }
+        locked.insert(pfn_range.clone());
+        Some(PhysFrameLockGuard {
+            lock: self,
+            pfn_range,
+        })
+    }
+
+    /// Converts a `PhysPageAddrArray` into a list of contiguous PFN ranges.
+    ///
+    /// Adjacent pages whose PFNs are consecutive are coalesced into a single range
+    /// to minimize the number of entries in the `RangeSet`.
+    fn pages_to_pfn_ranges<const ALIGN: usize>(
+        pages: &PhysPageAddrArray<ALIGN>,
+    ) -> Vec<Range<u64>> {
+        let mut ranges = Vec::new();
+        if pages.is_empty() {
+            return ranges;
+        }
+        let pfn = |addr: usize| -> u64 { (addr as u64) / Size4KiB::SIZE };
+        let mut start = pfn(pages[0].as_usize());
+        let mut end = start + 1; // exclusive
+
+        for page in &pages[1..] {
+            let p = pfn(page.as_usize());
+            if p == end {
+                // Contiguous — extend the current range.
+                end += 1;
+            } else {
+                ranges.push(start..end);
+                start = p;
+                end = p + 1;
+            }
+        }
+        ranges.push(start..end);
+        ranges
+    }
+
+    /// Attempts to lock every PFN covered by the given page array.
+    ///
+    /// Pages are coalesced into contiguous PFN sub-ranges and each sub-range is
+    /// checked against the lock set.  All-or-nothing: if any PFN in any
+    /// sub-range overlaps an already-locked PFN, nothing is locked and `None` is
+    /// returned.
+    ///
+    /// On success, returns the locked PFN ranges.  The caller must either call
+    /// [`record_vmap`] (on successful mapping) or [`unlock_pfn_ranges`] (on
+    /// mapping failure) to release the locks.
+    fn try_lock_pages<const ALIGN: usize>(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+    ) -> Option<Vec<Range<u64>>> {
+        let pfn_ranges = Self::pages_to_pfn_ranges(pages);
+        if pfn_ranges.is_empty() {
+            return Some(pfn_ranges);
+        }
+        let mut locked = self.locked.lock();
+        // Check all ranges first (all-or-nothing).
+        for r in &pfn_ranges {
+            if locked.overlaps(r) {
+                return None;
+            }
+        }
+        // No overlaps — insert all.
+        for r in &pfn_ranges {
+            locked.insert(r.clone());
+        }
+        Some(pfn_ranges)
+    }
+
+    /// Records the VA → PFN-ranges association so that [`unlock_for_vunmap`] can
+    /// recover the PFN ranges from a virtual base address.
+    ///
+    /// Called after a successful mapping while the PFN ranges are already held
+    /// via [`try_lock_pages`].
+    fn record_vmap(&self, base_va: usize, pfn_ranges: Vec<Range<u64>>) {
+        self.vmap_ranges.lock().insert(base_va, pfn_ranges);
+    }
+
+    /// Releases PFN ranges previously acquired by [`try_lock_pages`] that were
+    /// never recorded with [`record_vmap`] (e.g. because the mapping failed).
+    fn unlock_pfn_ranges(&self, pfn_ranges: &[Range<u64>]) {
+        let mut locked = self.locked.lock();
+        for r in pfn_ranges {
+            locked.remove(r.clone());
+        }
+    }
+
+    /// Unlocks all PFN ranges previously locked for a vmap operation, looking up
+    /// the ranges by virtual base address.
+    ///
+    /// Called by `VmapManager::vunmap` after unmapping.
+    fn unlock_for_vunmap(&self, base_va: usize) {
+        // Remove the entry while holding vmap_ranges, then drop the guard
+        // before acquiring `locked` to avoid nested locking.
+        let pfn_ranges = self.vmap_ranges.lock().remove(&base_va);
+        if let Some(pfn_ranges) = pfn_ranges {
+            let mut locked = self.locked.lock();
+            for r in pfn_ranges {
+                locked.remove(r);
+            }
+        }
+    }
+}
+
+/// RAII guard that unlocks a physical frame range when dropped.
+///
+/// Created by [`PhysFrameLock::try_lock_frames`]. The locked PFN range is
+/// removed from the lock set automatically on drop.
+struct PhysFrameLockGuard<'a> {
+    lock: &'a PhysFrameLock,
+    pfn_range: Range<u64>,
+}
+
+impl Drop for PhysFrameLockGuard<'_> {
+    fn drop(&mut self) {
+        if !self.pfn_range.is_empty() {
+            self.lock.locked.lock().remove(self.pfn_range.clone());
+        }
+    }
+}
+
 /// This is the platform for running LiteBox in kernel mode.
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
@@ -343,6 +637,8 @@ pub struct LinuxKernel<Host: HostInterface> {
     page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
     vtl0_kernel_info: Vtl0KernelInfo,
+    /// Prevents concurrent mapping of overlapping VTL0 physical frame ranges.
+    phys_frame_lock: PhysFrameLock,
 }
 
 pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
@@ -439,6 +735,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             page_table_manager: PageTableManager::new(pt),
             vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
             vtl0_kernel_info: Vtl0KernelInfo::new(),
+            phys_frame_lock: PhysFrameLock::new(),
         }))
     }
 
@@ -514,12 +811,21 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     }
 
     /// Map a VTL0 physical range and return a guard that unmaps on drop.
+    ///
+    /// Acquires a frame lock on the PFN range before mapping. The lock is held
+    /// for the lifetime of the returned guard and released when the guard is
+    /// dropped (after unmapping). Returns `None` if the frames are already
+    /// locked by another caller (all-or-nothing).
     fn map_vtl0_guard(
         &self,
         phys_addr: x86_64::PhysAddr,
         size: u64,
         flags: PageTableFlags,
     ) -> Option<Vtl0MappedGuard<'_, Host>> {
+        let start_pfn = phys_addr.align_down(Size4KiB::SIZE).as_u64() / Size4KiB::SIZE;
+        let end_pfn = (phys_addr + size).align_up(Size4KiB::SIZE).as_u64() / Size4KiB::SIZE;
+        let frame_lock_guard = self.phys_frame_lock.try_lock_frames(start_pfn..end_pfn)?;
+
         let (page_addr, page_aligned_length) = self
             .map_vtl0_phys_range(phys_addr, phys_addr + size, flags)
             .ok()?;
@@ -530,6 +836,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             page_aligned_length,
             ptr: page_addr.wrapping_add(page_offset),
             size: size.truncate(),
+            _frame_lock_guard: frame_lock_guard,
         })
     }
 
@@ -760,12 +1067,18 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 }
 
 /// RAII guard that unmaps VTL0 physical pages when dropped.
+///
+/// Holds a [`PhysFrameLockGuard`] that is released _after_ the pages are unmapped
+/// (Rust drops fields in declaration order).
 struct Vtl0MappedGuard<'a, Host: HostInterface> {
     owner: &'a LinuxKernel<Host>,
     page_addr: *mut u8,
     page_aligned_length: usize,
     ptr: *mut u8,
     size: usize,
+    /// Dropped after the struct's `Drop` impl unmaps the pages, releasing the
+    /// frame lock. Field ordering ensures unmap happens before unlock.
+    _frame_lock_guard: PhysFrameLockGuard<'a>,
 }
 
 impl<Host: HostInterface> Drop for Vtl0MappedGuard<'_, Host> {
@@ -1220,6 +1533,14 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             unimplemented!("ALIGN other than 4KiB is not supported yet")
         };
 
+        // Lock every PFN covered by the pages array (all-or-nothing).
+        // Pages may be non-contiguous; they are coalesced into contiguous
+        // sub-ranges for efficient locking.
+        let pfn_ranges = self
+            .phys_frame_lock
+            .try_lock_pages(pages)
+            .ok_or(PhysPointerError::FrameLockContention)?;
+
         let mut flags = PageTableFlags::PRESENT;
         if perms.contains(PhysPageMapPermissions::WRITE) {
             flags |= PageTableFlags::WRITABLE;
@@ -1230,11 +1551,16 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             .current_page_table()
             .map_phys_frame_range(frame_range, flags)
         {
+            // Record the base VA -> PFN ranges association for vunmap lookup.
+            self.phys_frame_lock
+                .record_vmap(page_addr as usize, pfn_ranges);
             Ok(PhysPageMapInfo {
                 base: page_addr,
                 size: pages.len() * ALIGN,
             })
         } else {
+            // Mapping failed; release the frame locks.
+            self.phys_frame_lock.unlock_pfn_ranges(&pfn_ranges);
             Err(PhysPointerError::InvalidPhysicalAddress(
                 pages[0].as_usize(),
             ))
@@ -1252,12 +1578,16 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                     ALIGN,
                 ));
             };
-            unsafe {
+            let result = unsafe {
                 self.page_table_manager
                     .current_page_table()
                     .unmap_pages(page_range, false, true)
                     .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))
-            }
+            };
+            // Release the frame lock after unmapping.
+            self.phys_frame_lock
+                .unlock_for_vunmap(vmap_info.base as usize);
+            result
         } else {
             unimplemented!("ALIGN other than 4KiB is not supported yet")
         }
@@ -1919,4 +2249,51 @@ pub fn platform_low() -> &'static Platform {
     PLATFORM_LOW
         .get()
         .expect("set_platform_low should have already been called before this point")
+}
+
+#[cfg(test)]
+mod core_tracking_mutex_tests {
+    use super::*;
+
+    #[test]
+    fn lock_and_access() {
+        let m = CoreTrackingMutex::new(42u32);
+        {
+            let mut guard = m.lock();
+            assert_eq!(*guard, 42);
+            *guard = 99;
+        }
+        // Guard dropped — re-acquire should work.
+        let guard = m.lock();
+        assert_eq!(*guard, 99);
+    }
+
+    #[test]
+    fn holder_cleared_on_drop() {
+        let m = CoreTrackingMutex::new(0u32);
+        {
+            let _guard = m.lock();
+            assert_ne!(m.holder.load(Ordering::Relaxed), NO_HOLDER);
+        }
+        assert_eq!(m.holder.load(Ordering::Relaxed), NO_HOLDER);
+    }
+
+    #[test]
+    #[should_panic(expected = "reentrancy detected")]
+    fn reentrancy_panics() {
+        let m = CoreTrackingMutex::new(0u32);
+        let _guard = m.lock();
+        // Same core — must panic, not deadlock.
+        let _guard2 = m.lock();
+    }
+
+    #[test]
+    fn two_independent_mutexes() {
+        let a = CoreTrackingMutex::new(1u32);
+        let b = CoreTrackingMutex::new(2u32);
+        let ga = a.lock();
+        let gb = b.lock();
+        assert_eq!(*ga, 1);
+        assert_eq!(*gb, 2);
+    }
 }
