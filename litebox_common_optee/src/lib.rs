@@ -2328,13 +2328,11 @@ mod tests {
         };
         let mut params_in = vec![0u8; 3 * size_of::<OpteeMsgParam>()];
         for (i, byte) in params_in.iter_mut().enumerate() {
-            *byte = (i & 0xFF) as u8;
+            *byte = u8::try_from(i % 256).unwrap();
         }
 
-        let msg_args = match OpteeMsgArgs::from_header_and_raw_params(&header, &params_in) {
-            Ok(m) => m,
-            Err(_) => panic!("expected Ok"),
-        };
+        let msg_args =
+            OpteeMsgArgs::from_header_and_raw_params(&header, &params_in).expect("expected Ok");
         assert_eq!(msg_args.func, 0x1234);
         assert_eq!(msg_args.session, 0xABCD);
         assert_eq!(msg_args.num_params, 3);
@@ -2346,10 +2344,9 @@ mod tests {
         assert_eq!(header_out.num_params, 3);
 
         let mut params_out = vec![0u8; 3 * size_of::<OpteeMsgParam>()];
-        let written = match msg_args.write_raw_params(&mut params_out) {
-            Ok(n) => n,
-            Err(_) => panic!("expected Ok"),
-        };
+        let written = msg_args
+            .write_raw_params(&mut params_out)
+            .expect("expected Ok");
         assert_eq!(written, 3 * size_of::<OpteeMsgParam>());
         assert_eq!(&params_out[..written], &params_in[..written]);
     }
@@ -2366,10 +2363,7 @@ mod tests {
             ret_origin: 0,
             num_params: 0,
         };
-        let msg_args = match OpteeMsgArgs::from_header_and_raw_params(&header, &[]) {
-            Ok(m) => m,
-            Err(_) => panic!("expected Ok"),
-        };
+        let msg_args = OpteeMsgArgs::from_header_and_raw_params(&header, &[]).expect("expected Ok");
         assert_eq!(msg_args.num_params, 0);
         assert_eq!(msg_args.cancel_id, 42);
 
@@ -2377,10 +2371,7 @@ mod tests {
         assert_eq!(header_out.num_params, 0);
 
         let mut buf = [0u8; 0];
-        let written = match msg_args.write_raw_params(&mut buf) {
-            Ok(n) => n,
-            Err(_) => panic!("expected Ok"),
-        };
+        let written = msg_args.write_raw_params(&mut buf).expect("expected Ok");
         assert_eq!(written, 0);
     }
 
@@ -2399,17 +2390,14 @@ mod tests {
             num_params: 6, // MAX_PARAMS
         };
         let params = vec![0xABu8; 6 * size_of::<OpteeMsgParam>()];
-        let msg_args = match OpteeMsgArgs::from_header_and_raw_params(&header, &params) {
-            Ok(m) => m,
-            Err(_) => panic!("expected Ok"),
-        };
+        let msg_args =
+            OpteeMsgArgs::from_header_and_raw_params(&header, &params).expect("expected Ok");
         assert_eq!(msg_args.num_params, 6);
 
         let mut params_out = vec![0u8; 6 * size_of::<OpteeMsgParam>()];
-        let written = match msg_args.write_raw_params(&mut params_out) {
-            Ok(n) => n,
-            Err(_) => panic!("expected Ok"),
-        };
+        let written = msg_args
+            .write_raw_params(&mut params_out)
+            .expect("expected Ok");
         assert_eq!(written, 6 * size_of::<OpteeMsgParam>());
         assert_eq!(params_out, params);
     }
@@ -2431,7 +2419,7 @@ mod tests {
         };
         let mut params_in = vec![0u8; 2 * size_of::<OpteeMsgParam>()];
         for (i, byte) in params_in.iter_mut().enumerate() {
-            *byte = (i & 0xFF) as u8;
+            *byte = u8::try_from(i % 256).unwrap();
         }
 
         let rpc_args = OpteeRpcArgs::from_header_and_raw_params(&header, &params_in)
