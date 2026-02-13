@@ -13,11 +13,9 @@ use core::mem::size_of;
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::{PtRegs, errno::Errno};
-use modular_bitfield::prelude::*;
-use modular_bitfield::specifiers::{B8, B54};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
-use zerocopy::{FromBytes, Immutable, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub mod syscall_nr;
 
@@ -411,27 +409,58 @@ const TEE_NUM_PARAMS: usize = 4;
 /// expected to allocate a shared buffer for this number of parameters.
 pub const NUM_RPC_PARAMS: usize = 4;
 
-#[expect(
-    clippy::identity_op,
-    reason = "the macro auto-generates this, but some issue causes it to still bubble up; this suppresses it the hard way"
-)]
-mod workaround_identity_op_suppression {
-    use modular_bitfield::prelude::*;
-    use modular_bitfield::specifiers::{B4, B48};
-    use zerocopy::{FromBytes, Immutable, IntoBytes};
-    #[bitfield]
-    #[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
-    #[repr(C)]
-    pub struct UteeParamsTypes {
-        pub type_0: B4,
-        pub type_1: B4,
-        pub type_2: B4,
-        pub type_3: B4,
-        #[skip]
-        __: B48,
+/// Packed parameter types for [`UteeParams`].
+///
+/// Wire layout (little-endian u64):
+/// - bits \[3:0\]   – type_0
+/// - bits \[7:4\]   – type_1
+/// - bits \[11:8\]  – type_2
+/// - bits \[15:12\] – type_3
+/// - bits \[63:16\] – reserved (zero)
+#[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(transparent)]
+pub struct UteeParamsTypes(u64);
+
+impl UteeParamsTypes {
+    const NIBBLE_MASK: u64 = 0xF;
+
+    /// Get the 4-bit type at the given `index` (0–3).
+    #[allow(clippy::cast_possible_truncation)]
+    fn get(self, index: usize) -> u8 {
+        ((self.0 >> (index * 4)) & Self::NIBBLE_MASK) as u8
+    }
+
+    /// Set the 4-bit type at the given `index` (0–3).
+    fn set(&mut self, index: usize, value: u8) {
+        let shift = index * 4;
+        self.0 = (self.0 & !(Self::NIBBLE_MASK << shift)) | (u64::from(value & 0xF) << shift);
+    }
+
+    pub fn type_0(&self) -> u8 {
+        self.get(0)
+    }
+    pub fn type_1(&self) -> u8 {
+        self.get(1)
+    }
+    pub fn type_2(&self) -> u8 {
+        self.get(2)
+    }
+    pub fn type_3(&self) -> u8 {
+        self.get(3)
+    }
+    pub fn set_type_0(&mut self, v: u8) {
+        self.set(0, v);
+    }
+    pub fn set_type_1(&mut self, v: u8) {
+        self.set(1, v);
+    }
+    pub fn set_type_2(&mut self, v: u8) {
+        self.set(2, v);
+    }
+    pub fn set_type_3(&mut self, v: u8) {
+        self.set(3, v);
     }
 }
-pub use workaround_identity_op_suppression::UteeParamsTypes;
 
 const TEE_PARAM_TYPE_NONE: u8 = 0;
 const TEE_PARAM_TYPE_VALUE_INPUT: u8 = 1;
@@ -1299,7 +1328,7 @@ pub enum OpteeRpcCommand {
 /// Temporary memory reference parameter
 ///
 /// `optee_msg_param_tmem` from `optee_os/core/include/optee_msg.h`
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct OpteeMsgParamTmem {
     /// Physical address of the buffer
@@ -1313,7 +1342,7 @@ pub struct OpteeMsgParamTmem {
 /// Registered memory reference parameter
 ///
 /// `optee_msg_param_rmem` from `optee_os/core/include/optee_msg.h`
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct OpteeMsgParamRmem {
     /// Offset into shared memory reference
@@ -1330,7 +1359,7 @@ pub struct OpteeMsgParamRmem {
 ///
 /// Note: LiteBox doesn't currently support FF-A shared memory, so this struct is
 /// provided for completeness but is not used.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct OpteeMsgParamFmem {
     /// Lower bits of offset into shared memory reference
@@ -1347,7 +1376,7 @@ pub struct OpteeMsgParamFmem {
 
 /// Opaque value parameter
 /// Value parameters are passed unchecked between normal and secure world.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct OpteeMsgParamValue {
     pub a: u64,
@@ -1355,16 +1384,12 @@ pub struct OpteeMsgParamValue {
     pub c: u64,
 }
 
-/// Parameter used together with `OpteeMsgArgs`
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub union OpteeMsgParamUnion {
-    tmem: OpteeMsgParamTmem,
-    rmem: OpteeMsgParamRmem,
-    fmem: OpteeMsgParamFmem,
-    value: OpteeMsgParamValue,
-    octets: [u8; 24],
-}
+/// Parameter used together with `OpteeMsgArgs`.
+///
+/// The 24-byte `data` field is the on-wire union of [`OpteeMsgParamTmem`],
+/// [`OpteeMsgParamRmem`], [`OpteeMsgParamFmem`], and [`OpteeMsgParamValue`].
+/// Use the typed accessor methods to interpret it.
+const OPTEE_MSG_PARAM_DATA_SIZE: usize = 24;
 
 const OPTEE_MSG_ATTR_TYPE_NONE: u8 = 0x0;
 const OPTEE_MSG_ATTR_TYPE_VALUE_INPUT: u8 = 0x1;
@@ -1395,41 +1420,43 @@ pub enum OpteeMsgAttrType {
     TmemInout = OPTEE_MSG_ATTR_TYPE_TMEM_INOUT,
 }
 
-#[non_exhaustive]
-#[bitfield]
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct OpteeMsgAttr {
-    pub typ: B8,
-    pub meta: bool,
-    pub noncontig: bool,
-    #[skip]
-    __: B54,
+/// Attribute field of [`OpteeMsgParam`].
+///
+/// Wire layout (little-endian u64):
+/// - bits \[7:0\]  – type (`OPTEE_MSG_ATTR_TYPE_*`)
+/// - bit  8       – meta
+/// - bit  9       – noncontig
+/// - bits \[63:10\] – reserved (zero)
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(transparent)]
+pub struct OpteeMsgAttr(u64);
+
+impl OpteeMsgAttr {
+    /// Returns the attribute type (bits 0–7).
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn typ(&self) -> u8 {
+        self.0 as u8
+    }
+
+    /// Returns `true` when the meta bit (bit 8) is set.
+    pub fn meta(&self) -> bool {
+        self.0 & (1 << 8) != 0
+    }
+
+    /// Returns `true` when the noncontig bit (bit 9) is set.
+    pub fn noncontig(&self) -> bool {
+        self.0 & (1 << 9) != 0
+    }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct OpteeMsgParam {
     attr: OpteeMsgAttr,
-    u: OpteeMsgParamUnion,
+    data: [u8; OPTEE_MSG_PARAM_DATA_SIZE],
 }
 
 impl OpteeMsgParam {
-    /// Deserialize an `OpteeMsgParam` from a byte slice of exactly `size_of::<OpteeMsgParam>()` bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < size_of::<Self>() {
-            return None;
-        }
-        // SAFETY: OpteeMsgParam is repr(C) and 32 bytes, and we've checked the input slice is large enough.
-        Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Self>()) })
-    }
-
-    /// Serialize this `OpteeMsgParam` as a byte slice of `size_of::<OpteeMsgParam>()` bytes.
-    pub fn as_bytes(&self) -> &[u8; size_of::<Self>()] {
-        // SAFETY: OpteeMsgParam is repr(C) and 32 bytes. Reinterpreting as bytes is safe.
-        unsafe { &*(&raw const *self).cast::<[u8; size_of::<Self>()]>() }
-    }
-
     pub fn attr_type(&self) -> OpteeMsgAttrType {
         OpteeMsgAttrType::try_from(self.attr.typ()).unwrap_or(OpteeMsgAttrType::None)
     }
@@ -1440,7 +1467,7 @@ impl OpteeMsgParam {
                 | OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT
                 | OPTEE_MSG_ATTR_TYPE_TMEM_INOUT
         ) {
-            Some(unsafe { self.u.tmem })
+            OpteeMsgParamTmem::read_from_bytes(&self.data).ok()
         } else {
             None
         }
@@ -1452,7 +1479,7 @@ impl OpteeMsgParam {
                 | OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT
                 | OPTEE_MSG_ATTR_TYPE_RMEM_INOUT
         ) {
-            Some(unsafe { self.u.rmem })
+            OpteeMsgParamRmem::read_from_bytes(&self.data).ok()
         } else {
             None
         }
@@ -1464,7 +1491,7 @@ impl OpteeMsgParam {
                 | OPTEE_MSG_ATTR_TYPE_RMEM_OUTPUT
                 | OPTEE_MSG_ATTR_TYPE_RMEM_INOUT
         ) {
-            Some(unsafe { self.u.fmem })
+            OpteeMsgParamFmem::read_from_bytes(&self.data).ok()
         } else {
             None
         }
@@ -1476,7 +1503,7 @@ impl OpteeMsgParam {
                 | OPTEE_MSG_ATTR_TYPE_VALUE_OUTPUT
                 | OPTEE_MSG_ATTR_TYPE_VALUE_INOUT
         ) {
-            Some(unsafe { self.u.value })
+            OpteeMsgParamValue::read_from_bytes(&self.data).ok()
         } else {
             None
         }
@@ -1643,7 +1670,7 @@ impl OpteeMsgArgs {
         if index >= self.num_params as usize {
             Err(OpteeSmcReturnCode::ENotAvail)
         } else {
-            self.params[index].u.value = value;
+            self.params[index].data.copy_from_slice(value.as_bytes());
             Ok(())
         }
     }
@@ -1658,8 +1685,9 @@ impl OpteeMsgArgs {
         if index >= self.num_params as usize {
             Err(OpteeSmcReturnCode::ENotAvail)
         } else {
-            // rmem.size and tmem.size are at the same offset as value.b in the union
-            self.params[index].u.rmem.size = size;
+            // rmem.size and tmem.size are at byte offset 8 in the 24-byte data,
+            // the same position as value.b in the original union.
+            self.params[index].data[8..16].copy_from_slice(&size.to_le_bytes());
             Ok(())
         }
     }
@@ -1708,13 +1736,14 @@ impl OpteeMsgArgs {
 
         let mut params = [OpteeMsgParam {
             attr: OpteeMsgAttr::default(),
-            u: OpteeMsgParamUnion { octets: [0u8; 24] },
+            data: [0u8; OPTEE_MSG_PARAM_DATA_SIZE],
         }; Self::MAX_PARAMS];
 
         for (i, param) in params.iter_mut().enumerate().take(num) {
             let offset = i * size_of::<OpteeMsgParam>();
             let param_bytes = &raw_params[offset..offset + size_of::<OpteeMsgParam>()];
-            *param = OpteeMsgParam::from_bytes(param_bytes).ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            *param = OpteeMsgParam::read_from_bytes(param_bytes)
+                .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
         }
 
         Ok(Self {
@@ -1838,13 +1867,14 @@ impl OpteeRpcArgs {
 
         let mut params = [OpteeMsgParam {
             attr: OpteeMsgAttr::default(),
-            u: OpteeMsgParamUnion { octets: [0u8; 24] },
+            data: [0u8; OPTEE_MSG_PARAM_DATA_SIZE],
         }; Self::MAX_PARAMS];
 
         for (i, param) in params.iter_mut().enumerate().take(num) {
             let offset = i * size_of::<OpteeMsgParam>();
             let param_bytes = &raw_params[offset..offset + size_of::<OpteeMsgParam>()];
-            *param = OpteeMsgParam::from_bytes(param_bytes).ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            *param = OpteeMsgParam::read_from_bytes(param_bytes)
+                .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
         }
 
         Ok(Self {

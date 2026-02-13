@@ -856,7 +856,6 @@ dependencies = [
  "elf 0.8.0",
  "litebox",
  "litebox_common_linux",
- "modular-bitfield",
  "num_enum",
  "thiserror",
  "zerocopy",
