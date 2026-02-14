@@ -36,8 +36,6 @@ use litebox_common_lvbs::{
         ModuleMemoryRange, Symbol, MODULE_VALIDATION_MAX_SIZE,
     },
 };
-#[cfg(debug_assertions)]
-use litebox_platform_lvbs::mshv::mem_integrity::parse_modinfo;
 use litebox_platform_lvbs::mshv::ringbuffer::set_ringbuffer;
 use litebox_platform_lvbs::{
     arch::get_core_id,
@@ -50,15 +48,17 @@ use litebox_platform_lvbs::{
     mshv::{
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_ap},
-        mem_integrity::{
-            validate_kernel_module_against_elf, validate_text_patch,
-            verify_kernel_module_signature, verify_kernel_pe_signature,
-        },
         vsm::CPU_ONLINE_MASK,
         vtl_switch::mshv_vsm_get_code_page_offsets,
     },
 };
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
+#[cfg(debug_assertions)]
+use crate::mem_integrity::parse_modinfo;
+use crate::mem_integrity::{
+    validate_kernel_module_against_elf, validate_text_patch,
+    verify_kernel_module_signature, verify_kernel_pe_signature,
+};
 use spin::rwlock::RwLock;
 use x509_cert::{der::Decode, Certificate};
 use x86_64::{

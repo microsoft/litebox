@@ -46,6 +46,7 @@ use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
 
+mod mem_integrity;
 mod vsm;
 
 /// # Panics
