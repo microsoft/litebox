@@ -165,11 +165,4 @@ pub struct Kimage {
 }
 pub const KEXEC_SEGMENT_MAX: usize = 16;
 
-/// `list_head` from [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/include/linux/types.h#L190)
-/// Pointer fields stored as u64 since we don't dereference them.
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
-#[repr(C)]
-pub struct ListHead {
-    pub next: u64,
-    pub prev: u64,
-}
+pub use litebox_common_lvbs::linux::ListHead;

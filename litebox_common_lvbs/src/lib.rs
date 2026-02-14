@@ -8,6 +8,7 @@
 pub mod error;
 pub mod heki;
 pub mod hvcall;
+pub mod linux;
 pub mod mem_layout;
 pub mod mshv;
 pub mod vsm;
