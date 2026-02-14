@@ -5,17 +5,19 @@ use crate::{
     debug_serial_println,
     host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
     mshv::{
-        DEFAULT_REG_PIN_MASK, HV_REGISTER_PENDING_EVENT0, HV_X64_REGISTER_APIC_BASE,
-        HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER,
-        HV_X64_REGISTER_GDTR, HV_X64_REGISTER_IDTR, HV_X64_REGISTER_LDTR, HV_X64_REGISTER_LSTAR,
-        HV_X64_REGISTER_RIP, HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR,
-        HV_X64_REGISTER_SYSENTER_CS, HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
-        HV_X64_REGISTER_TR, HvInterceptMessage, HvInterceptMessageHeader, HvMemInterceptMessage,
-        HvMessageType, HvMsrInterceptMessage, HvPendingExceptionEvent, MSR_CSTAR, MSR_EFER,
+        hvcall::HypervCallError, hvcall_vp::hvcall_set_vp_vtl0_registers, HvInterceptMessage,
+        HvInterceptMessageHeader, HvMemInterceptMessage, HvMessageType, HvMsrInterceptMessage,
+        HvPendingExceptionEvent, X86Cr0Flags, X86Cr4Flags, DEFAULT_REG_PIN_MASK,
+        HV_REGISTER_PENDING_EVENT0, HV_X64_REGISTER_GDTR, HV_X64_REGISTER_IDTR,
+        HV_X64_REGISTER_LDTR, HV_X64_REGISTER_RIP, HV_X64_REGISTER_TR, MSR_CSTAR, MSR_EFER,
         MSR_IA32_APICBASE, MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_EIP, MSR_IA32_SYSENTER_ESP,
-        MSR_LSTAR, MSR_STAR, MSR_SYSCALL_MASK, X86Cr0Flags, X86Cr4Flags, hvcall::HypervCallError,
-        hvcall_vp::hvcall_set_vp_vtl0_registers,
+        MSR_LSTAR, MSR_STAR, MSR_SYSCALL_MASK,
     },
+};
+use litebox_common_lvbs::mshv::{
+    HV_X64_REGISTER_APIC_BASE, HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR,
+    HV_X64_REGISTER_EFER, HV_X64_REGISTER_LSTAR, HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR,
+    HV_X64_REGISTER_SYSENTER_CS, HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
 };
 use num_enum::TryFromPrimitive;
 

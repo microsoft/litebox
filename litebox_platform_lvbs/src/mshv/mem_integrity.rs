@@ -7,10 +7,10 @@ use crate::{
     debug_serial_println,
     host::linux::ModuleSignature,
     mshv::{
-        heki::{HekiPatch, POKE_MAX_OPCODE_SIZE},
         vsm::ModuleMemory,
     },
 };
+use litebox_common_lvbs::heki::{HekiPatch, POKE_MAX_OPCODE_SIZE};
 use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};

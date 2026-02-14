@@ -164,5 +164,3 @@ pub struct Kimage {
     // we do not need the rest of the fields for now
 }
 pub const KEXEC_SEGMENT_MAX: usize = 16;
-
-pub use litebox_common_lvbs::linux::ListHead;

@@ -8,12 +8,10 @@ use crate::{
     host::linux::CpuMask,
     mshv::{
         error::VsmError,
-        heki::{
-            HekiKernelSymbol, HekiPatch, HekiPatchInfo, HekiRange, ModMemType,
-        },
         vtl1_mem_layout::PAGE_SIZE,
     },
 };
+use litebox_common_lvbs::heki::{HekiKernelSymbol, HekiPatch, HekiPatchInfo, HekiRange, ModMemType};
 use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};
 use core::{
     mem,
@@ -35,8 +33,6 @@ pub use litebox_common_lvbs::vsm::{
 };
 
 pub static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
-
-pub use litebox_common_lvbs::mshv::{ControlRegMap, NUM_CONTROL_REGS};
 
 /// Data structure for maintaining the kernel information in VTL0.
 /// It should be prepared by copying kernel data from VTL0 to VTL1 instead of

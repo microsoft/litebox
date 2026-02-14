@@ -4,14 +4,9 @@
 //! Per-CPU VTL1 kernel variables
 
 use crate::{
-    arch::{MAX_CORES, gdt, get_core_id},
+    arch::{gdt, get_core_id, MAX_CORES},
     host::bootparam::get_num_possible_cpus,
-    mshv::{
-        HvMessagePage, HvVpAssistPage,
-        vsm::{ControlRegMap, NUM_CONTROL_REGS},
-        vtl_switch::VtlState,
-        vtl1_mem_layout::PAGE_SIZE,
-    },
+    mshv::{vtl1_mem_layout::PAGE_SIZE, vtl_switch::VtlState, HvMessagePage, HvVpAssistPage},
 };
 use aligned_vec::avec;
 use alloc::boxed::Box;
@@ -19,6 +14,7 @@ use core::cell::{Cell, RefCell};
 use core::mem::offset_of;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::{rdgsbase, wrgsbase};
+use litebox_common_lvbs::mshv::{ControlRegMap, NUM_CONTROL_REGS};
 use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;
@@ -47,7 +43,7 @@ pub struct PerCpuVariables {
 impl PerCpuVariables {
     const XSAVE_ALIGNMENT: usize = 64; // XSAVE and XRSTORE require a 64-byte aligned buffer
     pub const VTL1_XSAVE_MASK: u64 = 0b11; // let XSAVE and XRSTORE deal with x87 and SSE states
-    // XSAVE area size for VTL1: 512 bytes (legacy x87+SSE area) + 64 bytes (XSAVE header)
+                                           // XSAVE area size for VTL1: 512 bytes (legacy x87+SSE area) + 64 bytes (XSAVE header)
     const VTL1_XSAVE_AREA_SIZE: usize = 512 + 64;
 
     pub(crate) fn kernel_stack_top(&self) -> u64 {

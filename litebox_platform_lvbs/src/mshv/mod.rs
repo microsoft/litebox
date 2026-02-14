@@ -4,7 +4,6 @@
 //! Hyper-V-specific code
 
 pub mod error;
-pub mod heki;
 pub mod hvcall;
 pub mod hvcall_mm;
 pub mod hvcall_vp;
@@ -88,12 +87,6 @@ pub const HVCALL_GET_VP_REGISTERS: u16 = 0x_0050;
 pub const HVCALL_SET_VP_REGISTERS: u16 = 0x_0051;
 
 pub const HV_X64_REGISTER_RIP: u32 = 0x0002_0010;
-pub use litebox_common_lvbs::mshv::{
-    HV_X64_REGISTER_APIC_BASE, HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4,
-    HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER, HV_X64_REGISTER_LSTAR,
-    HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR, HV_X64_REGISTER_SYSENTER_CS,
-    HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
-};
 pub const HV_X64_REGISTER_LDTR: u32 = 0x0006_0006;
 pub const HV_X64_REGISTER_TR: u32 = 0x0006_0007;
 pub const HV_X64_REGISTER_IDTR: u32 = 0x0007_0000;
