@@ -7,10 +7,6 @@ use crate::{
     debug_serial_println,
     host::linux::CpuMask,
     mshv::{
-        HV_X64_REGISTER_APIC_BASE, HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4,
-        HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER, HV_X64_REGISTER_LSTAR,
-        HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR, HV_X64_REGISTER_SYSENTER_CS,
-        HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
         error::VsmError,
         heki::{
             HekiKernelSymbol, HekiPatch, HekiPatchInfo, HekiRange, ModMemType,
@@ -40,64 +36,7 @@ pub use litebox_common_lvbs::vsm::{
 
 pub static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
 
-pub const NUM_CONTROL_REGS: usize = 11;
-
-/// Data structure for maintaining MSRs and control registers whose values are locked.
-/// This structure is expected to be stored in per-core kernel context, so we do not protect it with a lock.
-#[derive(Debug, Clone, Copy)]
-pub struct ControlRegMap {
-    pub entries: [(u32, u64); NUM_CONTROL_REGS],
-}
-
-impl ControlRegMap {
-    pub fn init(&mut self) {
-        [
-            HV_X64_REGISTER_CR0,
-            HV_X64_REGISTER_CR4,
-            HV_X64_REGISTER_LSTAR,
-            HV_X64_REGISTER_STAR,
-            HV_X64_REGISTER_CSTAR,
-            HV_X64_REGISTER_APIC_BASE,
-            HV_X64_REGISTER_EFER,
-            HV_X64_REGISTER_SYSENTER_CS,
-            HV_X64_REGISTER_SYSENTER_ESP,
-            HV_X64_REGISTER_SYSENTER_EIP,
-            HV_X64_REGISTER_SFMASK,
-        ]
-        .iter()
-        .enumerate()
-        .for_each(|(i, &reg_name)| {
-            self.entries[i] = (reg_name, 0);
-        });
-    }
-
-    pub fn get(&self, reg_name: u32) -> Option<u64> {
-        for entry in &self.entries {
-            if entry.0 == reg_name {
-                return Some(entry.1);
-            }
-        }
-        None
-    }
-
-    pub fn set(&mut self, reg_name: u32, value: u64) {
-        for entry in &mut self.entries {
-            if entry.0 == reg_name {
-                entry.1 = value;
-                return;
-            }
-        }
-    }
-
-    // consider implementing a mutable iterator (if we plan to lock many control registers)
-    pub fn reg_names(&self) -> [u32; NUM_CONTROL_REGS] {
-        let mut names = [0; NUM_CONTROL_REGS];
-        for (i, entry) in self.entries.iter().enumerate() {
-            names[i] = entry.0;
-        }
-        names
-    }
-}
+pub use litebox_common_lvbs::mshv::{ControlRegMap, NUM_CONTROL_REGS};
 
 /// Data structure for maintaining the kernel information in VTL0.
 /// It should be prepared by copying kernel data from VTL0 to VTL1 instead of
