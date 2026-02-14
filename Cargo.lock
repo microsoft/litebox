@@ -849,6 +849,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_common_lvbs"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.9.4",
+ "litebox",
+ "litebox_common_linux",
+ "modular-bitfield",
+ "num_enum",
+ "thiserror",
+ "x86_64",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_common_optee"
 version = "0.1.0"
 dependencies = [
@@ -914,6 +928,7 @@ dependencies = [
  "libc",
  "litebox",
  "litebox_common_linux",
+ "litebox_common_lvbs",
  "litebox_common_optee",
  "modular-bitfield",
  "num_enum",
