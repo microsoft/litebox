@@ -17,6 +17,16 @@ once_cell = { version = "1.21.3", default-features = false, features = ["race", 
 num_enum = { version = "0.7.4", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 x509-cert = { version = "0.2.5", default-features = false }
+authenticode = { version = "0.4.3", default-features = false, features = ["object"] }
+cms = { version = "0.2.3", default-features = false, features = ["alloc"] }
+const-oid = { version = "0.9.6", default-features = false, features = ["db"] }
+digest = { version = "0.10.7", default-features = false }
+elf = { version = "0.8.0", default-features = false }
+object = { version = "0.36.7", default-features = false, features = ["pe"] }
+rangemap = { version = "1.5.1", features = ["const_fn"] }
+rsa = { version = "0.9.10", default-features = false }
+sha2 = { version = "0.10.9", default-features = false, features = ["oid"] }
+thiserror = { version = "2.0.6", default-features = false }
 
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
