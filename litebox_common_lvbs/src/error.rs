@@ -272,3 +272,13 @@ impl From<VsmError> for Errno {
         }
     }
 }
+
+/// Errors for kernel ELF validation and relocation.
+#[derive(Debug, Error, PartialEq)]
+#[non_exhaustive]
+pub enum KernelElfError {
+    #[error("failed to parse ELF file")]
+    ElfParseFailed,
+    #[error("required section not found")]
+    SectionNotFound,
+}
