@@ -13,22 +13,18 @@ use crate::{
     mshv::{
         HvSynicSint, HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET,
         HV_HYPERCALL_REP_START_MASK, HV_HYPERCALL_REP_START_OFFSET, HV_HYPERCALL_RESULT_MASK,
-        HV_HYPERCALL_VARHEAD_OFFSET, HV_STATUS_ACCESS_DENIED, HV_STATUS_INSUFFICIENT_BUFFERS,
-        HV_STATUS_INSUFFICIENT_MEMORY, HV_STATUS_INVALID_ALIGNMENT,
-        HV_STATUS_INVALID_CONNECTION_ID, HV_STATUS_INVALID_HYPERCALL_CODE,
-        HV_STATUS_INVALID_HYPERCALL_INPUT, HV_STATUS_INVALID_PARAMETER, HV_STATUS_INVALID_PORT_ID,
-        HV_STATUS_OPERATION_DENIED, HV_STATUS_SUCCESS, HV_STATUS_TIME_OUT,
-        HV_STATUS_VTL_ALREADY_ENABLED, HV_X64_MSR_GUEST_OS_ID, HV_X64_MSR_HYPERCALL,
-        HV_X64_MSR_HYPERCALL_ENABLE, HV_X64_MSR_SCONTROL, HV_X64_MSR_SCONTROL_ENABLE,
-        HV_X64_MSR_SIMP, HV_X64_MSR_SIMP_ENABLE, HV_X64_MSR_SINT0, HV_X64_MSR_VP_ASSIST_PAGE,
-        HV_X64_MSR_VP_ASSIST_PAGE_ENABLE, HYPERVISOR_CALLBACK_VECTOR,
+        HV_HYPERCALL_VARHEAD_OFFSET, HV_STATUS_SUCCESS, HV_X64_MSR_GUEST_OS_ID,
+        HV_X64_MSR_HYPERCALL, HV_X64_MSR_HYPERCALL_ENABLE, HV_X64_MSR_SCONTROL,
+        HV_X64_MSR_SCONTROL_ENABLE, HV_X64_MSR_SIMP, HV_X64_MSR_SIMP_ENABLE, HV_X64_MSR_SINT0,
+        HV_X64_MSR_VP_ASSIST_PAGE, HV_X64_MSR_VP_ASSIST_PAGE_ENABLE, HYPERVISOR_CALLBACK_VECTOR,
         HYPERV_CPUID_IMPLEMENT_LIMITS, HYPERV_CPUID_INTERFACE,
         HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
     },
 };
 use core::arch::asm;
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 use thiserror::Error;
+
+pub use litebox_common_lvbs::hvcall::HypervCallError;
 
 #[cfg(debug_assertions)]
 use crate::mshv::HV_REGISTER_VP_INDEX;
@@ -248,37 +244,4 @@ pub enum HypervError {
     VPSetupFailed,
     #[error("unknown Hyper-V error")]
     Unknown,
-}
-
-/// Errors for Hyper-V hypercalls.
-#[derive(Debug, Error, TryFromPrimitive, IntoPrimitive)]
-#[non_exhaustive]
-#[repr(u32)]
-pub enum HypervCallError {
-    #[error("invalid hypercall code")]
-    InvalidCode = HV_STATUS_INVALID_HYPERCALL_CODE,
-    #[error("invalid hypercall input")]
-    InvalidInput = HV_STATUS_INVALID_HYPERCALL_INPUT,
-    #[error("invalid alignment")]
-    InvalidAlignment = HV_STATUS_INVALID_ALIGNMENT,
-    #[error("invalid parameter")]
-    InvalidParameter = HV_STATUS_INVALID_PARAMETER,
-    #[error("access denied")]
-    AccessDenied = HV_STATUS_ACCESS_DENIED,
-    #[error("operation denied")]
-    OperationDenied = HV_STATUS_OPERATION_DENIED,
-    #[error("insufficient memory")]
-    InsufficientMemory = HV_STATUS_INSUFFICIENT_MEMORY,
-    #[error("invalid port ID")]
-    InvalidPortID = HV_STATUS_INVALID_PORT_ID,
-    #[error("invalid connection ID")]
-    InvalidConnectionID = HV_STATUS_INVALID_CONNECTION_ID,
-    #[error("insufficient buffers")]
-    InsufficientBuffers = HV_STATUS_INSUFFICIENT_BUFFERS,
-    #[error("timeout")]
-    TimeOut = HV_STATUS_TIME_OUT,
-    #[error("VTL already enabled")]
-    AlreadyEnabled = HV_STATUS_VTL_ALREADY_ENABLED,
-    #[error("unknown hypercall error")]
-    Unknown = 0xffff_ffff,
 }
