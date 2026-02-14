@@ -3,14 +3,14 @@
 
 use crate::{
     host::linux::ListHead,
-    mshv::{HvPageProtFlags, error::VsmError, vtl1_mem_layout::PAGE_SIZE},
+    mshv::{error::VsmError, vtl1_mem_layout::PAGE_SIZE, HvPageProtFlags},
 };
 use core::mem;
 use litebox::utils::TruncateExt;
 use num_enum::TryFromPrimitive;
 use x86_64::{
-    PhysAddr, VirtAddr,
     structures::paging::{PageSize, Size4KiB},
+    PhysAddr, VirtAddr,
 };
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
@@ -83,7 +83,7 @@ pub enum ModMemType {
     Unknown = 0xffff_ffff_ffff_ffff,
 }
 
-pub(crate) fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
+pub fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
     let mut mem_attr = MemAttr::empty();
 
     match mod_mem_type {
@@ -261,7 +261,11 @@ impl HekiPatch {
     /// Creates a new `HekiPatch` with a given buffer. Returns `None` if any field is invalid.
     pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
         let patch = Self::read_from_bytes(bytes).ok()?;
-        if patch.is_valid() { Some(patch) } else { None }
+        if patch.is_valid() {
+            Some(patch)
+        } else {
+            None
+        }
     }
 
     pub fn is_valid(&self) -> bool {
@@ -319,7 +323,11 @@ impl HekiPatchInfo {
     /// Creates a new `HekiPatchInfo` with a given buffer. Returns `None` if any field is invalid.
     pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
         let info = Self::read_from_bytes(bytes).ok()?;
-        if info.is_valid() { Some(info) } else { None }
+        if info.is_valid() {
+            Some(info)
+        } else {
+            None
+        }
     }
 
     pub fn is_valid(&self) -> bool {

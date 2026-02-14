@@ -6,14 +6,14 @@
 use crate::host::{
     hv_hypercall_page_address,
     per_cpu_variables::{
-        PerCpuVariablesAsm, with_per_cpu_variables, with_per_cpu_variables_asm,
-        with_per_cpu_variables_mut,
+        with_per_cpu_variables, with_per_cpu_variables_asm, with_per_cpu_variables_mut,
+        PerCpuVariablesAsm,
     },
 };
 use crate::mshv::{
-    HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS,
-    VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
     error::VsmError, hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
+    HvRegisterVsmCodePageOffsets, HV_REGISTER_VSM_CODEPAGE_OFFSETS, NUM_VTLCALL_PARAMS,
+    VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
 };
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
 use num_enum::TryFromPrimitive;
@@ -276,7 +276,7 @@ enum VtlEntryReason {
     Interrupt = VTL_ENTRY_REASON_INTERRUPT,
 }
 
-pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), VsmError> {
+pub fn mshv_vsm_get_code_page_offsets() -> Result<(), VsmError> {
     let value = hvcall_get_vp_registers(HV_REGISTER_VSM_CODEPAGE_OFFSETS)
         .map_err(VsmError::HypercallFailed)?;
     let code_page_offsets = HvRegisterVsmCodePageOffsets::from_u64(value);

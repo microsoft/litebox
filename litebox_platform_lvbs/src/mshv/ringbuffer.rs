@@ -55,7 +55,7 @@ impl RingBuffer {
 }
 
 static RINGBUFFER_ONCE: Once<Mutex<RingBuffer>> = Once::new();
-pub(crate) fn set_ringbuffer(pa: PhysAddr, size: usize) -> &'static Mutex<RingBuffer> {
+pub fn set_ringbuffer(pa: PhysAddr, size: usize) -> &'static Mutex<RingBuffer> {
     RINGBUFFER_ONCE.call_once(|| {
         let ring_buffer = RingBuffer::new(pa, size);
         Mutex::new(ring_buffer)
