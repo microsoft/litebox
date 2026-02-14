@@ -1312,8 +1312,17 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             // VTL1 no longer protects the pages.
             crate::mshv::heki::MemAttr::all()
         };
-        crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
-            .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))
+        let pa = frame_range.start.start_address().as_u64();
+        let num_pages = frame_range.count() as u64;
+        if num_pages > 0 {
+            crate::mshv::hvcall_mm::hv_modify_vtl_protection_mask(
+                pa,
+                num_pages,
+                crate::mshv::heki::mem_attr_to_hv_page_prot_flags(mem_attr),
+            )
+            .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
+        }
+        Ok(())
     }
 }
 
