@@ -26,7 +26,7 @@ bitflags::bitflags! {
     }
 }
 
-pub(crate) fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
+pub fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
     let mut flags = HvPageProtFlags::empty();
 
     if attr.contains(MemAttr::MEM_ATTR_READ) {

@@ -117,6 +117,7 @@ pub fn init() -> Option<&'static Platform> {
     if let Err(e) = hvcall::init() {
         panic!("Err: {:?}", e);
     }
+    vsm::init();
     gdt::init();
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
