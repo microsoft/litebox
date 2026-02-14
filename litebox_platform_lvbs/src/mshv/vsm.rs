@@ -30,17 +30,13 @@ use spin::Once;
 use thiserror::Error;
 use x86_64::{
     PhysAddr, VirtAddr,
-    structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
+    structures::paging::{PageSize, Size4KiB, frame::PhysFrameRange},
 };
 use x509_cert::Certificate;
-use zerocopy::{FromBytes, Immutable, KnownLayout};
-
-#[derive(Copy, Clone, FromBytes, Immutable, KnownLayout)]
-#[repr(align(4096))]
-pub struct AlignedPage(pub [u8; PAGE_SIZE]);
-
-// For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
-pub const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
+pub use litebox_common_lvbs::vsm::{
+    AlignedPage, KexecMemoryMetadata, KexecMemoryRange, ModuleMemoryMetadata, ModuleMemoryRange,
+    MODULE_VALIDATION_MAX_SIZE,
+};
 
 pub static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
 
@@ -181,98 +177,6 @@ impl Vtl0KernelInfo {
 pub struct ModuleMemoryMetadataMap {
     inner: spin::mutex::SpinMutex<HashMap<i64, ModuleMemoryMetadata>>,
     key_gen: AtomicI64,
-}
-
-pub struct ModuleMemoryMetadata {
-    ranges: Vec<ModuleMemoryRange>,
-    patch_targets: Vec<PhysAddr>,
-}
-
-impl ModuleMemoryMetadata {
-    pub fn new() -> Self {
-        Self {
-            ranges: Vec::new(),
-            patch_targets: Vec::new(),
-        }
-    }
-
-    #[inline]
-    pub fn insert_heki_range(&mut self, heki_range: &HekiRange) {
-        let va = heki_range.va;
-        let pa = heki_range.pa;
-        let epa = heki_range.epa;
-        self.insert_memory_range(ModuleMemoryRange::new(
-            va,
-            pa,
-            epa,
-            heki_range.mod_mem_type(),
-        ));
-    }
-
-    #[inline]
-    pub fn insert_memory_range(&mut self, mem_range: ModuleMemoryRange) {
-        self.ranges.push(mem_range);
-    }
-
-    #[inline]
-    pub fn insert_patch_target(&mut self, patch_target: PhysAddr) {
-        self.patch_targets.push(patch_target);
-    }
-
-    // This function returns patch targets belonging to this module to remove them
-    // from the precomputed patch data map when the module is unloaded.
-    #[inline]
-    pub fn get_patch_targets(&self) -> &Vec<PhysAddr> {
-        &self.patch_targets
-    }
-}
-
-impl Default for ModuleMemoryMetadata {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ModuleMemoryMetadata {
-    /// Returns an iterator over the memory ranges.
-    pub fn iter(&self) -> core::slice::Iter<'_, ModuleMemoryRange> {
-        self.ranges.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a ModuleMemoryMetadata {
-    type Item = &'a ModuleMemoryRange;
-    type IntoIter = core::slice::Iter<'a, ModuleMemoryRange>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.ranges.iter()
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct ModuleMemoryRange {
-    pub virt_addr: VirtAddr,
-    pub phys_frame_range: PhysFrameRange<Size4KiB>,
-    pub mod_mem_type: ModMemType,
-}
-
-impl ModuleMemoryRange {
-    pub fn new(virt_addr: u64, phys_start: u64, phys_end: u64, mod_mem_type: ModMemType) -> Self {
-        Self {
-            virt_addr: VirtAddr::new(virt_addr),
-            phys_frame_range: PhysFrame::range(
-                PhysFrame::containing_address(PhysAddr::new(phys_start)),
-                PhysFrame::containing_address(PhysAddr::new(phys_end)),
-            ),
-            mod_mem_type,
-        }
-    }
-}
-
-impl Default for ModuleMemoryRange {
-    fn default() -> Self {
-        Self::new(0, 0, 0, ModMemType::Unknown)
-    }
 }
 
 impl ModuleMemoryMetadataMap {
@@ -587,57 +491,6 @@ impl KexecMemoryMetadataWrapper {
     }
 }
 
-// TODO: `ModuleMemoryMetadata` and `KexecMemoryMetadata` are similar. consider merging them into a single structure if possible.
-pub struct KexecMemoryMetadata {
-    ranges: Vec<KexecMemoryRange>,
-}
-
-impl KexecMemoryMetadata {
-    pub fn new() -> Self {
-        Self { ranges: Vec::new() }
-    }
-
-    #[inline]
-    pub fn insert_heki_range(&mut self, heki_range: &HekiRange) {
-        let va = heki_range.va;
-        let pa = heki_range.pa;
-        let epa = heki_range.epa;
-        self.insert_memory_range(KexecMemoryRange::new(va, pa, epa));
-    }
-
-    #[inline]
-    pub fn insert_memory_range(&mut self, mem_range: KexecMemoryRange) {
-        self.ranges.push(mem_range);
-    }
-
-    #[inline]
-    pub fn clear(&mut self) {
-        self.ranges.clear();
-    }
-}
-
-impl Default for KexecMemoryMetadata {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl KexecMemoryMetadata {
-    /// Returns an iterator over the memory ranges.
-    pub fn iter(&self) -> core::slice::Iter<'_, KexecMemoryRange> {
-        self.ranges.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a KexecMemoryMetadata {
-    type Item = &'a KexecMemoryRange;
-    type IntoIter = core::slice::Iter<'a, KexecMemoryRange>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.ranges.iter()
-    }
-}
-
 pub struct KexecMemoryMetadataIters<'a> {
     guard: spin::mutex::SpinMutexGuard<'a, KexecMemoryMetadata>,
     phantom: core::marker::PhantomData<&'a PhysFrameRange<Size4KiB>>,
@@ -646,30 +499,6 @@ pub struct KexecMemoryMetadataIters<'a> {
 impl<'a> KexecMemoryMetadataIters<'a> {
     pub fn iter_mem_ranges(&'a self) -> impl Iterator<Item = &'a KexecMemoryRange> {
         self.guard.ranges.iter()
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct KexecMemoryRange {
-    pub virt_addr: VirtAddr,
-    pub phys_frame_range: PhysFrameRange<Size4KiB>,
-}
-
-impl KexecMemoryRange {
-    pub fn new(virt_addr: u64, phys_start: u64, phys_end: u64) -> Self {
-        Self {
-            virt_addr: VirtAddr::new(virt_addr),
-            phys_frame_range: PhysFrame::range(
-                PhysFrame::containing_address(PhysAddr::new(phys_start)),
-                PhysFrame::containing_address(PhysAddr::new(phys_end)),
-            ),
-        }
-    }
-}
-
-impl Default for KexecMemoryRange {
-    fn default() -> Self {
-        Self::new(0, 0, 0)
     }
 }
 
