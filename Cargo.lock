@@ -1009,6 +1009,11 @@ dependencies = [
 name = "litebox_runner_lvbs"
 version = "0.1.0"
 dependencies = [
+ "authenticode",
+ "cms",
+ "const-oid",
+ "digest",
+ "elf 0.8.0",
  "hashbrown",
  "litebox",
  "litebox_common_linux",
@@ -1018,8 +1023,13 @@ dependencies = [
  "litebox_platform_multiplex",
  "litebox_shim_optee",
  "num_enum",
+ "object",
  "once_cell",
+ "rangemap",
+ "rsa",
+ "sha2",
  "spin 0.10.0",
+ "thiserror",
  "x509-cert",
  "x86_64",
  "zerocopy",
