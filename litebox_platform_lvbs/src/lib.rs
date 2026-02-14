@@ -6,7 +6,7 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
-use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
+use crate::host::per_cpu_variables::PerCpuVariablesAsm;
 use core::{
     arch::asm,
     sync::atomic::{AtomicU32, AtomicU64},
@@ -342,7 +342,6 @@ pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    pub vtl0_kernel_info: Vtl0KernelInfo,
 }
 
 pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
@@ -438,7 +437,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             host_and_task: core::marker::PhantomData,
             page_table_manager: PageTableManager::new(pt),
             vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
-            vtl0_kernel_info: Vtl0KernelInfo::new(),
         }))
     }
 

@@ -48,7 +48,7 @@ use litebox_platform_lvbs::{
     mshv::{
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_ap},
-        vsm::CPU_ONLINE_MASK,
+        CPU_ONLINE_MASK,
         vtl_switch::mshv_vsm_get_code_page_offsets,
     },
 };

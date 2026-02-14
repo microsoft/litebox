@@ -11,19 +11,20 @@ use crate::{
     debug_serial_println,
     host::per_cpu_variables::with_per_cpu_variables_mut,
     mshv::{
-        HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HV_VTL_NORMAL, HV_VTL_SECURE, HVCALL_ENABLE_VP_VTL,
-        HVCALL_GET_VP_REGISTERS, HVCALL_SET_VP_REGISTERS, HvEnableVpVtl, HvGetVpRegistersInput,
-        HvGetVpRegistersOutput, HvInputVtl, HvSetVpRegistersInput, SegmentRegisterAttributeFlags,
-        hvcall::{HypervCallError, hv_do_hypercall, hv_do_rep_hypercall},
+        hvcall::{hv_do_hypercall, hv_do_rep_hypercall, HypervCallError},
         vtl1_mem_layout::{
-            PAGE_SIZE, VTL1_KERNEL_STACK_PAGE, VTL1_TSS_PAGE, get_address_of_special_page,
+            get_address_of_special_page, PAGE_SIZE, VTL1_KERNEL_STACK_PAGE, VTL1_TSS_PAGE,
         },
+        HvEnableVpVtl, HvGetVpRegistersInput, HvGetVpRegistersOutput, HvInputVtl,
+        HvSetVpRegistersInput, SegmentRegisterAttributeFlags, HVCALL_ENABLE_VP_VTL,
+        HVCALL_GET_VP_REGISTERS, HVCALL_SET_VP_REGISTERS, HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF,
+        HV_VTL_NORMAL, HV_VTL_SECURE,
     },
     serial_println,
 };
 use x86_64::{
-    PrivilegeLevel,
     structures::{gdt::SegmentSelector, tss::TaskStateSegment},
+    PrivilegeLevel,
 };
 
 fn hvcall_set_vp_registers_internal(

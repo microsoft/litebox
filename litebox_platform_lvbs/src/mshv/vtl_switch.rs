@@ -11,11 +11,13 @@ use crate::host::{
     },
 };
 use crate::mshv::{
-    error::VsmError, hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
-    HvRegisterVsmCodePageOffsets, HV_REGISTER_VSM_CODEPAGE_OFFSETS, NUM_VTLCALL_PARAMS,
-    VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
+    hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
+    HvRegisterVsmCodePageOffsets, HV_REGISTER_VSM_CODEPAGE_OFFSETS, VTL_ENTRY_REASON_INTERRUPT,
+    VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
 };
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
+use litebox_common_lvbs::error::VsmError;
+use litebox_common_lvbs::mshv::NUM_VTLCALL_PARAMS;
 use num_enum::TryFromPrimitive;
 
 // ============================================================================

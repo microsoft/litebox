@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use fs::File;
 use fs_err as fs;
 use std::io::BufRead as _;
@@ -41,7 +41,7 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 7),
             ("litebox_runner_linux_userland/", 1),
-            ("litebox_runner_lvbs/", 4),
+            ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 1),
             ("litebox_shim_linux/", 1),
             ("litebox_shim_optee/", 3),

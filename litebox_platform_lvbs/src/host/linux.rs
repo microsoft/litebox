@@ -92,8 +92,6 @@ impl CpuMask {
     }
 }
 
-pub use litebox_common_lvbs::linux::{ModuleSignature, PkeyIdType, __be32};
-
 /// `kexec_segment` from [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/include/linux/kexec.h#L82)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]

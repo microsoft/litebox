@@ -3,44 +3,23 @@
 
 //! Hyper-V-specific code
 
-pub mod error;
 pub mod hvcall;
 pub mod hvcall_mm;
 pub mod hvcall_vp;
-pub mod mem_integrity;
 pub mod ringbuffer;
-pub mod vsm;
 pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
+use crate::host::linux::CpuMask;
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
+use alloc::boxed::Box;
 use modular_bitfield::prelude::*;
-use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45};
+use modular_bitfield::specifiers::{B16, B3, B31, B32, B4, B45, B7, B8};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use spin::Once;
 
-pub use litebox_common_lvbs::mshv::{
-    HV_STATUS_SUCCESS, HV_STATUS_INVALID_HYPERCALL_CODE, HV_STATUS_INVALID_HYPERCALL_INPUT,
-    HV_STATUS_INVALID_ALIGNMENT, HV_STATUS_INVALID_PARAMETER, HV_STATUS_ACCESS_DENIED,
-    HV_STATUS_OPERATION_DENIED, HV_STATUS_INSUFFICIENT_MEMORY, HV_STATUS_INVALID_PORT_ID,
-    HV_STATUS_INVALID_CONNECTION_ID, HV_STATUS_INSUFFICIENT_BUFFERS, HV_STATUS_TIME_OUT,
-    HV_STATUS_VTL_ALREADY_ENABLED,
-    HV_REGISTER_VSM_PARTITION_CONFIG, HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0,
-    HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
-    HV_REGISTER_CR_INTERCEPT_CR4_MASK,
-    HV_SECURE_VTL_BOOT_TOKEN, NUM_VTLCALL_PARAMS,
-    VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL, VSM_VTL_CALL_FUNC_ID_BOOT_APS,
-    VSM_VTL_CALL_FUNC_ID_LOCK_REGS, VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
-    VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY, VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
-    VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE, VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
-    VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE, VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
-    VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE, VSM_VTL_CALL_FUNC_ID_PATCH_TEXT,
-    VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY, VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
-    VsmFunction,
-    HvPageProtFlags,
-    HvRegisterVsmVpSecureVtlConfig, HvRegisterVsmPartitionConfig,
-    X86Cr4Flags, X86Cr0Flags, HvCrInterceptControlFlags,
-};
+pub static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
 
 pub const HV_HYPERCALL_REP_COMP_MASK: u64 = 0xfff_0000_0000;
 pub const HV_HYPERCALL_REP_COMP_OFFSET: u32 = 32;
@@ -653,6 +632,7 @@ impl HvPendingExceptionEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox_common_lvbs::mshv::{HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig};
 
     #[test]
     fn test_hv_input_vtl_bitfield() {
