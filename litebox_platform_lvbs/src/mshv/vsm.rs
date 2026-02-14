@@ -11,17 +11,17 @@ use crate::{
         vtl1_mem_layout::PAGE_SIZE,
     },
 };
+use litebox_common_lvbs::error::{MemoryContainerError, PatchDataMapError};
 use litebox_common_lvbs::heki::{HekiKernelSymbol, HekiPatch, HekiPatchInfo, HekiRange, ModMemType};
-use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};
+use litebox_common_lvbs::vsm::{MemoryRange, Symbol};
+use alloc::{boxed::Box, string::String, vec::Vec};
 use core::{
-    mem,
     ops::Range,
     sync::atomic::{AtomicBool, AtomicI64, Ordering},
 };
 use hashbrown::HashMap;
 use litebox::utils::TruncateExt;
 use spin::Once;
-use thiserror::Error;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{PageSize, Size4KiB, frame::PhysFrameRange},
@@ -257,18 +257,6 @@ impl ModuleMemory {
     }
 }
 
-/// Data structure for abstracting addressable paged memory. Unlike `ModuleMemoryMetadataMap` which maintains
-/// physical/virtual address ranges and their access permissions, this structure stores actual data in memory pages.
-/// This structure allows us to handle data copied from VTL0 (e.g., for virtual-address-based page sorting) without
-/// explicit page mappings at VTL1.
-/// This structure is expected to be used locally and temporarily, so we do not protect it with a lock.
-#[derive(Clone, Copy)]
-struct MemoryRange {
-    addr: VirtAddr,
-    phys_addr: PhysAddr,
-    len: u64,
-}
-
 pub struct MemoryContainer {
     range: Vec<MemoryRange>,
     buf: Vec<u8>,
@@ -381,14 +369,6 @@ impl core::ops::Deref for MemoryContainer {
     fn deref(&self) -> &Self::Target {
         &self.buf
     }
-}
-
-/// Errors for memory container operations.
-#[derive(Debug, Error, PartialEq)]
-#[non_exhaustive]
-pub enum MemoryContainerError {
-    #[error("failed to copy data from VTL0")]
-    CopyFromVtl0Failed,
 }
 
 pub struct KexecMemoryMetadataWrapper {
@@ -552,76 +532,9 @@ impl PatchDataMap {
     }
 }
 
-/// Errors for patch data map operations.
-#[derive(Debug, Error, PartialEq)]
-#[non_exhaustive]
-pub enum PatchDataMapError {
-    #[error("invalid HEKI patch info")]
-    InvalidHekiPatchInfo,
-    #[error("invalid HEKI patch")]
-    InvalidHekiPatch,
-}
-
-// TODO: Use this to resolve symbols in modules
-pub struct Symbol {
-    _value: u64,
-}
-
-impl Symbol {
-    /// Parse a symbol from a byte buffer.
-    pub fn from_bytes(
-        kinfo_start: usize,
-        start: VirtAddr,
-        bytes: &[u8],
-    ) -> Result<(String, Self), VsmError> {
-        let kinfo_bytes = &bytes[kinfo_start..];
-        let ksym = HekiKernelSymbol::from_bytes(kinfo_bytes)?;
-
-        let value_addr = start + mem::offset_of!(HekiKernelSymbol, value_offset) as u64;
-        let value = value_addr
-            .as_u64()
-            .wrapping_add_signed(i64::from(ksym.value_offset));
-
-        let name_offset = kinfo_start
-            + mem::offset_of!(HekiKernelSymbol, name_offset)
-            + usize::try_from(ksym.name_offset).map_err(|_| VsmError::SymbolNameOffsetInvalid)?;
-
-        if name_offset >= bytes.len() {
-            return Err(VsmError::SymbolNameOffsetInvalid);
-        }
-        let name_len = bytes[name_offset..]
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or(VsmError::SymbolNameNoTerminator)?;
-        if name_len >= HekiKernelSymbol::KSY_NAME_LEN {
-            return Err(VsmError::SymbolNameTooLong);
-        }
-
-        // SAFETY:
-        // - offset is within bytes (checked above)
-        // - there is a NUL terminator within bytes[offset..] (checked above)
-        // - Length of name string is within spec range (checked above)
-        // - bytes is still valid for the duration of this function
-        let name_str = unsafe {
-            let name_ptr = bytes.as_ptr().add(name_offset).cast::<c_char>();
-            CStr::from_ptr(name_ptr)
-        };
-        let name = CString::new(
-            name_str
-                .to_str()
-                .map_err(|_| VsmError::SymbolNameInvalidUtf8)?,
-        )
-        .map_err(|_| VsmError::SymbolNameInvalidUtf8)?;
-        let name = name
-            .into_string()
-            .map_err(|_| VsmError::SymbolNameInvalidUtf8)?;
-        Ok((name, Symbol { _value: value }))
-    }
-}
 pub struct SymbolTable {
     inner: spin::rwlock::RwLock<HashMap<String, Symbol>>,
 }
-use core::ffi::{CStr, c_char};
 
 impl Default for SymbolTable {
     fn default() -> Self {

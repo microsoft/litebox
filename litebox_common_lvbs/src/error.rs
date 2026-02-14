@@ -190,6 +190,24 @@ impl From<VerificationError> for VsmError {
     }
 }
 
+/// Errors for memory container operations.
+#[derive(Debug, Error, PartialEq)]
+#[non_exhaustive]
+pub enum MemoryContainerError {
+    #[error("failed to copy data from VTL0")]
+    CopyFromVtl0Failed,
+}
+
+/// Errors for patch data map operations.
+#[derive(Debug, Error, PartialEq)]
+#[non_exhaustive]
+pub enum PatchDataMapError {
+    #[error("invalid HEKI patch info")]
+    InvalidHekiPatchInfo,
+    #[error("invalid HEKI patch")]
+    InvalidHekiPatch,
+}
+
 impl From<VsmError> for Errno {
     fn from(e: VsmError) -> Self {
         match e {

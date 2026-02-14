@@ -5,9 +5,12 @@
 
 extern crate alloc;
 
-use crate::heki::{HekiRange, ModMemType};
+use crate::error::VsmError;
+use crate::heki::{HekiKernelSymbol, HekiRange, ModMemType};
 use crate::mem_layout::PAGE_SIZE;
-use alloc::vec::Vec;
+use alloc::{ffi::CString, string::String, vec::Vec};
+use core::ffi::{c_char, CStr};
+use core::mem;
 use x86_64::{
     structures::paging::{frame::PhysFrameRange, PhysFrame, Size4KiB},
     PhysAddr, VirtAddr,
@@ -189,5 +192,70 @@ impl KexecMemoryRange {
 impl Default for KexecMemoryRange {
     fn default() -> Self {
         Self::new(0, 0, 0)
+    }
+}
+
+/// Data structure for abstracting addressable paged memory ranges.
+#[derive(Clone, Copy)]
+pub struct MemoryRange {
+    pub addr: VirtAddr,
+    pub phys_addr: PhysAddr,
+    pub len: u64,
+}
+
+// TODO: Use this to resolve symbols in modules
+pub struct Symbol {
+    _value: u64,
+}
+
+impl Symbol {
+    /// Parse a symbol from a byte buffer.
+    pub fn from_bytes(
+        kinfo_start: usize,
+        start: VirtAddr,
+        bytes: &[u8],
+    ) -> Result<(String, Self), VsmError> {
+        let kinfo_bytes = &bytes[kinfo_start..];
+        let ksym = HekiKernelSymbol::from_bytes(kinfo_bytes)?;
+
+        let value_addr = start + mem::offset_of!(HekiKernelSymbol, value_offset) as u64;
+        let value = value_addr
+            .as_u64()
+            .wrapping_add_signed(i64::from(ksym.value_offset));
+
+        let name_offset = kinfo_start
+            + mem::offset_of!(HekiKernelSymbol, name_offset)
+            + usize::try_from(ksym.name_offset).map_err(|_| VsmError::SymbolNameOffsetInvalid)?;
+
+        if name_offset >= bytes.len() {
+            return Err(VsmError::SymbolNameOffsetInvalid);
+        }
+        let name_len = bytes[name_offset..]
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(VsmError::SymbolNameNoTerminator)?;
+        if name_len >= HekiKernelSymbol::KSY_NAME_LEN {
+            return Err(VsmError::SymbolNameTooLong);
+        }
+
+        // SAFETY:
+        // - offset is within bytes (checked above)
+        // - there is a NUL terminator within bytes[offset..] (checked above)
+        // - Length of name string is within spec range (checked above)
+        // - bytes is still valid for the duration of this function
+        let name_str = unsafe {
+            let name_ptr = bytes.as_ptr().add(name_offset).cast::<c_char>();
+            CStr::from_ptr(name_ptr)
+        };
+        let name = CString::new(
+            name_str
+                .to_str()
+                .map_err(|_| VsmError::SymbolNameInvalidUtf8)?,
+        )
+        .map_err(|_| VsmError::SymbolNameInvalidUtf8)?;
+        let name = name
+            .into_string()
+            .map_err(|_| VsmError::SymbolNameInvalidUtf8)?;
+        Ok((name, Symbol { _value: value }))
     }
 }
