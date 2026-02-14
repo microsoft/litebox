@@ -60,14 +60,14 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 #[derive(Copy, Clone, FromBytes, Immutable, KnownLayout)]
 #[repr(align(4096))]
-struct AlignedPage([u8; PAGE_SIZE]);
+pub struct AlignedPage(pub [u8; PAGE_SIZE]);
 
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
-const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
+pub const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
 
-static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
+pub static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
 
-pub(crate) fn init() {
+pub fn init() {
     assert!(
         !(get_core_id() == 0 && mshv_vsm_configure_partition().is_err()),
         "Failed to configure VSM partition"
@@ -308,7 +308,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     Ok(0)
 }
 
-fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
+pub fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
     let mut certs = Vec::new();
 
     while buf.len() >= 4 && buf[0] == 0x30 && buf[1] == 0x82 {
@@ -816,7 +816,7 @@ pub fn mshv_vsm_patch_text(patch_pa_0: u64, patch_pa_1: u64) -> Result<i64, VsmE
 
 /// This function copies patch data in `HekiPatch` structure from VTL0 to VTL1. This patch data can be
 /// stored within a physical page or across two likely non-contiguous physical pages.
-fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPatch, VsmError> {
+pub fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPatch, VsmError> {
     let patch_pa_0 = PhysAddr::try_new(patch_pa_0).map_err(|_| VsmError::InvalidPhysicalAddress)?;
     let patch_pa_1 = PhysAddr::try_new(patch_pa_1).map_err(|_| VsmError::InvalidPhysicalAddress)?;
     if patch_pa_0.is_null() || patch_pa_0 == patch_pa_1 || !patch_pa_1.is_aligned(Size4KiB::SIZE) {
@@ -867,7 +867,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
 
 /// This function apply the given `HekiPatch` patch data to VTL0 text.
 /// It assumes the caller has confirmed the validity of `HekiPatch` by invoking the `is_valid()` member function.
-fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
+pub fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
     let heki_patch_pa_0 = PhysAddr::new(heki_patch.pa[0]);
     let heki_patch_pa_1 = PhysAddr::new(heki_patch.pa[1]);
 
@@ -1006,7 +1006,7 @@ impl ControlRegMap {
 }
 
 #[allow(clippy::unnecessary_wraps)]
-fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
+pub fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
     let reg_names = with_per_cpu_variables_mut(|per_cpu_variables| {
         per_cpu_variables.vtl0_locked_regs.init();
         per_cpu_variables.vtl0_locked_regs.reg_names()
@@ -1026,14 +1026,14 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
 /// It should be prepared by copying kernel data from VTL0 to VTL1 instead of
 /// relying on shared memory access to VTL0 which suffers from security issues.
 pub struct Vtl0KernelInfo {
-    module_memory_metadata: ModuleMemoryMetadataMap,
+    pub module_memory_metadata: ModuleMemoryMetadataMap,
     boot_done: AtomicBool,
     system_certs: once_cell::race::OnceBox<Box<[Certificate]>>,
-    kexec_metadata: KexecMemoryMetadataWrapper,
-    crash_kexec_metadata: KexecMemoryMetadataWrapper,
-    precomputed_patches: PatchDataMap,
-    symbols: SymbolTable,
-    gpl_symbols: SymbolTable,
+    pub kexec_metadata: KexecMemoryMetadataWrapper,
+    pub crash_kexec_metadata: KexecMemoryMetadataWrapper,
+    pub precomputed_patches: PatchDataMap,
+    pub symbols: SymbolTable,
+    pub gpl_symbols: SymbolTable,
     // TODO: revocation cert, blocklist, etc.
 }
 
@@ -1058,7 +1058,7 @@ impl Vtl0KernelInfo {
     }
 
     /// This function records the end of the VTL0 boot process.
-    pub(crate) fn set_end_of_boot(&self) {
+    pub fn set_end_of_boot(&self) {
         self.boot_done
             .store(true, core::sync::atomic::Ordering::SeqCst);
     }
@@ -1116,7 +1116,7 @@ impl ModuleMemoryMetadata {
     }
 
     #[inline]
-    pub(crate) fn insert_heki_range(&mut self, heki_range: &HekiRange) {
+    pub fn insert_heki_range(&mut self, heki_range: &HekiRange) {
         let va = heki_range.va;
         let pa = heki_range.pa;
         let epa = heki_range.epa;
@@ -1129,19 +1129,19 @@ impl ModuleMemoryMetadata {
     }
 
     #[inline]
-    pub(crate) fn insert_memory_range(&mut self, mem_range: ModuleMemoryRange) {
+    pub fn insert_memory_range(&mut self, mem_range: ModuleMemoryRange) {
         self.ranges.push(mem_range);
     }
 
     #[inline]
-    pub(crate) fn insert_patch_target(&mut self, patch_target: PhysAddr) {
+    pub fn insert_patch_target(&mut self, patch_target: PhysAddr) {
         self.patch_targets.push(patch_target);
     }
 
     // This function returns patch targets belonging to this module to remove them
     // from the precomputed patch data map when the module is unloaded.
     #[inline]
-    pub(crate) fn get_patch_targets(&self) -> &Vec<PhysAddr> {
+    pub fn get_patch_targets(&self) -> &Vec<PhysAddr> {
         &self.patch_targets
     }
 }
@@ -1213,7 +1213,7 @@ impl ModuleMemoryMetadataMap {
     }
 
     /// Register a new module memory metadata structure in the map and return a unique key/token for it.
-    pub(crate) fn register_module_memory_metadata(
+    pub fn register_module_memory_metadata(
         &self,
         module_memory: ModuleMemoryMetadata,
     ) -> i64 {
@@ -1229,13 +1229,13 @@ impl ModuleMemoryMetadataMap {
         key
     }
 
-    pub(crate) fn remove(&self, key: i64) -> bool {
+    pub fn remove(&self, key: i64) -> bool {
         let mut map = self.inner.lock();
         map.remove(&key).is_some()
     }
 
     /// Return the addresses of patch targets belonging to a module identified by `key`
-    pub(crate) fn get_patch_targets(&self, key: i64) -> Option<Vec<PhysAddr>> {
+    pub fn get_patch_targets(&self, key: i64) -> Option<Vec<PhysAddr>> {
         let guard = self.inner.lock();
         guard
             .get(&key)
@@ -1281,7 +1281,7 @@ impl<'a> ModuleMemoryMetadataIters<'a> {
 
 /// This function copies `HekiPage` structures from VTL0 and returns a vector of them.
 /// `pa` and `nranges` specify the physical address range containing one or more than one `HekiPage` structures.
-fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
+pub fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
     let mut next_pa = PhysAddr::new(pa);
     let mut heki_pages = Vec::with_capacity(nranges.truncate());
     let mut range: u64 = 0;
@@ -1305,7 +1305,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
 /// `phys_frame_range` specifies the physical frame range to protect
 /// `mem_attr` specifies the memory attributes to be applied to the range
 #[inline]
-pub(crate) fn protect_physical_memory_range(
+pub fn protect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
     mem_attr: MemAttr,
 ) -> Result<(), VsmError> {
@@ -1354,14 +1354,14 @@ impl ModuleMemory {
     /// Write physical memory bytes from VTL0 specified in `HekiRange` at the specified virtual address of
     /// a certain memory container based on the memory/section type.
     #[inline]
-    pub(crate) fn write_bytes_from_heki_range(&mut self) -> Result<(), MemoryContainerError> {
+    pub fn write_bytes_from_heki_range(&mut self) -> Result<(), MemoryContainerError> {
         self.text.write_bytes_from_heki_range()?;
         self.init_text.write_bytes_from_heki_range()?;
         self.init_rodata.write_bytes_from_heki_range()?;
         Ok(())
     }
 
-    pub(crate) fn extend_range(
+    pub fn extend_range(
         &mut self,
         mod_mem_type: ModMemType,
         heki_range: &HekiRange,
@@ -1426,7 +1426,7 @@ impl MemoryContainer {
         })
     }
 
-    pub(crate) fn extend_range(&mut self, heki_range: &HekiRange) -> Result<(), VsmError> {
+    pub fn extend_range(&mut self, heki_range: &HekiRange) -> Result<(), VsmError> {
         let addr = VirtAddr::try_new(heki_range.va).map_err(|_| VsmError::InvalidVirtualAddress)?;
         let phys_addr =
             PhysAddr::try_new(heki_range.pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
@@ -1448,7 +1448,7 @@ impl MemoryContainer {
 
     /// Write physical memory bytes from VTL0 specified in `HekiRange` at the specified virtual address
     #[inline]
-    pub(crate) fn write_bytes_from_heki_range(&mut self) -> Result<(), MemoryContainerError> {
+    pub fn write_bytes_from_heki_range(&mut self) -> Result<(), MemoryContainerError> {
         let mut len: usize = 0;
         if self.buf.is_empty() {
             for range in &self.range {
@@ -1466,7 +1466,7 @@ impl MemoryContainer {
     }
 
     /// Write physical memory bytes from VTL0 at the specified physical address
-    pub(crate) fn write_vtl0_phys_bytes(
+    pub fn write_vtl0_phys_bytes(
         &mut self,
         phys_start: PhysAddr,
         phys_end: PhysAddr,
@@ -1527,12 +1527,12 @@ impl KexecMemoryMetadataWrapper {
         }
     }
 
-    pub(crate) fn clear_memory(&self) {
+    pub fn clear_memory(&self) {
         let mut inner = self.inner.lock();
         inner.clear();
     }
 
-    pub(crate) fn register_memory(&self, kexec_memory: KexecMemoryMetadata) {
+    pub fn register_memory(&self, kexec_memory: KexecMemoryMetadata) {
         let mut inner = self.inner.lock();
         inner.ranges = kexec_memory.ranges;
     }
@@ -1556,7 +1556,7 @@ impl KexecMemoryMetadata {
     }
 
     #[inline]
-    pub(crate) fn insert_heki_range(&mut self, heki_range: &HekiRange) {
+    pub fn insert_heki_range(&mut self, heki_range: &HekiRange) {
         let va = heki_range.va;
         let pa = heki_range.pa;
         let epa = heki_range.epa;
@@ -1564,12 +1564,12 @@ impl KexecMemoryMetadata {
     }
 
     #[inline]
-    pub(crate) fn insert_memory_range(&mut self, mem_range: KexecMemoryRange) {
+    pub fn insert_memory_range(&mut self, mem_range: KexecMemoryRange) {
         self.ranges.push(mem_range);
     }
 
     #[inline]
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.ranges.clear();
     }
 }

@@ -342,7 +342,7 @@ pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    vtl0_kernel_info: Vtl0KernelInfo,
+    pub vtl0_kernel_info: Vtl0KernelInfo,
 }
 
 pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
