@@ -6,14 +6,21 @@
 //! These functions were migrated from `litebox_platform_lvbs::mshv::vsm`
 //! to the runner crate where dispatch logic belongs.
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::{
+    marker::PhantomData,
+    ops::Range,
+    sync::atomic::{AtomicBool, AtomicI64, Ordering},
+};
+use hashbrown::HashMap;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{
-    error::VsmError,
+    error::{MemoryContainerError, PatchDataMapError, VsmError},
     heki::{
         mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr, HekiKdataType, HekiKernelInfo,
-        HekiKexecType, HekiPage, HekiPatch, MemAttr, ModMemType,
+        HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch, HekiPatchInfo, HekiRange, MemAttr,
+        ModMemType,
     },
     hvcall::HypervCallError,
     mem_layout::{PAGE_SHIFT, PAGE_SIZE},
@@ -25,8 +32,8 @@ use litebox_common_lvbs::{
         HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN,
     },
     vsm::{
-        AlignedPage, KexecMemoryMetadata, KexecMemoryRange, ModuleMemoryMetadata,
-        MODULE_VALIDATION_MAX_SIZE,
+        AlignedPage, KexecMemoryMetadata, KexecMemoryRange, MemoryRange, ModuleMemoryMetadata,
+        ModuleMemoryRange, Symbol, MODULE_VALIDATION_MAX_SIZE,
     },
 };
 #[cfg(debug_assertions)]
@@ -47,12 +54,12 @@ use litebox_platform_lvbs::{
             validate_kernel_module_against_elf, validate_text_patch,
             verify_kernel_module_signature, verify_kernel_pe_signature,
         },
-        vsm::{MemoryContainer, ModuleMemory, CPU_ONLINE_MASK},
+        vsm::CPU_ONLINE_MASK,
         vtl_switch::mshv_vsm_get_code_page_offsets,
     },
 };
-use litebox_platform_multiplex::platform;
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
+use spin::rwlock::RwLock;
 use x509_cert::{der::Decode, Certificate};
 use x86_64::{
     structures::paging::{frame::PhysFrameRange, PageSize, PhysFrame, Size4KiB},
@@ -60,7 +67,580 @@ use x86_64::{
 };
 use zerocopy::{FromBytes, FromZeros, IntoBytes};
 
+// ---------------------------------------------------------------------------
+// Logic types moved from litebox_platform_lvbs::mshv::vsm
+// ---------------------------------------------------------------------------
+
+/// Data structure for maintaining the kernel information in VTL0.
+/// It should be prepared by copying kernel data from VTL0 to VTL1 instead of
+/// relying on shared memory access to VTL0 which suffers from security issues.
+pub(crate) struct Vtl0KernelInfo {
+    pub module_memory_metadata: ModuleMemoryMetadataMap,
+    boot_done: AtomicBool,
+    system_certs: once_cell::race::OnceBox<Box<[Certificate]>>,
+    pub kexec_metadata: KexecMemoryMetadataWrapper,
+    pub crash_kexec_metadata: KexecMemoryMetadataWrapper,
+    pub precomputed_patches: PatchDataMap,
+    pub symbols: SymbolTable,
+    pub gpl_symbols: SymbolTable,
+    // TODO: revocation cert, blocklist, etc.
+}
+
+impl Default for Vtl0KernelInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vtl0KernelInfo {
+    pub fn new() -> Self {
+        Self {
+            module_memory_metadata: ModuleMemoryMetadataMap::new(),
+            boot_done: AtomicBool::new(false),
+            system_certs: once_cell::race::OnceBox::new(),
+            kexec_metadata: KexecMemoryMetadataWrapper::new(),
+            crash_kexec_metadata: KexecMemoryMetadataWrapper::new(),
+            precomputed_patches: PatchDataMap::new(),
+            symbols: SymbolTable::new(),
+            gpl_symbols: SymbolTable::new(),
+        }
+    }
+
+    /// This function records the end of the VTL0 boot process.
+    pub fn set_end_of_boot(&self) {
+        self.boot_done
+            .store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// This function checks whether the VTL0 boot process is done. VTL1 kernel relies on this function
+    /// to lock down certain security-critical VSM functions.
+    pub fn check_end_of_boot(&self) -> bool {
+        self.boot_done.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_system_certificates(&self, certs: Vec<Certificate>) {
+        let boxed_slice = certs.into_boxed_slice();
+        let _ = self.system_certs.set(boxed_slice.into());
+    }
+
+    pub fn get_system_certificates(&self) -> Option<&[Certificate]> {
+        self.system_certs.get().map(|b| &**b)
+    }
+
+    // This function finds the precomputed patch data corresponding to the input patch data.
+    // We need this because each step of `mshv_vsm_patch_data`/`text_poke_bp_batch` only
+    // provides a part of the patch data and addresses (`patch[0]` or `patch[1..patch_size-1]`).
+    pub fn find_precomputed_patch(&self, patch_data: &HekiPatch) -> Option<HekiPatch> {
+        self.precomputed_patches
+            .get(PhysAddr::new(patch_data.pa[0]))
+            .or_else(|| {
+                self.precomputed_patches
+                    .get(PhysAddr::new(patch_data.pa[0].saturating_sub(1)))
+            })
+            .or_else(|| {
+                self.precomputed_patches
+                    .get(PhysAddr::new(patch_data.pa[1]))
+            })
+            .or(None)
+    }
+}
+
+/// Data structure for maintaining the memory ranges of each VTL0 kernel module and their types
+pub(crate) struct ModuleMemoryMetadataMap {
+    inner: spin::mutex::SpinMutex<HashMap<i64, ModuleMemoryMetadata>>,
+    key_gen: AtomicI64,
+}
+
+impl ModuleMemoryMetadataMap {
+    pub fn new() -> Self {
+        Self {
+            inner: spin::mutex::SpinMutex::new(HashMap::new()),
+            key_gen: AtomicI64::new(0),
+        }
+    }
+
+    /// Generate a unique key for representing each loaded kernel module.
+    /// It assumes a 64-bit atomic counter is sufficient and there is no run out of keys.
+    fn gen_unique_key(&self) -> i64 {
+        self.key_gen.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn contains_key(&self, key: i64) -> bool {
+        self.inner.lock().contains_key(&key)
+    }
+
+    /// Register a new module memory metadata structure in the map and return a unique key/token for it.
+    pub fn register_module_memory_metadata(
+        &self,
+        module_memory: ModuleMemoryMetadata,
+    ) -> i64 {
+        let key = self.gen_unique_key();
+
+        let mut map = self.inner.lock();
+        assert!(
+            !map.contains_key(&key),
+            "VSM: Key {key} already exists in the module memory map",
+        );
+        let _ = map.insert(key, module_memory);
+
+        key
+    }
+
+    pub fn remove(&self, key: i64) -> bool {
+        let mut map = self.inner.lock();
+        map.remove(&key).is_some()
+    }
+
+    /// Return the addresses of patch targets belonging to a module identified by `key`
+    pub fn get_patch_targets(&self, key: i64) -> Option<Vec<PhysAddr>> {
+        let guard = self.inner.lock();
+        guard
+            .get(&key)
+            .map(|metadata| metadata.get_patch_targets().clone())
+    }
+
+    pub fn iter_entry(&self, key: i64) -> Option<ModuleMemoryMetadataIters<'_>> {
+        let guard = self.inner.lock();
+        if guard.contains_key(&key) {
+            Some(ModuleMemoryMetadataIters {
+                guard,
+                key,
+                phantom: PhantomData,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for ModuleMemoryMetadataMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub(crate) struct ModuleMemoryMetadataIters<'a> {
+    guard: spin::mutex::SpinMutexGuard<'a, HashMap<i64, ModuleMemoryMetadata>>,
+    key: i64,
+    phantom: PhantomData<&'a PhysFrameRange<Size4KiB>>,
+}
+
+impl<'a> ModuleMemoryMetadataIters<'a> {
+    /// Returns an iterator over the memory ranges.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the key is not found in the guard.
+    pub fn iter_mem_ranges(&'a self) -> impl Iterator<Item = &'a ModuleMemoryRange> {
+        self.guard.get(&self.key).unwrap().ranges.iter()
+    }
+}
+
+/// Data structure for maintaining the memory content of a kernel module by its sections. Currently, it only maintains
+/// certain sections like `.text` and `.init.text` which are needed for module validation.
+pub(crate) struct ModuleMemory {
+    text: MemoryContainer,
+    init_text: MemoryContainer,
+    init_rodata: MemoryContainer,
+}
+
+impl Default for ModuleMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ModuleMemory {
+    pub fn new() -> Self {
+        Self {
+            text: MemoryContainer::new(),
+            init_text: MemoryContainer::new(),
+            init_rodata: MemoryContainer::new(),
+        }
+    }
+
+    /// Return a memory container for a section of the module memory by its name
+    pub fn find_section_by_name(&self, name: &str) -> Option<&MemoryContainer> {
+        match name {
+            ".text" => Some(&self.text),
+            ".init.text" => Some(&self.init_text),
+            ".init.rodata" => Some(&self.init_rodata),
+            _ => None,
+        }
+    }
+
+    /// Write physical memory bytes from VTL0 specified in `HekiRange` at the specified virtual address of
+    /// a certain memory container based on the memory/section type.
+    #[inline]
+    pub fn write_bytes_from_heki_range(&mut self) -> Result<(), MemoryContainerError> {
+        self.text.write_bytes_from_heki_range()?;
+        self.init_text.write_bytes_from_heki_range()?;
+        self.init_rodata.write_bytes_from_heki_range()?;
+        Ok(())
+    }
+
+    pub fn extend_range(
+        &mut self,
+        mod_mem_type: ModMemType,
+        heki_range: &HekiRange,
+    ) -> Result<(), VsmError> {
+        match mod_mem_type {
+            ModMemType::Text => self.text.extend_range(heki_range)?,
+            ModMemType::InitText => self.init_text.extend_range(heki_range)?,
+            ModMemType::InitRoData => self.init_rodata.extend_range(heki_range)?,
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct MemoryContainer {
+    range: Vec<MemoryRange>,
+    buf: Vec<u8>,
+}
+
+impl Default for MemoryContainer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemoryContainer {
+    pub fn new() -> Self {
+        Self {
+            range: Vec::new(),
+            buf: Vec::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get_range(&self) -> Option<Range<VirtAddr>> {
+        let start_range = self.range.first()?;
+        let end_range = self.range.last()?;
+        Some(Range {
+            start: start_range.addr,
+            end: end_range.addr + end_range.len,
+        })
+    }
+
+    pub fn extend_range(&mut self, heki_range: &HekiRange) -> Result<(), VsmError> {
+        let addr = VirtAddr::try_new(heki_range.va).map_err(|_| VsmError::InvalidVirtualAddress)?;
+        let phys_addr =
+            PhysAddr::try_new(heki_range.pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
+        if let Some(last_range) = self.range.last()
+            && last_range.addr + last_range.len != addr
+        {
+            debug_serial_println!("Discontiguous address found {heki_range:?}");
+        }
+        self.range.push(MemoryRange {
+            addr,
+            phys_addr,
+            len: heki_range.epa - heki_range.pa,
+        });
+        Ok(())
+    }
+
+    #[inline]
+    pub fn write_bytes_from_heki_range(&mut self) -> Result<(), MemoryContainerError> {
+        let mut len: usize = 0;
+        if self.buf.is_empty() {
+            for range in &self.range {
+                let range_len: usize = range.len.truncate();
+                len += range_len;
+            }
+            self.buf.reserve_exact(len);
+        }
+
+        let range = self.range.clone();
+        for range in range {
+            self.write_vtl0_phys_bytes(range.phys_addr, range.phys_addr + range.len)?;
+        }
+        Ok(())
+    }
+
+    pub fn write_vtl0_phys_bytes(
+        &mut self,
+        phys_start: PhysAddr,
+        phys_end: PhysAddr,
+    ) -> Result<(), MemoryContainerError> {
+        let mut bytes_to_copy: usize = (phys_end - phys_start).truncate();
+        let mut phys_cur = phys_start;
+
+        while phys_cur < phys_end {
+            let phys_aligned = phys_cur.align_down(Size4KiB::SIZE);
+            let page = unsafe {
+                NormalWorldConstPtr::<AlignedPage, PAGE_SIZE>::with_usize(
+                    phys_aligned.as_u64() as usize,
+                )
+                .and_then(|mut ptr| ptr.read_at_offset(0))
+                .map_err(|_| MemoryContainerError::CopyFromVtl0Failed)?
+            };
+
+            let src_offset: usize = (phys_cur - phys_aligned).truncate();
+            let src_len = core::cmp::min(bytes_to_copy, PAGE_SIZE - src_offset);
+            let src = &page.0[src_offset..src_offset + src_len];
+
+            self.buf.extend_from_slice(src);
+            phys_cur += src_len as u64;
+            bytes_to_copy -= src_len;
+        }
+        Ok(())
+    }
+}
+
+impl core::ops::Deref for MemoryContainer {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buf
+    }
+}
+
+pub(crate) struct KexecMemoryMetadataWrapper {
+    inner: spin::mutex::SpinMutex<KexecMemoryMetadata>,
+}
+
+impl Default for KexecMemoryMetadataWrapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KexecMemoryMetadataWrapper {
+    pub fn new() -> Self {
+        Self {
+            inner: spin::mutex::SpinMutex::new(KexecMemoryMetadata::new()),
+        }
+    }
+
+    pub fn clear_memory(&self) {
+        let mut inner = self.inner.lock();
+        inner.clear();
+    }
+
+    pub fn register_memory(&self, kexec_memory: KexecMemoryMetadata) {
+        let mut inner = self.inner.lock();
+        inner.ranges = kexec_memory.ranges;
+    }
+
+    pub fn iter_guarded(&self) -> KexecMemoryMetadataIters<'_> {
+        KexecMemoryMetadataIters {
+            guard: self.inner.lock(),
+            phantom: PhantomData,
+        }
+    }
+}
+
+pub(crate) struct KexecMemoryMetadataIters<'a> {
+    guard: spin::mutex::SpinMutexGuard<'a, KexecMemoryMetadata>,
+    phantom: PhantomData<&'a PhysFrameRange<Size4KiB>>,
+}
+
+impl<'a> KexecMemoryMetadataIters<'a> {
+    pub fn iter_mem_ranges(&'a self) -> impl Iterator<Item = &'a KexecMemoryRange> {
+        self.guard.ranges.iter()
+    }
+}
+
+pub(crate) struct PatchDataMap {
+    inner: RwLock<HashMap<PhysAddr, HekiPatch>>,
+}
+
+impl Default for PatchDataMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PatchDataMap {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+
+    #[inline]
+    pub fn remove_patch_data(&self, patch_targets: &Vec<PhysAddr>) {
+        let mut inner = self.inner.write();
+        for key in patch_targets {
+            inner.remove(key);
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, addr: PhysAddr) -> Option<HekiPatch> {
+        let inner = self.inner.read();
+        inner.get(&addr).copied()
+    }
+
+    /// Add patch data from a buffer containing `HekiPatchInfo` and `HekiPatch` structures.
+    /// If this patch data is from a module (`module_memory_metadata` is `Some`), this function
+    /// denies any patch target addresses not within the module's executable memory ranges.
+    pub fn insert_patch_data_from_bytes(
+        &self,
+        patch_info_buf: &[u8],
+        mut module_memory_metadata: Option<&mut ModuleMemoryMetadata>,
+    ) -> Result<(), PatchDataMapError> {
+        if patch_info_buf.len() < core::mem::size_of::<HekiPatchInfo>() {
+            return Err(PatchDataMapError::InvalidHekiPatchInfo);
+        }
+        let mut inner = self.inner.write();
+
+        // the buffer looks like below:
+        // [`HekiPatchInfo`, [`HekiPatch`, ...], `HekiPatchInfo`, [`HekiPatch`, ...], ...]
+        // each `HekiPatchInfo` contains the number of `HekiPatch` structures (`patch_index`) that follow it.
+        let mut index: usize = 0;
+        while index <= patch_info_buf.len() - core::mem::size_of::<HekiPatchInfo>() {
+            let patch_info = HekiPatchInfo::try_from_bytes(
+                &patch_info_buf[index..index + core::mem::size_of::<HekiPatchInfo>()],
+            )
+            .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
+
+            let patch_index: usize = patch_info.patch_index.truncate();
+            let total_patch_size = core::mem::size_of::<HekiPatch>()
+                .checked_mul(patch_index)
+                .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
+            index = index
+                .checked_add(core::mem::size_of::<HekiPatchInfo>() + total_patch_size)
+                .filter(|&x| x <= patch_info_buf.len())
+                .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
+
+            for patch in patch_info_buf[index - total_patch_size..index]
+                .chunks(core::mem::size_of::<HekiPatch>())
+                .map(HekiPatch::try_from_bytes)
+            {
+                let patch = patch.ok_or(PatchDataMapError::InvalidHekiPatch)?;
+                let patch_target_pa_0 = PhysAddr::new(patch.pa[0]);
+                let patch_target_pa_1 = PhysAddr::new(patch.pa[1]);
+
+                if let Some(ref mut mod_mem_meta) = module_memory_metadata {
+                    for mod_mem_range in &**mod_mem_meta {
+                        let in_range = |pa: PhysAddr| {
+                            mod_mem_range.phys_frame_range.start.start_address() <= pa
+                                && mod_mem_range.phys_frame_range.end.start_address() > pa
+                        };
+                        if matches!(
+                            mod_mem_range.mod_mem_type,
+                            ModMemType::Text | ModMemType::InitText
+                        ) && in_range(patch_target_pa_0)
+                            && (patch_target_pa_1.is_null() || in_range(patch_target_pa_1))
+                        {
+                            mod_mem_meta.insert_patch_target(patch_target_pa_0);
+                            inner.insert(patch_target_pa_0, patch);
+
+                            // If the first byte of a patch target is in the first (physical) page while the remaining bytes
+                            // are in the second page, we use the second page as an additional key for the patch to deal with
+                            // Step 2 of `text_poke_bp_batch` where we only know the second to last bytes of the patch such
+                            // that cannot know the address of the first page. Details are in `validate_text_poke_bp_batch`.
+                            if !patch_target_pa_1.is_null()
+                                && (patch_target_pa_0 + 1).is_aligned(Size4KiB::SIZE)
+                            {
+                                mod_mem_meta.insert_patch_target(patch_target_pa_1);
+                                inner.insert(patch_target_pa_1, patch);
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    inner.insert(patch_target_pa_0, patch);
+                    if !patch_target_pa_1.is_null()
+                        && (patch_target_pa_0 + 1).is_aligned(Size4KiB::SIZE)
+                    {
+                        inner.insert(patch_target_pa_1, patch);
+                    }
+                }
+            }
+            index += total_patch_size;
+        }
+
+        Ok(())
+    }
+}
+
+pub(crate) struct SymbolTable {
+    inner: RwLock<HashMap<String, Symbol>>,
+}
+
+impl Default for SymbolTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Build a symbol table from a memory container.
+    pub fn build_from_container(
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+        mem: &MemoryContainer,
+        buf: &[u8],
+    ) -> Result<u64, VsmError> {
+        if mem.is_empty() {
+            return Err(VsmError::SymbolTableEmpty);
+        }
+        let Some(range) = mem.get_range() else {
+            return Err(VsmError::SymbolTableEmpty);
+        };
+        if start < range.start || end > range.end {
+            return Err(VsmError::SymbolTableOutOfRange);
+        }
+
+        let kinfo_len: usize = (end - start).truncate();
+        if !kinfo_len.is_multiple_of(HekiKernelSymbol::KSYM_LEN) {
+            return Err(VsmError::SymbolTableLengthInvalid);
+        }
+
+        let mut kinfo_offset: usize = (start - range.start).truncate();
+        let mut kinfo_addr = start;
+        let ksym_count = kinfo_len / HekiKernelSymbol::KSYM_LEN;
+        let mut inner = self.inner.write();
+        inner.reserve(ksym_count);
+
+        for _ in 0..ksym_count {
+            let (name, sym) = Symbol::from_bytes(kinfo_offset, kinfo_addr, buf)?;
+            inner.insert(name, sym);
+            kinfo_offset += HekiKernelSymbol::KSYM_LEN;
+            kinfo_addr += HekiKernelSymbol::KSYM_LEN as u64;
+        }
+        Ok(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VTL0_KERNEL_INFO global
+// ---------------------------------------------------------------------------
+
+static VTL0_KERNEL_INFO: spin::Once<Vtl0KernelInfo> = spin::Once::new();
+
+fn init_vtl0_kernel_info() {
+    VTL0_KERNEL_INFO.call_once(|| Vtl0KernelInfo::new());
+}
+
+fn vtl0_kernel_info() -> &'static Vtl0KernelInfo {
+    VTL0_KERNEL_INFO
+        .get()
+        .expect("vtl0_kernel_info not initialized")
+}
+
 pub(crate) fn init() {
+    if get_core_id() == 0 {
+        init_vtl0_kernel_info();
+    }
+
     assert!(
         !(get_core_id() == 0 && mshv_vsm_configure_partition().is_err()),
         "Failed to configure VSM partition"
@@ -201,7 +781,7 @@ fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
 fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Lock control registers");
 
-    if platform().vtl0_kernel_info.check_end_of_boot() {
+    if vtl0_kernel_info().check_end_of_boot() {
         return Err(VsmError::OperationAfterEndOfBoot(
             "control register locking",
         ));
@@ -246,7 +826,7 @@ fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
 /// VSM function for signaling the end of VTL0 boot process
 fn mshv_vsm_end_of_boot() -> i64 {
     debug_serial_println!("VSM: End of boot");
-    platform().vtl0_kernel_info.set_end_of_boot();
+    vtl0_kernel_info().set_end_of_boot();
     0
 }
 
@@ -262,7 +842,7 @@ fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, VsmError> {
         return Err(VsmError::InvalidInputAddress);
     }
 
-    if platform().vtl0_kernel_info.check_end_of_boot() {
+    if vtl0_kernel_info().check_end_of_boot() {
         return Err(VsmError::OperationAfterEndOfBoot(
             "kernel memory protection",
         ));
@@ -340,11 +920,11 @@ fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
         return Err(VsmError::InvalidInputAddress);
     }
 
-    if platform().vtl0_kernel_info.check_end_of_boot() {
+    if vtl0_kernel_info().check_end_of_boot() {
         return Err(VsmError::OperationAfterEndOfBoot("loading kernel data"));
     }
 
-    let vtl0_info = &platform().vtl0_kernel_info;
+    let vtl0_info = vtl0_kernel_info();
 
     let mut system_certs_mem = MemoryContainer::new();
     let mut kexec_trampoline_metadata = KexecMemoryMetadata::new();
@@ -476,8 +1056,7 @@ fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<
         nranges,
     );
 
-    let certs = platform()
-        .vtl0_kernel_info
+    let certs = vtl0_kernel_info()
         .get_system_certificates()
         .ok_or(VsmError::SystemCertificatesNotLoaded)?;
 
@@ -553,8 +1132,7 @@ fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<
     // pre-computed patch data for a module
     if !patch_info_for_module.is_empty() {
         let patch_info_buf = &patch_info_for_module[..];
-        platform()
-            .vtl0_kernel_info
+        vtl0_kernel_info()
             .precomputed_patches
             .insert_patch_data_from_bytes(patch_info_buf, Some(&mut module_memory_metadata))
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
@@ -569,8 +1147,7 @@ fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<
     }
 
     // register the module memory in the global map and obtain a unique token for it
-    let token = platform()
-        .vtl0_kernel_info
+    let token = vtl0_kernel_info()
         .module_memory_metadata
         .register_module_memory_metadata(module_memory_metadata);
     Ok(token)
@@ -583,16 +1160,14 @@ fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<
 fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Free kernel module's init (token: {})", token);
 
-    if !platform()
-        .vtl0_kernel_info
+    if !vtl0_kernel_info()
         .module_memory_metadata
         .contains_key(token)
     {
         return Err(VsmError::ModuleTokenInvalid);
     }
 
-    if let Some(entry) = platform()
-        .vtl0_kernel_info
+    if let Some(entry) = vtl0_kernel_info()
         .module_memory_metadata
         .iter_entry(token)
     {
@@ -625,16 +1200,14 @@ fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, VsmError> {
 fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Unload kernel module (token: {})", token);
 
-    if !platform()
-        .vtl0_kernel_info
+    if !vtl0_kernel_info()
         .module_memory_metadata
         .contains_key(token)
     {
         return Err(VsmError::ModuleTokenInvalid);
     }
 
-    if let Some(entry) = platform()
-        .vtl0_kernel_info
+    if let Some(entry) = vtl0_kernel_info()
         .module_memory_metadata
         .iter_entry(token)
     {
@@ -647,19 +1220,16 @@ fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, VsmError> {
         }
     }
 
-    if let Some(patch_targets) = platform()
-        .vtl0_kernel_info
+    if let Some(patch_targets) = vtl0_kernel_info()
         .module_memory_metadata
         .get_patch_targets(token)
     {
-        platform()
-            .vtl0_kernel_info
+        vtl0_kernel_info()
             .precomputed_patches
             .remove_patch_data(&patch_targets);
     }
 
-    platform()
-        .vtl0_kernel_info
+    vtl0_kernel_info()
         .module_memory_metadata
         .remove(token);
     Ok(0)
@@ -685,16 +1255,15 @@ fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64, Vsm
         crash
     );
 
-    let certs = platform()
-        .vtl0_kernel_info
+    let certs = vtl0_kernel_info()
         .get_system_certificates()
         .ok_or(VsmError::SystemCertificatesNotLoaded)?;
 
     let is_crash = crash != 0;
     let kexec_metadata_ref = if is_crash {
-        &platform().vtl0_kernel_info.crash_kexec_metadata
+        &vtl0_kernel_info().crash_kexec_metadata
     } else {
-        &platform().vtl0_kernel_info.kexec_metadata
+        &vtl0_kernel_info().kexec_metadata
     };
 
     // invalidate (i.e., remove protection and clear) the kexec memory ranges which were loaded in the past
@@ -798,8 +1367,7 @@ fn mshv_vsm_patch_text(patch_pa_0: u64, patch_pa_1: u64) -> Result<i64, VsmError
     let heki_patch = copy_heki_patch_from_vtl0(patch_pa_0, patch_pa_1)?;
     debug_serial_println!("VSM: {:?}", heki_patch);
 
-    let precomputed_patch = platform()
-        .vtl0_kernel_info
+    let precomputed_patch = vtl0_kernel_info()
         .find_precomputed_patch(&heki_patch)
         .ok_or(VsmError::PrecomputedPatchNotFound)?;
 

@@ -11,7 +11,7 @@ litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 litebox_common_lvbs = { path = "../litebox_common_lvbs/", version = "0.1.0" }
 litebox_shim_optee = { path = "../litebox_shim_optee/", version = "0.1.0" }
-spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
+spin = { version = "0.10.0", default-features = false, features = ["spin_mutex", "rwlock", "once"] }
 hashbrown = "0.15.2"
 once_cell = { version = "1.21.3", default-features = false, features = ["race", "alloc"] }
 num_enum = { version = "0.7.4", default-features = false }
