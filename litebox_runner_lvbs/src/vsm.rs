@@ -9,6 +9,26 @@
 use alloc::vec::Vec;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
+use litebox_common_lvbs::{
+    error::VsmError,
+    heki::{
+        mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr, HekiKdataType, HekiKernelInfo,
+        HekiKexecType, HekiPage, HekiPatch, MemAttr, ModMemType,
+    },
+    hvcall::HypervCallError,
+    mem_layout::{PAGE_SHIFT, PAGE_SIZE},
+    mshv::{
+        HvCrInterceptControlFlags, HvPageProtFlags, HvRegisterVsmPartitionConfig,
+        HvRegisterVsmVpSecureVtlConfig, VsmFunction, X86Cr0Flags, X86Cr4Flags,
+        HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
+        HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
+        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN,
+    },
+    vsm::{
+        AlignedPage, KexecMemoryMetadata, KexecMemoryRange, ModuleMemoryMetadata,
+        MODULE_VALIDATION_MAX_SIZE,
+    },
+};
 #[cfg(debug_assertions)]
 use litebox_platform_lvbs::mshv::mem_integrity::parse_modinfo;
 use litebox_platform_lvbs::mshv::ringbuffer::set_ringbuffer;
@@ -21,29 +41,14 @@ use litebox_platform_lvbs::{
         per_cpu_variables::with_per_cpu_variables_mut,
     },
     mshv::{
-        error::VsmError,
-        heki::{
-            mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr, HekiKdataType,
-            HekiKernelInfo, HekiKexecType, HekiPage, HekiPatch, MemAttr, ModMemType,
-        },
-        hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_ap},
         mem_integrity::{
             validate_kernel_module_against_elf, validate_text_patch,
             verify_kernel_module_signature, verify_kernel_pe_signature,
         },
-        vsm::{
-            AlignedPage, KexecMemoryMetadata, KexecMemoryRange, MemoryContainer, ModuleMemory,
-            ModuleMemoryMetadata, CPU_ONLINE_MASK, MODULE_VALIDATION_MAX_SIZE,
-        },
-        vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
+        vsm::{MemoryContainer, ModuleMemory, CPU_ONLINE_MASK},
         vtl_switch::mshv_vsm_get_code_page_offsets,
-        HvCrInterceptControlFlags, HvPageProtFlags, HvRegisterVsmPartitionConfig,
-        HvRegisterVsmVpSecureVtlConfig, VsmFunction, X86Cr0Flags, X86Cr4Flags,
-        HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
-        HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
-        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN,
     },
 };
 use litebox_platform_multiplex::platform;

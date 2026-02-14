@@ -9,6 +9,7 @@ litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", 
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_lvbs"] }
 litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
+litebox_common_lvbs = { path = "../litebox_common_lvbs/", version = "0.1.0" }
 litebox_shim_optee = { path = "../litebox_shim_optee/", version = "0.1.0" }
 spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
 hashbrown = "0.15.2"
