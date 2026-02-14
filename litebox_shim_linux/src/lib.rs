@@ -172,9 +172,7 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
     ) -> DefaultFS {
         default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
     }
-}
 
-impl<FS: ShimFS> LinuxShimBuilder<FS> {
     /// Set the load filter, which can augment envp or auxv when starting a new program.
     pub fn set_load_filter(&mut self, callback: LoadFilter) {
         self.load_filter = Some(callback);
