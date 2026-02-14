@@ -240,6 +240,13 @@ impl Default for HekiPage {
     }
 }
 
+impl HekiPage {
+    /// Returns an iterator over the valid ranges in this page.
+    pub fn iter(&self) -> core::slice::Iter<'_, HekiRange> {
+        self.into_iter()
+    }
+}
+
 impl<'a> IntoIterator for &'a HekiPage {
     type Item = &'a HekiRange;
     type IntoIter = core::slice::Iter<'a, HekiRange>;
@@ -313,6 +320,10 @@ impl HekiKernelSymbol {
     pub const KSYM_LEN: usize = mem::size_of::<HekiKernelSymbol>();
     pub const KSY_NAME_LEN: usize = 512;
 
+    /// Constructs a `HekiKernelSymbol` from a byte slice.
+    ///
+    /// # Panics
+    /// Panics if the byte slice pointer is not properly aligned for `HekiKernelSymbol`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, VsmError> {
         if bytes.len() < Self::KSYM_LEN {
             return Err(VsmError::BufferTooSmall("HekiKernelSymbol"));
@@ -346,6 +357,10 @@ pub struct HekiKernelInfo {
 impl HekiKernelInfo {
     const KINFO_LEN: usize = mem::size_of::<HekiKernelInfo>();
 
+    /// Constructs a `HekiKernelInfo` from a byte slice.
+    ///
+    /// # Panics
+    /// Panics if the byte slice pointer is not properly aligned for `HekiKernelInfo`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, VsmError> {
         if bytes.len() < Self::KINFO_LEN {
             return Err(VsmError::BufferTooSmall("HekiKernelInfo"));

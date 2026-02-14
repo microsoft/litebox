@@ -377,7 +377,7 @@ impl MemoryContainer {
             let phys_aligned = phys_cur.align_down(Size4KiB::SIZE);
             let page = unsafe {
                 NormalWorldConstPtr::<AlignedPage, PAGE_SIZE>::with_usize(
-                    phys_aligned.as_u64() as usize,
+                    phys_aligned.as_u64().truncate(),
                 )
                 .and_then(|mut ptr| ptr.read_at_offset(0))
                 .map_err(|_| MemoryContainerError::CopyFromVtl0Failed)?
@@ -627,7 +627,7 @@ impl SymbolTable {
 static VTL0_KERNEL_INFO: spin::Once<Vtl0KernelInfo> = spin::Once::new();
 
 fn init_vtl0_kernel_info() {
-    VTL0_KERNEL_INFO.call_once(|| Vtl0KernelInfo::new());
+    VTL0_KERNEL_INFO.call_once(Vtl0KernelInfo::new);
 }
 
 fn vtl0_kernel_info() -> &'static Vtl0KernelInfo {
@@ -696,7 +696,7 @@ fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i
 
     let cpu_mask = unsafe {
         NormalWorldConstPtr::<CpuMask, PAGE_SIZE>::with_usize(
-            cpu_online_mask_page_addr.as_u64() as usize
+            cpu_online_mask_page_addr.as_u64().truncate()
         )
         .and_then(|mut ptr| ptr.read_at_offset(0))
         .map_err(|_| VsmError::CpuOnlineMaskCopyFailed)?
@@ -711,7 +711,7 @@ fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i
     // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
     let mut boot_signal_page_buf = unsafe {
         NormalWorldConstPtr::<AlignedPage, PAGE_SIZE>::with_usize(
-            boot_signal_page_addr.as_u64() as usize
+            boot_signal_page_addr.as_u64().truncate()
         )
         .and_then(|mut ptr| ptr.read_at_offset(0))
         .map_err(|_| VsmError::BootSignalPageCopyFailed)?
@@ -741,7 +741,7 @@ fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i
 
     unsafe {
         NormalWorldMutPtr::<AlignedPage, PAGE_SIZE>::with_usize(
-            boot_signal_page_addr.as_u64() as usize
+            boot_signal_page_addr.as_u64().truncate()
         )
         .and_then(|mut ptr| ptr.write_at_offset(0, *boot_signal_page_buf))
         .map_err(|_| VsmError::BootSignalWriteFailed)?;
@@ -1406,7 +1406,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
         || (patch_pa_0.align_up(Size4KiB::SIZE) == patch_pa_1.align_down(Size4KiB::SIZE))
     {
         unsafe {
-            NormalWorldConstPtr::<HekiPatch, PAGE_SIZE>::with_usize(patch_pa_0.as_u64() as usize)
+            NormalWorldConstPtr::<HekiPatch, PAGE_SIZE>::with_usize(patch_pa_0.as_u64().truncate())
                 .and_then(|mut ptr| ptr.read_at_offset(0))
                 .map(|boxed| *boxed)
                 .map_err(|_| VsmError::Vtl0CopyFailed)
@@ -1417,7 +1417,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
         unsafe {
             let first_slice = heki_patch_bytes.get_unchecked_mut(..bytes_in_first_page);
             NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                patch_pa_0.as_u64() as usize,
+                patch_pa_0.as_u64().truncate(),
                 first_slice.len(),
             )
             .and_then(|mut ptr| ptr.read_slice_at_offset(0, first_slice))
@@ -1425,7 +1425,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
 
             let second_slice = heki_patch_bytes.get_unchecked_mut(bytes_in_first_page..);
             NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                patch_pa_1.as_u64() as usize,
+                patch_pa_1.as_u64().truncate(),
                 second_slice.len(),
             )
             .and_then(|mut ptr| ptr.read_slice_at_offset(0, second_slice))
@@ -1455,7 +1455,7 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
         let code_slice = &heki_patch.code[..usize::from(heki_patch.size)];
         unsafe {
             NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                heki_patch_pa_0.as_u64() as usize,
+                heki_patch_pa_0.as_u64().truncate(),
                 code_slice.len(),
             )
             .and_then(|mut ptr| ptr.write_slice_at_offset(0, code_slice))
@@ -1466,14 +1466,14 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
 
         unsafe {
             NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                (heki_patch_pa_0 + patch_target_page_offset as u64).as_u64() as usize,
+                (heki_patch_pa_0 + patch_target_page_offset as u64).as_u64().truncate(),
                 patch_first.len(),
             )
             .and_then(|mut ptr| ptr.write_slice_at_offset(0, patch_first))
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
 
             NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                heki_patch_pa_1.as_u64() as usize,
+                heki_patch_pa_1.as_u64().truncate(),
                 patch_second.len(),
             )
             .and_then(|mut ptr| ptr.write_slice_at_offset(0, patch_second))
@@ -1553,7 +1553,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
 
     while range < nranges {
         let heki_page = unsafe {
-            NormalWorldConstPtr::<HekiPage, PAGE_SIZE>::with_usize(next_pa.as_u64() as usize)
+            NormalWorldConstPtr::<HekiPage, PAGE_SIZE>::with_usize(next_pa.as_u64().truncate())
                 .and_then(|mut ptr| ptr.read_at_offset(0))
                 .ok()?
         };
