@@ -34,7 +34,7 @@ use litebox_common_linux::{
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{ConstPtr, Descriptor, MutPtr};
-use crate::{GlobalState, Task};
+use crate::{GlobalState, ShimFS, Task};
 use crate::{
     Platform,
     syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr},
@@ -56,7 +56,7 @@ macro_rules! convert_flags {
 
 pub(super) type SocketFd = litebox::net::SocketFd<Platform>;
 
-impl super::file::FilesState {
+impl<FS: ShimFS> super::file::FilesState<FS> {
     fn with_socket_fd<R>(
         &self,
         raw_fd: usize,
@@ -87,7 +87,7 @@ impl super::file::FilesState {
         &self,
         sockfd: u32,
         inet_op: impl FnOnce(&SocketFd) -> Result<R, Errno>,
-        unix_op: impl FnOnce(Arc<UnixSocket>) -> Result<R, Errno>,
+        unix_op: impl FnOnce(Arc<UnixSocket<FS>>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
         let file_table = self.file_descriptors.read();
         match file_table.get_fd(sockfd).ok_or(Errno::EBADF)? {
@@ -191,7 +191,7 @@ pub(super) enum SocketOptionValue {
 /// so that they can access `net` and the litebox descriptor table. This might
 /// change if the nature of the litebox descriptor table changes, or if network
 /// namespaces are implemented.
-impl GlobalState {
+impl<FS: ShimFS> GlobalState<FS> {
     fn initialize_socket(
         &self,
         fd: &SocketFd,
@@ -900,7 +900,7 @@ fn parse_type_and_flags(type_and_flags: u32) -> Result<(SockType, SockFlags), Er
     Ok((ty, flags))
 }
 
-impl Task {
+impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `socket`
     pub(crate) fn sys_socket(
         &self,
@@ -1167,7 +1167,7 @@ pub(crate) fn write_sockaddr_to_user(
     addrlen.write_at_offset(0, len).ok_or(Errno::EFAULT)
 }
 
-impl Task {
+impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `accept`
     pub(crate) fn sys_accept(
         &self,
@@ -1660,7 +1660,7 @@ impl Task {
 }
 
 #[cfg(target_arch = "x86")]
-impl Task {
+impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_socketcall(&self, call: i32, args: ConstPtr<usize>) -> Result<usize, Errno> {
         use crate::ToSyscallResult;
         use litebox_common_linux::SocketcallType;
@@ -1856,7 +1856,7 @@ mod tests {
     const SERVER_PORT: u16 = 8080;
     const CLIENT_PORT: u16 = 8081;
 
-    fn init_platform(tun_device_name: Option<&str>) -> crate::Task {
+    fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate::DefaultFS> {
         let task = crate::syscalls::tests::init_platform(tun_device_name);
         let global = task.global.clone();
         if tun_device_name.is_some() {
@@ -1877,12 +1877,17 @@ mod tests {
         task
     }
 
-    fn close_socket(task: &crate::Task, fd: u32) {
+    fn close_socket(task: &crate::Task<crate::DefaultFS>, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
             .expect("close socket failed");
     }
 
-    fn epoll_add(task: &crate::Task, epfd: i32, target_fd: u32, events: litebox::event::Events) {
+    fn epoll_add(
+        task: &crate::Task<crate::DefaultFS>,
+        epfd: i32,
+        target_fd: u32,
+        events: litebox::event::Events,
+    ) {
         let ev = litebox_common_linux::EpollEvent {
             events: events.bits(),
             data: u64::from(target_fd),
@@ -1899,7 +1904,7 @@ mod tests {
     }
 
     fn epoll_wait(
-        task: &crate::Task,
+        task: &crate::Task<crate::DefaultFS>,
         epfd: i32,
         events: &mut [litebox_common_linux::EpollEvent],
     ) -> usize {
@@ -1909,7 +1914,7 @@ mod tests {
     }
 
     fn test_tcp_socket_as_server(
-        task: &crate::Task,
+        task: &crate::Task<crate::DefaultFS>,
         ip: [u8; 4],
         port: u16,
         is_nonblocking: bool,
@@ -2482,11 +2487,15 @@ mod unix_tests {
 
     extern crate std;
 
-    fn create_unix_socket(task: &Task, ty: SockType, flags: SockFlags) -> u32 {
+    fn create_unix_socket(task: &Task<crate::DefaultFS>, ty: SockType, flags: SockFlags) -> u32 {
         task.do_socket(AddressFamily::UNIX, ty, flags, 0).unwrap()
     }
 
-    fn create_unix_server_socket(task: &Task, addr: &str, flags: SockFlags) -> Result<u32, Errno> {
+    fn create_unix_server_socket(
+        task: &Task<crate::DefaultFS>,
+        addr: &str,
+        flags: SockFlags,
+    ) -> Result<u32, Errno> {
         let server_fd = create_unix_socket(task, SockType::Stream, flags);
         task.do_bind(
             server_fd,
@@ -2496,12 +2505,12 @@ mod unix_tests {
         Ok(server_fd)
     }
 
-    fn close_socket(task: &crate::Task, fd: u32) {
+    fn close_socket(task: &crate::Task<crate::DefaultFS>, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
             .expect("close socket failed");
     }
 
-    fn ppoll(task: &Task, fd: u32, events: Events) {
+    fn ppoll(task: &Task<crate::DefaultFS>, fd: u32, events: Events) {
         let fd = i32::try_from(fd).unwrap();
         let mut pollfd = [litebox_common_linux::Pollfd {
             fd,
