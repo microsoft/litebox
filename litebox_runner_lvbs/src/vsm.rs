@@ -54,7 +54,7 @@ use x86_64::{
 };
 use zerocopy::{FromBytes, FromZeros, IntoBytes};
 
-pub fn init() {
+pub(crate) fn init() {
     assert!(
         !(get_core_id() == 0 && mshv_vsm_configure_partition().is_err()),
         "Failed to configure VSM partition"
@@ -93,7 +93,7 @@ pub fn init() {
 /// VSM function for enabling VTL of APs
 /// Not supported in this implementation.
 #[allow(clippy::unnecessary_wraps)]
-pub fn mshv_vsm_enable_aps(_cpu_present_mask_pfn: u64) -> Result<i64, VsmError> {
+fn mshv_vsm_enable_aps(_cpu_present_mask_pfn: u64) -> Result<i64, VsmError> {
     debug_serial_println!("mshv_vsm_enable_aps() not supported");
     Ok(0)
 }
@@ -101,7 +101,7 @@ pub fn mshv_vsm_enable_aps(_cpu_present_mask_pfn: u64) -> Result<i64, VsmError> 
 /// VSM function for enabling VTL and booting APs
 /// `cpu_online_mask_pfn` indicates the page containing the VTL0's CPU online mask.
 /// `boot_signal_pfn` indicates the boot signal page to let VTL0 know that VTL1 is ready.
-pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i64, VsmError> {
+fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Boot APs");
     let cpu_online_mask_page_addr = PhysAddr::try_new(cpu_online_mask_pfn << PAGE_SHIFT)
         .map_err(|_| VsmError::InvalidPhysicalAddress)?;
@@ -159,7 +159,7 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
 }
 
 /// VSM function for enforcing certain security features of VTL0
-pub fn mshv_vsm_secure_config_vtl0() -> Result<i64, VsmError> {
+fn mshv_vsm_secure_config_vtl0() -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Secure VTL0 configuration");
 
     let mut config = HvRegisterVsmVpSecureVtlConfig::new();
@@ -173,7 +173,7 @@ pub fn mshv_vsm_secure_config_vtl0() -> Result<i64, VsmError> {
 }
 
 /// VSM function to configure a VSM partition for VTL1
-pub fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
+fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Configure partition");
 
     let mut config = HvRegisterVsmPartitionConfig::new();
@@ -187,7 +187,7 @@ pub fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
 }
 
 /// VSM function for locking VTL0's control registers.
-pub fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
+fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Lock control registers");
 
     if platform().vtl0_kernel_info.check_end_of_boot() {
@@ -233,7 +233,7 @@ pub fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
 }
 
 /// VSM function for signaling the end of VTL0 boot process
-pub fn mshv_vsm_end_of_boot() -> i64 {
+fn mshv_vsm_end_of_boot() -> i64 {
     debug_serial_println!("VSM: End of boot");
     platform().vtl0_kernel_info.set_end_of_boot();
     0
@@ -241,7 +241,7 @@ pub fn mshv_vsm_end_of_boot() -> i64 {
 
 /// VSM function for protecting certain memory ranges (e.g., kernel text, data, heap).
 /// `pa` and `nranges` specify a memory area containing the information about the memory ranges to protect.
-pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, VsmError> {
+fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     if PhysAddr::try_new(pa)
         .ok()
         .filter(|p| p.is_aligned(Size4KiB::SIZE))
@@ -294,7 +294,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     Ok(0)
 }
 
-pub fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
+fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
     let mut certs = Vec::new();
 
     while buf.len() >= 4 && buf[0] == 0x30 && buf[1] == 0x82 {
@@ -319,7 +319,7 @@ pub fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
 
 /// VSM function for loading kernel data (e.g., certificates, blocklist, kernel symbols) into VTL1.
 /// `pa` and `nranges` specify memory areas containing the information about the memory ranges to load.
-pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
+fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     if PhysAddr::try_new(pa)
         .ok()
         .filter(|p| p.is_aligned(Size4KiB::SIZE))
@@ -449,7 +449,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
 /// `pa` and `nranges` specify a memory area containing the information about the kernel module to validate or protect.
 /// `flags` controls the validation process (unused for now).
 /// This function returns a unique `token` to VTL0, which is used to identify the module in subsequent calls.
-pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<i64, VsmError> {
+fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<i64, VsmError> {
     if PhysAddr::try_new(pa)
         .ok()
         .filter(|p| p.is_aligned(Size4KiB::SIZE))
@@ -569,7 +569,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 /// freeing the memory ranges that were used only for initialization and
 /// write-protecting the memory ranges that should be read-only after initialization.
 /// `token` is the unique identifier for the module.
-pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, VsmError> {
+fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Free kernel module's init (token: {})", token);
 
     if !platform()
@@ -611,7 +611,7 @@ pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, VsmError> {
 
 /// VSM function for supporting the unloading of a guest kernel module.
 /// `token` is the unique identifier for the module.
-pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, VsmError> {
+fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Unload kernel module (token: {})", token);
 
     if !platform()
@@ -656,7 +656,7 @@ pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, VsmError> {
 
 /// VSM function for copying secondary key
 #[allow(clippy::unnecessary_wraps)]
-pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> Result<i64, VsmError> {
+fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Copy secondary key");
     // TODO: copy secondary key
     Ok(0)
@@ -666,7 +666,7 @@ pub fn mshv_vsm_copy_secondary_key(_pa: u64, _nranges: u64) -> Result<i64, VsmEr
 /// This function protects the kexec kernel blob (PE) only if it has a valid signature.
 /// Note: this function does not make kexec kernel pages executable, which should be done by
 /// another VTL1 method that can intercept the kexec/reset signal.
-pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64, VsmError> {
+fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64, VsmError> {
     debug_serial_println!(
         "VSM: Validate kexec pa {:#x} nranges {} crash {}",
         pa,
@@ -783,7 +783,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
 /// VSM function for patching kernel or module text. VTL0 kernel calls this function to patch certain kernel or module
 /// text region (which it does not have a permission to modify). It passes `HekiPatch` structure which can be stored
 /// within one or across two likely non-contiguous physical pages.
-pub fn mshv_vsm_patch_text(patch_pa_0: u64, patch_pa_1: u64) -> Result<i64, VsmError> {
+fn mshv_vsm_patch_text(patch_pa_0: u64, patch_pa_1: u64) -> Result<i64, VsmError> {
     let heki_patch = copy_heki_patch_from_vtl0(patch_pa_0, patch_pa_1)?;
     debug_serial_println!("VSM: {:?}", heki_patch);
 
@@ -802,7 +802,7 @@ pub fn mshv_vsm_patch_text(patch_pa_0: u64, patch_pa_1: u64) -> Result<i64, VsmE
 
 /// This function copies patch data in `HekiPatch` structure from VTL0 to VTL1. This patch data can be
 /// stored within a physical page or across two likely non-contiguous physical pages.
-pub fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPatch, VsmError> {
+fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPatch, VsmError> {
     let patch_pa_0 = PhysAddr::try_new(patch_pa_0).map_err(|_| VsmError::InvalidPhysicalAddress)?;
     let patch_pa_1 = PhysAddr::try_new(patch_pa_1).map_err(|_| VsmError::InvalidPhysicalAddress)?;
     if patch_pa_0.is_null() || patch_pa_0 == patch_pa_1 || !patch_pa_1.is_aligned(Size4KiB::SIZE) {
@@ -853,7 +853,7 @@ pub fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<Hek
 
 /// This function apply the given `HekiPatch` patch data to VTL0 text.
 /// It assumes the caller has confirmed the validity of `HekiPatch` by invoking the `is_valid()` member function.
-pub fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
+fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
     let heki_patch_pa_0 = PhysAddr::new(heki_patch.pa[0]);
     let heki_patch_pa_1 = PhysAddr::new(heki_patch.pa[1]);
 
@@ -933,7 +933,7 @@ pub(crate) fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
 }
 
 #[allow(clippy::unnecessary_wraps)]
-pub fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
+fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
     let reg_names = with_per_cpu_variables_mut(|per_cpu_variables| {
         per_cpu_variables.vtl0_locked_regs.init();
         per_cpu_variables.vtl0_locked_regs.reg_names()
@@ -951,7 +951,7 @@ pub fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
 
 /// This function copies `HekiPage` structures from VTL0 and returns a vector of them.
 /// `pa` and `nranges` specify the physical address range containing one or more than one `HekiPage` structures.
-pub fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
+fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
     let mut next_pa = PhysAddr::new(pa);
     let mut heki_pages = Vec::with_capacity(nranges.truncate());
     let mut range: u64 = 0;
@@ -974,7 +974,7 @@ pub fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>>
 /// `phys_frame_range` specifies the physical frame range to protect
 /// `mem_attr` specifies the memory attributes to be applied to the range
 #[inline]
-pub fn protect_physical_memory_range(
+fn protect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
     mem_attr: MemAttr,
 ) -> Result<(), VsmError> {
