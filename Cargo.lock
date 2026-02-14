@@ -1004,7 +1004,6 @@ dependencies = [
  "num_enum",
  "once_cell",
  "spin 0.10.0",
- "thiserror",
  "x509-cert",
  "x86_64",
  "zerocopy",

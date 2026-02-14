@@ -14,7 +14,6 @@ spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"]
 hashbrown = "0.15.2"
 once_cell = { version = "1.21.3", default-features = false, features = ["race", "alloc"] }
 num_enum = { version = "0.7.4", default-features = false }
-thiserror = { version = "2.0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 x509-cert = { version = "0.2.5", default-features = false }
 

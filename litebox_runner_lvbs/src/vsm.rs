@@ -6,7 +6,7 @@
 //! These functions were migrated from `litebox_platform_lvbs::mshv::vsm`
 //! to the runner crate where dispatch logic belongs.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
 #[cfg(debug_assertions)]
@@ -24,7 +24,7 @@ use litebox_platform_lvbs::{
         error::VsmError,
         heki::{
             mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr, HekiKdataType,
-            HekiKernelInfo, HekiKexecType, HekiPage, HekiPatch, HekiRange, MemAttr, ModMemType,
+            HekiKernelInfo, HekiKexecType, HekiPage, HekiPatch, MemAttr, ModMemType,
         },
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
@@ -43,10 +43,7 @@ use litebox_platform_lvbs::{
         HvRegisterVsmVpSecureVtlConfig, VsmFunction, X86Cr0Flags, X86Cr4Flags,
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
-        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN, HV_X64_REGISTER_APIC_BASE,
-        HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER,
-        HV_X64_REGISTER_LSTAR, HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR,
-        HV_X64_REGISTER_SYSENTER_CS, HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
+        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN,
     },
 };
 use litebox_platform_multiplex::platform;
