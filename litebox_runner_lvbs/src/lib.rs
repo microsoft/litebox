@@ -24,14 +24,14 @@ use litebox_platform_lvbs::{
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
     mm::MemoryProvider,
     mshv::{
-        NUM_VTLCALL_PARAMS, VsmFunction, hvcall,
-        vsm::vsm_dispatch,
+        hvcall,
         vsm_intercept::raise_vtl0_gp_fault,
-        vtl_switch::{vtl_switch, vtl_switch_init},
         vtl1_mem_layout::{
-            VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
-            VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
+            get_heap_start_address, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE,
+            VTL1_PML4E_PAGE, VTL1_PRE_POPULATED_MEMORY_SIZE,
         },
+        vtl_switch::{vtl_switch, vtl_switch_init},
+        VsmFunction, NUM_VTLCALL_PARAMS,
     },
     serial_println,
 };
@@ -40,11 +40,13 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{
-    MAX_TA_INSTANCES, SessionIdGuard, SessionManager, TaInstance, allocate_session_id,
+    allocate_session_id, SessionIdGuard, SessionManager, TaInstance, MAX_TA_INSTANCES,
 };
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
+
+mod vsm;
 
 /// # Panics
 ///
@@ -152,7 +154,7 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
             let smc_args_pfn = params[1];
             optee_smc_handler_entry(smc_args_pfn)
         }
-        _ => vsm_dispatch(func_id, &params[1..]),
+        _ => vsm::vsm_dispatch(func_id, &params[1..]),
     }
 }
 
