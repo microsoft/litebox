@@ -36,7 +36,7 @@ use litebox_common_lvbs::{
         ModuleMemoryRange, Symbol, MODULE_VALIDATION_MAX_SIZE,
     },
 };
-use litebox_platform_lvbs::mshv::ringbuffer::set_ringbuffer;
+use crate::ringbuffer::set_ringbuffer;
 use litebox_platform_lvbs::{
     arch::get_core_id,
     debug_serial_print, debug_serial_println,
@@ -1485,6 +1485,12 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
 
 fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i64, VsmError> {
     set_ringbuffer(PhysAddr::new(phys_addr), size);
+    // Register the ring buffer print hook so ioport::print() mirrors output here.
+    unsafe {
+        litebox_platform_lvbs::arch::ioport::register_print_hook(
+            crate::ringbuffer::print_to_ringbuffer,
+        );
+    }
     protect_physical_memory_range(
         PhysFrame::range(
             PhysFrame::containing_address(PhysAddr::new(phys_addr)),
