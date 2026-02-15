@@ -11,7 +11,10 @@ mod globals;
 extern crate alloc;
 
 use alloc::{borrow::ToOwned, string::ToString};
-use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
+use litebox::{
+    fs::FileSystem as _,
+    utils::{ReinterpretUnsignedExt as _, TruncateExt as _},
+};
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
 type Platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel;
@@ -246,6 +249,17 @@ pub extern "C" fn sandbox_process_init(
     let shim = unsafe { (*shim).as_ref().expect("initialized") };
     let litebox = shim.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    in_mem_fs.with_root_privileges(|fs| {
+        let mode = litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO;
+        if let Err(err) = fs.mkdir("/tmp", mode) {
+            match err {
+                litebox::fs::errors::MkdirError::AlreadyExists => {
+                    fs.chmod("/tmp", mode).expect("Failed to call chmod");
+                }
+                _ => panic!("failed to create /tmp"),
+            }
+        }
+    });
     load_host_files_into_fs(&mut in_mem_fs);
 
     let socket_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(

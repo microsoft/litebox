@@ -11,13 +11,13 @@ use core::{arch::asm, sync::atomic::AtomicU32};
 
 use litebox::mm::linux::PageRange;
 use litebox::platform::Instant as _;
+use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider,
     Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider,
     UnblockedOrTimedOut,
 };
-use litebox::platform::RawPointerProvider;
 use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
 
