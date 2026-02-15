@@ -1486,11 +1486,9 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
 fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i64, VsmError> {
     set_ringbuffer(PhysAddr::new(phys_addr), size);
     // Register the ring buffer print hook so ioport::print() mirrors output here.
-    unsafe {
-        litebox_platform_lvbs::arch::ioport::register_print_hook(
-            crate::ringbuffer::print_to_ringbuffer,
-        );
-    }
+    litebox_platform_lvbs::arch::ioport::register_print_hook(
+        crate::ringbuffer::print_to_ringbuffer,
+    );
     protect_physical_memory_range(
         PhysFrame::range(
             PhysFrame::containing_address(PhysAddr::new(phys_addr)),

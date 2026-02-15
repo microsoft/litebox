@@ -16,7 +16,6 @@ use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
     Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutex as _, RawMutexProvider,
     RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
-    page_mgmt::DeallocationError,
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
@@ -35,8 +34,7 @@ use litebox_common_linux::{
 use x86_64::{
     VirtAddr,
     structures::paging::{
-        PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
-        mapper::MapToError,
+        PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
     },
 };
 use zerocopy::{FromBytes, IntoBytes};
@@ -419,93 +417,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
     }
 
-    /// This function maps VTL0 physical page frames containing the physical addresses
-    /// from `phys_start` to `phys_end` to the VTL1 kernel page table. It internally page aligns
-    /// the input addresses to ensure the mapped memory area covers the entire input addresses
-    /// at the page level. It returns a page-aligned address (as `mmap` does) and the length of the mapped memory.
-    ///
-    /// Note: VTL0 physical memory is external/remote memory that this Rust binary doesn't own,
-    /// so mapping it doesn't create aliasing issues within the Rust memory model.
-    fn map_vtl0_phys_range(
-        &self,
-        phys_start: x86_64::PhysAddr,
-        phys_end: x86_64::PhysAddr,
-        flags: PageTableFlags,
-    ) -> Result<(*mut u8, usize), MapToError<Size4KiB>> {
-        let frame_range = PhysFrame::range(
-            PhysFrame::containing_address(phys_start),
-            PhysFrame::containing_address(phys_end.align_up(Size4KiB::SIZE)),
-        );
-
-        // ensure the input address range does not overlap with VTL1 memory
-        if frame_range.start < self.vtl1_phys_frame_range.end
-            && self.vtl1_phys_frame_range.start < frame_range.end
-        {
-            return Err(MapToError::FrameAllocationFailed);
-        }
-
-        Ok((
-            self.page_table_manager
-                .current_page_table()
-                .map_phys_frame_range(frame_range, flags)?,
-            usize::try_from(frame_range.len()).unwrap() * PAGE_SIZE,
-        ))
-    }
-
-    /// This function unmaps VTL0 pages from the page table.
-    ///
-    /// Allocator does not allocate memory frames for VTL0 pages, so frame deallocation is not needed.
-    ///
-    /// Note: VTL0 physical memory is external memory not owned by LiteBox (similar to MMIO).
-    /// LiteBox accesses it by creating a temporary non-shared mapping, copying data to/from a
-    /// LiteBox-owned buffer, and unmapping immediately. No Rust references are created to the
-    /// mapped VTL0 memory; all accesses use raw pointer operations (read_volatile /
-    /// copy_nonoverlapping) to avoid violating Rust's aliasing model.
-    fn unmap_vtl0_pages(
-        &self,
-        page_addr: *const u8,
-        length: usize,
-    ) -> Result<(), DeallocationError> {
-        let page_addr = x86_64::VirtAddr::new(page_addr as u64);
-        if page_addr.page_offset() != PageOffset::new(0) {
-            return Err(DeallocationError::Unaligned);
-        }
-        unsafe {
-            self.page_table_manager.current_page_table().unmap_pages(
-                PageRange::<PAGE_SIZE>::new(
-                    page_addr.as_u64().truncate(),
-                    (page_addr + length as u64)
-                        .align_up(Size4KiB::SIZE)
-                        .as_u64()
-                        .truncate(),
-                )
-                .ok_or(DeallocationError::Unaligned)?,
-                false,
-                true,
-            )
-        }
-    }
-
-    /// Map a VTL0 physical range and return a guard that unmaps on drop.
-    fn map_vtl0_guard(
-        &self,
-        phys_addr: x86_64::PhysAddr,
-        size: u64,
-        flags: PageTableFlags,
-    ) -> Option<Vtl0MappedGuard<'_, Host>> {
-        let (page_addr, page_aligned_length) = self
-            .map_vtl0_phys_range(phys_addr, phys_addr + size, flags)
-            .ok()?;
-        let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
-        Some(Vtl0MappedGuard {
-            owner: self,
-            page_addr,
-            page_aligned_length,
-            ptr: page_addr.wrapping_add(page_offset),
-            size: size.truncate(),
-        })
-    }
-
     /// Create a new task page table for VTL1 user space and returns its ID.
     ///
     /// See [`PageTableManager`] for security notes on KPTI.
@@ -584,26 +495,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// Enable syscall support in the platform.
     pub fn enable_syscall_support() {
         syscall_entry::init();
-    }
-}
-
-/// RAII guard that unmaps VTL0 physical pages when dropped.
-struct Vtl0MappedGuard<'a, Host: HostInterface> {
-    owner: &'a LinuxKernel<Host>,
-    page_addr: *mut u8,
-    page_aligned_length: usize,
-    ptr: *mut u8,
-    size: usize,
-}
-
-impl<Host: HostInterface> Drop for Vtl0MappedGuard<'_, Host> {
-    fn drop(&mut self) {
-        assert!(
-            self.owner
-                .unmap_vtl0_pages(self.page_addr, self.page_aligned_length)
-                .is_ok(),
-            "Failed to unmap VTL0 pages"
-        );
     }
 }
 
@@ -1732,28 +1623,4 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
     );
 }
 
-// NOTE: The below code is a naive workaround to let LVBS code to access the platform.
-// Rather than doing this, we should implement LVBS interface/provider for the platform.
 
-pub type Platform = crate::host::LvbsLinuxKernel;
-
-static PLATFORM_LOW: once_cell::race::OnceRef<'static, Platform> = once_cell::race::OnceRef::new();
-
-/// # Panics
-///
-/// Panics if invoked more than once
-pub fn set_platform_low(platform: &'static Platform) {
-    match PLATFORM_LOW.set(platform) {
-        Ok(()) => {}
-        Err(()) => panic!("set_platform should only be called once per crate"),
-    }
-}
-
-/// # Panics
-///
-/// Panics if [`set_platform_low`] has not been invoked before this
-pub fn platform_low() -> &'static Platform {
-    PLATFORM_LOW
-        .get()
-        .expect("set_platform_low should have already been called before this point")
-}

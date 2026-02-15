@@ -31,7 +31,7 @@ use litebox_platform_lvbs::{
             get_heap_start_address, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE,
             VTL1_PML4E_PAGE, VTL1_PRE_POPULATED_MEMORY_SIZE,
         },
-        vtl_switch::{vtl_switch, vtl_switch_init},
+        vtl_switch::{vtl_switch},
     },
     serial_println,
 };
@@ -128,9 +128,7 @@ pub fn init() -> Option<&'static Platform> {
     ret
 }
 
-pub fn run(platform: Option<&'static Platform>) -> ! {
-    vtl_switch_init(platform);
-
+pub fn run(_platform: Option<&'static Platform>) -> ! {
     let mut return_value: Option<i64> = None;
     loop {
         let params = vtl_switch(return_value);

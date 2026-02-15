@@ -28,7 +28,7 @@ impl RingBuffer {
         }
     }
 
-    fn copy_slice_to_vtl0(&self, pa: PhysAddr, buf: &[u8]) {
+    fn copy_slice_to_vtl0(pa: PhysAddr, buf: &[u8]) {
         if buf.is_empty() {
             return;
         }
@@ -47,7 +47,7 @@ impl RingBuffer {
         // the final [ring buffer size] values from the input buffer
         if buf.len() >= self.size {
             let single_slice = &buf[(buf.len() - self.size)..];
-            self.copy_slice_to_vtl0(self.rb_pa, single_slice);
+            Self::copy_slice_to_vtl0(self.rb_pa, single_slice);
             self.write_offset = 0;
             return;
         }
@@ -57,10 +57,10 @@ impl RingBuffer {
         if buf.len() > space_remaining {
             let first_slice = &buf[..space_remaining];
             let wraparound_slice = &buf[space_remaining..];
-            self.copy_slice_to_vtl0(self.rb_pa + self.write_offset as u64, first_slice);
-            self.copy_slice_to_vtl0(self.rb_pa, wraparound_slice);
+            Self::copy_slice_to_vtl0(self.rb_pa + self.write_offset as u64, first_slice);
+            Self::copy_slice_to_vtl0(self.rb_pa, wraparound_slice);
         } else {
-            self.copy_slice_to_vtl0(self.rb_pa + self.write_offset as u64, buf);
+            Self::copy_slice_to_vtl0(self.rb_pa + self.write_offset as u64, buf);
         }
         self.write_offset = (self.write_offset + buf.len()) % self.size;
     }

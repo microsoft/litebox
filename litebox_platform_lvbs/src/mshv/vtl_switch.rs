@@ -126,16 +126,6 @@ impl VtlState {
     }
 }
 
-/// Initialize VTL switch for the current CPU.
-///
-/// This function sets the platform reference for the current CPU.
-/// It should be called once before entering the VTL switch loop.
-pub fn vtl_switch_init(platform: Option<&'static crate::Platform>) {
-    if let Some(platform) = platform {
-        crate::set_platform_low(platform);
-    }
-}
-
 /// Assembly macro to save VTL state to the VtlState memory area.
 ///
 /// This macro saves the current `rsp` to scratch, sets `rsp` to point to the top of
