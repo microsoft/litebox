@@ -47,6 +47,7 @@ use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
 
 mod mem_integrity;
+mod ringbuffer;
 mod vsm;
 
 /// # Panics
