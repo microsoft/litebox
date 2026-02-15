@@ -6,7 +6,6 @@
 pub mod hvcall;
 pub mod hvcall_mm;
 pub mod hvcall_vp;
-pub mod ringbuffer;
 pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;

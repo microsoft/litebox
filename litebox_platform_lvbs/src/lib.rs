@@ -506,41 +506,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         })
     }
 
-    /// This function copies a slice from the VTL1 kernel to VTL0 physical memory.
-    /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address.
-    pub unsafe fn copy_slice_to_vtl0_phys<T: Copy>(
-        &self,
-        phys_addr: x86_64::PhysAddr,
-        value: &[T],
-    ) -> bool {
-        if core::mem::size_of_val(value) == 0 {
-            return true;
-        }
-
-        let Some(dst_guard) = self.map_vtl0_guard(
-            phys_addr,
-            core::mem::size_of_val(value) as u64,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-        ) else {
-            return false;
-        };
-
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                dst_guard.ptr,
-                value.as_ptr().cast::<u8>(),
-                dst_guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault copying to VTL0 mapped page");
-        result.is_ok()
-    }
-
     /// Create a new task page table for VTL1 user space and returns its ID.
     ///
     /// See [`PageTableManager`] for security notes on KPTI.
