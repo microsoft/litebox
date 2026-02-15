@@ -16,25 +16,16 @@ use hashbrown::HashMap;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{
-    error::{MemoryContainerError, PatchDataMapError, VsmError},
-    heki::{
-        mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr, HekiKdataType, HekiKernelInfo,
-        HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch, HekiPatchInfo, HekiRange, MemAttr,
-        ModMemType,
-    },
-    hvcall::HypervCallError,
-    mem_layout::{PAGE_SHIFT, PAGE_SIZE},
-    mshv::{
-        HvCrInterceptControlFlags, HvPageProtFlags, HvRegisterVsmPartitionConfig,
-        HvRegisterVsmVpSecureVtlConfig, VsmFunction, X86Cr0Flags, X86Cr4Flags,
-        HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
-        HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
-        HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN,
-    },
-    vsm::{
-        AlignedPage, KexecMemoryMetadata, KexecMemoryRange, MemoryRange, ModuleMemoryMetadata,
-        ModuleMemoryRange, Symbol, MODULE_VALIDATION_MAX_SIZE,
-    },
+    AlignedPage, HekiKdataType, HekiKernelInfo, HekiKernelSymbol, HekiKexecType, HekiPage,
+    HekiPatch, HekiPatchInfo, HekiRange, HvCrInterceptControlFlags, HvPageProtFlags,
+    HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig, HypervCallError,
+    KexecMemoryMetadata, KexecMemoryRange, MemAttr, MemoryContainerError, MemoryRange,
+    ModMemType, ModuleMemoryMetadata, ModuleMemoryRange, PatchDataMapError, Symbol, VsmError,
+    VsmFunction, X86Cr0Flags, X86Cr4Flags, MODULE_VALIDATION_MAX_SIZE, PAGE_SHIFT, PAGE_SIZE,
+    HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
+    HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
+    HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN,
+    mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
 };
 use crate::ringbuffer::set_ringbuffer;
 use litebox_platform_lvbs::{

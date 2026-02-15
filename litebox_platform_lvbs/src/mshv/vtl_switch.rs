@@ -16,8 +16,8 @@ use crate::mshv::{
     VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
 };
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
-use litebox_common_lvbs::error::VsmError;
-use litebox_common_lvbs::mshv::NUM_VTLCALL_PARAMS;
+use litebox_common_lvbs::VsmError;
+use litebox_common_lvbs::NUM_VTLCALL_PARAMS;
 use num_enum::TryFromPrimitive;
 
 // ============================================================================

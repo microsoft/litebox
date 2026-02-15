@@ -8,7 +8,7 @@
 
 use core::fmt;
 use litebox::utils::TruncateExt;
-use litebox_common_lvbs::mem_layout::PAGE_SIZE;
+use litebox_common_lvbs::PAGE_SIZE;
 use litebox_shim_optee::NormalWorldMutPtr;
 use spin::{Mutex, Once};
 use x86_64::PhysAddr;

@@ -22,10 +22,10 @@ use crate::{
     },
 };
 use core::arch::asm;
-use litebox_common_lvbs::mshv::HV_STATUS_SUCCESS;
+use litebox_common_lvbs::HV_STATUS_SUCCESS;
 use thiserror::Error;
 
-pub use litebox_common_lvbs::hvcall::HypervCallError;
+pub use litebox_common_lvbs::HypervCallError;
 
 #[cfg(debug_assertions)]
 use crate::mshv::HV_REGISTER_VP_INDEX;

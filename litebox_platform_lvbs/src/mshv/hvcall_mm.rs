@@ -12,7 +12,7 @@ use crate::{
         HV_PARTITION_ID_SELF,
     },
 };
-use litebox_common_lvbs::mshv::HvPageProtFlags;
+use litebox_common_lvbs::HvPageProtFlags;
 
 /// Hyper-V Hypercall to prevent lower VTLs (i.e., VTL0) from accessing a specified range of
 /// guest physical memory pages with a given protection flag.

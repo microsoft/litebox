@@ -18,7 +18,7 @@ use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin,
     TeeResult, UteeEntryFunc, UteeParams,
 };
-use litebox_common_lvbs::mshv::{VsmFunction, NUM_VTLCALL_PARAMS};
+use litebox_common_lvbs::{VsmFunction, NUM_VTLCALL_PARAMS};
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
     debug_serial_println,

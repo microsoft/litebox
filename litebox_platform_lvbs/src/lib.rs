@@ -1023,13 +1023,13 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
 
         let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
             // VTL1 wants to write data to the pages, preventing VTL0 from reading/executing the pages.
-            litebox_common_lvbs::heki::MemAttr::empty()
+            litebox_common_lvbs::MemAttr::empty()
         } else if perms.contains(PhysPageMapPermissions::READ) {
             // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
-            litebox_common_lvbs::heki::MemAttr::MEM_ATTR_READ | litebox_common_lvbs::heki::MemAttr::MEM_ATTR_EXEC
+            litebox_common_lvbs::MemAttr::MEM_ATTR_READ | litebox_common_lvbs::MemAttr::MEM_ATTR_EXEC
         } else {
             // VTL1 no longer protects the pages.
-            litebox_common_lvbs::heki::MemAttr::all()
+            litebox_common_lvbs::MemAttr::all()
         };
         let pa = frame_range.start.start_address().as_u64();
         let num_pages = frame_range.count() as u64;
@@ -1037,7 +1037,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             crate::mshv::hvcall_mm::hv_modify_vtl_protection_mask(
                 pa,
                 num_pages,
-                litebox_common_lvbs::heki::mem_attr_to_hv_page_prot_flags(mem_attr),
+                litebox_common_lvbs::mem_attr_to_hv_page_prot_flags(mem_attr),
             )
             .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
         }

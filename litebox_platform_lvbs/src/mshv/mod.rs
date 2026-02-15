@@ -626,7 +626,7 @@ impl HvPendingExceptionEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_common_lvbs::mshv::{HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig};
+    use litebox_common_lvbs::{HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig};
 
     #[test]
     fn test_hv_input_vtl_bitfield() {

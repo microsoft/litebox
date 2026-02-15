@@ -14,7 +14,7 @@ use core::cell::{Cell, RefCell};
 use core::mem::offset_of;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::{rdgsbase, wrgsbase};
-use litebox_common_lvbs::mshv::{ControlRegMap, NUM_CONTROL_REGS};
+use litebox_common_lvbs::{ControlRegMap, NUM_CONTROL_REGS};
 use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;
