@@ -14,7 +14,7 @@ use crate::host::linux::CpuMask;
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use alloc::boxed::Box;
 use modular_bitfield::prelude::*;
-use modular_bitfield::specifiers::{B16, B3, B31, B32, B4, B45, B7, B8};
+use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use spin::Once;
 

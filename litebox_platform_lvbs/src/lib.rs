@@ -33,9 +33,7 @@ use litebox_common_linux::{
 };
 use x86_64::{
     VirtAddr,
-    structures::paging::{
-        PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
-    },
+    structures::paging::{PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -1026,7 +1024,8 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             litebox_common_lvbs::MemAttr::empty()
         } else if perms.contains(PhysPageMapPermissions::READ) {
             // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
-            litebox_common_lvbs::MemAttr::MEM_ATTR_READ | litebox_common_lvbs::MemAttr::MEM_ATTR_EXEC
+            litebox_common_lvbs::MemAttr::MEM_ATTR_READ
+                | litebox_common_lvbs::MemAttr::MEM_ATTR_EXEC
         } else {
             // VTL1 no longer protects the pages.
             litebox_common_lvbs::MemAttr::all()
@@ -1622,5 +1621,3 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
     );
 }
-
-

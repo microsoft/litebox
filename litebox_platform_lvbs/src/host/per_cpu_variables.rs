@@ -4,9 +4,9 @@
 //! Per-CPU VTL1 kernel variables
 
 use crate::{
-    arch::{gdt, get_core_id, MAX_CORES},
+    arch::{MAX_CORES, gdt, get_core_id},
     host::bootparam::get_num_possible_cpus,
-    mshv::{vtl1_mem_layout::PAGE_SIZE, vtl_switch::VtlState, HvMessagePage, HvVpAssistPage},
+    mshv::{HvMessagePage, HvVpAssistPage, vtl_switch::VtlState, vtl1_mem_layout::PAGE_SIZE},
 };
 use aligned_vec::avec;
 use alloc::boxed::Box;
@@ -43,7 +43,7 @@ pub struct PerCpuVariables {
 impl PerCpuVariables {
     const XSAVE_ALIGNMENT: usize = 64; // XSAVE and XRSTORE require a 64-byte aligned buffer
     pub const VTL1_XSAVE_MASK: u64 = 0b11; // let XSAVE and XRSTORE deal with x87 and SSE states
-                                           // XSAVE area size for VTL1: 512 bytes (legacy x87+SSE area) + 64 bytes (XSAVE header)
+    // XSAVE area size for VTL1: 512 bytes (legacy x87+SSE area) + 64 bytes (XSAVE header)
     const VTL1_XSAVE_AREA_SIZE: usize = 512 + 64;
 
     pub(crate) fn kernel_stack_top(&self) -> u64 {

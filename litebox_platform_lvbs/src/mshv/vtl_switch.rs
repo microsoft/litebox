@@ -6,18 +6,18 @@
 use crate::host::{
     hv_hypercall_page_address,
     per_cpu_variables::{
-        with_per_cpu_variables, with_per_cpu_variables_asm, with_per_cpu_variables_mut,
-        PerCpuVariablesAsm,
+        PerCpuVariablesAsm, with_per_cpu_variables, with_per_cpu_variables_asm,
+        with_per_cpu_variables_mut,
     },
 };
 use crate::mshv::{
-    hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
-    HvRegisterVsmCodePageOffsets, HV_REGISTER_VSM_CODEPAGE_OFFSETS, VTL_ENTRY_REASON_INTERRUPT,
-    VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
+    HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets, VTL_ENTRY_REASON_INTERRUPT,
+    VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED, hvcall_vp::hvcall_get_vp_registers,
+    vsm_intercept::vsm_handle_intercept,
 };
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
-use litebox_common_lvbs::VsmError;
 use litebox_common_lvbs::NUM_VTLCALL_PARAMS;
+use litebox_common_lvbs::VsmError;
 use num_enum::TryFromPrimitive;
 
 // ============================================================================

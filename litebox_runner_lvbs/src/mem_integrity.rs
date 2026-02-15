@@ -4,9 +4,6 @@
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
 use crate::vsm::ModuleMemory;
-use litebox_common_lvbs::ModuleSignature;
-use litebox_platform_lvbs::debug_serial_println;
-use litebox_common_lvbs::{HekiPatch, POKE_MAX_OPCODE_SIZE};
 use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};
@@ -22,6 +19,9 @@ use elf::{
     string_table::StringTable,
     symbol::Symbol,
 };
+use litebox_common_lvbs::ModuleSignature;
+use litebox_common_lvbs::{HekiPatch, POKE_MAX_OPCODE_SIZE};
+use litebox_platform_lvbs::debug_serial_println;
 use object::read::pe::PeFile64;
 
 use litebox_common_lvbs::{KernelElfError, VerificationError};
@@ -618,7 +618,10 @@ const JMP32_INSN_SIZE: u8 = 5;
 /// Each invocation of `text_poke_bp_batch` does one of the steps with a portion of the code (1 or n-1 bytes),
 /// so there are up to three invocations for each target target address.
 /// Refer [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/arch/x86/kernel/alternative.c#L2164)
-pub(crate) fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
+pub(crate) fn validate_text_poke_bp_batch(
+    patch_data: &HekiPatch,
+    precomputed_patch: &HekiPatch,
+) -> bool {
     // step 1
     if patch_data.size == 1 && patch_data.code[0] == INT3_INSN_OPCODE {
         return true;

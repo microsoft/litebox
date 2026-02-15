@@ -6,6 +6,13 @@
 //! These functions were migrated from `litebox_platform_lvbs::mshv::vsm`
 //! to the runner crate where dispatch logic belongs.
 
+#[cfg(debug_assertions)]
+use crate::mem_integrity::parse_modinfo;
+use crate::mem_integrity::{
+    validate_kernel_module_against_elf, validate_text_patch, verify_kernel_module_signature,
+    verify_kernel_pe_signature,
+};
+use crate::ringbuffer::set_ringbuffer;
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::{
     marker::PhantomData,
@@ -16,46 +23,39 @@ use hashbrown::HashMap;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{
-    AlignedPage, HekiKdataType, HekiKernelInfo, HekiKernelSymbol, HekiKexecType, HekiPage,
-    HekiPatch, HekiPatchInfo, HekiRange, HvCrInterceptControlFlags, HvPageProtFlags,
-    HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig, HypervCallError,
-    KexecMemoryMetadata, KexecMemoryRange, MemAttr, MemoryContainerError, MemoryRange,
-    ModMemType, ModuleMemoryMetadata, ModuleMemoryRange, PatchDataMapError, Symbol, VsmError,
-    VsmFunction, X86Cr0Flags, X86Cr4Flags, MODULE_VALIDATION_MAX_SIZE, PAGE_SHIFT, PAGE_SIZE,
-    HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
+    AlignedPage, HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
     HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
-    HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN,
-    mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr,
+    HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_SECURE_VTL_BOOT_TOKEN, HekiKdataType, HekiKernelInfo,
+    HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch, HekiPatchInfo, HekiRange,
+    HvCrInterceptControlFlags, HvPageProtFlags, HvRegisterVsmPartitionConfig,
+    HvRegisterVsmVpSecureVtlConfig, HypervCallError, KexecMemoryMetadata, KexecMemoryRange,
+    MODULE_VALIDATION_MAX_SIZE, MemAttr, MemoryContainerError, MemoryRange, ModMemType,
+    ModuleMemoryMetadata, ModuleMemoryRange, PAGE_SHIFT, PAGE_SIZE, PatchDataMapError, Symbol,
+    VsmError, VsmFunction, X86Cr0Flags, X86Cr4Flags, mem_attr_to_hv_page_prot_flags,
+    mod_mem_type_to_mem_attr,
 };
-use crate::ringbuffer::set_ringbuffer;
 use litebox_platform_lvbs::{
     arch::get_core_id,
     debug_serial_print, debug_serial_println,
     host::{
         bootparam::get_vtl1_memory_info,
-        linux::{CpuMask, Kimage, KEXEC_SEGMENT_MAX},
+        linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
         per_cpu_variables::with_per_cpu_variables_mut,
     },
     mshv::{
+        CPU_ONLINE_MASK,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_ap},
-        CPU_ONLINE_MASK,
         vtl_switch::mshv_vsm_get_code_page_offsets,
     },
 };
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr};
-#[cfg(debug_assertions)]
-use crate::mem_integrity::parse_modinfo;
-use crate::mem_integrity::{
-    validate_kernel_module_against_elf, validate_text_patch,
-    verify_kernel_module_signature, verify_kernel_pe_signature,
-};
 use spin::rwlock::RwLock;
-use x509_cert::{der::Decode, Certificate};
 use x86_64::{
-    structures::paging::{frame::PhysFrameRange, PageSize, PhysFrame, Size4KiB},
     PhysAddr, VirtAddr,
+    structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
+use x509_cert::{Certificate, der::Decode};
 use zerocopy::{FromBytes, FromZeros, IntoBytes};
 
 // ---------------------------------------------------------------------------
@@ -161,10 +161,7 @@ impl ModuleMemoryMetadataMap {
     }
 
     /// Register a new module memory metadata structure in the map and return a unique key/token for it.
-    pub fn register_module_memory_metadata(
-        &self,
-        module_memory: ModuleMemoryMetadata,
-    ) -> i64 {
+    pub fn register_module_memory_metadata(&self, module_memory: ModuleMemoryMetadata) -> i64 {
         let key = self.gen_unique_key();
 
         let mut map = self.inner.lock();
@@ -687,7 +684,7 @@ fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i
 
     let cpu_mask = unsafe {
         NormalWorldConstPtr::<CpuMask, PAGE_SIZE>::with_usize(
-            cpu_online_mask_page_addr.as_u64().truncate()
+            cpu_online_mask_page_addr.as_u64().truncate(),
         )
         .and_then(|mut ptr| ptr.read_at_offset(0))
         .map_err(|_| VsmError::CpuOnlineMaskCopyFailed)?
@@ -702,7 +699,7 @@ fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i
     // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
     let mut boot_signal_page_buf = unsafe {
         NormalWorldConstPtr::<AlignedPage, PAGE_SIZE>::with_usize(
-            boot_signal_page_addr.as_u64().truncate()
+            boot_signal_page_addr.as_u64().truncate(),
         )
         .and_then(|mut ptr| ptr.read_at_offset(0))
         .map_err(|_| VsmError::BootSignalPageCopyFailed)?
@@ -732,7 +729,7 @@ fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Result<i
 
     unsafe {
         NormalWorldMutPtr::<AlignedPage, PAGE_SIZE>::with_usize(
-            boot_signal_page_addr.as_u64().truncate()
+            boot_signal_page_addr.as_u64().truncate(),
         )
         .and_then(|mut ptr| ptr.write_at_offset(0, *boot_signal_page_buf))
         .map_err(|_| VsmError::BootSignalWriteFailed)?;
@@ -1158,10 +1155,7 @@ fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, VsmError> {
         return Err(VsmError::ModuleTokenInvalid);
     }
 
-    if let Some(entry) = vtl0_kernel_info()
-        .module_memory_metadata
-        .iter_entry(token)
-    {
+    if let Some(entry) = vtl0_kernel_info().module_memory_metadata.iter_entry(token) {
         for mod_mem_range in entry.iter_mem_ranges() {
             match mod_mem_range.mod_mem_type {
                 ModMemType::InitText | ModMemType::InitData | ModMemType::InitRoData => {
@@ -1198,10 +1192,7 @@ fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, VsmError> {
         return Err(VsmError::ModuleTokenInvalid);
     }
 
-    if let Some(entry) = vtl0_kernel_info()
-        .module_memory_metadata
-        .iter_entry(token)
-    {
+    if let Some(entry) = vtl0_kernel_info().module_memory_metadata.iter_entry(token) {
         // make the memory ranges of a module readable, writable, and non-executable to let the VTL0 kernel unload the module
         for mod_mem_range in entry.iter_mem_ranges() {
             protect_physical_memory_range(
@@ -1220,9 +1211,7 @@ fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, VsmError> {
             .remove_patch_data(&patch_targets);
     }
 
-    vtl0_kernel_info()
-        .module_memory_metadata
-        .remove(token);
+    vtl0_kernel_info().module_memory_metadata.remove(token);
     Ok(0)
 }
 
@@ -1457,7 +1446,9 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
 
         unsafe {
             NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                (heki_patch_pa_0 + patch_target_page_offset as u64).as_u64().truncate(),
+                (heki_patch_pa_0 + patch_target_page_offset as u64)
+                    .as_u64()
+                    .truncate(),
                 patch_first.len(),
             )
             .and_then(|mut ptr| ptr.write_slice_at_offset(0, patch_first))

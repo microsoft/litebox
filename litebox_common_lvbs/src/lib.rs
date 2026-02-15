@@ -8,7 +8,7 @@
 extern crate alloc;
 
 use alloc::{ffi::CString, string::String, vec::Vec};
-use core::ffi::{c_char, CStr};
+use core::ffi::{CStr, c_char};
 use core::mem;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
@@ -17,8 +17,8 @@ use modular_bitfield::specifiers::B62;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use thiserror::Error;
 use x86_64::{
-    structures::paging::{frame::PhysFrameRange, PageSize, PhysFrame, Size4KiB},
     PhysAddr, VirtAddr,
+    structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
@@ -960,11 +960,7 @@ impl HekiPatch {
     /// Creates a new `HekiPatch` with a given buffer. Returns `None` if any field is invalid.
     pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
         let patch = Self::read_from_bytes(bytes).ok()?;
-        if patch.is_valid() {
-            Some(patch)
-        } else {
-            None
-        }
+        if patch.is_valid() { Some(patch) } else { None }
     }
 
     pub fn is_valid(&self) -> bool {
@@ -1097,11 +1093,7 @@ impl HekiPatchInfo {
     /// Creates a new `HekiPatchInfo` with a given buffer. Returns `None` if any field is invalid.
     pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
         let info = Self::read_from_bytes(bytes).ok()?;
-        if info.is_valid() {
-            Some(info)
-        } else {
-            None
-        }
+        if info.is_valid() { Some(info) } else { None }
     }
 
     pub fn is_valid(&self) -> bool {

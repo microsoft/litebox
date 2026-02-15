@@ -14,11 +14,11 @@ use litebox::{
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::errno::Errno;
+use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmFunction};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin,
     TeeResult, UteeEntryFunc, UteeParams,
 };
-use litebox_common_lvbs::{VsmFunction, NUM_VTLCALL_PARAMS};
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
     debug_serial_println,
@@ -27,11 +27,11 @@ use litebox_platform_lvbs::{
     mshv::{
         hvcall,
         vsm_intercept::raise_vtl0_gp_fault,
+        vtl_switch::vtl_switch,
         vtl1_mem_layout::{
-            get_heap_start_address, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE,
-            VTL1_PML4E_PAGE, VTL1_PRE_POPULATED_MEMORY_SIZE,
+            VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
+            VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
         },
-        vtl_switch::{vtl_switch},
     },
     serial_println,
 };
@@ -40,7 +40,7 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{
-    allocate_session_id, SessionIdGuard, SessionManager, TaInstance, MAX_TA_INSTANCES,
+    MAX_TA_INSTANCES, SessionIdGuard, SessionManager, TaInstance, allocate_session_id,
 };
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;

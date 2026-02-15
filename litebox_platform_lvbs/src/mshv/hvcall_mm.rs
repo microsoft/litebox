@@ -6,10 +6,10 @@
 use crate::{
     host::per_cpu_variables::with_per_cpu_variables_mut,
     mshv::{
-        hvcall::{hv_do_rep_hypercall, HypervCallError},
+        HV_PARTITION_ID_SELF, HVCALL_MODIFY_VTL_PROTECTION_MASK, HvInputModifyVtlProtectionMask,
+        HvInputVtl,
+        hvcall::{HypervCallError, hv_do_rep_hypercall},
         vtl1_mem_layout::PAGE_SHIFT,
-        HvInputModifyVtlProtectionMask, HvInputVtl, HVCALL_MODIFY_VTL_PROTECTION_MASK,
-        HV_PARTITION_ID_SELF,
     },
 };
 use litebox_common_lvbs::HvPageProtFlags;
