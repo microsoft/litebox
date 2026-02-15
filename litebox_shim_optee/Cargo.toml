@@ -20,7 +20,7 @@ num_enum = { version = "0.7.3", default-features = false }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 spin = { version = "0.10.0", default-features = false, features = ["spin_mutex", "once"] }
 thiserror = { version = "2.0.6", default-features = false }
-zerocopy = { version = "0.8", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
 [features]
 default = ["platform_lvbs"]

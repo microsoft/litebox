@@ -26,10 +26,10 @@ use litebox_common_optee::{
     OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeSecureWorldCapabilities,
     OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode, TeeIdentity, TeeLogin,
     TeeOrigin, TeeParamType, TeeResult, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
-    optee_msg_arg_total_size,
+    optee_msg_args_total_size,
 };
 use once_cell::race::OnceBox;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, Immutable};
 
 // OP-TEE version and build info (2.0)
 // TODO: Consider replacing it with our own version info
@@ -72,13 +72,13 @@ fn page_align_up(len: u64) -> u64 {
 /// our private copy after the single read.
 ///
 /// The copy size is determined by known-good upper bounds, not by untrusted data:
-///   - Main args: `optee_msg_arg_total_size(MAX_ARG_PARAM_COUNT = 6)` = 224 bytes (the Linux
+///   - Main args: `optee_msg_args_total_size(MAX_ARG_PARAM_COUNT = 6)` = 224 bytes (the Linux
 ///     driver always allocates at least this much for the main arg).
-///   - RPC args (when present): `optee_msg_arg_total_size(rpc_num_params)`, where
+///   - RPC args (when present): `optee_msg_args_total_size(rpc_num_params)`, where
 ///     `rpc_num_params` is our own negotiated value from `EXCHANGE_CAPABILITIES`.
 ///
 /// If `has_rpc_arg` is true, expects an appended RPC `optee_msg_arg` immediately after
-/// the main one at offset `optee_msg_arg_total_size(num_params)` (the *actual* `num_params`,
+/// the main one at offset `optee_msg_args_total_size(num_params)` (the *actual* `num_params`,
 /// not `MAX_ARG_PARAM_COUNT`). This matches the Linux driver's layout.
 ///
 /// VTL0 physical memory layout at `phys_addr`:
@@ -111,9 +111,9 @@ pub fn read_optee_msg_args_from_phys(
     has_rpc_arg: bool,
 ) -> Result<(Box<OpteeMsgArgs>, Option<Box<OpteeRpcArgs>>), OpteeSmcReturnCode> {
     // Compute copy size from known-good upper bounds — no untrusted data involved.
-    let main_max = optee_msg_arg_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.truncate());
+    let main_max = optee_msg_args_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.truncate());
     let copy_size = if has_rpc_arg {
-        main_max + optee_msg_arg_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.truncate())
+        main_max + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.truncate())
     } else {
         main_max
     };
@@ -136,7 +136,7 @@ pub fn read_optee_msg_args_from_phys(
         return Err(OpteeSmcReturnCode::EBadCmd);
     }
 
-    let main_size = optee_msg_arg_total_size(main_header.num_params);
+    let main_size = optee_msg_args_total_size(main_header.num_params);
     let main_params = &blob[size_of::<OpteeMsgArgsHeader>()..main_size];
     let main_args = OpteeMsgArgs::from_header_and_raw_params(&main_header, main_params)?;
 
@@ -535,7 +535,7 @@ pub fn update_optee_msg_args(
 /// virtually contiguous in the normal world. All these address values must be page aligned.
 ///
 /// `pages_data` from [Linux](https://elixir.bootlin.com/linux/v6.18.2/source/drivers/tee/optee/smc_abi.c#L409)
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, Immutable)]
 #[repr(C)]
 struct ShmRefPagesData {
     pub pages_list: [u64; Self::PAGELIST_ENTRIES_PER_PAGE],

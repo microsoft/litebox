@@ -65,6 +65,29 @@ use litebox_common_linux::vmap::{
     PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
 use litebox_platform_multiplex::platform;
+use zerocopy::FromBytes;
+
+/// Allocate a zeroed `Box<T>` on the heap.
+///
+/// # Panics
+///
+/// Panics if `T` is a zero-sized type, since `alloc_zeroed` with a zero-sized
+/// layout is undefined behavior.
+fn box_new_zeroed<T: FromBytes>() -> alloc::boxed::Box<T> {
+    assert!(
+        core::mem::size_of::<T>() > 0,
+        "box_new_zeroed does not support zero-sized types"
+    );
+    let layout = core::alloc::Layout::new::<T>();
+    // Safety: layout has a non-zero size and correct alignment for T.
+    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) }.cast::<T>();
+    if ptr.is_null() {
+        alloc::alloc::handle_alloc_error(layout);
+    }
+    // Safety: ptr is a valid, zeroed, properly aligned heap allocation for T.
+    // T: FromBytes guarantees all-zero is a valid bit pattern.
+    unsafe { alloc::boxed::Box::from_raw(ptr) }
+}
 
 #[inline]
 fn align_down(address: usize, align: usize) -> usize {
@@ -176,10 +199,14 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     /// The caller should be aware that the given physical address might be concurrently written by
     /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
     /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
+    /// `FromBytes` is required to ensure T is valid for any bit pattern from untrusted physical memory.
     pub unsafe fn read_at_offset(
         &mut self,
         count: usize,
-    ) -> Result<alloc::boxed::Box<T>, PhysPointerError> {
+    ) -> Result<alloc::boxed::Box<T>, PhysPointerError>
+    where
+        T: FromBytes,
+    {
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
@@ -190,19 +217,18 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 PhysPageMapPermissions::READ,
             )?
         };
-        let mut buffer = core::mem::MaybeUninit::<T>::uninit();
+        let mut boxed = box_new_zeroed::<T>();
         // Fallible: another core may unmap this page concurrently.
         let result = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
-                buffer.as_mut_ptr().cast::<u8>(),
+                core::ptr::from_mut::<T>(boxed.as_mut()).cast::<u8>(),
                 guard.ptr.cast::<u8>(),
                 guard.size,
             )
         };
         debug_assert!(result.is_ok(), "fault reading from mapped physical page");
         result.map_err(|_| PhysPointerError::CopyFailed)?;
-        // Safety: memcpy_fallible fully initialized the buffer on success.
-        Ok(alloc::boxed::Box::new(unsafe { buffer.assume_init() }))
+        Ok(boxed)
     }
 
     /// Read a slice of values at the given offset from the physical pointer.
@@ -212,11 +238,15 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     /// The caller should be aware that the given physical address might be concurrently written by
     /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
     /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
+    /// `FromBytes` is required to ensure T is valid for any bit pattern from untrusted physical memory.
     pub unsafe fn read_slice_at_offset(
         &mut self,
         count: usize,
         values: &mut [T],
-    ) -> Result<(), PhysPointerError> {
+    ) -> Result<(), PhysPointerError>
+    where
+        T: FromBytes,
+    {
         if count
             .checked_add(values.len())
             .is_none_or(|end| end > self.count)
@@ -467,7 +497,7 @@ pub struct PhysConstPtr<T: Clone, const ALIGN: usize> {
     inner: PhysMutPtr<T, ALIGN>,
 }
 
-impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
+impl<T: Clone + FromBytes, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     /// Create a new `PhysConstPtr` from the given physical page array and offset.
     ///
     /// All addresses in `pages` should be valid and aligned to `ALIGN`, and `offset` should be smaller
@@ -513,7 +543,10 @@ impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     pub unsafe fn read_at_offset(
         &mut self,
         count: usize,
-    ) -> Result<alloc::boxed::Box<T>, PhysPointerError> {
+    ) -> Result<alloc::boxed::Box<T>, PhysPointerError>
+    where
+        T: FromBytes,
+    {
         unsafe { self.inner.read_at_offset(count) }
     }
 
@@ -528,7 +561,10 @@ impl<T: Clone, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
         &mut self,
         count: usize,
         values: &mut [T],
-    ) -> Result<(), PhysPointerError> {
+    ) -> Result<(), PhysPointerError>
+    where
+        T: FromBytes,
+    {
         unsafe { self.inner.read_slice_at_offset(count, values) }
     }
 }

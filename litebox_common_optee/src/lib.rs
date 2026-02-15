@@ -1287,11 +1287,18 @@ const OPTEE_MSG_RPC_CMD_LOAD_TA: u32 = 0;
 const OPTEE_MSG_RPC_CMD_RPMB: u32 = 1;
 const OPTEE_MSG_RPC_CMD_FS: u32 = 2;
 const OPTEE_MSG_RPC_CMD_GET_TIME: u32 = 3;
-const OPTEE_MSG_RPC_CMD_WAIT_QUEUE: u32 = 4;
+const OPTEE_MSG_RPC_CMD_NOTIFICATION: u32 = 4;
 const OPTEE_MSG_RPC_CMD_SUSPEND: u32 = 5;
-const OPTEE_MSG_RPC_CMD_SHM_ALLOC: u32 = 28;
-const OPTEE_MSG_RPC_CMD_SHM_FREE: u32 = 29;
-const OPTEE_MSG_RPC_CMD_NOTIFICATION: u32 = 30;
+const OPTEE_MSG_RPC_CMD_SHM_ALLOC: u32 = 6;
+const OPTEE_MSG_RPC_CMD_SHM_FREE: u32 = 7;
+const OPTEE_MSG_RPC_CMD_GPROF: u32 = 9;
+const OPTEE_MSG_RPC_CMD_SOCKET: u32 = 10;
+const OPTEE_MSG_RPC_CMD_FTRACE: u32 = 11;
+const OPTEE_MSG_RPC_CMD_PLUGIN: u32 = 12;
+const OPTEE_MSG_RPC_CMD_I2C_TRANSFER: u32 = 21;
+const OPTEE_MSG_RPC_CMD_RPMB_PROBE_RESET: u32 = 22;
+const OPTEE_MSG_RPC_CMD_RPMB_PROBE_NEXT: u32 = 23;
+const OPTEE_MSG_RPC_CMD_RPMB_PROBE_FRAMES: u32 = 24;
 
 /// RPC command IDs from `optee_os/core/include/optee_msg.h`
 ///
@@ -1302,24 +1309,38 @@ const OPTEE_MSG_RPC_CMD_NOTIFICATION: u32 = 30;
 #[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive)]
 #[repr(u32)]
 pub enum OpteeRpcCommand {
-    /// Load a Trusted Application binary.
+    /// Load a TA into memory, defined in tee-supplicant.
     LoadTa = OPTEE_MSG_RPC_CMD_LOAD_TA,
-    /// Replay Protected Memory Block (RPMB) access.
+    /// Reserved
     Rpmb = OPTEE_MSG_RPC_CMD_RPMB,
-    /// REE file-system access.
+    /// REE file-system access, defined in tee-supplicant.
     Fs = OPTEE_MSG_RPC_CMD_FS,
-    /// Get REE time.
+    /// Get time.
     GetTime = OPTEE_MSG_RPC_CMD_GET_TIME,
-    /// Wait-queue sleep/wake.
-    WaitQueue = OPTEE_MSG_RPC_CMD_WAIT_QUEUE,
+    /// Notification from/to secure world.
+    Notification = OPTEE_MSG_RPC_CMD_NOTIFICATION,
     /// Suspend execution.
     Suspend = OPTEE_MSG_RPC_CMD_SUSPEND,
-    /// Allocate shared memory for RPC output.
+    /// Allocate a piece of shared memory.
     ShmAlloc = OPTEE_MSG_RPC_CMD_SHM_ALLOC,
     /// Free previously allocated shared memory.
     ShmFree = OPTEE_MSG_RPC_CMD_SHM_FREE,
-    /// Asynchronous notification.
-    Notification = OPTEE_MSG_RPC_CMD_NOTIFICATION,
+    /// GProf support management commands.
+    Gprof = OPTEE_MSG_RPC_CMD_GPROF,
+    /// Socket commands.
+    Socket = OPTEE_MSG_RPC_CMD_SOCKET,
+    /// Ftrace support management commands.
+    Ftrace = OPTEE_MSG_RPC_CMD_FTRACE,
+    /// Plugin commands.
+    Plugin = OPTEE_MSG_RPC_CMD_PLUGIN,
+    /// I2C transfer commands.
+    I2cTransfer = OPTEE_MSG_RPC_CMD_I2C_TRANSFER,
+    /// Reset RPMB probing
+    RpmbProbeReset = OPTEE_MSG_RPC_CMD_RPMB_PROBE_RESET,
+    /// Probe next RPMB device
+    RpmbProbeNext = OPTEE_MSG_RPC_CMD_RPMB_PROBE_NEXT,
+    /// RPBM access
+    RpmbProbeFrames = OPTEE_MSG_RPC_CMD_RPMB_PROBE_FRAMES,
 }
 
 /// Temporary memory reference parameter
@@ -1523,10 +1544,11 @@ impl OpteeMsgParam {
 /// An unvalidated `num_params` from normal world memory could produce an oversized result,
 /// leading to out-of-bounds access on fixed-size arrays.
 /// See CVE-2022-46152 (OP-TEE OOB via unvalidated `num_params`).
-pub const fn optee_msg_arg_total_size(num_params: u32) -> usize {
+#[inline]
+pub const fn optee_msg_args_total_size(num_params: u32) -> usize {
     debug_assert!(
         num_params as usize <= OpteeMsgArgs::MAX_ARG_PARAM_COUNT,
-        "optee_msg_arg_total_size: num_params exceeds MAX_ARG_PARAM_COUNT"
+        "optee_msg_args_total_size: num_params exceeds MAX_ARG_PARAM_COUNT"
     );
     core::mem::size_of::<OpteeMsgArgsHeader>()
         + core::mem::size_of::<OpteeMsgParam>() * num_params as usize
@@ -1960,7 +1982,7 @@ impl From<&OpteeSmcArgsPage> for OpteeSmcArgs {
 }
 
 /// OP-TEE SMC call arguments.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes)]
 pub struct OpteeSmcArgs {
     args: [usize; Self::NUM_OPTEE_SMC_ARGS],
 }
@@ -2149,6 +2171,12 @@ const OPTEE_SMC_RETURN_ENOMEM: usize = 0x6;
 const OPTEE_SMC_RETURN_ENOTAVAIL: usize = 0x7;
 const OPTEE_SMC_RETURN_UNKNOWN_FUNCTION: usize = 0xffff_ffff;
 
+const OPTEE_SMC_RETURN_RPC_PREFIX: usize = 0xffff_0000;
+const OPTEE_SMC_RETURN_RPC_ALLOC: usize = OPTEE_SMC_RETURN_RPC_PREFIX;
+const OPTEE_SMC_RETURN_RPC_FREE: usize = OPTEE_SMC_RETURN_RPC_PREFIX | 0x2;
+const OPTEE_SMC_RETURN_RPC_FOREIGN_INTR: usize = OPTEE_SMC_RETURN_RPC_PREFIX | 0x4;
+const OPTEE_SMC_RETURN_RPC_CMD: usize = OPTEE_SMC_RETURN_RPC_PREFIX | 0x5;
+
 #[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, TryFromPrimitive)]
 #[repr(usize)]
@@ -2162,6 +2190,10 @@ pub enum OpteeSmcReturnCode {
     ENomem = OPTEE_SMC_RETURN_ENOMEM,
     ENotAvail = OPTEE_SMC_RETURN_ENOTAVAIL,
     UnknownFunction = OPTEE_SMC_RETURN_UNKNOWN_FUNCTION,
+    RpcAlloc = OPTEE_SMC_RETURN_RPC_ALLOC,
+    RpcFree = OPTEE_SMC_RETURN_RPC_FREE,
+    RpcForeignIntr = OPTEE_SMC_RETURN_RPC_FOREIGN_INTR,
+    RpcCmd = OPTEE_SMC_RETURN_RPC_CMD,
 }
 
 impl From<litebox_common_linux::vmap::PhysPointerError> for OpteeSmcReturnCode {
@@ -2334,9 +2366,9 @@ mod tests {
     fn test_optee_rpc_args_roundtrip() {
         use alloc::vec;
 
-        // ShmAlloc = 28
+        // ShmAlloc = 6
         let header = OpteeMsgArgsHeader {
-            cmd: 28,
+            cmd: 6,
             func: 0,
             session: 0,
             cancel_id: 0,
@@ -2356,7 +2388,7 @@ mod tests {
         assert_eq!(rpc_args.num_params, 2);
 
         let header_out = rpc_args.to_header();
-        assert_eq!(header_out.cmd, 28);
+        assert_eq!(header_out.cmd, 6);
         assert_eq!(header_out.func, 0);
         assert_eq!(header_out.session, 0);
         assert_eq!(header_out.cancel_id, 0);
@@ -2372,10 +2404,10 @@ mod tests {
 
     #[test]
     fn test_rpc_args_rejects_main_cmd() {
-        // Pick a cmd value that lies in the gap between Suspend (5) and ShmAlloc (28),
+        // Pick a cmd value that lies in the gap between Plugin (12) and I2C Transfer (21),
         // so it is not a valid OpteeRpcCommand variant.
         let header = OpteeMsgArgsHeader {
-            cmd: 6, // not a valid OpteeRpcCommand
+            cmd: 14, // not a valid OpteeRpcCommand
             func: 0,
             session: 0,
             cancel_id: 0,

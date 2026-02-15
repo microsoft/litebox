@@ -19,7 +19,7 @@ use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeRpcArgs, OpteeSmcArgs,
     OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams,
-    optee_msg_arg_total_size,
+    optee_msg_args_total_size,
 };
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
@@ -314,49 +314,42 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
         return *smc_args;
     };
-    match smc_result {
-        OpteeSmcResult::CallWithArg { msg_args, rpc_args } => {
-            let mut msg_args = *msg_args;
-            let rpc_args = rpc_args.map(|b| *b);
-            debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
-            let result = match msg_args.cmd {
-                OpenSession => {
-                    handle_open_session(&mut msg_args, msg_args_phys_addr, rpc_args.as_ref())
+    if let OpteeSmcResult::CallWithArg {
+        msg_args,
+        rpc_args: _,
+    } = smc_result
+    {
+        let mut msg_args = *msg_args;
+        debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
+        let result = match msg_args.cmd {
+            OpenSession => handle_open_session(&mut msg_args, msg_args_phys_addr),
+            InvokeCommand => handle_invoke_command(&mut msg_args, msg_args_phys_addr),
+            CloseSession => handle_close_session(&mut msg_args, msg_args_phys_addr),
+            _ => {
+                let r = handle_optee_msg_args(&msg_args);
+                if r.is_ok() {
+                    msg_args.ret = TeeResult::Success;
+                } else {
+                    msg_args.ret = TeeResult::BadParameters;
                 }
-                InvokeCommand => {
-                    handle_invoke_command(&mut msg_args, msg_args_phys_addr, rpc_args.as_ref())
-                }
-                CloseSession => {
-                    handle_close_session(&mut msg_args, msg_args_phys_addr, rpc_args.as_ref())
-                }
-                _ => {
-                    let r = handle_optee_msg_args(&msg_args);
-                    if r.is_ok() {
-                        msg_args.ret = TeeResult::Success;
-                    } else {
-                        msg_args.ret = TeeResult::BadParameters;
-                    }
-                    msg_args.ret_origin = TeeOrigin::Tee;
-                    let _ = write_non_ta_msg_args_to_normal_world(
-                        &msg_args,
-                        msg_args_phys_addr,
-                        rpc_args.as_ref(),
-                    );
-                    r
-                }
-            };
-
-            // Always switch back to base page table before returning to VTL0
-            // Safety: No user-space memory references are held after this point
-            unsafe { switch_to_base_page_table() };
-
-            match result {
-                Ok(()) => smc_args.set_return_code(OpteeSmcReturnCode::Ok),
-                Err(e) => smc_args.set_return_code(e),
+                msg_args.ret_origin = TeeOrigin::Tee;
+                let _ = write_non_ta_msg_args_to_normal_world(&msg_args, msg_args_phys_addr);
+                r
             }
-            *smc_args
+        };
+
+        // Always switch back to base page table before returning to VTL0
+        // Safety: No user-space memory references are held after this point
+        unsafe { switch_to_base_page_table() };
+
+        if let Err(e) = result {
+            smc_args.set_return_code(e);
+        } else {
+            smc_args.set_return_code(OpteeSmcReturnCode::Ok);
         }
-        _ => smc_result.into(),
+        *smc_args
+    } else {
+        smc_result.into()
     }
 }
 
@@ -372,7 +365,6 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
 fn handle_open_session(
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
-    rpc_args: Option<&OpteeRpcArgs>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let ta_req_info = decode_ta_request(msg_args).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
     if ta_req_info.entry_func != UteeEntryFunc::OpenSession {
@@ -393,7 +385,6 @@ fn handle_open_session(
             params,
             ta_uuid,
             &ta_req_info,
-            rpc_args,
         )
     } else {
         open_session_new_instance(
@@ -403,7 +394,6 @@ fn handle_open_session(
             ta_uuid,
             client_identity,
             &ta_req_info,
-            rpc_args,
         )
     }
 }
@@ -423,7 +413,6 @@ fn open_session_single_instance(
     params: &[litebox_common_optee::UteeParamOwned],
     ta_uuid: litebox_common_optee::TeeUuid,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
-    rpc_args: Option<&OpteeRpcArgs>,
 ) -> Result<(), OpteeSmcReturnCode> {
     // Use try_lock to avoid spinning - return EThreadLimit if TA is in use
     // The Linux driver will handle this by waiting and retrying
@@ -522,7 +511,6 @@ fn open_session_single_instance(
                     None, // No session ID on failure
                     Some(&ta_params),
                     Some(ta_req_info),
-                    rpc_args,
                 )?;
 
                 session_manager().remove_single_instance(&ta_uuid);
@@ -548,7 +536,6 @@ fn open_session_single_instance(
             None, // No session ID on failure
             Some(&ta_params),
             Some(ta_req_info),
-            rpc_args,
         )?;
 
         return Ok(());
@@ -566,7 +553,6 @@ fn open_session_single_instance(
         Some(runner_session_id),
         Some(&ta_params),
         Some(ta_req_info),
-        rpc_args,
     )?;
 
     debug_serial_println!(
@@ -588,7 +574,6 @@ fn open_session_new_instance(
     ta_uuid: litebox_common_optee::TeeUuid,
     client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
-    rpc_args: Option<&OpteeRpcArgs>,
 ) -> Result<(), OpteeSmcReturnCode> {
     // Check TA instance limit
     // TODO: consider better resource management strategy
@@ -673,7 +658,6 @@ fn open_session_new_instance(
             None, // No session ID on failure
             None,
             Some(ta_req_info),
-            rpc_args,
         )?;
 
         return Ok(());
@@ -740,7 +724,6 @@ fn open_session_new_instance(
             None, // No session ID on failure
             Some(&ta_params),
             Some(ta_req_info),
-            rpc_args,
         )?;
 
         // Tear down the page table - no session was registered
@@ -774,7 +757,6 @@ fn open_session_new_instance(
         Some(runner_session_id),
         Some(&ta_params),
         Some(ta_req_info),
-        rpc_args,
     )?;
 
     debug_serial_println!(
@@ -796,7 +778,6 @@ fn open_session_new_instance(
 fn handle_invoke_command(
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
-    rpc_args: Option<&OpteeRpcArgs>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let ta_req_info = decode_ta_request(msg_args).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
     if ta_req_info.entry_func != UteeEntryFunc::InvokeCommand {
@@ -893,7 +874,6 @@ fn handle_invoke_command(
             None,
             Some(&ta_params),
             Some(&ta_req_info),
-            rpc_args,
         )?;
 
         if is_last_session {
@@ -926,7 +906,6 @@ fn handle_invoke_command(
         None,
         Some(&ta_params),
         Some(&ta_req_info),
-        rpc_args,
     )?;
 
     Ok(())
@@ -940,7 +919,6 @@ fn handle_invoke_command(
 fn handle_close_session(
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
-    rpc_args: Option<&OpteeRpcArgs>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let ta_req_info = decode_ta_request(msg_args).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
     if ta_req_info.entry_func != UteeEntryFunc::CloseSession {
@@ -996,7 +974,6 @@ fn handle_close_session(
         None,
         None,
         None,
-        rpc_args,
     )?;
 
     // Clone the instance Arc before dropping the lock for later cleanup check
@@ -1063,8 +1040,8 @@ fn handle_close_session(
 
 /// Update msg_args with return values and write back to normal world memory.
 ///
-/// Serializes the main `OpteeMsgArgs` (and optional `OpteeRpcArgs`) into a contiguous byte
-/// blob and writes it to the VTL0 physical address.
+/// Serializes `OpteeMsgArgs` into a contiguous byte blob and writes it to
+/// the VTL0 physical address.
 ///
 /// Per OP-TEE OS semantics:
 /// - `TeeOrigin::Tee` is used when the error comes from TEE itself (panic/TARGET_DEAD)
@@ -1087,7 +1064,6 @@ fn write_msg_args_to_normal_world(
     session_id: Option<u32>,
     ta_params: Option<&UteeParams>,
     ta_req_info: Option<&litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>>,
-    rpc_args: Option<&OpteeRpcArgs>,
 ) -> Result<(), OpteeSmcReturnCode> {
     // Ensure we're on a task page table, not the base page table.
     // Accessing TA userspace memory requires the TA's page table to be active.
@@ -1113,28 +1089,15 @@ fn write_msg_args_to_normal_world(
         msg_args,
     )?;
 
-    // Compute total size to write to the normal world memory including optional RPC args
-    let main_size = optee_msg_arg_total_size(msg_args.num_params);
-    let total_size = if let Some(rpc) = rpc_args {
-        main_size + optee_msg_arg_total_size(rpc.num_params)
-    } else {
-        main_size
-    };
+    let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
 
-    let mut blob = vec![0u8; total_size];
-
+    let mut blob = vec![0u8; msg_args_size];
     blob[..size_of::<OpteeMsgArgsHeader>()].copy_from_slice(msg_args.to_header().as_bytes());
-    msg_args.write_raw_params(&mut blob[size_of::<OpteeMsgArgsHeader>()..main_size])?;
-
-    if let Some(rpc) = rpc_args {
-        blob[main_size..main_size + size_of::<OpteeMsgArgsHeader>()]
-            .copy_from_slice(rpc.to_header().as_bytes());
-        rpc.write_raw_params(&mut blob[main_size + size_of::<OpteeMsgArgsHeader>()..total_size])?;
-    }
+    msg_args.write_raw_params(&mut blob[size_of::<OpteeMsgArgsHeader>()..msg_args_size])?;
 
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
         msg_args_phys_addr.truncate(),
-        total_size,
+        msg_args_size,
     )?;
     // SAFETY: Writing msg_args back to normal world memory at a valid physical address.
     // The blob contains the serialized variable-length optee_msg_arg structure(s).
@@ -1142,42 +1105,58 @@ fn write_msg_args_to_normal_world(
     Ok(())
 }
 
-/// Write back `OpteeMsgArgs` (and optional `OpteeRpcArgs`) for non-TA commands
-/// (e.g., RegisterShm, UnregisterShm) that don't require TA userspace memory access.
+/// Write back `OpteeMsgArgs` for non-TA commands (e.g., RegisterShm, UnregisterShm) that
+/// don't require TA userspace memory access.
 ///
 /// Unlike [`write_msg_args_to_normal_world`], this function does not access TA userspace
 /// memory and can be called from the base page table context. It simply serializes the
-/// msg_args (which should already have `ret` / `ret_origin` set by the caller) and the
-/// rpc_args (preserved as-is) back to the normal world physical address.
+/// msg_args (which should already have `ret` / `ret_origin` set by the caller) back to
+/// the normal world physical address.
 #[inline]
 fn write_non_ta_msg_args_to_normal_world(
     msg_args: &OpteeMsgArgs,
     msg_args_phys_addr: u64,
-    rpc_args: Option<&OpteeRpcArgs>,
 ) -> Result<(), OpteeSmcReturnCode> {
-    let main_size = optee_msg_arg_total_size(msg_args.num_params);
-    let total_size = if let Some(rpc) = rpc_args {
-        main_size + optee_msg_arg_total_size(rpc.num_params)
-    } else {
-        main_size
-    };
+    let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
 
-    let mut blob = vec![0u8; total_size];
-
+    let mut blob = vec![0u8; msg_args_size];
     blob[..size_of::<OpteeMsgArgsHeader>()].copy_from_slice(msg_args.to_header().as_bytes());
-    msg_args.write_raw_params(&mut blob[size_of::<OpteeMsgArgsHeader>()..main_size])?;
-
-    if let Some(rpc) = rpc_args {
-        blob[main_size..main_size + size_of::<OpteeMsgArgsHeader>()]
-            .copy_from_slice(rpc.to_header().as_bytes());
-        rpc.write_raw_params(&mut blob[main_size + size_of::<OpteeMsgArgsHeader>()..total_size])?;
-    }
+    msg_args.write_raw_params(&mut blob[size_of::<OpteeMsgArgsHeader>()..msg_args_size])?;
 
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
         msg_args_phys_addr.truncate(),
-        total_size,
+        msg_args_size,
     )?;
     // SAFETY: Writing msg_args back to normal world memory at a valid physical address.
+    // The blob contains the serialized variable-length optee_msg_arg structure(s).
+    unsafe { ptr.write_slice_at_offset(0, &blob) }?;
+    Ok(())
+}
+
+/// Write `OpteeRpcArgs` to the normal world. Its write address is determined by
+/// `msg_args_phys_addr` and the size of `OpteeMsgArgs`.
+///
+/// Unlike [`write_msg_args_to_normal_world`], this function does not access TA userspace
+/// memory and can be called from the base page table context. It simply serializes the
+/// rpc_args and writes it to the normal world physical address.
+#[expect(dead_code)]
+#[inline]
+fn write_rpc_args_to_normal_world(
+    msg_args: &OpteeMsgArgs,
+    msg_args_phys_addr: u64,
+    rpc_args: &OpteeRpcArgs,
+) -> Result<(), OpteeSmcReturnCode> {
+    let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
+    let rpc_args_size = optee_msg_args_total_size(rpc_args.num_params);
+
+    let mut blob = vec![0u8; rpc_args_size];
+    blob[..size_of::<OpteeMsgArgsHeader>()].copy_from_slice(rpc_args.to_header().as_bytes());
+    rpc_args.write_raw_params(&mut blob[size_of::<OpteeMsgArgsHeader>()..rpc_args_size])?;
+
+    let rpc_pa: usize =
+        <u64 as litebox::utils::TruncateExt<usize>>::truncate(msg_args_phys_addr) + msg_args_size; // RPC args are placed right after the main msg_args blob
+    let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(rpc_pa, rpc_args_size)?;
+    // SAFETY: Writing rpc_args back to normal world memory at a valid physical address.
     // The blob contains the serialized variable-length optee_msg_arg structure(s).
     unsafe { ptr.write_slice_at_offset(0, &blob) }?;
     Ok(())
