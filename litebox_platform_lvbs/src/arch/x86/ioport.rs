@@ -3,8 +3,11 @@
 
 //! I/O Port-based serial communication
 
-use crate::mshv::ringbuffer::ringbuffer;
-use core::{arch::asm, fmt};
+use core::{
+    arch::asm,
+    fmt,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 use spin::{Mutex, Once};
 
 // LVBS uses COM PORT 2 for printing out debug messages
@@ -149,12 +152,30 @@ impl fmt::Write for ComPort {
     }
 }
 
+/// Function pointer hook for auxiliary print output (e.g., ring buffer).
+/// Set by the runner after initializing the ring buffer.
+static PRINT_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Register a print hook function that will be called with every `print()` invocation.
+///
+/// # Safety
+///
+/// `hook` must point to a function with signature `fn(fmt::Arguments)` that is safe to call
+/// from any context where `print()` is called.
+pub unsafe fn register_print_hook(hook: fn(fmt::Arguments)) {
+    PRINT_HOOK.store(hook as *mut (), Ordering::Release);
+}
+
 #[doc(hidden)]
 pub fn print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
     let _ = com().lock().write_fmt(args);
-    if let Some(rb) = ringbuffer() {
-        let _ = rb.lock().write_fmt(args);
+    let hook = PRINT_HOOK.load(Ordering::Acquire);
+    if !hook.is_null() {
+        // SAFETY: The caller of `register_print_hook` guarantees the pointer is a valid
+        // `fn(fmt::Arguments)`.
+        let f: fn(fmt::Arguments) = unsafe { core::mem::transmute(hook) };
+        f(args);
     }
 }
 
