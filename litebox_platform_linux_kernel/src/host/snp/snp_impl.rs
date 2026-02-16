@@ -219,7 +219,13 @@ fn exit_thread() -> ! {
 pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) -> ! {
     let tls = unsafe { &*get_tls() };
     match tls.shim.get().unwrap().syscall(pt_regs) {
-        litebox::shim::ContinueOperation::ResumeGuest => unsafe { crate::switch_to_guest(pt_regs) },
+        litebox::shim::ContinueOperation::ResumeGuest => {
+            // TODO: once shim supports handling SIGINT, we don't this.
+            if has_pending_signals() {
+                exit_thread();
+            }
+            unsafe { crate::switch_to_guest(pt_regs) }
+        },
         litebox::shim::ContinueOperation::ExitThread => exit_thread(),
     }
 }
@@ -572,7 +578,7 @@ impl HostInterface for HostSnpInterface {
             tv_sec: i64::try_from(t.as_secs()).unwrap(),
             tv_nsec: u64::from(t.subsec_nanos()),
         });
-        Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
+        match Self::syscalls(SyscallN::<6, NR_SYSCALL_FUTEX> {
             args: [
                 mutex.as_ptr() as u64,
                 FUTEX_WAIT as u64,
@@ -583,8 +589,18 @@ impl HostInterface for HostSnpInterface {
                 0,
                 0,
             ],
-        })
-        .map(|_| ())
+        }) {
+            Ok(_) => Ok(()),
+            Err(Errno::EINTR) => {
+                // TODO: temporary solution before shim supports SIGINT.
+                // We need to send a signal so that shim can observe it and stop blocking.
+                if has_pending_signals() {
+                    exit_thread();
+                }
+                Err(Errno::EINTR)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn read_from_stdin(buf: &mut [u8]) -> Result<usize, Errno> {
@@ -653,4 +669,12 @@ impl litebox::platform::CrngProvider for SnpLinuxKernel {
             b.copy_from_slice(&random.next_u64().to_ne_bytes()[..b.len()]);
         }
     }
+}
+
+const TIF_SIGPENDING: u64 = 1 << 2; /* signal pending */
+const TIF_NOTIFY_SIGNAL: u64 = 1 << 17; /* signal notifications exist */
+
+pub fn has_pending_signals() -> bool {
+    let vsbox_task = current().unwrap();
+    vsbox_task.flags & (TIF_SIGPENDING | TIF_NOTIFY_SIGNAL) != 0
 }
