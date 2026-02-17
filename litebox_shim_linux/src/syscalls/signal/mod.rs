@@ -21,7 +21,7 @@ use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
     shim::Exception,
     sync::Mutex,
     utils::ReinterpretUnsignedExt as _,
@@ -531,8 +531,26 @@ impl Task {
         !pending.is_empty()
     }
 
+    /// Returns whether the process-level alarm timer has expired.
+    pub(crate) fn alarm_expired(&self) -> bool {
+        self.process()
+            .alarm_deadline
+            .lock()
+            .is_some_and(|deadline| self.global.platform.now() >= deadline)
+    }
+
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
+        // Check for expired process-level alarm timer and enqueue SIGALRM if needed.
+        {
+            let mut alarm = self.process().alarm_deadline.lock();
+            if alarm.is_some_and(|deadline| self.global.platform.now() >= deadline) {
+                *alarm = None;
+                drop(alarm);
+                self.send_signal(Signal::SIGALRM, siginfo_kill(Signal::SIGALRM));
+            }
+        }
+
         loop {
             let mut pending = self.signals.pending.borrow_mut();
             let Some(signal) = pending.next(self.signals.blocked.get()) else {
