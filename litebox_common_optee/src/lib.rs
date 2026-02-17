@@ -1592,6 +1592,38 @@ pub struct OpteeMsgArgsHeader {
     pub num_params: u32,
 }
 
+/// Convert the header portion of this `OpteeMsgArgs` to an `OpteeMsgArgsHeader`.
+impl From<OpteeMsgArgs> for OpteeMsgArgsHeader {
+    fn from(args: OpteeMsgArgs) -> Self {
+        Self {
+            cmd: args.cmd as u32,
+            func: args.func,
+            session: args.session,
+            cancel_id: args.cancel_id,
+            pad: 0,
+            ret: args.ret.into(),
+            ret_origin: *args.ret_origin.value(),
+            num_params: args.num_params,
+        }
+    }
+}
+
+/// Convert the header portion of this `OpteeRpcArgs` to an `OpteeMsgArgsHeader`.
+impl From<OpteeRpcArgs> for OpteeMsgArgsHeader {
+    fn from(args: OpteeRpcArgs) -> Self {
+        Self {
+            cmd: args.cmd as u32,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: args.ret.into(),
+            ret_origin: *args.ret_origin.value(),
+            num_params: args.num_params,
+        }
+    }
+}
+
 /// `optee_msg_arg` from `optee_os/core/include/optee_msg.h`
 /// OP-TEE message argument structure that the normal world (or VTL0) OP-TEE driver and OP-TEE OS use to
 /// exchange messages.
@@ -1713,7 +1745,7 @@ impl OpteeMsgArgs {
     /// This is `TEE_NUM_PARAMS + 2` = 6, matching the Linux driver's `MAX_ARG_PARAM_COUNT`.
     pub const MAX_ARG_PARAM_COUNT: usize = TEE_NUM_PARAMS + 2;
 
-    /// Construct an `OpteeMsgArgs` from a zerocopy header and a raw parameter byte slice.
+    /// Construct an `OpteeMsgArgs` from an `OpteeMsgArgsHeader` and a raw parameter byte slice.
     ///
     /// `raw_params` must contain at least `header.num_params * size_of::<OpteeMsgParam>()` bytes.
     /// `header.num_params` must not exceed `MAX_ARG_PARAM_COUNT` (6).
@@ -1754,7 +1786,7 @@ impl OpteeMsgArgs {
             func: header.func,
             session: header.session,
             cancel_id: header.cancel_id,
-            pad: header.pad,
+            pad: 0,
             ret,
             ret_origin,
             num_params: header.num_params,
@@ -1762,38 +1794,24 @@ impl OpteeMsgArgs {
         })
     }
 
-    /// Convert the header portion of this `OpteeMsgArgs` back to an `OpteeMsgArgsHeader`.
-    pub fn to_header(&self) -> OpteeMsgArgsHeader {
-        OpteeMsgArgsHeader {
-            cmd: self.cmd as u32,
-            func: self.func,
-            session: self.session,
-            cancel_id: self.cancel_id,
-            pad: self.pad,
-            ret: self.ret as u32,
-            ret_origin: *self.ret_origin.value(),
-            num_params: self.num_params,
-        }
-    }
-
-    /// Serialize the params portion (up to `num_params`) as raw bytes into `buf`.
+    /// Serialize this `OpteeMsgArgs` into a raw byte buffer.
     ///
-    /// Re-validates `num_params <= MAX_ARG_PARAM_COUNT` before using as loop bound.
-    pub fn write_raw_params(&self, buf: &mut [u8]) -> Result<usize, OpteeSmcReturnCode> {
-        let num = self.num_params as usize;
-        if num > Self::MAX_ARG_PARAM_COUNT {
-            return Err(OpteeSmcReturnCode::EBadCmd);
-        }
-        let out_buf_len = num * size_of::<OpteeMsgParam>();
-        if buf.len() < out_buf_len {
+    /// The buffer should be large enough to hold the header plus `num_params` parameters
+    /// (as returned by [`optee_msg_args_total_size`]).
+    pub fn serialize(&self, buf: &mut [u8]) -> Result<(), OpteeSmcReturnCode> {
+        if buf.len() < optee_msg_args_total_size(self.num_params)
+            || self.num_params as usize > Self::MAX_ARG_PARAM_COUNT
+        {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
-        for i in 0..num {
-            let offset = i * size_of::<OpteeMsgParam>();
-            buf[offset..offset + size_of::<OpteeMsgParam>()]
-                .copy_from_slice(self.params[i].as_bytes());
-        }
-        Ok(out_buf_len)
+        let header = OpteeMsgArgsHeader::from(*self);
+        let header_bytes = header.as_bytes();
+        buf[..header_bytes.len()].copy_from_slice(header_bytes);
+        write_optee_msg_params_to_buf(
+            &self.params[..self.num_params as usize],
+            &mut buf[header_bytes.len()..],
+        );
+        Ok(())
     }
 }
 
@@ -1842,11 +1860,10 @@ impl OpteeRpcArgs {
     /// This is `NUM_RPC_PARAMS`, the count negotiated during `EXCHANGE_CAPABILITIES`.
     pub const MAX_RPC_ARG_PARAM_COUNT: usize = NUM_RPC_PARAMS;
 
-    /// Construct an `OpteeRpcArgs` from a zerocopy header and a raw parameter byte slice.
+    /// Construct an `OpteeRpcArgs` from an `OpteeMsgArgsHeader` and a raw parameter byte slice.
     ///
-    /// The `cmd` field is parsed as [`OpteeRpcCommand`]. Unlike
-    /// [`OpteeMsgArgs::from_header_and_raw_params`], `func`, `session`, and `cancel_id`
-    /// are stored as reserved zeros — they carry no meaning for RPC.
+    /// Unlike [`OpteeMsgArgs::from_header_and_raw_params`], `cmd` is parsed as [`OpteeRpcCommand`] and
+    /// `func`, `session`, and `cancel_id` are stored as zeros — they carry no meaning for RPC.
     pub fn from_header_and_raw_params(
         header: &OpteeMsgArgsHeader,
         raw_params: &[u8],
@@ -1891,38 +1908,24 @@ impl OpteeRpcArgs {
         })
     }
 
-    /// Convert back to an [`OpteeMsgArgsHeader`] for wire serialization.
+    /// Serialize this `OpteeRpcArgs` into a raw byte buffer.
     ///
-    /// The reserved fields (`func`, `session`, `cancel_id`) are written as 0.
-    pub fn to_header(&self) -> OpteeMsgArgsHeader {
-        OpteeMsgArgsHeader {
-            cmd: self.cmd as u32,
-            func: 0,
-            session: 0,
-            cancel_id: 0,
-            pad: 0,
-            ret: self.ret as u32,
-            ret_origin: *self.ret_origin.value(),
-            num_params: self.num_params,
-        }
-    }
-
-    /// Serialize the params portion (up to `num_params`) as raw bytes into `buf`.
-    pub fn write_raw_params(&self, buf: &mut [u8]) -> Result<usize, OpteeSmcReturnCode> {
-        let num = self.num_params as usize;
-        if num > Self::MAX_RPC_ARG_PARAM_COUNT {
-            return Err(OpteeSmcReturnCode::EBadCmd);
-        }
-        let out_buf_len = num * size_of::<OpteeMsgParam>();
-        if buf.len() < out_buf_len {
+    /// The buffer should be large enough to hold the header plus `num_params` parameters
+    /// (as returned by [`optee_msg_args_total_size`]).
+    pub fn serialize(&self, buf: &mut [u8]) -> Result<(), OpteeSmcReturnCode> {
+        if buf.len() < optee_msg_args_total_size(self.num_params)
+            || self.num_params as usize > Self::MAX_RPC_ARG_PARAM_COUNT
+        {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
-        for i in 0..num {
-            let offset = i * size_of::<OpteeMsgParam>();
-            buf[offset..offset + size_of::<OpteeMsgParam>()]
-                .copy_from_slice(self.params[i].as_bytes());
-        }
-        Ok(out_buf_len)
+        let header = OpteeMsgArgsHeader::from(*self);
+        let header_bytes = header.as_bytes();
+        buf[..header_bytes.len()].copy_from_slice(header_bytes);
+        write_optee_msg_params_to_buf(
+            &self.params[..self.num_params as usize],
+            &mut buf[header_bytes.len()..],
+        );
+        Ok(())
     }
 
     /// Access a parameter by index with bounds checking against `num_params`.
@@ -1946,9 +1949,47 @@ impl OpteeRpcArgs {
                 .ok_or(OpteeSmcReturnCode::EBadCmd)
         }
     }
+
+    /// Set a value parameter by index with bounds checking against `num_params`.
+    pub fn set_param_value(
+        &mut self,
+        index: usize,
+        value: OpteeMsgParamValue,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].data.copy_from_slice(value.as_bytes());
+            Ok(())
+        }
+    }
+
+    /// Set a tmem parameter by index with bounds checking against `num_params`.
+    pub fn set_param_tmem(
+        &mut self,
+        index: usize,
+        tmem: OpteeMsgParamTmem,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].data.copy_from_slice(tmem.as_bytes());
+            Ok(())
+        }
+    }
+
     // Note: RPC does not use rmem params. Rmem requires pre-registered shared memory
     // references from the normal-world driver, which is a main-messaging-path concept.
     // RPC uses tmem for buffer references since OP-TEE provides physical addresses directly.
+}
+
+/// Serialize the params portion as raw bytes into `buf`.
+#[inline]
+fn write_optee_msg_params_to_buf(params: &[OpteeMsgParam], buf: &mut [u8]) {
+    for (i, param) in params.iter().enumerate() {
+        let offset = i * size_of::<OpteeMsgParam>();
+        buf[offset..offset + size_of::<OpteeMsgParam>()].copy_from_slice(param.as_bytes());
+    }
 }
 
 /// A memory page to exchange OP-TEE SMC call arguments.
@@ -2348,18 +2389,11 @@ mod tests {
         assert_eq!(msg_args.session, 0xABCD);
         assert_eq!(msg_args.num_params, 3);
 
-        let header_out = msg_args.to_header();
+        let header_out = OpteeMsgArgsHeader::from(msg_args);
         assert_eq!(header_out.cmd, 1);
         assert_eq!(header_out.func, 0x1234);
         assert_eq!(header_out.session, 0xABCD);
         assert_eq!(header_out.num_params, 3);
-
-        let mut params_out = vec![0u8; 3 * size_of::<OpteeMsgParam>()];
-        let written = msg_args
-            .write_raw_params(&mut params_out)
-            .expect("expected Ok");
-        assert_eq!(written, 3 * size_of::<OpteeMsgParam>());
-        assert_eq!(&params_out[..written], &params_in[..written]);
     }
 
     #[test]
@@ -2387,19 +2421,12 @@ mod tests {
         assert_eq!(rpc_args.cmd, OpteeRpcCommand::ShmAlloc);
         assert_eq!(rpc_args.num_params, 2);
 
-        let header_out = rpc_args.to_header();
+        let header_out = OpteeMsgArgsHeader::from(rpc_args);
         assert_eq!(header_out.cmd, 6);
         assert_eq!(header_out.func, 0);
         assert_eq!(header_out.session, 0);
         assert_eq!(header_out.cancel_id, 0);
         assert_eq!(header_out.num_params, 2);
-
-        let mut params_out = vec![0u8; 2 * size_of::<OpteeMsgParam>()];
-        let written = rpc_args
-            .write_raw_params(&mut params_out)
-            .expect("should serialize");
-        assert_eq!(written, 2 * size_of::<OpteeMsgParam>());
-        assert_eq!(&params_out[..written], &params_in[..written]);
     }
 
     #[test]

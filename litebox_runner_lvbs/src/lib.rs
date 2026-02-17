@@ -8,7 +8,6 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
-use core::mem::size_of;
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
     mm::linux::PAGE_SIZE,
@@ -17,9 +16,8 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeRpcArgs, OpteeSmcArgs,
-    OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams,
-    optee_msg_args_total_size,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
+    OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
 };
 use litebox_platform_lvbs::{
     arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
@@ -48,7 +46,6 @@ use litebox_shim_optee::session::{
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;
 use spin::mutex::SpinMutex;
-use zerocopy::IntoBytes;
 
 /// # Panics
 ///
@@ -1090,10 +1087,8 @@ fn write_msg_args_to_normal_world(
     )?;
 
     let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
-
     let mut blob = vec![0u8; msg_args_size];
-    blob[..size_of::<OpteeMsgArgsHeader>()].copy_from_slice(msg_args.to_header().as_bytes());
-    msg_args.write_raw_params(&mut blob[size_of::<OpteeMsgArgsHeader>()..msg_args_size])?;
+    msg_args.serialize(&mut blob)?;
 
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
         msg_args_phys_addr.truncate(),
@@ -1118,10 +1113,8 @@ fn write_non_ta_msg_args_to_normal_world(
     msg_args_phys_addr: u64,
 ) -> Result<(), OpteeSmcReturnCode> {
     let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
-
     let mut blob = vec![0u8; msg_args_size];
-    blob[..size_of::<OpteeMsgArgsHeader>()].copy_from_slice(msg_args.to_header().as_bytes());
-    msg_args.write_raw_params(&mut blob[size_of::<OpteeMsgArgsHeader>()..msg_args_size])?;
+    msg_args.serialize(&mut blob)?;
 
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
         msg_args_phys_addr.truncate(),
@@ -1147,11 +1140,10 @@ fn write_rpc_args_to_normal_world(
     rpc_args: &OpteeRpcArgs,
 ) -> Result<(), OpteeSmcReturnCode> {
     let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
-    let rpc_args_size = optee_msg_args_total_size(rpc_args.num_params);
 
+    let rpc_args_size = optee_msg_args_total_size(rpc_args.num_params);
     let mut blob = vec![0u8; rpc_args_size];
-    blob[..size_of::<OpteeMsgArgsHeader>()].copy_from_slice(rpc_args.to_header().as_bytes());
-    rpc_args.write_raw_params(&mut blob[size_of::<OpteeMsgArgsHeader>()..rpc_args_size])?;
+    rpc_args.serialize(&mut blob)?;
 
     let rpc_pa: usize =
         <u64 as litebox::utils::TruncateExt<usize>>::truncate(msg_args_phys_addr) + msg_args_size; // RPC args are placed right after the main msg_args blob
