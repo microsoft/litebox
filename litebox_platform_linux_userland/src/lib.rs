@@ -926,6 +926,38 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     fn interrupt_thread(&self, thread: &Self::ThreadHandle) {
         thread.interrupt();
     }
+
+    fn schedule_interrupt(&self, delay: std::time::Duration) {
+        if delay.is_zero() {
+            return;
+        }
+
+        // Arm a one-shot ITIMER_REAL timer. When it fires, the kernel delivers
+        // SIGALRM to a guest thread (non-guest threads block SIGALRM), and
+        // `interrupt_signal_handler` re-enters the shim via `interrupt_callback`.
+        let secs = delay.as_secs().cast_signed();
+        let usecs = libc::suseconds_t::from(delay.subsec_micros());
+        let itimer = libc::itimerval {
+            it_interval: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            it_value: libc::timeval {
+                tv_sec: secs,
+                tv_usec: usecs,
+            },
+        };
+        // Safety: setitimer with valid arguments is safe. libc crate doesn't
+        // expose a wrapper, so we call via syscall().
+        unsafe {
+            libc::syscall(
+                libc::SYS_setitimer,
+                libc::ITIMER_REAL,
+                &raw const itimer,
+                std::ptr::null_mut::<libc::itimerval>(),
+            );
+        }
+    }
 }
 
 impl litebox::platform::RawMutexProvider for LinuxUserland {
@@ -1754,6 +1786,23 @@ fn register_exception_handlers() {
                     &mut NEXT_SA[sig.reinterpret_as_unsigned() as usize],
                 );
             }
+        }
+
+        // Register SIGALRM with `interrupt_signal_handler` for `schedule_interrupt`.
+        // Non-guest threads block SIGALRM, so it always fires on a guest thread.
+        // The handler re-enters the shim, which checks the alarm deadline and
+        // delivers guest SIGALRM via `process_signals()`.
+        unsafe {
+            let mut sa: libc::sigaction = core::mem::zeroed();
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            sa.sa_sigaction = interrupt_signal_handler as *const () as usize;
+            let mut old_sa = core::mem::zeroed();
+            sigaction(libc::SIGALRM, Some(&sa), &mut old_sa);
+            assert_eq!(
+                old_sa.sa_sigaction,
+                libc::SIG_DFL,
+                "signal SIGALRM handler already installed",
+            );
         }
     });
 }

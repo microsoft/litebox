@@ -125,6 +125,10 @@ pub(crate) struct Process {
     inner: Mutex<Platform, ProcessInner>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits,
+    /// Process-wide alarm timer deadline. When this instant passes, SIGALRM is
+    /// delivered to an arbitrary thread in the process.
+    pub(crate) alarm_deadline:
+        Mutex<Platform, Option<<Platform as litebox::platform::TimeProvider>::Instant>>,
 }
 
 /// The locked portion of the process state.
@@ -160,6 +164,7 @@ impl Process {
                 threads: BTreeMap::from_iter([(pid, remote)]),
             }),
             limits: ResourceLimits::default(),
+            alarm_deadline: Mutex::new(None),
         }
     }
 
@@ -1141,6 +1146,53 @@ impl<FS: ShimFS> Task<FS> {
             tloc.write_at_offset(0, seconds).ok_or(Errno::EFAULT)?;
         }
         Ok(seconds)
+    }
+
+    /// Handle syscall `alarm`.
+    ///
+    /// Sets a process-wide timer to deliver SIGALRM after `seconds` seconds. If
+    /// `seconds` is 0, any pending alarm is cancelled. Returns the number of
+    /// seconds remaining on a previously set alarm (rounded up), or 0 if none
+    /// was set.
+    ///
+    /// The alarm is per-process: all threads share the same alarm timer, and
+    /// SIGALRM is delivered to whichever thread next enters the shim. A
+    /// platform-level timer interrupt is also scheduled so that the signal is
+    /// delivered even if the calling thread is running in guest userspace.
+    pub(crate) fn sys_alarm(&self, seconds: u32) -> u32 {
+        let now = self.global.platform.now();
+        let mut alarm = self.process().alarm_deadline.lock();
+
+        // Get remaining seconds from any previous alarm (rounded up per Linux semantics).
+        let remaining = match *alarm {
+            Some(deadline) => {
+                match deadline.checked_duration_since(&now) {
+                    Some(dur) if !dur.is_zero() => {
+                        let secs = dur.as_secs();
+                        let extra = u64::from(dur.subsec_nanos() > 0);
+                        // Saturate to u32::MAX to avoid truncation.
+                        u32::try_from(secs + extra).unwrap_or(u32::MAX)
+                    }
+                    _ => 0, // Deadline already passed or is now.
+                }
+            }
+            None => 0,
+        };
+
+        // Set new alarm or cancel.
+        if seconds > 0 {
+            let delay = Duration::from_secs(u64::from(seconds));
+            *alarm = now.checked_add(delay);
+
+            // Schedule a platform-level timer to interrupt a thread
+            // when the alarm fires, ensuring SIGALRM delivery even if the
+            // guest is executing in userspace.
+            self.global.platform.schedule_interrupt(delay);
+        } else {
+            *alarm = None;
+        }
+
+        remaining
     }
 
     /// Handle syscall `getpid`.
