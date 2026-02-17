@@ -45,6 +45,6 @@ impl Task {
 
 impl litebox::event::wait::CheckForInterrupt for Task {
     fn check_for_interrupt(&self) -> bool {
-        self.is_exiting() || self.has_pending_signals()
+        self.is_exiting() || self.has_pending_signals() || self.alarm_expired()
     }
 }
