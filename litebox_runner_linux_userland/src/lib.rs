@@ -275,6 +275,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(5);
             pin_thread_to_cpu(0);
 
+            // Block SIGALRM on this non-guest thread so that setitimer(ITIMER_REAL)
+            // only delivers SIGALRM to guest threads, which have the proper signal
+            // handler context to re-enter the shim.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&raw mut set);
+                libc::sigaddset(&raw mut set, libc::SIGALRM);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+            }
+
             while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
                 let timeout = loop {
                     match shim.perform_network_interaction() {

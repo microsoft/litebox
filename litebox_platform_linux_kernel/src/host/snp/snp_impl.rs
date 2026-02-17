@@ -225,7 +225,7 @@ pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) -> ! {
                 exit_thread();
             }
             unsafe { crate::switch_to_guest(pt_regs) }
-        },
+        }
         litebox::shim::ContinueOperation::ExitThread => exit_thread(),
     }
 }

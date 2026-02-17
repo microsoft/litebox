@@ -95,6 +95,23 @@ pub trait ThreadProvider: RawPointerProvider {
     /// [`EnterShim`]: crate::shim::EnterShim
     /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
     fn interrupt_thread(&self, thread: &Self::ThreadHandle);
+
+    /// Schedule a process-wide interrupt after `delay`.
+    ///
+    /// After `delay` has elapsed, [`EnterShim::interrupt`] should be called on an
+    /// arbitrary guest thread so that pending signals such as SIGALRM can be processed.
+    ///
+    /// A zero `delay` is a no-op.
+    ///
+    /// This is a best-effort operation. The default implementation does
+    /// nothing, meaning the signal will only be delivered when a thread next
+    /// enters the shim via a syscall or exception. Platforms that support
+    /// timer-based interruption should override this method.
+    ///
+    /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
+    fn schedule_interrupt(&self, _delay: core::time::Duration) {
+        // Default: no-op. The alarm will be checked on the next syscall entry.
+    }
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the

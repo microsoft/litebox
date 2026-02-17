@@ -1126,6 +1126,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
+            SyscallRequest::Alarm { seconds } => Ok(self.sys_alarm(seconds) as usize),
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)
