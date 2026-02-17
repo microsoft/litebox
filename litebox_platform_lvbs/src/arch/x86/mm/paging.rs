@@ -12,7 +12,7 @@ use x86_64::{
             PageTableFlags, PhysFrame, Size4KiB, Translate,
             frame::PhysFrameRange,
             mapper::{
-                FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
+                CleanUp, FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
                 UnmapError as X64UnmapError,
             },
         },
@@ -372,50 +372,62 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// non-contiguous physical pages to a contiguous virtual address range.
     ///
     /// # Arguments
-    /// * `frames` - Slice of physical frames to map (may be non-contiguous)
-    /// * `base_va` - Starting virtual address for the mapping
-    /// * `flags` - Page table flags to apply to all mappings
+    /// - `frames` - Slice of physical frames to map (non-contiguous, no duplicate)
+    /// - `base_va` - Starting virtual address for the mapping
+    /// - `flags` - Page table flags to apply to all mappings
     ///
     /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err(MapToError::PageAlreadyMapped)` if any VA is already mapped
-    /// * `Err(MapToError::FrameAllocationFailed)` if page table allocation fails
+    /// - `Ok(*mut u8)` — pointer to the start of the mapped virtual range
+    /// - `Err(MapToError::PageAlreadyMapped)` if any VA is already mapped
+    /// - `Err(MapToError::FrameAllocationFailed)` if page table allocation fails
     ///
     /// # Behavior
     /// - Any existing mapping is treated as an error (shared mappings not supported)
     /// - On error, all pages mapped by this call are unmapped (atomic)
-    pub(crate) fn map_non_contiguous_phys_pages(
+    pub(crate) fn map_non_contiguous_phys_frames(
         &self,
         frames: &[PhysFrame<Size4KiB>],
         base_va: VirtAddr,
         flags: PageTableFlags,
-    ) -> Result<(), MapToError<Size4KiB>> {
+    ) -> Result<*mut u8, MapToError<Size4KiB>> {
         let mut allocator = PageTableAllocator::<M>::new();
         let mut mapped_count: usize = 0;
 
         let mut inner = self.inner.lock();
-        for (i, &target_frame) in frames.iter().enumerate() {
-            let va = base_va + (i as u64) * Size4KiB::SIZE;
-            let page: Page<Size4KiB> = Page::containing_address(va);
 
-            // Without shared mapping support, any existing mapping is an error
-            match inner.translate(page.start_address()) {
+        if !base_va.is_aligned(Size4KiB::SIZE) {
+            return Err(MapToError::FrameAllocationFailed);
+        }
+
+        // Quick pre-scan: check all target VAs for existing mappings before
+        // modifying any page table entries. This avoids expensive rollback when
+        // an overlap is detected partway through.
+        for i in 0..frames.len() {
+            let va = base_va + (i as u64) * Size4KiB::SIZE;
+            match inner.translate(va) {
                 TranslateResult::Mapped { frame, .. } => {
-                    // Page already mapped - rollback and fail
-                    Self::rollback_mapped_pages(&mut inner, base_va, mapped_count);
-                    // Convert MappedFrame to PhysFrame for the error
                     let existing_frame =
                         PhysFrame::<Size4KiB>::containing_address(frame.start_address());
                     return Err(MapToError::PageAlreadyMapped(existing_frame));
                 }
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(_) => {
-                    Self::rollback_mapped_pages(&mut inner, base_va, mapped_count);
                     return Err(MapToError::FrameAllocationFailed);
                 }
             }
+        }
 
-            let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        // All VAs verified as unmapped — proceed with mapping.
+        let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        for (i, &target_frame) in frames.iter().enumerate() {
+            let va = base_va + (i as u64) * Size4KiB::SIZE;
+            let page: Page<Size4KiB> = Page::containing_address(va);
+
+            // Note: Since we lock the entire page table for the duration of this function (`self.inner.lock()`),
+            // there should be no concurrent modifications to the page table. If we allow concurrent mappings
+            // in the future, we should re-check the VA here before mapping and return an error
+            // if it is no longer unmapped.
+
             match unsafe {
                 inner.map_to_with_table_flags(
                     page,
@@ -432,20 +444,25 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     }
                 }
                 Err(e) => {
-                    Self::rollback_mapped_pages(&mut inner, base_va, mapped_count);
+                    Self::rollback_mapped_pages(&mut inner, base_va, mapped_count, &mut allocator);
                     return Err(e);
                 }
             }
         }
 
-        Ok(())
+        Ok(base_va.as_mut_ptr())
     }
 
-    /// Rollback helper: unmap the first `count` pages starting from `base_va`.
+    /// Rollback helper: unmap the first `count` pages starting from `base_va`
+    /// and free any intermediate page-table frames (P1/P2/P3) that became empty.
+    ///
+    /// Note: The caller must already hold the page table lock (`self.inner`).
+    /// This function accepts the locked `MappedPageTable` directly.
     fn rollback_mapped_pages(
         inner: &mut MappedPageTable<'_, FrameMapping<M>>,
         base_va: VirtAddr,
         count: usize,
+        allocator: &mut PageTableAllocator<M>,
     ) {
         for i in 0..count {
             let va = base_va + (i as u64) * Size4KiB::SIZE;
@@ -454,6 +471,20 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 && FLUSH_TLB
             {
                 fl.flush();
+            }
+        }
+
+        // Free any intermediate page-table frames (P1/P2/P3) that are now
+        // empty after unmapping.
+        if count > 0 {
+            let start = Page::<Size4KiB>::containing_address(base_va);
+            let end = Page::<Size4KiB>::containing_address(
+                base_va + ((count - 1) as u64) * Size4KiB::SIZE,
+            );
+            // Safety: the vmap VA range is used exclusively by this page table
+            // and all leaf entries have just been unmapped above.
+            unsafe {
+                inner.clean_up_addr_range(Page::range_inclusive(start, end), allocator);
             }
         }
     }
