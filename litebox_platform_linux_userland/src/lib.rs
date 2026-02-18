@@ -308,6 +308,17 @@ impl LinuxUserland {
 
 impl litebox::platform::Provider for LinuxUserland {}
 
+impl litebox::platform::SignalProvider for LinuxUserland {
+    fn take_pending_signals(&self, mut f: impl FnMut(litebox::shim::Signal)) {
+        let sigs = take_pending_host_signals();
+        for sig in sigs {
+            if let Ok(signal) = sig.try_into() {
+                f(signal);
+            }
+        }
+    }
+}
+
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates or returns.
@@ -949,7 +960,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 tv_usec: 0,
             },
             it_value: libc::timeval {
-                tv_sec: secs,
+                tv_sec: secs.truncate(),
                 tv_usec: usecs,
             },
         };
@@ -1025,23 +1036,20 @@ impl RawMutex {
         }
 
         // We wait on the futex, with a timeout if needed
-        loop {
-            break match futex_timeout(
-                &self.inner,
-                FutexOperation::Wait,
-                /* expected value */ val,
-                timeout,
-                /* ignored */ None,
-            ) {
-                Ok(0) => Ok(UnblockedOrTimedOut::Unblocked),
-                Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
-                Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
-                Err(syscalls::Errno::EINTR) => continue,
-                Err(e) => {
-                    panic!("Unexpected errno={e} for FUTEX_WAIT")
-                }
-                _ => unreachable!(),
-            };
+        match futex_timeout(
+            &self.inner,
+            FutexOperation::Wait,
+            /* expected value */ val,
+            timeout,
+            /* ignored */ None,
+        ) {
+            Ok(0) | Err(syscalls::Errno::EINTR) => Ok(UnblockedOrTimedOut::Unblocked),
+            Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
+            Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
+            Err(e) => {
+                panic!("Unexpected errno={e} for FUTEX_WAIT")
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -1671,13 +1679,7 @@ extern "C-unwind" fn exception_handler(
 }
 
 extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
-    thread_ctx.call_shim(|shim, ctx| {
-        let sigs = take_pending_host_signals();
-        for sig in sigs.iter() {
-            shim.signal(sig.try_into().unwrap());
-        }
-        shim.interrupt(ctx)
-    });
+    thread_ctx.call_shim(|shim, ctx| shim.interrupt(ctx));
 }
 
 /// Calls `f` in order to call into a shim entrypoint.

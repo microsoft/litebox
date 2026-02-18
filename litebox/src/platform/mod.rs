@@ -50,6 +50,22 @@ pub trait Provider:
 {
 }
 
+/// Provider for consuming platform-originating signals.
+///
+/// Platforms can record signals (e.g., `SIGALRM` from an interval timer) in
+/// per-thread storage. The shim should call [`SignalProvider::take_pending_signals`]
+/// to consume and forward them before re-entering the guest.
+pub trait SignalProvider {
+    /// Atomically take all pending platform signals for the current thread,
+    /// passing each one to `f`.
+    ///
+    /// After this call returns, the platform will have no pending signals for
+    /// the calling thread (until new signals arrive).
+    ///
+    /// The default implementation does nothing (no signals).
+    fn take_pending_signals(&self, _f: impl FnMut(crate::shim::Signal)) {}
+}
+
 /// Thread management provider.
 pub trait ThreadProvider: RawPointerProvider {
     /// Execution context for the current thread of the guest program.
