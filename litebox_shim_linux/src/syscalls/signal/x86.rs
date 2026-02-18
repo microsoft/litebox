@@ -69,21 +69,21 @@ pub(super) fn sp(ctx: &PtRegs) -> usize {
     ctx.esp
 }
 
-pub(super) fn get_signal_frame(sp: usize, action: &SigAction) -> Option<usize> {
+pub(super) fn get_signal_frame(sp: usize, action: &SigAction) -> usize {
     let mut frame_addr = sp;
 
     // Space for the signal frame.
     if action.flags.contains(SaFlags::SIGINFO) {
-        frame_addr = frame_addr.checked_sub(core::mem::size_of::<SignalFrameRt>())?;
+        frame_addr = frame_addr.wrapping_sub(core::mem::size_of::<SignalFrameRt>());
     } else {
-        frame_addr = frame_addr.checked_sub(core::mem::size_of::<SignalFrame>())?;
+        frame_addr = frame_addr.wrapping_sub(core::mem::size_of::<SignalFrame>());
     }
 
     // Align the frame (offset by 4 bytes for return address).
     frame_addr &= !15;
-    frame_addr = frame_addr.checked_sub(4)?;
+    frame_addr = frame_addr.wrapping_sub(4);
 
-    Some(frame_addr)
+    frame_addr
 }
 
 impl SignalState {

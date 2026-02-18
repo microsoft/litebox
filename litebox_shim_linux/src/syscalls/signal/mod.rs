@@ -359,7 +359,7 @@ impl SignalState {
             sp
         };
 
-        let frame_addr = arch::get_signal_frame(sp, action).ok_or(DeliverFault)?;
+        let frame_addr = arch::get_signal_frame(sp, action);
 
         if (switch_stacks || on_alt_stack) && !is_on_stack(&altstack, frame_addr) {
             return Err(DeliverFault);
