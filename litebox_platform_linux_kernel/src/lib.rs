@@ -15,8 +15,8 @@ use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider,
-    Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider,
-    UnblockedOrTimedOut,
+    Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutexProvider, SignalProvider,
+    TimeProvider, UnblockedOrTimedOut,
 };
 use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
@@ -85,6 +85,7 @@ impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, H
 }
 
 impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
+impl<Host: HostInterface> SignalProvider for LinuxKernel<Host> {}
 
 // TODO: implement pointer validation to ensure the pointers are in user space.
 type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
@@ -195,10 +196,10 @@ impl<Host: HostInterface> RawMutex<Host> {
         timeout: Option<core::time::Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         match Host::block_or_maybe_timeout(&self.inner, val, timeout) {
-            Ok(()) => {
+            Ok(()) | Err(Errno::EINTR) => {
                 return Ok(UnblockedOrTimedOut::Unblocked);
             }
-            Err(Errno::EAGAIN | Errno::EINTR) => {
+            Err(Errno::EAGAIN) => {
                 // If the futex value does not match val, then the call fails
                 // immediately with the error EAGAIN.
                 return Err(ImmediatelyWokenUp);

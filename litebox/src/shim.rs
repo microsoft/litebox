@@ -70,9 +70,6 @@ pub trait EnterShim {
     /// handler instead of this one.
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation;
 
-    /// Queue a signal to be delivered
-    fn signal(&self, signal: Signal);
-
     /// Re-enter a thread of a guest program or library that is already loaded
     /// in memory.
     ///

@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
+#include <poll.h>
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -156,6 +157,51 @@ int test_alarm_fires_in_userspace(void) {
     return 0;
 }
 
+// Test: SIGALRM should interrupt poll() blocked on a pipe with no data.
+int test_alarm_interrupts_poll(void) {
+    int pipefd[2];
+    TEST_ASSERT(pipe(pipefd) == 0, "pipe failed");
+
+    struct sigaction sa;
+    sa.sa_handler = alarm_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGALRM, &sa, NULL) == -1) {
+        perror("sigaction");
+        return 1;
+    }
+    alarm_count = 0;
+
+    struct pollfd fds[1];
+    fds[0].fd = pipefd[0];
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+
+    alarm(1);  // Fire SIGALRM in 1 second
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    int ret = poll(fds, 1, 60000);  // 60s timeout — should be interrupted long before
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    long elapsed_ms = (end.tv_sec - start.tv_sec) * 1000 +
+                      (end.tv_nsec - start.tv_nsec) / 1000000;
+
+    TEST_ASSERT(ret == -1 && errno == EINTR,
+                "poll() should return -1/EINTR when interrupted by SIGALRM");
+    TEST_ASSERT(alarm_count == 1, "alarm handler should have fired exactly once");
+    TEST_ASSERT(elapsed_ms < 5000,
+                "poll() should have been interrupted within ~1s, not blocked for 60s");
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+    printf("alarm_interrupts_poll: PASS (elapsed=%ldms)\n", elapsed_ms);
+    return 0;
+}
+
 int main(void) {
     printf("Starting alarm tests...\n");
 
@@ -165,7 +211,7 @@ int main(void) {
     if (test_alarm_fires() != 0) return 1;
     if (test_alarm_cancel() != 0) return 1;
     if (test_alarm_fires_in_userspace() != 0) return 1;
-
+    if (test_alarm_interrupts_poll() != 0) return 1;
     printf("All alarm tests passed!\n");
     return 0;
 }
