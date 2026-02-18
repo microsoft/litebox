@@ -521,3 +521,82 @@ fn test_tun_and_runner_with_iperf3() {
     has_started.store(true, std::sync::atomic::Ordering::Relaxed);
     runner.run();
 }
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "reason"]
+fn test_runner_with_unixbench() {
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    // download and compile unixbench if not exists
+    let unixbench_url = "https://github.com/kdlucas/byte-unixbench/archive/refs/tags/v6.0.0.zip";
+    let unixbench_dir =
+        std::path::Path::new(out_dir.as_str()).join("byte-unixbench-6.0.0/UnixBench");
+    println!("unixbench_dir: {}", unixbench_dir.to_str().unwrap());
+    if !unixbench_dir.exists() {
+        let zip_path = std::path::Path::new(out_dir.as_str()).join("unixbench.zip");
+        if !zip_path.exists() {
+            let output = std::process::Command::new("curl")
+                .args(["-L", "-o"])
+                .arg(zip_path.to_str().unwrap())
+                .arg(unixbench_url)
+                .output()
+                .expect("Failed to download unixbench");
+            assert!(
+                output.status.success(),
+                "failed to download unixbench {:?}",
+                std::str::from_utf8(output.stderr.as_slice()).unwrap()
+            );
+        }
+        let output = std::process::Command::new("unzip")
+            .arg(zip_path.to_str().unwrap())
+            .arg("-d")
+            .arg(out_dir.as_str())
+            .output()
+            .expect("Failed to unzip unixbench");
+        assert!(
+            output.status.success(),
+            "failed to unzip unixbench {:?}",
+            std::str::from_utf8(output.stderr.as_slice()).unwrap()
+        );
+        let output = std::process::Command::new("make")
+            .current_dir(&unixbench_dir)
+            .output()
+            .expect("Failed to compile unixbench");
+        assert!(
+            output.status.success(),
+            "failed to compile unixbench {:?}",
+            std::str::from_utf8(output.stderr.as_slice()).unwrap()
+        );
+    }
+
+    let tests = [
+        ("pgms/dhry2reg", vec!["5"]), // requires `alarm`
+        ("pgms/whetstone-double", vec![]),
+        // ("pgms/execl", vec!["5"]), // duration reduced from 30 to 5; need to fix path
+        // (
+        //     "pgms/fstime",
+        //     vec!["-c", "-t", "5", "-b", "1024", "-m", "2000"],
+        // ), // duration reduced from 30 to 5; requires `sync`
+        ("pgms/pipe", vec!["5"]), // requires `alarm`
+        // // ("pgms/context1", vec!["5"]), // requires `alarm`, `fork`
+        // // ("pgms/spawn", vec!["5"]), // requires `fork`
+        // ("pgms/syscall", vec!["5"]), // requires `alarm`, `umask`
+        ("pgms/hanoi", vec!["5"]),   // requires `alarm`
+        ("pgms/arithoh", vec!["5"]), // requires `alarm`
+    ];
+    for (path, args) in tests {
+        let path = unixbench_dir.join(path);
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("failed to get file stem");
+        Runner::new(
+            Backend::Rewriter,
+            &path,
+            &format!("unixbench_{stem}_rewriter"),
+        )
+        .args(args)
+        .env(format!("UB_BINDIR={}", unixbench_dir.join("pgms").to_str().unwrap()).as_str())
+        .run();
+    }
+}
