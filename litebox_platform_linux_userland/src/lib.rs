@@ -389,6 +389,9 @@ in_guest:
 .globl interrupt
 interrupt:
     .byte 0
+    .align 4
+pending_host_signals:
+    .long 0
     "
 );
 
@@ -798,6 +801,9 @@ in_guest:
 .globl interrupt
 interrupt:
     .byte 0
+    .align 4
+pending_host_signals:
+    .long 0
     "
 );
 
@@ -958,6 +964,37 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
             );
         }
     }
+}
+
+fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
+    // Atomically swap the per-thread pending signals with zero.
+    // `xchg` has an implicit lock prefix so it is safe against signal
+    // handler writes on this thread.
+    // Only the low 32 bits are used (covers traditional signals 1-31).
+    let lo: u32;
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // In host context on x86_64, fs = host TLS.
+            core::arch::asm!(
+                "xor {tmp:e}, {tmp:e}",
+                "xchg DWORD PTR fs:pending_host_signals@tpoff, {tmp:e}",
+                tmp = out(reg) lo,
+                options(nostack)
+            );
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            // In host context on x86, gs = host TLS.
+            core::arch::asm!(
+                "xor {tmp}, {tmp}",
+                "xchg DWORD PTR gs:pending_host_signals@ntpoff, {tmp}",
+                tmp = out(reg) lo,
+                options(nostack)
+            );
+        }
+    }
+    litebox_common_linux::signal::SigSet::from_u64(lo as u64)
 }
 
 impl litebox::platform::RawMutexProvider for LinuxUserland {
@@ -1634,7 +1671,13 @@ extern "C-unwind" fn exception_handler(
 }
 
 extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
-    thread_ctx.call_shim(|shim, ctx| shim.interrupt(ctx));
+    thread_ctx.call_shim(|shim, ctx| {
+        let sigs = take_pending_host_signals();
+        for sig in sigs.iter() {
+            shim.signal(sig.try_into().unwrap());
+        }
+        shim.interrupt(ctx)
+    });
 }
 
 /// Calls `f` in order to call into a shim entrypoint.
@@ -1794,21 +1837,27 @@ fn register_exception_handlers() {
             }
         }
 
-        // Register SIGALRM with `interrupt_signal_handler` for `schedule_interrupt`.
-        // Non-guest threads block SIGALRM, so it always fires on a guest thread.
-        // The handler re-enters the shim, which checks the alarm deadline and
-        // delivers guest SIGALRM via `process_signals()`.
-        unsafe {
-            let mut sa: libc::sigaction = core::mem::zeroed();
-            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-            sa.sa_sigaction = interrupt_signal_handler as *const () as usize;
-            let mut old_sa = core::mem::zeroed();
-            sigaction(libc::SIGALRM, Some(&sa), &mut old_sa);
-            assert_eq!(
-                old_sa.sa_sigaction,
-                libc::SIG_DFL,
-                "signal SIGALRM handler already installed",
-            );
+        // Note that non-guest threads should block these signals, so it always fires on a guest thread.
+        let traditional_signals = &[
+            libc::SIGINT,
+            libc::SIGALRM,
+        ];
+        for &sig in traditional_signals {
+            unsafe {
+                let mut sa: libc::sigaction = core::mem::zeroed();
+                sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+                sa.sa_sigaction = interrupt_signal_handler as *const () as usize;
+                // Block the interrupt signal while handling signals
+                libc::sigaddset(&raw mut sa.sa_mask, interrupt_signal);
+                let mut old_sa = core::mem::zeroed();
+                sigaction(sig, Some(&sa), &mut old_sa);
+                assert_eq!(
+                    old_sa.sa_sigaction,
+                    libc::SIG_DFL,
+                    "signal {} handler already installed",
+                    sig
+                );
+            }
         }
     });
 }
@@ -2213,10 +2262,46 @@ unsafe fn next_signal_handler(
 
 /// Signal handler for interrupt signals.
 unsafe fn interrupt_signal_handler(
-    _signum: libc::c_int,
+    signum: libc::c_int,
     _info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    // Record host-originated signals (SIGINT, SIGALRM, etc.) in the
+    // per-thread pending bitmask so the shim can forward them to the guest.
+    // TODO: no realtime signal support for now.
+    if signum > 0 && signum < 32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // On x86_64 guest threads, gs always holds the host TLS base.
+            let gsbase: u64;
+            unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
+            if gsbase != 0 {
+                let mask: u32 = 1u32 << (signum - 1);
+                unsafe {
+                    core::arch::asm!(
+                        "lock or DWORD PTR gs:pending_host_signals@tpoff, {mask:e}",
+                        mask = in(reg) mask,
+                        options(nostack)
+                    );
+                }
+            }
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            // On x86 guest threads, fs always holds the host TLS selector.
+            if context.uc_mcontext.gregs[libc::REG_FS as usize] != 0 {
+                let mask: u32 = 1u32 << (signum - 1);
+                unsafe {
+                    core::arch::asm!(
+                        "lock or DWORD PTR fs:pending_host_signals@ntpoff, {mask}",
+                        mask = in(reg) mask,
+                        options(nostack)
+                    );
+                }
+            }
+        }
+    }
+
     // The interrupt signal can arrive in different contexts:
     // 1. The thread is running in the host at the beginning of the syscall
     //    handler. Do nothing--the syscall handler will handle the interrupt.
