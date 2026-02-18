@@ -42,7 +42,8 @@ struct SignalFrameRt {
 impl<FS: crate::ShimFS> Task<FS> {
     /// Legacy signal return syscall implementation for x86.
     pub(crate) fn sys_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
-        let lctx_addr = ctx.esp.wrapping_sub(8);
+        let sigframe_addr = ctx.esp.wrapping_sub(8);
+        let lctx_addr = sigframe_addr.wrapping_add(offset_of!(SignalFrame, context));
         let lctx_ptr = ConstPtr::<LegacyContext>::from_usize(lctx_addr);
         let Some(lctx) = lctx_ptr.read_at_offset(0) else {
             self.force_signal(Signal::SIGSEGV, false);
@@ -68,21 +69,21 @@ pub(super) fn sp(ctx: &PtRegs) -> usize {
     ctx.esp
 }
 
-pub(super) fn get_signal_frame(sp: usize, action: &SigAction) -> usize {
+pub(super) fn get_signal_frame(sp: usize, action: &SigAction) -> Option<usize> {
     let mut frame_addr = sp;
 
     // Space for the signal frame.
     if action.flags.contains(SaFlags::SIGINFO) {
-        frame_addr -= core::mem::size_of::<SignalFrameRt>();
+        frame_addr = frame_addr.checked_sub(core::mem::size_of::<SignalFrameRt>())?;
     } else {
-        frame_addr -= core::mem::size_of::<SignalFrame>();
+        frame_addr = frame_addr.checked_sub(core::mem::size_of::<SignalFrame>())?;
     }
 
     // Align the frame (offset by 4 bytes for return address).
     frame_addr &= !15;
-    frame_addr -= 4;
+    frame_addr = frame_addr.checked_sub(4)?;
 
-    frame_addr
+    Some(frame_addr)
 }
 
 impl SignalState {
