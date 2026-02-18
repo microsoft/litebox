@@ -70,6 +70,9 @@ pub trait EnterShim {
     /// handler instead of this one.
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation;
 
+    /// Queue a signal to be delivered
+    fn signal(&self, signal: Signal);
+
     /// Re-enter a thread of a guest program or library that is already loaded
     /// in memory.
     ///
@@ -129,4 +132,33 @@ impl Exception {
     pub const GENERAL_PROTECTION_FAULT: Self = Self(13);
     /// #PF
     pub const PAGE_FAULT: Self = Self(14);
+}
+
+/// A signal number.
+///
+/// Signal numbers are 1-based and must be in the range 1–63.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Signal(u32);
+
+impl Signal {
+    /// SIGINT (signal 2) — interrupt from keyboard (Ctrl+C).
+    pub const SIGINT: Self = Self(2);
+    /// SIGALRM (signal 14) — timer signal from `alarm`.
+    pub const SIGALRM: Self = Self(14);
+
+    /// Create a `Signal` from a raw signal number.
+    ///
+    /// Returns `None` if `signum` is outside the valid range 1–63.
+    pub const fn from_raw(signum: u32) -> Option<Self> {
+        if signum >= 1 && signum <= 63 {
+            Some(Self(signum))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the raw signal number.
+    pub const fn as_raw(self) -> u32 {
+        self.0
+    }
 }

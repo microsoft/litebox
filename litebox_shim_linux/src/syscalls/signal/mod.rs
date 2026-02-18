@@ -21,7 +21,7 @@ use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
-    platform::{RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
+    platform::{RawConstPointer as _, RawMutPointer as _},
     shim::Exception,
     sync::Mutex,
     utils::ReinterpretUnsignedExt as _,
@@ -36,6 +36,8 @@ use litebox_platform_multiplex::Platform;
 pub(crate) struct SignalState {
     /// Pending thread signals.
     pending: RefCell<PendingSignals>,
+    /// Pending process signals (shared across all threads).
+    shared_pending: Arc<Mutex<Platform, PendingSignals>>,
     /// Currently blocked signals.
     blocked: Cell<SigSet>,
     /// Signal handlers.
@@ -50,6 +52,7 @@ impl SignalState {
     pub fn new_process() -> Self {
         Self {
             pending: RefCell::new(PendingSignals::new()),
+            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
             blocked: Cell::new(SigSet::empty()),
             handlers: RefCell::new(Arc::new(SignalHandlers::new())),
             altstack: Cell::new(SigAltStack {
@@ -71,6 +74,8 @@ impl SignalState {
         Self {
             // Reset pending
             pending: RefCell::new(PendingSignals::new()),
+            // Share process-wide pending signals
+            shared_pending: self.shared_pending.clone(),
             // Preserve blocked
             blocked: Cell::new(self.blocked.get()),
             // Share handlers across tasks
@@ -280,7 +285,7 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
 
 /// Creates a `Siginfo` for a signal sent by a user process via `kill()`,
 /// `tkill()`, or `tgkill()`.
-fn siginfo_kill(signal: Signal) -> Siginfo {
+pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
     Siginfo {
         signo: signal.as_i32(),
         errno: 0,
@@ -526,42 +531,38 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Returns whether there are any pending signals that can be delivered.
     pub(crate) fn has_pending_signals(&self) -> bool {
-        let pending = self.signals.pending.borrow().pending & !self.signals.blocked.get();
-        !pending.is_empty()
-    }
-
-    /// Returns whether the process-level alarm timer has expired.
-    pub(crate) fn alarm_expired(&self) -> bool {
-        self.process()
-            .alarm_deadline
-            .lock()
-            .is_some_and(|deadline| self.global.platform.now() >= deadline)
+        let blocked = self.signals.blocked.get();
+        let thread_pending = self.signals.pending.borrow().pending & !blocked;
+        if !thread_pending.is_empty() {
+            return true;
+        }
+        let shared_pending = self.signals.shared_pending.lock().pending & !blocked;
+        !shared_pending.is_empty()
     }
 
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
-        // Check for expired process-level alarm timer and enqueue SIGALRM if needed.
-        {
-            let mut alarm = self.process().alarm_deadline.lock();
-            if alarm.is_some_and(|deadline| self.global.platform.now() >= deadline) {
-                *alarm = None;
-                drop(alarm);
-                self.send_signal(Signal::SIGALRM, siginfo_kill(Signal::SIGALRM));
-            }
-        }
-
         loop {
-            let mut pending = self.signals.pending.borrow_mut();
-            let Some(signal) = pending.next(self.signals.blocked.get()) else {
-                break;
+            let blocked = self.signals.blocked.get();
+            let (signal, siginfo) = {
+                let mut pending = self.signals.pending.borrow_mut();
+                if let Some(signal) = pending.next(blocked) {
+                    (signal, pending.remove(signal))
+                } else {
+                    // Then try shared pending.
+                    let mut shared = self.signals.shared_pending.lock();
+                    if let Some(signal) = shared.next(blocked) {
+                        (signal, shared.remove(signal))
+                    } else {
+                        break;
+                    }
+                }
             };
             if self.is_exiting() {
                 // Don't deliver any more signals if exiting.
                 return;
             }
 
-            let siginfo: Siginfo = pending.remove(signal);
-            drop(pending);
             let action = self.signals.handlers.borrow().inner.lock()[signal].action;
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
@@ -604,10 +605,18 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Only supports sending signals to self for now.
-    fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
+    pub(crate) fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
         self.signals
             .pending
             .borrow_mut()
+            .push(&self.process().limits, signal, siginfo);
+    }
+
+    /// Sends a process-directed signal (stored in shared_pending).
+    pub(crate) fn send_shared_signal(&self, signal: Signal, siginfo: Siginfo) {
+        self.signals
+            .shared_pending
+            .lock()
             .push(&self.process().limits, signal, siginfo);
     }
 

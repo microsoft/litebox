@@ -71,6 +71,10 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         todo!("Handle interrupt in OP-TEE shim");
     }
+
+    fn signal(&self, signal: litebox::shim::Signal) {
+        todo!("Handle signal in OP-TEE shim: {:?}", signal);
+    }
 }
 
 impl OpteeShimEntrypoints {
