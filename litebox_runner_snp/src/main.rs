@@ -16,7 +16,7 @@ use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints}
 
 // FUTURE: replace this with some kind of OnceLock, or just eliminate this
 // entirely (ideal).
-static mut SHIM: Option<litebox_shim_linux::LinuxShim> = None;
+static mut SHIM: Option<litebox_shim_linux::LinuxShim<litebox_shim_linux::DefaultFS>> = None;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn floating_point_handler(_pt_regs: &mut litebox_common_linux::PtRegs) {
