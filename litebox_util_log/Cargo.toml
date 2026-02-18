@@ -1,0 +1,27 @@
+[package]
+name = "litebox_util_log"
+version = "0.1.0"
+edition = "2024"
+description = "Logging facade for LiteBox that supports multiple backends"
+
+[features]
+default = ["backend_log"]
+backend_log = ["dep:log", "log/kv"]
+backend_tracing = ["dep:tracing"]
+
+# Key-value capture features (mirrors log's kv features)
+kv_std = ["log?/kv_std"]
+kv_sval = ["log?/kv_sval"]
+kv_serde = ["log?/kv_serde"]
+
+[dependencies]
+log = { version = "0.4", optional = true, default-features = false }
+tracing = { version = "0.1", optional = true, default-features = false }
+litebox_util_log_macros = { path = "../litebox_util_log_macros" }
+
+[dev-dependencies]
+env_logger = { version = "0.11", features = ["unstable-kv"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true
