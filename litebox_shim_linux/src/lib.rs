@@ -33,6 +33,8 @@ use litebox::{
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
+use crate::syscalls::signal::siginfo_kill;
+
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 // DEVNOTE: this is before the `mod` declarations so that it can be used within them.
 macro_rules! log_unsupported {
@@ -117,6 +119,24 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         self.enter_shim(false, ctx, |_, _| {})
+    }
+
+    fn signal(&self, signal: litebox::shim::Signal) {
+        let signal = match signal {
+            litebox::shim::Signal::SIGINT => litebox_common_linux::signal::Signal::SIGINT,
+            litebox::shim::Signal::SIGALRM => {
+                // Check for expired process-level alarm timer and enqueue SIGALRM if needed.
+                let mut alarm = self.task.process().alarm_deadline.lock();
+                if alarm.is_some_and(|deadline| self.task.global.platform.now() >= deadline) {
+                    *alarm = None;
+                } else {
+                    return;
+                }
+                litebox_common_linux::signal::Signal::SIGALRM
+            }
+            _ => unimplemented!("unsupported signal: {signal:?}"),
+        };
+        self.task.send_shared_signal(signal, siginfo_kill(signal));
     }
 }
 
