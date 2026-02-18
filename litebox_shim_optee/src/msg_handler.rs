@@ -27,7 +27,8 @@ use litebox_common_optee::{
     TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
 };
 use once_cell::race::OnceBox;
-
+use core::sync::atomic::{AtomicBool, Ordering};
+use litebox_common_linux::MY_FLAG;
 // OP-TEE version and build info (2.0)
 // TODO: Consider replacing it with our own version info
 const OPTEE_MSG_REVISION_MAJOR: usize = 2;
@@ -76,6 +77,7 @@ pub fn handle_optee_smc_args(
         "OP-TEE SMC Function: {:?}",
         func_id
     );
+    MY_FLAG.store(true, Ordering::SeqCst);
     match func_id {
         OpteeSmcFunction::CallWithArg
         | OpteeSmcFunction::CallWithRpcArg

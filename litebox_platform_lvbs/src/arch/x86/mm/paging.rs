@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::arch::x86_64::_MM_FROUND_RAISE_EXC;
+use core::sync::atomic::{AtomicBool, Ordering};
 use litebox::mm::linux::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
 use litebox::platform::page_mgmt;
 use x86_64::{
@@ -18,6 +20,8 @@ use x86_64::{
         },
     },
 };
+use litebox_common_linux::MY_FLAG;
+use crate::debug_serial_println;
 
 use crate::UserMutPtr;
 use crate::mm::{
@@ -115,6 +119,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         dealloc_frames: bool,
         flush_tlb: bool,
     ) -> Result<(), page_mgmt::DeallocationError> {
+       if MY_FLAG.load(Ordering::SeqCst) {
+           debug_serial_println!("!!!litebox unmap_pages called with range: {:#x} - {:#x}", range.start, range.end);
+       }
         let start_va = VirtAddr::new(range.start as _);
         let start = Page::<Size4KiB>::from_start_address(start_va)
             .or(Err(page_mgmt::DeallocationError::Unaligned))?;
@@ -122,28 +129,54 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         let end = Page::<Size4KiB>::from_start_address(end_va)
             .or(Err(page_mgmt::DeallocationError::Unaligned))?;
         let mut allocator = PageTableAllocator::<M>::new();
-
         // Note this implementation is slow as each page requires a full page table walk.
         // If we have N pages, it will be N times slower.
         let mut inner = self.inner.lock();
         for page in Page::range(start, end) {
+            if MY_FLAG.load(Ordering::SeqCst) {
+                debug_serial_println!("!!!litebox unmap_pages checking page {:#x}", page.start_address());
+            }
             match inner.unmap(page) {
                 Ok((frame, fl)) => {
+                    // if MY_FLAG.load(Ordering::SeqCst) {
+                    //     debug_serial_println!("!!!litebox unmap_pages unmapped page 2");
+                    // }
                     if dealloc_frames {
+                        // if MY_FLAG.load(Ordering::SeqCst) {
+                        //     debug_serial_println!("!!!litebox unmap_pages deallocating frame 3");
+                        // }
                         unsafe { allocator.deallocate_frame(frame) };
                     }
                     if flush_tlb && FLUSH_TLB {
+                        // if MY_FLAG.load(Ordering::SeqCst) {
+                        //     debug_serial_println!("!!!litebox unmap_pages flushing TLB 4");
+                        // }
                         fl.flush();
                     }
                 }
-                Err(X64UnmapError::PageNotMapped) => {}
+                Err(X64UnmapError::PageNotMapped) => {
+                    if MY_FLAG.load(Ordering::SeqCst) {
+                        debug_serial_println!("!!!litebox ERR unmap_pages page not mapped 1: {:#x}", page.start_address());
+                    }
+                    break;
+                    // unreachable!()
+                }
                 Err(X64UnmapError::ParentEntryHugePage) => {
+                    if MY_FLAG.load(Ordering::SeqCst) {
+                        debug_serial_println!("!!!litebox ERR unmap_pages ParentEntryHugePage 1: {:#x}", page.start_address());
+                    }
                     unreachable!("we do not support huge pages");
                 }
                 Err(X64UnmapError::InvalidFrameAddress(pa)) => {
+                    if MY_FLAG.load(Ordering::SeqCst) {
+                        debug_serial_println!("!!!litebox ERR unmap_pages InvalidFrameAddress 1: {:#x}", page.start_address());
+                    }
                     todo!("Invalid frame address: {:#x}", pa);
                 }
             }
+        }
+        if MY_FLAG.load(Ordering::SeqCst) {
+        debug_serial_println!("!!!litebox unmap_pages finished unmapping pages 5: {:#x} - {:#x}", range.start, range.end);
         }
         Ok(())
     }
@@ -172,22 +205,25 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// this safety requirement can be relaxed.
     pub(crate) unsafe fn cleanup_user_mappings(&self, user_addr_min: usize, user_addr_max: usize) {
         use x86_64::structures::paging::mapper::CleanUp;
-
+debug_serial_println!("!!!litebox cleanup_user_mappings");
         // Unmap and deallocate user data pages
         // No TLB flush needed - this page table is being destroyed and will never be reused
         let user_range = PageRange::<ALIGN> {
             start: user_addr_min,
             end: user_addr_max,
         };
+        debug_serial_println!("!!!litebox cleanup_user_mappings checkpoint 1");
         // Safety: The caller ensures no references to the unmapped pages exist.
         let _ = unsafe { self.unmap_pages(user_range, true, false) };
-
+debug_serial_println!("!!!litebox cleanup_user_mappings checkpoint 2");
         // Clean up all empty P1 - P3 tables
         let mut allocator = PageTableAllocator::<M>::new();
+        debug_serial_println!("!!!litebox cleanup_user_mappings checkpoint 3");
         // Safety: The page table is being destroyed and will not be reused.
         unsafe {
             self.inner.lock().clean_up(&mut allocator);
         }
+        debug_serial_println!("!!!litebox cleanup_user_mappings checkpoint 4");
     }
 
     pub(crate) unsafe fn remap_pages(

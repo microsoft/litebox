@@ -17,7 +17,9 @@ use syscalls::Sysno;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::signal::SigSet;
+use core::sync::atomic::{AtomicBool, Ordering};
 
+pub static MY_FLAG: AtomicBool = AtomicBool::new(false);
 pub mod errno;
 pub mod loader;
 pub mod mm;

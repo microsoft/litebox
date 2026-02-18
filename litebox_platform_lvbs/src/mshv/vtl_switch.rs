@@ -3,13 +3,13 @@
 
 //! VTL switch related functions
 
-use crate::host::{
+use crate::{host::{
     hv_hypercall_page_address,
     per_cpu_variables::{
         PerCpuVariablesAsm, with_per_cpu_variables, with_per_cpu_variables_asm,
         with_per_cpu_variables_mut,
     },
-};
+}, serial_println};
 use crate::mshv::{
     HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS,
     VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
@@ -227,6 +227,7 @@ macro_rules! LOAD_VTL_STATE_ASM {
 /// The caller must ensure that VTL0 general-purpose registers have been saved to
 /// per-CPU variables
 fn handle_vtl_entry() -> Option<[u64; NUM_VTLCALL_PARAMS]> {
+    serial_println!("Handling VTL entry...");
     let reason = get_vtl_entry_reason()?;
     match reason {
         VtlEntryReason::VtlCall => Some(get_vtlcall_params()),
@@ -307,6 +308,7 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
     set_vtl_return_value(value);
 
     loop {
+        serial_println!("Switching to VTL0...");
         // Inline asm performs the VTL switch:
         // 1. Restore VTL0 state (XRSTOR + load GP registers)
         // 2. Return to VTL0 (cli + hypercall)
@@ -349,6 +351,7 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
                 out("r15") _,
             );
         }
+        serial_println!("Entered VTL1. Checking entry reason...");
         if let Some(params) = handle_vtl_entry() {
             // Reset VTL1 xsaved flags. The CPU's XSAVEOPT tracking is global - it only tracks
             // one buffer at a time. At this point, the CPU's tracking might rely on VTL0's

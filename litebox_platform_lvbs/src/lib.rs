@@ -315,15 +315,14 @@ impl PageTableManager {
     /// - `Err(Errno::ENOENT)` if the page table ID does not exist
     /// - `Err(Errno::EBUSY)` if the page table is currently active (switch away first)
     pub unsafe fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
+        debug_serial_println!("!!!litebox Deleting task page table with ID {} 2", task_pt_id);
         if task_pt_id == BASE_PAGE_TABLE_ID {
             return Err(Errno::EINVAL);
         }
-
         // Ensure we're not deleting the current page table (check CR3)
         if self.current_page_table_id() == task_pt_id {
             return Err(Errno::EBUSY);
         }
-
         let mut task_pts = self.task_page_tables.lock();
         if let Some(pt) = task_pts.remove(&task_pt_id) {
             let phys_frame = pt.get_physical_frame();
@@ -332,11 +331,13 @@ impl PageTableManager {
             let mut frame_to_id = self.frame_to_id.lock();
             frame_to_id.remove(&phys_frame);
             drop(frame_to_id);
+            debug_serial_println!("!!!litebox delete_task_page_table checkpoint 1");
 
             // Safety: We're about to delete this page table, so it's safe to unmap all pages.
             unsafe {
                 pt.cleanup_user_mappings(Self::USER_ADDR_MIN, Self::USER_ADDR_MAX);
             }
+            debug_serial_println!("!!!litebox delete_task_page_table checkpoint 2");
             // The PageTable's Drop impl will deallocate the top-level (P4) frame
             Ok(())
         } else {
@@ -713,6 +714,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// - `Err(Errno::ENOENT)` if the page table doesn't exist
     /// - `Err(Errno::EBUSY)` if the page table is currently active
     pub unsafe fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
+        debug_serial_println!("!!!litebox Deleting task page table with ID {} 1", task_pt_id);
         // Safety: caller guarantees no dangling references
         unsafe { self.page_table_manager.delete_task_page_table(task_pt_id) }
     }

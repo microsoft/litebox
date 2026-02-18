@@ -18,11 +18,7 @@ use litebox_common_optee::{
     TeeResult, UteeEntryFunc, UteeParams,
 };
 use litebox_platform_lvbs::{
-    arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
-    debug_serial_println,
-    host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
-    mm::MemoryProvider,
-    mshv::{
+    arch::{gdt, get_core_id, instrs::hlt_loop, interrupts}, debug_serial_print, debug_serial_println, host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables}, mm::MemoryProvider, mshv::{
         NUM_VTLCALL_PARAMS, VsmFunction, hvcall,
         vsm::vsm_dispatch,
         vsm_intercept::raise_vtl0_gp_fault,
@@ -31,8 +27,7 @@ use litebox_platform_lvbs::{
             VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
             VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
         },
-    },
-    serial_println,
+    }, serial_println
 };
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::msg_handler::{
@@ -241,6 +236,7 @@ unsafe fn switch_to_task_page_table(task_pt_id: usize) -> Result<(), OpteeSmcRet
 /// by this page table are held after deletion.
 #[inline]
 unsafe fn delete_task_page_table(task_pt_id: usize) -> Result<(), OpteeSmcReturnCode> {
+    debug_serial_println!("!!!litebox Deleting task page table ID: {} 0", task_pt_id);
     let platform = litebox_platform_multiplex::platform();
     // Safety: caller guarantees no dangling references
     unsafe {
@@ -933,6 +929,7 @@ fn handle_close_session(
             &mut ctx,
         );
     }
+    debug_serial_println!("!!!litebox Called TA_CloseSessionEntryPoint");
 
     // CloseSession always succeeds (TA_CloseSessionEntryPoint returns void)
     write_msg_args_to_normal_world(
@@ -958,10 +955,15 @@ fn handle_close_session(
     let remaining_sessions = session_manager()
         .sessions()
         .count_sessions_for_instance(&instance_arc);
-
+debug_serial_println!("!!!litebox CloseSession: remaining_sessions={}", remaining_sessions);
     // If this was the last session using the TA instance, clean up (unless keep_alive is set)
     if remaining_sessions == 0 {
         if let Some(entry) = removed_entry {
+            debug_serial_println!("!!!litebox last session closed for TA instance, checking cleanup: session_id={}, single_instance={}, keep_alive={}",
+                session_id,
+                entry.ta_flags.is_single_instance(),
+                entry.ta_flags.is_keep_alive(),
+            );
             // If this is a single-instance TA with keep_alive flag, don't remove it from memory.
             // Note: keep_alive is only meaningful for single-instance TAs.
             if entry.ta_flags.is_single_instance() && entry.ta_flags.is_keep_alive() {
@@ -986,7 +988,7 @@ fn handle_close_session(
             // Drop the instance to release shim/loaded_program resources
             drop(instance);
             drop(entry);
-
+debug_serial_println!("!!!litebox handle_close_sessions checkpoint");
             // Delete the task page table
             // Safety: We've switched to the base page table above.
             let _ = unsafe { delete_task_page_table(task_pt_id) };
@@ -1061,8 +1063,8 @@ fn write_msg_args_to_normal_world(
 }
 
 // use include_bytes! to include ldelf and (KMPP) TA binaries
-const LDELF_BINARY: &[u8] = &[0u8; 0];
-const TA_BINARY: &[u8] = &[0u8; 0];
+const LDELF_BINARY: &[u8] = include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/ldelf.elf");
+const TA_BINARY: &[u8] = include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
