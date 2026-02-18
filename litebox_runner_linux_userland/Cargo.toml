@@ -14,6 +14,8 @@ litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_mu
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux" }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
 memmap2 = "0.9.8"
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [dev-dependencies]
 sha2 = "0.10"

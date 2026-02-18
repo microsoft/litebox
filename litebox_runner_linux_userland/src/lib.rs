@@ -12,6 +12,14 @@ use std::path::{Path, PathBuf};
 extern crate alloc;
 
 /// Run Linux programs with LiteBox on unmodified Linux
+///
+/// # Tracing
+///
+/// LiteBox supports detailed tracing output controlled by the `LITEBOX_LOG` environment variable.
+///
+/// Examples:
+/// - `LITEBOX_LOG=debug` - Show debug and higher level logs
+/// - `LITEBOX_LOG=litebox=debug,litebox::fs=trace` - Multiple filters at different levels
 #[derive(Parser, Debug)]
 pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `python3 --version`)
@@ -98,6 +106,17 @@ fn mmapped_file_data(path: impl AsRef<Path>) -> Result<&'static [u8]> {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    // Initialize tracing subscriber with LITEBOX_LOG environment variable
+    tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .with_level(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_env_var("LITEBOX_LOG")
+                .from_env_lossy(),
+        )
+        .init();
+
     if !cli_args.insert_files.is_empty() {
         unimplemented!(
             "this should (hopefully soon) have a nicer interface to support loading in files"
