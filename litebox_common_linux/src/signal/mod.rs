@@ -102,6 +102,17 @@ impl TryFrom<i32> for Signal {
         }
     }
 }
+impl TryFrom<Signal> for litebox::shim::Signal {
+    type Error = Signal;
+
+    fn try_from(value: Signal) -> Result<Self, Self::Error> {
+        match value {
+            Signal::SIGINT => Ok(Self::SIGINT),
+            Signal::SIGALRM => Ok(Self::SIGALRM),
+            _ => Err(value),
+        }
+    }
+}
 
 /// The default disposition of a signal.
 pub enum SignalDisposition {
@@ -160,6 +171,23 @@ impl SigSet {
         }
     }
 
+    /// Removes and returns the lowest-numbered signal in the set, or `None` if
+    /// empty.
+    pub fn pop_lowest(&mut self) -> Option<Signal> {
+        if self.0 == 0 {
+            return None;
+        }
+        let bit = self.0.trailing_zeros();
+        self.0 &= !(1u64 << bit);
+        Some(Signal(bit.reinterpret_as_signed() + 1))
+    }
+
+    /// Returns an iterator over the signals in this set, from lowest to
+    /// highest.
+    pub fn iter(self) -> SigSetIter {
+        SigSetIter(self)
+    }
+
     pub fn as_u64(&self) -> u64 {
         self.0
     }
@@ -190,6 +218,33 @@ impl core::ops::Not for SigSet {
 
     fn not(self) -> Self::Output {
         Self(!self.0)
+    }
+}
+
+/// An iterator over the signals in a [`SigSet`], yielding them from lowest to
+/// highest signal number.
+#[derive(Clone)]
+pub struct SigSetIter(SigSet);
+
+impl Iterator for SigSetIter {
+    type Item = Signal;
+
+    fn next(&mut self) -> Option<Signal> {
+        self.0.pop_lowest()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let count = self.0.0.count_ones() as usize;
+        (count, Some(count))
+    }
+}
+
+impl IntoIterator for SigSet {
+    type Item = Signal;
+    type IntoIter = SigSetIter;
+
+    fn into_iter(self) -> SigSetIter {
+        self.iter()
     }
 }
 
