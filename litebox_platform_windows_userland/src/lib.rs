@@ -321,6 +321,7 @@ impl WindowsUserland {
 }
 
 impl litebox::platform::Provider for WindowsUserland {}
+impl litebox::platform::SignalProvider for WindowsUserland {}
 
 /// Runs a guest thread using the provided shim and the given initial context.
 ///

@@ -37,6 +37,10 @@ impl Task {
     #[must_use]
     pub(crate) fn prepare_to_run_guest(&self, ctx: &mut litebox_common_linux::PtRegs) -> bool {
         self.wait_state.0.prepare_to_run_guest(|| {
+            use litebox::platform::SignalProvider as _;
+            self.global.platform.take_pending_signals(|signal| {
+                self.take_pending_signals(signal);
+            });
             self.process_signals(ctx);
             !self.is_exiting()
         })
@@ -45,6 +49,10 @@ impl Task {
 
 impl litebox::event::wait::CheckForInterrupt for Task {
     fn check_for_interrupt(&self) -> bool {
+        use litebox::platform::SignalProvider as _;
+        self.global.platform.take_pending_signals(|sig| {
+            self.take_pending_signals(sig);
+        });
         self.is_exiting() || self.has_pending_signals()
     }
 }

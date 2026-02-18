@@ -605,6 +605,27 @@ impl Task {
         }
     }
 
+    pub(crate) fn take_pending_signals(&self, sig: litebox::shim::Signal) {
+        let signal = match sig {
+            litebox::shim::Signal::SIGALRM => {
+                // Note we may get a spurious SIGALRM because we never disarm the timer (e.g., user
+                // can cancel an alarm by setting a new one or setting a timer with a zero timeout).
+                // Thus we check whether the current alarm deadline has actually passed before delivering the signal.
+                use litebox::platform::TimeProvider as _;
+                let mut alarm = self.process().alarm_deadline.lock();
+                if alarm.is_some_and(|deadline| self.global.platform.now() >= deadline) {
+                    *alarm = None;
+                } else {
+                    return;
+                }
+                litebox_common_linux::signal::Signal::SIGALRM
+            }
+            litebox::shim::Signal::SIGINT => litebox_common_linux::signal::Signal::SIGINT,
+            _ => unimplemented!(),
+        };
+        self.send_shared_signal(signal, siginfo_kill(signal));
+    }
+
     /// Only supports sending signals to self for now.
     pub(crate) fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
         self.signals
