@@ -1200,7 +1200,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             return Err(PhysPointerError::InvalidPhysicalAddress(0));
         }
 
-        // Reject duplicate page addresses — shared mappings are not supported.
+        // Reject duplicate page addresses
         {
             let mut seen = hashbrown::HashSet::with_capacity(pages.len());
             for page in pages {
@@ -1258,7 +1258,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                 .collect();
 
             let base_va = vmap_allocator()
-                .allocate_and_register(&frames)
+                .allocate_va_and_register_map(&frames)
                 .ok_or(PhysPointerError::AlreadyMapped(pages[0].as_usize()))?;
 
             match self
@@ -1271,7 +1271,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                     size: pages.len() * ALIGN,
                 }),
                 Err(e) => {
-                    vmap_allocator().rollback_allocation(base_va);
+                    let _ = vmap_allocator().unregister_allocation(base_va);
                     match e {
                         MapToError::PageAlreadyMapped(_) => {
                             Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
@@ -1290,19 +1290,25 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
-        // Unmap VTL0 pages (doesn't deallocate physical frames — they belong to VTL0).
-        self.unmap_vtl0_pages(vmap_info.base, vmap_info.size)
-            .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))?;
-
         let base_va = x86_64::VirtAddr::new(vmap_info.base as u64);
 
-        // If this is a vmap region (for non-contiguous physical pages), unregister from the vmap allocator first.
-        if crate::mm::vmap::is_vmap_address(base_va) {
+        // Perform both cleanup steps unconditionally so that a failure in one
+        // does not leave the other in an inconsistent state.
+        let unmap_result = self
+            .unmap_vtl0_pages(vmap_info.base, vmap_info.size)
+            .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize));
+
+        let unregister_result = if crate::mm::vmap::is_vmap_address(base_va) {
             crate::mm::vmap::vmap_allocator()
                 .unregister_allocation(base_va)
-                .ok_or(PhysPointerError::Unmapped(vmap_info.base as usize))?;
-        }
-        Ok(())
+                .ok_or(PhysPointerError::Unmapped(vmap_info.base as usize))
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+
+        // Report the first error, if any.
+        unmap_result.and(unregister_result)
     }
 
     fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {

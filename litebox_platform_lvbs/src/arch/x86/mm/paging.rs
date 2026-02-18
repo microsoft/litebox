@@ -382,7 +382,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// - `Err(MapToError::FrameAllocationFailed)` if page table allocation fails
     ///
     /// # Behavior
-    /// - Any existing mapping is treated as an error (shared mappings not supported)
+    /// - Any existing mapping is treated as an error
     /// - On error, all pages mapped by this call are unmapped (atomic)
     pub(crate) fn map_non_contiguous_phys_frames(
         &self,
@@ -395,39 +395,39 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         let mut inner = self.inner.lock();
 
-        if !base_va.is_aligned(Size4KiB::SIZE) {
-            return Err(MapToError::FrameAllocationFailed);
-        }
+        let start_page = Page::<Size4KiB>::from_start_address(base_va)
+            .map_err(|_| MapToError::FrameAllocationFailed)?;
+        let end_page = start_page + frames.len() as u64;
 
-        // Quick pre-scan: check all target VAs for existing mappings before
-        // modifying any page table entries. This avoids expensive rollback when
-        // an overlap is detected partway through.
-        for i in 0..frames.len() {
-            let va = base_va + (i as u64) * Size4KiB::SIZE;
+        // Pre-scan: verify all target VAs are unmapped before modifying any page table entries.
+        // The caller provides freshly allocated VAs from the vmap allocator so collisions
+        // indicate a bug: panic in debug builds, return an error in release builds.
+        for page in Page::range(start_page, end_page) {
+            let va = page.start_address();
             match inner.translate(va) {
                 TranslateResult::Mapped { frame, .. } => {
                     let existing_frame =
                         PhysFrame::<Size4KiB>::containing_address(frame.start_address());
+                    debug_assert!(
+                        false,
+                        "vmap: VA {va:?} is already mapped to {existing_frame:?}"
+                    );
                     return Err(MapToError::PageAlreadyMapped(existing_frame));
                 }
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(_) => {
+                    debug_assert!(false, "vmap: invalid frame address at VA {va:?}");
                     return Err(MapToError::FrameAllocationFailed);
                 }
             }
         }
 
-        // All VAs verified as unmapped — proceed with mapping.
         let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-        for (i, &target_frame) in frames.iter().enumerate() {
-            let va = base_va + (i as u64) * Size4KiB::SIZE;
-            let page: Page<Size4KiB> = Page::containing_address(va);
-
+        for (page, &target_frame) in Page::range(start_page, end_page).zip(frames.iter()) {
             // Note: Since we lock the entire page table for the duration of this function (`self.inner.lock()`),
             // there should be no concurrent modifications to the page table. If we allow concurrent mappings
             // in the future, we should re-check the VA here before mapping and return an error
             // if it is no longer unmapped.
-
             match unsafe {
                 inner.map_to_with_table_flags(
                     page,
@@ -444,7 +444,16 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     }
                 }
                 Err(e) => {
-                    Self::rollback_mapped_pages(&mut inner, base_va, mapped_count, &mut allocator);
+                    if mapped_count > 0 {
+                        Self::rollback_mapped_pages(
+                            &mut inner,
+                            Page::range_inclusive(
+                                start_page,
+                                start_page + (mapped_count as u64 - 1),
+                            ),
+                            &mut allocator,
+                        );
+                    }
                     return Err(e);
                 }
             }
@@ -453,20 +462,17 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(base_va.as_mut_ptr())
     }
 
-    /// Rollback helper: unmap the first `count` pages starting from `base_va`
-    /// and free any intermediate page-table frames (P1/P2/P3) that became empty.
+    /// Rollback helper: unmap the pages in `pages` and free any intermediate
+    /// page-table frames (P1/P2/P3) that became empty.
     ///
     /// Note: The caller must already hold the page table lock (`self.inner`).
     /// This function accepts the locked `MappedPageTable` directly.
     fn rollback_mapped_pages(
         inner: &mut MappedPageTable<'_, FrameMapping<M>>,
-        base_va: VirtAddr,
-        count: usize,
+        pages: x86_64::structures::paging::page::PageRangeInclusive<Size4KiB>,
         allocator: &mut PageTableAllocator<M>,
     ) {
-        for i in 0..count {
-            let va = base_va + (i as u64) * Size4KiB::SIZE;
-            let page: Page<Size4KiB> = Page::containing_address(va);
+        for page in pages {
             if let Ok((_frame, fl)) = inner.unmap(page)
                 && FLUSH_TLB
             {
@@ -476,16 +482,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         // Free any intermediate page-table frames (P1/P2/P3) that are now
         // empty after unmapping.
-        if count > 0 {
-            let start = Page::<Size4KiB>::containing_address(base_va);
-            let end = Page::<Size4KiB>::containing_address(
-                base_va + ((count - 1) as u64) * Size4KiB::SIZE,
-            );
-            // Safety: the vmap VA range is used exclusively by this page table
-            // and all leaf entries have just been unmapped above.
-            unsafe {
-                inner.clean_up_addr_range(Page::range_inclusive(start, end), allocator);
-            }
+        // Safety: the vmap VA range is used exclusively by this page table
+        // and all leaf entries have just been unmapped above.
+        unsafe {
+            inner.clean_up_addr_range(pages, allocator);
         }
     }
 
