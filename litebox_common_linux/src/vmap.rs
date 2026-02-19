@@ -174,4 +174,8 @@ pub enum PhysPointerError {
     CopyFailed,
     #[error("Duplicate physical page address {0:#x} in the input array")]
     DuplicatePhysicalAddress(usize),
+    #[error("Virtual address space exhausted in vmap region")]
+    VaSpaceExhausted,
+    #[error("Page-table frame allocation failed (out of memory)")]
+    FrameAllocationFailed,
 }

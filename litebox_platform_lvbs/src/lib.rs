@@ -512,6 +512,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
                 .ok_or(DeallocationError::Unaligned)?,
                 false,
                 true,
+                false,
             )
         }
     }
@@ -1058,7 +1059,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Clear the existing mappings first.
-                unsafe { current_pt.unmap_pages(range, true, true).unwrap() };
+                unsafe { current_pt.unmap_pages(range, true, true, false).unwrap() };
             }
         }
         let flags = u32::from(initial_permissions.bits())
@@ -1080,7 +1081,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         unsafe {
             self.page_table_manager
                 .current_page_table()
-                .unmap_pages(range, true, true)
+                .unmap_pages(range, true, true, false)
         }
     }
 
@@ -1200,20 +1201,11 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             return Err(PhysPointerError::InvalidPhysicalAddress(0));
         }
 
-        // Reject duplicate page addresses
-        {
-            let mut seen = hashbrown::HashSet::with_capacity(pages.len());
-            for page in pages {
-                if !seen.insert(page.as_usize()) {
-                    return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));
-                }
-            }
-        }
-
         if ALIGN != PAGE_SIZE {
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
+        // TODO: Add `PageTableFlags::NO_EXECUTE` once DEP is enabled.
         let mut flags = PageTableFlags::PRESENT;
         if perms.contains(PhysPageMapPermissions::WRITE) {
             flags |= PageTableFlags::WRITABLE;
@@ -1247,11 +1239,24 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                 Err(MapToError::PageAlreadyMapped(_)) => {
                     Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
                 }
-                Err(_) => Err(PhysPointerError::InvalidPhysicalAddress(
-                    pages[0].as_usize(),
-                )),
+                Err(MapToError::FrameAllocationFailed) => {
+                    Err(PhysPointerError::FrameAllocationFailed)
+                }
+                Err(MapToError::ParentEntryHugePage) => Err(
+                    PhysPointerError::InvalidPhysicalAddress(pages[0].as_usize()),
+                ),
             }
         } else {
+            // Reject duplicate page addresses
+            {
+                let mut seen = hashbrown::HashSet::with_capacity(pages.len());
+                for page in pages {
+                    if !seen.insert(page.as_usize()) {
+                        return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));
+                    }
+                }
+            }
+
             let frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = pages
                 .iter()
                 .map(|p| PhysFrame::containing_address(x86_64::PhysAddr::new(p.as_usize() as u64)))
@@ -1259,7 +1264,17 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
 
             let base_va = vmap_allocator()
                 .allocate_va_and_register_map(&frames)
-                .ok_or(PhysPointerError::AlreadyMapped(pages[0].as_usize()))?;
+                .map_err(|e| match e {
+                    crate::mm::vmap::VmapAllocError::EmptyInput => {
+                        PhysPointerError::InvalidPhysicalAddress(0)
+                    }
+                    crate::mm::vmap::VmapAllocError::DuplicateMapping => {
+                        PhysPointerError::AlreadyMapped(pages[0].as_usize())
+                    }
+                    crate::mm::vmap::VmapAllocError::VaSpaceExhausted => {
+                        PhysPointerError::VaSpaceExhausted
+                    }
+                })?;
 
             match self
                 .page_table_manager
@@ -1276,9 +1291,12 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                         MapToError::PageAlreadyMapped(_) => {
                             Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
                         }
-                        _ => Err(PhysPointerError::InvalidPhysicalAddress(
-                            pages[0].as_usize(),
-                        )),
+                        MapToError::FrameAllocationFailed => {
+                            Err(PhysPointerError::FrameAllocationFailed)
+                        }
+                        MapToError::ParentEntryHugePage => Err(
+                            PhysPointerError::InvalidPhysicalAddress(pages[0].as_usize()),
+                        ),
                     }
                 }
             }
@@ -1292,23 +1310,19 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
 
         let base_va = x86_64::VirtAddr::new(vmap_info.base as u64);
 
-        // Perform both cleanup steps unconditionally so that a failure in one
-        // does not leave the other in an inconsistent state.
-        let unmap_result = self
-            .unmap_vtl0_pages(vmap_info.base, vmap_info.size)
-            .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize));
+        // Unmap the page table entries first. Only release the VA range back
+        // to the allocator when unmapping succeeds; if it fails, stale PTE
+        // entries remain and recycling the VA would cause collisions.
+        self.unmap_vtl0_pages(vmap_info.base, vmap_info.size)
+            .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))?;
 
-        let unregister_result = if crate::mm::vmap::is_vmap_address(base_va) {
+        if crate::mm::vmap::is_vmap_address(base_va) {
             crate::mm::vmap::vmap_allocator()
                 .unregister_allocation(base_va)
-                .ok_or(PhysPointerError::Unmapped(vmap_info.base as usize))
-                .map(|_| ())
-        } else {
-            Ok(())
-        };
+                .ok_or(PhysPointerError::Unmapped(vmap_info.base as usize))?;
+        }
 
-        // Report the first error, if any.
-        unmap_result.and(unregister_result)
+        Ok(())
     }
 
     fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
@@ -1332,23 +1346,20 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError> {
-        let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
-        let phys_end = x86_64::PhysAddr::new(
-            pages
-                .last()
-                .unwrap()
-                .as_usize()
-                .checked_add(ALIGN)
-                .ok_or(PhysPointerError::Overflow)? as u64,
-        );
-        let frame_range = if ALIGN == PAGE_SIZE {
-            PhysFrame::range(
-                PhysFrame::<Size4KiB>::containing_address(phys_start),
-                PhysFrame::<Size4KiB>::containing_address(phys_end),
-            )
-        } else {
-            unimplemented!("ALIGN other than 4KiB is not supported yet")
-        };
+        if ALIGN != PAGE_SIZE {
+            unimplemented!("ALIGN other than 4KiB is not supported yet");
+        }
+
+        // Build a RangeSet so that adjacent pages are coalesced into contiguous
+        // ranges, minimizing the number of hypercalls.
+        let mut range_set = rangemap::RangeSet::new();
+        for page in pages {
+            let start = page.as_usize() as u64;
+            let end = start
+                .checked_add(ALIGN as u64)
+                .ok_or(PhysPointerError::Overflow)?;
+            range_set.insert(start..end);
+        }
 
         let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
             // VTL1 wants to write data to the pages, preventing VTL0 from reading/executing the pages.
@@ -1360,8 +1371,17 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             // VTL1 no longer protects the pages.
             crate::mshv::heki::MemAttr::all()
         };
-        crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
-            .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))
+
+        for range in range_set.iter() {
+            let frame_range = PhysFrame::range(
+                PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
+                PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
+            );
+            crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
+                .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
+        }
+
+        Ok(())
     }
 }
 

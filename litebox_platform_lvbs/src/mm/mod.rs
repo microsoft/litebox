@@ -6,6 +6,7 @@
 use crate::arch::{PhysAddr, VirtAddr};
 
 pub(crate) mod pgtable;
+#[cfg(feature = "optee_syscall")]
 pub(crate) mod vmap;
 
 #[cfg(test)]
