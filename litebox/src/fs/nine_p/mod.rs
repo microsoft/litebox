@@ -7,13 +7,6 @@
 //! network connection. The 9P protocol is a simple, message-based protocol originally designed
 //! for Plan 9 from Bell Labs. 9P2000.L is a Linux-specific variant that provides better
 //! compatibility with POSIX semantics.
-//!
-//! # Submodules
-//!
-//! The 9P implementation is split into several submodules:
-//! - `fcall` - Protocol message definitions and encoding/decoding
-//! - `transport` - Transport layer traits and message I/O
-//! - `client` - High-level 9P client for protocol operations
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -441,29 +434,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     }
 
     /// Convert getattr response to FileStatus
-    fn rgetattr_to_file_status(attr: &fcall::Rgetattr) -> super::FileStatus {
+    fn rgetattr_to_file_status(attr: &fcall::Rgetattr) -> Result<super::FileStatus, Error> {
         let file_type = Self::qid_type_to_file_type(attr.qid.typ);
 
         if attr.valid.contains(fcall::GetattrMask::BASIC) {
-            super::FileStatus {
+            Ok(super::FileStatus {
                 file_type,
                 mode: super::Mode::from_bits_truncate(attr.stat.mode),
-                size: usize::try_from(attr.stat.size).expect("file size exceeds usize"),
+                size: usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?,
                 owner: super::UserInfo {
-                    user: u16::try_from(attr.stat.uid).expect("uid exceeds u16"),
-                    group: u16::try_from(attr.stat.gid).expect("gid exceeds u16"),
+                    user: u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?,
+                    group: u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?,
                 },
                 node_info: super::NodeInfo {
                     dev: DEVICE_ID,
-                    ino: usize::try_from(attr.qid.path).expect("inode number exceeds usize"),
+                    ino: usize::try_from(attr.qid.path).map_err(|_| Error::InvalidResponse)?,
                     rdev: NonZeroUsize::new(
-                        usize::try_from(attr.stat.rdev).expect("rdev exceeds usize"),
+                        usize::try_from(attr.stat.rdev).map_err(|_| Error::InvalidResponse)?,
                     ),
                 },
-                blksize: usize::try_from(attr.stat.blksize).expect("block size exceeds usize"),
-            }
+                blksize: usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?,
+            })
         } else {
-            super::FileStatus {
+            Ok(super::FileStatus {
                 file_type,
                 mode: if attr.valid.contains(fcall::GetattrMask::MODE) {
                     super::Mode::from_bits_truncate(attr.stat.mode)
@@ -471,39 +464,39 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                     super::Mode::empty()
                 },
                 size: if attr.valid.contains(fcall::GetattrMask::SIZE) {
-                    usize::try_from(attr.stat.size).expect("file size exceeds usize")
+                    usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?
                 } else {
                     0
                 },
                 owner: super::UserInfo {
                     user: if attr.valid.contains(fcall::GetattrMask::UID) {
-                        u16::try_from(attr.stat.uid).expect("uid exceeds u16")
+                        u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?
                     } else {
                         0
                     },
                     group: if attr.valid.contains(fcall::GetattrMask::GID) {
-                        u16::try_from(attr.stat.gid).expect("gid exceeds u16")
+                        u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?
                     } else {
                         0
                     },
                 },
                 node_info: super::NodeInfo {
                     dev: DEVICE_ID,
-                    ino: usize::try_from(attr.qid.path).expect("inode number exceeds usize"),
+                    ino: usize::try_from(attr.qid.path).map_err(|_| Error::InvalidResponse)?,
                     rdev: if attr.valid.contains(fcall::GetattrMask::RDEV) {
                         NonZeroUsize::new(
-                            usize::try_from(attr.stat.rdev).expect("rdev exceeds usize"),
+                            usize::try_from(attr.stat.rdev).map_err(|_| Error::InvalidResponse)?,
                         )
                     } else {
                         None
                     },
                 },
                 blksize: if attr.valid.contains(fcall::GetattrMask::BLOCKS) {
-                    usize::try_from(attr.stat.blksize).expect("block size exceeds usize")
+                    usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?
                 } else {
                     0
                 },
-            }
+            })
         }
     }
 
@@ -695,7 +688,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             super::SeekWhence::RelativeToCurrentOffset => current_offset,
             super::SeekWhence::RelativeToEnd => {
                 let attr = self.client.getattr(fid, fcall::GetattrMask::SIZE)?;
-                usize::try_from(attr.stat.size).expect("file size exceeds usize")
+                usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?
             }
         };
         let new_offset = base
@@ -731,8 +724,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             uid: 0,
             gid: 0,
             size: length as u64,
-            atime: fcall::Time::default(),
-            mtime: fcall::Time::default(),
+            ..Default::default()
         };
 
         self.client.setattr(fid, fcall::SetattrMask::SIZE, stat)?;
@@ -756,11 +748,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         let stat = fcall::SetAttr {
             mode: mode.bits(),
-            uid: 0,
-            gid: 0,
-            size: 0,
-            atime: fcall::Time::default(),
-            mtime: fcall::Time::default(),
+            ..Default::default()
         };
 
         let result = self.client.setattr(fid, fcall::SetattrMask::MODE, stat);
@@ -794,12 +782,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             None => 0,
         };
         let stat = fcall::SetAttr {
-            mode: 0,
             uid,
             gid,
-            size: 0,
-            atime: fcall::Time::default(),
-            mtime: fcall::Time::default(),
+            ..Default::default()
         };
 
         let result = self.client.setattr(fid, valid, stat);
@@ -857,17 +842,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                     super::FileType::RegularFile
                 };
 
-                super::DirEntry {
+                Ok(super::DirEntry {
                     name: String::from_utf8_lossy(&e.name).into_owned(),
                     file_type,
                     ino_info: Some(super::NodeInfo {
                         dev: DEVICE_ID,
-                        ino: usize::try_from(e.qid.path).expect("inode number exceeds usize"),
+                        ino: usize::try_from(e.qid.path).map_err(|_| Error::InvalidResponse)?,
                         rdev: None,
                     }),
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
 
         Ok(dir_entries)
     }
@@ -883,7 +868,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let _ = self.client.clunk(fid);
 
         result
-            .map(|attr| Self::rgetattr_to_file_status(&attr))
+            .and_then(|attr| Self::rgetattr_to_file_status(&attr))
             .map_err(FileStatusError::from)
     }
 
@@ -902,7 +887,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         // Perform blocking I/O without holding any locks.
         let attr = self.client.getattr(fid, fcall::GetattrMask::ALL)?;
 
-        Ok(Self::rgetattr_to_file_status(&attr))
+        Ok(Self::rgetattr_to_file_status(&attr)?)
     }
 }
 

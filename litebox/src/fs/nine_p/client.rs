@@ -28,13 +28,13 @@ impl IdGenerator {
         }
     }
 
-    fn next(&mut self) -> u32 {
+    fn next(&mut self) -> Result<u32, Error> {
         if let Some(id) = self.free_ids.pop() {
-            id
+            Ok(id)
         } else {
             let id = self.next;
-            self.next = self.next.checked_add(1).expect("out of fids");
-            id
+            self.next = self.next.checked_add(1).ok_or(Error::Io)?;
+            Ok(id)
         }
     }
 
@@ -63,7 +63,7 @@ impl<Platform: RawSyncPrimitivesProvider> FidGenerator<Platform> {
     }
 
     /// Allocate a new fid
-    fn next(&self) -> u32 {
+    fn next(&self) -> Result<u32, Error> {
         self.inner.lock().next()
     }
 
@@ -189,7 +189,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         uname: &str,
         aname: &str,
     ) -> Result<(fcall::Qid, fcall::Fid), Error> {
-        let fid = self.fids.next();
+        let fid = self.fids.next()?;
         let res = self.fcall(
             Fcall::Tattach(fcall::Tattach {
                 afid: fcall::NOFID,
@@ -223,7 +223,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         if wnames.len() > fcall::MAXWELEM {
             return Err(Error::InvalidPathname);
         }
-        let new_fid = self.fids.next();
+        let new_fid = self.fids.next()?;
         let ret = self.fcall(
             Fcall::Twalk(fcall::Twalk {
                 fid,
@@ -350,7 +350,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             Fcall::Tread(fcall::Tread {
                 fid,
                 offset,
-                count: u32::try_from(count).expect("count exceeds u32"),
+                count: u32::try_from(count).map_err(|_| Error::InvalidResponse)?,
             }),
             |response| match response {
                 Fcall::Rread(fcall::Rread { data }) => {

@@ -6,9 +6,7 @@
 //! This module implements the 9P2000.L protocol used for network filesystem access.
 //! See <https://9p.io/sys/man/5/intro> and <https://github.com/chaos/diod/blob/master/protocol.md>
 
-use core::fmt::Display;
-
-use super::transport::{self, Write};
+use super::transport;
 use alloc::{borrow::Cow, vec::Vec};
 use bitflags::bitflags;
 
@@ -37,6 +35,96 @@ pub(super) const READDIRHDRSZ: u32 = 24;
 
 /// Maximum elements in a single walk.
 pub(super) const MAXWELEM: usize = 13;
+
+/// Generates a struct definition along with `encode_to` and `decode_from` methods
+/// for automatic 9P wire-format serialization.
+macro_rules! Serializer {
+    // ── Struct definition ─────────────
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident $(<$lt:lifetime>)? {
+            $(
+                $(#[$fmeta:meta])*
+                $fvis:vis $field:ident : $fty:tt $(<$flt:lifetime>)?
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $vis struct $name $(<$lt>)? {
+            $(
+                $(#[$fmeta])*
+                $fvis $field : $fty $(<$flt>)?,
+            )*
+        }
+
+        impl $(<$lt>)? $name $(<$lt>)? {
+            #[allow(unused_variables)]
+            fn encode_to<W: transport::Write>(&self, w: &mut W) -> Result<(), transport::WriteError> {
+                $(Serializer!(@encode w, self.$field, $fty $(<$flt>)?);)*
+                Ok(())
+            }
+
+            #[allow(unused_variables)]
+            fn decode_from(d: &mut Serializer!(@decoder_ty $($lt)?)) -> Result<Self, super::Error> {
+                Ok(Self {
+                    $($field: Serializer!(@decode d, $fty $(<$flt>)?),)*
+                })
+            }
+        }
+    };
+
+    // ── Helper: FcallDecoder type with optional lifetime ─────────────────────
+    (@decoder_ty $lt:lifetime) => { FcallDecoder<$lt> };
+    (@decoder_ty) => { FcallDecoder<'_> };
+
+    // ── Encode dispatch ──────────────────────────────────────────────────────
+    // Types with unique wire-format helpers:
+    (@encode $w:ident, $val:expr, FcallStr $(<$lt:lifetime>)?) => {
+        encode_str($w, &$val)?;
+    };
+    (@encode $w:ident, $val:expr, VecFcallStr $(<$lt:lifetime>)?) => {
+        encode_vec_str($w, &$val)?;
+    };
+    (@encode $w:ident, $val:expr, VecQid) => {
+        encode_vec_qid($w, &$val)?;
+    };
+    (@encode $w:ident, $val:expr, DataBuf $(<$lt:lifetime>)?) => {
+        encode_data_buf($w, &$val)?;
+    };
+    // Primitives — encoded as little-endian:
+    (@encode $w:ident, $val:expr, u8) => { encode_le($w, $val)?; };
+    (@encode $w:ident, $val:expr, u16) => { encode_le($w, $val)?; };
+    (@encode $w:ident, $val:expr, u32) => { encode_le($w, $val)?; };
+    (@encode $w:ident, $val:expr, u64) => { encode_le($w, $val)?; };
+    // Everything else (Serializer! structs, bitflags, DirEntryData) — has encode_to:
+    (@encode $w:ident, $val:expr, $ty:tt $(<$lt:lifetime>)?) => {
+        $val.encode_to($w)?;
+    };
+
+    // ── Decode dispatch ──────────────────────────────────────────────────────
+    // Types with unique wire-format helpers:
+    (@decode $d:ident, FcallStr $(<$lt:lifetime>)?) => {
+        $d.decode_str()?
+    };
+    (@decode $d:ident, VecFcallStr $(<$lt:lifetime>)?) => {
+        $d.decode_vec_str()?
+    };
+    (@decode $d:ident, VecQid) => {
+        $d.decode_vec_qid()?
+    };
+    (@decode $d:ident, DataBuf $(<$lt:lifetime>)?) => {
+        $d.decode_data_buf()?
+    };
+    // Primitives — decoded from little-endian:
+    (@decode $d:ident, u8) => { $d.decode_le::<u8>()? };
+    (@decode $d:ident, u16) => { $d.decode_le::<u16>()? };
+    (@decode $d:ident, u32) => { $d.decode_le::<u32>()? };
+    (@decode $d:ident, u64) => { $d.decode_le::<u64>()? };
+    // Everything else (Serializer! structs, bitflags, DirEntryData) — has decode_from:
+    (@decode $d:ident, $ty:tt $(<$lt:lifetime>)?) => {
+        $ty::decode_from($d)?
+    };
+}
 
 bitflags! {
     /// Flags passed to Tlopen.
@@ -184,6 +272,39 @@ bitflags! {
 /// String type used in 9P protocol messages
 pub(super) type FcallStr<'a> = Cow<'a, [u8]>;
 
+/// Type aliases for complex generic types used as `Serializer!` fields.
+type VecFcallStr<'a> = Vec<FcallStr<'a>>;
+type VecQid = Vec<Qid>;
+type DataBuf<'a> = Cow<'a, [u8]>;
+
+/// Generates `encode_to` and `decode_from` methods for bitflags types so they
+/// participate in the `Serializer!` fallback dispatch.
+macro_rules! impl_bitflags_serializer {
+    ($($name:ident),* $(,)?) => {
+        $(
+            impl $name {
+                fn encode_to<W: transport::Write>(&self, w: &mut W) -> Result<(), transport::WriteError> {
+                    encode_le(w, self.bits())
+                }
+
+                fn decode_from(d: &mut FcallDecoder<'_>) -> Result<Self, super::Error> {
+                    Ok(Self::from_bits_truncate(d.decode_le()?))
+                }
+            }
+        )*
+    };
+}
+
+impl_bitflags_serializer! {
+    LOpenFlags,
+    GetattrMask,
+    SetattrMask,
+    LockStatus,
+    LockFlag,
+    LockType,
+    QidType,
+}
+
 /// Directory entry data container
 #[derive(Clone, Debug)]
 pub(super) struct DirEntryData<'a> {
@@ -191,14 +312,29 @@ pub(super) struct DirEntryData<'a> {
 }
 
 impl<'a> DirEntryData<'a> {
-    /// Create directory entry data from a vector
-    fn with(v: Vec<DirEntry<'a>>) -> DirEntryData<'a> {
-        DirEntryData { data: v }
-    }
-
     /// Calculate the total size of all entries
     fn size(&self) -> u64 {
         self.data.iter().fold(0, |a, e| a + e.size())
+    }
+
+    fn encode_to<W: transport::Write>(&self, w: &mut W) -> Result<(), transport::WriteError> {
+        encode_le(
+            w,
+            u32::try_from(self.size()).map_err(|_| transport::WriteError)?,
+        )?;
+        for e in &self.data {
+            e.encode_to(w)?;
+        }
+        Ok(())
+    }
+
+    fn decode_from(d: &mut FcallDecoder<'a>) -> Result<Self, super::Error> {
+        let end_len = d.buf.len() - d.decode_le::<u32>()? as usize;
+        let mut v = Vec::new();
+        while d.buf.len() > end_len {
+            v.push(DirEntry::decode_from(d)?);
+        }
+        Ok(DirEntryData { data: v })
     }
 }
 
@@ -314,72 +450,84 @@ repr_enum! {
     }
 }
 
-/// Unique identifier for a file
-#[derive(Clone, Debug, Copy)]
-pub(super) struct Qid {
-    pub(super) typ: QidType,
-    pub(super) version: u32,
-    pub(super) path: u64,
+Serializer! {
+    /// Unique identifier for a file
+    #[derive(Clone, Debug, Copy)]
+    pub(super) struct Qid {
+        pub(super) typ: QidType,
+        pub(super) version: u32,
+        pub(super) path: u64,
+    }
 }
 
-/// File system statistics
-#[derive(Clone, Debug, Copy)]
-struct Statfs {
-    typ: u32,
-    bsize: u32,
-    blocks: u64,
-    bfree: u64,
-    bavail: u64,
-    files: u64,
-    ffree: u64,
-    fsid: u64,
-    namelen: u32,
+Serializer! {
+    /// File system statistics
+    #[derive(Clone, Debug, Copy)]
+    struct Statfs {
+        typ: u32,
+        bsize: u32,
+        blocks: u64,
+        bfree: u64,
+        bavail: u64,
+        files: u64,
+        ffree: u64,
+        fsid: u64,
+        namelen: u32,
+    }
 }
 
-/// Time structure
-#[derive(Clone, Debug, Copy, Default)]
-pub(super) struct Time {
-    sec: u64,
-    nsec: u64,
+Serializer! {
+    /// Time structure
+    #[derive(Clone, Debug, Copy, Default)]
+    pub(super) struct Time {
+        sec: u64,
+        nsec: u64,
+    }
 }
 
-/// File attributes
-#[derive(Clone, Debug, Copy)]
-pub(super) struct Stat {
-    pub(super) mode: u32,
-    pub(super) uid: u32,
-    pub(super) gid: u32,
-    pub(super) nlink: u64,
-    pub(super) rdev: u64,
-    pub(super) size: u64,
-    pub(super) blksize: u64,
-    pub(super) blocks: u64,
-    pub(super) atime: Time,
-    pub(super) mtime: Time,
-    pub(super) ctime: Time,
-    pub(super) btime: Time,
-    pub(super) generation: u64,
-    pub(super) data_version: u64,
+Serializer! {
+    /// File attributes
+    #[derive(Clone, Debug, Copy)]
+    pub(super) struct Stat {
+        pub(super) mode: u32,
+        pub(super) uid: u32,
+        pub(super) gid: u32,
+        pub(super) nlink: u64,
+        pub(super) rdev: u64,
+        pub(super) size: u64,
+        pub(super) blksize: u64,
+        pub(super) blocks: u64,
+        pub(super) atime: Time,
+        pub(super) mtime: Time,
+        pub(super) ctime: Time,
+        pub(super) btime: Time,
+        pub(super) generation: u64,
+        pub(super) data_version: u64,
+    }
 }
 
-/// Set file attributes
-#[derive(Clone, Debug, Copy, Default)]
-pub(super) struct SetAttr {
-    pub(super) mode: u32,
-    pub(super) uid: u32,
-    pub(super) gid: u32,
-    pub(super) size: u64,
-    pub(super) atime: Time,
-    pub(super) mtime: Time,
+Serializer! {
+    /// Set file attributes
+    #[derive(Clone, Debug, Copy, Default)]
+    pub(super) struct SetAttr {
+        pub(super) mode: u32,
+        pub(super) uid: u32,
+        pub(super) gid: u32,
+        pub(super) size: u64,
+        pub(super) atime: Time,
+        pub(super) mtime: Time,
+    }
 }
 
-/// Directory entry
-#[derive(Clone, Debug)]
-pub(super) struct DirEntry<'a> {
-    pub(super) qid: Qid,
-    pub(super) offset: u64,
-    pub(super) typ: u8,
-    pub(super) name: FcallStr<'a>,
+Serializer! {
+    /// Directory entry
+    #[derive(Clone, Debug)]
+    pub(super) struct DirEntry<'a> {
+        pub(super) qid: Qid,
+        pub(super) offset: u64,
+        pub(super) typ: u8,
+        pub(super) name: FcallStr<'a>,
+    }
 }
 
 impl DirEntry<'_> {
@@ -389,7 +537,7 @@ impl DirEntry<'_> {
             qid: self.qid,
             offset: self.offset,
             typ: self.typ,
-            name: FcallStr::Owned(self.name.clone().into_owned()),
+            name: Cow::Owned(self.name.into_owned()),
         }
     }
 
@@ -399,553 +547,645 @@ impl DirEntry<'_> {
     }
 }
 
-/// File lock request
-#[derive(Clone, Debug)]
-pub(super) struct Flock<'a> {
-    typ: LockType,
-    flags: LockFlag,
-    start: u64,
-    length: u64,
-    proc_id: u32,
-    client_id: FcallStr<'a>,
+Serializer! {
+    /// File lock request
+    #[derive(Clone, Debug)]
+    pub(super) struct Flock<'a> {
+        typ: LockType,
+        flags: LockFlag,
+        start: u64,
+        length: u64,
+        proc_id: u32,
+        client_id: FcallStr<'a>,
+    }
 }
 
-/// Get lock request
-#[derive(Clone, Debug)]
-struct Getlock<'a> {
-    typ: LockType,
-    start: u64,
-    length: u64,
-    proc_id: u32,
-    client_id: FcallStr<'a>,
+Serializer! {
+    /// Get lock request
+    #[derive(Clone, Debug)]
+    struct Getlock<'a> {
+        typ: LockType,
+        start: u64,
+        length: u64,
+        proc_id: u32,
+        client_id: FcallStr<'a>,
+    }
 }
 
 // ============================================================================
 // Response/Request structures
 // ============================================================================
 
-/// Error response
-#[derive(Clone, Debug)]
-pub(super) struct Rlerror {
-    pub(super) ecode: u32,
+Serializer! {
+    /// Error response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rlerror {
+        pub(super) ecode: u32,
+    }
 }
 
-impl Display for Rlerror {
+impl core::fmt::Display for Rlerror {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Remote error: {}", self.ecode)
     }
 }
 
-/// Attach request
-#[derive(Clone, Debug)]
-pub(super) struct Tattach<'a> {
-    pub(super) fid: u32,
-    pub(super) afid: u32,
-    pub(super) uname: FcallStr<'a>,
-    pub(super) aname: FcallStr<'a>,
-    pub(super) n_uname: u32,
+Serializer! {
+    /// Attach request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tattach<'a> {
+        pub(super) fid: u32,
+        pub(super) afid: u32,
+        pub(super) uname: FcallStr<'a>,
+        pub(super) aname: FcallStr<'a>,
+        pub(super) n_uname: u32,
+    }
 }
 
-/// Attach response
-#[derive(Clone, Debug)]
-pub(super) struct Rattach {
-    pub(super) qid: Qid,
+Serializer! {
+    /// Attach response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rattach {
+        pub(super) qid: Qid,
+    }
 }
 
-/// Statfs request
-#[derive(Clone, Debug)]
-pub(super) struct Tstatfs {
-    fid: u32,
+Serializer! {
+    /// Statfs request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tstatfs {
+        fid: u32,
+    }
 }
 
-/// Statfs response
-#[derive(Clone, Debug)]
-pub(super) struct Rstatfs {
-    statfs: Statfs,
+Serializer! {
+    /// Statfs response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rstatfs {
+        statfs: Statfs,
+    }
 }
 
-/// Open request
-#[derive(Clone, Debug)]
-pub(super) struct Tlopen {
-    pub(super) fid: u32,
-    pub(super) flags: LOpenFlags,
+Serializer! {
+    /// Open request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tlopen {
+        pub(super) fid: u32,
+        pub(super) flags: LOpenFlags,
+    }
 }
 
-/// Open response
-#[derive(Clone, Debug)]
-pub(super) struct Rlopen {
-    pub(super) qid: Qid,
-    pub(super) iounit: u32,
+Serializer! {
+    /// Open response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rlopen {
+        pub(super) qid: Qid,
+        pub(super) iounit: u32,
+    }
 }
 
-/// Create request
-#[derive(Clone, Debug)]
-pub(super) struct Tlcreate<'a> {
-    pub(super) fid: u32,
-    pub(super) name: FcallStr<'a>,
-    pub(super) flags: LOpenFlags,
-    pub(super) mode: u32,
-    pub(super) gid: u32,
+Serializer! {
+    /// Create request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tlcreate<'a> {
+        pub(super) fid: u32,
+        pub(super) name: FcallStr<'a>,
+        pub(super) flags: LOpenFlags,
+        pub(super) mode: u32,
+        pub(super) gid: u32,
+    }
 }
 
-/// Create response
-#[derive(Clone, Debug)]
-pub(super) struct Rlcreate {
-    pub(super) qid: Qid,
-    pub(super) iounit: u32,
+Serializer! {
+    /// Create response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rlcreate {
+        pub(super) qid: Qid,
+        pub(super) iounit: u32,
+    }
 }
 
-/// Symlink request
-#[derive(Clone, Debug)]
-pub(super) struct Tsymlink<'a> {
-    fid: u32,
-    name: FcallStr<'a>,
-    symtgt: FcallStr<'a>,
-    gid: u32,
+Serializer! {
+    /// Symlink request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tsymlink<'a> {
+        fid: u32,
+        name: FcallStr<'a>,
+        symtgt: FcallStr<'a>,
+        gid: u32,
+    }
 }
 
-/// Symlink response
-#[derive(Clone, Debug)]
-pub(super) struct Rsymlink {
-    qid: Qid,
+Serializer! {
+    /// Symlink response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rsymlink {
+        qid: Qid,
+    }
 }
 
-/// Mknod request
-#[derive(Clone, Debug)]
-pub(super) struct Tmknod<'a> {
-    dfid: u32,
-    name: FcallStr<'a>,
-    mode: u32,
-    major: u32,
-    minor: u32,
-    gid: u32,
+Serializer! {
+    /// Mknod request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tmknod<'a> {
+        dfid: u32,
+        name: FcallStr<'a>,
+        mode: u32,
+        major: u32,
+        minor: u32,
+        gid: u32,
+    }
 }
 
-/// Mknod response
-#[derive(Clone, Debug)]
-pub(super) struct Rmknod {
-    qid: Qid,
+Serializer! {
+    /// Mknod response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rmknod {
+        qid: Qid,
+    }
 }
 
-/// Rename request
-#[derive(Clone, Debug)]
-pub(super) struct Trename<'a> {
-    pub(super) fid: u32,
-    pub(super) dfid: u32,
-    pub(super) name: FcallStr<'a>,
+Serializer! {
+    /// Rename request
+    #[derive(Clone, Debug)]
+    pub(super) struct Trename<'a> {
+        pub(super) fid: u32,
+        pub(super) dfid: u32,
+        pub(super) name: FcallStr<'a>,
+    }
 }
 
-/// Rename response
-#[derive(Clone, Debug)]
-pub(super) struct Rrename {}
-
-/// Readlink request
-#[derive(Clone, Debug)]
-pub(super) struct Treadlink {
-    fid: u32,
+Serializer! {
+    /// Rename response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rrename {}
 }
 
-/// Readlink response
-#[derive(Clone, Debug)]
-pub(super) struct Rreadlink<'a> {
-    target: FcallStr<'a>,
+Serializer! {
+    /// Readlink request
+    #[derive(Clone, Debug)]
+    pub(super) struct Treadlink {
+        fid: u32,
+    }
 }
 
-/// Getattr request
-#[derive(Clone, Debug)]
-pub(super) struct Tgetattr {
-    pub(super) fid: u32,
-    pub(super) req_mask: GetattrMask,
+Serializer! {
+    /// Readlink response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rreadlink<'a> {
+        target: FcallStr<'a>,
+    }
 }
 
-/// Getattr response
-#[derive(Clone, Debug)]
-pub(super) struct Rgetattr {
-    pub(super) valid: GetattrMask,
-    pub(super) qid: Qid,
-    pub(super) stat: Stat,
+Serializer! {
+    /// Getattr request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tgetattr {
+        pub(super) fid: u32,
+        pub(super) req_mask: GetattrMask,
+    }
 }
 
-/// Setattr request
-#[derive(Clone, Debug)]
-pub(super) struct Tsetattr {
-    pub(super) fid: u32,
-    pub(super) valid: SetattrMask,
-    pub(super) stat: SetAttr,
+Serializer! {
+    /// Getattr response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rgetattr {
+        pub(super) valid: GetattrMask,
+        pub(super) qid: Qid,
+        pub(super) stat: Stat,
+    }
 }
 
-/// Setattr response
-#[derive(Clone, Debug)]
-pub(super) struct Rsetattr {}
-
-/// Xattr walk request
-#[derive(Clone, Debug)]
-pub(super) struct Txattrwalk<'a> {
-    fid: u32,
-    new_fid: u32,
-    name: FcallStr<'a>,
+Serializer! {
+    /// Setattr request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tsetattr {
+        pub(super) fid: u32,
+        pub(super) valid: SetattrMask,
+        pub(super) stat: SetAttr,
+    }
 }
 
-/// Xattr walk response
-#[derive(Clone, Debug)]
-pub(super) struct Rxattrwalk {
-    size: u64,
+Serializer! {
+    /// Setattr response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rsetattr {}
 }
 
-/// Xattr create request
-#[derive(Clone, Debug)]
-pub(super) struct Txattrcreate<'a> {
-    fid: u32,
-    name: FcallStr<'a>,
-    attr_size: u64,
-    flags: u32,
+Serializer! {
+    /// Xattr walk request
+    #[derive(Clone, Debug)]
+    pub(super) struct Txattrwalk<'a> {
+        fid: u32,
+        new_fid: u32,
+        name: FcallStr<'a>,
+    }
 }
 
-/// Xattr create response
-#[derive(Clone, Debug)]
-pub(super) struct Rxattrcreate {}
-
-/// Readdir request
-#[derive(Clone, Debug)]
-pub(super) struct Treaddir {
-    pub(super) fid: u32,
-    pub(super) offset: u64,
-    pub(super) count: u32,
+Serializer! {
+    /// Xattr walk response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rxattrwalk {
+        size: u64,
+    }
 }
 
-/// Readdir response
-#[derive(Clone, Debug)]
-pub(super) struct Rreaddir<'a> {
-    pub(super) data: DirEntryData<'a>,
+Serializer! {
+    /// Xattr create request
+    #[derive(Clone, Debug)]
+    pub(super) struct Txattrcreate<'a> {
+        fid: u32,
+        name: FcallStr<'a>,
+        attr_size: u64,
+        flags: u32,
+    }
 }
 
-/// Fsync request
-#[derive(Clone, Debug)]
-pub(super) struct Tfsync {
-    pub(super) fid: u32,
-    pub(super) datasync: u32,
+Serializer! {
+    /// Xattr create response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rxattrcreate {}
 }
 
-/// Fsync response
-#[derive(Clone, Debug)]
-pub(super) struct Rfsync {}
-
-/// Lock request
-#[derive(Clone, Debug)]
-pub(super) struct Tlock<'a> {
-    fid: u32,
-    flock: Flock<'a>,
+Serializer! {
+    /// Readdir request
+    #[derive(Clone, Debug)]
+    pub(super) struct Treaddir {
+        pub(super) fid: u32,
+        pub(super) offset: u64,
+        pub(super) count: u32,
+    }
 }
 
-/// Lock response
-#[derive(Clone, Debug)]
-pub(super) struct Rlock {
-    status: LockStatus,
+Serializer! {
+    /// Readdir response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rreaddir<'a> {
+        pub(super) data: DirEntryData<'a>,
+    }
 }
 
-/// Getlock request
-#[derive(Clone, Debug)]
-pub(super) struct Tgetlock<'a> {
-    fid: u32,
-    flock: Getlock<'a>,
+Serializer! {
+    /// Fsync request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tfsync {
+        pub(super) fid: u32,
+        pub(super) datasync: u32,
+    }
 }
 
-/// Getlock response
-#[derive(Clone, Debug)]
-pub(super) struct Rgetlock<'a> {
-    flock: Getlock<'a>,
+Serializer! {
+    /// Fsync response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rfsync {}
 }
 
-/// Link request
-#[derive(Clone, Debug)]
-pub(super) struct Tlink<'a> {
-    dfid: u32,
-    fid: u32,
-    name: FcallStr<'a>,
+Serializer! {
+    /// Lock request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tlock<'a> {
+        fid: u32,
+        flock: Flock<'a>,
+    }
 }
 
-/// Link response
-#[derive(Clone, Debug)]
-pub(super) struct Rlink {}
-
-/// Mkdir request
-#[derive(Clone, Debug)]
-pub(super) struct Tmkdir<'a> {
-    pub(super) dfid: u32,
-    pub(super) name: FcallStr<'a>,
-    pub(super) mode: u32,
-    pub(super) gid: u32,
+Serializer! {
+    /// Lock response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rlock {
+        status: LockStatus,
+    }
 }
 
-/// Mkdir response
-#[derive(Clone, Debug)]
-pub(super) struct Rmkdir {
-    pub(super) qid: Qid,
+Serializer! {
+    /// Getlock request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tgetlock<'a> {
+        fid: u32,
+        flock: Getlock<'a>,
+    }
 }
 
-/// Renameat request
-#[derive(Clone, Debug)]
-pub(super) struct Trenameat<'a> {
-    olddfid: u32,
-    oldname: FcallStr<'a>,
-    newdfid: u32,
-    newname: FcallStr<'a>,
+Serializer! {
+    /// Getlock response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rgetlock<'a> {
+        flock: Getlock<'a>,
+    }
 }
 
-/// Renameat response
-#[derive(Clone, Debug)]
-pub(super) struct Rrenameat {}
-
-/// Unlinkat request
-#[derive(Clone, Debug)]
-pub(super) struct Tunlinkat<'a> {
-    pub(super) dfid: u32,
-    pub(super) name: FcallStr<'a>,
-    pub(super) flags: u32,
+Serializer! {
+    /// Link request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tlink<'a> {
+        dfid: u32,
+        fid: u32,
+        name: FcallStr<'a>,
+    }
 }
 
-/// Unlinkat response
-#[derive(Clone, Debug)]
-pub(super) struct Runlinkat {}
-
-/// Auth request
-#[derive(Clone, Debug)]
-pub(super) struct Tauth<'a> {
-    afid: u32,
-    uname: FcallStr<'a>,
-    aname: FcallStr<'a>,
-    n_uname: u32,
+Serializer! {
+    /// Link response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rlink {}
 }
 
-/// Auth response
-#[derive(Clone, Debug)]
-pub(super) struct Rauth {
-    aqid: Qid,
+Serializer! {
+    /// Mkdir request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tmkdir<'a> {
+        pub(super) dfid: u32,
+        pub(super) name: FcallStr<'a>,
+        pub(super) mode: u32,
+        pub(super) gid: u32,
+    }
 }
 
-/// Version request
-#[derive(Clone, Debug)]
-pub(super) struct Tversion<'a> {
-    pub(super) msize: u32,
-    pub(super) version: FcallStr<'a>,
+Serializer! {
+    /// Mkdir response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rmkdir {
+        pub(super) qid: Qid,
+    }
 }
 
-/// Version response
-#[derive(Clone, Debug)]
-pub(super) struct Rversion<'a> {
-    pub(super) msize: u32,
-    pub(super) version: FcallStr<'a>,
+Serializer! {
+    /// Renameat request
+    #[derive(Clone, Debug)]
+    pub(super) struct Trenameat<'a> {
+        olddfid: u32,
+        oldname: FcallStr<'a>,
+        newdfid: u32,
+        newname: FcallStr<'a>,
+    }
 }
 
-/// Flush request
-#[derive(Clone, Debug)]
-pub(super) struct Tflush {
-    oldtag: u16,
+Serializer! {
+    /// Renameat response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rrenameat {}
 }
 
-/// Flush response
-#[derive(Clone, Debug)]
-pub(super) struct Rflush {}
-
-/// Walk request
-#[derive(Clone, Debug)]
-pub(super) struct Twalk<'a> {
-    pub(super) fid: u32,
-    pub(super) new_fid: u32,
-    pub(super) wnames: Vec<FcallStr<'a>>,
+Serializer! {
+    /// Unlinkat request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tunlinkat<'a> {
+        pub(super) dfid: u32,
+        pub(super) name: FcallStr<'a>,
+        pub(super) flags: u32,
+    }
 }
 
-/// Walk response
-#[derive(Clone, Debug)]
-pub(super) struct Rwalk {
-    pub(super) wqids: Vec<Qid>,
+Serializer! {
+    /// Unlinkat response
+    #[derive(Clone, Debug)]
+    pub(super) struct Runlinkat {}
 }
 
-/// Read request
-#[derive(Clone, Debug)]
-pub(super) struct Tread {
-    pub(super) fid: u32,
-    pub(super) offset: u64,
-    pub(super) count: u32,
+Serializer! {
+    /// Auth request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tauth<'a> {
+        afid: u32,
+        uname: FcallStr<'a>,
+        aname: FcallStr<'a>,
+        n_uname: u32,
+    }
 }
 
-/// Read response
-#[derive(Clone, Debug)]
-pub(super) struct Rread<'a> {
-    pub(super) data: Cow<'a, [u8]>,
+Serializer! {
+    /// Auth response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rauth {
+        aqid: Qid,
+    }
 }
 
-/// Write request
-#[derive(Clone, Debug)]
-pub(super) struct Twrite<'a> {
-    pub(super) fid: u32,
-    pub(super) offset: u64,
-    pub(super) data: Cow<'a, [u8]>,
+Serializer! {
+    /// Version request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tversion<'a> {
+        pub(super) msize: u32,
+        pub(super) version: FcallStr<'a>,
+    }
 }
 
-/// Write response
-#[derive(Clone, Debug)]
-pub(super) struct Rwrite {
-    pub(super) count: u32,
+Serializer! {
+    /// Version response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rversion<'a> {
+        pub(super) msize: u32,
+        pub(super) version: FcallStr<'a>,
+    }
 }
 
-/// Clunk request
-#[derive(Clone, Debug)]
-pub(super) struct Tclunk {
-    pub(super) fid: u32,
+Serializer! {
+    /// Flush request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tflush {
+        oldtag: u16,
+    }
 }
 
-/// Clunk response
-#[derive(Clone, Debug)]
-pub(super) struct Rclunk {}
-
-/// Remove request
-#[derive(Clone, Debug)]
-pub(super) struct Tremove {
-    pub(super) fid: u32,
+Serializer! {
+    /// Flush response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rflush {}
 }
 
-/// Remove response
-#[derive(Clone, Debug)]
-pub(super) struct Rremove {}
+Serializer! {
+    /// Walk request
+    #[derive(Clone, Debug)]
+    pub(super) struct Twalk<'a> {
+        pub(super) fid: u32,
+        pub(super) new_fid: u32,
+        pub(super) wnames: VecFcallStr<'a>,
+    }
+}
+
+Serializer! {
+    /// Walk response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rwalk {
+        pub(super) wqids: VecQid,
+    }
+}
+
+Serializer! {
+    /// Read request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tread {
+        pub(super) fid: u32,
+        pub(super) offset: u64,
+        pub(super) count: u32,
+    }
+}
+
+Serializer! {
+    /// Read response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rread<'a> {
+        pub(super) data: DataBuf<'a>,
+    }
+}
+
+Serializer! {
+    /// Write request
+    #[derive(Clone, Debug)]
+    pub(super) struct Twrite<'a> {
+        pub(super) fid: u32,
+        pub(super) offset: u64,
+        pub(super) data: DataBuf<'a>,
+    }
+}
+
+Serializer! {
+    /// Write response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rwrite {
+        pub(super) count: u32,
+    }
+}
+
+Serializer! {
+    /// Clunk request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tclunk {
+        pub(super) fid: u32,
+    }
+}
+
+Serializer! {
+    /// Clunk response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rclunk {}
+}
+
+Serializer! {
+    /// Remove request
+    #[derive(Clone, Debug)]
+    pub(super) struct Tremove {
+        pub(super) fid: u32,
+    }
+}
+
+Serializer! {
+    /// Remove response
+    #[derive(Clone, Debug)]
+    pub(super) struct Rremove {}
+}
 
 // ============================================================================
-// Fcall enum and conversions
+// Fcall enum, conversions, and dispatch
 // ============================================================================
 
-/// 9P protocol message
-#[derive(Clone, Debug)]
-pub(super) enum Fcall<'a> {
-    Rlerror(Rlerror),
-    Tattach(Tattach<'a>),
-    Rattach(Rattach),
-    Tstatfs(Tstatfs),
-    Rstatfs(Rstatfs),
-    Tlopen(Tlopen),
-    Rlopen(Rlopen),
-    Tlcreate(Tlcreate<'a>),
-    Rlcreate(Rlcreate),
-    Tsymlink(Tsymlink<'a>),
-    Rsymlink(Rsymlink),
-    Tmknod(Tmknod<'a>),
-    Rmknod(Rmknod),
-    Trename(Trename<'a>),
-    Rrename(Rrename),
-    Treadlink(Treadlink),
-    Rreadlink(Rreadlink<'a>),
-    Tgetattr(Tgetattr),
-    Rgetattr(Rgetattr),
-    Tsetattr(Tsetattr),
-    Rsetattr(Rsetattr),
-    Txattrwalk(Txattrwalk<'a>),
-    Rxattrwalk(Rxattrwalk),
-    Txattrcreate(Txattrcreate<'a>),
-    Rxattrcreate(Rxattrcreate),
-    Treaddir(Treaddir),
-    Rreaddir(Rreaddir<'a>),
-    Tfsync(Tfsync),
-    Rfsync(Rfsync),
-    Tlock(Tlock<'a>),
-    Rlock(Rlock),
-    Tgetlock(Tgetlock<'a>),
-    Rgetlock(Rgetlock<'a>),
-    Tlink(Tlink<'a>),
-    Rlink(Rlink),
-    Tmkdir(Tmkdir<'a>),
-    Rmkdir(Rmkdir),
-    Trenameat(Trenameat<'a>),
-    Rrenameat(Rrenameat),
-    Tunlinkat(Tunlinkat<'a>),
-    Runlinkat(Runlinkat),
-    Tauth(Tauth<'a>),
-    Rauth(Rauth),
-    Tversion(Tversion<'a>),
-    Rversion(Rversion<'a>),
-    Tflush(Tflush),
-    Rflush(Rflush),
-    Twalk(Twalk<'a>),
-    Rwalk(Rwalk),
-    Tread(Tread),
-    Rread(Rread<'a>),
-    Twrite(Twrite<'a>),
-    Rwrite(Rwrite),
-    Tclunk(Tclunk),
-    Rclunk(Rclunk),
-    Tremove(Tremove),
-    Rremove(Rremove),
-}
+/// Central dispatch macro: defines the `Fcall` enum, `From` impls, `encode_fcall`,
+/// and `FcallDecoder::decode_message` from a single canonical list of message types.
+///
+/// This ensures all dispatch sites stay in sync automatically.
+macro_rules! fcall_types {
+    ($($name:ident $(<$lt:lifetime>)?),* $(,)?) => {
+        /// 9P protocol message
+        #[derive(Clone, Debug)]
+        pub(super) enum Fcall<'a> {
+            $($name($name $(<$lt>)?),)*
+        }
 
-// Implement From for all message types
-macro_rules! impl_from_for_fcall {
-    ($($variant:ident($ty:ty)),* $(,)?) => {
         $(
-            impl<'a> From<$ty> for Fcall<'a> {
-                fn from(v: $ty) -> Fcall<'a> {
-                    Fcall::$variant(v)
+            impl<'a> From<$name $(<$lt>)?> for Fcall<'a> {
+                fn from(v: $name $(<$lt>)?) -> Fcall<'a> {
+                    Fcall::$name(v)
                 }
             }
         )*
+
+        fn encode_fcall<W: transport::Write>(
+            w: &mut W,
+            tag: u16,
+            fcall: Fcall<'_>,
+        ) -> Result<(), transport::WriteError> {
+            match fcall {
+                $(Fcall::$name(v) => {
+                    encode_le(w, FcallType::$name as u8)?;
+                    encode_le(w, tag)?;
+                    v.encode_to(w)?;
+                })*
+            }
+            Ok(())
+        }
+
+        impl<'b> FcallDecoder<'b> {
+            fn decode_message(&mut self) -> Result<TaggedFcall<'b>, super::Error> {
+                let msg_type = FcallType::from_u8(self.decode_le::<u8>()?);
+                let tag = self.decode_le::<u16>()?;
+                let fcall = match msg_type {
+                    $(Some(FcallType::$name) => Fcall::$name($name::decode_from(self)?),)*
+                    None => return Err(super::Error::InvalidResponse),
+                };
+                Ok(TaggedFcall { tag, fcall })
+            }
+        }
     };
 }
 
-impl_from_for_fcall! {
-    Rlerror(Rlerror),
-    Rattach(Rattach),
-    Tstatfs(Tstatfs),
-    Rstatfs(Rstatfs),
-    Tlopen(Tlopen),
-    Rlopen(Rlopen),
-    Rlcreate(Rlcreate),
-    Rsymlink(Rsymlink),
-    Rmknod(Rmknod),
-    Rrename(Rrename),
-    Treadlink(Treadlink),
-    Tgetattr(Tgetattr),
-    Rgetattr(Rgetattr),
-    Tsetattr(Tsetattr),
-    Rsetattr(Rsetattr),
-    Rxattrwalk(Rxattrwalk),
-    Rxattrcreate(Rxattrcreate),
-    Treaddir(Treaddir),
-    Tfsync(Tfsync),
-    Rfsync(Rfsync),
-    Rlock(Rlock),
-    Rlink(Rlink),
-    Rmkdir(Rmkdir),
-    Rrenameat(Rrenameat),
-    Runlinkat(Runlinkat),
-    Rauth(Rauth),
-    Tflush(Tflush),
-    Rflush(Rflush),
-    Rwalk(Rwalk),
-    Tread(Tread),
-    Rwrite(Rwrite),
-    Tclunk(Tclunk),
-    Rclunk(Rclunk),
-    Tremove(Tremove),
-    Rremove(Rremove),
-    Tattach(Tattach<'a>),
-    Tlcreate(Tlcreate<'a>),
-    Tsymlink(Tsymlink<'a>),
-    Tmknod(Tmknod<'a>),
-    Trename(Trename<'a>),
-    Rreadlink(Rreadlink<'a>),
-    Txattrwalk(Txattrwalk<'a>),
-    Txattrcreate(Txattrcreate<'a>),
-    Rreaddir(Rreaddir<'a>),
-    Tlock(Tlock<'a>),
-    Tgetlock(Tgetlock<'a>),
-    Rgetlock(Rgetlock<'a>),
-    Tlink(Tlink<'a>),
-    Tmkdir(Tmkdir<'a>),
-    Trenameat(Trenameat<'a>),
-    Tunlinkat(Tunlinkat<'a>),
-    Tauth(Tauth<'a>),
-    Tversion(Tversion<'a>),
-    Rversion(Rversion<'a>),
-    Twalk(Twalk<'a>),
-    Rread(Rread<'a>),
-    Twrite(Twrite<'a>),
+fcall_types! {
+    Rlerror,
+    Tattach<'a>,
+    Rattach,
+    Tstatfs,
+    Rstatfs,
+    Tlopen,
+    Rlopen,
+    Tlcreate<'a>,
+    Rlcreate,
+    Tsymlink<'a>,
+    Rsymlink,
+    Tmknod<'a>,
+    Rmknod,
+    Trename<'a>,
+    Rrename,
+    Treadlink,
+    Rreadlink<'a>,
+    Tgetattr,
+    Rgetattr,
+    Tsetattr,
+    Rsetattr,
+    Txattrwalk<'a>,
+    Rxattrwalk,
+    Txattrcreate<'a>,
+    Rxattrcreate,
+    Treaddir,
+    Rreaddir<'a>,
+    Tfsync,
+    Rfsync,
+    Tlock<'a>,
+    Rlock,
+    Tgetlock<'a>,
+    Rgetlock<'a>,
+    Tlink<'a>,
+    Rlink,
+    Tmkdir<'a>,
+    Rmkdir,
+    Trenameat<'a>,
+    Rrenameat,
+    Tunlinkat<'a>,
+    Runlinkat,
+    Tauth<'a>,
+    Rauth,
+    Tversion<'a>,
+    Rversion<'a>,
+    Tflush,
+    Rflush,
+    Twalk<'a>,
+    Rwalk,
+    Tread,
+    Rread<'a>,
+    Twrite<'a>,
+    Rwrite,
+    Tclunk,
+    Rclunk,
+    Tremove,
+    Rremove,
 }
 
 /// Tagged 9P message
@@ -967,7 +1207,7 @@ impl<'a> TaggedFcall<'a> {
         encode_fcall(buf, tag, fcall)?;
 
         // Write the size at the beginning
-        let size = u32::try_from(buf.len()).expect("buffer length exceeds u32");
+        let size = u32::try_from(buf.len()).map_err(|_| transport::WriteError)?;
         buf[0..4].copy_from_slice(&size.to_le_bytes());
 
         Ok(())
@@ -980,516 +1220,92 @@ impl<'a> TaggedFcall<'a> {
         }
 
         let mut decoder = FcallDecoder { buf: &buf[4..] };
-        decoder.decode()
+        decoder.decode_message()
     }
 }
+
+// ============================================================================
+// Little-endian wire encoding
+// ============================================================================
+
+/// Trait for encoding/decoding types in little-endian wire format.
+///
+/// The 9P protocol uses little-endian byte order for all integer fields.
+trait LeWire: Sized + Copy {
+    const SIZE: usize;
+    fn write_le<W: transport::Write>(self, w: &mut W) -> Result<(), transport::WriteError>;
+    fn read_le(buf: &[u8]) -> Option<Self>;
+}
+
+macro_rules! impl_le_wire {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl LeWire for $ty {
+                const SIZE: usize = core::mem::size_of::<$ty>();
+
+                fn write_le<W: transport::Write>(self, w: &mut W) -> Result<(), transport::WriteError> {
+                    w.write_all(&self.to_le_bytes())
+                }
+
+                fn read_le(buf: &[u8]) -> Option<Self> {
+                    Some(<$ty>::from_le_bytes(buf.try_into().ok()?))
+                }
+            }
+        )*
+    };
+}
+
+impl_le_wire!(u8, u16, u32, u64);
 
 // ============================================================================
 // Encoding functions
 // ============================================================================
 
-fn encode_u8<W: Write>(w: &mut W, v: u8) -> Result<(), transport::WriteError> {
-    w.write_all(&[v])
+/// Encode a primitive integer in little-endian format to the writer.
+fn encode_le<W: transport::Write>(w: &mut W, v: impl LeWire) -> Result<(), transport::WriteError> {
+    v.write_le(w)
 }
 
-fn encode_u16<W: Write>(w: &mut W, v: u16) -> Result<(), transport::WriteError> {
-    w.write_all(&v.to_le_bytes())
-}
-
-fn encode_u32<W: Write>(w: &mut W, v: u32) -> Result<(), transport::WriteError> {
-    w.write_all(&v.to_le_bytes())
-}
-
-fn encode_u64<W: Write>(w: &mut W, v: u64) -> Result<(), transport::WriteError> {
-    w.write_all(&v.to_le_bytes())
-}
-
-fn encode_str<W: Write>(w: &mut W, v: &FcallStr<'_>) -> Result<(), transport::WriteError> {
-    encode_u16(w, u16::try_from(v.len()).expect("str length exceeds u16"))?;
-    w.write_all(v)
-}
-
-fn encode_data_buf<W: Write>(w: &mut W, v: &[u8]) -> Result<(), transport::WriteError> {
-    encode_u32(
+fn encode_str<W: transport::Write>(
+    w: &mut W,
+    v: &FcallStr<'_>,
+) -> Result<(), transport::WriteError> {
+    encode_le(
         w,
-        u32::try_from(v.len()).expect("data buffer length exceeds u32"),
+        u16::try_from(v.len()).map_err(|_| transport::WriteError)?,
     )?;
     w.write_all(v)
 }
 
-fn encode_vec_str<W: Write>(w: &mut W, v: &[FcallStr<'_>]) -> Result<(), transport::WriteError> {
-    encode_u16(w, u16::try_from(v.len()).expect("vec length exceeds u16"))?;
+fn encode_data_buf<W: transport::Write>(w: &mut W, v: &[u8]) -> Result<(), transport::WriteError> {
+    encode_le(
+        w,
+        u32::try_from(v.len()).map_err(|_| transport::WriteError)?,
+    )?;
+    w.write_all(v)
+}
+
+fn encode_vec_str<W: transport::Write>(
+    w: &mut W,
+    v: &[FcallStr<'_>],
+) -> Result<(), transport::WriteError> {
+    encode_le(
+        w,
+        u16::try_from(v.len()).map_err(|_| transport::WriteError)?,
+    )?;
     for s in v {
         encode_str(w, s)?;
     }
     Ok(())
 }
 
-fn encode_vec_qid<W: Write>(w: &mut W, v: Vec<Qid>) -> Result<(), transport::WriteError> {
-    encode_u16(w, u16::try_from(v.len()).expect("vec length exceeds u16"))?;
-    for q in v {
-        encode_qid(w, q)?;
-    }
-    Ok(())
-}
-
-fn encode_qidtype<W: Write>(w: &mut W, v: QidType) -> Result<(), transport::WriteError> {
-    encode_u8(w, v.bits())
-}
-
-fn encode_locktype<W: Write>(w: &mut W, v: LockType) -> Result<(), transport::WriteError> {
-    encode_u8(w, v.bits())
-}
-
-fn encode_lockstatus<W: Write>(w: &mut W, v: LockStatus) -> Result<(), transport::WriteError> {
-    encode_u8(w, v.bits())
-}
-
-fn encode_lockflag<W: Write>(w: &mut W, v: LockFlag) -> Result<(), transport::WriteError> {
-    encode_u32(w, v.bits())
-}
-
-fn encode_getattrmask<W: Write>(w: &mut W, v: GetattrMask) -> Result<(), transport::WriteError> {
-    encode_u64(w, v.bits())
-}
-
-fn encode_setattrmask<W: Write>(w: &mut W, v: SetattrMask) -> Result<(), transport::WriteError> {
-    encode_u32(w, v.bits())
-}
-
-fn encode_qid<W: Write>(w: &mut W, v: Qid) -> Result<(), transport::WriteError> {
-    encode_qidtype(w, v.typ)?;
-    encode_u32(w, v.version)?;
-    encode_u64(w, v.path)?;
-    Ok(())
-}
-
-fn encode_statfs<W: Write>(w: &mut W, v: Statfs) -> Result<(), transport::WriteError> {
-    encode_u32(w, v.typ)?;
-    encode_u32(w, v.bsize)?;
-    encode_u64(w, v.blocks)?;
-    encode_u64(w, v.bfree)?;
-    encode_u64(w, v.bavail)?;
-    encode_u64(w, v.files)?;
-    encode_u64(w, v.ffree)?;
-    encode_u64(w, v.fsid)?;
-    encode_u32(w, v.namelen)?;
-    Ok(())
-}
-
-fn encode_time<W: Write>(w: &mut W, v: Time) -> Result<(), transport::WriteError> {
-    encode_u64(w, v.sec)?;
-    encode_u64(w, v.nsec)?;
-    Ok(())
-}
-
-fn encode_stat<W: Write>(w: &mut W, v: Stat) -> Result<(), transport::WriteError> {
-    encode_u32(w, v.mode)?;
-    encode_u32(w, v.uid)?;
-    encode_u32(w, v.gid)?;
-    encode_u64(w, v.nlink)?;
-    encode_u64(w, v.rdev)?;
-    encode_u64(w, v.size)?;
-    encode_u64(w, v.blksize)?;
-    encode_u64(w, v.blocks)?;
-    encode_time(w, v.atime)?;
-    encode_time(w, v.mtime)?;
-    encode_time(w, v.ctime)?;
-    encode_time(w, v.btime)?;
-    encode_u64(w, v.generation)?;
-    encode_u64(w, v.data_version)?;
-    Ok(())
-}
-
-fn encode_setattr<W: Write>(w: &mut W, v: SetAttr) -> Result<(), transport::WriteError> {
-    encode_u32(w, v.mode)?;
-    encode_u32(w, v.uid)?;
-    encode_u32(w, v.gid)?;
-    encode_u64(w, v.size)?;
-    encode_time(w, v.atime)?;
-    encode_time(w, v.mtime)?;
-    Ok(())
-}
-
-fn encode_direntrydata<W: Write>(
-    w: &mut W,
-    v: DirEntryData<'_>,
-) -> Result<(), transport::WriteError> {
-    encode_u32(
+fn encode_vec_qid<W: transport::Write>(w: &mut W, v: &[Qid]) -> Result<(), transport::WriteError> {
+    encode_le(
         w,
-        u32::try_from(v.size()).expect("direntrydata size exceeds u32"),
+        u16::try_from(v.len()).map_err(|_| transport::WriteError)?,
     )?;
-    for e in v.data {
-        encode_direntry(w, e)?;
-    }
-    Ok(())
-}
-
-fn encode_direntry<W: Write>(w: &mut W, v: DirEntry<'_>) -> Result<(), transport::WriteError> {
-    encode_qid(w, v.qid)?;
-    encode_u64(w, v.offset)?;
-    encode_u8(w, v.typ)?;
-    encode_str(w, &v.name)?;
-    Ok(())
-}
-
-fn encode_flock<W: Write>(w: &mut W, v: Flock<'_>) -> Result<(), transport::WriteError> {
-    encode_locktype(w, v.typ)?;
-    encode_lockflag(w, v.flags)?;
-    encode_u64(w, v.start)?;
-    encode_u64(w, v.length)?;
-    encode_u32(w, v.proc_id)?;
-    encode_str(w, &v.client_id)?;
-    Ok(())
-}
-
-fn encode_getlock<W: Write>(w: &mut W, v: Getlock<'_>) -> Result<(), transport::WriteError> {
-    encode_locktype(w, v.typ)?;
-    encode_u64(w, v.start)?;
-    encode_u64(w, v.length)?;
-    encode_u32(w, v.proc_id)?;
-    encode_str(w, &v.client_id)?;
-    Ok(())
-}
-
-fn encode_fcall<W: Write>(
-    w: &mut W,
-    tag: u16,
-    fcall: Fcall<'_>,
-) -> Result<(), transport::WriteError> {
-    match fcall {
-        Fcall::Rlerror(v) => {
-            encode_u8(w, FcallType::Rlerror as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.ecode)?;
-        }
-        Fcall::Tattach(v) => {
-            encode_u8(w, FcallType::Tattach as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_u32(w, v.afid)?;
-            encode_str(w, &v.uname)?;
-            encode_str(w, &v.aname)?;
-            encode_u32(w, v.n_uname)?;
-        }
-        Fcall::Rattach(v) => {
-            encode_u8(w, FcallType::Rattach as u8)?;
-            encode_u16(w, tag)?;
-            encode_qid(w, v.qid)?;
-        }
-        Fcall::Tstatfs(v) => {
-            encode_u8(w, FcallType::Tstatfs as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-        }
-        Fcall::Rstatfs(v) => {
-            encode_u8(w, FcallType::Rstatfs as u8)?;
-            encode_u16(w, tag)?;
-            encode_statfs(w, v.statfs)?;
-        }
-        Fcall::Tlopen(v) => {
-            encode_u8(w, FcallType::Tlopen as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_u32(w, v.flags.bits())?;
-        }
-        Fcall::Rlopen(v) => {
-            encode_u8(w, FcallType::Rlopen as u8)?;
-            encode_u16(w, tag)?;
-            encode_qid(w, v.qid)?;
-            encode_u32(w, v.iounit)?;
-        }
-        Fcall::Tlcreate(v) => {
-            encode_u8(w, FcallType::Tlcreate as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_str(w, &v.name)?;
-            encode_u32(w, v.flags.bits())?;
-            encode_u32(w, v.mode)?;
-            encode_u32(w, v.gid)?;
-        }
-        Fcall::Rlcreate(v) => {
-            encode_u8(w, FcallType::Rlcreate as u8)?;
-            encode_u16(w, tag)?;
-            encode_qid(w, v.qid)?;
-            encode_u32(w, v.iounit)?;
-        }
-        Fcall::Tsymlink(v) => {
-            encode_u8(w, FcallType::Tsymlink as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_str(w, &v.name)?;
-            encode_str(w, &v.symtgt)?;
-            encode_u32(w, v.gid)?;
-        }
-        Fcall::Rsymlink(v) => {
-            encode_u8(w, FcallType::Rsymlink as u8)?;
-            encode_u16(w, tag)?;
-            encode_qid(w, v.qid)?;
-        }
-        Fcall::Tmknod(v) => {
-            encode_u8(w, FcallType::Tmknod as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.dfid)?;
-            encode_str(w, &v.name)?;
-            encode_u32(w, v.mode)?;
-            encode_u32(w, v.major)?;
-            encode_u32(w, v.minor)?;
-            encode_u32(w, v.gid)?;
-        }
-        Fcall::Rmknod(v) => {
-            encode_u8(w, FcallType::Rmknod as u8)?;
-            encode_u16(w, tag)?;
-            encode_qid(w, v.qid)?;
-        }
-        Fcall::Trename(v) => {
-            encode_u8(w, FcallType::Trename as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_u32(w, v.dfid)?;
-            encode_str(w, &v.name)?;
-        }
-        Fcall::Rrename(_) => {
-            encode_u8(w, FcallType::Rrename as u8)?;
-            encode_u16(w, tag)?;
-        }
-        Fcall::Treadlink(v) => {
-            encode_u8(w, FcallType::Treadlink as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-        }
-        Fcall::Rreadlink(v) => {
-            encode_u8(w, FcallType::Rreadlink as u8)?;
-            encode_u16(w, tag)?;
-            encode_str(w, &v.target)?;
-        }
-        Fcall::Tgetattr(v) => {
-            encode_u8(w, FcallType::Tgetattr as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_getattrmask(w, v.req_mask)?;
-        }
-        Fcall::Rgetattr(v) => {
-            encode_u8(w, FcallType::Rgetattr as u8)?;
-            encode_u16(w, tag)?;
-            encode_getattrmask(w, v.valid)?;
-            encode_qid(w, v.qid)?;
-            encode_stat(w, v.stat)?;
-        }
-        Fcall::Tsetattr(v) => {
-            encode_u8(w, FcallType::Tsetattr as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_setattrmask(w, v.valid)?;
-            encode_setattr(w, v.stat)?;
-        }
-        Fcall::Rsetattr(_) => {
-            encode_u8(w, FcallType::Rsetattr as u8)?;
-            encode_u16(w, tag)?;
-        }
-        Fcall::Txattrwalk(v) => {
-            encode_u8(w, FcallType::Txattrwalk as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_u32(w, v.new_fid)?;
-            encode_str(w, &v.name)?;
-        }
-        Fcall::Rxattrwalk(v) => {
-            encode_u8(w, FcallType::Rxattrwalk as u8)?;
-            encode_u16(w, tag)?;
-            encode_u64(w, v.size)?;
-        }
-        Fcall::Txattrcreate(v) => {
-            encode_u8(w, FcallType::Txattrcreate as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_str(w, &v.name)?;
-            encode_u64(w, v.attr_size)?;
-            encode_u32(w, v.flags)?;
-        }
-        Fcall::Rxattrcreate(_) => {
-            encode_u8(w, FcallType::Rxattrcreate as u8)?;
-            encode_u16(w, tag)?;
-        }
-        Fcall::Treaddir(v) => {
-            encode_u8(w, FcallType::Treaddir as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_u64(w, v.offset)?;
-            encode_u32(w, v.count)?;
-        }
-        Fcall::Rreaddir(v) => {
-            encode_u8(w, FcallType::Rreaddir as u8)?;
-            encode_u16(w, tag)?;
-            encode_direntrydata(w, v.data)?;
-        }
-        Fcall::Tfsync(v) => {
-            encode_u8(w, FcallType::Tfsync as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_u32(w, v.datasync)?;
-        }
-        Fcall::Rfsync(_) => {
-            encode_u8(w, FcallType::Rfsync as u8)?;
-            encode_u16(w, tag)?;
-        }
-        Fcall::Tlock(v) => {
-            encode_u8(w, FcallType::Tlock as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_flock(w, v.flock)?;
-        }
-        Fcall::Rlock(v) => {
-            encode_u8(w, FcallType::Rlock as u8)?;
-            encode_u16(w, tag)?;
-            encode_lockstatus(w, v.status)?;
-        }
-        Fcall::Tgetlock(v) => {
-            encode_u8(w, FcallType::Tgetlock as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_getlock(w, v.flock)?;
-        }
-        Fcall::Rgetlock(v) => {
-            encode_u8(w, FcallType::Rgetlock as u8)?;
-            encode_u16(w, tag)?;
-            encode_getlock(w, v.flock)?;
-        }
-        Fcall::Tlink(v) => {
-            encode_u8(w, FcallType::Tlink as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.dfid)?;
-            encode_u32(w, v.fid)?;
-            encode_str(w, &v.name)?;
-        }
-        Fcall::Rlink(_) => {
-            encode_u8(w, FcallType::Rlink as u8)?;
-            encode_u16(w, tag)?;
-        }
-        Fcall::Tmkdir(v) => {
-            encode_u8(w, FcallType::Tmkdir as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.dfid)?;
-            encode_str(w, &v.name)?;
-            encode_u32(w, v.mode)?;
-            encode_u32(w, v.gid)?;
-        }
-        Fcall::Rmkdir(v) => {
-            encode_u8(w, FcallType::Rmkdir as u8)?;
-            encode_u16(w, tag)?;
-            encode_qid(w, v.qid)?;
-        }
-        Fcall::Trenameat(v) => {
-            encode_u8(w, FcallType::Trenameat as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.olddfid)?;
-            encode_str(w, &v.oldname)?;
-            encode_u32(w, v.newdfid)?;
-            encode_str(w, &v.newname)?;
-        }
-        Fcall::Rrenameat(_) => {
-            encode_u8(w, FcallType::Rrenameat as u8)?;
-            encode_u16(w, tag)?;
-        }
-        Fcall::Tunlinkat(v) => {
-            encode_u8(w, FcallType::Tunlinkat as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.dfid)?;
-            encode_str(w, &v.name)?;
-            encode_u32(w, v.flags)?;
-        }
-        Fcall::Runlinkat(_) => {
-            encode_u8(w, FcallType::Runlinkat as u8)?;
-            encode_u16(w, tag)?;
-        }
-        Fcall::Tauth(v) => {
-            encode_u8(w, FcallType::Tauth as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.afid)?;
-            encode_str(w, &v.uname)?;
-            encode_str(w, &v.aname)?;
-            encode_u32(w, v.n_uname)?;
-        }
-        Fcall::Rauth(v) => {
-            encode_u8(w, FcallType::Rauth as u8)?;
-            encode_u16(w, tag)?;
-            encode_qid(w, v.aqid)?;
-        }
-        Fcall::Tversion(v) => {
-            encode_u8(w, FcallType::Tversion as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.msize)?;
-            encode_str(w, &v.version)?;
-        }
-        Fcall::Rversion(v) => {
-            encode_u8(w, FcallType::Rversion as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.msize)?;
-            encode_str(w, &v.version)?;
-        }
-        Fcall::Tflush(v) => {
-            encode_u8(w, FcallType::Tflush as u8)?;
-            encode_u16(w, tag)?;
-            encode_u16(w, v.oldtag)?;
-        }
-        Fcall::Rflush(_) => {
-            encode_u8(w, FcallType::Rflush as u8)?;
-            encode_u16(w, tag)?;
-        }
-        Fcall::Twalk(v) => {
-            encode_u8(w, FcallType::Twalk as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_u32(w, v.new_fid)?;
-            encode_vec_str(w, &v.wnames)?;
-        }
-        Fcall::Rwalk(v) => {
-            encode_u8(w, FcallType::Rwalk as u8)?;
-            encode_u16(w, tag)?;
-            encode_vec_qid(w, v.wqids)?;
-        }
-        Fcall::Tread(v) => {
-            encode_u8(w, FcallType::Tread as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_u64(w, v.offset)?;
-            encode_u32(w, v.count)?;
-        }
-        Fcall::Rread(v) => {
-            encode_u8(w, FcallType::Rread as u8)?;
-            encode_u16(w, tag)?;
-            encode_data_buf(w, &v.data)?;
-        }
-        Fcall::Twrite(v) => {
-            encode_u8(w, FcallType::Twrite as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-            encode_u64(w, v.offset)?;
-            encode_data_buf(w, &v.data)?;
-        }
-        Fcall::Rwrite(v) => {
-            encode_u8(w, FcallType::Rwrite as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.count)?;
-        }
-        Fcall::Tclunk(v) => {
-            encode_u8(w, FcallType::Tclunk as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-        }
-        Fcall::Rclunk(_) => {
-            encode_u8(w, FcallType::Rclunk as u8)?;
-            encode_u16(w, tag)?;
-        }
-        Fcall::Tremove(v) => {
-            encode_u8(w, FcallType::Tremove as u8)?;
-            encode_u16(w, tag)?;
-            encode_u32(w, v.fid)?;
-        }
-        Fcall::Rremove(_) => {
-            encode_u8(w, FcallType::Rremove as u8)?;
-            encode_u16(w, tag)?;
-        }
+    for q in v {
+        q.encode_to(w)?;
     }
     Ok(())
 }
@@ -1503,47 +1319,8 @@ struct FcallDecoder<'b> {
 }
 
 impl<'b> FcallDecoder<'b> {
-    fn decode_u8(&mut self) -> Result<u8, super::Error> {
-        if let Some(v) = self.buf.first() {
-            self.buf = &self.buf[1..];
-            Ok(*v)
-        } else {
-            Err(super::Error::InvalidResponse)
-        }
-    }
-
-    fn decode_u16(&mut self) -> Result<u16, super::Error> {
-        if self.buf.len() >= 2 {
-            let v = u16::from_le_bytes(self.buf[0..2].try_into().unwrap());
-            self.buf = &self.buf[2..];
-            Ok(v)
-        } else {
-            Err(super::Error::InvalidResponse)
-        }
-    }
-
-    fn decode_u32(&mut self) -> Result<u32, super::Error> {
-        if self.buf.len() >= 4 {
-            let v = u32::from_le_bytes(self.buf[0..4].try_into().unwrap());
-            self.buf = &self.buf[4..];
-            Ok(v)
-        } else {
-            Err(super::Error::InvalidResponse)
-        }
-    }
-
-    fn decode_u64(&mut self) -> Result<u64, super::Error> {
-        if self.buf.len() >= 8 {
-            let v = u64::from_le_bytes(self.buf[0..8].try_into().unwrap());
-            self.buf = &self.buf[8..];
-            Ok(v)
-        } else {
-            Err(super::Error::InvalidResponse)
-        }
-    }
-
     fn decode_str(&mut self) -> Result<FcallStr<'b>, super::Error> {
-        let n = self.decode_u16()? as usize;
+        let n = self.decode_le::<u16>()? as usize;
         if self.buf.len() >= n {
             let v = FcallStr::Borrowed(&self.buf[..n]);
             self.buf = &self.buf[n..];
@@ -1554,7 +1331,7 @@ impl<'b> FcallDecoder<'b> {
     }
 
     fn decode_data_buf(&mut self) -> Result<Cow<'b, [u8]>, super::Error> {
-        let n = self.decode_u32()? as usize;
+        let n = self.decode_le::<u32>()? as usize;
         if self.buf.len() >= n {
             let v = &self.buf[..n];
             self.buf = &self.buf[n..];
@@ -1565,357 +1342,31 @@ impl<'b> FcallDecoder<'b> {
     }
 
     fn decode_vec_qid(&mut self) -> Result<Vec<Qid>, super::Error> {
-        let len = self.decode_u16()?;
+        let len = self.decode_le::<u16>()?;
         let mut v = Vec::new();
         for _ in 0..len {
-            v.push(self.decode_qid()?);
+            v.push(Qid::decode_from(self)?);
         }
         Ok(v)
     }
 
-    fn decode_direntrydata(&mut self) -> Result<DirEntryData<'b>, super::Error> {
-        let end_len = self.buf.len() - self.decode_u32()? as usize;
+    fn decode_vec_str(&mut self) -> Result<Vec<FcallStr<'b>>, super::Error> {
+        let len = self.decode_le::<u16>()?;
         let mut v = Vec::new();
-        while self.buf.len() > end_len {
-            v.push(self.decode_direntry()?);
+        for _ in 0..len {
+            v.push(self.decode_str()?);
         }
-        Ok(DirEntryData::with(v))
+        Ok(v)
     }
 
-    fn decode_qidtype(&mut self) -> Result<QidType, super::Error> {
-        Ok(QidType::from_bits_truncate(self.decode_u8()?))
-    }
-
-    fn decode_locktype(&mut self) -> Result<LockType, super::Error> {
-        Ok(LockType::from_bits_truncate(self.decode_u8()?))
-    }
-
-    fn decode_lockstatus(&mut self) -> Result<LockStatus, super::Error> {
-        Ok(LockStatus::from_bits_truncate(self.decode_u8()?))
-    }
-
-    fn decode_lockflag(&mut self) -> Result<LockFlag, super::Error> {
-        Ok(LockFlag::from_bits_truncate(self.decode_u32()?))
-    }
-
-    fn decode_getattrmask(&mut self) -> Result<GetattrMask, super::Error> {
-        Ok(GetattrMask::from_bits_truncate(self.decode_u64()?))
-    }
-
-    fn decode_setattrmask(&mut self) -> Result<SetattrMask, super::Error> {
-        Ok(SetattrMask::from_bits_truncate(self.decode_u32()?))
-    }
-
-    fn decode_qid(&mut self) -> Result<Qid, super::Error> {
-        Ok(Qid {
-            typ: self.decode_qidtype()?,
-            version: self.decode_u32()?,
-            path: self.decode_u64()?,
-        })
-    }
-
-    fn decode_statfs(&mut self) -> Result<Statfs, super::Error> {
-        Ok(Statfs {
-            typ: self.decode_u32()?,
-            bsize: self.decode_u32()?,
-            blocks: self.decode_u64()?,
-            bfree: self.decode_u64()?,
-            bavail: self.decode_u64()?,
-            files: self.decode_u64()?,
-            ffree: self.decode_u64()?,
-            fsid: self.decode_u64()?,
-            namelen: self.decode_u32()?,
-        })
-    }
-
-    fn decode_time(&mut self) -> Result<Time, super::Error> {
-        Ok(Time {
-            sec: self.decode_u64()?,
-            nsec: self.decode_u64()?,
-        })
-    }
-
-    fn decode_stat(&mut self) -> Result<Stat, super::Error> {
-        Ok(Stat {
-            mode: self.decode_u32()?,
-            uid: self.decode_u32()?,
-            gid: self.decode_u32()?,
-            nlink: self.decode_u64()?,
-            rdev: self.decode_u64()?,
-            size: self.decode_u64()?,
-            blksize: self.decode_u64()?,
-            blocks: self.decode_u64()?,
-            atime: self.decode_time()?,
-            mtime: self.decode_time()?,
-            ctime: self.decode_time()?,
-            btime: self.decode_time()?,
-            generation: self.decode_u64()?,
-            data_version: self.decode_u64()?,
-        })
-    }
-
-    fn decode_setattr(&mut self) -> Result<SetAttr, super::Error> {
-        Ok(SetAttr {
-            mode: self.decode_u32()?,
-            uid: self.decode_u32()?,
-            gid: self.decode_u32()?,
-            size: self.decode_u64()?,
-            atime: self.decode_time()?,
-            mtime: self.decode_time()?,
-        })
-    }
-
-    fn decode_direntry(&mut self) -> Result<DirEntry<'b>, super::Error> {
-        Ok(DirEntry {
-            qid: self.decode_qid()?,
-            offset: self.decode_u64()?,
-            typ: self.decode_u8()?,
-            name: self.decode_str()?,
-        })
-    }
-
-    fn decode_flock(&mut self) -> Result<Flock<'b>, super::Error> {
-        Ok(Flock {
-            typ: self.decode_locktype()?,
-            flags: self.decode_lockflag()?,
-            start: self.decode_u64()?,
-            length: self.decode_u64()?,
-            proc_id: self.decode_u32()?,
-            client_id: self.decode_str()?,
-        })
-    }
-
-    fn decode_getlock(&mut self) -> Result<Getlock<'b>, super::Error> {
-        Ok(Getlock {
-            typ: self.decode_locktype()?,
-            start: self.decode_u64()?,
-            length: self.decode_u64()?,
-            proc_id: self.decode_u32()?,
-            client_id: self.decode_str()?,
-        })
-    }
-
-    fn decode(&mut self) -> Result<TaggedFcall<'b>, super::Error> {
-        let msg_type = FcallType::from_u8(self.decode_u8()?);
-        let tag = self.decode_u16()?;
-        let fcall = match msg_type {
-            Some(FcallType::Rlerror) => Fcall::Rlerror(Rlerror {
-                ecode: self.decode_u32()?,
-            }),
-            Some(FcallType::Tattach) => Fcall::Tattach(Tattach {
-                fid: self.decode_u32()?,
-                afid: self.decode_u32()?,
-                uname: self.decode_str()?,
-                aname: self.decode_str()?,
-                n_uname: self.decode_u32()?,
-            }),
-            Some(FcallType::Rattach) => Fcall::Rattach(Rattach {
-                qid: self.decode_qid()?,
-            }),
-            Some(FcallType::Tstatfs) => Fcall::Tstatfs(Tstatfs {
-                fid: self.decode_u32()?,
-            }),
-            Some(FcallType::Rstatfs) => Fcall::Rstatfs(Rstatfs {
-                statfs: self.decode_statfs()?,
-            }),
-            Some(FcallType::Tlopen) => Fcall::Tlopen(Tlopen {
-                fid: self.decode_u32()?,
-                flags: LOpenFlags::from_bits_truncate(self.decode_u32()?),
-            }),
-            Some(FcallType::Rlopen) => Fcall::Rlopen(Rlopen {
-                qid: self.decode_qid()?,
-                iounit: self.decode_u32()?,
-            }),
-            Some(FcallType::Tlcreate) => Fcall::Tlcreate(Tlcreate {
-                fid: self.decode_u32()?,
-                name: self.decode_str()?,
-                flags: LOpenFlags::from_bits_truncate(self.decode_u32()?),
-                mode: self.decode_u32()?,
-                gid: self.decode_u32()?,
-            }),
-            Some(FcallType::Rlcreate) => Fcall::Rlcreate(Rlcreate {
-                qid: self.decode_qid()?,
-                iounit: self.decode_u32()?,
-            }),
-            Some(FcallType::Tsymlink) => Fcall::Tsymlink(Tsymlink {
-                fid: self.decode_u32()?,
-                name: self.decode_str()?,
-                symtgt: self.decode_str()?,
-                gid: self.decode_u32()?,
-            }),
-            Some(FcallType::Rsymlink) => Fcall::Rsymlink(Rsymlink {
-                qid: self.decode_qid()?,
-            }),
-            Some(FcallType::Tmknod) => Fcall::Tmknod(Tmknod {
-                dfid: self.decode_u32()?,
-                name: self.decode_str()?,
-                mode: self.decode_u32()?,
-                major: self.decode_u32()?,
-                minor: self.decode_u32()?,
-                gid: self.decode_u32()?,
-            }),
-            Some(FcallType::Rmknod) => Fcall::Rmknod(Rmknod {
-                qid: self.decode_qid()?,
-            }),
-            Some(FcallType::Trename) => Fcall::Trename(Trename {
-                fid: self.decode_u32()?,
-                dfid: self.decode_u32()?,
-                name: self.decode_str()?,
-            }),
-            Some(FcallType::Rrename) => Fcall::Rrename(Rrename {}),
-            Some(FcallType::Treadlink) => Fcall::Treadlink(Treadlink {
-                fid: self.decode_u32()?,
-            }),
-            Some(FcallType::Rreadlink) => Fcall::Rreadlink(Rreadlink {
-                target: self.decode_str()?,
-            }),
-            Some(FcallType::Tgetattr) => Fcall::Tgetattr(Tgetattr {
-                fid: self.decode_u32()?,
-                req_mask: self.decode_getattrmask()?,
-            }),
-            Some(FcallType::Rgetattr) => Fcall::Rgetattr(Rgetattr {
-                valid: self.decode_getattrmask()?,
-                qid: self.decode_qid()?,
-                stat: self.decode_stat()?,
-            }),
-            Some(FcallType::Tsetattr) => Fcall::Tsetattr(Tsetattr {
-                fid: self.decode_u32()?,
-                valid: self.decode_setattrmask()?,
-                stat: self.decode_setattr()?,
-            }),
-            Some(FcallType::Rsetattr) => Fcall::Rsetattr(Rsetattr {}),
-            Some(FcallType::Txattrwalk) => Fcall::Txattrwalk(Txattrwalk {
-                fid: self.decode_u32()?,
-                new_fid: self.decode_u32()?,
-                name: self.decode_str()?,
-            }),
-            Some(FcallType::Rxattrwalk) => Fcall::Rxattrwalk(Rxattrwalk {
-                size: self.decode_u64()?,
-            }),
-            Some(FcallType::Txattrcreate) => Fcall::Txattrcreate(Txattrcreate {
-                fid: self.decode_u32()?,
-                name: self.decode_str()?,
-                attr_size: self.decode_u64()?,
-                flags: self.decode_u32()?,
-            }),
-            Some(FcallType::Rxattrcreate) => Fcall::Rxattrcreate(Rxattrcreate {}),
-            Some(FcallType::Treaddir) => Fcall::Treaddir(Treaddir {
-                fid: self.decode_u32()?,
-                offset: self.decode_u64()?,
-                count: self.decode_u32()?,
-            }),
-            Some(FcallType::Rreaddir) => Fcall::Rreaddir(Rreaddir {
-                data: self.decode_direntrydata()?,
-            }),
-            Some(FcallType::Tfsync) => Fcall::Tfsync(Tfsync {
-                fid: self.decode_u32()?,
-                datasync: self.decode_u32()?,
-            }),
-            Some(FcallType::Rfsync) => Fcall::Rfsync(Rfsync {}),
-            Some(FcallType::Tlock) => Fcall::Tlock(Tlock {
-                fid: self.decode_u32()?,
-                flock: self.decode_flock()?,
-            }),
-            Some(FcallType::Rlock) => Fcall::Rlock(Rlock {
-                status: self.decode_lockstatus()?,
-            }),
-            Some(FcallType::Tgetlock) => Fcall::Tgetlock(Tgetlock {
-                fid: self.decode_u32()?,
-                flock: self.decode_getlock()?,
-            }),
-            Some(FcallType::Rgetlock) => Fcall::Rgetlock(Rgetlock {
-                flock: self.decode_getlock()?,
-            }),
-            Some(FcallType::Tlink) => Fcall::Tlink(Tlink {
-                dfid: self.decode_u32()?,
-                fid: self.decode_u32()?,
-                name: self.decode_str()?,
-            }),
-            Some(FcallType::Rlink) => Fcall::Rlink(Rlink {}),
-            Some(FcallType::Tmkdir) => Fcall::Tmkdir(Tmkdir {
-                dfid: self.decode_u32()?,
-                name: self.decode_str()?,
-                mode: self.decode_u32()?,
-                gid: self.decode_u32()?,
-            }),
-            Some(FcallType::Rmkdir) => Fcall::Rmkdir(Rmkdir {
-                qid: self.decode_qid()?,
-            }),
-            Some(FcallType::Trenameat) => Fcall::Trenameat(Trenameat {
-                olddfid: self.decode_u32()?,
-                oldname: self.decode_str()?,
-                newdfid: self.decode_u32()?,
-                newname: self.decode_str()?,
-            }),
-            Some(FcallType::Rrenameat) => Fcall::Rrenameat(Rrenameat {}),
-            Some(FcallType::Tunlinkat) => Fcall::Tunlinkat(Tunlinkat {
-                dfid: self.decode_u32()?,
-                name: self.decode_str()?,
-                flags: self.decode_u32()?,
-            }),
-            Some(FcallType::Runlinkat) => Fcall::Runlinkat(Runlinkat {}),
-            Some(FcallType::Tauth) => Fcall::Tauth(Tauth {
-                afid: self.decode_u32()?,
-                uname: self.decode_str()?,
-                aname: self.decode_str()?,
-                n_uname: self.decode_u32()?,
-            }),
-            Some(FcallType::Rauth) => Fcall::Rauth(Rauth {
-                aqid: self.decode_qid()?,
-            }),
-            Some(FcallType::Tversion) => Fcall::Tversion(Tversion {
-                msize: self.decode_u32()?,
-                version: self.decode_str()?,
-            }),
-            Some(FcallType::Rversion) => Fcall::Rversion(Rversion {
-                msize: self.decode_u32()?,
-                version: self.decode_str()?,
-            }),
-            Some(FcallType::Tflush) => Fcall::Tflush(Tflush {
-                oldtag: self.decode_u16()?,
-            }),
-            Some(FcallType::Rflush) => Fcall::Rflush(Rflush {}),
-            Some(FcallType::Twalk) => Fcall::Twalk(Twalk {
-                fid: self.decode_u32()?,
-                new_fid: self.decode_u32()?,
-                wnames: {
-                    let len = self.decode_u16()?;
-                    let mut wnames = Vec::new();
-                    for _ in 0..len {
-                        wnames.push(self.decode_str()?);
-                    }
-                    wnames
-                },
-            }),
-            Some(FcallType::Rwalk) => Fcall::Rwalk(Rwalk {
-                wqids: self.decode_vec_qid()?,
-            }),
-            Some(FcallType::Tread) => Fcall::Tread(Tread {
-                fid: self.decode_u32()?,
-                offset: self.decode_u64()?,
-                count: self.decode_u32()?,
-            }),
-            Some(FcallType::Rread) => Fcall::Rread(Rread {
-                data: self.decode_data_buf()?,
-            }),
-            Some(FcallType::Twrite) => Fcall::Twrite(Twrite {
-                fid: self.decode_u32()?,
-                offset: self.decode_u64()?,
-                data: self.decode_data_buf()?,
-            }),
-            Some(FcallType::Rwrite) => Fcall::Rwrite(Rwrite {
-                count: self.decode_u32()?,
-            }),
-            Some(FcallType::Tclunk) => Fcall::Tclunk(Tclunk {
-                fid: self.decode_u32()?,
-            }),
-            Some(FcallType::Rclunk) => Fcall::Rclunk(Rclunk {}),
-            Some(FcallType::Tremove) => Fcall::Tremove(Tremove {
-                fid: self.decode_u32()?,
-            }),
-            Some(FcallType::Rremove) => Fcall::Rremove(Rremove {}),
-            None => return Err(super::Error::InvalidResponse),
-        };
-        Ok(TaggedFcall { tag, fcall })
+    /// Decode a primitive integer from the buffer in little-endian format.
+    fn decode_le<T: LeWire>(&mut self) -> Result<T, super::Error> {
+        if self.buf.len() >= T::SIZE {
+            let v = T::read_le(&self.buf[..T::SIZE]).ok_or(super::Error::InvalidResponse)?;
+            self.buf = &self.buf[T::SIZE..];
+            Ok(v)
+        } else {
+            Err(super::Error::InvalidResponse)
+        }
     }
 }
