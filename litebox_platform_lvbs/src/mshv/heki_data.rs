@@ -1,44 +1,41 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// modular_bitfield generates warning. There is an updated crate
-// with fix, but we are locked to current version.
-#![allow(unused_parens)]
+//! VTL0 data format and parsing
 
 use modular_bitfield::{
     bitfield,
-    prelude::{B8, B32},
+    prelude::{B16, B32},
 };
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 use crate::mshv::{
     error::VsmError,
-    heki::{HekiKdataType, HekiKexecType, HekiSymbolInfoType, ModMemType},
+    heki::{HekiKdataType, HekiKexecType, HekiPatchType, HekiSymbolInfoType, ModMemType},
     vtl1_mem_layout::PAGE_SIZE,
 };
 
 #[bitfield(bits = 64)]
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(u64)]
-pub struct HekiDataAttr {
+pub struct HekiDataApiAttr {
     #[skip(setters)]
-    pub dtype: HekiKdataType,
+    pub data_type: HekiKdataType,
     #[skip(setters)]
-    pub size: B32,
-    pub dflags: B8,
-    #[skip]
-    __: B8,
+    pub size: B16, // Size of data page or buffer will be < 2^16-1
+    pub flags: B32, // Custom flags per api
 }
 
+/// `HekiDataRange` describes a range of VTL0 memory, its associated
+/// context-specific type and memory attributes.
 #[repr(C)]
 #[derive(FromBytes, Immutable, KnownLayout)]
 pub struct HekiDataRange {
     pub va: u64,
     pub pa: u64,
-    pub epa: u64,
+    pub size: u32,
     data_type: u16,
-    pub attr: u16,
-    rsvd: u32,
+    pub mem_attr: u16,
 }
 
 impl core::fmt::Debug for HekiDataRange {
@@ -46,21 +43,19 @@ impl core::fmt::Debug for HekiDataRange {
         let data_type = self.data_type;
         let va = self.va;
         let pa = self.pa;
-        let epa = self.epa;
-        let attr = self.attr;
+        let size = self.size;
+        let attr = self.mem_attr;
         f.debug_struct("HekiDataRange")
             .field("va", &format_args!("{va:#x}"))
             .field("pa", &format_args!("{pa:#x}"))
-            .field("epa", &format_args!("{epa:#x}"))
+            .field("epa", &format_args!("{:#x}", pa + u64::from(size)))
             .field("attr", &format_args!("{attr:#x}"))
             .field("type", &format_args!("{data_type}"))
-            .field("size", &format_args!("{:?}", self.epa - self.pa))
-            .finish_non_exhaustive()
+            .field("size", &format_args!("{size}"))
+            .finish()
     }
 }
 
-/// `HekiDataRange` is a generic container for various types of memory ranges.
-/// It has a context-specific `attributes`
 impl HekiDataRange {
     #[inline]
     pub fn heki_symbol_info_type(&self) -> HekiSymbolInfoType {
@@ -80,6 +75,11 @@ impl HekiDataRange {
     #[inline]
     pub fn heki_kexec_type(&self) -> HekiKexecType {
         HekiKexecType::try_from(self.data_type).unwrap_or(HekiKexecType::Unknown)
+    }
+
+    #[inline]
+    pub fn heki_patch_type(&self) -> HekiPatchType {
+        HekiPatchType::try_from(self.data_type).unwrap_or(HekiPatchType::Unknown)
     }
 }
 
@@ -119,7 +119,7 @@ impl HekiDataPage {
     const MAX_RANGE_COUNT: usize =
         (Self::SIZE - size_of::<HekiDataHdr>()) / size_of::<HekiDataRange>();
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<&Self, VsmError> {
+    pub fn try_from_bytes(bytes: &[u8]) -> Result<&Self, VsmError> {
         let (data_page, _) =
             HekiDataPage::ref_from_prefix(bytes).map_err(|_| VsmError::DataPageInvalid)?;
         Ok(data_page)
@@ -129,7 +129,7 @@ impl HekiDataPage {
         HekiKdataType::try_from(self.hdr.data_type).unwrap_or(HekiKdataType::Unknown)
     }
 
-    pub fn next(&self) -> Option<(u64, u64, usize)> {
+    pub fn next_page_params(&self) -> Option<(u64, u64, usize)> {
         if self.hdr.next_pa != 0 {
             Some((self.hdr.next, self.hdr.next_pa, Self::SIZE))
         } else {

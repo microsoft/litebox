@@ -13,7 +13,7 @@ use x86_64::{
     PhysAddr,
     structures::paging::{PageSize, Size4KiB},
 };
-use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq)]
