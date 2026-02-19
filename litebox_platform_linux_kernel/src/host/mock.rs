@@ -106,7 +106,7 @@ impl HostInterface for MockHostInterface {
             syscalls::syscall2(
                 syscalls::Sysno::clock_gettime,
                 0, // CLOCK_REALTIME
-                &mut t as *mut _ as usize,
+                &raw mut t as usize,
             )
         };
         assert!(ret.is_ok(), "clock_gettime failed");
