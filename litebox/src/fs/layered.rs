@@ -94,15 +94,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
     }
 
-    /// (private-only) check if the lower level has the path; if there is a path failure, just fail
-    /// out with the relevant path error.
-    fn ensure_lower_contains(&self, path: &str) -> Result<FileType, PathError> {
-        match self.lower.file_status(path) {
-            Ok(stat) => Ok(stat.file_type),
-            Err(FileStatusError::ClosedFd) => unreachable!(),
-            Err(FileStatusError::Io) => Err(PathError::NoSuchFileOrDirectory),
-            Err(FileStatusError::PathError(e)) => Err(e),
-        }
+    /// (private-only) check if the lower level has the path; if there is an I/O or path failure,
+    /// propagate the relevant error.
+    fn ensure_lower_contains(&self, path: &str) -> Result<FileType, FileStatusError> {
+        self.lower.file_status(path).map(|stat| stat.file_type)
     }
 
     /// (private-only) Create all parent/ancestor directories for a `path`, making sure that each of
@@ -151,16 +146,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     }
                 }
                 Ok(FileType::RegularFile | FileType::CharacterDevice)
-                | Err(PathError::MissingComponent) => unreachable!(),
-                Err(PathError::ComponentNotADirectory) => unimplemented!(),
-                Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
-                Err(e @ PathError::NoSearchPerms { .. }) => {
+                | Err(
+                    FileStatusError::PathError(PathError::MissingComponent)
+                    | FileStatusError::ClosedFd,
+                ) => unreachable!(),
+                Err(FileStatusError::PathError(PathError::ComponentNotADirectory)) => {
+                    unimplemented!()
+                }
+                Err(FileStatusError::PathError(PathError::InvalidPathname)) => {
+                    unreachable!("we just confirmed valid path")
+                }
+                Err(FileStatusError::PathError(e @ PathError::NoSearchPerms { .. })) => {
                     return Err(e)?;
                 }
-                Err(PathError::NoSuchFileOrDirectory) => {
+                Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
                     assert_ne!(dir, path);
                     return Err(PathError::MissingComponent)?;
                 }
+                Err(FileStatusError::Io) => return Err(MkdirError::Io),
             }
         }
         // The loop above should return at one of its return points
@@ -950,7 +953,12 @@ impl<
                 }
             },
         }
-        self.ensure_lower_contains(&path)?;
+        match self.ensure_lower_contains(&path) {
+            Ok(_) => {}
+            Err(FileStatusError::Io) => return Err(ChmodError::Io),
+            Err(FileStatusError::PathError(e)) => return Err(ChmodError::PathError(e)),
+            Err(FileStatusError::ClosedFd) => unreachable!(),
+        }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
@@ -990,7 +998,12 @@ impl<
                 }
             },
         }
-        self.ensure_lower_contains(&path)?;
+        match self.ensure_lower_contains(&path) {
+            Ok(_) => {}
+            Err(FileStatusError::Io) => return Err(ChownError::Io),
+            Err(FileStatusError::PathError(e)) => return Err(ChownError::PathError(e)),
+            Err(FileStatusError::ClosedFd) => unreachable!(),
+        }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
@@ -1034,7 +1047,11 @@ impl<
                 ) => {
                     // We must now check if the lower level contains the file; if it does not, we
                     // must exit with failure. Otherwise, we fallthrough to place the tombstone.
-                    match self.ensure_lower_contains(&path)? {
+                    match self.ensure_lower_contains(&path).map_err(|e| match e {
+                        FileStatusError::Io => UnlinkError::Io,
+                        FileStatusError::PathError(p) => UnlinkError::PathError(p),
+                        FileStatusError::ClosedFd => unreachable!(),
+                    })? {
                         FileType::RegularFile => {
                             // fallthrough
                         }
