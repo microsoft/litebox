@@ -413,7 +413,11 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         )
     }
 
-    /// Read directory entries
+    /// Read directory entries starting at the given offset.
+    ///
+    /// The `offset` is an opaque cookie from the server (taken from
+    /// [`DirEntry::offset`](fcall::DirEntry::offset)); pass `0` to start from the beginning.
+    /// Use [`readdir_all`](Client::readdir_all) to read all entries.
     pub(super) fn readdir(
         &self,
         fid: fcall::Fid,

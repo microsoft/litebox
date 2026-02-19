@@ -353,7 +353,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
     }
 
-    /// Walk to the parent of a path and return the parent fid and the name
+    /// Walk to the parent of a path and return the parent fid and the name of the final component
     fn walk_to_parent<'a>(&self, path: &'a str) -> Result<(fcall::Fid, &'a str), Error> {
         let components: Vec<&str> = path
             .normalized_components()
