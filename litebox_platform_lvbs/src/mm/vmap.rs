@@ -9,6 +9,7 @@
 
 use alloc::boxed::Box;
 use hashbrown::HashMap;
+use litebox::utils::TruncateExt;
 use rangemap::RangeSet;
 use spin::Once;
 use spin::mutex::SpinMutex;
@@ -34,11 +35,15 @@ pub enum VmapAllocError {
 /// Start of the vmap virtual address region.
 /// This address is chosen to be within the 4-level paging canonical address space
 /// and not conflict with VTL1's direct-mapped physical memory.
-const VMAP_START: u64 = 0x6000_0000_0000;
+pub(crate) const VMAP_START: usize = 0x6000_0000_0000;
 
 /// End of the vmap virtual address region.
 /// Provides 1 TiB of virtual address space for vmap allocations.
-const VMAP_END: u64 = 0x6FFF_FFFF_F000;
+const VMAP_END: usize = 0x6FFF_FFFF_F000;
+
+/// Virtual page numbers corresponding to `VMAP_START` and `VMAP_END`.
+const VMAP_START_VPN: usize = VMAP_START / PAGE_SIZE;
+const VMAP_END_VPN: usize = VMAP_END / PAGE_SIZE;
 
 /// Number of unmapped guard pages appended after each vmap allocation.
 const GUARD_PAGES: usize = 1;
@@ -52,13 +57,13 @@ struct VmapAllocation {
 
 /// Inner state for the vmap region allocator.
 ///
-/// Uses a bump allocator with a `RangeSet` free list for virtual addresses
+/// Uses a bump allocator with a `RangeSet` free list for virtual page numbers
 /// and HashMap for maintaining mappings between physical and virtual addresses.
 struct VmapRegionAllocatorInner {
-    /// Next available virtual address for allocation (bump allocator).
-    next_va: VirtAddr,
-    /// Free set of previously allocated and freed VA ranges (auto-coalescing).
-    free_set: RangeSet<VirtAddr>,
+    /// Next available virtual page number for allocation (bump allocator).
+    next_vpn: usize,
+    /// Free set of previously allocated and freed VPN ranges (auto-coalescing).
+    free_set: RangeSet<usize>,
     /// Map from physical frame to virtual address.
     pa_to_va_map: HashMap<PhysFrame<Size4KiB>, VirtAddr>,
     /// Allocation metadata indexed by starting virtual address.
@@ -69,11 +74,16 @@ impl VmapRegionAllocatorInner {
     /// Creates a new vmap region allocator inner state.
     fn new() -> Self {
         Self {
-            next_va: VirtAddr::new(VMAP_START),
+            next_vpn: VMAP_START_VPN,
             free_set: RangeSet::new(),
             pa_to_va_map: HashMap::new(),
             allocations: HashMap::new(),
         }
+    }
+
+    /// Converts a virtual page number to a `VirtAddr`.
+    fn vpn_to_va(vpn: usize) -> VirtAddr {
+        VirtAddr::new((vpn * PAGE_SIZE) as u64)
     }
 
     /// Allocates a contiguous virtual address range for the given number of pages,
@@ -93,31 +103,25 @@ impl VmapRegionAllocatorInner {
         }
 
         let total_pages = num_pages.checked_add(GUARD_PAGES)?;
-        let size = (total_pages as u64).checked_mul(PAGE_SIZE as u64)?;
 
         // Try to find a suitable range in the free set (first-fit)
         for range in self.free_set.iter() {
-            if range.end - range.start >= size {
-                let allocated_start = range.start;
-                // Remove the allocated portion from the free set
-                self.free_set
-                    .remove(allocated_start..allocated_start + size);
-                return Some(allocated_start);
+            if range.end - range.start >= total_pages {
+                let start_vpn = range.start;
+                self.free_set.remove(start_vpn..start_vpn + total_pages);
+                return Some(Self::vpn_to_va(start_vpn));
             }
         }
 
         // Fall back to bump allocation.
-        // `size` already includes GUARD_PAGES, so `end_va` accounts for both
-        // the data pages and the trailing guard pages.
-        let end_raw = self.next_va.as_u64().checked_add(size)?;
-        if end_raw > VMAP_END {
+        let end_vpn = self.next_vpn.checked_add(total_pages)?;
+        if end_vpn > VMAP_END_VPN {
             return None;
         }
-        let end_va = VirtAddr::new(end_raw);
 
-        let allocated_va = self.next_va;
-        self.next_va = end_va;
-        Some(allocated_va)
+        let allocated_vpn = self.next_vpn;
+        self.next_vpn = end_vpn;
+        Some(Self::vpn_to_va(allocated_vpn))
     }
 
     /// Returns a VA range to the free set for reuse.
@@ -125,15 +129,16 @@ impl VmapRegionAllocatorInner {
         if num_pages == 0 {
             return;
         }
+        let start_vpn =
+            <u64 as litebox::utils::TruncateExt<usize>>::truncate(start.as_u64()) / PAGE_SIZE;
         let total_pages = num_pages + GUARD_PAGES;
-        let end = start + (total_pages as u64) * (PAGE_SIZE as u64);
-        self.free_set.insert(start..end);
+        self.free_set.insert(start_vpn..start_vpn + total_pages);
     }
 }
 
 /// Checks if a virtual address is within the vmap region.
 pub fn is_vmap_address(va: VirtAddr) -> bool {
-    (VMAP_START..VMAP_END).contains(&va.as_u64())
+    (VMAP_START..VMAP_END).contains(&va.as_u64().truncate())
 }
 
 /// Vmap region allocator that manages virtual address allocation and PA↔VA mappings.
@@ -230,11 +235,11 @@ mod tests {
 
     #[test]
     fn test_is_vmap_address() {
-        assert!(is_vmap_address(VirtAddr::new(VMAP_START)));
-        assert!(is_vmap_address(VirtAddr::new(VMAP_START + 0x1000)));
-        assert!(is_vmap_address(VirtAddr::new(VMAP_END - 1)));
-        assert!(!is_vmap_address(VirtAddr::new(VMAP_START - 1)));
-        assert!(!is_vmap_address(VirtAddr::new(VMAP_END)));
+        assert!(is_vmap_address(VirtAddr::new(VMAP_START as u64)));
+        assert!(is_vmap_address(VirtAddr::new(VMAP_START as u64 + 0x1000)));
+        assert!(is_vmap_address(VirtAddr::new(VMAP_END as u64 - 1)));
+        assert!(!is_vmap_address(VirtAddr::new(VMAP_START as u64 - 1)));
+        assert!(!is_vmap_address(VirtAddr::new(VMAP_END as u64)));
     }
 
     #[test]
@@ -244,14 +249,14 @@ mod tests {
         // Allocate first range (1 data page + 1 guard page = 2 pages consumed)
         let va1 = allocator.allocate_va_range(1);
         assert!(va1.is_some());
-        assert_eq!(va1.unwrap().as_u64(), VMAP_START);
+        assert_eq!(va1.unwrap().as_u64(), VMAP_START as u64);
 
         // Second allocation starts after data + guard pages
         let va2 = allocator.allocate_va_range(2);
         assert!(va2.is_some());
         assert_eq!(
             va2.unwrap().as_u64(),
-            VMAP_START + (1 + GUARD_PAGES as u64) * PAGE_SIZE as u64
+            VMAP_START as u64 + (1 + GUARD_PAGES as u64) * PAGE_SIZE as u64
         );
 
         // Zero pages should return None
@@ -292,7 +297,7 @@ mod tests {
         let base_va = allocator.allocate_va_and_register_map(&frames);
         assert!(base_va.is_ok());
         let base_va = base_va.unwrap();
-        assert_eq!(base_va.as_u64(), VMAP_START);
+        assert_eq!(base_va.as_u64(), VMAP_START as u64);
 
         // Duplicate PA should fail with DuplicateMapping
         let duplicate = allocator
@@ -349,7 +354,7 @@ mod tests {
 
         // Unregistering an unknown VA returns None
         assert_eq!(
-            allocator.unregister_allocation(VirtAddr::new(VMAP_END - 0x1000)),
+            allocator.unregister_allocation(VirtAddr::new(VMAP_END as u64 - 0x1000)),
             None
         );
     }

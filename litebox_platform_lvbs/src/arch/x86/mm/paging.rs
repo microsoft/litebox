@@ -508,6 +508,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                         "vmap: map_to_with_table_flags failed at page {page:?}: {e:?}"
                     );
                     if mapped_count > 0 {
+                        crate::debug_serial_println!(
+                            "vmap: rolling back {mapped_count} pages mapped at {base_va:#x} due to error"
+                        );
                         Self::rollback_mapped_pages(
                             &mut inner,
                             Page::range_inclusive(
