@@ -94,14 +94,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
     }
 
-    /// (private-only) check if the lower level has the path; if there is a path failure, just fail
-    /// out with the relevant path error.
-    fn ensure_lower_contains(&self, path: &str) -> Result<FileType, PathError> {
-        match self.lower.file_status(path) {
-            Ok(stat) => Ok(stat.file_type),
-            Err(FileStatusError::ClosedFd) => unreachable!(),
-            Err(FileStatusError::PathError(e)) => Err(e),
-        }
+    /// (private-only) check if the lower level has the path; if there is an I/O or path failure,
+    /// propagate the relevant error.
+    fn ensure_lower_contains(&self, path: &str) -> Result<FileType, FileStatusError> {
+        self.lower.file_status(path).map(|stat| stat.file_type)
     }
 
     /// (private-only) Create all parent/ancestor directories for a `path`, making sure that each of
@@ -132,6 +128,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                                 // perfectly fine, just fallthrough to next place in the loop
                             }
                             MkdirError::ReadOnlyFileSystem
+                            | MkdirError::Io
                             | MkdirError::NoWritePerms
                             | MkdirError::PathError(
                                 PathError::ComponentNotADirectory
@@ -149,16 +146,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     }
                 }
                 Ok(FileType::RegularFile | FileType::CharacterDevice)
-                | Err(PathError::MissingComponent) => unreachable!(),
-                Err(PathError::ComponentNotADirectory) => unimplemented!(),
-                Err(PathError::InvalidPathname) => unreachable!("we just confirmed valid path"),
-                Err(e @ PathError::NoSearchPerms { .. }) => {
+                | Err(
+                    FileStatusError::PathError(PathError::MissingComponent)
+                    | FileStatusError::ClosedFd,
+                ) => unreachable!(),
+                Err(FileStatusError::PathError(PathError::ComponentNotADirectory)) => {
+                    unimplemented!()
+                }
+                Err(FileStatusError::PathError(PathError::InvalidPathname)) => {
+                    unreachable!("we just confirmed valid path")
+                }
+                Err(FileStatusError::PathError(e @ PathError::NoSearchPerms { .. })) => {
                     return Err(e)?;
                 }
-                Err(PathError::NoSuchFileOrDirectory) => {
+                Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
                     assert_ne!(dir, path);
                     return Err(PathError::MissingComponent)?;
                 }
+                Err(FileStatusError::Io) => return Err(MkdirError::Io),
             }
         }
         // The loop above should return at one of its return points
@@ -199,6 +204,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             Ok(fd) => fd,
             Err(e) => match e {
                 OpenError::AccessNotAllowed => return Err(MigrationError::NoReadPerms),
+                OpenError::Io => return Err(MigrationError::Io),
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
@@ -255,6 +261,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         return Err(MigrationError::NotAFile);
                     }
                     ReadError::ClosedFd | ReadError::NotForReading => unreachable!(),
+                    ReadError::Io => return Err(MigrationError::Io),
                 },
             }
         }
@@ -419,6 +426,8 @@ pub enum MigrationError {
     NotAFile,
     #[error("no read access permissions")]
     NoReadPerms,
+    #[error("I/O error")]
+    Io,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -525,6 +534,7 @@ impl<
             }
             Err(e) => match &e {
                 OpenError::AccessNotAllowed
+                | OpenError::Io
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
@@ -532,7 +542,8 @@ impl<
                     TruncateError::IsDirectory
                     | TruncateError::NotForWriting
                     | TruncateError::IsTerminalDevice
-                    | TruncateError::ClosedFd,
+                    | TruncateError::ClosedFd
+                    | TruncateError::Io,
                 )
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
@@ -816,6 +827,7 @@ impl<
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
+            Err(MigrationError::Io) => return Err(WriteError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
         }
         // As a sanity check, in debug mode, confirm that it is now an upper file
@@ -905,6 +917,7 @@ impl<
 
                                     Ok(())
                                 }
+                                Err(TruncateError::Io) => Err(TruncateError::Io),
                             }
                         } else {
                             // The lower level truncate will correctly identify dir/file and handle
@@ -924,6 +937,7 @@ impl<
             Ok(()) => return Ok(()),
             Err(e) => match e {
                 ChmodError::NotTheOwner
+                | ChmodError::Io
                 | ChmodError::ReadOnlyFileSystem
                 | ChmodError::PathError(
                     PathError::ComponentNotADirectory
@@ -939,11 +953,17 @@ impl<
                 }
             },
         }
-        self.ensure_lower_contains(&path)?;
+        match self.ensure_lower_contains(&path) {
+            Ok(_) => {}
+            Err(FileStatusError::Io) => return Err(ChmodError::Io),
+            Err(FileStatusError::PathError(e)) => return Err(ChmodError::PathError(e)),
+            Err(FileStatusError::ClosedFd) => unreachable!(),
+        }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
+            Err(MigrationError::Io) => return Err(ChmodError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
@@ -962,6 +982,7 @@ impl<
             Ok(()) => return Ok(()),
             Err(e) => match e {
                 ChownError::NotTheOwner
+                | ChownError::Io
                 | ChownError::ReadOnlyFileSystem
                 | ChownError::PathError(
                     PathError::ComponentNotADirectory
@@ -977,11 +998,17 @@ impl<
                 }
             },
         }
-        self.ensure_lower_contains(&path)?;
+        match self.ensure_lower_contains(&path) {
+            Ok(_) => {}
+            Err(FileStatusError::Io) => return Err(ChownError::Io),
+            Err(FileStatusError::PathError(e)) => return Err(ChownError::PathError(e)),
+            Err(FileStatusError::ClosedFd) => unreachable!(),
+        }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
+            Err(MigrationError::Io) => return Err(ChownError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
@@ -1005,6 +1032,7 @@ impl<
             }
             Err(e) => match e {
                 UnlinkError::NoWritePerms
+                | UnlinkError::Io
                 | UnlinkError::IsADirectory
                 | UnlinkError::ReadOnlyFileSystem
                 | UnlinkError::PathError(
@@ -1019,7 +1047,11 @@ impl<
                 ) => {
                     // We must now check if the lower level contains the file; if it does not, we
                     // must exit with failure. Otherwise, we fallthrough to place the tombstone.
-                    match self.ensure_lower_contains(&path)? {
+                    match self.ensure_lower_contains(&path).map_err(|e| match e {
+                        FileStatusError::Io => UnlinkError::Io,
+                        FileStatusError::PathError(p) => UnlinkError::PathError(p),
+                        FileStatusError::ClosedFd => unreachable!(),
+                    })? {
                         FileType::RegularFile => {
                             // fallthrough
                         }
@@ -1054,6 +1086,7 @@ impl<
             }
             Err(e) => match e {
                 MkdirError::NoWritePerms
+                | MkdirError::Io
                 | MkdirError::AlreadyExists
                 | MkdirError::ReadOnlyFileSystem
                 | MkdirError::PathError(
@@ -1099,6 +1132,7 @@ impl<
                 }
                 OpenError::PathError(pe) => return Err(pe.into()),
                 OpenError::AccessNotAllowed => todo!(),
+                OpenError::Io => return Err(RmdirError::Io),
                 OpenError::ReadOnlyFileSystem => {
                     return Err(RmdirError::ReadOnlyFileSystem);
                 }
@@ -1112,6 +1146,7 @@ impl<
         let entries = match self.read_dir(&dir_fd) {
             Ok(entries) => entries,
             Err(ReadDirError::ClosedFd | ReadDirError::NotADirectory) => unreachable!(),
+            Err(ReadDirError::Io) => return Err(RmdirError::Io),
         };
         self.close(&dir_fd).expect("close dir fd failed");
         // "." and ".." are always present; anything more => not empty.
@@ -1135,6 +1170,7 @@ impl<
                 ) => unreachable!(),
                 RmdirError::Busy
                 | RmdirError::NoWritePerms
+                | RmdirError::Io
                 | RmdirError::PathError(PathError::NoSearchPerms { .. }) => return Err(e),
             }
         }
@@ -1161,6 +1197,7 @@ impl<
                     ) => unreachable!(),
                     RmdirError::Busy
                     | RmdirError::NoWritePerms
+                    | RmdirError::Io
                     | RmdirError::PathError(PathError::NoSearchPerms { .. }) => return Err(e),
                 }
             }
@@ -1278,6 +1315,7 @@ impl<
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);
                 }
+                FileStatusError::Io => return Err(e),
                 FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
