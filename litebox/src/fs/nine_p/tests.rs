@@ -16,10 +16,6 @@ use crate::platform::mock::MockPlatform;
 
 use super::transport;
 
-// ---------------------------------------------------------------------------
-// Transport adapter: implement litebox 9P transport traits for TcpStream
-// ---------------------------------------------------------------------------
-
 /// A wrapper around `TcpStream` that implements the litebox 9P transport traits.
 struct TcpTransport {
     stream: TcpStream,
@@ -672,4 +668,266 @@ fn test_nine_p_broken_seek() {
 
     let result = fs.seek(&fd, -1, crate::fs::SeekWhence::RelativeToEnd);
     assert!(matches!(result, Err(SeekError::Io)));
+}
+
+#[test]
+fn test_nine_p_deep_path_walk() {
+    use core::fmt::Write as _;
+
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    let fs = connect_9p(&litebox, &server);
+
+    // Create a path deeper than MAXWELEM (13) to exercise walk_chunked
+    let mut path = std::string::String::new();
+    for i in 0..20 {
+        path.push('/');
+        write!(path, "d{i}").unwrap();
+        fs.mkdir(&*path, Mode::RWXU)
+            .expect("failed to mkdir deep path component");
+    }
+
+    // Create a file at the bottom
+    let file_path = path.clone() + "/deep_file.txt";
+    let fd = fs
+        .open(&*file_path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+        .expect("failed to create file in deep path");
+    fs.write(&fd, b"deep content", None).unwrap();
+    fs.close(&fd).unwrap();
+
+    // Read it back
+    let fd = fs
+        .open(&*file_path, OFlags::RDONLY, Mode::empty())
+        .expect("failed to open file in deep path");
+    let mut buf = alloc::vec![0u8; 64];
+    let n = fs.read(&fd, &mut buf, None).unwrap();
+    assert_eq!(&buf[..n], b"deep content");
+    fs.close(&fd).unwrap();
+
+    // Verify file_status works through the deep path
+    let status = fs
+        .file_status(&*file_path)
+        .expect("failed to stat deep file");
+    assert_eq!(status.file_type, crate::fs::FileType::RegularFile);
+    assert_eq!(status.size, 12);
+}
+
+#[test]
+fn test_nine_p_chmod() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    let fs = connect_9p(&litebox, &server);
+
+    // Create a file
+    let fd = fs
+        .open(
+            "/chmod_test.txt",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RWXU,
+        )
+        .expect("failed to create file");
+    fs.close(&fd).unwrap();
+
+    // Change permissions to read-only for user
+    fs.chmod("/chmod_test.txt", Mode::RUSR)
+        .expect("chmod failed");
+
+    // Verify via host filesystem
+    let host_path = server.export_path().join("chmod_test.txt");
+    let metadata = std::fs::metadata(&host_path).unwrap();
+    let host_mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
+    assert_eq!(
+        host_mode & 0o777,
+        0o400,
+        "permissions should be read-only for user"
+    );
+
+    // Also verify via 9P file_status
+    let status = fs
+        .file_status("/chmod_test.txt")
+        .expect("file_status failed");
+    assert!(status.mode.contains(Mode::RUSR), "mode should contain RUSR");
+    assert!(
+        !status.mode.contains(Mode::WUSR),
+        "mode should not contain WUSR"
+    );
+}
+
+#[test]
+fn test_nine_p_chown() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    let fs = connect_9p(&litebox, &server);
+
+    // Create a file
+    let fd = fs
+        .open(
+            "/chown_test.txt",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RWXU,
+        )
+        .expect("failed to create file");
+    fs.close(&fd).unwrap();
+
+    // Get current ownership
+    let status_before = fs
+        .file_status("/chown_test.txt")
+        .expect("file_status failed");
+
+    // Change group to the same value (chown to a different uid/gid requires root)
+    fs.chown(
+        "/chown_test.txt",
+        Some(status_before.owner.user),
+        Some(status_before.owner.group),
+    )
+    .expect("chown failed");
+
+    // Verify ownership hasn't changed
+    let status_after = fs
+        .file_status("/chown_test.txt")
+        .expect("file_status failed after chown");
+    assert_eq!(status_after.owner.user, status_before.owner.user);
+    assert_eq!(status_after.owner.group, status_before.owner.group);
+}
+
+#[test]
+fn test_nine_p_fd_file_status() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    let fs = connect_9p(&litebox, &server);
+
+    // Create a file with known content
+    let fd = fs
+        .open(
+            "/fd_stat_test.txt",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RWXU,
+        )
+        .expect("failed to create file");
+    fs.write(&fd, b"hello fd_stat", None).unwrap();
+    fs.close(&fd).unwrap();
+
+    // Open the file and check fd_file_status
+    let fd = fs
+        .open("/fd_stat_test.txt", OFlags::RDONLY, Mode::empty())
+        .expect("failed to open file");
+
+    let status = fs.fd_file_status(&fd).expect("fd_file_status failed");
+    assert_eq!(status.file_type, crate::fs::FileType::RegularFile);
+    assert_eq!(status.size, 13, "file size should be 13 bytes");
+
+    // Also check fd_file_status on a directory
+    fs.close(&fd).unwrap();
+
+    let fd = fs
+        .open("/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .expect("failed to open root dir");
+    let status = fs
+        .fd_file_status(&fd)
+        .expect("fd_file_status on dir failed");
+    assert_eq!(status.file_type, crate::fs::FileType::Directory);
+    fs.close(&fd).unwrap();
+}
+
+#[test]
+fn test_nine_p_large_read_write() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    let fs = connect_9p(&litebox, &server);
+
+    // The msize is 65536 and IOHDRSZ is 24, so the max per-message payload
+    // is 65512 bytes. Write data larger than that to verify the client
+    // correctly caps per-message size.
+    let data_size = 100_000;
+    let data: alloc::vec::Vec<u8> = (0..data_size)
+        .map(|i: usize| u8::try_from(i % 251).unwrap())
+        .collect();
+
+    let fd = fs
+        .open("/large_test.bin", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+        .expect("failed to create file");
+
+    // Write in a loop (the client caps each write to msize - IOHDRSZ)
+    let mut written = 0;
+    while written < data.len() {
+        let n = fs.write(&fd, &data[written..], None).expect("write failed");
+        assert!(n > 0, "write should make progress");
+        written += n;
+    }
+    assert_eq!(written, data.len());
+
+    fs.close(&fd).unwrap();
+
+    // Read it all back
+    let fd = fs
+        .open("/large_test.bin", OFlags::RDONLY, Mode::empty())
+        .expect("failed to open file for reading");
+
+    let mut read_buf = alloc::vec![0u8; data_size];
+    let mut total_read = 0;
+    while total_read < data.len() {
+        let n = fs
+            .read(&fd, &mut read_buf[total_read..], None)
+            .expect("read failed");
+        if n == 0 {
+            break;
+        }
+        total_read += n;
+    }
+    assert_eq!(total_read, data.len());
+    assert_eq!(read_buf, data);
+
+    fs.close(&fd).unwrap();
+}
+
+#[test]
+fn test_nine_p_explicit_offset_read_write() {
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    let fs = connect_9p(&litebox, &server);
+
+    let fd = fs
+        .open("/offset_test.txt", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+        .expect("failed to create file");
+
+    // Write "AAAAAAAAAA" at offset 0 using implicit offset
+    fs.write(&fd, b"AAAAAAAAAA", None).unwrap();
+
+    // Write "BBBBB" at explicit offset 5 — should NOT change the fd offset
+    let n = fs
+        .write(&fd, b"BBBBB", Some(5))
+        .expect("explicit offset write failed");
+    assert_eq!(n, 5);
+
+    // The fd offset should still be 10 (from the first write), not 10
+    // Write "C" using implicit offset — should go at offset 10
+    fs.write(&fd, b"C", None).unwrap();
+
+    fs.close(&fd).unwrap();
+
+    // Verify the final file content on host: "AAAAABBBBBC"
+    let host_content =
+        std::fs::read_to_string(server.export_path().join("offset_test.txt")).unwrap();
+    assert_eq!(host_content, "AAAAABBBBBC");
+
+    // Now test explicit offset reads
+    let fd = fs
+        .open("/offset_test.txt", OFlags::RDONLY, Mode::empty())
+        .expect("failed to open for reading");
+
+    // Read 5 bytes at explicit offset 5 → "BBBBB"
+    let mut buf = alloc::vec![0u8; 5];
+    let n = fs
+        .read(&fd, &mut buf, Some(5))
+        .expect("explicit offset read failed");
+    assert_eq!(n, 5);
+    assert_eq!(&buf[..n], b"BBBBB");
+
+    // fd offset should still be 0 (explicit offset doesn't change it)
+    // Read using implicit offset → should start at 0
+    let mut buf = alloc::vec![0u8; 11];
+    let n = fs.read(&fd, &mut buf, None).expect("implicit read failed");
+    assert_eq!(&buf[..n], b"AAAAABBBBBC");
+
+    fs.close(&fd).unwrap();
 }
