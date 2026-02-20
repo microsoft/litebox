@@ -5,7 +5,7 @@
 
 use crate::mshv::ringbuffer::ringbuffer;
 use core::{arch::asm, fmt};
-use spin::{Mutex, Once};
+use spin::Mutex;
 
 // LVBS uses COM PORT 2 for printing out debug messages
 const COM_PORT_2: u16 = 0x2F8;
@@ -134,8 +134,7 @@ impl ComPort {
 }
 
 fn com() -> &'static Mutex<ComPort> {
-    static COM_ONCE: Once<Mutex<ComPort>> = Once::new();
-    COM_ONCE.call_once(|| {
+    crate::PLATFORM_STATE.init_com(|| {
         let mut com_port = ComPort::new(COM_PORT_2);
         com_port.init();
         Mutex::new(com_port)

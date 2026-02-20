@@ -13,10 +13,9 @@ pub use lvbs_impl::LvbsLinuxKernel;
 pub mod mock;
 
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
-use core::num::NonZeroUsize;
 
 #[repr(align(4096))]
-struct HypercallPage([u8; PAGE_SIZE]);
+pub(crate) struct HypercallPage(pub(crate) [u8; PAGE_SIZE]);
 
 /// Get the address of a Hyper-V hypercall page. A `call` instruction to this address
 /// results in a trap-based Hyper-V hypercall. We must ensure that each
@@ -28,16 +27,5 @@ struct HypercallPage([u8; PAGE_SIZE]);
 /// # Panics
 /// Panics if the address of the hypercall page is not page-aligned or zero
 pub fn hv_hypercall_page_address() -> u64 {
-    static HYPERCALL_PAGE: HypercallPage = HypercallPage([0; PAGE_SIZE]);
-    static HYPERCALL_PAGE_ADDR_ONCE: once_cell::race::OnceNonZeroUsize =
-        once_cell::race::OnceNonZeroUsize::new();
-    let hypercall_page_addr = HYPERCALL_PAGE_ADDR_ONCE.get_or_init(|| {
-        let addr = HYPERCALL_PAGE.0.as_ptr() as usize;
-        assert!(
-            addr.is_multiple_of(PAGE_SIZE),
-            "Hypercall page address is not page-aligned"
-        );
-        NonZeroUsize::new(addr).expect("Failed to get non-zero hypercall page address")
-    });
-    hypercall_page_addr.get() as u64
+    crate::PLATFORM_STATE.hypercall_page_address()
 }

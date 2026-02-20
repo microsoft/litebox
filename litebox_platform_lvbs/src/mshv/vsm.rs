@@ -49,7 +49,6 @@ use core::{
 use hashbrown::HashMap;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
-use spin::Once;
 use thiserror::Error;
 use x86_64::{
     PhysAddr, VirtAddr,
@@ -64,8 +63,6 @@ struct AlignedPage([u8; PAGE_SIZE]);
 
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
-
-static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
 
 pub(crate) fn init() {
     assert!(
@@ -122,7 +119,9 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
         .map_err(|_| VsmError::InvalidPhysicalAddress)?;
 
     let Some(cpu_mask) = (unsafe {
-        crate::platform_low().copy_from_vtl0_phys::<CpuMask>(cpu_online_mask_page_addr)
+        crate::PLATFORM_STATE
+            .platform()
+            .copy_from_vtl0_phys::<CpuMask>(cpu_online_mask_page_addr)
     }) else {
         return Err(VsmError::CpuOnlineMaskCopyFailed);
     };
@@ -135,7 +134,9 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
 
     // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
     let Some(mut boot_signal_page_buf) = (unsafe {
-        crate::platform_low().copy_from_vtl0_phys::<AlignedPage>(boot_signal_page_addr)
+        crate::PLATFORM_STATE
+            .platform()
+            .copy_from_vtl0_phys::<AlignedPage>(boot_signal_page_addr)
     }) else {
         return Err(VsmError::BootSignalPageCopyFailed);
     };
@@ -160,10 +161,11 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
     }
 
     // Store the cpu_online_mask for later use
-    CPU_ONLINE_MASK.call_once(|| cpu_mask);
+    crate::PLATFORM_STATE.init_cpu_online_mask(cpu_mask);
 
     if unsafe {
-        crate::platform_low()
+        crate::PLATFORM_STATE
+            .platform()
             .copy_to_vtl0_phys::<AlignedPage>(boot_signal_page_addr, &boot_signal_page_buf)
     } {
         Ok(0)
@@ -204,7 +206,7 @@ pub fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
 pub fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Lock control registers");
 
-    if crate::platform_low().vtl0_kernel_info.check_end_of_boot() {
+    if crate::PLATFORM_STATE.vtl0_kernel_info().check_end_of_boot() {
         return Err(VsmError::OperationAfterEndOfBoot(
             "control register locking",
         ));
@@ -249,7 +251,7 @@ pub fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
 /// VSM function for signaling the end of VTL0 boot process
 pub fn mshv_vsm_end_of_boot() -> i64 {
     debug_serial_println!("VSM: End of boot");
-    crate::platform_low().vtl0_kernel_info.set_end_of_boot();
+    crate::PLATFORM_STATE.vtl0_kernel_info().set_end_of_boot();
     0
 }
 
@@ -265,7 +267,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, VsmError> {
         return Err(VsmError::InvalidInputAddress);
     }
 
-    if crate::platform_low().vtl0_kernel_info.check_end_of_boot() {
+    if crate::PLATFORM_STATE.vtl0_kernel_info().check_end_of_boot() {
         return Err(VsmError::OperationAfterEndOfBoot(
             "kernel memory protection",
         ));
@@ -343,11 +345,11 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
         return Err(VsmError::InvalidInputAddress);
     }
 
-    if crate::platform_low().vtl0_kernel_info.check_end_of_boot() {
+    if crate::PLATFORM_STATE.vtl0_kernel_info().check_end_of_boot() {
         return Err(VsmError::OperationAfterEndOfBoot("loading kernel data"));
     }
 
-    let vtl0_info = &crate::platform_low().vtl0_kernel_info;
+    let vtl0_info = crate::PLATFORM_STATE.vtl0_kernel_info();
 
     let mut system_certs_mem = MemoryContainer::new();
     let mut kexec_trampoline_metadata = KexecMemoryMetadata::new();
@@ -479,8 +481,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         nranges,
     );
 
-    let certs = crate::platform_low()
-        .vtl0_kernel_info
+    let certs = crate::PLATFORM_STATE
+        .vtl0_kernel_info()
         .get_system_certificates()
         .ok_or(VsmError::SystemCertificatesNotLoaded)?;
 
@@ -556,8 +558,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     // pre-computed patch data for a module
     if !patch_info_for_module.is_empty() {
         let patch_info_buf = &patch_info_for_module[..];
-        crate::platform_low()
-            .vtl0_kernel_info
+        crate::PLATFORM_STATE
+            .vtl0_kernel_info()
             .precomputed_patches
             .insert_patch_data_from_bytes(patch_info_buf, Some(&mut module_memory_metadata))
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
@@ -572,8 +574,8 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     }
 
     // register the module memory in the global map and obtain a unique token for it
-    let token = crate::platform_low()
-        .vtl0_kernel_info
+    let token = crate::PLATFORM_STATE
+        .vtl0_kernel_info()
         .module_memory_metadata
         .register_module_memory_metadata(module_memory_metadata);
     Ok(token)
@@ -586,16 +588,16 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Free kernel module's init (token: {})", token);
 
-    if !crate::platform_low()
-        .vtl0_kernel_info
+    if !crate::PLATFORM_STATE
+        .vtl0_kernel_info()
         .module_memory_metadata
         .contains_key(token)
     {
         return Err(VsmError::ModuleTokenInvalid);
     }
 
-    if let Some(entry) = crate::platform_low()
-        .vtl0_kernel_info
+    if let Some(entry) = crate::PLATFORM_STATE
+        .vtl0_kernel_info()
         .module_memory_metadata
         .iter_entry(token)
     {
@@ -628,16 +630,16 @@ pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, VsmError> {
 pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Unload kernel module (token: {})", token);
 
-    if !crate::platform_low()
-        .vtl0_kernel_info
+    if !crate::PLATFORM_STATE
+        .vtl0_kernel_info()
         .module_memory_metadata
         .contains_key(token)
     {
         return Err(VsmError::ModuleTokenInvalid);
     }
 
-    if let Some(entry) = crate::platform_low()
-        .vtl0_kernel_info
+    if let Some(entry) = crate::PLATFORM_STATE
+        .vtl0_kernel_info()
         .module_memory_metadata
         .iter_entry(token)
     {
@@ -650,19 +652,19 @@ pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, VsmError> {
         }
     }
 
-    if let Some(patch_targets) = crate::platform_low()
-        .vtl0_kernel_info
+    if let Some(patch_targets) = crate::PLATFORM_STATE
+        .vtl0_kernel_info()
         .module_memory_metadata
         .get_patch_targets(token)
     {
-        crate::platform_low()
-            .vtl0_kernel_info
+        crate::PLATFORM_STATE
+            .vtl0_kernel_info()
             .precomputed_patches
             .remove_patch_data(&patch_targets);
     }
 
-    crate::platform_low()
-        .vtl0_kernel_info
+    crate::PLATFORM_STATE
+        .vtl0_kernel_info()
         .module_memory_metadata
         .remove(token);
     Ok(0)
@@ -688,16 +690,18 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
         crash
     );
 
-    let certs = crate::platform_low()
-        .vtl0_kernel_info
+    let certs = crate::PLATFORM_STATE
+        .vtl0_kernel_info()
         .get_system_certificates()
         .ok_or(VsmError::SystemCertificatesNotLoaded)?;
 
     let is_crash = crash != 0;
     let kexec_metadata_ref = if is_crash {
-        &crate::platform_low().vtl0_kernel_info.crash_kexec_metadata
+        &crate::PLATFORM_STATE
+            .vtl0_kernel_info()
+            .crash_kexec_metadata
     } else {
-        &crate::platform_low().vtl0_kernel_info.kexec_metadata
+        &crate::PLATFORM_STATE.vtl0_kernel_info().kexec_metadata
     };
 
     // invalidate (i.e., remove protection and clear) the kexec memory ranges which were loaded in the past
@@ -801,8 +805,8 @@ pub fn mshv_vsm_patch_text(patch_pa_0: u64, patch_pa_1: u64) -> Result<i64, VsmE
     let heki_patch = copy_heki_patch_from_vtl0(patch_pa_0, patch_pa_1)?;
     debug_serial_println!("VSM: {:?}", heki_patch);
 
-    let precomputed_patch = crate::platform_low()
-        .vtl0_kernel_info
+    let precomputed_patch = crate::PLATFORM_STATE
+        .vtl0_kernel_info()
         .find_precomputed_patch(&heki_patch)
         .ok_or(VsmError::PrecomputedPatchNotFound)?;
 
@@ -840,17 +844,21 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
     if patch_pa_1.is_null()
         || (patch_pa_0.align_up(Size4KiB::SIZE) == patch_pa_1.align_down(Size4KiB::SIZE))
     {
-        unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPatch>(patch_pa_0) }
-            .map(|boxed| *boxed)
-            .ok_or(VsmError::Vtl0CopyFailed)
+        unsafe {
+            crate::PLATFORM_STATE
+                .platform()
+                .copy_from_vtl0_phys::<HekiPatch>(patch_pa_0)
+        }
+        .map(|boxed| *boxed)
+        .ok_or(VsmError::Vtl0CopyFailed)
     } else {
         let mut heki_patch = HekiPatch::new_zeroed();
         let heki_patch_bytes = heki_patch.as_mut_bytes();
         unsafe {
-            if !crate::platform_low().copy_slice_from_vtl0_phys(
+            if !crate::PLATFORM_STATE.platform().copy_slice_from_vtl0_phys(
                 patch_pa_0,
                 heki_patch_bytes.get_unchecked_mut(..bytes_in_first_page),
-            ) || !crate::platform_low().copy_slice_from_vtl0_phys(
+            ) || !crate::PLATFORM_STATE.platform().copy_slice_from_vtl0_phys(
                 patch_pa_1,
                 heki_patch_bytes.get_unchecked_mut(bytes_in_first_page..),
             ) {
@@ -879,7 +887,7 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
         || (heki_patch_pa_0.align_up(Size4KiB::SIZE) == heki_patch_pa_1.align_down(Size4KiB::SIZE))
     {
         if !unsafe {
-            crate::platform_low().copy_slice_to_vtl0_phys(
+            crate::PLATFORM_STATE.platform().copy_slice_to_vtl0_phys(
                 heki_patch_pa_0,
                 &heki_patch.code[..usize::from(heki_patch.size)],
             )
@@ -890,10 +898,12 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
         let (patch_first, patch_second) = heki_patch.code.split_at(bytes_in_first_page);
 
         unsafe {
-            if !crate::platform_low().copy_slice_to_vtl0_phys(
+            if !crate::PLATFORM_STATE.platform().copy_slice_to_vtl0_phys(
                 heki_patch_pa_0 + patch_target_page_offset as u64,
                 patch_first,
-            ) || !crate::platform_low().copy_slice_to_vtl0_phys(heki_patch_pa_1, patch_second)
+            ) || !crate::PLATFORM_STATE
+                .platform()
+                .copy_slice_to_vtl0_phys(heki_patch_pa_1, patch_second)
             {
                 return Err(VsmError::Vtl0CopyFailed);
             }
@@ -1287,8 +1297,11 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
     let mut range: u64 = 0;
 
     while range < nranges {
-        let heki_page =
-            (unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(next_pa) })?;
+        let heki_page = (unsafe {
+            crate::PLATFORM_STATE
+                .platform()
+                .copy_from_vtl0_phys::<HekiPage>(next_pa)
+        })?;
         if !heki_page.is_valid() {
             return None;
         }
@@ -1476,9 +1489,11 @@ impl MemoryContainer {
 
         while phys_cur < phys_end {
             let phys_aligned = phys_cur.align_down(Size4KiB::SIZE);
-            let Some(page) =
-                (unsafe { crate::platform_low().copy_from_vtl0_phys::<AlignedPage>(phys_aligned) })
-            else {
+            let Some(page) = (unsafe {
+                crate::PLATFORM_STATE
+                    .platform()
+                    .copy_from_vtl0_phys::<AlignedPage>(phys_aligned)
+            }) else {
                 return Err(MemoryContainerError::CopyFromVtl0Failed);
             };
 

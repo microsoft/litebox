@@ -28,7 +28,9 @@ impl RingBuffer {
         if buf.len() >= self.size {
             let single_slice = &buf[(buf.len() - self.size)..];
             unsafe {
-                crate::platform_low().copy_slice_to_vtl0_phys(self.rb_pa, single_slice);
+                crate::PLATFORM_STATE
+                    .platform()
+                    .copy_slice_to_vtl0_phys(self.rb_pa, single_slice);
             }
             self.write_offset = 0;
             return;
@@ -40,13 +42,17 @@ impl RingBuffer {
             let first_slice = &buf[..space_remaining];
             let wraparound_slice = &buf[space_remaining..];
             unsafe {
-                crate::platform_low()
+                crate::PLATFORM_STATE
+                    .platform()
                     .copy_slice_to_vtl0_phys(self.rb_pa + self.write_offset as u64, first_slice);
-                crate::platform_low().copy_slice_to_vtl0_phys(self.rb_pa, wraparound_slice);
+                crate::PLATFORM_STATE
+                    .platform()
+                    .copy_slice_to_vtl0_phys(self.rb_pa, wraparound_slice);
             }
         } else {
             unsafe {
-                crate::platform_low()
+                crate::PLATFORM_STATE
+                    .platform()
                     .copy_slice_to_vtl0_phys(self.rb_pa + self.write_offset as u64, buf);
             }
         }

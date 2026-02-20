@@ -19,7 +19,6 @@
 use crate::mshv::HYPERVISOR_CALLBACK_VECTOR;
 use core::ops::IndexMut;
 use litebox_common_linux::PtRegs;
-use spin::Once;
 use x86_64::{VirtAddr, structures::idt::InterruptDescriptorTable};
 
 // Include assembly ISR stubs
@@ -47,8 +46,7 @@ unsafe extern "C" {
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 fn idt() -> &'static InterruptDescriptorTable {
-    static IDT_ONCE: Once<InterruptDescriptorTable> = Once::new();
-    IDT_ONCE.call_once(|| {
+    crate::PLATFORM_STATE.init_idt(|| {
         let mut idt = InterruptDescriptorTable::new();
 
         // Safety: These are valid function pointers to assembly ISR stubs that properly

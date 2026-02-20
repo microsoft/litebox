@@ -3,6 +3,7 @@
 
 //! VTL1 kernel boot parameters (compatible with Linux kernel's boot_params structure and command line)
 
+use crate::PLATFORM_STATE;
 use crate::{
     debug_serial_println,
     mshv::vtl1_mem_layout::{
@@ -11,7 +12,6 @@ use crate::{
 };
 use core::ffi::{CStr, c_char};
 use num_enum::TryFromPrimitive;
-use spin::Once;
 
 // This module defines a simplified Linux boot params structure
 // (based on arch/x86/include/uapi/asm/bootparam.h and
@@ -28,9 +28,6 @@ const E820_UNUSABLE: u32 = 5;
 const E820_PMEM: u32 = 7;
 const E820_PRAM: u32 = 12;
 const E820_RESERVED_KERN: u32 = 128;
-
-static POSSIBLE_CPUS: Once<u32> = Once::new();
-static VTL1_MEMORY_INFO: Once<(u64, u64)> = Once::new();
 
 #[derive(Default, Clone, Copy)]
 #[repr(C, packed)]
@@ -126,8 +123,8 @@ fn dump_cmdline() {
 
 /// Funtion to get the guest physical start address and size of VTL1 memory
 pub fn get_vtl1_memory_info() -> Result<(u64, u64), VtlMemoryError> {
-    if let Some(pair) = VTL1_MEMORY_INFO.get().copied() {
-        Ok(pair)
+    if let Some(mem) = PLATFORM_STATE.vtl1_memory() {
+        Ok(mem)
     } else {
         Err(VtlMemoryError::InvalidBootParams)
     }
@@ -135,28 +132,26 @@ pub fn get_vtl1_memory_info() -> Result<(u64, u64), VtlMemoryError> {
 
 /// Funtion to get the number of possible cpus from the command line (Linux kernel's num_possible_cpus())
 pub fn get_num_possible_cpus() -> Result<u32, VtlMemoryError> {
-    if let Some(cpus) = POSSIBLE_CPUS.get() {
-        Ok(*cpus)
+    if let Some(cpus) = PLATFORM_STATE.possible_cpus() {
+        Ok(cpus)
     } else {
         Err(VtlMemoryError::InvalidCmdLine)
     }
 }
 
-fn save_vtl1_memory_info() -> Result<(), VtlMemoryError> {
+fn extract_vtl1_memory_info() -> Result<(u64, u64), VtlMemoryError> {
     let boot_params = get_address_of_special_page(VTL1_BOOT_PARAMS_PAGE) as *const BootParams;
-    if let Some((start, size)) = unsafe { (*boot_params).memory_info().ok() } {
-        VTL1_MEMORY_INFO.call_once(|| (start, size));
-        return Ok(());
-    }
-    Err(VtlMemoryError::InvalidBootParams)
+    // Safety: boot_params points to the VTL1 boot params page which is valid during initialization.
+    unsafe { (*boot_params).memory_info() }
 }
 
-fn save_possible_cpus() -> Result<(), VtlMemoryError> {
+fn extract_possible_cpus() -> Result<u32, VtlMemoryError> {
     let cmdline = get_address_of_special_page(VTL1_CMDLINE_PAGE) as *const c_char;
     if cmdline.is_null() {
         return Err(VtlMemoryError::InvalidCmdLine);
     }
 
+    // Safety: cmdline points to the VTL1 command line page which is a valid C string during initialization.
     if let Some(cmdline_str) = unsafe { CStr::from_ptr(cmdline).to_str().ok() } {
         for token in cmdline_str.split_whitespace() {
             if token.starts_with("possible_cpus=")
@@ -164,14 +159,14 @@ fn save_possible_cpus() -> Result<(), VtlMemoryError> {
             {
                 let num = v.parse::<u32>().unwrap_or(0);
                 if num > 0 {
-                    POSSIBLE_CPUS.call_once(|| num);
-                    return Ok(());
+                    return Ok(num);
                 }
             }
         }
     }
     Err(VtlMemoryError::InvalidCmdLine)
 }
+
 /// # Panics
 ///
 /// Panics if possible cpus or vtl1 memory extraction fails
@@ -180,8 +175,10 @@ pub fn parse_boot_info() {
     dump_cmdline();
     #[cfg(debug_assertions)]
     dump_boot_params();
-    save_possible_cpus().unwrap(); // Panic if CPU extraction fails
-    save_vtl1_memory_info().unwrap(); // Panic if memory extraction fails
+    let possible_cpus = extract_possible_cpus().expect("failed to extract possible CPUs");
+    let vtl1_memory = extract_vtl1_memory_info().expect("failed to extract VTL1 memory info");
+    PLATFORM_STATE.init_possible_cpus(possible_cpus);
+    PLATFORM_STATE.init_vtl1_memory(vtl1_memory.0, vtl1_memory.1);
 }
 
 /// E820 entry type

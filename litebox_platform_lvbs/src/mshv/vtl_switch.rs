@@ -129,8 +129,9 @@ impl VtlState {
 /// This function sets the platform reference for the current CPU.
 /// It should be called once before entering the VTL switch loop.
 pub fn vtl_switch_init(platform: Option<&'static crate::Platform>) {
+    // TODO: this can be removed once we move all HVCI/HEKI stuffs to the LVBS runner.
     if let Some(platform) = platform {
-        crate::set_platform_low(platform);
+        crate::PLATFORM_STATE.set_platform(platform);
     }
 }
 

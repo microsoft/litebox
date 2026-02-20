@@ -75,7 +75,169 @@ fn box_new_zeroed<T: FromBytes>() -> alloc::boxed::Box<T> {
     unsafe { alloc::boxed::Box::from_raw(ptr) }
 }
 
-static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
+/// Platform-internal global state. This is not directly exposed to other layers.
+pub(crate) struct PlatformState {
+    cpu_mhz: AtomicU64,
+    idt: spin::Once<x86_64::structures::idt::InterruptDescriptorTable>,
+    com: spin::Once<spin::Mutex<arch::ioport::ComPort>>,
+    rng: spin::mutex::SpinMutex<litebox::utils::rng::FastRng>,
+    cpu_online_mask: spin::Once<alloc::boxed::Box<host::linux::CpuMask>>,
+    possible_cpus: spin::Once<u32>,
+    vtl1_memory: spin::Once<(u64, u64)>,
+    hypercall_page: host::HypercallPage,
+    hypercall_page_addr: once_cell::race::OnceNonZeroUsize,
+    /// TODO: move this to the LVBS runner.
+    vtl0_kernel_info: spin::Once<Vtl0KernelInfo>,
+    /// TODO: this can be removed once we move all HVCI/HEKI stuffs to the LVBS runner.
+    platform: once_cell::race::OnceRef<'static, Platform>,
+}
+
+impl PlatformState {
+    /// Initializes the number of possible CPUs. Only the first call takes effect.
+    pub(crate) fn init_possible_cpus(&self, cpus: u32) {
+        self.possible_cpus.call_once(|| cpus);
+    }
+
+    /// Returns the number of possible CPUs, or `None` if not yet initialized.
+    pub(crate) fn possible_cpus(&self) -> Option<u32> {
+        self.possible_cpus.get().copied()
+    }
+
+    /// Initializes VTL1 memory info (start address, size). Only the first call takes effect.
+    pub(crate) fn init_vtl1_memory(&self, start: u64, size: u64) {
+        self.vtl1_memory.call_once(|| (start, size));
+    }
+
+    /// Returns VTL1 memory info `(start, size)`, or `None` if not yet initialized.
+    pub(crate) fn vtl1_memory(&self) -> Option<(u64, u64)> {
+        self.vtl1_memory.get().copied()
+    }
+
+    /// Returns the VTL1 physical frame range, derived from the boot-time `vtl1_memory` info.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vtl1_memory` has not been initialized yet.
+    pub(crate) fn vtl1_phys_frame_range(
+        &self,
+    ) -> PhysFrameRange<x86_64::structures::paging::Size4KiB> {
+        let &(start, size) = self.vtl1_memory.get().expect("vtl1_memory not initialized");
+        let phys_start = x86_64::PhysAddr::new(start);
+        let phys_end = x86_64::PhysAddr::new(start + size);
+        PhysFrame::range(
+            PhysFrame::containing_address(phys_start),
+            PhysFrame::containing_address(phys_end),
+        )
+    }
+
+    /// Stores the CPU frequency in MHz.
+    pub(crate) fn init_cpu_mhz(&self, mhz: u64) {
+        self.cpu_mhz
+            .store(mhz, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the CPU frequency in MHz.
+    pub(crate) fn cpu_mhz(&self) -> u64 {
+        self.cpu_mhz.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Initializes the IDT (exactly once) and returns a reference to it.
+    pub(crate) fn init_idt(
+        &self,
+        f: impl FnOnce() -> x86_64::structures::idt::InterruptDescriptorTable,
+    ) -> &x86_64::structures::idt::InterruptDescriptorTable {
+        self.idt.call_once(f)
+    }
+
+    /// Initializes the COM port (exactly once) and returns a reference to it.
+    pub(crate) fn init_com(
+        &self,
+        f: impl FnOnce() -> spin::Mutex<arch::ioport::ComPort>,
+    ) -> &spin::Mutex<arch::ioport::ComPort> {
+        self.com.call_once(f)
+    }
+
+    /// Initializes the CPU online mask. Only the first call takes effect.
+    pub(crate) fn init_cpu_online_mask(&self, mask: alloc::boxed::Box<host::linux::CpuMask>) {
+        self.cpu_online_mask.call_once(|| mask);
+    }
+
+    /// Fills the given buffer with pseudo-random bytes.
+    pub(crate) fn fill_rng_bytes(&self, buf: &mut [u8]) {
+        let mut rng = self.rng.lock();
+        for chunk in buf.chunks_mut(8) {
+            chunk.copy_from_slice(&rng.next_u64().to_ne_bytes()[..chunk.len()]);
+        }
+    }
+
+    /// Returns the physical address of the Hyper-V hypercall page.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the hypercall page address is not page-aligned or zero.
+    pub(crate) fn hypercall_page_address(&self) -> u64 {
+        let addr = self.hypercall_page_addr.get_or_init(|| {
+            let addr = self.hypercall_page.0.as_ptr() as usize;
+            assert!(
+                addr.is_multiple_of(mshv::vtl1_mem_layout::PAGE_SIZE),
+                "Hypercall page address is not page-aligned"
+            );
+            core::num::NonZeroUsize::new(addr)
+                .expect("Failed to get non-zero hypercall page address")
+        });
+        addr.get() as u64
+    }
+
+    /// Initializes VTL0 kernel information. Only the first call takes effect.
+    pub(crate) fn init_vtl0_kernel_info(&self) {
+        self.vtl0_kernel_info.call_once(Vtl0KernelInfo::new);
+    }
+
+    /// Returns a reference to the VTL0 kernel information.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vtl0_kernel_info` has not been initialized yet.
+    pub(crate) fn vtl0_kernel_info(&self) -> &Vtl0KernelInfo {
+        self.vtl0_kernel_info
+            .get()
+            .expect("vtl0_kernel_info not initialized")
+    }
+
+    /// Sets the platform reference. Only the first call takes effect.
+    pub(crate) fn set_platform(&self, platform: &'static Platform) {
+        let res = self.platform.set(platform);
+        debug_assert!(
+            res.is_ok(),
+            "set_platform should only be called once, but it was called multiple times"
+        );
+    }
+
+    /// Returns a reference to the platform instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `set_platform` has not been called yet.
+    pub(crate) fn platform(&self) -> &'static Platform {
+        self.platform.get().expect("platform not initialized")
+    }
+}
+
+pub(crate) static PLATFORM_STATE: PlatformState = PlatformState {
+    cpu_mhz: AtomicU64::new(0),
+    platform: once_cell::race::OnceRef::new(),
+    idt: spin::Once::new(),
+    com: spin::Once::new(),
+    rng: spin::mutex::SpinMutex::new(litebox::utils::rng::FastRng::new_from_seed(
+        core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
+    )),
+    cpu_online_mask: spin::Once::new(),
+    possible_cpus: spin::Once::new(),
+    vtl1_memory: spin::Once::new(),
+    hypercall_page: host::HypercallPage([0; mshv::vtl1_mem_layout::PAGE_SIZE]),
+    hypercall_page_addr: once_cell::race::OnceNonZeroUsize::new(),
+    vtl0_kernel_info: spin::Once::new(),
+};
 
 /// Special page table ID for the base (kernel-only) page table.
 /// No real physical frame has address 0, so this is a safe sentinel.
@@ -341,8 +503,6 @@ impl PageTableManager {
 pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table_manager: PageTableManager,
-    vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    vtl0_kernel_info: Vtl0KernelInfo,
 }
 
 pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
@@ -434,16 +594,15 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
         // There is only one long-running platform ever expected, thus this leak is perfectly ok in
         // order to simplify usage of the platform.
+        PLATFORM_STATE.init_vtl0_kernel_info();
         alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
             host_and_task: core::marker::PhantomData,
             page_table_manager: PageTableManager::new(pt),
-            vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
-            vtl0_kernel_info: Vtl0KernelInfo::new(),
         }))
     }
 
     pub fn init(&self, cpu_mhz: u64) {
-        CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
+        PLATFORM_STATE.init_cpu_mhz(cpu_mhz);
     }
 
     /// This function maps VTL0 physical page frames containing the physical addresses
@@ -465,9 +624,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         );
 
         // ensure the input address range does not overlap with VTL1 memory
-        if frame_range.start < self.vtl1_phys_frame_range.end
-            && self.vtl1_phys_frame_range.start < frame_range.end
-        {
+        let vtl1_range = PLATFORM_STATE.vtl1_phys_frame_range();
+        if frame_range.start < vtl1_range.end && vtl1_range.start < frame_range.end {
             return Err(MapToError::FrameAllocationFailed);
         }
 
@@ -687,7 +845,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// The ID of the newly created task page table, or `Err(Errno)` on failure.
     pub fn create_task_page_table(&self) -> Result<usize, Errno> {
         self.page_table_manager
-            .create_task_page_table(self.vtl1_phys_frame_range)
+            .create_task_page_table(PLATFORM_STATE.vtl1_phys_frame_range())
     }
 
     /// Deletes a task page table by its ID.
@@ -898,17 +1056,15 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
 
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        self.0.checked_sub(earlier.0).map(|v| {
-            core::time::Duration::from_micros(
-                v / CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed),
-            )
-        })
+        self.0
+            .checked_sub(earlier.0)
+            .map(|v| core::time::Duration::from_micros(v / PLATFORM_STATE.cpu_mhz()))
     }
 
     fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
         let duration_micros: u64 = duration.as_micros().try_into().ok()?;
         Some(Instant(self.0.checked_add(
-            duration_micros.checked_mul(CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed))?,
+            duration_micros.checked_mul(PLATFORM_STATE.cpu_mhz())?,
         )?))
     }
 }
@@ -1267,8 +1423,9 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
         if pages.is_empty() {
             return Ok(());
         }
-        let start_address = self.vtl1_phys_frame_range.start.start_address().as_u64();
-        let end_address = self.vtl1_phys_frame_range.end.start_address().as_u64();
+        let vtl1_range = PLATFORM_STATE.vtl1_phys_frame_range();
+        let start_address = vtl1_range.start.start_address().as_u64();
+        let end_address = vtl1_range.end.start_address().as_u64();
         for page in pages {
             let addr = page.as_usize() as u64;
             // a physical page belonging to LiteBox (VTL1) should not be used for `vmap`
@@ -1895,28 +2052,4 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
     );
 }
 
-// NOTE: The below code is a naive workaround to let LVBS code to access the platform.
-// Rather than doing this, we should implement LVBS interface/provider for the platform.
-
 pub type Platform = crate::host::LvbsLinuxKernel;
-
-static PLATFORM_LOW: once_cell::race::OnceRef<'static, Platform> = once_cell::race::OnceRef::new();
-
-/// # Panics
-///
-/// Panics if invoked more than once
-pub fn set_platform_low(platform: &'static Platform) {
-    match PLATFORM_LOW.set(platform) {
-        Ok(()) => {}
-        Err(()) => panic!("set_platform should only be called once per crate"),
-    }
-}
-
-/// # Panics
-///
-/// Panics if [`set_platform_low`] has not been invoked before this
-pub fn platform_low() -> &'static Platform {
-    PLATFORM_LOW
-        .get()
-        .expect("set_platform_low should have already been called before this point")
-}
