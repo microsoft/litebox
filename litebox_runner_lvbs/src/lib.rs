@@ -20,7 +20,7 @@ use litebox_common_optee::{
     OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
 };
 use litebox_platform_lvbs::{
-    arch::{gdt, get_core_id, instrs::hlt_loop, interrupts},
+    arch::{gdt, instrs::hlt_loop, interrupts, is_bsp},
     debug_serial_println,
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
     mm::MemoryProvider,
@@ -53,7 +53,7 @@ use spin::mutex::SpinMutex;
 pub fn init() -> Option<&'static Platform> {
     let mut ret: Option<&'static Platform> = None;
 
-    if get_core_id() == 0 {
+    if is_bsp() {
         if let Ok((start, size)) = get_vtl1_memory_info() {
             let vtl1_start = x86_64::PhysAddr::new(start);
             let vtl1_end = x86_64::PhysAddr::new(start + size);

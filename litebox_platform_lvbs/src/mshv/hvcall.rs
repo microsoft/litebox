@@ -5,8 +5,8 @@
 
 use crate::{
     arch::{
-        get_core_id,
         instrs::{rdmsr, wrmsr},
+        is_bsp,
     },
     debug_serial_println,
     host::{hv_hypercall_page_address, per_cpu_variables::with_per_cpu_variables},
@@ -110,7 +110,7 @@ pub fn init() -> Result<(), HypervError> {
     if guest_id != rdmsr(HV_X64_MSR_GUEST_OS_ID) {
         return Err(HypervError::InvalidGuestOSID);
     }
-    if get_core_id() == 0 {
+    if is_bsp() {
         debug_serial_println!(
             "HV_X64_MSR_GUEST_OS_ID: {:#x}",
             rdmsr(HV_X64_MSR_GUEST_OS_ID)
@@ -148,7 +148,7 @@ pub fn init() -> Result<(), HypervError> {
     sint.set_auto_eoi(true);
 
     wrmsr(HV_X64_MSR_SINT0, sint.as_uint64());
-    if get_core_id() == 0 {
+    if is_bsp() {
         debug_serial_println!("HV_X64_MSR_SINT0: {:#x}", rdmsr(HV_X64_MSR_SINT0));
     }
 

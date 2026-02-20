@@ -5,6 +5,7 @@
 
 use crate::{
     arch::{
+        bsp_vp_index,
         instrs::rdmsr,
         msr::{MSR_EFER, MSR_IA32_CR_PAT},
     },
@@ -21,6 +22,7 @@ use crate::{
     },
     serial_println,
 };
+use litebox::utils::TruncateExt;
 use x86_64::{
     PrivilegeLevel,
     structures::{gdt::SegmentSelector, tss::TaskStateSegment},
@@ -208,23 +210,22 @@ fn hvcall_enable_vp_vtl(
 }
 
 unsafe extern "C" {
-    static _start: u8;
+    static _ap_start: u8;
 }
 
 #[inline]
 fn get_entry() -> u64 {
-    &raw const _start as u64
+    &raw const _ap_start as u64
 }
 
-/// Hyper-V Hypercall to initialize VTL (VTL1 for now) for a core (except core 0)
+/// Hyper-V Hypercall to initialize VTL (VTL1 for now) for a VP (except the BSP)
 #[allow(
     clippy::similar_names,
     reason = "some versions of clippy trigger this warning due to rip/rsp"
 )]
-pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
-    // Skip boot processor since VTL is already enabled for it by VTL0
-    if core == 0 {
-        debug_serial_println!("Skipping boot processor (core 0)");
+pub fn init_vtl_ap(vp_index: u32) -> Result<u64, HypervCallError> {
+    if vp_index == bsp_vp_index().truncate() {
+        debug_serial_println!("Skipping init_vtl_ap for BSP");
         return Ok(0);
     }
 
@@ -232,14 +233,14 @@ pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
     let rsp = get_address_of_special_page(VTL1_KERNEL_STACK_PAGE) + PAGE_SIZE as u64 - 1;
     let tss = get_address_of_special_page(VTL1_TSS_PAGE);
 
-    let result = hvcall_enable_vp_vtl(core, HV_VTL_SECURE, tss, rip, rsp);
+    let result = hvcall_enable_vp_vtl(vp_index, HV_VTL_SECURE, tss, rip, rsp);
     match result {
         Ok(_) => {
-            debug_serial_println!("Enabled VTL for core {}", core);
+            debug_serial_println!("Enabled VTL for VP index {}", vp_index);
             Ok(0)
         }
         Err(e) => {
-            serial_println!("Failed to enable VTL for core {}: {:?}", core, e);
+            serial_println!("Failed to enable VTL for VP index {}: {:?}", vp_index, e);
             Err(e)
         }
     }

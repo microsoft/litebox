@@ -4,7 +4,7 @@
 //! Per-CPU VTL1 kernel variables
 
 use crate::{
-    arch::{MAX_CORES, gdt, get_core_id},
+    arch::{MAX_CORES, gdt, is_bsp},
     host::bootparam::get_num_possible_cpus,
     mshv::{
         HvMessagePage, HvVpAssistPage,
@@ -418,7 +418,6 @@ static mut PER_CPU_VARIABLE_ADDRESSES_IDX: usize = 0;
 /// # Safety
 /// This function assumes the following:
 /// - The GSBASE register values of individual cores must be properly set (i.e., they must be different).
-/// - `get_core_id()` must return distinct APIC IDs for different cores.
 ///
 /// If we cannot guarantee these assumptions, this function may result in unsafe or undefined behaviors.
 ///
@@ -444,7 +443,6 @@ where
 /// # Safety
 /// This function assumes the following:
 /// - The GSBASE register values of individual cores must be properly set (i.e., they must be different).
-/// - `get_core_id()` must return distinct APIC IDs for different cores.
 ///
 /// If we cannot guarantee these assumptions, this function may result in unsafe or undefined behaviors.
 ///
@@ -490,8 +488,7 @@ where
 fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut PerCpuVariables>> {
     let gsbase = unsafe { rdgsbase() };
     if gsbase == 0 {
-        let core_id = get_core_id();
-        let refcell_wrapper = if core_id == 0 {
+        let refcell_wrapper = if is_bsp() {
             let addr = &raw mut BSP_VARIABLES;
             unsafe {
                 PER_CPU_VARIABLE_ADDRESSES[0] = RefCellWrapper::new(addr);
