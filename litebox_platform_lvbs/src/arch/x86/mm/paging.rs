@@ -31,48 +31,58 @@ const FLUSH_TLB: bool = true;
 #[cfg(test)]
 const FLUSH_TLB: bool = false;
 
-/// When flushing more than this many pages, use a full CR3 reload instead of
-/// per-page `invlpg` instructions. This heuristic is from the Linux kernel.
+/// When we flush multiple TLB entries, flushing the entire TLB (e.g., write to CR3)
+/// can be more efficient than flushing individual entries (e.g., `invlpg`).
+/// This threshold is a heuristic from the Linux kernel:
 /// <https://elixir.bootlin.com/linux/v6.18.6/source/arch/x86/mm/tlb.c#L1394>
 #[cfg(not(test))]
 const TLB_SINGLE_PAGE_FLUSH_CEILING: usize = 33;
 
 /// Flush TLB entries for a contiguous page range.
 ///
-/// For small ranges (<= [`TLB_SINGLE_PAGE_FLUSH_CEILING`]) this issues `invlpg` per
-/// page. For larger ranges it reloads CR3 to flush the entire TLB.
+/// When `all_cores` is `true`, uses Hyper-V hypercalls for TLB flush so that
+/// remote cores sharing the same page table also see the invalidation.
 ///
-/// TODO(security): Both `invlpg` and CR3 reload are local to the executing core.
-/// Threads of the same process (CLONE_VM) can be scheduled on different cores
-/// sharing the same page table, so a remote core may retain stale TLB entries
-/// after unmap/mprotect. While threads sharing a page table are not themselves
-/// a security boundary, a stale TLB entry can allow access to a physical frame
-/// that has been freed and reallocated to a *different* process, breaking
-/// process isolation. This function should send IPIs to remote cores for a
-/// cross-core TLB shootdown (similar to Linux's `flush_tlb_others` /
-/// `native_flush_tlb_others`). On AMD CPUs with INVLPGB support, use the
-/// `invlpgb`/`tlbsync` instructions instead of IPIs for broadcast invalidation.
-/// On newer Intel CPUs, use Remote Action Requests (RAR) for the same purpose.
-///
-/// Note: OP-TEE TAs only unmap pages when tearing down the entire TA instance
-/// and its sessions, so multi-session TAs sharing a page table are not affected.
+/// When `all_cores` is `false`, only the **local** VP's TLB is flushed.
+/// The local flush is still needed under Hyper-V because the virtual
+/// TLB may cache not-present translations (TLFS §11.6.1).
 #[cfg(not(test))]
-fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
+fn flush_tlb_range(start: Page<Size4KiB>, count: usize, all_cores: bool) {
+    use crate::mshv::{hvcall_mm, is_hvcall_ready};
+
     if count == 0 {
         return;
     }
-    if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
-        let end = start + count as u64;
-        for page in Page::range(start, end) {
-            x86_64::instructions::tlb::flush(page.start_address());
+
+    // If the current VP is the BSP, it might use MM operations **before** the hypercall page is set up.
+    // In that case, we fall back to local TLB flushes. This is safe because no AP enters VTL1 yet.
+    if !all_cores || !is_hvcall_ready() {
+        if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
+            let base = start.start_address().as_u64();
+            for i in 0..count {
+                x86_64::instructions::tlb::flush(VirtAddr::new(base + (i as u64) * Size4KiB::SIZE));
+            }
+        } else {
+            x86_64::instructions::tlb::flush_all();
         }
+        return;
+    }
+
+    let result = if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
+        hvcall_mm::hv_flush_virtual_address_list(start.start_address().as_u64(), count)
     } else {
+        hvcall_mm::hv_flush_virtual_address_space()
+    };
+
+    if let Err(e) = result {
+        // Hypercall failed — fall back to local flush so this core is at least coherent.
+        debug_assert!(false, "TLB flush hypercall failed: {e:?}");
         x86_64::instructions::tlb::flush_all();
     }
 }
 
 #[cfg(test)]
-fn flush_tlb_range(_start: Page<Size4KiB>, _count: usize) {}
+fn flush_tlb_range(_start: Page<Size4KiB>, _count: usize, _all_cores: bool) {}
 
 #[inline]
 fn frame_to_pointer<M: MemoryProvider>(frame: PhysFrame) -> *mut PageTable {
@@ -195,7 +205,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         if flush_tlb {
             let page_count = (end.start_address() - start.start_address()) / Size4KiB::SIZE;
-            flush_tlb_range(start, page_count.truncate());
+            // Present → not-present: other cores may hold stale entries.
+            flush_tlb_range(start, page_count.truncate(), true);
         }
 
         if clean_up_page_tables {
@@ -318,15 +329,16 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             new_start += 1;
         }
 
-        // Flush old (unmapped) addresses. The new (mapped) addresses are not-present →
-        // present transitions which also require flushing under Hyper-V's virtual TLB
-        // (see comment in `map_phys_frame_range`).
+        // Flush old (unmapped) addresses — other cores may hold stale entries.
         let page_count = (end.start_address() - flush_start.start_address()) / Size4KiB::SIZE;
-        flush_tlb_range(flush_start, page_count.truncate());
+        flush_tlb_range(flush_start, page_count.truncate(), true);
+        // Flush new (mapped) addresses — not-present → present; only the local
+        // core's virtual TLB may cache the stale not-present translation
+        // (see comment in `map_phys_frame_range`).
         let new_flush_start =
             Page::<Size4KiB>::from_start_address(VirtAddr::new(new_range.start as u64))
                 .or(Err(page_mgmt::RemapError::Unaligned))?;
-        flush_tlb_range(new_flush_start, page_count.truncate());
+        flush_tlb_range(new_flush_start, page_count.truncate(), false);
 
         Ok(UserMutPtr::from_ptr(new_range.start as *mut u8))
     }
@@ -385,7 +397,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         }
 
         let page_count = (end.start_address() - start.start_address()) / Size4KiB::SIZE + 1;
-        flush_tlb_range(start, page_count.truncate());
+        // Permission change: other cores may hold stale (wider) permissions.
+        flush_tlb_range(start, page_count.truncate(), true);
 
         Ok(())
     }
@@ -442,10 +455,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         //    from a not-present to a present state"
         // Without this flush, the hypervisor may serve stale "not-present"
         // translations, causing spurious page faults.
+        // Not-present → present: only the local core's virtual TLB can hold a
+        // stale not-present translation.  No cross-core flush needed.
         let start =
             Page::<Size4KiB>::containing_address(M::pa_to_va(frame_range.start.start_address()));
         let page_count = frame_range.len();
-        flush_tlb_range(start, page_count.truncate());
+        flush_tlb_range(start, page_count.truncate(), false);
 
         Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
@@ -525,9 +540,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             }
         }
 
-        // See comment in `map_phys_frame_range` — Hyper-V requires TLB notification
-        // even for not-present → present transitions.
-        flush_tlb_range(start_page, mapped_count);
+        // Not-present → present: local flush only (see `map_phys_frame_range`).
+        flush_tlb_range(start_page, mapped_count, false);
 
         Ok(base_va.as_mut_ptr())
     }
@@ -550,7 +564,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             }
         }
 
-        flush_tlb_range(first_page, count);
+        // Rolling back just-mapped pages — only the current core touched
+        // them, so a local flush suffices.
+        flush_tlb_range(first_page, count, false);
 
         // Safety: all leaf entries in `pages` have been unmapped above while
         // holding `self.inner`, so any P1/P2/P3 frames that became empty can

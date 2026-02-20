@@ -263,6 +263,9 @@ impl PerCpuVariablesAsm {
     pub fn set_vtl_return_addr(&self, addr: usize) {
         self.vtl_return_addr.set(addr);
     }
+    pub fn get_vtl_return_addr(&self) -> usize {
+        self.vtl_return_addr.get()
+    }
     pub fn set_vtl0_state_top_addr(&self, addr: usize) {
         self.vtl0_state_top_addr.set(addr);
     }

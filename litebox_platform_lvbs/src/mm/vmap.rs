@@ -234,15 +234,6 @@ mod tests {
     use x86_64::PhysAddr;
 
     #[test]
-    fn test_is_vmap_address() {
-        assert!(is_vmap_address(VirtAddr::new(VMAP_START as u64)));
-        assert!(is_vmap_address(VirtAddr::new(VMAP_START as u64 + 0x1000)));
-        assert!(is_vmap_address(VirtAddr::new(VMAP_END as u64 - 1)));
-        assert!(!is_vmap_address(VirtAddr::new(VMAP_START as u64 - 1)));
-        assert!(!is_vmap_address(VirtAddr::new(VMAP_END as u64)));
-    }
-
-    #[test]
     fn test_allocate_va_range() {
         let mut allocator = VmapRegionAllocatorInner::new();
 

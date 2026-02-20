@@ -6,7 +6,7 @@
 pub mod error;
 pub(crate) mod heki;
 pub mod hvcall;
-mod hvcall_mm;
+pub(crate) mod hvcall_mm;
 mod hvcall_vp;
 mod mem_integrity;
 pub(crate) mod ringbuffer;
@@ -73,10 +73,18 @@ pub const VTL_ENTRY_REASON_RESERVED: u32 = 0x0;
 pub const VTL_ENTRY_REASON_LOWER_VTL_CALL: u32 = 0x1;
 pub const VTL_ENTRY_REASON_INTERRUPT: u32 = 0x2;
 
+pub const HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE: u16 = 0x_0002;
+pub const HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST: u16 = 0x_0003;
 pub const HVCALL_MODIFY_VTL_PROTECTION_MASK: u16 = 0x_000c;
 pub const HVCALL_ENABLE_VP_VTL: u16 = 0x_000f;
 pub const HVCALL_GET_VP_REGISTERS: u16 = 0x_0050;
 pub const HVCALL_SET_VP_REGISTERS: u16 = 0x_0051;
+
+/// Flags for `HvCallFlushVirtualAddressSpace` / `HvCallFlushVirtualAddressList`.
+/// TLFS §3.5.2
+pub const HV_FLUSH_ALL_PROCESSORS: u64 = 1 << 0;
+pub const HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES: u64 = 1 << 1;
+pub const HV_FLUSH_NON_GLOBAL_MAPPINGS_ONLY: u64 = 1 << 2;
 
 pub const HV_X64_REGISTER_RIP: u32 = 0x0002_0010;
 pub const HV_X64_REGISTER_CR0: u32 = 0x0004_0000;
@@ -517,6 +525,64 @@ impl Default for HvInputModifyVtlProtectionMask {
     }
 }
 
+/// Input structure for `HvCallFlushVirtualAddressSpace` (0x0002).
+///
+/// Layout (TLFS §6.5.2):
+/// - Fixed header: `address_space` (u64) + `flags` (u64) + `processor_mask` (u64)
+///
+/// This is the **non-extended** version; it uses a simple 64-bit processor
+/// mask (one bit per VP, max 64 VPs).  When `HV_FLUSH_ALL_PROCESSORS` is
+/// set in `flags` the mask is ignored, but must still be present.
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvInputFlushVirtualAddressSpace {
+    /// CR3 / EPTP value identifying the address space. Ignored when
+    /// `HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES` is set.
+    pub address_space: u64,
+    /// Combination of `HV_FLUSH_*` flags.
+    pub flags: u64,
+    /// 64-bit processor mask (bit *i* → VP *i*). Ignored when
+    /// `HV_FLUSH_ALL_PROCESSORS` is set in `flags`.
+    pub processor_mask: u64,
+}
+
+/// Input structure for `HvCallFlushVirtualAddressList` (0x0003).
+///
+/// Layout (TLFS §6.5.3):
+/// - Fixed header: `address_space` (u64) + `flags` (u64) + `processor_mask` (u64)
+/// - Rep elements: array of `HV_GVA_RANGE` entries (u64 each)
+///
+/// This is the **non-extended** version; it uses a simple 64-bit processor
+/// mask.  The GVA range list is placed immediately after the fixed header.
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvInputFlushVirtualAddressList {
+    /// CR3 / EPTP value identifying the address space.
+    pub address_space: u64,
+    /// Combination of `HV_FLUSH_*` flags.
+    pub flags: u64,
+    /// 64-bit processor mask. Ignored when `HV_FLUSH_ALL_PROCESSORS` is set.
+    pub processor_mask: u64,
+    /// GVA range entries. Each entry specifies a GVA range to flush.
+    /// Bits 11:0 encode `additional_pages` (number of *extra* pages beyond the
+    /// first; 0 = flush exactly 1 page).
+    /// Bits 63:12 encode the GVA page number (GVA >> 12).
+    pub gva_range_list: [u64; HV_FLUSH_MAX_GVAS],
+}
+
+/// Maximum number of GVA range entries that fit in a single hypercall input page
+/// after the fixed header of `HvInputFlushVirtualAddressList`.
+///
+/// Input page = 4096 bytes. Header = 3 × 8 = 24 bytes. Remaining = 4072 / 8 = 509.
+#[expect(clippy::cast_possible_truncation)]
+const HV_FLUSH_MAX_GVAS: usize =
+    ((PAGE_SIZE as u32 - 3 * (u64::BITS / 8)) / (u64::BITS / 8)) as usize;
+
+impl HvInputFlushVirtualAddressList {
+    /// Maximum number of GVA range entries per hypercall invocation.
+    pub const MAX_GVAS_PER_REQUEST: usize = HV_FLUSH_MAX_GVAS;
+}
+
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -851,6 +917,17 @@ impl HvPendingExceptionEvent {
     pub fn as_u64(&self) -> u64 {
         u64::from_le_bytes(self.into_bytes())
     }
+}
+
+/// Check whether Hyper-V hypercalls are ready.
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn is_hvcall_ready() -> bool {
+    use crate::host::per_cpu_variables::with_per_cpu_variables_asm;
+    // The VTL return address is configured only after the hypercall page
+    // has been set up, so a non-zero value indicates that hypercalls are
+    // available.
+    with_per_cpu_variables_asm(|pcv| pcv.get_vtl_return_addr() != 0)
 }
 
 #[cfg(test)]
