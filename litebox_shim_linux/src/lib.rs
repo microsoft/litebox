@@ -107,9 +107,9 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
             }
             .is_ok()
             {
-                return ContinueOperation::ResumeKernelPlatform;
+                return ContinueOperation::Resume;
             } else {
-                return ContinueOperation::ExceptionFixup;
+                return ContinueOperation::Terminate;
             }
         }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
@@ -132,9 +132,9 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         }
         f(&self.task, ctx);
         if self.task.prepare_to_run_guest(ctx) {
-            ContinueOperation::ResumeGuest
+            ContinueOperation::Resume
         } else {
-            ContinueOperation::ExitThread
+            ContinueOperation::Terminate
         }
     }
 }

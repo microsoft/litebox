@@ -1726,7 +1726,7 @@ unsafe extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext<'_>
         } else {
             // We likely got here just to restore fsbase, so don't bother the
             // shim.
-            ContinueOperation::ResumeGuest
+            ContinueOperation::Resume
         }
     });
 }
@@ -1752,14 +1752,8 @@ impl ThreadContext<'_> {
         // before returning.
         let op = f(self.shim, self.ctx, self.tls.interrupt.replace(false));
         match op {
-            ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
-            ContinueOperation::ExitThread => {}
-            ContinueOperation::ResumeKernelPlatform => {
-                panic!("ResumeKernelPlatform not expected in windows_userland")
-            }
-            ContinueOperation::ExceptionFixup => {
-                panic!("ExceptionFixup not expected in windows_userland")
-            }
+            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::Terminate => {}
         }
     }
 }

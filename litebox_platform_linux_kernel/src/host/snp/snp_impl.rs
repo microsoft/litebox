@@ -196,14 +196,8 @@ pub unsafe fn run_thread(
 
     let shim = tls.shim.get().unwrap().as_ref();
     match shim.init(regs) {
-        litebox::shim::ContinueOperation::ResumeGuest => unsafe { crate::switch_to_guest(regs) },
-        litebox::shim::ContinueOperation::ExitThread => exit_thread(),
-        litebox::shim::ContinueOperation::ResumeKernelPlatform => {
-            panic!("ResumeKernelPlatform not expected in SNP init")
-        }
-        litebox::shim::ContinueOperation::ExceptionFixup => {
-            panic!("ExceptionFixup not expected in SNP init")
-        }
+        litebox::shim::ContinueOperation::Resume => unsafe { crate::switch_to_guest(regs) },
+        litebox::shim::ContinueOperation::Terminate => exit_thread(),
     }
 }
 
@@ -227,14 +221,8 @@ fn exit_thread() -> ! {
 pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) -> ! {
     let tls = unsafe { &*get_tls() };
     match tls.shim.get().unwrap().syscall(pt_regs) {
-        litebox::shim::ContinueOperation::ResumeGuest => unsafe { crate::switch_to_guest(pt_regs) },
-        litebox::shim::ContinueOperation::ExitThread => exit_thread(),
-        litebox::shim::ContinueOperation::ResumeKernelPlatform => {
-            panic!("ResumeKernelPlatform not expected in SNP syscall")
-        }
-        litebox::shim::ContinueOperation::ExceptionFixup => {
-            panic!("ExceptionFixup not expected in SNP syscall")
-        }
+        litebox::shim::ContinueOperation::Resume => unsafe { crate::switch_to_guest(pt_regs) },
+        litebox::shim::ContinueOperation::Terminate => exit_thread(),
     }
 }
 

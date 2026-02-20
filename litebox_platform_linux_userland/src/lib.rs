@@ -1631,14 +1631,8 @@ impl ThreadContext<'_> {
         }
         let op = f(self.shim, self.ctx);
         match op {
-            ContinueOperation::ResumeGuest => unsafe { switch_to_guest(self.ctx) },
-            ContinueOperation::ExitThread => {}
-            ContinueOperation::ResumeKernelPlatform => {
-                panic!("ResumeKernelPlatform not expected in linux_userland")
-            }
-            ContinueOperation::ExceptionFixup => {
-                panic!("ExceptionFixup not expected in linux_userland")
-            }
+            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::Terminate => {}
         }
     }
 }

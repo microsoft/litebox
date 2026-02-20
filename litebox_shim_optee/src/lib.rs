@@ -80,19 +80,19 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
             };
             if info.kernel_mode {
                 return if result.is_ok() {
-                    ContinueOperation::ResumeKernelPlatform
+                    ContinueOperation::Resume
                 } else {
-                    ContinueOperation::ExceptionFixup
+                    ContinueOperation::Terminate
                 };
             } else if result.is_ok() {
-                return ContinueOperation::ResumeGuest;
+                return ContinueOperation::Resume;
             }
             // User-mode page fault that couldn't be resolved;
             // fall through to kill the TA below.
         }
         // OP-TEE has no signal handling. Kill the TA on any non-PF exception.
         ctx.rax = (TeeResult::TargetDead as u32) as usize;
-        ContinueOperation::ExitThread
+        ContinueOperation::Terminate
     }
 
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -338,7 +338,7 @@ impl Task {
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         match self.thread.init_state.get() {
-            ThreadInitState::None => ContinueOperation::ExitThread,
+            ThreadInitState::None => ContinueOperation::Terminate,
             ThreadInitState::Ldelf { .. } => self.handle_ldelf_syscall_request(ctx),
             ThreadInitState::Ta { .. } => self.handle_ta_syscall_request(ctx),
         }
@@ -353,16 +353,16 @@ impl Task {
             Err(err) => {
                 // TODO: this seems like the wrong kind of error for OPTEE.
                 ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
-                return ContinueOperation::ResumeGuest;
+                return ContinueOperation::Resume;
             }
         };
 
         if let SyscallRequest::Return { ret } = request {
             ctx.rax = self.sys_return(ret);
-            return ContinueOperation::ExitThread;
+            return ContinueOperation::Terminate;
         } else if let SyscallRequest::Panic { code } = request {
             ctx.rax = self.sys_panic(code);
-            return ContinueOperation::ExitThread;
+            return ContinueOperation::Terminate;
         }
         let res: Result<(), TeeResult> = match request {
             SyscallRequest::Log { buf, len } => match buf.to_owned_slice(len) {
@@ -531,17 +531,17 @@ impl Task {
             Ok(()) => u32::from(TeeResult::Success),
             Err(e) => e.into(),
         } as usize;
-        ContinueOperation::ResumeGuest
+        ContinueOperation::Resume
     }
 
     fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         // Ensure handle_init_request is invoked at most once.
         if self.thread.initialized.replace(true) {
-            return ContinueOperation::ExitThread;
+            return ContinueOperation::Terminate;
         }
 
         match self.thread.init_state.get() {
-            ThreadInitState::None | ThreadInitState::Ta { .. } => ContinueOperation::ExitThread,
+            ThreadInitState::None | ThreadInitState::Ta { .. } => ContinueOperation::Terminate,
             ThreadInitState::Ldelf {
                 ldelf_arg_address,
                 entry_point,
@@ -556,7 +556,7 @@ impl Task {
                     ctx.ss = 0x2b; // __USER_DS
                     ctx.eflags = 0x202; // IF (interrupt enable) and reserved bit 1
                 }
-                ContinueOperation::ResumeGuest
+                ContinueOperation::Resume
             }
         }
     }
@@ -571,7 +571,7 @@ impl Task {
     fn handle_reenter_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         let state = self.thread.init_state.get();
         match state {
-            ThreadInitState::None | ThreadInitState::Ldelf { .. } => ContinueOperation::ExitThread,
+            ThreadInitState::None | ThreadInitState::Ldelf { .. } => ContinueOperation::Terminate,
             ThreadInitState::Ta {
                 cmd_id,
                 params_address,
@@ -592,7 +592,7 @@ impl Task {
                     ctx.ss = 0x2b; // __USER_DS
                     ctx.eflags = 0x202; // IF (interrupt enable) and reserved bit 1
                 }
-                ContinueOperation::ResumeGuest
+                ContinueOperation::Resume
             }
         }
     }
@@ -606,7 +606,7 @@ impl Task {
             Err(err) => {
                 // TODO: this seems like the wrong kind of error for OPTEE.
                 ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
-                return ContinueOperation::ResumeGuest;
+                return ContinueOperation::Resume;
             }
         };
 
@@ -615,10 +615,10 @@ impl Task {
             if ctx.rax == 0 {
                 self.get_ldelf_result();
             }
-            return ContinueOperation::ExitThread;
+            return ContinueOperation::Terminate;
         } else if let LdelfSyscallRequest::Panic { code } = request {
             ctx.rax = self.sys_panic(code);
-            return ContinueOperation::ExitThread;
+            return ContinueOperation::Terminate;
         }
         let res: Result<(), TeeResult> = match request {
             LdelfSyscallRequest::Log { buf, len } => match buf.to_owned_slice(len) {
@@ -683,7 +683,7 @@ impl Task {
             Ok(()) => u32::from(TeeResult::Success),
             Err(e) => e.into(),
         } as usize;
-        ContinueOperation::ResumeGuest
+        ContinueOperation::Resume
     }
 
     /// Load `ldelf` and prepare the stack and CPU context for it with the given TA UUID.

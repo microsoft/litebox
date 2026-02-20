@@ -1767,8 +1767,30 @@ unsafe extern "C" fn run_thread_arch(
     );
 }
 
+unsafe extern "C" {
+    // Defined in asm blocks above
+    fn syscall_callback() -> isize;
+}
+
+unsafe extern "C" fn init_handler(thread_ctx: &mut ThreadContext) {
+    match thread_ctx.call_shim(|shim, ctx| shim.init(ctx)) {
+        ContinueOperation::Resume => unsafe { switch_to_user(thread_ctx.ctx) },
+        ContinueOperation::Terminate => {}
+    }
+}
+
+unsafe extern "C" fn reenter_handler(thread_ctx: &mut ThreadContext) {
+    match thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx)) {
+        ContinueOperation::Resume => unsafe { switch_to_user(thread_ctx.ctx) },
+        ContinueOperation::Terminate => {}
+    }
+}
+
 unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
-    thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
+    match thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx)) {
+        ContinueOperation::Resume => unsafe { switch_to_user(thread_ctx.ctx) },
+        ContinueOperation::Terminate => {}
+    }
 }
 
 /// Handles exceptions and routes to the shim's exception handler via `call_shim`.
@@ -1809,29 +1831,39 @@ unsafe extern "C" fn exception_handler(
         }
     };
     match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
-        Some(val) => val,
-        None => {
-            // ExceptionFixup: look up exception table, panic if not found.
-            litebox::mm::exception_table::search_exception_tables(faulting_rip).unwrap_or_else(
-                || {
-                    panic!(
-                        "EXCEPTION: PAGE FAULT\n\
-                         Accessed Address: {:#x}\n\
-                         Error Code: {:#x}\n\
-                         Faulting RIP: {:#x}",
-                        info.cr2, info.error_code, faulting_rip,
-                    )
-                },
-            )
+        ContinueOperation::Resume => {
+            if kernel_mode {
+                // Kernel-mode exception handled (e.g., demand paging succeeded).
+                0
+            } else {
+                // User-mode exception handled; resume user execution.
+                unsafe { switch_to_user(thread_ctx.ctx) }
+            }
+        }
+        ContinueOperation::Terminate => {
+            if kernel_mode {
+                // Look up exception table fixup, panic if not found.
+                litebox::mm::exception_table::search_exception_tables(faulting_rip).unwrap_or_else(
+                    || {
+                        panic!(
+                            "EXCEPTION: PAGE FAULT\n\
+                             Accessed Address: {:#x}\n\
+                             Error Code: {:#x}\n\
+                             Faulting RIP: {:#x}",
+                            info.cr2, info.error_code, faulting_rip,
+                        )
+                    },
+                )
+            } else {
+                // User-mode exception not handled; return 0 to exit the thread.
+                0
+            }
         }
     }
 }
 
-/// Calls `f` in order to call into a shim entrypoint.
-///
-/// Returns `Some(0)` for most operations. Returns `None` for
-/// `ExceptionFixup` (caller is responsible for looking up the fixup).
-/// For `ResumeGuest`, does not return (switches directly to user mode).
+/// Calls `f` to invoke a shim entrypoint, returning the shim's
+/// [`ContinueOperation`] for the caller to interpret.
 impl ThreadContext<'_> {
     fn call_shim(
         &mut self,
@@ -1839,27 +1871,9 @@ impl ThreadContext<'_> {
             &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
             &mut litebox_common_linux::PtRegs,
         ) -> ContinueOperation,
-    ) -> Option<usize> {
-        let op = f(self.shim, self.ctx);
-        match op {
-            ContinueOperation::ResumeGuest => unsafe { switch_to_user(self.ctx) },
-            ContinueOperation::ExitThread | ContinueOperation::ResumeKernelPlatform => Some(0),
-            ContinueOperation::ExceptionFixup => None,
-        }
+    ) -> ContinueOperation {
+        f(self.shim, self.ctx)
     }
-}
-
-unsafe extern "C" {
-    // Defined in asm blocks above
-    fn syscall_callback() -> isize;
-}
-
-unsafe extern "C" fn init_handler(thread_ctx: &mut ThreadContext) {
-    thread_ctx.call_shim(|shim, ctx| shim.init(ctx));
-}
-
-unsafe extern "C" fn reenter_handler(thread_ctx: &mut ThreadContext) {
-    thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx));
 }
 
 // Switches to the provided user context with the user mode.
