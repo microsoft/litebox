@@ -7,7 +7,7 @@
 use crate::mshv::mem_integrity::parse_modinfo;
 use crate::mshv::ringbuffer::set_ringbuffer;
 use crate::{
-    arch::get_core_id,
+    arch::is_bsp,
     debug_serial_print, debug_serial_println,
     host::{
         bootparam::get_vtl1_memory_info,
@@ -69,7 +69,7 @@ static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
 
 pub(crate) fn init() {
     assert!(
-        !(get_core_id() == 0 && mshv_vsm_configure_partition().is_err()),
+        !(is_bsp() && mshv_vsm_configure_partition().is_err()),
         "Failed to configure VSM partition"
     );
 
@@ -83,7 +83,7 @@ pub(crate) fn init() {
         "Failed to secure VTL0 configuration"
     );
 
-    if get_core_id() == 0 {
+    if is_bsp() {
         if let Ok((start, size)) = get_vtl1_memory_info() {
             debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, start + size);
             if protect_physical_memory_range(
@@ -142,7 +142,14 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
 
     let mut error = None;
 
-    // Initialize VTL for each online CPU and update its boot signal byte
+    // Initialize VTL for each online CPU and update its boot signal byte.
+    // TODO: The cpumask provides Linux CPU IDs which may not match Hyper-V VP indices.
+    // Currently we assume cpu_id == vp_index, which holds for standard Hyper-V topologies
+    // but is not architecturally guaranteed. Two possible fixes:
+    //   1) Have VTL0 pass per-CPU hv_vp_index values so VTL1 can translate
+    //      Linux CPU IDs to Hyper-V VP indices.
+    //   2) Have VTL0 compute and pass an online VP-index mask (instead of a
+    //      conventional cpumask) so VTL1 can use VP indices directly.
     cpu_mask.for_each_cpu(|cpu_id| {
         if cpu_id > boot_signal_page_buf.0.len() - 1 {
             error = Some(HypervCallError::InvalidInput);

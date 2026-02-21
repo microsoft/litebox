@@ -7,7 +7,7 @@
 
 use core::arch::asm;
 use litebox_platform_lvbs::{
-    arch::{enable_extended_states, enable_fsgsbase, get_core_id, instrs::hlt_loop},
+    arch::{enable_extended_states, enable_fsgsbase, instrs::hlt_loop, is_bsp},
     host::{
         bootparam::parse_boot_info,
         per_cpu_variables::{PerCpuVariablesAsm, init_per_cpu_variables},
@@ -116,16 +116,29 @@ unsafe fn apply_relocations() {
     }
 }
 
+/// BSP entry point. Applies ELF relocations then falls through to common
+/// initialisation. Only the BSP must enter via `_start`; APs enter at
+/// [`_ap_start`].
 #[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
-    let core_id = get_core_id();
-    if core_id == 0 {
-        unsafe {
-            apply_relocations();
-        }
+    unsafe {
+        apply_relocations();
     }
 
+    // SAFETY: falls through to the same init path APs use.
+    #[expect(clippy::used_underscore_items)]
+    unsafe {
+        _ap_start()
+    }
+}
+
+/// AP entry point: Common initialization shared by BSP (after relocations)
+/// and all APs. APs are directed here by `init_vtl_ap` via
+/// [`get_entry`](litebox_platform_lvbs::mshv::hvcall_vp).
+#[expect(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _ap_start() -> ! {
     enable_fsgsbase();
     enable_extended_states();
     init_per_cpu_variables();
@@ -143,8 +156,7 @@ pub unsafe extern "C" fn _start() -> ! {
 }
 
 unsafe extern "C" fn kernel_main() -> ! {
-    let core_id = get_core_id();
-    if core_id == 0 {
+    if is_bsp() {
         serial_println!("==============================");
         serial_println!(" Hello from LiteBox for LVBS! ");
         serial_println!("==============================");

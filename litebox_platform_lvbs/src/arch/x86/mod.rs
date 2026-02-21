@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use litebox::utils::TruncateExt;
+
 pub mod gdt;
 pub mod instrs;
 pub mod interrupts;
@@ -19,16 +21,41 @@ pub(crate) use x86_64::{
 #[cfg(test)]
 pub(crate) use x86_64::structures::paging::mapper::{MappedFrame, TranslateResult};
 
-/// Get the APIC ID of the current core.
+/// VP index of the bootstrap processor, initialized on the first call to
+/// [`is_bsp`].
+static BSP_VP_INDEX: spin::Once<usize> = spin::Once::new();
+
+/// Get the VP index of the current virtual processor from the Hyper-V
+/// `HV_REGISTER_VP_INDEX` MSR.
+///
+/// Unlike CPUID-based APIC IDs, VP indices are guaranteed to be unique and
+/// contiguous across virtual processors in a Hyper-V partition.
 #[inline]
-pub fn get_core_id() -> usize {
-    use core::arch::x86_64::__cpuid_count as cpuid_count;
-    const CPU_VERSION_INFO: u32 = 1;
+pub fn get_vp_index() -> usize {
+    instrs::rdmsr(crate::mshv::HV_REGISTER_VP_INDEX).truncate()
+}
 
-    let result = unsafe { cpuid_count(CPU_VERSION_INFO, 0x0) };
-    let apic_id = (result.ebx >> 24) & 0xff;
+/// Returns `true` if the current virtual processor is the bootstrap processor
+/// (BSP).
+///
+/// The first VP to call this function is recorded as the BSP. All subsequent
+/// calls compare the caller's VP index against the stored value.
+#[inline]
+pub fn is_bsp() -> bool {
+    *BSP_VP_INDEX.call_once(get_vp_index) == get_vp_index()
+}
 
-    apic_id as usize
+/// Returns the VP index of the bootstrap processor.
+///
+/// # Panics
+///
+/// Panics if [`is_bsp`] has not been called yet (i.e., the BSP VP index
+/// has not been initialised).
+#[inline]
+pub fn bsp_vp_index() -> usize {
+    *BSP_VP_INDEX
+        .get()
+        .expect("BSP VP index not yet initialised")
 }
 
 /// Enable FSGSBASE instructions
