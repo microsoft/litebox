@@ -3,6 +3,8 @@
 
 //! VTL switch related functions
 
+use crate::arch::MAX_CORES;
+use crate::arch::instrs::rdmsr;
 use crate::host::{
     hv_hypercall_page_address,
     per_cpu_variables::{
@@ -11,12 +13,69 @@ use crate::host::{
     },
 };
 use crate::mshv::{
-    HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS,
-    VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
-    error::VsmError, hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
+    HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VP_INDEX, HV_REGISTER_VSM_CODEPAGE_OFFSETS,
+    HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
+    VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED, error::VsmError,
+    hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
 };
+use bitvec::prelude::{BitArray, Lsb0};
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
 use num_enum::TryFromPrimitive;
+use spin::mutex::SpinMutex;
+
+/// Bitmask of VPs that are currently executing VTL1 code. Bit *N* is set
+/// when VP index *N* is inside VTL1 (between VTL entry and VTL return).
+///
+/// The TLB flush hypercalls read this mask so they only target VPs that
+/// are in VTL1. VPs running in VTL0 use a separate address space and
+/// will receive a full TLB flush on their next VTL1 entry.
+///
+/// Supports up to `MAX_CORES` VPs. [`vtl1_vp_enter`] asserts that the VP index fits.
+type Vtl1VpMaskBits = BitArray<[u64; HV_FLUSH_EX_VP_SET_BANKS], Lsb0>;
+static VTL1_VP_MASK: SpinMutex<Vtl1VpMaskBits> = SpinMutex::new(Vtl1VpMaskBits::ZERO);
+
+/// Read the current VP index from the hypervisor MSR.
+#[inline]
+fn current_vp_index() -> u32 {
+    rdmsr(HV_REGISTER_VP_INDEX).truncate()
+}
+
+/// Mark the current VP as executing in VTL1.
+///
+/// # Panics
+/// Panics if the VP index ≥ `MAX_CORES`.
+#[inline]
+fn vtl1_vp_enter() {
+    let vp_index = current_vp_index();
+    assert!(
+        vp_index < u32::try_from(MAX_CORES).unwrap(),
+        "VP index {vp_index} exceeds the configured processor mask"
+    );
+    VTL1_VP_MASK.lock().set(vp_index as usize, true);
+}
+
+/// Remove the current VP from the VTL1 mask (it is returning to VTL0).
+#[inline]
+fn vtl1_vp_exit() {
+    let vp_index = current_vp_index();
+    VTL1_VP_MASK.lock().set(vp_index as usize, false);
+}
+
+/// Return the current VTL1 VP mask for use in TLB flush hypercalls.
+///
+/// The returned value is a snapshot. VPs may enter or leave VTL1
+/// between the load and the hypercall, but that is benign:
+/// - A VP that left VTL1 after the snapshot merely receives a redundant flush.
+/// - A VP that entered VTL1 after the snapshot performs a full TLB flush
+///   because CR3 is reloaded at the entry and PCID is not enabled in VTL1.
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn vtl1_vp_mask() -> [u64; HV_FLUSH_EX_VP_SET_BANKS] {
+    let mask = VTL1_VP_MASK.lock();
+    let mut banks = [0u64; HV_FLUSH_EX_VP_SET_BANKS];
+    banks.copy_from_slice(mask.as_raw_slice());
+    banks
+}
 
 // ============================================================================
 // VTL0 XSAVE/XRSTOR macros (simplified, always use plain XSAVE/XRSTOR)
@@ -132,6 +191,10 @@ pub fn vtl_switch_init(platform: Option<&'static crate::Platform>) {
     if let Some(platform) = platform {
         crate::set_platform_low(platform);
     }
+    // The VP is already in VTL1 when the runner calls this; register it
+    // in the mask so TLB flushes during the first VTL call dispatch
+    // target this VP.
+    vtl1_vp_enter();
 }
 
 /// Assembly macro to save VTL state to the VtlState memory area.
@@ -307,6 +370,11 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
     set_vtl_return_value(value);
 
     loop {
+        vtl1_vp_exit();
+        // Note. The below asm block only touches stable memory locations (no on-demand memory
+        // allocation, no permission changes). So, it is safe to exclude the current VP from
+        // the VTL1 mask before the asm block.
+
         // Inline asm performs the VTL switch:
         // 1. Restore VTL0 state (XRSTOR + load GP registers)
         // 2. Return to VTL0 (cli + hypercall)
@@ -349,6 +417,9 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
                 out("r15") _,
             );
         }
+
+        vtl1_vp_enter();
+
         if let Some(params) = handle_vtl_entry() {
             // Reset VTL1 xsaved flags. The CPU's XSAVEOPT tracking is global - it only tracks
             // one buffer at a time. At this point, the CPU's tracking might rely on VTL0's
