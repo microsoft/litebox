@@ -3,6 +3,7 @@
 
 //! VTL switch related functions
 
+use crate::arch::MAX_CORES;
 use crate::arch::instrs::rdmsr;
 use crate::host::{
     hv_hypercall_page_address,
@@ -12,25 +13,26 @@ use crate::host::{
     },
 };
 use crate::mshv::{
-    HV_REGISTER_VP_INDEX, HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets,
-    NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
-    VTL_ENTRY_REASON_RESERVED, error::VsmError, hvcall_vp::hvcall_get_vp_registers,
-    vsm_intercept::vsm_handle_intercept,
+    HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VP_INDEX, HV_REGISTER_VSM_CODEPAGE_OFFSETS,
+    HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
+    VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED, error::VsmError,
+    hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
 };
-use core::sync::atomic::{AtomicU64, Ordering};
+use bitvec::prelude::{BitArray, Lsb0};
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
 use num_enum::TryFromPrimitive;
+use spin::mutex::SpinMutex;
 
-/// Bitmask of VPs that are currently executing VTL1 code.  Bit *N* is set
+/// Bitmask of VPs that are currently executing VTL1 code. Bit *N* is set
 /// when VP index *N* is inside VTL1 (between VTL entry and VTL return).
 ///
 /// The TLB flush hypercalls read this mask so they only target VPs that
 /// are in VTL1. VPs running in VTL0 use a separate address space and
 /// will receive a full TLB flush on their next VTL1 entry.
 ///
-/// Supports up to 64 VPs (the non-extended hypercall processor mask is
-/// 64 bits wide).  [`vtl1_vp_enter`] asserts that the VP index fits.
-static VTL1_VP_MASK: AtomicU64 = AtomicU64::new(0);
+/// Supports up to `MAX_CORES` VPs. [`vtl1_vp_enter`] asserts that the VP index fits.
+type Vtl1VpMaskBits = BitArray<[u64; HV_FLUSH_EX_VP_SET_BANKS], Lsb0>;
+static VTL1_VP_MASK: SpinMutex<Vtl1VpMaskBits> = SpinMutex::new(Vtl1VpMaskBits::ZERO);
 
 /// Read the current VP index from the hypervisor MSR.
 #[inline]
@@ -41,35 +43,38 @@ fn current_vp_index() -> u32 {
 /// Mark the current VP as executing in VTL1.
 ///
 /// # Panics
-/// Panics (debug-only) if the VP index ≥ 64.
+/// Panics if the VP index ≥ `MAX_CORES`.
 #[inline]
 fn vtl1_vp_enter() {
     let vp_index = current_vp_index();
-    debug_assert!(
-        vp_index < 64,
-        "VP index {vp_index} exceeds the 64-bit processor mask"
+    assert!(
+        vp_index < u32::try_from(MAX_CORES).unwrap(),
+        "VP index {vp_index} exceeds the configured processor mask"
     );
-    VTL1_VP_MASK.fetch_or(1u64 << vp_index, Ordering::Release);
+    VTL1_VP_MASK.lock().set(vp_index as usize, true);
 }
 
 /// Remove the current VP from the VTL1 mask (it is returning to VTL0).
 #[inline]
 fn vtl1_vp_exit() {
     let vp_index = current_vp_index();
-    VTL1_VP_MASK.fetch_and(!(1u64 << vp_index), Ordering::Release);
+    VTL1_VP_MASK.lock().set(vp_index as usize, false);
 }
 
 /// Return the current VTL1 VP mask for use in TLB flush hypercalls.
 ///
-/// The returned value is a snapshot — VPs may enter or leave VTL1
+/// The returned value is a snapshot. VPs may enter or leave VTL1
 /// between the load and the hypercall, but that is benign:
 /// - A VP that left VTL1 after the snapshot merely receives a redundant flush.
-/// - A VP that entered VTL1 after the snapshot will perform a full TLB flush
-///   as part of the VTL transition.
+/// - A VP that entered VTL1 after the snapshot performs a full TLB flush
+///   because CR3 is reloaded at the entry and PCID is not enabled in VTL1.
 #[cfg(not(test))]
 #[inline]
-pub(crate) fn vtl1_vp_mask() -> u64 {
-    VTL1_VP_MASK.load(Ordering::Acquire)
+pub(crate) fn vtl1_vp_mask() -> [u64; HV_FLUSH_EX_VP_SET_BANKS] {
+    let mask = VTL1_VP_MASK.lock();
+    let mut banks = [0u64; HV_FLUSH_EX_VP_SET_BANKS];
+    banks.copy_from_slice(mask.as_raw_slice());
+    banks
 }
 
 // ============================================================================

@@ -50,6 +50,7 @@ pub trait MemoryProvider {
     fn pa_to_va(pa: PhysAddr) -> VirtAddr {
         let pa = pa.as_u64() & !Self::PRIVATE_PTE_MASK;
         let va = VirtAddr::new_truncate(pa + Self::GVA_OFFSET.as_u64());
+        #[cfg(feature = "optee_syscall")]
         assert!(
             va.as_u64() < vmap::VMAP_START as u64,
             "VA {va:#x} is out of range for direct mapping"

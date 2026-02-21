@@ -15,6 +15,7 @@ pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
+use crate::arch::MAX_CORES;
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
@@ -73,8 +74,8 @@ pub const VTL_ENTRY_REASON_RESERVED: u32 = 0x0;
 pub const VTL_ENTRY_REASON_LOWER_VTL_CALL: u32 = 0x1;
 pub const VTL_ENTRY_REASON_INTERRUPT: u32 = 0x2;
 
-pub const HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE: u16 = 0x_0002;
-pub const HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST: u16 = 0x_0003;
+pub const HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX: u16 = 0x_0013;
+pub const HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST_EX: u16 = 0x_0014;
 pub const HVCALL_MODIFY_VTL_PROTECTION_MASK: u16 = 0x_000c;
 pub const HVCALL_ENABLE_VP_VTL: u16 = 0x_000f;
 pub const HVCALL_GET_VP_REGISTERS: u16 = 0x_0050;
@@ -525,62 +526,65 @@ impl Default for HvInputModifyVtlProtectionMask {
     }
 }
 
-/// Input structure for `HvCallFlushVirtualAddressSpace` (0x0002).
+/// VP-set format for sparse 4K virtual processor numbering.
+pub const HV_GENERIC_SET_SPARSE_4K: u64 = 0;
+
+/// Number of VP banks encoded in EX flush requests.
 ///
-/// Layout (TLFS §6.5.2):
-/// - Fixed header: `address_space` (u64) + `flags` (u64) + `processor_mask` (u64)
+/// Each bank contains 64 VPs.
+pub const HV_FLUSH_EX_VP_SET_BANKS: usize = MAX_CORES.div_ceil(64);
+
+/// Input structure for `HvCallFlushVirtualAddressSpaceEx` (0x0013).
 ///
-/// This is the **non-extended** version; it uses a simple 64-bit processor
-/// mask (one bit per VP, max 64 VPs).  When `HV_FLUSH_ALL_PROCESSORS` is
-/// set in `flags` the mask is ignored, but must still be present.
+/// Layout (TLFS §6.5.2 EX):
+/// - `address_space` (u64)
+/// - `flags` (u64)
+/// - VP set header: `vp_set_format` (u64), `vp_set_valid_bank_mask` (u64)
+/// - VP set banks: `vp_set_bank_contents` (u64 per bank)
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
-pub struct HvInputFlushVirtualAddressSpace {
-    /// CR3 / EPTP value identifying the address space. Ignored when
-    /// `HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES` is set.
+pub struct HvInputFlushVirtualAddressSpaceEx {
     pub address_space: u64,
-    /// Combination of `HV_FLUSH_*` flags.
     pub flags: u64,
-    /// 64-bit processor mask (bit *i* → VP *i*). Ignored when
-    /// `HV_FLUSH_ALL_PROCESSORS` is set in `flags`.
-    pub processor_mask: u64,
+    pub vp_set_format: u64,
+    pub vp_set_valid_bank_mask: u64,
+    pub vp_set_bank_contents: [u64; HV_FLUSH_EX_VP_SET_BANKS],
 }
 
-/// Input structure for `HvCallFlushVirtualAddressList` (0x0003).
+/// Input structure for `HvCallFlushVirtualAddressListEx` (0x0014).
 ///
-/// Layout (TLFS §6.5.3):
-/// - Fixed header: `address_space` (u64) + `flags` (u64) + `processor_mask` (u64)
+/// Layout (TLFS §6.5.3 EX):
+/// - Fixed header: `address_space` (u64), `flags` (u64)
+/// - Variable header: VP set (`vp_set_*` and bank contents)
 /// - Rep elements: array of `HV_GVA_RANGE` entries (u64 each)
-///
-/// This is the **non-extended** version; it uses a simple 64-bit processor
-/// mask.  The GVA range list is placed immediately after the fixed header.
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
-pub struct HvInputFlushVirtualAddressList {
-    /// CR3 / EPTP value identifying the address space.
+pub struct HvInputFlushVirtualAddressListEx {
     pub address_space: u64,
-    /// Combination of `HV_FLUSH_*` flags.
     pub flags: u64,
-    /// 64-bit processor mask. Ignored when `HV_FLUSH_ALL_PROCESSORS` is set.
-    pub processor_mask: u64,
-    /// GVA range entries. Each entry specifies a GVA range to flush.
-    /// Bits 11:0 encode `additional_pages` (number of *extra* pages beyond the
-    /// first; 0 = flush exactly 1 page).
-    /// Bits 63:12 encode the GVA page number (GVA >> 12).
-    pub gva_range_list: [u64; HV_FLUSH_MAX_GVAS],
+    pub vp_set_format: u64,
+    pub vp_set_valid_bank_mask: u64,
+    pub vp_set_bank_contents: [u64; HV_FLUSH_EX_VP_SET_BANKS],
+    pub gva_range_list: [u64; HV_FLUSH_EX_MAX_GVAS],
 }
 
-/// Maximum number of GVA range entries that fit in a single hypercall input page
-/// after the fixed header of `HvInputFlushVirtualAddressList`.
+/// Maximum number of GVA entries that fit in one input page for
+/// `HvInputFlushVirtualAddressListEx` with a VP set sized for `MAX_CORES`.
 ///
-/// Input page = 4096 bytes. Header = 3 × 8 = 24 bytes. Remaining = 4072 / 8 = 509.
+/// Input page = 4096 bytes.
+/// Header = (4 + `HV_FLUSH_EX_VP_SET_BANKS`) * 8 bytes.
 #[expect(clippy::cast_possible_truncation)]
-const HV_FLUSH_MAX_GVAS: usize =
-    ((PAGE_SIZE as u32 - 3 * (u64::BITS / 8)) / (u64::BITS / 8)) as usize;
+const HV_FLUSH_EX_MAX_GVAS: usize = ((PAGE_SIZE as u32
+    - (4 + HV_FLUSH_EX_VP_SET_BANKS as u32) * (u64::BITS / 8))
+    / (u64::BITS / 8)) as usize;
 
-impl HvInputFlushVirtualAddressList {
-    /// Maximum number of GVA range entries per hypercall invocation.
-    pub const MAX_GVAS_PER_REQUEST: usize = HV_FLUSH_MAX_GVAS;
+impl HvInputFlushVirtualAddressListEx {
+    /// Number of 64-bit words occupied by the VP-set variable header.
+    #[allow(clippy::cast_possible_truncation)]
+    pub const VP_SET_QWORD_COUNT: u16 = (2 + HV_FLUSH_EX_VP_SET_BANKS) as u16;
+
+    /// Maximum number of GVA range entries per EX hypercall invocation.
+    pub const MAX_GVAS_PER_REQUEST: usize = HV_FLUSH_EX_MAX_GVAS;
 }
 
 #[bitfield]

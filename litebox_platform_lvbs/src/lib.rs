@@ -24,14 +24,12 @@ use litebox::{
     shim::ContinueOperation,
     utils::TruncateExt,
 };
-use litebox_common_linux::{
-    PunchthroughSyscall,
-    errno::Errno,
-    vmap::{
-        PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
-        VmapManager,
-    },
+#[cfg(feature = "optee_syscall")]
+use litebox_common_linux::vmap::{
+    PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
+    VmapManager,
 };
+use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use x86_64::{
     VirtAddr,
     structures::paging::{

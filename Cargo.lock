@@ -874,6 +874,7 @@ dependencies = [
  "arrayvec",
  "authenticode",
  "bitflags 2.9.4",
+ "bitvec",
  "buddy_system_allocator",
  "cfg-if",
  "cms",

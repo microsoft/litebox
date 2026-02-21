@@ -17,6 +17,7 @@ spin = { version = "0.10.0", default-features = false, features = [
   "once",
   "rwlock",
 ] }
+bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
 arrayvec = { version = "0.7.6", default-features = false }
 rangemap = { version = "1.5.1", features = ["const_fn"] }
 thiserror = { version = "2.0.6", default-features = false }

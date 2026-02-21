@@ -5,9 +5,10 @@
 
 #[cfg(not(test))]
 use crate::mshv::{
-    HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES, HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST,
-    HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE, HvInputFlushVirtualAddressList,
-    HvInputFlushVirtualAddressSpace, hvcall::hv_do_hypercall, vtl_switch::vtl1_vp_mask,
+    HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES, HV_FLUSH_EX_VP_SET_BANKS, HV_GENERIC_SET_SPARSE_4K,
+    HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST_EX, HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX,
+    HvInputFlushVirtualAddressListEx, HvInputFlushVirtualAddressSpaceEx, hvcall::hv_do_hypercall,
+    vtl_switch::vtl1_vp_mask,
 };
 use crate::{
     host::per_cpu_variables::with_per_cpu_variables_mut,
@@ -18,6 +19,21 @@ use crate::{
         vtl1_mem_layout::PAGE_SHIFT,
     },
 };
+
+#[cfg(not(test))]
+#[inline]
+fn vp_set_valid_bank_mask(vp_set_bank_contents: [u64; HV_FLUSH_EX_VP_SET_BANKS]) -> u64 {
+    vp_set_bank_contents
+        .iter()
+        .enumerate()
+        .fold(0u64, |mask, (bank, contents)| {
+            if *contents != 0 {
+                mask | (1u64 << bank)
+            } else {
+                mask
+            }
+        })
+}
 
 /// Hyper-V Hypercall to prevent lower VTLs (i.e., VTL0) from accessing a specified range of
 /// guest physical memory pages with a given protection flag.
@@ -74,20 +90,27 @@ pub fn hv_modify_vtl_protection_mask(
 /// This is the cross-core equivalent of a local CR3 reload.
 #[cfg(not(test))]
 pub(crate) fn hv_flush_virtual_address_space() -> Result<(), HypervCallError> {
+    let vp_mask = vtl1_vp_mask();
+    let valid_bank_mask = vp_set_valid_bank_mask(vp_mask);
+    if valid_bank_mask == 0 {
+        return Ok(());
+    }
     let input = with_per_cpu_variables_mut(|pcv| unsafe {
         &mut *pcv
             .hv_hypercall_input_page_as_mut_ptr()
-            .cast::<HvInputFlushVirtualAddressSpace>()
+            .cast::<HvInputFlushVirtualAddressSpaceEx>()
     });
 
-    *input = HvInputFlushVirtualAddressSpace {
+    *input = HvInputFlushVirtualAddressSpaceEx {
         address_space: 0,
         flags: HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES,
-        processor_mask: vtl1_vp_mask(),
+        vp_set_format: HV_GENERIC_SET_SPARSE_4K,
+        vp_set_valid_bank_mask: valid_bank_mask,
+        vp_set_bank_contents: vp_mask,
     };
 
     hv_do_hypercall(
-        u64::from(HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE),
+        u64::from(HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX),
         (&raw const *input).cast::<core::ffi::c_void>(),
         core::ptr::null_mut(),
     )?;
@@ -115,15 +138,22 @@ pub(crate) fn hv_flush_virtual_address_list(
     );
     debug_assert!(page_count > 0, "page_count must not be 0");
 
+    let vp_mask = vtl1_vp_mask();
+    let valid_bank_mask = vp_set_valid_bank_mask(vp_mask);
+    if valid_bank_mask == 0 {
+        return Ok(());
+    }
     let input = with_per_cpu_variables_mut(|pcv| unsafe {
         &mut *pcv
             .hv_hypercall_input_page_as_mut_ptr()
-            .cast::<HvInputFlushVirtualAddressList>()
+            .cast::<HvInputFlushVirtualAddressListEx>()
     });
 
     input.address_space = 0;
     input.flags = HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES;
-    input.processor_mask = vtl1_vp_mask();
+    input.vp_set_format = HV_GENERIC_SET_SPARSE_4K;
+    input.vp_set_valid_bank_mask = valid_bank_mask;
+    input.vp_set_bank_contents = vp_mask;
 
     let mut remaining = page_count;
     let mut current_va = start_va;
@@ -132,7 +162,7 @@ pub(crate) fn hv_flush_virtual_address_list(
         let mut gva_count: u16 = 0;
 
         while remaining > 0
-            && (gva_count as usize) < HvInputFlushVirtualAddressList::MAX_GVAS_PER_REQUEST
+            && (gva_count as usize) < HvInputFlushVirtualAddressListEx::MAX_GVAS_PER_REQUEST
         {
             // Each entry can cover up to `MAX_ADDITIONAL_PAGES + 1` pages.
             let additional = remaining.saturating_sub(1).min(MAX_ADDITIONAL_PAGES);
@@ -148,9 +178,9 @@ pub(crate) fn hv_flush_virtual_address_list(
         }
 
         hv_do_rep_hypercall(
-            HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST,
+            HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST_EX,
             gva_count,
-            0, // simple processor mask, not HV_VP_SET
+            HvInputFlushVirtualAddressListEx::VP_SET_QWORD_COUNT,
             (&raw const *input).cast::<core::ffi::c_void>(),
             core::ptr::null_mut(),
         )?;
