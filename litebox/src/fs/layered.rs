@@ -1336,6 +1336,21 @@ impl<
             blksize,
         })
     }
+
+    fn get_static_backing_data(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+    ) -> Option<&'static [u8]> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.get_static_backing_data(fd),
+            EntryX::Lower { fd } => self.lower.get_static_backing_data(fd),
+            EntryX::Tombstone => unreachable!(),
+        }
+    }
 }
 
 struct Descriptor<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 'static> {

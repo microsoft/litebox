@@ -5,8 +5,11 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use litebox::{
-    mm::linux::{MappingError, PAGE_SIZE},
-    platform::RawMutPointer,
+    mm::linux::{MappingError, PAGE_SIZE, PageRange},
+    platform::{
+        PageManagementProvider, RawConstPointer, RawMutPointer,
+        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
+    },
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
@@ -65,6 +68,124 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     fn do_mmap_file(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Result<MutPtr<u8>, MappingError> {
+        if let Some(cow_result) =
+            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset)
+        {
+            return cow_result;
+        }
+        self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)
+    }
+
+    /// Attempt to create a CoW mapping for a file with static backing data.
+    ///
+    /// Returns `Some(result)` if CoW was attempted (success or failure),
+    /// `None` if CoW is not applicable (fall back to memcpy).
+    // TODO(jb): does this need to be Option-Result or can it just be Option?
+    fn try_cow_mmap_file(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: &ProtFlags,
+        flags: &MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Option<Result<MutPtr<u8>, MappingError>> {
+        if !len.is_multiple_of(PAGE_SIZE) {
+            return None;
+        }
+
+        let Ok(fd) = u32::try_from(fd) else {
+            return None;
+        };
+
+        let files = self.files.borrow();
+        let raw_fd = match files.file_descriptors.read().get_fd(fd)? {
+            crate::Descriptor::LiteBoxRawFd(raw_fd) => *raw_fd,
+            _ => return None,
+        };
+
+        let static_data = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| self.global.fs.get_static_backing_data(typed_fd),
+                |_| None,
+                |_| None,
+            )
+            .ok()??;
+
+        if offset > static_data.len() {
+            return None;
+        }
+
+        let available_len = static_data.len().saturating_sub(offset);
+        if available_len < len {
+            // Cannot fill full page
+            return None;
+        }
+
+        // TODO(jb): Do we ever need to do NoReplace?
+        let fixed_behavior = if flags.contains(MapFlags::MAP_FIXED) {
+            FixedAddressBehavior::Replace
+        } else {
+            FixedAddressBehavior::Hint
+        };
+
+        let permissions = {
+            let mut perms = MemoryRegionPermissions::empty();
+            perms.set(
+                MemoryRegionPermissions::READ,
+                prot.contains(ProtFlags::PROT_READ),
+            );
+            perms.set(
+                MemoryRegionPermissions::WRITE,
+                prot.contains(ProtFlags::PROT_WRITE),
+            );
+            perms.set(
+                MemoryRegionPermissions::EXEC,
+                prot.contains(ProtFlags::PROT_EXEC),
+            );
+            perms
+        };
+
+        match <_ as PageManagementProvider<{ PAGE_SIZE }>>::try_allocate_cow_pages(
+            litebox_platform_multiplex::platform(),
+            suggested_addr.unwrap_or(0),
+            &static_data[offset..offset + len],
+            permissions,
+            fixed_behavior,
+        ) {
+            Ok(ptr) => {
+                let range =
+                    PageRange::new(ptr.as_usize(), ptr.as_usize().checked_add(len).unwrap())
+                        .unwrap();
+                // SAFETY: ptr is the freshly CoW-mapped region of exactly `len` bytes with
+                // `permissions`.
+                unsafe {
+                    self.global.pm.register_existing_mapping(
+                        range,
+                        permissions,
+                        true,
+                        fixed_behavior == FixedAddressBehavior::Replace,
+                    )
+                }
+                .unwrap();
+                Some(Ok(ptr))
+            }
+            Err(_cow_not_supported) => None,
+        }
+    }
+
+    /// Fallback mmap implementation using page-by-page memcpy, for files where the CoW attempt
+    /// fails (either due to lack of support on platform, or non-static-backed data, etc.)
+    fn do_mmap_file_memcpy(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
