@@ -1078,6 +1078,21 @@ impl Vtl0KernelInfo {
         self.system_certs.get().map(|b| &**b)
     }
 
+    /// Extract RSA public keys from all system certificates.
+    pub fn get_rsa_public_keys(&self) -> Vec<rsa::RsaPublicKey> {
+        use rsa::pkcs1::DecodeRsaPublicKey;
+        let Some(certs) = self.get_system_certificates() else {
+            return Vec::new();
+        };
+        certs
+            .iter()
+            .filter_map(|cert| {
+                let key_info = &cert.tbs_certificate.subject_public_key_info;
+                rsa::RsaPublicKey::from_pkcs1_der(key_info.subject_public_key.raw_bytes()).ok()
+            })
+            .collect()
+    }
+
     // This function finds the precomputed patch data corresponding to the input patch data.
     // We need this because each step of `mshv_vsm_patch_data`/`text_poke_bp_batch` only
     // provides a part of the patch data and addresses (`patch[0]` or `patch[1..patch_size-1]`).

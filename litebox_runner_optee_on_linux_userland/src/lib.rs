@@ -43,6 +43,11 @@ pub struct CliArgs {
         default_value = "rewriter"
     )]
     pub interception_backend: InterceptionBackend,
+    /// Path to a DER-encoded RSA public key file for TA signature verification.
+    ///
+    /// Can be specified multiple times to provide several keys.
+    #[arg(long = "verification-key", value_hint = clap::ValueHint::FilePath)]
+    pub verification_keys: Vec<std::path::PathBuf>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -90,8 +95,26 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(None);
     litebox_platform_multiplex::set_platform(platform);
-    let shim_builder = litebox_shim_optee::OpteeShimBuilder::new();
+    let mut shim_builder = litebox_shim_optee::OpteeShimBuilder::new();
     let _litebox = shim_builder.litebox();
+
+    if !cli_args.verification_keys.is_empty() {
+        use rsa::pkcs1::DecodeRsaPublicKey;
+        let keys: Vec<rsa::RsaPublicKey> = cli_args
+            .verification_keys
+            .iter()
+            .map(|path| {
+                let der = std::fs::read(path).unwrap_or_else(|e| {
+                    panic!("Failed to read verification key {}: {e}", path.display())
+                });
+                rsa::RsaPublicKey::from_pkcs1_der(&der).unwrap_or_else(|e| {
+                    panic!("Failed to parse RSA public key {}: {e}", path.display())
+                })
+            })
+            .collect();
+        shim_builder = shim_builder.with_verification_keys(keys);
+    }
+
     let shim = shim_builder.build();
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),

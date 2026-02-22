@@ -885,6 +885,7 @@ const TEE_ALG_AES_CTR: u32 = 0x1000_0210;
 const TEE_ALG_AES_GCM: u32 = 0x4000_0810;
 const TEE_ALG_RSASSA_PKCS1_V1_5_SHA256: u32 = 0x7000_4830;
 const TEE_ALG_RSASSA_PKCS1_V1_5_SHA512: u32 = 0x7000_6830;
+const TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256: u32 = 0x7041_4930;
 const TEE_ALG_HMAC_SHA256: u32 = 0x3000_0004;
 const TEE_ALG_HMAC_SHA512: u32 = 0x3000_0006;
 const TEE_ALG_ILLEGAL_VALUE: u32 = 0xefff_ffff;
@@ -900,6 +901,7 @@ pub enum TeeAlgorithm {
     AesGcm = TEE_ALG_AES_GCM,
     RsaPkcs1Sha256 = TEE_ALG_RSASSA_PKCS1_V1_5_SHA256,
     RsaPkcs1Sha512 = TEE_ALG_RSASSA_PKCS1_V1_5_SHA512,
+    RsaPssSha256 = TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256,
     HmacSha256 = TEE_ALG_HMAC_SHA256,
     HmacSha512 = TEE_ALG_HMAC_SHA512,
     IllegalValue = TEE_ALG_ILLEGAL_VALUE,
@@ -939,9 +941,9 @@ impl From<TeeAlgorithm> for TeeAlgorithmClass {
         match algo {
             TeeAlgorithm::AesCtr | TeeAlgorithm::AesGcm => TeeAlgorithmClass::Cipher,
             TeeAlgorithm::HmacSha256 | TeeAlgorithm::HmacSha512 => TeeAlgorithmClass::Mac,
-            TeeAlgorithm::RsaPkcs1Sha256 | TeeAlgorithm::RsaPkcs1Sha512 => {
-                TeeAlgorithmClass::AsymmetricSignature
-            }
+            TeeAlgorithm::RsaPkcs1Sha256
+            | TeeAlgorithm::RsaPkcs1Sha512
+            | TeeAlgorithm::RsaPssSha256 => TeeAlgorithmClass::AsymmetricSignature,
             _ => TeeAlgorithmClass::Unknown,
         }
     }

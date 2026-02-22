@@ -10,6 +10,7 @@ bitflags = "2.9.0"
 bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
 cfg-if = "1.0.0"
 ctr = { version = "0.8", default-features = false }
+digest = { version = "0.10.7", default-features = false }
 elf = { version = "0.8.0", default-features = false }
 hashbrown = "0.15.2"
 litebox = { path = "../litebox/", version = "0.1.0" }
@@ -18,6 +19,8 @@ litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0" }
 litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version = "0.1.0", default-features = false }
 num_enum = { version = "0.7.3", default-features = false }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
+rsa = { version = "0.9.10", default-features = false }
+sha2 = { version = "0.10.9", default-features = false, features = ["oid"] }
 spin = { version = "0.10.0", default-features = false, features = ["spin_mutex", "once"] }
 thiserror = { version = "2.0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }

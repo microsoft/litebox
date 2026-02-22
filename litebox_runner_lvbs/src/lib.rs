@@ -600,7 +600,15 @@ fn open_session_new_instance(
     })?;
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
-    let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
+    let mut builder = litebox_shim_optee::OpteeShimBuilder::new();
+
+    // Use RSA public keys from system certificates for TA signature verification.
+    let verification_keys = litebox_platform_multiplex::platform().get_rsa_public_keys();
+    if !verification_keys.is_empty() {
+        builder = builder.with_verification_keys(verification_keys);
+    }
+
+    let shim = builder.build();
     let loaded_program = Box::new(
         shim.load_ldelf(
             LDELF_BINARY,

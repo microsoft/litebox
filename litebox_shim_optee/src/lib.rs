@@ -10,7 +10,7 @@ extern crate alloc;
 
 use crate::loader::elf::ElfLoaderError;
 use aes::{Aes128, Aes192, Aes256};
-use alloc::{sync::Arc, vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::cell::Cell;
 use ctr::Ctr128BE;
 use hashbrown::HashMap;
@@ -31,6 +31,7 @@ use litebox_platform_multiplex::Platform;
 
 pub mod loader;
 pub mod session;
+pub mod signed_hdr;
 pub(crate) mod syscalls;
 
 pub mod msg_handler;
@@ -115,6 +116,7 @@ impl OpteeShimEntrypoints {
 pub struct OpteeShimBuilder {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
+    verification_keys: alloc::boxed::Box<[rsa::RsaPublicKey]>,
 }
 
 impl Default for OpteeShimBuilder {
@@ -130,7 +132,18 @@ impl OpteeShimBuilder {
         Self {
             platform,
             litebox: LiteBox::new(platform),
+            verification_keys: alloc::boxed::Box::default(),
         }
+    }
+
+    /// Set the RSA public keys used to verify TA signatures.
+    ///
+    /// During verification, each key is tried in order until one succeeds.
+    /// When no keys are set, only the SHA-256 hash integrity check is performed.
+    #[must_use]
+    pub fn with_verification_keys(mut self, keys: Vec<rsa::RsaPublicKey>) -> Self {
+        self.verification_keys = keys.into_boxed_slice();
+        self
     }
 
     /// Returns the litebox object for the shim.
@@ -144,7 +157,7 @@ impl OpteeShimBuilder {
             platform: self.platform,
             pm: PageManager::new(&self.litebox),
             _litebox: self.litebox,
-            ta_uuid_map: TaUuidMap::new(),
+            ta_uuid_map: TaUuidMap::new(self.verification_keys),
         });
         OpteeShim(global)
     }
@@ -187,6 +200,12 @@ impl GlobalState {
     /// Get the TA flags associated with the given TA UUID.
     pub(crate) fn get_ta_flags(&self, ta_uuid: &TeeUuid) -> TaFlags {
         self.ta_uuid_map.get_flags(ta_uuid).unwrap_or_default()
+    }
+
+    /// Get the TA version associated with the given TA UUID.
+    /// Returns 0 for raw (unsigned) TAs or if the UUID is not found.
+    pub(crate) fn get_ta_version(&self, ta_uuid: &TeeUuid) -> u32 {
+        self.ta_uuid_map.get_version(ta_uuid).unwrap_or(0)
     }
 
     /// Remove the TA binary associated with the given TA UUID.
@@ -275,10 +294,12 @@ impl OpteeShim {
         };
         // Get TA flags from the stored binary
         let ta_flags = entrypoints.task.global.get_ta_flags(&ta_uuid);
+        let ta_version = entrypoints.task.global.get_ta_version(&ta_uuid);
         Ok(LoadedProgram {
             entrypoints: Some(entrypoints),
             params_address,
             ta_flags,
+            ta_version,
         })
     }
 
@@ -326,6 +347,8 @@ pub struct LoadedProgram {
     pub params_address: Option<usize>,
     /// TA flags parsed from the `.ta_head` section
     pub ta_flags: TaFlags,
+    /// TA version from the signed header, or 0 for raw (unsigned) TAs
+    pub ta_version: u32,
 }
 
 impl Task {
@@ -1190,27 +1213,52 @@ impl TaHandleMap {
 
 /// Entry in the TA UUID map containing binary data and parsed flags.
 struct TaInfo {
-    /// The raw TA binary
+    /// The raw TA binary (ELF, with SHDR stripped if it was a signed TA)
     binary: alloc::boxed::Box<[u8]>,
     /// Parsed TA flags from .ta_head section
     flags: TaFlags,
+    /// TA version from the signed header, or 0 for raw (unsigned) TAs
+    ta_version: u32,
 }
 
 /// Data structure to maintain a mapping from TA UUIDs to their binary data and flags.
 pub(crate) struct TaUuidMap {
     inner: spin::mutex::SpinMutex<HashMap<TeeUuid, TaInfo>>,
+    /// RSA public keys for verifying TA signatures.
+    /// During verification each key is tried until one succeeds.
+    /// When empty, signature verification is skipped (hash is still verified).
+    verification_keys: alloc::boxed::Box<[rsa::RsaPublicKey]>,
 }
 
 impl TaUuidMap {
-    pub(crate) fn new() -> Self {
+    fn new(verification_keys: alloc::boxed::Box<[rsa::RsaPublicKey]>) -> Self {
         Self {
             inner: spin::mutex::SpinMutex::new(HashMap::new()),
+            verification_keys,
         }
     }
 
     pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: alloc::boxed::Box<[u8]>) -> bool {
-        // Parse TA head from the binary's .ta_head section
-        let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
+        // Detect signed TA (SHDR magic) and strip the header if present.
+        let (elf_bin, ta_version) = if signed_hdr::is_signed_ta(&ta_bin) {
+            // Verify hash (always) and RSA signature (only if verification keys are configured).
+            match signed_hdr::verify_signed_ta(&ta_bin, &self.verification_keys) {
+                Ok(verified) => {
+                    // Verify that the UUID in the signed header matches the expected UUID
+                    if verified.uuid != uuid {
+                        return false;
+                    }
+                    (verified.binary, verified.ta_version)
+                }
+                Err(_) => return false,
+            }
+        } else {
+            // Raw ELF — treat as unsigned with version 0
+            (ta_bin, 0)
+        };
+
+        // Parse TA head from the (stripped) ELF binary's .ta_head section
+        let Some(ta_head) = litebox_common_optee::parse_ta_head(&elf_bin) else {
             return false;
         };
 
@@ -1223,8 +1271,9 @@ impl TaUuidMap {
         inner.insert(
             uuid,
             TaInfo {
-                binary: ta_bin,
+                binary: elf_bin,
                 flags: ta_head.flags,
+                ta_version,
             },
         );
         true
@@ -1237,6 +1286,11 @@ impl TaUuidMap {
     /// Get the TA flags for a given UUID.
     pub(crate) fn get_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
         self.inner.lock().get(uuid).map(|info| info.flags)
+    }
+
+    /// Get the TA version for a given UUID.
+    pub(crate) fn get_version(&self, uuid: &TeeUuid) -> Option<u32> {
+        self.inner.lock().get(uuid).map(|info| info.ta_version)
     }
 
     // Lazy removal of TA binaries when they are no longer needed.

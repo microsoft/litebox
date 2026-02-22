@@ -47,12 +47,20 @@ pub fn run_ta_with_test_commands(
             continue;
         }
         if func_id == UteeEntryFunc::OpenSession {
-            let ta_head = litebox_common_optee::parse_ta_head(ta_bin)
-                .expect("Failed to parse TA header from ta_bin");
+            // Extract UUID: from SHDR if signed, or from .ta_head if raw ELF
+            let ta_uuid = if litebox_shim_optee::signed_hdr::is_signed_ta(ta_bin) {
+                let parsed = litebox_shim_optee::signed_hdr::parse_signed_ta(ta_bin)
+                    .expect("Failed to parse signed TA header");
+                parsed.bootstrap.uuid
+            } else {
+                let ta_head = litebox_common_optee::parse_ta_head(ta_bin)
+                    .expect("Failed to parse TA header from ta_bin");
+                ta_head.uuid
+            };
             let loaded = shim
                 .load_ldelf(
                     ldelf_bin,
-                    ta_head.uuid,
+                    ta_uuid,
                     Some(ta_bin),
                     None,
                     allocate_session_id().unwrap(),

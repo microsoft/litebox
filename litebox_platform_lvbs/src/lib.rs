@@ -345,6 +345,13 @@ pub struct LinuxKernel<Host: HostInterface> {
     vtl0_kernel_info: Vtl0KernelInfo,
 }
 
+impl<Host: HostInterface> LinuxKernel<Host> {
+    /// Extract RSA public keys from all provisioned system certificates.
+    pub fn get_rsa_public_keys(&self) -> alloc::vec::Vec<rsa::RsaPublicKey> {
+        self.vtl0_kernel_info.get_rsa_public_keys()
+    }
+}
+
 pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
     punchthrough: PunchthroughSyscall<'a, LinuxKernel<Host>>,
     host: core::marker::PhantomData<Host>,
