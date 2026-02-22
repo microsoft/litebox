@@ -50,22 +50,6 @@ pub trait Provider:
 {
 }
 
-/// Provider for consuming platform-originating signals.
-///
-/// Platforms can record signals (e.g., `SIGALRM` from an interval timer) in
-/// per-thread storage. The shim should call [`SignalProvider::take_pending_signals`]
-/// to consume and forward them before re-entering the guest.
-pub trait SignalProvider {
-    /// Atomically take all pending platform signals for the current thread,
-    /// passing each one to `f`.
-    ///
-    /// After this call returns, the platform will have no pending signals for
-    /// the calling thread (until new signals arrive).
-    ///
-    /// The default implementation does nothing (no signals).
-    fn take_pending_signals(&self, _f: impl FnMut(crate::shim::Signal)) {}
-}
-
 /// Thread management provider.
 pub trait ThreadProvider: RawPointerProvider {
     /// Execution context for the current thread of the guest program.
@@ -112,22 +96,32 @@ pub trait ThreadProvider: RawPointerProvider {
     /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
     fn interrupt_thread(&self, thread: &Self::ThreadHandle);
 
-    /// Schedule a process-wide interrupt after `delay`.
+    /// Similar to [`interrupt_thread`], but allows for a `delay` before the interrupt
+    /// takes effect and does not target a specific thread.
     ///
-    /// After `delay` has elapsed, [`EnterShim::interrupt`] should be called on an
-    /// arbitrary guest thread so that pending signals such as SIGALRM can be processed.
+    /// Platforms that support this operation should override this and set
+    /// [`SUPPORTS_SCHEDULE_INTERRUPT`](Self::SUPPORTS_SCHEDULE_INTERRUPT)
+    /// to `true`.
     ///
-    /// A zero `delay` is a no-op.
+    /// [`interrupt_thread`]: Self::interrupt_thread
+    #[allow(unused_variables, reason = "no-op by default")]
+    fn schedule_interrupt(&self, delay: core::time::Duration) {}
+
+    /// Whether this platform implements [`schedule_interrupt`](Self::schedule_interrupt).
+    const SUPPORTS_SCHEDULE_INTERRUPT: bool = false;
+}
+
+/// Provider for consuming platform-originating signals.
+///
+/// Platforms can record signals (e.g., `SIGINT`) and the shim should call
+/// [`SignalProvider::take_pending_signals`] to consume them.
+pub trait SignalProvider {
+    /// Atomically take all pending asynchronous signals (e.g., SIGINT and SIGALRM)
+    /// for the current thread, passing each one to `f`.
     ///
-    /// This is a best-effort operation. The default implementation does
-    /// nothing, meaning the signal will only be delivered when a thread next
-    /// enters the shim via a syscall or exception. Platforms that support
-    /// timer-based interruption should override this method.
-    ///
-    /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
-    fn schedule_interrupt(&self, _delay: core::time::Duration) {
-        // Default: no-op. The alarm will be checked on the next syscall entry.
-    }
+    /// Platforms that support asynchronous signals should override this method.
+    #[allow(unused_variables, reason = "no-op by default")]
+    fn take_pending_signals(&self, f: impl FnMut(crate::shim::Signal)) {}
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the

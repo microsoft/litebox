@@ -271,20 +271,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let net_worker = if cli_args.tun_device_name.is_some() {
         let shim = shim.clone();
         let shutdown_clone = shutdown.clone();
-        let child = std::thread::spawn(move || {
+        let child = litebox_platform_linux_userland::spawn_host_thread(move || {
             const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(5);
             pin_thread_to_cpu(0);
-
-            // Block SIGALRM/SIGINT on this non-guest thread so that host only delivers
-            // those signals to guest threads, which have the proper signal
-            // handler context to re-enter the shim.
-            unsafe {
-                let mut set: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&raw mut set);
-                libc::sigaddset(&raw mut set, libc::SIGALRM);
-                libc::sigaddset(&raw mut set, libc::SIGINT);
-                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
-            }
 
             while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
                 let timeout = loop {
