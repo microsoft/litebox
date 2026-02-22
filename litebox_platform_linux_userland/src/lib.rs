@@ -953,7 +953,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         // SIGALRM to a guest thread (non-guest threads block SIGALRM), and
         // `interrupt_signal_handler` re-enters the shim via `interrupt_callback`.
         let secs = delay.as_secs().cast_signed();
-        let usecs = libc::suseconds_t::from(delay.subsec_micros());
+        let usecs = libc::suseconds_t::from(delay.subsec_micros().cast_signed());
         let itimer = libc::itimerval {
             it_interval: libc::timeval {
                 tv_sec: 0,
@@ -1005,7 +1005,7 @@ fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
             );
         }
     }
-    litebox_common_linux::signal::SigSet::from_u64(lo as u64)
+    litebox_common_linux::signal::SigSet::from_u64(u64::from(lo))
 }
 
 impl litebox::platform::RawMutexProvider for LinuxUserland {
@@ -1840,10 +1840,7 @@ fn register_exception_handlers() {
         }
 
         // Note that non-guest threads should block these signals, so it always fires on a guest thread.
-        let traditional_signals = &[
-            libc::SIGINT,
-            libc::SIGALRM,
-        ];
+        let traditional_signals = &[libc::SIGINT, libc::SIGALRM];
         for &sig in traditional_signals {
             unsafe {
                 let mut sa: libc::sigaction = core::mem::zeroed();
@@ -1856,8 +1853,7 @@ fn register_exception_handlers() {
                 assert_eq!(
                     old_sa.sa_sigaction,
                     libc::SIG_DFL,
-                    "signal {} handler already installed",
-                    sig
+                    "signal {sig} handler already installed",
                 );
             }
         }

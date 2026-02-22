@@ -10,13 +10,13 @@ use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use litebox::mm::linux::PageRange;
+use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider,
     Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutexProvider, SignalProvider,
     TimeProvider, UnblockedOrTimedOut,
 };
-use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
 
@@ -182,17 +182,13 @@ impl<Host: HostInterface> RawMutex<Host> {
         timeout: Option<core::time::Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         match Host::block_or_maybe_timeout(&self.inner, val, timeout) {
-            Ok(()) | Err(Errno::EINTR) => {
-                return Ok(UnblockedOrTimedOut::Unblocked);
-            }
+            Ok(()) | Err(Errno::EINTR) => Ok(UnblockedOrTimedOut::Unblocked),
             Err(Errno::EAGAIN) => {
                 // If the futex value does not match val, then the call fails
                 // immediately with the error EAGAIN.
-                return Err(ImmediatelyWokenUp);
+                Err(ImmediatelyWokenUp)
             }
-            Err(Errno::ETIMEDOUT) => {
-                return Ok(UnblockedOrTimedOut::TimedOut);
-            }
+            Err(Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
             Err(e) => {
                 todo!("Error: {:?}", e);
             }
