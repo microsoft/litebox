@@ -854,6 +854,46 @@ unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) 
     );
 }
 
+/// Non-guest threads (e.g., network workers, background tasks) **must** call this
+/// function at the start of their execution so the kernel only delivers
+/// `SIGALRM` / `SIGINT` to guest threads, which have the proper signal-handler
+/// context to re-enter the shim.
+fn block_guest_signals() {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut set);
+        libc::sigaddset(&raw mut set, libc::SIGALRM);
+        libc::sigaddset(&raw mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+    }
+}
+
+/// Spawn a non-guest ("host") thread that automatically blocks guest interrupt
+/// signals before running `f`.
+///
+/// Every background thread created by a runner (network workers, I/O helpers,
+/// etc.) should use this function instead of [`std::thread::spawn`] to ensure
+/// that `SIGALRM` and `SIGINT` are only delivered to guest threads.
+///
+/// # Example
+///
+/// ```ignore
+/// let handle = litebox_platform_linux_userland::spawn_host_thread(move || {
+///     // This thread will never receive SIGALRM or SIGINT.
+///     do_background_work();
+/// });
+/// ```
+pub fn spawn_host_thread<F, T>(f: F) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        block_guest_signals();
+        f()
+    })
+}
+
 fn thread_start(
     init_thread: Box<
         dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
@@ -943,6 +983,8 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     fn interrupt_thread(&self, thread: &Self::ThreadHandle) {
         thread.interrupt();
     }
+
+    const SUPPORTS_SCHEDULE_INTERRUPT: bool = true;
 
     fn schedule_interrupt(&self, delay: std::time::Duration) {
         if delay.is_zero() {
