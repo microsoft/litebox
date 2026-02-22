@@ -7,7 +7,9 @@
 
 use core::arch::asm;
 use litebox_platform_lvbs::{
-    arch::{enable_extended_states, enable_fsgsbase, get_core_id, instrs::hlt_loop},
+    arch::{
+        enable_extended_states, enable_fsgsbase, enable_smep_smap, get_core_id, instrs::hlt_loop,
+    },
     host::{
         bootparam::parse_boot_info,
         per_cpu_variables::{PerCpuVariablesAsm, init_per_cpu_variables},
@@ -153,5 +155,8 @@ unsafe extern "C" fn kernel_main() -> ! {
     }
 
     let platform = litebox_runner_lvbs::init();
+
+    enable_smep_smap();
+
     litebox_runner_lvbs::run(platform)
 }
