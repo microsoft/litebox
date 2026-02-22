@@ -4,10 +4,10 @@
 //! Per-CPU VTL1 kernel variables
 
 use crate::{
-    arch::{MAX_CORES, gdt, get_core_id},
+    arch::{MAX_CORES, gdt, get_core_id, instrs::rdmsr},
     host::bootparam::get_num_possible_cpus,
     mshv::{
-        HvMessagePage, HvVpAssistPage,
+        HV_REGISTER_VP_INDEX, HvMessagePage, HvVpAssistPage,
         vsm::{ControlRegMap, NUM_CONTROL_REGS},
         vtl_switch::VtlState,
         vtl1_mem_layout::PAGE_SIZE,
@@ -42,6 +42,7 @@ pub struct PerCpuVariables {
     pub vtl0_locked_regs: ControlRegMap,
     pub gdt: Option<&'static gdt::GdtWrapper>,
     pub tls: VirtAddr,
+    vp_index: u32,
 }
 
 impl PerCpuVariables {
@@ -88,6 +89,23 @@ impl PerCpuVariables {
 
     pub fn set_vtl_return_value(&mut self, value: u64) {
         self.vtl0_state.r8 = value; // LVBS uses R8 to return a value from VTL1 to VTL0
+    }
+
+    /// Return the cached Hyper-V VP index for this core (which never changes during
+    /// the lifetime of the core).
+    ///
+    /// # Panics
+    /// Panics if the VP index returned by the hypervisor is ≥ `MAX_CORES`.
+    pub fn vp_index(&mut self) -> u32 {
+        if self.vp_index == u32::MAX {
+            let vp_index: u32 = rdmsr(HV_REGISTER_VP_INDEX).truncate();
+            assert!(
+                vp_index < u32::try_from(MAX_CORES).unwrap(),
+                "VP index {vp_index} exceeds the configured processor mask"
+            );
+            self.vp_index = vp_index;
+        }
+        self.vp_index
     }
 
     /// Return kernel code, user code, and user data segment selectors
@@ -181,6 +199,7 @@ static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
     },
     gdt: const { None },
     tls: VirtAddr::zero(),
+    vp_index: u32::MAX,
 };
 
 /// Specify the layout of PerCpuVariables for Assembly area.

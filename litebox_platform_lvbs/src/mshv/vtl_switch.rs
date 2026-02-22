@@ -3,62 +3,109 @@
 
 //! VTL switch related functions
 
-use crate::arch::MAX_CORES;
-use crate::arch::instrs::rdmsr;
 use crate::host::{
     hv_hypercall_page_address,
     per_cpu_variables::{
-        PerCpuVariablesAsm, with_per_cpu_variables, with_per_cpu_variables_asm,
+        PerCpuVariables, PerCpuVariablesAsm, with_per_cpu_variables, with_per_cpu_variables_asm,
         with_per_cpu_variables_mut,
     },
 };
 use crate::mshv::{
-    HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VP_INDEX, HV_REGISTER_VSM_CODEPAGE_OFFSETS,
-    HvRegisterVsmCodePageOffsets, NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT,
-    VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED, error::VsmError,
-    hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
+    HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets,
+    NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
+    VTL_ENTRY_REASON_RESERVED, error::VsmError, hvcall_vp::hvcall_get_vp_registers,
+    vsm_intercept::vsm_handle_intercept,
 };
-use bitvec::prelude::{BitArray, Lsb0};
+use core::sync::atomic::{AtomicU64, Ordering};
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
 use num_enum::TryFromPrimitive;
-use spin::mutex::SpinMutex;
 
-/// Bitmask of VPs that are currently executing VTL1 code. Bit *N* is set
-/// when VP index *N* is inside VTL1 (between VTL entry and VTL return).
+/// Bitmask of VPs currently executing VTL1 code.
 ///
-/// The TLB flush hypercalls read this mask so they only target VPs that
-/// are in VTL1. VPs running in VTL0 use a separate address space and
-/// will receive a full TLB flush on their next VTL1 entry.
+/// Bit *N* is set when VP index *N* is inside VTL1 (between VTL entry and
+/// VTL return). The TLB flush hypercalls read this mask so they only target
+/// VPs that are in VTL1. VPs running in VTL0 use a separate address space
+/// and will receive a full TLB flush on their next VTL1 entry (i.e., CR3 reload).
+///
+/// Each VP only ever sets/clears its own bit, so plain `fetch_or` / `fetch_and`
+/// with `Relaxed` ordering is sufficient. No cross-VP data dependency exists.
+///
+/// Aligned to a 64-byte cache line to prevent false sharing with adjacent data.
 ///
 /// Supports up to `MAX_CORES` VPs. [`vtl1_vp_enter`] asserts that the VP index fits.
-type Vtl1VpMaskBits = BitArray<[u64; HV_FLUSH_EX_VP_SET_BANKS], Lsb0>;
-static VTL1_VP_MASK: SpinMutex<Vtl1VpMaskBits> = SpinMutex::new(Vtl1VpMaskBits::ZERO);
-
-/// Read the current VP index from the hypervisor MSR.
-#[inline]
-fn current_vp_index() -> u32 {
-    rdmsr(HV_REGISTER_VP_INDEX).truncate()
+#[repr(C, align(64))]
+struct AtomicVpMask {
+    banks: [AtomicU64; HV_FLUSH_EX_VP_SET_BANKS],
 }
 
+impl AtomicVpMask {
+    const fn new() -> Self {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const ZERO: AtomicU64 = AtomicU64::new(0);
+        Self {
+            banks: [ZERO; HV_FLUSH_EX_VP_SET_BANKS],
+        }
+    }
+
+    /// Set bit `index` (VP enters VTL1).
+    #[inline]
+    fn set(&self, index: usize) {
+        let bank = index / 64;
+        let bit = index % 64;
+        self.banks[bank].fetch_or(1u64 << bit, Ordering::Relaxed);
+    }
+
+    /// Clear bit `index` (VP exits VTL1).
+    #[inline]
+    fn clear(&self, index: usize) {
+        let bank = index / 64;
+        let bit = index % 64;
+        self.banks[bank].fetch_and(!(1u64 << bit), Ordering::Relaxed);
+    }
+
+    /// Snapshot the mask for use in TLB flush hypercalls.
+    #[cfg(not(test))]
+    #[inline]
+    fn snapshot(&self) -> [u64; HV_FLUSH_EX_VP_SET_BANKS] {
+        let mut out = [0u64; HV_FLUSH_EX_VP_SET_BANKS];
+        for (dst, src) in out.iter_mut().zip(self.banks.iter()) {
+            *dst = src.load(Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Check whether `vp_index` is the only bit set in the mask.
+    #[cfg(not(test))]
+    #[inline]
+    fn is_single_vp(&self, vp_index: u32) -> bool {
+        let bank = vp_index as usize / 64;
+        let expected = 1u64 << (vp_index as usize % 64);
+        for (i, b) in self.banks.iter().enumerate() {
+            let val = b.load(Ordering::Relaxed);
+            if i == bank {
+                if val != expected {
+                    return false;
+                }
+            } else if val != 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+static VTL1_VP_MASK: AtomicVpMask = AtomicVpMask::new();
+
 /// Mark the current VP as executing in VTL1.
-///
-/// # Panics
-/// Panics if the VP index ≥ `MAX_CORES`.
 #[inline]
 fn vtl1_vp_enter() {
-    let vp_index = current_vp_index();
-    assert!(
-        vp_index < u32::try_from(MAX_CORES).unwrap(),
-        "VP index {vp_index} exceeds the configured processor mask"
-    );
-    VTL1_VP_MASK.lock().set(vp_index as usize, true);
+    VTL1_VP_MASK.set(with_per_cpu_variables_mut(PerCpuVariables::vp_index) as usize);
 }
 
 /// Remove the current VP from the VTL1 mask (it is returning to VTL0).
 #[inline]
 fn vtl1_vp_exit() {
-    let vp_index = current_vp_index();
-    VTL1_VP_MASK.lock().set(vp_index as usize, false);
+    VTL1_VP_MASK.clear(with_per_cpu_variables_mut(PerCpuVariables::vp_index) as usize);
 }
 
 /// Return the current VTL1 VP mask for use in TLB flush hypercalls.
@@ -71,10 +118,17 @@ fn vtl1_vp_exit() {
 #[cfg(not(test))]
 #[inline]
 pub(crate) fn vtl1_vp_mask() -> [u64; HV_FLUSH_EX_VP_SET_BANKS] {
-    let mask = VTL1_VP_MASK.lock();
-    let mut banks = [0u64; HV_FLUSH_EX_VP_SET_BANKS];
-    banks.copy_from_slice(mask.as_raw_slice());
-    banks
+    VTL1_VP_MASK.snapshot()
+}
+
+/// Return `true` if the current VP is the only VP executing in VTL1.
+///
+/// Used to decide whether a local TLB flush is sufficient (no other VP
+/// is in VTL1 to flush).
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn is_only_vp_in_vtl1() -> bool {
+    VTL1_VP_MASK.is_single_vp(with_per_cpu_variables_mut(PerCpuVariables::vp_index))
 }
 
 // ============================================================================
@@ -191,6 +245,7 @@ pub fn vtl_switch_init(platform: Option<&'static crate::Platform>) {
     if let Some(platform) = platform {
         crate::set_platform_low(platform);
     }
+
     // The VP is already in VTL1 when the runner calls this; register it
     // in the mask so TLB flushes during the first VTL call dispatch
     // target this VP.

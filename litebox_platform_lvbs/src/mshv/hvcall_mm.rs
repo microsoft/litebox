@@ -7,8 +7,9 @@
 use crate::mshv::{
     HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES, HV_FLUSH_EX_VP_SET_BANKS, HV_GENERIC_SET_SPARSE_4K,
     HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST_EX, HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX,
-    HvInputFlushVirtualAddressListEx, HvInputFlushVirtualAddressSpaceEx, hvcall::hv_do_hypercall,
-    vtl_switch::vtl1_vp_mask,
+    HvInputFlushVirtualAddressListEx, HvInputFlushVirtualAddressSpaceEx,
+    hvcall::hv_do_hypercall,
+    vtl_switch::{is_only_vp_in_vtl1, vtl1_vp_mask},
 };
 use crate::{
     host::per_cpu_variables::with_per_cpu_variables_mut,
@@ -20,6 +21,11 @@ use crate::{
     },
 };
 
+/// Compute the valid-bank bitmask for a sparse VP set (TLFS §3.7).
+///
+/// Returns a `u64` where bit *i* is set if `vp_set_bank_contents[i]` is
+/// non-zero, indicating that the corresponding bank carries at least one
+/// target VP. The hypervisor uses this mask to skip empty banks.
 #[cfg(not(test))]
 #[inline]
 fn vp_set_valid_bank_mask(vp_set_bank_contents: [u64; HV_FLUSH_EX_VP_SET_BANKS]) -> u64 {
@@ -90,11 +96,19 @@ pub fn hv_modify_vtl_protection_mask(
 /// This is the cross-core equivalent of a local CR3 reload.
 #[cfg(not(test))]
 pub(crate) fn hv_flush_virtual_address_space() -> Result<(), HypervCallError> {
-    let vp_mask = vtl1_vp_mask();
-    let valid_bank_mask = vp_set_valid_bank_mask(vp_mask);
-    if valid_bank_mask == 0 {
+    // Fast path: only this VP is in VTL1 — local flush is sufficient.
+    if is_only_vp_in_vtl1() {
+        x86_64::instructions::tlb::flush_all();
         return Ok(());
     }
+
+    let vp_mask = vtl1_vp_mask();
+    let valid_bank_mask = vp_set_valid_bank_mask(vp_mask);
+    debug_assert!(
+        valid_bank_mask != 0,
+        "caller is in VTL1 but VP mask is empty"
+    );
+
     let input = with_per_cpu_variables_mut(|pcv| unsafe {
         &mut *pcv
             .hv_hypercall_input_page_as_mut_ptr()
@@ -138,11 +152,21 @@ pub(crate) fn hv_flush_virtual_address_list(
     );
     debug_assert!(page_count > 0, "page_count must not be 0");
 
-    let vp_mask = vtl1_vp_mask();
-    let valid_bank_mask = vp_set_valid_bank_mask(vp_mask);
-    if valid_bank_mask == 0 {
+    // Fast path: only this VP is in VTL1 — local flush is sufficient.
+    if is_only_vp_in_vtl1() {
+        for va in (start_va..start_va + (page_count as u64) * 4096).step_by(4096) {
+            x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(va));
+        }
         return Ok(());
     }
+
+    let vp_mask = vtl1_vp_mask();
+    let valid_bank_mask = vp_set_valid_bank_mask(vp_mask);
+    debug_assert!(
+        valid_bank_mask != 0,
+        "caller is in VTL1 but VP mask is empty"
+    );
+
     let input = with_per_cpu_variables_mut(|pcv| unsafe {
         &mut *pcv
             .hv_hypercall_input_page_as_mut_ptr()
