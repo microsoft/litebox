@@ -32,16 +32,9 @@ pub enum VmapAllocError {
     VaSpaceExhausted,
 }
 
-/// Start of the vmap virtual address region.
-/// This address is chosen to be within the 4-level paging canonical address space
-/// and not conflict with VTL1's direct-mapped physical memory.
-pub(crate) const VMAP_START: usize = 0x6000_0000_0000;
+use crate::{VMAP_END, VMAP_START};
 
-/// End of the vmap virtual address region.
-/// Provides 1 TiB of virtual address space for vmap allocations.
-const VMAP_END: usize = 0x6FFF_FFFF_F000;
-
-/// Virtual page numbers corresponding to `VMAP_START` and `VMAP_END`.
+/// Virtual page numbers corresponding to [`crate::VMAP_START`] and [`crate::VMAP_END`].
 const VMAP_START_VPN: usize = VMAP_START / PAGE_SIZE;
 const VMAP_END_VPN: usize = VMAP_END / PAGE_SIZE;
 

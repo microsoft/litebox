@@ -82,19 +82,49 @@ static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 /// No real physical frame has address 0, so this is a safe sentinel.
 pub const BASE_PAGE_TABLE_ID: usize = 0;
 
+// VTL1 virtual address space layout (4-level paging, canonical range)
+//
+// High canonical half (0xFFFF_8000_0000_0000 .. 0xFFFF_FFFF_FFFF_FFFF):
+//  0xFFFF_CFFF_FFFF_F000  ┌─────────────────────────────────┐ ← VMAP_END
+//                         │ vmap region  (~16 TiB)          │
+//                         │ non-contiguous PA→VA mappings   │
+//  0xFFFF_C000_0000_0000  └─────────────────────────────────┘ ← VMAP_START
+//
+// Low canonical half  (0x0000_0000_0000_0000 .. 0x0000_7FFF_FFFF_FFFF):
+//  0x0000_7FFF_FFFF_F000  ┌─────────────────────────────────┐ ← USER_ADDR_MAX
+//                         │ User address space (~64 TiB)    │
+//                         │ mmap / TA memory                │
+//  0x0000_3FFF_FFFF_F000  ├─────────────────────────────────┤ ← USER_ADDR_MIN
+//                         │ Identity-mapped (VA == PA)      │
+//                         │ up to 64 TiB of physical memory │
+//  0x0000_0000_0000_0000  └─────────────────────────────────┘
+//
+// Identity-mapped region covers [0, USER_ADDR_MIN) in the low canonical half.
+// 4-level paging supports up to 64 TiB of physical memory (46-bit MAXPHYADDR),
+// so 64 TiB of identity-map VA space is sufficient.
+// USER_ADDR_MIN..USER_ADDR_MAX is reserved for user-space allocations.
+// VMAP_START..VMAP_END is in the high canonical half for vmap mappings.
+
+/// Start of the vmap virtual address region.
+/// Placed in the high (negative) canonical address range so it does not
+/// compete with identity-mapped or user-space addresses in the low half.
+pub(crate) const VMAP_START: usize = 0xFFFF_C000_0000_0000;
+
+/// End of the vmap virtual address region (exclusive).
+/// Provides ~16 TiB of virtual address space for vmap allocations.
+pub(crate) const VMAP_END: usize = 0xFFFF_CFFF_FFFF_F000;
+
 /// Maximum virtual address (exclusive) for user-space allocations.
 /// This is set to (1 << 47) - PAGE_SIZE (upper limit of 4-level paging).
 const USER_ADDR_MAX: usize = 0x7FFF_FFFF_F000;
 
 /// Size of the user address space range.
-const USER_ADDR_RANGE_SIZE: usize = 0x1000_0000_0000; // 16 TiB
+const USER_ADDR_RANGE_SIZE: usize = 0x4000_0000_0000; // 64 TiB
 
 /// Minimum virtual address for user-space allocations.
 ///
 /// Kernel memory uses low addresses (identity mapped: VA == PA).
 /// User memory uses addresses in range [`USER_ADDR_MIN`, `USER_ADDR_MAX`).
-/// This separation allows easy identification during cleanup and supports
-/// future designs where kernel VAs may be in higher addresses.
 const USER_ADDR_MIN: usize = USER_ADDR_MAX - USER_ADDR_RANGE_SIZE;
 
 /// Manages base and task page tables.

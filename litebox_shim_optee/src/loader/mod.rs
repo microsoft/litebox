@@ -18,4 +18,4 @@ pub(crate) const DEFAULT_STACK_SIZE: usize = 1024 * 1024; // 1 MB
 /// This must be >= `USER_ADDR_MIN` defined in the platform because user memory is
 /// mapped in the range [`USER_ADDR_MIN`, `USER_ADDR_MAX`) for easy identification
 /// during cleanup. The binary grows upwards from this address.
-pub const DEFAULT_LOW_ADDR: usize = 0x6FFF_FFFF_F000;
+pub const DEFAULT_LOW_ADDR: usize = 0x3FFF_FFFF_F000;

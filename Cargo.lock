@@ -828,7 +828,6 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "num_enum",
- "thiserror",
  "zerocopy",
 ]
 
@@ -874,9 +873,6 @@ dependencies = [
  "arrayvec",
  "authenticode",
  "bitflags 2.9.4",
- "bitvec",
- "buddy_system_allocator",
- "cfg-if",
  "cms",
  "const-oid",
  "digest",
@@ -885,7 +881,6 @@ dependencies = [
  "libc",
  "litebox",
  "litebox_common_linux",
- "litebox_common_optee",
  "modular-bitfield",
  "num_enum",
  "object",
@@ -893,9 +888,7 @@ dependencies = [
  "rangemap",
  "raw-cpuid",
  "rsa",
- "sha1",
  "sha2",
- "slabmalloc",
  "spin 0.10.0",
  "thiserror",
  "x509-cert",
@@ -965,18 +958,15 @@ dependencies = [
 name = "litebox_runner_lvbs"
 version = "0.1.0"
 dependencies = [
- "hashbrown",
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
  "litebox_platform_lvbs",
  "litebox_platform_multiplex",
  "litebox_shim_optee",
- "num_enum",
  "once_cell",
  "spin 0.10.0",
  "x86_64",
- "zerocopy",
 ]
 
 [[package]]
@@ -987,7 +977,6 @@ dependencies = [
  "arrayvec",
  "base64",
  "clap",
- "libc",
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
@@ -1037,9 +1026,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "arrayvec",
- "bitflags 2.9.4",
  "bitvec",
- "cfg-if",
  "ctr",
  "elf",
  "hashbrown",
