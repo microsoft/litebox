@@ -1216,9 +1216,41 @@ mod test_utils {
     extern crate std;
     use super::*;
 
+    /// Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
+    /// to mirror the TLS base used in guest context, so that test threads can use the
+    /// same TLS access code as guest threads.
+    fn set_tls_base() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            // In guest context gs holds the host TLS base.  Mirror that in
+            // test threads so interrupt_signal_handler and
+            // signal_handler_exit_guest work identically.
+            core::arch::asm!(
+                "rdfsbase {tmp}",
+                "wrgsbase {tmp}",
+                tmp = out(reg) _,
+                options(nostack, preserves_flags),
+            );
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            // On x86, guest context stores host TLS selector in fs;
+            // host/test threads keep it in gs.  Copy gs → fs.
+            unsafe {
+                core::arch::asm!(
+                    "mov {tmp:x}, gs",
+                    "mov fs, {tmp:x}",
+                    tmp = out(reg) _,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+    }
+
     impl GlobalState {
         /// Make a new task with default values for testing.
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
+            set_tls_base();
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1280,7 +1312,10 @@ mod test_utils {
             R: 'static + Send,
         {
             let task = self.clone_for_test().unwrap();
-            std::thread::spawn(move || f(task))
+            std::thread::spawn(move || {
+                set_tls_base();
+                f(task)
+            })
         }
     }
 }
