@@ -2314,7 +2314,6 @@ unsafe fn interrupt_signal_handler(
             libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
             libc::kill(libc::getpid(), signum);
         }
-        return;
     };
 
     // Record host-originated signals (SIGINT, SIGALRM, etc.) in the

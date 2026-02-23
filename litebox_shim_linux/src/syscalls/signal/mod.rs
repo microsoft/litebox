@@ -626,7 +626,7 @@ impl<FS: ShimFS> Task<FS> {
                 // Note we may get a spurious SIGALRM because we never disarm the timer (e.g., user
                 // can cancel an alarm by setting a new one or setting a timer with a zero timeout).
                 // Thus we check whether the current alarm deadline has actually passed before delivering the signal.
-                return self.check_alarm_deadline();
+                self.check_alarm_deadline();
             }
             litebox::shim::Signal::SIGINT => self.send_shared_signal(
                 litebox_common_linux::signal::Signal::SIGINT,
@@ -636,8 +636,31 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Returns whether the given signal is currently being ignored.
+    fn is_signal_ignored(&self, signal: Signal) -> bool {
+        // SIGKILL and SIGSTOP can never be ignored.
+        if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
+            return false;
+        }
+        // Blocked signals are never ignored, since the signal handler may
+        // change by the time it is unblocked.
+        if self.signals.blocked.get().contains(signal) {
+            return false;
+        }
+        let handlers = self.signals.handlers.borrow();
+        let inner = handlers.inner.lock();
+        match inner[signal].action.sigaction {
+            SIG_IGN => true,
+            SIG_DFL => matches!(signal.default_disposition(), SignalDisposition::Ignore),
+            _ => false,
+        }
+    }
+
     /// Only supports sending signals to self for now.
     pub(crate) fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
+        if self.is_signal_ignored(signal) {
+            return;
+        }
         self.signals
             .pending
             .borrow_mut()
@@ -646,6 +669,9 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Sends a process-directed signal (stored in shared_pending).
     pub(crate) fn send_shared_signal(&self, signal: Signal, siginfo: Siginfo) {
+        if self.is_signal_ignored(signal) {
+            return;
+        }
         self.signals
             .shared_pending
             .lock()
