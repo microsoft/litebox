@@ -81,8 +81,6 @@ pub const HVCALL_ENABLE_VP_VTL: u16 = 0x_000f;
 pub const HVCALL_GET_VP_REGISTERS: u16 = 0x_0050;
 pub const HVCALL_SET_VP_REGISTERS: u16 = 0x_0051;
 
-/// Flags for `HvCallFlushVirtualAddressSpace` / `HvCallFlushVirtualAddressList`.
-/// TLFS §3.5.2
 pub const HV_FLUSH_ALL_PROCESSORS: u64 = 1 << 0;
 pub const HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES: u64 = 1 << 1;
 pub const HV_FLUSH_NON_GLOBAL_MAPPINGS_ONLY: u64 = 1 << 2;
@@ -536,7 +534,7 @@ pub const HV_FLUSH_EX_VP_SET_BANKS: usize = MAX_CORES.div_ceil(64);
 
 /// Input structure for `HvCallFlushVirtualAddressSpaceEx` (0x0013).
 ///
-/// Layout (TLFS §6.5.2 EX):
+/// Layout (<https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/hypercalls/hvcallflushvirtualaddressspaceex>):
 /// - `address_space` (u64)
 /// - `flags` (u64)
 /// - VP set header: `vp_set_format` (u64), `vp_set_valid_bank_mask` (u64)
@@ -553,7 +551,7 @@ pub struct HvInputFlushVirtualAddressSpaceEx {
 
 /// Input structure for `HvCallFlushVirtualAddressListEx` (0x0014).
 ///
-/// Layout (TLFS §6.5.3 EX):
+/// Layout (<https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/hypercalls/hvcallflushvirtualaddresslistex>):
 /// - Fixed header: `address_space` (u64), `flags` (u64)
 /// - Variable header: VP set (`vp_set_*` and bank contents)
 /// - Rep elements: array of `HV_GVA_RANGE` entries (u64 each)

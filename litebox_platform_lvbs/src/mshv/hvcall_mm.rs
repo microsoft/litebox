@@ -21,7 +21,8 @@ use crate::{
     },
 };
 
-/// Compute the valid-bank bitmask for a sparse VP set (TLFS §3.7).
+/// Compute the valid-bank bitmask for a sparse VP set
+/// (<https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/datatypes/hv_vp_set>).
 ///
 /// Returns a `u64` where bit *i* is set if `vp_set_bank_contents[i]` is
 /// non-zero, indicating that the corresponding bank carries at least one
@@ -214,6 +215,7 @@ pub(crate) fn hv_flush_virtual_address_list(
 }
 
 /// Maximum number of additional pages encodable in bits 11:0 of a
-/// GVA range entry (TLFS §3.5.3).
+/// GVA range entry
+/// (<https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/hypercalls/hvcallflushvirtualaddresslist>).
 #[cfg(not(test))]
 const MAX_ADDITIONAL_PAGES: usize = 0xFFF; // 4095
