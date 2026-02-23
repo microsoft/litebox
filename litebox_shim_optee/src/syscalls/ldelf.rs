@@ -52,8 +52,8 @@ impl Task {
         let total_size = num_bytes
             .checked_add(pad_begin)
             .and_then(|t| t.checked_add(pad_end))
-            .ok_or(TeeResult::BadParameters)?
-            .next_multiple_of(PAGE_SIZE);
+            .and_then(|t| t.checked_next_multiple_of(PAGE_SIZE))
+            .ok_or(TeeResult::BadParameters)?;
         if addr.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
@@ -178,8 +178,8 @@ impl Task {
         let total_size = num_bytes
             .checked_add(pad_begin)
             .and_then(|t| t.checked_add(pad_end))
-            .ok_or(TeeResult::BadParameters)?
-            .next_multiple_of(PAGE_SIZE);
+            .and_then(|t| t.checked_next_multiple_of(PAGE_SIZE))
+            .ok_or(TeeResult::BadParameters)?;
         if addr.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }

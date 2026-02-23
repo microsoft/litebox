@@ -17,7 +17,7 @@ use crate::Task;
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
-    (addr + align - 1) & !(align - 1)
+    addr.wrapping_add(align - 1) & !(align - 1)
 }
 
 #[expect(

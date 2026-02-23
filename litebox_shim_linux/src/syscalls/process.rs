@@ -468,14 +468,14 @@ fn wake_robust_list(
     let (mut entry, mut pi) = fetch_robust_entry(crate::ConstPtr::from_usize(head.list.next));
     let (pending, ppi) = fetch_robust_entry(crate::ConstPtr::from_usize(head.list_op_pending));
     let futex_offset = head.futex_offset;
-    let entry_head = head_ptr + offset_of!(litebox_common_linux::RobustListHead, list);
+    let entry_head = head_ptr.wrapping_add(offset_of!(litebox_common_linux::RobustListHead, list));
     while entry.as_usize() != entry_head && limit > 0 {
         let nxt = entry
             .read_at_offset(0)
             .map(|e| fetch_robust_entry(crate::ConstPtr::from_usize(e.next)));
         if entry.as_usize() != pending.as_usize() {
             handle_futex_death(
-                crate::ConstPtr::from_usize(entry.as_usize() + futex_offset),
+                crate::ConstPtr::from_usize(entry.as_usize().wrapping_add(futex_offset)),
                 pi,
                 false,
             )?;
@@ -491,7 +491,7 @@ fn wake_robust_list(
 
     if pending.as_usize() != 0 {
         let _ = handle_futex_death(
-            crate::ConstPtr::from_usize(pending.as_usize() + futex_offset),
+            crate::ConstPtr::from_usize(pending.as_usize().wrapping_add(futex_offset)),
             ppi,
             true,
         );
@@ -1311,7 +1311,9 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 out.push(cs);
                 // advance to next pointer
-                base = crate::ConstPtr::from_usize(base.as_usize() + core::mem::size_of::<usize>());
+                base = crate::ConstPtr::from_usize(
+                    base.as_usize().wrapping_add(core::mem::size_of::<usize>()),
+                );
             }
             Ok(out)
         }
