@@ -1275,6 +1275,24 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
+            IoctlArg::TIOCGPGRP(pgrp) => {
+                let fg = self
+                    .global
+                    .fg_pgrp
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                pgrp.write_at_offset(0, fg).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPGRP(pgrp) => {
+                let pgid: i32 = pgrp.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                if pgid <= 0 {
+                    return Err(Errno::EINVAL);
+                }
+                self.global
+                    .fg_pgrp
+                    .store(pgid, core::sync::atomic::Ordering::Relaxed);
+                Ok(0)
+            }
             IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset(
                     0,
@@ -1389,6 +1407,8 @@ impl<FS: ShimFS> Task<FS> {
             },
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
+            | IoctlArg::TIOCGPGRP(..)
+            | IoctlArg::TIOCSPGRP(..)
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCGWINSZ(..) => match desc {
                 Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(

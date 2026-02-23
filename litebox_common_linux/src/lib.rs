@@ -588,6 +588,8 @@ pub struct Winsize {
 
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TIOCGPGRP: u32 = 0x540F;
+pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
@@ -601,6 +603,10 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TCGETS(Platform::RawMutPointer<Termios>),
     /// Set the current serial port settings.
     TCSETS(Platform::RawConstPointer<Termios>),
+    /// Get the process group ID of the foreground process group on the terminal.
+    TIOCGPGRP(Platform::RawMutPointer<i32>),
+    /// Set the foreground process group ID on the terminal.
+    TIOCSPGRP(Platform::RawConstPointer<i32>),
     /// Get window size.
     TIOCGWINSZ(Platform::RawMutPointer<Winsize>),
     /// Obtain device unit number, which can be used to generate
@@ -2217,6 +2223,14 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Getpid,
     Getppid,
+    Getpgrp,
+    Setpgid {
+        pid: i32,
+        pgid: i32,
+    },
+    Getpgid {
+        pid: i32,
+    },
     Getuid,
     Geteuid,
     Getgid,
@@ -2408,6 +2422,8 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     match cmd {
                         TCGETS => IoctlArg::TCGETS(ctx.sys_req_ptr(2)),
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
+                        TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
+                        TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
@@ -2587,6 +2603,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
+            Sysno::getpgrp => SyscallRequest::Getpgrp,
+            Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
+            Sysno::getpgid => sys_req!(Getpgid { pid }),
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
