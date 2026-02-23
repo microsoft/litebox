@@ -1658,4 +1658,138 @@ mod tests {
             "prctl get_name returned unexpected comm for too long name"
         );
     }
+
+    /// After the alarm deadline passes, a blocking operation should be
+    /// interrupted and SIGALRM should be pending.
+    #[test]
+    fn test_alarm_fires_after_deadline() {
+        use litebox_common_linux::{ClockId, TimerFlags, Timespec};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Set a 1-second alarm.
+        assert_eq!(task.sys_alarm(1), 0);
+
+        // Block in a nanosleep longer than the alarm
+        let mut remain = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let mut request = Timespec {
+            tv_sec: 3,
+            tv_nsec: 0,
+        };
+        let result = task.sys_clock_nanosleep(
+            ClockId::Monotonic,
+            TimerFlags::empty(),
+            litebox_common_linux::TimeParam::Timespec64(crate::MutPtr::from_ptr(&raw mut request)),
+            litebox_common_linux::TimeParam::Timespec64(crate::MutPtr::from_ptr(&raw mut remain)),
+        );
+
+        // The nanosleep should have been interrupted by SIGALRM.
+        assert_eq!(
+            result,
+            Err(litebox_common_linux::errno::Errno::EINTR),
+            "nanosleep should have been interrupted"
+        );
+        let millis = remain.tv_sec.cast_unsigned() * 1000 + remain.tv_nsec / 1_000_000;
+        // Allow a small tolerance (10ms) for timing imprecision
+        assert!(
+            (1990..=2010).contains(&millis),
+            "expected 2s remaining,  got {millis:?}"
+        );
+
+        // The alarm should be consumed (deadline cleared).
+        let remaining = task.sys_alarm(0);
+        assert_eq!(remaining, 0, "alarm should have been cleared by check");
+    }
+
+    /// Cancelling an alarm before it fires should prevent signal delivery
+    /// even if a blocking operation runs past the original deadline.
+    #[test]
+    fn test_alarm_cancel_prevents_signal() {
+        use litebox_common_linux::{ClockId, TimerFlags, Timespec};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        assert_eq!(task.sys_alarm(1), 0);
+        // Cancel before it fires.
+        let remaining = task.sys_alarm(0);
+        assert!(remaining >= 1, "alarm should still have had time remaining");
+
+        // A short nanosleep past the original deadline should complete
+        // normally — no signal should interrupt it.
+        let mut request = Timespec {
+            tv_sec: 2,
+            tv_nsec: 0,
+        };
+        let result = task.sys_clock_nanosleep(
+            ClockId::Monotonic,
+            TimerFlags::empty(),
+            litebox_common_linux::TimeParam::Timespec64(crate::MutPtr::from_ptr(&raw mut request)),
+            litebox_common_linux::TimeParam::None,
+        );
+        assert_eq!(result, Ok(()), "nanosleep should not have been interrupted");
+
+        assert!(
+            !task.has_pending_signals(),
+            "cancelled alarm should not produce SIGALRM"
+        );
+    }
+
+    /// Setting alarm with SIG_IGN for SIGALRM: a blocking operation is still
+    /// interrupted, but `process_signals` discards the signal.
+    #[test]
+    fn test_alarm_with_sigign() {
+        use litebox_common_linux::signal::{SIG_IGN, SaFlags, SigAction, SigSet, Signal};
+        use litebox_common_linux::{ClockId, TimerFlags, Timespec};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Install SIG_IGN for SIGALRM.
+        let act = SigAction {
+            sigaction: SIG_IGN,
+            flags: SaFlags::empty(),
+            #[cfg(target_pointer_width = "64")]
+            __pad: 0,
+            restorer: 0,
+            mask: SigSet::empty(),
+        };
+        let act_ptr = crate::ConstPtr::from_ptr(&raw const act);
+        task.sys_rt_sigaction(
+            Signal::SIGALRM,
+            Some(act_ptr),
+            None,
+            core::mem::size_of::<SigSet>(),
+        )
+        .expect("rt_sigaction failed");
+
+        // Set a 1-second alarm and block in a short nanosleep.
+        assert_eq!(task.sys_alarm(1), 0);
+        let mut request = Timespec {
+            tv_sec: 3,
+            tv_nsec: 0,
+        };
+        let result = task.sys_clock_nanosleep(
+            ClockId::Monotonic,
+            TimerFlags::empty(),
+            litebox_common_linux::TimeParam::Timespec64(crate::MutPtr::from_ptr(&raw mut request)),
+            litebox_common_linux::TimeParam::None,
+        );
+
+        // With SIG_IGN, nanosleep should NOT be interrupted — matching real
+        // Linux behaviour where ignored signals are silently dropped at
+        // send time and never make blocking syscalls return EINTR.
+        assert_eq!(
+            result,
+            Ok(()),
+            "nanosleep should complete normally when SIGALRM is ignored"
+        );
+
+        // No pending signals because the ignored SIGALRM was silently dropped.
+        assert!(
+            !task.has_pending_signals(),
+            "SIG_IGN should cause SIGALRM to be silently dropped"
+        );
+    }
 }
