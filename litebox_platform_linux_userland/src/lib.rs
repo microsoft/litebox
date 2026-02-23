@@ -2300,6 +2300,23 @@ unsafe fn interrupt_signal_handler(
     _info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    let raise_signal = |signum: libc::c_int| {
+        // block the signal on this non-guest thread so the kernel won't
+        // deliver it here again, then re-raise as process-directed so a
+        // guest thread picks it up.
+        //
+        // This should only be called by test threads (spawned via cargo test).
+        // Other non-guest threads like network worker threads should have already blocked these signals.
+        unsafe {
+            let mut set: libc::sigset_t = core::mem::zeroed();
+            libc::sigemptyset(&raw mut set);
+            libc::sigaddset(&raw mut set, signum);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+            libc::kill(libc::getpid(), signum);
+        }
+        return;
+    };
+
     // Record host-originated signals (SIGINT, SIGALRM, etc.) in the
     // per-thread pending bitmask so the shim can forward them to the guest.
     // TODO: no realtime signal support for now.
@@ -2318,7 +2335,9 @@ unsafe fn interrupt_signal_handler(
                         options(nostack)
                     );
                 }
-            }
+            } else {
+                raise_signal(signum);
+            };
         }
         #[cfg(target_arch = "x86")]
         {
@@ -2332,6 +2351,8 @@ unsafe fn interrupt_signal_handler(
                         options(nostack)
                     );
                 }
+            } else {
+                raise_signal(signum);
             }
         }
     }
