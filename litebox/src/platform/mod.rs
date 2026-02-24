@@ -290,6 +290,22 @@ pub trait RawMutex: Send + Sync + 'static {
         self.wake_many(i32::MAX as usize)
     }
 
+    /// Called when a thread enters an interruptible wait on this mutex.
+    ///
+    /// Platforms can use this to store the condvar address in thread-local
+    /// storage so that signal handlers can wake the thread via
+    /// [`try_wake_condvar`](crate::event::wait::try_wake_condvar).
+    ///
+    /// This is a no-op by default.
+    fn on_wait_start(&self) {}
+
+    /// Called when a thread leaves an interruptible wait on this mutex.
+    ///
+    /// Platforms should clear any state set by [`on_wait_start`](Self::on_wait_start).
+    ///
+    /// This is a no-op by default.
+    fn on_wait_end(&self) {}
+
     /// If the underlying value is `val`, block until a wake operation wakes us up.
     ///
     /// Importantly, a wake operation does NOT guarantee that the underlying value has changed; it

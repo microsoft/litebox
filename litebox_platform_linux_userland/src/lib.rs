@@ -404,6 +404,9 @@ interrupt:
     .align 4
 pending_host_signals:
     .long 0
+    .align 8
+wait_condvar_addr:
+    .quad 0
     "
 );
 
@@ -816,6 +819,9 @@ interrupt:
     .align 4
 pending_host_signals:
     .long 0
+    .align 4
+wait_condvar_addr:
+    .long 0
     "
 );
 
@@ -1024,9 +1030,9 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     }
 
     fn init_test_thread(&self) {
-        /// Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
-        /// to mirror the TLS base used in guest context, so that test threads can use the
-        /// same TLS access code as guest threads.
+        // Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
+        // to mirror the TLS base used in guest context, so that test threads can use the
+        // same TLS access code as guest threads.
         #[cfg(target_arch = "x86_64")]
         unsafe {
             // In guest context gs holds the host TLS base.  Mirror that in
@@ -1057,10 +1063,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
             libc::pthread_self()
         }))));
         CURRENT_THREAD.with_borrow_mut(|current| {
-            assert!(
-                current.is_none(),
-                "nested with_thread_handle calls are not supported"
-            );
             *current = Some(handle);
         });
     }
@@ -1118,12 +1120,6 @@ impl RawMutex {
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        // We immediately wake up (without even hitting syscalls) if we can clearly see that the
-        // value is different.
-        if self.inner.load(Ordering::SeqCst) != val {
-            return Err(ImmediatelyWokenUp);
-        }
-
         // We wait on the futex, with a timeout if needed
         match futex_timeout(
             &self.inner,
@@ -1148,6 +1144,41 @@ impl litebox::platform::RawMutex for RawMutex {
 
     fn underlying_atomic(&self) -> &AtomicU32 {
         &self.inner
+    }
+
+    fn on_wait_start(&self) {
+        let mutex = self as *const Self;
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!(
+                "mov fs:wait_condvar_addr@tpoff, {}",
+                in(reg) mutex,
+                options(nostack, preserves_flags),
+            );
+            #[cfg(target_arch = "x86")]
+            core::arch::asm!(
+                "mov gs:wait_condvar_addr@ntpoff, {}",
+                in(reg) mutex,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    fn on_wait_end(&self) {
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!(
+                "mov fs:wait_condvar_addr@tpoff, {zero}",
+                zero = in(reg) 0usize,
+                options(nostack, preserves_flags),
+            );
+            #[cfg(target_arch = "x86")]
+            core::arch::asm!(
+                "mov gs:wait_condvar_addr@ntpoff, {zero}",
+                zero = in(reg) 0u32,
+                options(nostack, preserves_flags),
+            );
+        }
     }
 
     fn wake_many(&self, n: usize) -> usize {
@@ -2341,6 +2372,24 @@ unsafe fn next_signal_handler(
     }
 }
 
+/// Async-signal-safe wake of a thread blocked in an interruptible wait.
+///
+/// This is the signal-handler counterpart of `WaitStateInner::wake()`: it
+/// CAS's the condvar from WAITING to WOKEN and issues a futex wake so the
+/// blocked thread returns from `futex_wait` with EAGAIN.
+///
+/// `condvar_addr` is the raw address read from the `wait_condvar_addr` TLS
+/// variable (0 means no condvar is registered).
+fn try_wake_wait_condvar(condvar_addr: usize) {
+    if condvar_addr == 0 {
+        return;
+    }
+    // SAFETY: condvar_addr points to a valid RawMutex inside a
+    // WaitStateInner (stable address via Arc), set by RawMutex::on_wait_start.
+    let mutex = unsafe { &*(condvar_addr as *const RawMutex) };
+    litebox::event::wait::try_wake_condvar(mutex);
+}
+
 /// Signal handler for interrupt signals.
 unsafe fn interrupt_signal_handler(
     signum: libc::c_int,
@@ -2381,14 +2430,29 @@ unsafe fn interrupt_signal_handler(
                         options(nostack)
                     );
                 }
+                // Wake the wait condvar if the thread is blocked in an
+                // interruptible wait (same operation as WaitStateInner::wake,
+                // but async-signal-safe).
+                let condvar_addr: usize;
+                unsafe {
+                    core::arch::asm!(
+                        "mov {}, gs:wait_condvar_addr@tpoff",
+                        out(reg) condvar_addr,
+                        options(nostack, preserves_flags)
+                    );
+                }
+                try_wake_wait_condvar(condvar_addr);
             } else {
                 raise_signal(signum);
-            };
+                return;
+            }
         }
         #[cfg(target_arch = "x86")]
         {
             // On x86 guest threads, fs always holds the host TLS selector.
-            if context.uc_mcontext.gregs[libc::REG_FS as usize] != 0 {
+            let fs: u16;
+            unsafe { core::arch::asm!("mov {:x}, fs", out(reg) fs, options(nostack, nomem)) };
+            if fs != 0 {
                 let mask: u32 = 1u32 << (signum - 1);
                 unsafe {
                     core::arch::asm!(
@@ -2397,8 +2461,19 @@ unsafe fn interrupt_signal_handler(
                         options(nostack)
                     );
                 }
+                // Wake the wait condvar (same logic as x86_64 above).
+                let condvar_addr: usize;
+                unsafe {
+                    core::arch::asm!(
+                        "mov {}, fs:wait_condvar_addr@ntpoff",
+                        out(reg) condvar_addr,
+                        options(nostack, preserves_flags)
+                    );
+                }
+                try_wake_wait_condvar(condvar_addr);
             } else {
                 raise_signal(signum);
+                return;
             }
         }
     }

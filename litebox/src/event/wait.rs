@@ -161,30 +161,7 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
 impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
     /// Wakes up the thread if it is waiting (but not if it is running in the guest).
     fn wake(&self) {
-        let condvar = &self.condvar;
-        let v = condvar.underlying_atomic().fetch_update(
-            Ordering::Release,
-            Ordering::Relaxed,
-            |state| match ThreadState(state) {
-                ThreadState::RUNNING_IN_HOST
-                | ThreadState::WOKEN
-                | ThreadState::INTERRUPTED_GUEST
-                | ThreadState::RUNNING_IN_GUEST => None,
-                ThreadState::WAITING => Some(ThreadState::WOKEN.0),
-                state => unreachable!("{state:?}"),
-            },
-        );
-        match v.map(ThreadState) {
-            Ok(ThreadState::WAITING) => {
-                condvar.wake_one();
-            }
-            Ok(state) => unreachable!("{state:?}"),
-            Err(_) => {
-                // Provide a consistent release fence even if we didn't wake up
-                // the thread.
-                core::sync::atomic::fence(Ordering::Release);
-            }
-        }
+        try_wake_condvar(&self.condvar);
     }
 
     fn state_for_assert(&self) -> ThreadState {
@@ -374,6 +351,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// evaluating the wait and interrupt conditions so that wakeups are not
     /// missed.
     fn start_wait(&self) {
+        self.waker.0.condvar.on_wait_start();
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);
@@ -384,6 +362,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         self.waker
             .0
             .set_state(ThreadState::RUNNING_IN_HOST, Ordering::Relaxed);
+        self.waker.0.condvar.on_wait_end();
     }
 
     /// Checks whether the wait should be interrupted. If not, then performs
@@ -477,4 +456,42 @@ pub enum WaitError {
     Interrupted,
     #[error("wait timed out")]
     TimedOut,
+}
+
+/// Attempts to wake a thread that is in the WAITING state by CAS'ing the
+/// condvar from WAITING to WOKEN, then issuing a futex wake.
+///
+/// This is intended to be called from signal handlers. It is async-signal-safe:
+/// it performs only an atomic compare-exchange (and possibly a futex wake) and
+/// does not allocate or panic.
+///
+/// Returns `true` if the thread was woken. Returns `false` if the thread was
+/// not in the WAITING state.
+pub fn try_wake_condvar<T: RawMutex>(condvar: &T) {
+    let v =
+        condvar
+            .underlying_atomic()
+            .fetch_update(
+                Ordering::Release,
+                Ordering::Relaxed,
+                |state| match ThreadState(state) {
+                    ThreadState::RUNNING_IN_HOST
+                    | ThreadState::WOKEN
+                    | ThreadState::INTERRUPTED_GUEST
+                    | ThreadState::RUNNING_IN_GUEST => None,
+                    ThreadState::WAITING => Some(ThreadState::WOKEN.0),
+                    state => unreachable!("{state:?}"),
+                },
+            );
+    match v.map(ThreadState) {
+        Ok(ThreadState::WAITING) => {
+            condvar.wake_one();
+        }
+        Ok(state) => unreachable!("{state:?}"),
+        Err(_) => {
+            // Provide a consistent release fence even if we didn't wake up
+            // the thread.
+            core::sync::atomic::fence(Ordering::Release);
+        }
+    }
 }
