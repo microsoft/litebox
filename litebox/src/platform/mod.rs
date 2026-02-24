@@ -299,7 +299,7 @@ pub trait RawMutex: Send + Sync + 'static {
     ///
     /// Platforms can use this to store the condvar address in thread-local
     /// storage so that signal handlers can wake the thread via
-    /// [`try_wake_condvar`](crate::event::wait::try_wake_condvar).
+    /// [`try_wake_condvar`](crate::event::wait::WaitState::try_wake_condvar).
     ///
     /// This is a no-op by default.
     fn on_wait_start(&self) {}

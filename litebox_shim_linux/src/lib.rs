@@ -1280,9 +1280,7 @@ mod test_utils {
             R: 'static + Send,
         {
             let task = self.clone_for_test().unwrap();
-            std::thread::spawn(move || {
-                f(task)
-            })
+            std::thread::spawn(move || f(task))
         }
     }
 }

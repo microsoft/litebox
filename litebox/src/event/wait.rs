@@ -162,21 +162,18 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
     /// Returns `true` if the thread was woken. Returns `false` if the thread was
     /// not in the WAITING state.
     pub fn try_wake_condvar(condvar: &Platform::RawMutex) {
-        let v =
-            condvar
-                .underlying_atomic()
-                .fetch_update(
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                    |state| match ThreadState(state) {
-                        ThreadState::RUNNING_IN_HOST
-                        | ThreadState::WOKEN
-                        | ThreadState::INTERRUPTED_GUEST
-                        | ThreadState::RUNNING_IN_GUEST => None,
-                        ThreadState::WAITING => Some(ThreadState::WOKEN.0),
-                        state => unreachable!("{state:?}"),
-                    },
-                );
+        let v = condvar.underlying_atomic().fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |state| match ThreadState(state) {
+                ThreadState::RUNNING_IN_HOST
+                | ThreadState::WOKEN
+                | ThreadState::INTERRUPTED_GUEST
+                | ThreadState::RUNNING_IN_GUEST => None,
+                ThreadState::WAITING => Some(ThreadState::WOKEN.0),
+                state => unreachable!("{state:?}"),
+            },
+        );
         match v.map(ThreadState) {
             Ok(ThreadState::WAITING) => {
                 condvar.wake_one();

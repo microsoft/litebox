@@ -313,11 +313,41 @@ impl litebox::platform::SignalProvider for LinuxUserland {
     fn take_pending_signals(&self, mut f: impl FnMut(litebox::shim::Signal)) {
         let sigs = take_pending_host_signals();
         for sig in sigs {
-            if let Ok(signal) = sig.try_into() {
-                f(signal);
-            }
+            f(sig);
         }
     }
+}
+
+/// Atomically takes the per-thread pending host signal bitmask.
+fn take_pending_host_signals() -> litebox::shim::SigSet {
+    // Atomically swap the per-thread pending signals with zero.
+    // `xchg` has an implicit lock prefix so it is safe against signal
+    // handler writes on this thread.
+    // Only the low 32 bits are used (covers traditional signals 1-31).
+    let lo: u32;
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // In host context on x86_64, fs = host TLS.
+            core::arch::asm!(
+                "xor {tmp:e}, {tmp:e}",
+                "xchg DWORD PTR fs:pending_host_signals@tpoff, {tmp:e}",
+                tmp = out(reg) lo,
+                options(nostack)
+            );
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            // In host context on x86, gs = host TLS.
+            core::arch::asm!(
+                "xor {tmp}, {tmp}",
+                "xchg DWORD PTR gs:pending_host_signals@ntpoff, {tmp}",
+                tmp = out(reg) lo,
+                options(nostack)
+            );
+        }
+    }
+    litebox::shim::SigSet::from_u64(u64::from(lo))
 }
 
 /// Runs a guest thread using the provided shim and the given initial context.
@@ -1035,9 +1065,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         // same TLS access code as guest threads.
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            // In guest context gs holds the host TLS base.  Mirror that in
-            // test threads so interrupt_signal_handler and
-            // signal_handler_exit_guest work identically.
             core::arch::asm!(
                 "rdfsbase {tmp}",
                 "wrgsbase {tmp}",
@@ -1047,8 +1074,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         }
         #[cfg(target_arch = "x86")]
         {
-            // On x86, guest context stores host TLS selector in fs;
-            // host/test threads keep it in gs.  Copy gs → fs.
             unsafe {
                 core::arch::asm!(
                     "mov {tmp:x}, gs",
@@ -1059,52 +1084,8 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
             }
         }
 
-        let handle = ThreadHandle(std::sync::Arc::new(std::sync::Mutex::new(Some(unsafe {
-            libc::pthread_self()
-        }))));
-        CURRENT_THREAD.with_borrow_mut(|current| {
-            *current = Some(handle);
-        });
-
-        let result = f();
-
-        CURRENT_THREAD.with_borrow_mut(|current| {
-            *current = None;
-        });
-
-        result
+        ThreadHandle::run_with_handle(f)
     }
-}
-
-fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
-    // Atomically swap the per-thread pending signals with zero.
-    // `xchg` has an implicit lock prefix so it is safe against signal
-    // handler writes on this thread.
-    // Only the low 32 bits are used (covers traditional signals 1-31).
-    let lo: u32;
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        {
-            // In host context on x86_64, fs = host TLS.
-            core::arch::asm!(
-                "xor {tmp:e}, {tmp:e}",
-                "xchg DWORD PTR fs:pending_host_signals@tpoff, {tmp:e}",
-                tmp = out(reg) lo,
-                options(nostack)
-            );
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            // In host context on x86, gs = host TLS.
-            core::arch::asm!(
-                "xor {tmp}, {tmp}",
-                "xchg DWORD PTR gs:pending_host_signals@ntpoff, {tmp}",
-                tmp = out(reg) lo,
-                options(nostack)
-            );
-        }
-    }
-    litebox_common_linux::signal::SigSet::from_u64(u64::from(lo))
 }
 
 impl litebox::platform::RawMutexProvider for LinuxUserland {
@@ -2430,13 +2411,21 @@ unsafe fn interrupt_signal_handler(
     // per-thread pending bitmask so the shim can forward them to the guest.
     // TODO: no realtime signal support for now.
     if signum > 0 && signum < 32 {
+        // Only record signals that can be forwarded to the guest as
+        // litebox::shim::Signal. Unknown signals are silently dropped.
+        let Ok(signal) = litebox_common_linux::signal::Signal::try_from(signum) else {
+            return;
+        };
+        let Ok(signal) = litebox::shim::Signal::try_from(signal) else {
+            return;
+        };
         #[cfg(target_arch = "x86_64")]
         {
             // On x86_64 guest threads, gs always holds the host TLS base.
             let gsbase: u64;
             unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
             if gsbase != 0 {
-                let mask: u32 = 1u32 << (signum - 1);
+                let mask: u32 = 1u32 << (signal.as_raw() - 1);
                 unsafe {
                     core::arch::asm!(
                         "lock or DWORD PTR gs:pending_host_signals@tpoff, {mask:e}",
@@ -2444,9 +2433,7 @@ unsafe fn interrupt_signal_handler(
                         options(nostack)
                     );
                 }
-                // Wake the wait condvar if the thread is blocked in an
-                // interruptible wait (same operation as WaitStateInner::wake,
-                // but async-signal-safe).
+                // Wake the wait condvar if the thread is blocked in an interruptible wait
                 let condvar_addr: usize;
                 unsafe {
                     core::arch::asm!(
@@ -2467,7 +2454,7 @@ unsafe fn interrupt_signal_handler(
             let fs: u16;
             unsafe { core::arch::asm!("mov {:x}, fs", out(reg) fs, options(nostack, nomem)) };
             if fs != 0 {
-                let mask: u32 = 1u32 << (signum - 1);
+                let mask: u32 = 1u32 << (signal.as_raw() - 1);
                 unsafe {
                     core::arch::asm!(
                         "lock or DWORD PTR fs:pending_host_signals@ntpoff, {mask}",

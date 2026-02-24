@@ -857,9 +857,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         // Ensure the module-wide TLS slot is allocated.
         ensure_tls_index();
         let tls = TlsState::new();
-        ThreadHandle::run_with_handle(&tls, || {
-            f()
-        })
+        ThreadHandle::run_with_handle(&tls, || f())
     }
 }
 
@@ -966,7 +964,9 @@ impl ThreadHandle {
                 .retain(|h| !Arc::ptr_eq(&h.0, &current.0));
             *current.0.lock().unwrap() = None;
             let tls_index = TLS_INDEX.load(Ordering::Relaxed);
-            unsafe { windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null()) };
+            unsafe {
+                windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null())
+            };
         });
         f()
     }

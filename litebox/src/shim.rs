@@ -183,7 +183,7 @@ impl Signal {
 /// Bit `(signum - 1)` is set when signal `signum` is present in the set.
 /// Because signal numbers are 1-based and capped at 63, all 63 possible
 /// signals fit in a single `u64`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SigSet(u64);
 
 impl SigSet {
