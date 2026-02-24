@@ -42,7 +42,7 @@ pub struct PerCpuVariables {
     pub vtl0_locked_regs: ControlRegMap,
     pub gdt: Option<&'static gdt::GdtWrapper>,
     pub tls: VirtAddr,
-    vp_index: u32,
+    pub vp_index: u32,
 }
 
 impl PerCpuVariables {
@@ -577,10 +577,13 @@ pub fn allocate_per_cpu_variables() {
     #[allow(clippy::needless_range_loop)]
     for i in 1..num_cores {
         let mut per_cpu_variables = Box::<PerCpuVariables>::new_uninit();
-        // Safety: `PerCpuVariables` is larger than the stack size, so we manually `memset` it to zero.
+        // Safety: `PerCpuVariables` is too large for the stack, so we zero-init
+        // via `write_bytes` then fix up `vp_index` to the `u32::MAX` sentinel
+        // before calling `assume_init`.
         let per_cpu_variables = unsafe {
             let ptr = per_cpu_variables.as_mut_ptr();
             ptr.write_bytes(0, 1);
+            (*ptr).vp_index = u32::MAX;
             per_cpu_variables.assume_init()
         };
         unsafe {
