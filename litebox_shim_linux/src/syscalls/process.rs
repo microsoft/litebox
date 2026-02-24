@@ -1187,7 +1187,7 @@ impl Task {
             // Schedule a platform-level timer to interrupt a thread
             // when the alarm fires, ensuring SIGALRM delivery even if the
             // guest is executing in userspace.
-            self.global.platform.schedule_interrupt(delay);
+            self.global.platform.schedule_interrupt(None, delay);
         } else {
             *alarm = None;
         }
