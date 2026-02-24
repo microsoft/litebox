@@ -518,6 +518,48 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         unsafe { Self::init(frame.start_address()) }
     }
 
+    /// Copy all non-zero PML4 entries from `source` into this page table.
+    ///
+    /// This is used to share kernel page table structures (P3/P2/P1) between
+    /// the base page table and task page tables, avoiding per-task allocation
+    /// of intermediate page table frames for the kernel region.
+    ///
+    /// Only entries that are present in `source` and absent in `self` are copied.
+    /// Entries already present in `self` are left unchanged.
+    pub(crate) fn copy_pml4_entries_from(&self, source: &Self) {
+        let mut dst = self.inner.lock();
+        let src = source.inner.lock();
+        for (dst_entry, src_entry) in dst
+            .level_4_table_mut()
+            .iter_mut()
+            .zip(src.level_4_table().iter())
+        {
+            if !src_entry.is_unused() && dst_entry.is_unused() {
+                dst_entry.set_addr(src_entry.addr(), src_entry.flags());
+            }
+        }
+    }
+
+    /// Clear PML4 entries that are shared with the base page table.
+    ///
+    /// This must be called before `cleanup_page_table_frames` / `drop` to
+    /// prevent the task page table from freeing P3/P2/P1 frames that are
+    /// owned by the base page table.
+    pub(crate) fn clear_shared_pml4_entries(&self, base: &Self) {
+        let mut dst = self.inner.lock();
+        let src = base.inner.lock();
+        for (dst_entry, src_entry) in dst
+            .level_4_table_mut()
+            .iter_mut()
+            .zip(src.level_4_table().iter())
+        {
+            // If the entry points to the same P3 frame as the base, it is shared.
+            if !src_entry.is_unused() && dst_entry.addr() == src_entry.addr() {
+                dst_entry.set_unused();
+            }
+        }
+    }
+
     /// This function changes the address space of the current processor/core using the given page table
     /// (e.g., its CR3 register) and returns the physical frame of the previous top-level page table.
     /// It preserves the CR3 flags.

@@ -281,31 +281,21 @@ impl PageTableManager {
 
     /// Creates a new task page table and returns its ID.
     ///
-    /// The new page table is initialized with the VTL1 kernel memory mapped
-    /// for proper syscall handling.
-    ///
-    /// # Arguments
-    ///
-    /// * `vtl1_phys_frame_range` - The physical frame range of VTL1 kernel memory to map
+    /// The new page table shares the base page table's kernel PML4 entries
+    /// rather than allocating new intermediate page table frames. This avoids
+    /// allocating P3/P2/P1 frames for every task, significantly reducing
+    /// memory usage when creating/destroying many TAs.
     ///
     /// # Returns
     ///
     /// The ID of the newly created task page table (its P4 frame start address),
-    /// or `Err(Errno::ENOMEM)` if allocation fails.
-    pub fn create_task_page_table(
-        &self,
-        vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    ) -> Result<usize, Errno> {
+    /// or `Err(Errno::ENOMEM)` if the P4 frame allocation fails.
+    pub fn create_task_page_table(&self) -> Result<usize, Errno> {
         let pt = unsafe { mm::PageTable::new_top_level() };
-        if pt
-            .map_phys_frame_range(
-                vtl1_phys_frame_range,
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-            )
-            .is_err()
-        {
-            return Err(Errno::ENOMEM);
-        }
+
+        // Share kernel page table structures by copying PML4 entries from the
+        // base page table. This is safe because kernel mappings are never modified.
+        pt.copy_pml4_entries_from(&self.base_page_table);
 
         let pt = alloc::boxed::Box::new(pt);
         let task_pt_id: usize = pt.get_physical_frame().start_address().as_u64().truncate();
@@ -355,7 +345,13 @@ impl PageTableManager {
         if let Some(pt) = task_pts.remove(&task_pt_id) {
             drop(task_pts);
 
-            // Safety: We're about to delete this page table, so it's safe to unmap all pages.
+            // Clear PML4 entries that point to the base page table's P3/P2/P1
+            // frames. Without this, cleanup_page_table_frames and Drop would
+            // free page table frames owned by the base page table.
+            pt.clear_shared_pml4_entries(&self.base_page_table);
+
+            // Safety: We're about to delete this page table, so it's safe to
+            // free the remaining (user-space) intermediate page table frames.
             unsafe {
                 pt.cleanup_page_table_frames();
             }
@@ -718,8 +714,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// The ID of the newly created task page table, or `Err(Errno)` on failure.
     pub fn create_task_page_table(&self) -> Result<usize, Errno> {
-        self.page_table_manager
-            .create_task_page_table(self.vtl1_phys_frame_range)
+        self.page_table_manager.create_task_page_table()
     }
 
     /// Deletes a task page table by its ID.
