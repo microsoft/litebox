@@ -182,12 +182,6 @@ impl SigSet {
         Some(Signal(bit.reinterpret_as_signed() + 1))
     }
 
-    /// Returns an iterator over the signals in this set, from lowest to
-    /// highest.
-    pub fn iter(self) -> SigSetIter {
-        SigSetIter(self)
-    }
-
     pub fn as_u64(&self) -> u64 {
         self.0
     }
@@ -218,33 +212,6 @@ impl core::ops::Not for SigSet {
 
     fn not(self) -> Self::Output {
         Self(!self.0)
-    }
-}
-
-/// An iterator over the signals in a [`SigSet`], yielding them from lowest to
-/// highest signal number.
-#[derive(Clone)]
-pub struct SigSetIter(SigSet);
-
-impl Iterator for SigSetIter {
-    type Item = Signal;
-
-    fn next(&mut self) -> Option<Signal> {
-        self.0.pop_lowest()
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let count = self.0.0.count_ones() as usize;
-        (count, Some(count))
-    }
-}
-
-impl IntoIterator for SigSet {
-    type Item = Signal;
-    type IntoIter = SigSetIter;
-
-    fn into_iter(self) -> SigSetIter {
-        self.iter()
     }
 }
 
