@@ -1210,7 +1210,6 @@ pub type LoadFilter = fn(envp: &mut alloc::vec::Vec<alloc::ffi::CString>);
 mod test_utils {
     extern crate std;
     use super::*;
-    use litebox::platform::ThreadProvider as _;
 
     impl<FS: ShimFS> GlobalState<FS> {
         /// Make a new task with default values for testing.
@@ -1281,9 +1280,6 @@ mod test_utils {
         {
             let task = self.clone_for_test().unwrap();
             std::thread::spawn(move || {
-                // Register this test thread with the platform so that
-                // `current_thread()` and related functionality works.
-                litebox_platform_multiplex::platform().init_test_thread();
                 f(task)
             })
         }
