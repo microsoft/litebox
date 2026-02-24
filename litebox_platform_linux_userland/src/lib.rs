@@ -29,6 +29,84 @@ mod syscall_intercept;
 
 extern crate alloc;
 
+// ---------------------------------------------------------------------------
+// TLS (`.tbss`) access helpers
+//
+// On x86_64, the ELF TLS model uses `@tpoff`; on x86 it uses `@ntpoff`.
+// At guest-host transitions we swap `fs` and `gs`, so after the swap the host TLS base
+// is in the normal segment register. Before the swap (e.g. in a signal
+// handler that fires while the guest is running), the host TLS base is
+// in the *saved* segment register (`gs` on x86_64, `fs` on x86).
+//
+// The macros below produce string literals so they can be used inside
+// `concat!()` within `core::arch::asm!()`.
+// ---------------------------------------------------------------------------
+
+/// TLS relocation suffix: `"@tpoff"` on x86_64, `"@ntpoff"` on x86.
+#[cfg(target_arch = "x86_64")]
+macro_rules! tls_suffix {
+    () => {
+        "@tpoff"
+    };
+}
+#[cfg(target_arch = "x86")]
+macro_rules! tls_suffix {
+    () => {
+        "@ntpoff"
+    };
+}
+
+/// Segment register used for TLS after the fs/gs swap (normal host context).
+#[cfg(target_arch = "x86_64")]
+macro_rules! tls_seg {
+    () => {
+        "fs"
+    };
+}
+#[cfg(target_arch = "x86")]
+macro_rules! tls_seg {
+    () => {
+        "gs"
+    };
+}
+
+/// Segment register where the host TLS base is saved before the swap
+/// (signal handler context while the guest is running).
+#[cfg(target_arch = "x86_64")]
+macro_rules! saved_tls_seg {
+    () => {
+        "gs"
+    };
+}
+#[cfg(target_arch = "x86")]
+macro_rules! saved_tls_seg {
+    () => {
+        "fs"
+    };
+}
+
+/// Full TLS memory operand for a `.tbss` variable in normal host context
+/// (after the fs/gs swap).
+///
+/// Example: `tls!("pending_host_signals")` expands to
+/// `"fs:pending_host_signals@tpoff"` on x86_64.
+macro_rules! tls {
+    ($var:literal) => {
+        concat!(tls_seg!(), ":", $var, tls_suffix!())
+    };
+}
+
+/// Full TLS memory operand for a `.tbss` variable accessed via the *saved*
+/// segment register (before the fs/gs swap, e.g. from a signal handler).
+///
+/// Example: `saved_tls!("in_guest")` expands to
+/// `"gs:in_guest@tpoff"` on x86_64.
+macro_rules! saved_tls {
+    ($var:literal) => {
+        concat!(saved_tls_seg!(), ":", $var, tls_suffix!())
+    };
+}
+
 /// The userland Linux platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -326,26 +404,12 @@ fn take_pending_host_signals() -> litebox::shim::SigSet {
     // Only the low 32 bits are used (covers traditional signals 1-31).
     let lo: u32;
     unsafe {
-        #[cfg(target_arch = "x86_64")]
-        {
-            // In host context on x86_64, fs = host TLS.
-            core::arch::asm!(
-                "xor {tmp:e}, {tmp:e}",
-                "xchg DWORD PTR fs:pending_host_signals@tpoff, {tmp:e}",
-                tmp = out(reg) lo,
-                options(nostack)
-            );
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            // In host context on x86, gs = host TLS.
-            core::arch::asm!(
-                "xor {tmp}, {tmp}",
-                "xchg DWORD PTR gs:pending_host_signals@ntpoff, {tmp}",
-                tmp = out(reg) lo,
-                options(nostack)
-            );
-        }
+        core::arch::asm!(
+            "xor {tmp:e}, {tmp:e}",
+            concat!("xchg DWORD PTR ", tls!("pending_host_signals"), ", {tmp:e}"),
+            tmp = out(reg) lo,
+            options(nostack)
+        );
     }
     litebox::shim::SigSet::from_u64(u64::from(lo))
 }
@@ -1138,15 +1202,8 @@ impl litebox::platform::RawMutex for RawMutex {
     fn on_wait_start(&self) {
         let mutex = self as *const Self;
         unsafe {
-            #[cfg(target_arch = "x86_64")]
             core::arch::asm!(
-                "mov fs:wait_condvar_addr@tpoff, {}",
-                in(reg) mutex,
-                options(nostack, preserves_flags),
-            );
-            #[cfg(target_arch = "x86")]
-            core::arch::asm!(
-                "mov gs:wait_condvar_addr@ntpoff, {}",
+                concat!("mov ", tls!("wait_condvar_addr"), ", {}"),
                 in(reg) mutex,
                 options(nostack, preserves_flags),
             );
@@ -1155,16 +1212,9 @@ impl litebox::platform::RawMutex for RawMutex {
 
     fn on_wait_end(&self) {
         unsafe {
-            #[cfg(target_arch = "x86_64")]
             core::arch::asm!(
-                "mov fs:wait_condvar_addr@tpoff, {zero}",
+                concat!("mov ", tls!("wait_condvar_addr"), ", {zero}"),
                 zero = in(reg) 0usize,
-                options(nostack, preserves_flags),
-            );
-            #[cfg(target_arch = "x86")]
-            core::arch::asm!(
-                "mov gs:wait_condvar_addr@ntpoff, {zero}",
-                zero = in(reg) 0u32,
                 options(nostack, preserves_flags),
             );
         }
@@ -1804,14 +1854,8 @@ impl ThreadContext<'_> {
         // now (by calling into the shim), and it might be set again by the shim
         // before returning.
         unsafe {
-            #[cfg(target_arch = "x86_64")]
             core::arch::asm!(
-                "mov BYTE PTR fs:interrupt@tpoff, 0",
-                options(nostack, preserves_flags)
-            );
-            #[cfg(target_arch = "x86")]
-            core::arch::asm!(
-                "mov BYTE PTR gs:interrupt@ntpoff, 0",
+                concat!("mov BYTE PTR ", tls!("interrupt"), ", 0"),
                 options(nostack, preserves_flags)
             );
         }
@@ -2371,7 +2415,7 @@ unsafe fn next_signal_handler(
 ///
 /// This is the signal-handler counterpart of `WaitStateInner::wake()`: it
 /// CAS's the condvar from WAITING to WOKEN and issues a futex wake so the
-/// blocked thread returns from `futex_wait` with EAGAIN.
+/// blocked thread returns from `futex_wait`.
 ///
 /// `condvar_addr` is the raw address read from the `wait_condvar_addr` TLS
 /// variable (0 means no condvar is registered).
@@ -2383,6 +2427,37 @@ fn try_wake_wait_condvar(condvar_addr: usize) {
     // WaitStateInner (stable address via Arc), set by RawMutex::on_wait_start.
     let mutex = unsafe { &*(condvar_addr as *const RawMutex) };
     litebox::event::wait::WaitState::<LinuxUserland>::try_wake_condvar(mutex);
+}
+
+/// Records a pending host signal in the `.tbss` bitmask and wakes any condvar
+/// the thread is blocked on.
+///
+/// This uses the **guest / signal-handler** TLS segment register, so it must
+/// only be called from a signal handler where the saved host TLS segment is
+/// valid.
+///
+/// # Safety
+///
+/// Must be called from a signal handler on a guest thread whose saved host TLS
+/// segment register is valid.
+unsafe fn record_pending_signal(signal: litebox::shim::Signal) {
+    let mask: u32 = 1u32 << (signal.as_raw() - 1);
+    unsafe {
+        core::arch::asm!(
+            concat!("lock or DWORD PTR ", saved_tls!("pending_host_signals"), ", {mask:e}"),
+            mask = in(reg) mask,
+            options(nostack)
+        );
+    }
+    let condvar_addr: usize;
+    unsafe {
+        core::arch::asm!(
+            concat!("mov {}, ", saved_tls!("wait_condvar_addr")),
+            out(reg) condvar_addr,
+            options(nostack, preserves_flags)
+        );
+    }
+    try_wake_wait_condvar(condvar_addr);
 }
 
 /// Signal handler for interrupt signals.
@@ -2419,63 +2494,29 @@ unsafe fn interrupt_signal_handler(
         let Ok(signal) = litebox::shim::Signal::try_from(signal) else {
             return;
         };
+
+        // Check whether the saved host TLS segment is valid (i.e. this is a
+        // guest thread). If not, re-raise the signal process-wide.
+        let is_guest_thread;
         #[cfg(target_arch = "x86_64")]
         {
-            // On x86_64 guest threads, gs always holds the host TLS base.
             let gsbase: u64;
             unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
-            if gsbase != 0 {
-                let mask: u32 = 1u32 << (signal.as_raw() - 1);
-                unsafe {
-                    core::arch::asm!(
-                        "lock or DWORD PTR gs:pending_host_signals@tpoff, {mask:e}",
-                        mask = in(reg) mask,
-                        options(nostack)
-                    );
-                }
-                // Wake the wait condvar if the thread is blocked in an interruptible wait
-                let condvar_addr: usize;
-                unsafe {
-                    core::arch::asm!(
-                        "mov {}, gs:wait_condvar_addr@tpoff",
-                        out(reg) condvar_addr,
-                        options(nostack, preserves_flags)
-                    );
-                }
-                try_wake_wait_condvar(condvar_addr);
-            } else {
-                raise_signal(signum);
-                return;
-            }
+            is_guest_thread = gsbase != 0;
         }
         #[cfg(target_arch = "x86")]
         {
-            // On x86 guest threads, fs always holds the host TLS selector.
             let fs: u16;
             unsafe { core::arch::asm!("mov {:x}, fs", out(reg) fs, options(nostack, nomem)) };
-            if fs != 0 {
-                let mask: u32 = 1u32 << (signal.as_raw() - 1);
-                unsafe {
-                    core::arch::asm!(
-                        "lock or DWORD PTR fs:pending_host_signals@ntpoff, {mask}",
-                        mask = in(reg) mask,
-                        options(nostack)
-                    );
-                }
-                // Wake the wait condvar (same logic as x86_64 above).
-                let condvar_addr: usize;
-                unsafe {
-                    core::arch::asm!(
-                        "mov {}, fs:wait_condvar_addr@ntpoff",
-                        out(reg) condvar_addr,
-                        options(nostack, preserves_flags)
-                    );
-                }
-                try_wake_wait_condvar(condvar_addr);
-            } else {
-                raise_signal(signum);
-                return;
-            }
+            is_guest_thread = fs != 0;
+        }
+
+        if is_guest_thread {
+            // SAFETY: we verified the saved host TLS segment is valid above.
+            unsafe { record_pending_signal(signal) };
+        } else {
+            raise_signal(signum);
+            return;
         }
     }
 
