@@ -1693,10 +1693,10 @@ mod tests {
             "nanosleep should have been interrupted"
         );
         let millis = remain.tv_sec.cast_unsigned() * 1000 + remain.tv_nsec / 1_000_000;
-        // Allow a small tolerance (10ms) for timing imprecision
+        // Allow tolerance for timer imprecision (especially on Windows).
         assert!(
-            (1990..=2010).contains(&millis),
-            "expected 2s remaining,  got {millis:?}"
+            (1900..=2100).contains(&millis),
+            "expected ~2s remaining, got {millis:?}"
         );
 
         // The alarm should be consumed (deadline cleared).
