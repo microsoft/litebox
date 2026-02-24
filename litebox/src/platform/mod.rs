@@ -114,14 +114,19 @@ pub trait ThreadProvider: RawPointerProvider {
     /// Whether this platform implements [`schedule_interrupt`](Self::schedule_interrupt).
     const SUPPORTS_SCHEDULE_INTERRUPT: bool = false;
 
-    /// Registers the current thread with the platform so that
-    /// [`current_thread`](Self::current_thread) and related functionality
-    /// works on test threads that do not go through the normal
-    /// [`spawn_thread`](Self::spawn_thread) / guest entry path.
+    /// Runs `f` on the current thread after performing any platform-specific
+    /// thread registration needed for [`current_thread`](Self::current_thread)
+    /// and related functionality to work.
     ///
-    /// This is a no-op by default. Platforms that require explicit thread
-    /// registration/setup should override this.
-    fn init_test_thread(&self) {}
+    /// This is intended for test threads that do not go through the normal
+    /// [`spawn_thread`](Self::spawn_thread) / guest entry path. The platform
+    /// sets up thread state before calling `f` and tears it down afterward.
+    ///
+    /// The default implementation simply calls `f()` with no additional setup.
+    /// Platforms that require explicit thread registration should override this.
+    fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
 }
 
 /// Provider for consuming platform-originating signals.

@@ -1029,7 +1029,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         }
     }
 
-    fn init_test_thread(&self) {
+    fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
         // to mirror the TLS base used in guest context, so that test threads can use the
         // same TLS access code as guest threads.
@@ -1065,6 +1065,14 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         CURRENT_THREAD.with_borrow_mut(|current| {
             *current = Some(handle);
         });
+
+        let result = f();
+
+        CURRENT_THREAD.with_borrow_mut(|current| {
+            *current = None;
+        });
+
+        result
     }
 }
 

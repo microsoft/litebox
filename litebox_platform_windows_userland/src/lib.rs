@@ -352,7 +352,7 @@ impl litebox::platform::SignalProvider for WindowsUserland {
 /// Ensures the module-wide TLS slot index ([`TLS_INDEX`]) has been allocated.
 ///
 /// This must be called before any code that reads `TLS_INDEX`. Both
-/// [`run_thread`] (guest threads) and [`init_test_thread`](WindowsUserland::init_test_thread)
+/// [`run_thread`] (guest threads) and [`run_test_thread`](WindowsUserland::run_test_thread)
 /// (test threads) go through here.
 fn ensure_tls_index() {
     // Allocate a TLS slot for this module if not already done. This is used as
@@ -397,12 +397,6 @@ fn run_thread_inner(
         .guest_context_top
         .set(std::ptr::from_mut(ctx).wrapping_add(1));
 
-    // Safety: `tls_state` lives on the stack for the duration of this call.
-    unsafe { install_tls(&tls_state) };
-    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
-    let _tls_guard = litebox::utils::defer(|| unsafe {
-        windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null());
-    });
     let mut thread_ctx = ThreadContext {
         shim,
         ctx,
@@ -859,23 +853,13 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         );
     }
 
-    fn init_test_thread(&self) {
+    fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Ensure the module-wide TLS slot is allocated.
         ensure_tls_index();
-
-        // Create a minimal TlsState for the test thread. We deliberately leak
-        // the allocation so the TLS pointer remains valid for the thread's
-        // lifetime.
-        let tls: &'static TlsState = Box::leak(Box::new(TlsState::new()));
-
-        // Safety: `tls` is leaked so it outlives the thread.
-        unsafe { install_tls(tls) };
-
-        // Create a ThreadHandle for the current thread.
-        let handle = ThreadHandle::for_current_thread(tls);
-        CURRENT_THREAD_HANDLE.with_borrow_mut(|current| {
-            *current = Some(handle);
-        });
+        let tls = TlsState::new();
+        ThreadHandle::run_with_handle(&tls, || {
+            f()
+        })
     }
 }
 
@@ -936,8 +920,7 @@ thread_local! {
 ///
 /// The Ctrl+C handler picks a thread from this list to deliver SIGINT.
 /// Threads are registered in [`ThreadHandle::run_with_handle`] and
-/// [`WindowsUserland::init_test_thread`], and removed when the guard drops
-/// or the thread exits.
+/// removed when the guard drops.
 ///
 /// TODO: This global list only works when we support a single process. For
 /// multi-process support, each process (or `WindowsUserland` instance) should
@@ -960,9 +943,11 @@ impl ThreadHandle {
         }))))
     }
 
-    /// Creates a [`ThreadHandle`] for the current thread, registers it in
-    /// [`ACTIVE_THREADS`] and [`CURRENT_THREAD_HANDLE`], and returns a clone.
-    fn register_current_thread(tls: &TlsState) -> ThreadHandle {
+    /// Runs `f`, ensuring that [`CURRENT_THREAD_HANDLE`] is set while in the call to `f`.
+    fn run_with_handle<R>(tls: &TlsState, f: impl FnOnce() -> R) -> R {
+        // Safety: `tls_state` lives for the duration of this call.
+        unsafe { install_tls(tls) };
+
         let handle = Self::for_current_thread(tls);
         ACTIVE_THREADS.lock().unwrap().push(handle.clone());
         CURRENT_THREAD_HANDLE.with_borrow_mut(|current| {
@@ -972,7 +957,18 @@ impl ThreadHandle {
             );
             *current = Some(handle.clone());
         });
-        handle
+        let _guard = litebox::utils::defer(move || {
+            let current = CURRENT_THREAD_HANDLE.take().unwrap();
+            // Remove from the global registry.
+            ACTIVE_THREADS
+                .lock()
+                .unwrap()
+                .retain(|h| !Arc::ptr_eq(&h.0, &current.0));
+            *current.0.lock().unwrap() = None;
+            let tls_index = TLS_INDEX.load(Ordering::Relaxed);
+            unsafe { windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null()) };
+        });
+        f()
     }
 
     /// Sets a pending signal on this thread, wakes it from any condvar wait,
@@ -1001,21 +997,6 @@ impl ThreadHandle {
         }
 
         self.interrupt(None);
-    }
-
-    /// Runs `f`, ensuring that [`CURRENT_THREAD_HANDLE`] is set while in the call to `f`.
-    fn run_with_handle<R>(tls: &TlsState, f: impl FnOnce() -> R) -> R {
-        Self::register_current_thread(tls);
-        let _guard = litebox::utils::defer(move || {
-            let current = CURRENT_THREAD_HANDLE.take().unwrap();
-            // Remove from the global registry.
-            ACTIVE_THREADS
-                .lock()
-                .unwrap()
-                .retain(|h| !Arc::ptr_eq(&h.0, &current.0));
-            *current.0.lock().unwrap() = None;
-        });
-        f()
     }
 
     /// Interrupt the thread represented by this handle, where `current` is the
