@@ -92,16 +92,19 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 //
 // Low canonical half  (0x0000_0000_0000_0000 .. 0x0000_7FFF_FFFF_FFFF):
 //  0x0000_7FFF_FFFF_F000  ┌─────────────────────────────────┐ ← USER_ADDR_MAX
-//                         │ User address space (~64 TiB)    │
+//                         │ User address space (~4 GiB)     │
 //                         │ mmap / TA memory                │
-//  0x0000_3FFF_FFFF_F000  ├─────────────────────────────────┤ ← USER_ADDR_MIN
+//  0x0000_7FFE_FFFF_F000  ├─────────────────────────────────┤ ← USER_ADDR_MIN
+//                         │        (unmapped gap)           │
+//  0x0000_4000_0000_0000  ├─────────────────────────────────┤
 //                         │ Identity-mapped (VA == PA)      │
 //                         │ up to 64 TiB of physical memory │
 //  0x0000_0000_0000_0000  └─────────────────────────────────┘
 //
-// Identity-mapped region covers [0, USER_ADDR_MIN) in the low canonical half.
+// Identity-mapped region covers [0, 64 TiB) in the low canonical half.
 // 4-level paging supports up to 64 TiB of physical memory (46-bit MAXPHYADDR),
 // so 64 TiB of identity-map VA space is sufficient.
+// There is an unmapped gap between the identity-mapped region and USER_ADDR_MIN.
 // USER_ADDR_MIN..USER_ADDR_MAX is reserved for user-space allocations.
 // VMAP_START..VMAP_END is in the high canonical half for vmap mappings.
 
@@ -119,7 +122,8 @@ pub(crate) const VMAP_END: usize = 0xFFFF_CFFF_FFFF_F000;
 const USER_ADDR_MAX: usize = 0x7FFF_FFFF_F000;
 
 /// Size of the user address space range.
-const USER_ADDR_RANGE_SIZE: usize = 0x4000_0000_0000; // 64 TiB
+/// TODO: Restricted to 4 GiB due to slow `cleanup_user_mappings`. Will fix this issue.
+const USER_ADDR_RANGE_SIZE: usize = 0x1_0000_0000; // 4 GiB
 
 /// Minimum virtual address for user-space allocations.
 ///
