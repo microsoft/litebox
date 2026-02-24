@@ -6,7 +6,7 @@
 pub mod error;
 pub(crate) mod heki;
 pub mod hvcall;
-mod hvcall_mm;
+pub(crate) mod hvcall_mm;
 mod hvcall_vp;
 mod mem_integrity;
 pub(crate) mod ringbuffer;
@@ -15,6 +15,7 @@ pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
+use crate::arch::MAX_CORES;
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
@@ -73,10 +74,16 @@ pub const VTL_ENTRY_REASON_RESERVED: u32 = 0x0;
 pub const VTL_ENTRY_REASON_LOWER_VTL_CALL: u32 = 0x1;
 pub const VTL_ENTRY_REASON_INTERRUPT: u32 = 0x2;
 
+pub const HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX: u16 = 0x_0013;
+pub const HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST_EX: u16 = 0x_0014;
 pub const HVCALL_MODIFY_VTL_PROTECTION_MASK: u16 = 0x_000c;
 pub const HVCALL_ENABLE_VP_VTL: u16 = 0x_000f;
 pub const HVCALL_GET_VP_REGISTERS: u16 = 0x_0050;
 pub const HVCALL_SET_VP_REGISTERS: u16 = 0x_0051;
+
+pub const HV_FLUSH_ALL_PROCESSORS: u64 = 1 << 0;
+pub const HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES: u64 = 1 << 1;
+pub const HV_FLUSH_NON_GLOBAL_MAPPINGS_ONLY: u64 = 1 << 2;
 
 pub const HV_X64_REGISTER_RIP: u32 = 0x0002_0010;
 pub const HV_X64_REGISTER_CR0: u32 = 0x0004_0000;
@@ -517,6 +524,67 @@ impl Default for HvInputModifyVtlProtectionMask {
     }
 }
 
+/// VP-set format for sparse 4K virtual processor numbering.
+pub const HV_GENERIC_SET_SPARSE_4K: u64 = 0;
+
+/// Number of VP banks encoded in EX flush requests.
+///
+/// Each bank contains 64 VPs.
+pub const HV_FLUSH_EX_VP_SET_BANKS: usize = MAX_CORES.div_ceil(64);
+
+/// Input structure for `HvCallFlushVirtualAddressSpaceEx` (0x0013).
+///
+/// Layout (<https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/hypercalls/hvcallflushvirtualaddressspaceex>):
+/// - `address_space` (u64)
+/// - `flags` (u64)
+/// - VP set header: `vp_set_format` (u64), `vp_set_valid_bank_mask` (u64)
+/// - VP set banks: `vp_set_bank_contents` (u64 per bank)
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvInputFlushVirtualAddressSpaceEx {
+    pub address_space: u64,
+    pub flags: u64,
+    pub vp_set_format: u64,
+    pub vp_set_valid_bank_mask: u64,
+    pub vp_set_bank_contents: [u64; HV_FLUSH_EX_VP_SET_BANKS],
+}
+
+/// Input structure for `HvCallFlushVirtualAddressListEx` (0x0014).
+///
+/// Layout (<https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/hypercalls/hvcallflushvirtualaddresslistex>):
+/// - Fixed header: `address_space` (u64), `flags` (u64)
+/// - Variable header: VP set (`vp_set_*` and bank contents)
+/// - Rep elements: array of `HV_GVA_RANGE` entries (u64 each)
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+pub struct HvInputFlushVirtualAddressListEx {
+    pub address_space: u64,
+    pub flags: u64,
+    pub vp_set_format: u64,
+    pub vp_set_valid_bank_mask: u64,
+    pub vp_set_bank_contents: [u64; HV_FLUSH_EX_VP_SET_BANKS],
+    pub gva_range_list: [u64; HV_FLUSH_EX_MAX_GVAS],
+}
+
+/// Maximum number of GVA entries that fit in one input page for
+/// `HvInputFlushVirtualAddressListEx` with a VP set sized for `MAX_CORES`.
+///
+/// Input page = 4096 bytes.
+/// Header = (4 + `HV_FLUSH_EX_VP_SET_BANKS`) * 8 bytes.
+#[expect(clippy::cast_possible_truncation)]
+const HV_FLUSH_EX_MAX_GVAS: usize = ((PAGE_SIZE as u32
+    - (4 + HV_FLUSH_EX_VP_SET_BANKS as u32) * (u64::BITS / 8))
+    / (u64::BITS / 8)) as usize;
+
+impl HvInputFlushVirtualAddressListEx {
+    /// Number of 64-bit words occupied by the VP-set variable header.
+    #[allow(clippy::cast_possible_truncation)]
+    pub const VP_SET_QWORD_COUNT: u16 = (2 + HV_FLUSH_EX_VP_SET_BANKS) as u16;
+
+    /// Maximum number of GVA range entries per EX hypercall invocation.
+    pub const MAX_GVAS_PER_REQUEST: usize = HV_FLUSH_EX_MAX_GVAS;
+}
+
 #[bitfield]
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -851,6 +919,17 @@ impl HvPendingExceptionEvent {
     pub fn as_u64(&self) -> u64 {
         u64::from_le_bytes(self.into_bytes())
     }
+}
+
+/// Check whether Hyper-V hypercalls are ready.
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn is_hvcall_ready() -> bool {
+    use crate::host::per_cpu_variables::with_per_cpu_variables_asm;
+    // The VTL return address is configured only after the hypercall page
+    // has been set up, so a non-zero value indicates that hypercalls are
+    // available.
+    with_per_cpu_variables_asm(|pcv| pcv.get_vtl_return_addr() != 0)
 }
 
 #[cfg(test)]

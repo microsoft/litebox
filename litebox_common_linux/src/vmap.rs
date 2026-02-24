@@ -166,12 +166,16 @@ pub enum PhysPointerError {
     NoMappingInfo,
     #[error("Overflow occurred during calculation")]
     Overflow,
-    #[error("Non-contiguous physical pages in the array")]
-    NonContiguousPages,
     #[error("The operation is unsupported on this platform")]
     UnsupportedOperation,
     #[error("Unsupported permissions: {0:#x}")]
     UnsupportedPermissions(u8),
     #[error("Memory copy failed")]
     CopyFailed,
+    #[error("Duplicate physical page address {0:#x} in the input array")]
+    DuplicatePhysicalAddress(usize),
+    #[error("Virtual address space exhausted in vmap region")]
+    VaSpaceExhausted,
+    #[error("Page-table frame allocation failed (out of memory)")]
+    FrameAllocationFailed,
 }

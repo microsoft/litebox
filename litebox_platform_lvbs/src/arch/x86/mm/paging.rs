@@ -3,6 +3,7 @@
 
 use litebox::mm::linux::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
 use litebox::platform::page_mgmt;
+use litebox::utils::TruncateExt;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -12,7 +13,7 @@ use x86_64::{
             PageTableFlags, PhysFrame, Size4KiB, Translate,
             frame::PhysFrameRange,
             mapper::{
-                FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
+                CleanUp, FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
                 UnmapError as X64UnmapError,
             },
         },
@@ -25,10 +26,54 @@ use crate::mm::{
     pgtable::{PageTableAllocator, PageTableImpl},
 };
 
+/// When we flush multiple TLB entries, flushing the entire TLB (e.g., write to CR3)
+/// can be more efficient than flushing individual entries (e.g., `invlpg`).
+/// This threshold is a heuristic from the Linux kernel:
+/// <https://elixir.bootlin.com/linux/v6.18.6/source/arch/x86/mm/tlb.c#L1394>
 #[cfg(not(test))]
-const FLUSH_TLB: bool = true;
+const TLB_SINGLE_PAGE_FLUSH_CEILING: usize = 33;
+
+/// Flush TLB entries for a contiguous page range across all cores.
+///
+/// Uses Hyper-V hypercalls so that remote cores sharing the same page table
+/// also see the invalidation.
+#[cfg(not(test))]
+fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
+    use crate::mshv::{hvcall_mm, is_hvcall_ready};
+
+    if count == 0 {
+        return;
+    }
+
+    // If the current VP is the BSP, it might use MM operations **before** the hypercall page is set up.
+    // In that case, we fall back to local TLB flushes. This is safe because no AP enters VTL1 yet.
+    if !is_hvcall_ready() {
+        if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
+            let base = start.start_address().as_u64();
+            for i in 0..count {
+                x86_64::instructions::tlb::flush(VirtAddr::new(base + (i as u64) * Size4KiB::SIZE));
+            }
+        } else {
+            x86_64::instructions::tlb::flush_all();
+        }
+        return;
+    }
+
+    let result = if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
+        hvcall_mm::hv_flush_virtual_address_list(start.start_address().as_u64(), count)
+    } else {
+        hvcall_mm::hv_flush_virtual_address_space()
+    };
+
+    if let Err(e) = result {
+        // Hypercall failed — fall back to local flush so this core is at least coherent.
+        debug_assert!(false, "TLB flush hypercall failed: {e:?}");
+        x86_64::instructions::tlb::flush_all();
+    }
+}
+
 #[cfg(test)]
-const FLUSH_TLB: bool = false;
+fn flush_tlb_range(_start: Page<Size4KiB>, _count: usize) {}
 
 #[inline]
 fn frame_to_pointer<M: MemoryProvider>(frame: PhysFrame) -> *mut PageTable {
@@ -102,38 +147,41 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         UserMutPtr::from_ptr(range.start as *mut u8)
     }
 
-    /// Unmap 4KiB pages from the page table
-    /// Set `dealloc_frames` to `true` to free the corresponding physical frames.
+    /// Unmap a range of 4KiB pages from the page table.
+    ///
+    /// Set `dealloc_frames` to `true` to free the corresponding physical frames. Skip this
+    /// when the corresponding physical frames are managed elsewhere (e.g., VTL0).
     /// Set `flush_tlb` to `true` to flush TLB entries after unmapping (not needed when
     /// the page table is being destroyed).
-    ///
-    /// Note it does not free the allocated frames for page table itself (only those allocated to
-    /// user space).
+    /// Set `clean_up_page_tables` to `true` to free intermediate page-table frames
+    /// (P1/P2/P3) that become empty after unmapping. Skip this when the VA range
+    /// will be reused soon, as the intermediate frames would just be re-allocated.
     pub(crate) unsafe fn unmap_pages(
         &self,
         range: PageRange<ALIGN>,
         dealloc_frames: bool,
         flush_tlb: bool,
+        clean_up_page_tables: bool,
     ) -> Result<(), page_mgmt::DeallocationError> {
-        let start_va = VirtAddr::new(range.start as _);
-        let start = Page::<Size4KiB>::from_start_address(start_va)
+        if range.is_empty() {
+            return Ok(());
+        }
+        let start = Page::<Size4KiB>::from_start_address(VirtAddr::new(range.start as _))
             .or(Err(page_mgmt::DeallocationError::Unaligned))?;
-        let end_va = VirtAddr::new(range.end as _);
-        let end = Page::<Size4KiB>::from_start_address(end_va)
+        let end = Page::<Size4KiB>::from_start_address(VirtAddr::new(range.end as _))
             .or(Err(page_mgmt::DeallocationError::Unaligned))?;
         let mut allocator = PageTableAllocator::<M>::new();
 
+        // Note: TLB entries are batch-flushed after all pages are unmapped, consistent
+        // with the Linux kernel's mmu_gather approach.
         // Note this implementation is slow as each page requires a full page table walk.
         // If we have N pages, it will be N times slower.
         let mut inner = self.inner.lock();
         for page in Page::range(start, end) {
             match inner.unmap(page) {
-                Ok((frame, fl)) => {
+                Ok((frame, _)) => {
                     if dealloc_frames {
                         unsafe { allocator.deallocate_frame(frame) };
-                    }
-                    if flush_tlb && FLUSH_TLB {
-                        fl.flush();
                     }
                 }
                 Err(X64UnmapError::PageNotMapped) => {}
@@ -145,42 +193,34 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
             }
         }
+
+        if flush_tlb {
+            let page_count = (end.start_address() - start.start_address()) / Size4KiB::SIZE;
+            // Present → not-present: other cores may hold stale entries.
+            flush_tlb_range(start, page_count.truncate());
+        }
+
+        if clean_up_page_tables {
+            // Safety: all leaf entries in the range have been unmapped above;
+            // the caller guarantees this VA range is no longer in use.
+            unsafe {
+                inner.clean_up_addr_range(Page::range_inclusive(start, end - 1u64), &mut allocator);
+            }
+        }
+
         Ok(())
     }
 
-    /// Unmap and deallocate all user pages and their page table frames.
-    ///
-    /// User pages are identified by their virtual address being in range
-    /// [user_addr_min, user_addr_max). This works because:
-    /// - Kernel memory uses addresses outside this range (e.g., low addresses for
-    ///   identity mapped VA == PA, or future designs with high kernel addresses)
-    /// - User memory uses addresses in [user_addr_min, user_addr_max), allocated via mmap
-    ///
-    /// This method deallocates:
-    /// 1. All user data frames (pages with VA in [user_addr_min, user_addr_max))
-    /// 2. ALL page table frames (P1/P2/P3) regardless of address range
-    ///    (because each user page table has its own PT frame allocations,
-    ///    including for the kernel identity mapping)
-    ///
-    /// Kernel data frames (physical memory) are NOT deallocated - only their
-    /// page table entries are cleaned up.
+    /// Clean up intermediate page table frames (P1-P3) for a task page table
+    /// that is being destroyed.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that no references to the unmapped pages exist.
-    /// Once we implement page fault handling for user pages with memcpy_fallible in the LVBS platform,
-    /// this safety requirement can be relaxed.
-    pub(crate) unsafe fn cleanup_user_mappings(&self, user_addr_min: usize, user_addr_max: usize) {
+    /// The caller must ensure that:
+    /// - All user data frames have been released before calling this function (e.g., using `PageManager::release_memory()`)
+    /// - The page table is no longer active (not loaded in CR3)
+    pub(crate) unsafe fn cleanup_page_table_frames(&self) {
         use x86_64::structures::paging::mapper::CleanUp;
-
-        // Unmap and deallocate user data pages
-        // No TLB flush needed - this page table is being destroyed and will never be reused
-        let user_range = PageRange::<ALIGN> {
-            start: user_addr_min,
-            end: user_addr_max,
-        };
-        // Safety: The caller ensures no references to the unmapped pages exist.
-        let _ = unsafe { self.unmap_pages(user_range, true, false) };
 
         // Clean up all empty P1 - P3 tables
         let mut allocator = PageTableAllocator::<M>::new();
@@ -204,10 +244,13 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         let end: Page<Size4KiB> = Page::from_start_address(VirtAddr::new(old_range.end as u64))
             .or(Err(page_mgmt::RemapError::Unaligned))?;
 
+        // Note: TLB entries for the old addresses are batch-flushed after all pages
+        // are remapped, consistent with the Linux kernel's approach.
         // Note this implementation is slow as each page requires three full page table walks.
         // If we have N pages, it will be 3N times slower.
         let mut allocator = PageTableAllocator::<M>::new();
         let mut inner = self.inner.lock();
+        let flush_start = start;
         while start < end {
             match inner.translate(start.start_address()) {
                 TranslateResult::Mapped {
@@ -215,7 +258,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     offset: _,
                     flags,
                 } => match inner.unmap(start) {
-                    Ok((frame, fl)) => {
+                    Ok((frame, _)) => {
                         match unsafe { inner.map_to(new_start, frame, flags, &mut allocator) } {
                             Ok(_) => {}
                             Err(e) => match e {
@@ -229,9 +272,6 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                                     return Err(page_mgmt::RemapError::OutOfMemory);
                                 }
                             },
-                        }
-                        if FLUSH_TLB {
-                            fl.flush();
                         }
                     }
                     Err(X64UnmapError::PageNotMapped) => {
@@ -255,6 +295,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             new_start += 1;
         }
 
+        // Flush old (unmapped) addresses — other cores may hold stale entries.
+        let page_count = (end.start_address() - flush_start.start_address()) / Size4KiB::SIZE;
+        flush_tlb_range(flush_start, page_count.truncate());
+
         Ok(UserMutPtr::from_ptr(new_range.start as *mut u8))
     }
 
@@ -270,6 +314,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             Page::from_start_address(start).or(Err(page_mgmt::PermissionUpdateError::Unaligned))?;
         let end: Page<Size4KiB> = Page::containing_address(end - 1);
 
+        // Note: TLB entries are batch-flushed after all permission updates, consistent
+        // with the Linux kernel's flush_tlb_range approach.
         // TODO: this implementation is slow as each page requires two full page table walks.
         // If we have N pages, it will be 2N times slower.
         let mut inner = self.inner.lock();
@@ -292,11 +338,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                         match unsafe {
                             inner.update_flags(page, (flags & !Self::MPROTECT_PTE_MASK) | new_flags)
                         } {
-                            Ok(fl) => {
-                                if FLUSH_TLB {
-                                    fl.flush();
-                                }
-                            }
+                            Ok(_) => {}
                             Err(e) => match e {
                                 FlagUpdateError::PageNotMapped => unreachable!(),
                                 FlagUpdateError::ParentEntryHugePage => {
@@ -312,6 +354,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
             }
         }
+
+        let page_count = (end.start_address() - start.start_address()) / Size4KiB::SIZE + 1;
+        // Permission change: other cores may hold stale (wider) permissions.
+        flush_tlb_range(start, page_count.truncate());
 
         Ok(())
     }
@@ -353,11 +399,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             match unsafe {
                 inner.map_to_with_table_flags(page, target_frame, flags, flags, &mut allocator)
             } {
-                Ok(fl) => {
-                    if FLUSH_TLB {
-                        fl.flush();
-                    }
-                }
+                Ok(_) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -365,11 +407,157 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
 
+    /// Map non-contiguous physical frames to virtually contiguous addresses.
+    ///
+    /// This function maps each physical frame in `frames` to consecutive virtual addresses
+    /// starting from `base_va`. Unlike `map_phys_frame_range`, this allows mapping
+    /// non-contiguous physical pages to a contiguous virtual address range.
+    ///
+    /// # Arguments
+    /// - `frames` - Slice of physical frames to map (non-contiguous, no duplicate)
+    /// - `base_va` - Starting virtual address for the mapping
+    /// - `flags` - Page table flags to apply to all mappings
+    ///
+    /// # Returns
+    /// - `Ok(*mut u8)` — pointer to the start of the mapped virtual range
+    /// - `Err(MapToError::PageAlreadyMapped)` if any VA is already mapped
+    /// - `Err(MapToError::FrameAllocationFailed)` if page table allocation fails
+    ///
+    /// # Behavior
+    /// - Any existing mapping is treated as an error
+    /// - On error, all pages mapped by this call are unmapped (atomic)
+    #[cfg(feature = "optee_syscall")]
+    pub(crate) fn map_non_contiguous_phys_frames(
+        &self,
+        frames: &[PhysFrame<Size4KiB>],
+        base_va: VirtAddr,
+        flags: PageTableFlags,
+    ) -> Result<*mut u8, MapToError<Size4KiB>> {
+        let mut allocator = PageTableAllocator::<M>::new();
+        let mut mapped_count: usize = 0;
+
+        let mut inner = self.inner.lock();
+
+        let start_page = Page::<Size4KiB>::from_start_address(base_va)
+            .map_err(|_| MapToError::FrameAllocationFailed)?;
+        let end_page = start_page + frames.len() as u64;
+
+        let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        for (page, &target_frame) in Page::range(start_page, end_page).zip(frames.iter()) {
+            // Note: Since we lock the entire page table for the duration of this function (`self.inner.lock()`),
+            // there should be no concurrent modifications to the page table. If we allow concurrent mappings
+            // in the future, we should re-check the VA here before mapping and return an error
+            // if it is no longer unmapped.
+            match unsafe {
+                inner.map_to_with_table_flags(
+                    page,
+                    target_frame,
+                    flags,
+                    table_flags,
+                    &mut allocator,
+                )
+            } {
+                Ok(_) => {
+                    mapped_count += 1;
+                }
+                Err(e) => {
+                    debug_assert!(
+                        false,
+                        "vmap: map_to_with_table_flags failed at page {page:?}: {e:?}"
+                    );
+                    if mapped_count > 0 {
+                        crate::debug_serial_println!(
+                            "vmap: rolling back {mapped_count} pages mapped at {base_va:#x} due to error"
+                        );
+                        Self::rollback_mapped_pages(
+                            &mut inner,
+                            Page::range_inclusive(
+                                start_page,
+                                start_page + (mapped_count as u64 - 1), // inclusive range
+                            ),
+                            &mut allocator,
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(base_va.as_mut_ptr())
+    }
+
+    /// Rollback helper: unmap the pages in `pages` and free any intermediate
+    /// page-table frames (P1/P2/P3) that became empty.
+    ///
+    /// `pages` are inclusive as `clean_up_addr_range` expects an inclusive range.
+    ///
+    /// Note: The caller must already hold the page table lock (`self.inner`).
+    /// This function accepts the locked `MappedPageTable` directly.
+    #[cfg(feature = "optee_syscall")]
+    fn rollback_mapped_pages(
+        inner: &mut MappedPageTable<'_, FrameMapping<M>>,
+        pages: x86_64::structures::paging::page::PageRangeInclusive<Size4KiB>,
+        allocator: &mut PageTableAllocator<M>,
+    ) {
+        for page in pages {
+            let _ = inner.unmap(page);
+        }
+
+        // Safety: all leaf entries in `pages` have been unmapped above while
+        // holding `self.inner`, so any P1/P2/P3 frames that became empty can
+        // be safely freed.
+        unsafe {
+            inner.clean_up_addr_range(pages, allocator);
+        }
+    }
+
     /// This function creates a new empty top-level page table.
     pub(crate) unsafe fn new_top_level() -> Self {
         let frame = PageTableAllocator::<M>::allocate_frame(true)
             .expect("Failed to allocate a new page table frame");
         unsafe { Self::init(frame.start_address()) }
+    }
+
+    /// Copy all non-zero PML4 entries from `source` into this page table.
+    ///
+    /// This is used to share kernel page table structures (P3/P2/P1) between
+    /// the base page table and task page tables, avoiding per-task allocation
+    /// of intermediate page table frames for the kernel region.
+    ///
+    /// Only entries that are present in `source` and absent in `self` are copied.
+    /// Entries already present in `self` are left unchanged.
+    pub(crate) fn copy_pml4_entries_from(&self, source: &Self) {
+        let mut dst = self.inner.lock();
+        let src = source.inner.lock();
+        for (dst_entry, src_entry) in dst
+            .level_4_table_mut()
+            .iter_mut()
+            .zip(src.level_4_table().iter())
+        {
+            if !src_entry.is_unused() && dst_entry.is_unused() {
+                dst_entry.set_addr(src_entry.addr(), src_entry.flags());
+            }
+        }
+    }
+
+    /// Clear PML4 entries that are shared with the base page table.
+    ///
+    /// This must be called before `cleanup_page_table_frames` / `drop` to
+    /// prevent the task page table from freeing P3/P2/P1 frames that are
+    /// owned by the base page table.
+    pub(crate) fn clear_shared_pml4_entries(&self, base: &Self) {
+        let mut dst = self.inner.lock();
+        let src = base.inner.lock();
+        for (dst_entry, src_entry) in dst
+            .level_4_table_mut()
+            .iter_mut()
+            .zip(src.level_4_table().iter())
+        {
+            // If the entry points to the same P3 frame as the base, it is shared.
+            if !src_entry.is_unused() && dst_entry.addr() == src_entry.addr() {
+                dst_entry.set_unused();
+            }
+        }
     }
 
     /// This function changes the address space of the current processor/core using the given page table
@@ -488,11 +676,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                         &mut allocator,
                     )
                 } {
-                    Ok(fl) => {
-                        if FLUSH_TLB {
-                            fl.flush();
-                        }
-                    }
+                    Ok(_fl) => {}
                     Err(e) => {
                         unsafe { allocator.deallocate_frame(frame) };
                         match e {
