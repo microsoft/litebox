@@ -321,22 +321,35 @@ impl WindowsUserland {
 }
 
 impl litebox::platform::Provider for WindowsUserland {}
-impl litebox::platform::SignalProvider for WindowsUserland {}
 
-/// Runs a guest thread using the provided shim and the given initial context.
+impl litebox::platform::SignalProvider for WindowsUserland {
+    fn take_pending_signals(&self, mut f: impl FnMut(litebox::shim::Signal)) {
+        // Drain per-thread pending signals.
+        let bits = get_tls_ptr()
+            .map(|p| {
+                unsafe { &*p }
+                    .pending_host_signals
+                    .swap(0, Ordering::SeqCst)
+            })
+            .unwrap_or(0);
+
+        // TODO: fix it
+        for signum in 1..=31u32 {
+            if bits & (1 << (signum - 1)) != 0 {
+                if let Some(signal) = litebox::shim::Signal::from_raw(signum) {
+                    f(signal);
+                }
+            }
+        }
+    }
+}
+
+/// Ensures the module-wide TLS slot index ([`TLS_INDEX`]) has been allocated.
 ///
-/// This will run until the thread terminates.
-///
-/// # Safety
-/// The context must be valid guest context.
-#[expect(
-    clippy::missing_panics_doc,
-    reason = "the caller cannot control whether this will panic"
-)]
-pub unsafe fn run_thread(
-    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &mut litebox_common_linux::PtRegs,
-) {
+/// This must be called before any code that reads `TLS_INDEX`. Both
+/// [`run_thread`] (guest threads) and [`init_test_thread`](WindowsUserland::init_test_thread)
+/// (test threads) go through here.
+fn ensure_tls_index() {
     // Allocate a TLS slot for this module if not already done. This is used as
     // a place to store data across calls to the guest, since all the registers
     // are used by the guest and will be clobbered.
@@ -354,6 +367,19 @@ pub unsafe fn run_thread(
         );
         TLS_INDEX.store(index, Ordering::Relaxed);
     });
+}
+
+/// Runs a guest thread using the provided shim and the given initial context.
+///
+/// This will run until the thread terminates.
+///
+/// # Safety
+/// The context must be valid guest context.
+pub unsafe fn run_thread(
+    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    ensure_tls_index();
     run_thread_inner(&shim, ctx);
 }
 
@@ -361,22 +387,14 @@ fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
+    let tls_state = TlsState::new();
+    tls_state
+        .guest_context_top
+        .set(std::ptr::from_mut(ctx).wrapping_add(1));
+
+    // Safety: `tls_state` lives on the stack for the duration of this call.
+    unsafe { install_tls(&tls_state) };
     let tls_index = TLS_INDEX.load(Ordering::Relaxed);
-    let tls_state = TlsState {
-        host_sp: Cell::new(core::ptr::null_mut()),
-        host_bp: Cell::new(core::ptr::null_mut()),
-        guest_context_top: std::ptr::from_mut(ctx).wrapping_add(1).into(),
-        scratch: 0.into(),
-        is_in_guest: false.into(),
-        interrupt: false.into(),
-        continue_context: Box::default(),
-    };
-    unsafe {
-        windows_sys::Win32::System::Threading::TlsSetValue(
-            tls_index,
-            core::ptr::from_ref(&tls_state).cast(),
-        );
-    }
     let _tls_guard = litebox::utils::defer(|| unsafe {
         windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null());
     });
@@ -401,6 +419,53 @@ struct TlsState {
     interrupt: Cell<bool>,
     continue_context:
         Box<std::cell::UnsafeCell<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>>,
+    /// Bitmask of pending host-originated signals for this thread.
+    /// Bit `(signum - 1)` is set when signal `signum` is pending.
+    /// Accessed atomically because timer callbacks run on threadpool threads.
+    pending_host_signals: AtomicU32,
+    /// Address currently being waited on via `WaitOnAddress`, or null.
+    waiting_condvar: std::sync::atomic::AtomicPtr<c_void>,
+    /// Lock held across `WaitOnAddress` in [`RawMutex::block_or_maybe_timeout`].
+    ///
+    /// The interrupt path uses `try_lock` to determine whether the target
+    /// thread is currently blocked:
+    /// - `try_lock` succeeds → not inside `WaitOnAddress`.
+    /// - `try_lock` fails → inside `WaitOnAddress`; read `waiting_condvar`
+    ///   and call `WakeByAddressAll`.
+    waiting_lock: Mutex<()>,
+}
+
+impl TlsState {
+    /// Creates a new `TlsState` with all fields zeroed / defaulted.
+    fn new() -> Self {
+        Self {
+            host_sp: Cell::new(core::ptr::null_mut()),
+            host_bp: Cell::new(core::ptr::null_mut()),
+            guest_context_top: core::ptr::null_mut::<litebox_common_linux::PtRegs>().into(),
+            scratch: 0.into(),
+            is_in_guest: false.into(),
+            interrupt: false.into(),
+            continue_context: Box::default(),
+            pending_host_signals: AtomicU32::new(0),
+            waiting_condvar: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            waiting_lock: Mutex::new(()),
+        }
+    }
+}
+
+/// Stores `tls` in the current thread's Windows TLS slot.
+///
+/// # Safety
+///
+/// The caller must ensure `tls` remains valid for the duration of its use.
+unsafe fn install_tls(tls: &TlsState) {
+    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
+    unsafe {
+        windows_sys::Win32::System::Threading::TlsSetValue(
+            tls_index,
+            core::ptr::from_ref(tls).cast(),
+        );
+    }
 }
 
 fn get_tls_ptr() -> Option<*const TlsState> {
@@ -408,9 +473,12 @@ fn get_tls_ptr() -> Option<*const TlsState> {
     if tls_index == u32::MAX {
         return None;
     }
-    Some(unsafe {
-        windows_sys::Win32::System::Threading::TlsGetValue(tls_index).cast::<TlsState>()
-    })
+    let ptr =
+        unsafe { windows_sys::Win32::System::Threading::TlsGetValue(tls_index).cast::<TlsState>() };
+    if ptr.is_null() {
+        return None;
+    }
+    Some(ptr)
 }
 
 /// Runs the guest thread until it terminates.
@@ -748,6 +816,102 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
             thread.interrupt(current.as_ref());
         });
     }
+
+    const SUPPORTS_SCHEDULE_INTERRUPT: bool = true;
+
+    fn schedule_interrupt(&self, thread: Option<&Self::ThreadHandle>, delay: core::time::Duration) {
+        if delay.is_zero() {
+            return;
+        }
+
+        let due_time_ms: u32 = {
+            let ms = delay.as_millis();
+            u32::try_from(ms).unwrap_or(u32::MAX)
+        };
+
+        // Use the provided thread handle or fall back to the current thread.
+        let thread = match thread {
+            Some(t) => t.clone(),
+            None => self.current_thread(),
+        };
+
+        // Pack the target thread handle into a heap allocation that the timer
+        // callback will free.
+        let ctx = Box::into_raw(Box::new(TimerCallbackContext { thread }));
+
+        let mut timer_handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        // Safety: CreateTimerQueueTimer is safe with valid arguments.
+        // We pass NULL for the timer queue to use the default timer queue.
+        // WT_EXECUTEONLYONCE ensures the callback fires only once.
+        let ok = unsafe {
+            windows_sys::Win32::System::Threading::CreateTimerQueueTimer(
+                &raw mut timer_handle,
+                std::ptr::null_mut(), // default timer queue
+                Some(timer_callback),
+                ctx.cast(),
+                due_time_ms,
+                0, // no repeat
+                windows_sys::Win32::System::Threading::WT_EXECUTEONLYONCE,
+            )
+        };
+        assert!(
+            ok != 0,
+            "CreateTimerQueueTimer failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn init_test_thread(&self) {
+        // Ensure the module-wide TLS slot is allocated.
+        ensure_tls_index();
+
+        // Create a minimal TlsState for the test thread. We deliberately leak
+        // the allocation so the TLS pointer remains valid for the thread's
+        // lifetime.
+        let tls: &'static TlsState = Box::leak(Box::new(TlsState::new()));
+
+        // Safety: `tls` is leaked so it outlives the thread.
+        unsafe { install_tls(tls) };
+
+        // Create a ThreadHandle for the current thread.
+        let handle = ThreadHandle::for_current_thread(tls);
+        CURRENT_THREAD_HANDLE.with_borrow_mut(|current| {
+            *current = Some(handle);
+        });
+    }
+}
+
+/// Context passed to the Windows timer-queue callback, carrying the target
+/// thread handle so the callback can directly interrupt the right thread.
+struct TimerCallbackContext {
+    thread: ThreadHandle,
+}
+
+/// Timer callback invoked by the Windows timer queue threadpool when an alarm fires.
+///
+/// Sets the SIGALRM bit in the target thread's `pending_host_signals`, then
+/// interrupts the thread to ensure signal-delivery code runs promptly.
+unsafe extern "system" fn timer_callback(context: *mut c_void, _timer_or_wait_fired: bool) {
+    // Safety: `context` was created via `Box::into_raw` in `schedule_interrupt`.
+    let ctx = unsafe { Box::from_raw(context.cast::<TimerCallbackContext>()) };
+
+    let sigalrm_bit: u32 = 1 << (litebox::shim::Signal::SIGALRM.as_raw() - 1);
+
+    // Set the pending signal on the target thread's TLS.
+    {
+        let inner = ctx.thread.0.lock().unwrap();
+        if let Some(inner) = inner.as_ref() {
+            // Safety: the TLS pointer is valid as long as the thread is alive,
+            // and we hold the thread handle lock so we know it hasn't exited.
+            let tls = unsafe { &*inner.tls.0 };
+            tls.pending_host_signals
+                .fetch_or(sigalrm_bit, Ordering::SeqCst);
+        }
+    }
+
+    // Interrupt the target thread so it re-enters the shim and processes
+    // the pending signal.
+    ctx.thread.interrupt(None);
 }
 
 #[derive(Clone)]
@@ -766,19 +930,24 @@ thread_local! {
 }
 
 impl ThreadHandle {
-    /// Runs `f`, ensuring that [`CURRENT_THREAD_HANDLE`] is set while in the call to `f`.
-    fn run_with_handle<R>(tls: &TlsState, f: impl FnOnce() -> R) -> R {
+    /// Creates a [`ThreadHandle`] referencing the calling OS thread.
+    fn for_current_thread(tls: &TlsState) -> ThreadHandle {
         let win_handle = unsafe {
             std::os::windows::io::BorrowedHandle::borrow_raw(
                 windows_sys::Win32::System::Threading::GetCurrentThread(),
             )
         };
-        let handle = ThreadHandle(Arc::new(Mutex::new(Some(ThreadHandleInner {
+        ThreadHandle(Arc::new(Mutex::new(Some(ThreadHandleInner {
             handle: win_handle
                 .try_clone_to_owned()
                 .expect("failed to clone current thread handle"),
             tls: SendConstPtr(tls),
-        }))));
+        }))))
+    }
+
+    /// Runs `f`, ensuring that [`CURRENT_THREAD_HANDLE`] is set while in the call to `f`.
+    fn run_with_handle<R>(tls: &TlsState, f: impl FnOnce() -> R) -> R {
+        let handle = Self::for_current_thread(tls);
         CURRENT_THREAD_HANDLE.with_borrow_mut(|current| {
             assert!(
                 current.is_none(),
@@ -786,7 +955,7 @@ impl ThreadHandle {
             );
             *current = Some(handle);
         });
-        let _guard = litebox::utils::defer(|| {
+        let _guard = litebox::utils::defer(move || {
             let current = CURRENT_THREAD_HANDLE.take().unwrap();
             *current.0.lock().unwrap() = None;
         });
@@ -859,7 +1028,22 @@ impl ThreadHandle {
 
         if !target_tls.is_in_guest.get() {
             // Not running in the guest. The interrupt flag will be checked
-            // before returning to the guest, so just resume.
+            // before returning to the guest.
+            //
+            // Use `try_lock` on `waiting_lock` to determine whether
+            // the thread is blocked in `WaitOnAddress`:
+            // - Success: not inside `WaitOnAddress`; the interrupt
+            //   flag will be seen before the next wait.
+            // - Failure: inside `WaitOnAddress` holding the lock;
+            //   read `waiting_condvar` and wake it.
+            if target_tls.waiting_lock.try_lock().is_err() {
+                let condvar = target_tls.waiting_condvar.load(Ordering::Acquire);
+                if !condvar.is_null() {
+                    unsafe {
+                        Win32_Threading::WakeByAddressAll(condvar);
+                    }
+                }
+            }
             return;
         }
 
@@ -1025,30 +1209,49 @@ impl RawMutex {
             }
         };
 
+        // Acquire the per-thread waiting lock so that
+        // `ThreadHandle::interrupt` can determine (via `try_lock`)
+        // whether we are blocked in `WaitOnAddress`.
+        let tls = get_tls_ptr().map(|p| unsafe { &*p });
+        let wait_addr = (&raw const self.inner).cast::<c_void>().cast_mut();
+        let _wait_guard = if let Some(tls) = tls {
+            tls.waiting_condvar.store(wait_addr, Ordering::Release);
+            let guard = tls.waiting_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Re-check the interrupt flag after acquiring the lock.
+            if tls.interrupt.get() {
+                tls.waiting_condvar
+                    .store(std::ptr::null_mut(), Ordering::Release);
+                return Err(ImmediatelyWokenUp);
+            }
+            Some(guard)
+        } else {
+            None
+        };
+
         let ok = unsafe {
             Win32_Threading::WaitOnAddress(
-                (&raw const self.inner).cast::<c_void>(),
+                wait_addr.cast_const(),
                 (&raw const val).cast::<c_void>(),
                 std::mem::size_of::<u32>(),
                 timeout_ms,
             ) != 0
         };
 
+        // Clear the wait address now that we are no longer blocked.
+        if let Some(tls) = tls {
+            tls.waiting_condvar
+                .store(std::ptr::null_mut(), Ordering::Release);
+        }
+        drop(_wait_guard);
+
         if ok {
             Ok(UnblockedOrTimedOut::Unblocked)
         } else {
-            // Check why WaitOnAddress failed
             let err = unsafe { GetLastError() };
             match err {
-                Win32_Foundation::ERROR_TIMEOUT => {
-                    // Timed out
-                    Ok(UnblockedOrTimedOut::TimedOut)
-                }
-                e => {
-                    // Other error, possibly spurious wakeup or value changed
-                    // Continue the loop to check the value again
-                    panic!("Unexpected error={e} for WaitOnAddress");
-                }
+                Win32_Foundation::ERROR_TIMEOUT => Ok(UnblockedOrTimedOut::TimedOut),
+                e => panic!("Unexpected error={e} for WaitOnAddress"),
             }
         }
     }

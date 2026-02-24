@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
+use std::unimplemented;
 
 use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
@@ -986,13 +987,17 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
 
     const SUPPORTS_SCHEDULE_INTERRUPT: bool = true;
 
-    fn schedule_interrupt(&self, delay: std::time::Duration) {
+    fn schedule_interrupt(&self, thread: Option<&Self::ThreadHandle>, delay: std::time::Duration) {
         if delay.is_zero() {
             return;
         }
 
-        // Arm a one-shot ITIMER_REAL timer. When it fires, the kernel delivers
-        // SIGALRM to a guest thread (non-guest threads block SIGALRM), and
+        if thread.is_some() {
+            unimplemented!("targeted interrupts are not implemented yet");
+        }
+
+        // Arm a one-shot timer. When it fires, the kernel delivers
+        // SIGALRM to a guest thread (non-guest threads should block SIGALRM), and
         // `interrupt_signal_handler` re-enters the shim via `interrupt_callback`.
         let secs = delay.as_secs().cast_signed();
         let usecs = libc::suseconds_t::from(delay.subsec_micros().cast_signed());
@@ -1016,6 +1021,48 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 std::ptr::null_mut::<libc::itimerval>(),
             );
         }
+    }
+
+    fn init_test_thread(&self) {
+        /// Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
+        /// to mirror the TLS base used in guest context, so that test threads can use the
+        /// same TLS access code as guest threads.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            // In guest context gs holds the host TLS base.  Mirror that in
+            // test threads so interrupt_signal_handler and
+            // signal_handler_exit_guest work identically.
+            core::arch::asm!(
+                "rdfsbase {tmp}",
+                "wrgsbase {tmp}",
+                tmp = out(reg) _,
+                options(nostack, preserves_flags),
+            );
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            // On x86, guest context stores host TLS selector in fs;
+            // host/test threads keep it in gs.  Copy gs → fs.
+            unsafe {
+                core::arch::asm!(
+                    "mov {tmp:x}, gs",
+                    "mov fs, {tmp:x}",
+                    tmp = out(reg) _,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+
+        let handle = ThreadHandle(std::sync::Arc::new(std::sync::Mutex::new(Some(unsafe {
+            libc::pthread_self()
+        }))));
+        CURRENT_THREAD.with_borrow_mut(|current| {
+            assert!(
+                current.is_none(),
+                "nested with_thread_handle calls are not supported"
+            );
+            *current = Some(handle);
+        });
     }
 }
 

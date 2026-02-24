@@ -97,7 +97,10 @@ pub trait ThreadProvider: RawPointerProvider {
     fn interrupt_thread(&self, thread: &Self::ThreadHandle);
 
     /// Similar to [`interrupt_thread`], but allows for a `delay` before the interrupt
-    /// takes effect and does not target a specific thread.
+    /// takes effect.
+    ///
+    /// If `thread` is `Some`, the interrupt targets that specific thread.
+    /// Otherwise, the platform chooses the target.
     ///
     /// Platforms that support this operation should override this and set
     /// [`SUPPORTS_SCHEDULE_INTERRUPT`](Self::SUPPORTS_SCHEDULE_INTERRUPT)
@@ -105,10 +108,20 @@ pub trait ThreadProvider: RawPointerProvider {
     ///
     /// [`interrupt_thread`]: Self::interrupt_thread
     #[allow(unused_variables, reason = "no-op by default")]
-    fn schedule_interrupt(&self, delay: core::time::Duration) {}
+    fn schedule_interrupt(&self, thread: Option<&Self::ThreadHandle>, delay: core::time::Duration) {
+    }
 
     /// Whether this platform implements [`schedule_interrupt`](Self::schedule_interrupt).
     const SUPPORTS_SCHEDULE_INTERRUPT: bool = false;
+
+    /// Registers the current thread with the platform so that
+    /// [`current_thread`](Self::current_thread) and related functionality
+    /// works on test threads that do not go through the normal
+    /// [`spawn_thread`](Self::spawn_thread) / guest entry path.
+    ///
+    /// This is a no-op by default. Platforms that require explicit thread
+    /// registration/setup should override this.
+    fn init_test_thread(&self) {}
 }
 
 /// Provider for consuming platform-originating signals.
