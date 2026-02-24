@@ -512,10 +512,13 @@ fn open_session_single_instance(
 
                 session_manager().remove_single_instance(&ta_uuid);
 
-                // Switch to base page table and delete the task page table
-                unsafe { switch_to_base_page_table() };
-                // Safety: We've switched to the base page table above.
-                let _ = unsafe { delete_task_page_table(task_pt_id) };
+                // Safety: We are about to tear down this TA instance;
+                // no references to user-space memory will be held afterwards.
+                unsafe {
+                    instance_arc.lock().shim.release_user_mappings();
+                    switch_to_base_page_table();
+                    let _ = delete_task_page_table(task_pt_id);
+                }
 
                 // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
                 // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
@@ -610,9 +613,13 @@ fn open_session_new_instance(
             runner_session_id,
         )
         .map_err(|_| {
-            unsafe { switch_to_base_page_table() };
-            // Safety: We've switched to the base page table above.
-            let _ = unsafe { delete_task_page_table(task_pt_id) };
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe {
+                shim.release_user_mappings();
+                switch_to_base_page_table();
+                let _ = delete_task_page_table(task_pt_id);
+            }
             OpteeSmcReturnCode::ENomem
         })?,
     );
@@ -643,9 +650,13 @@ fn open_session_new_instance(
             "ldelf/TA_CreateEntryPoint failed: return_code={:?}",
             ldelf_return_code
         );
-        unsafe { switch_to_base_page_table() };
-        // Safety: We've switched to the base page table above.
-        let _ = unsafe { delete_task_page_table(task_pt_id) };
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe {
+            shim.release_user_mappings();
+            switch_to_base_page_table();
+            let _ = delete_task_page_table(task_pt_id);
+        }
 
         // Write error response back to normal world
         write_msg_args_to_normal_world(
@@ -662,9 +673,13 @@ fn open_session_new_instance(
 
     // Load TA context with parameters for OpenSession - pass actual session_id
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
-        unsafe { switch_to_base_page_table() };
-        // Safety: We've switched to the base page table above.
-        let _ = unsafe { delete_task_page_table(task_pt_id) };
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe {
+            shim.release_user_mappings();
+            switch_to_base_page_table();
+            let _ = delete_task_page_table(task_pt_id);
+        }
         OpteeSmcReturnCode::EBadCmd
     })?;
     loaded_program
@@ -678,9 +693,13 @@ fn open_session_new_instance(
             None,
         )
         .map_err(|_| {
-            unsafe { switch_to_base_page_table() };
-            // Safety: We've switched to the base page table above.
-            let _ = unsafe { delete_task_page_table(task_pt_id) };
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe {
+                shim.release_user_mappings();
+                switch_to_base_page_table();
+                let _ = delete_task_page_table(task_pt_id);
+            }
             OpteeSmcReturnCode::EBadCmd
         })?;
 
@@ -723,10 +742,13 @@ fn open_session_new_instance(
             Some(ta_req_info),
         )?;
 
-        // Tear down the page table - no session was registered
-        unsafe { switch_to_base_page_table() };
-        // Safety: We've switched to the base page table above.
-        let _ = unsafe { delete_task_page_table(task_pt_id) };
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe {
+            shim.release_user_mappings();
+            switch_to_base_page_table();
+            let _ = delete_task_page_table(task_pt_id);
+        }
 
         return Ok(());
     }
@@ -879,10 +901,13 @@ fn handle_invoke_command(
                 session_manager().remove_single_instance(&ta_uuid);
             }
 
-            // Switch to base page table and delete the task page table
-            unsafe { switch_to_base_page_table() };
-            // Safety: We've switched to the base page table above.
-            let _ = unsafe { delete_task_page_table(task_pt_id) };
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe {
+                instance_arc.lock().shim.release_user_mappings();
+                switch_to_base_page_table();
+                let _ = delete_task_page_table(task_pt_id);
+            }
             debug_serial_println!(
                 "InvokeCommand: cleaned up dead TA instance, task_pt_id={}",
                 task_pt_id
@@ -1009,14 +1034,17 @@ fn handle_close_session(
             let instance = entry.instance.lock();
             let task_pt_id = instance.task_page_table_id;
 
-            // Make sure we're on the base page table before deleting
-            unsafe { switch_to_base_page_table() };
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe {
+                instance.shim.release_user_mappings();
+                switch_to_base_page_table();
+            }
 
             // Drop the instance to release shim/loaded_program resources
             drop(instance);
             drop(entry);
 
-            // Delete the task page table
             // Safety: We've switched to the base page table above.
             let _ = unsafe { delete_task_page_table(task_pt_id) };
 

@@ -319,9 +319,8 @@ impl PageTableManager {
     /// Deletes a task page table by its ID.
     ///
     /// This function:
-    /// 1. Unmaps all non-kernel pages (returning physical frames to the allocator)
-    /// 2. Cleans up page table structure frames
-    /// 3. Drops the page table (deallocating the top-level frame)
+    /// 1. Clean up page table structure frames (P1-P3)
+    /// 2. Drop the page table (deallocating the top-level P4 frame)
     ///
     /// # Arguments
     ///
@@ -329,8 +328,9 @@ impl PageTableManager {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that no references or pointers to memory mapped
-    /// by this page table are held after deletion.
+    /// The caller must ensure that:
+    /// - All user data frames have been released before calling this function
+    /// - No references or pointers to memory mapped by this page table are held after deletion
     ///
     /// # Returns
     ///
@@ -357,7 +357,7 @@ impl PageTableManager {
 
             // Safety: We're about to delete this page table, so it's safe to unmap all pages.
             unsafe {
-                pt.cleanup_user_mappings(Self::USER_ADDR_MIN, Self::USER_ADDR_MAX);
+                pt.cleanup_page_table_frames();
             }
             // The PageTable's Drop impl will deallocate the top-level (P4) frame
             Ok(())
@@ -725,18 +725,14 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// Deletes a task page table by its ID.
     ///
     /// This function:
-    /// 1. Unmaps all non-kernel pages (returning physical frames to the allocator)
-    /// 2. Cleans up page table structure frames
-    /// 3. Drops the page table (deallocating the top-level frame)
-    ///
-    /// Frames within the VTL1 kernel physical memory range are not deallocated
-    /// (they belong to the kernel). Only user-allocated frames are returned to
-    /// the allocator.
+    /// 1. Cleans up page table structure frames (P1-P3)
+    /// 2. Drops the page table (deallocating the top-level P4 frame)
     ///
     /// # Safety
     ///
-    /// The caller must ensure that no references or pointers to memory mapped
-    /// by this page table are held after deletion.
+    /// The caller must ensure that:
+    /// - All user data frames have been released before calling this function
+    /// - No references or pointers to memory mapped by this page table are held after deletion
     ///
     /// # Returns
     ///

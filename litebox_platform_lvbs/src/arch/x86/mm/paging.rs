@@ -211,39 +211,16 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
-    /// Unmap and deallocate all user pages and their page table frames.
-    ///
-    /// User pages are identified by their virtual address being in range
-    /// [user_addr_min, user_addr_max). This works because:
-    /// - Kernel memory uses addresses outside this range (e.g., low addresses for
-    ///   identity mapped VA == PA, or future designs with high kernel addresses)
-    /// - User memory uses addresses in [user_addr_min, user_addr_max), allocated via mmap
-    ///
-    /// This method deallocates:
-    /// 1. All user data frames (pages with VA in [user_addr_min, user_addr_max))
-    /// 2. ALL page table frames (P1/P2/P3) regardless of address range
-    ///    (because each user page table has its own PT frame allocations,
-    ///    including for the kernel identity mapping)
-    ///
-    /// Kernel data frames (physical memory) are NOT deallocated - only their
-    /// page table entries are cleaned up.
+    /// Clean up intermediate page table frames (P1-P3) for a task page table
+    /// that is being destroyed.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that no references to the unmapped pages exist.
-    /// Once we implement page fault handling for user pages with memcpy_fallible in the LVBS platform,
-    /// this safety requirement can be relaxed.
-    pub(crate) unsafe fn cleanup_user_mappings(&self, user_addr_min: usize, user_addr_max: usize) {
+    /// The caller must ensure that:
+    /// - All user data frames have been released before calling this function (e.g., using `PageManager::release_memory()`)
+    /// - The page table is no longer active (not loaded in CR3)
+    pub(crate) unsafe fn cleanup_page_table_frames(&self) {
         use x86_64::structures::paging::mapper::CleanUp;
-
-        // Unmap and deallocate user data pages
-        // No TLB flush needed - this page table is being destroyed and will never be reused
-        let user_range = PageRange::<ALIGN> {
-            start: user_addr_min,
-            end: user_addr_max,
-        };
-        // Safety: The caller ensures no references to the unmapped pages exist.
-        let _ = unsafe { self.unmap_pages(user_range, true, false, false) };
 
         // Clean up all empty P1 - P3 tables
         let mut allocator = PageTableAllocator::<M>::new();
