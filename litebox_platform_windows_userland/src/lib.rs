@@ -333,13 +333,9 @@ impl litebox::platform::SignalProvider for WindowsUserland {
             })
             .unwrap_or(0);
 
-        // TODO: fix it
-        for signum in 1..=31u32 {
-            if bits & (1 << (signum - 1)) != 0 {
-                if let Some(signal) = litebox::shim::Signal::from_raw(signum) {
-                    f(signal);
-                }
-            }
+        let sigs = litebox::shim::SigSet::from_u64(u64::from(bits));
+        for signal in sigs {
+            f(signal);
         }
     }
 }
@@ -420,19 +416,13 @@ struct TlsState {
     continue_context:
         Box<std::cell::UnsafeCell<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>>,
     /// Bitmask of pending host-originated signals for this thread.
-    /// Bit `(signum - 1)` is set when signal `signum` is pending.
-    /// Accessed atomically because timer callbacks run on threadpool threads.
     pending_host_signals: AtomicU32,
-    /// Address currently being waited on via `WaitOnAddress`, or null.
-    waiting_condvar: std::sync::atomic::AtomicPtr<c_void>,
-    /// Lock held across `WaitOnAddress` in [`RawMutex::block_or_maybe_timeout`].
+    /// Pointer to the `RawMutex` currently being waited on via
+    /// `WaitOnAddress`, or null if not waiting.
     ///
-    /// The interrupt path uses `try_lock` to determine whether the target
-    /// thread is currently blocked:
-    /// - `try_lock` succeeds → not inside `WaitOnAddress`.
-    /// - `try_lock` fails → inside `WaitOnAddress`; read `waiting_condvar`
-    ///   and call `WakeByAddressAll`.
-    waiting_lock: Mutex<()>,
+    /// Set by [`RawMutex::on_wait_start`] and cleared by
+    /// [`RawMutex::on_wait_end`].
+    waiting_condvar: std::sync::atomic::AtomicPtr<RawMutex>,
 }
 
 impl TlsState {
@@ -448,7 +438,6 @@ impl TlsState {
             continue_context: Box::default(),
             pending_host_signals: AtomicU32::new(0),
             waiting_condvar: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
-            waiting_lock: Mutex::new(()),
         }
     }
 }
@@ -909,6 +898,19 @@ unsafe extern "system" fn timer_callback(context: *mut c_void, _timer_or_wait_fi
         }
     }
 
+    // Wake the wait condvar (if active) so the thread unblocks from
+    // `WaitOnAddress` and can process the pending signal.
+    {
+        let inner = ctx.thread.0.lock().unwrap();
+        if let Some(inner) = inner.as_ref() {
+            let tls = unsafe { &*inner.tls.0 };
+            let condvar = tls.waiting_condvar.load(Ordering::Acquire);
+            if !condvar.is_null() {
+                litebox::event::wait::try_wake_condvar(unsafe { &*condvar });
+            }
+        }
+    }
+
     // Interrupt the target thread so it re-enters the shim and processes
     // the pending signal.
     ctx.thread.interrupt(None);
@@ -1030,19 +1032,18 @@ impl ThreadHandle {
             // Not running in the guest. The interrupt flag will be checked
             // before returning to the guest.
             //
-            // Use `try_lock` on `waiting_lock` to determine whether
-            // the thread is blocked in `WaitOnAddress`:
-            // - Success: not inside `WaitOnAddress`; the interrupt
-            //   flag will be seen before the next wait.
-            // - Failure: inside `WaitOnAddress` holding the lock;
-            //   read `waiting_condvar` and wake it.
-            if target_tls.waiting_lock.try_lock().is_err() {
-                let condvar = target_tls.waiting_condvar.load(Ordering::Acquire);
-                if !condvar.is_null() {
-                    unsafe {
-                        Win32_Threading::WakeByAddressAll(condvar);
-                    }
-                }
+            // If the thread has registered a wait condvar (via
+            // `on_wait_start`), wake it using the same CAS protocol
+            // as `WaitStateInner::wake()`. This transitions the
+            // condvar from WAITING → WOKEN and issues a futex wake
+            // so `WaitOnAddress` returns.
+            let condvar = target_tls.waiting_condvar.load(Ordering::Acquire);
+            if !condvar.is_null() {
+                // Safety: `condvar` points to a valid `RawMutex`
+                // inside a `WaitStateInner` (stable via Arc), set by
+                // `RawMutex::on_wait_start`. The target thread is
+                // suspended, so the pointer is valid.
+                litebox::event::wait::try_wake_condvar(unsafe { &*condvar });
             }
             return;
         }
@@ -1194,12 +1195,6 @@ impl RawMutex {
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        // We immediately wake up (without even hitting syscalls) if we can clearly see that the
-        // value is different.
-        if self.inner.load(Ordering::SeqCst) != val {
-            return Err(ImmediatelyWokenUp);
-        }
-
         // Compute timeout in ms
         let timeout_ms = match timeout {
             None => Win32_Threading::INFINITE, // no timeout
@@ -1209,25 +1204,7 @@ impl RawMutex {
             }
         };
 
-        // Acquire the per-thread waiting lock so that
-        // `ThreadHandle::interrupt` can determine (via `try_lock`)
-        // whether we are blocked in `WaitOnAddress`.
-        let tls = get_tls_ptr().map(|p| unsafe { &*p });
         let wait_addr = (&raw const self.inner).cast::<c_void>().cast_mut();
-        let _wait_guard = if let Some(tls) = tls {
-            tls.waiting_condvar.store(wait_addr, Ordering::Release);
-            let guard = tls.waiting_lock.lock().unwrap_or_else(|e| e.into_inner());
-
-            // Re-check the interrupt flag after acquiring the lock.
-            if tls.interrupt.get() {
-                tls.waiting_condvar
-                    .store(std::ptr::null_mut(), Ordering::Release);
-                return Err(ImmediatelyWokenUp);
-            }
-            Some(guard)
-        } else {
-            None
-        };
 
         let ok = unsafe {
             Win32_Threading::WaitOnAddress(
@@ -1237,13 +1214,6 @@ impl RawMutex {
                 timeout_ms,
             ) != 0
         };
-
-        // Clear the wait address now that we are no longer blocked.
-        if let Some(tls) = tls {
-            tls.waiting_condvar
-                .store(std::ptr::null_mut(), Ordering::Release);
-        }
-        drop(_wait_guard);
 
         if ok {
             Ok(UnblockedOrTimedOut::Unblocked)
@@ -1262,6 +1232,20 @@ impl litebox::platform::RawMutex for RawMutex {
 
     fn underlying_atomic(&self) -> &AtomicU32 {
         &self.inner
+    }
+
+    fn on_wait_start(&self) {
+        if let Some(tls) = get_tls_ptr().map(|p| unsafe { &*p }) {
+            tls.waiting_condvar
+                .store(std::ptr::from_ref(self).cast_mut(), Ordering::Release);
+        }
+    }
+
+    fn on_wait_end(&self) {
+        if let Some(tls) = get_tls_ptr().map(|p| unsafe { &*p }) {
+            tls.waiting_condvar
+                .store(std::ptr::null_mut(), Ordering::Release);
+        }
     }
 
     fn wake_many(&self, n: usize) -> usize {
