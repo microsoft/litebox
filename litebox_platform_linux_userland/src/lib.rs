@@ -2393,7 +2393,7 @@ fn try_wake_wait_condvar(condvar_addr: usize) {
     // SAFETY: condvar_addr points to a valid RawMutex inside a
     // WaitStateInner (stable address via Arc), set by RawMutex::on_wait_start.
     let mutex = unsafe { &*(condvar_addr as *const RawMutex) };
-    litebox::event::wait::try_wake_condvar(mutex);
+    litebox::event::wait::WaitState::<LinuxUserland>::try_wake_condvar(mutex);
 }
 
 /// Signal handler for interrupt signals.
