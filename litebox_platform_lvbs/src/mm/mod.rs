@@ -6,6 +6,8 @@
 use crate::arch::{PhysAddr, VirtAddr};
 
 pub(crate) mod pgtable;
+#[cfg(feature = "optee_syscall")]
+pub(crate) mod vmap;
 
 #[cfg(test)]
 pub mod tests;
@@ -47,7 +49,13 @@ pub trait MemoryProvider {
     /// Obtain virtual address (VA) of a page given its PA
     fn pa_to_va(pa: PhysAddr) -> VirtAddr {
         let pa = pa.as_u64() & !Self::PRIVATE_PTE_MASK;
-        VirtAddr::new_truncate(pa + Self::GVA_OFFSET.as_u64())
+        let va = VirtAddr::new_truncate(pa + Self::GVA_OFFSET.as_u64());
+        #[cfg(feature = "optee_syscall")]
+        assert!(
+            va.as_u64() < crate::VMAP_START as u64,
+            "VA {va:#x} is out of range for direct mapping"
+        );
+        va
     }
 
     /// Set physical address as private via mask.

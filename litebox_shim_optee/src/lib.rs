@@ -286,6 +286,22 @@ impl OpteeShim {
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self.0.pm
     }
+
+    /// Release all user-space memory mappings owned by this shim instance.
+    ///
+    /// This must be called before switching to the base page table and deleting
+    /// the task page table so that every mapped physical page is properly freed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no references to the released memory regions
+    /// are held after this call.
+    pub unsafe fn release_user_mappings(&self) {
+        let release = |_r: core::ops::Range<usize>, _vm: litebox::mm::linux::VmFlags| true;
+        unsafe {
+            let _ = self.page_manager().release_memory(release);
+        }
+    }
 }
 
 impl OpteeShimEntrypoints {

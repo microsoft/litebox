@@ -24,14 +24,12 @@ use litebox::{
     shim::ContinueOperation,
     utils::TruncateExt,
 };
-use litebox_common_linux::{
-    PunchthroughSyscall,
-    errno::Errno,
-    vmap::{
-        PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
-        VmapManager,
-    },
+#[cfg(feature = "optee_syscall")]
+use litebox_common_linux::vmap::{
+    PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
+    VmapManager,
 };
+use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use x86_64::{
     VirtAddr,
     structures::paging::{
@@ -40,6 +38,9 @@ use x86_64::{
     },
 };
 use zerocopy::{FromBytes, IntoBytes};
+
+#[cfg(feature = "optee_syscall")]
+use crate::mm::vmap::vmap_allocator;
 
 extern crate alloc;
 
@@ -81,19 +82,49 @@ static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 /// No real physical frame has address 0, so this is a safe sentinel.
 pub const BASE_PAGE_TABLE_ID: usize = 0;
 
+// VTL1 virtual address space layout (4-level paging, canonical range)
+//
+// High canonical half (0xFFFF_8000_0000_0000 .. 0xFFFF_FFFF_FFFF_FFFF):
+//  0xFFFF_CFFF_FFFF_F000  ┌─────────────────────────────────┐ ← VMAP_END
+//                         │ vmap region  (~16 TiB)          │
+//                         │ non-contiguous PA→VA mappings   │
+//  0xFFFF_C000_0000_0000  └─────────────────────────────────┘ ← VMAP_START
+//
+// Low canonical half  (0x0000_0000_0000_0000 .. 0x0000_7FFF_FFFF_FFFF):
+//  0x0000_7FFF_FFFF_F000  ┌─────────────────────────────────┐ ← USER_ADDR_MAX
+//                         │ User address space (~64 TiB)    │
+//                         │ mmap / TA memory                │
+//  0x0000_3FFF_FFFF_F000  ├─────────────────────────────────┤ ← USER_ADDR_MIN
+//                         │ Identity-mapped (VA == PA)      │
+//                         │ up to 64 TiB of physical memory │
+//  0x0000_0000_0000_0000  └─────────────────────────────────┘
+//
+// Identity-mapped region covers [0, USER_ADDR_MIN) in the low canonical half.
+// 4-level paging supports up to 64 TiB of physical memory (46-bit MAXPHYADDR),
+// so 64 TiB of identity-map VA space is sufficient.
+// USER_ADDR_MIN..USER_ADDR_MAX is reserved for user-space allocations.
+// VMAP_START..VMAP_END is in the high canonical half for vmap mappings.
+
+/// Start of the vmap virtual address region.
+/// Placed in the high (negative) canonical address range so it does not
+/// compete with identity-mapped or user-space addresses in the low half.
+pub(crate) const VMAP_START: usize = 0xFFFF_C000_0000_0000;
+
+/// End of the vmap virtual address region (exclusive).
+/// Provides ~16 TiB of virtual address space for vmap allocations.
+pub(crate) const VMAP_END: usize = 0xFFFF_CFFF_FFFF_F000;
+
 /// Maximum virtual address (exclusive) for user-space allocations.
 /// This is set to (1 << 47) - PAGE_SIZE (upper limit of 4-level paging).
 const USER_ADDR_MAX: usize = 0x7FFF_FFFF_F000;
 
 /// Size of the user address space range.
-const USER_ADDR_RANGE_SIZE: usize = 0x1000_0000_0000; // 16 TiB
+const USER_ADDR_RANGE_SIZE: usize = 0x4000_0000_0000; // 64 TiB
 
 /// Minimum virtual address for user-space allocations.
 ///
 /// Kernel memory uses low addresses (identity mapped: VA == PA).
 /// User memory uses addresses in range [`USER_ADDR_MIN`, `USER_ADDR_MAX`).
-/// This separation allows easy identification during cleanup and supports
-/// future designs where kernel VAs may be in higher addresses.
 const USER_ADDR_MIN: usize = USER_ADDR_MAX - USER_ADDR_RANGE_SIZE;
 
 /// Manages base and task page tables.
@@ -250,31 +281,21 @@ impl PageTableManager {
 
     /// Creates a new task page table and returns its ID.
     ///
-    /// The new page table is initialized with the VTL1 kernel memory mapped
-    /// for proper syscall handling.
-    ///
-    /// # Arguments
-    ///
-    /// * `vtl1_phys_frame_range` - The physical frame range of VTL1 kernel memory to map
+    /// The new page table shares the base page table's kernel PML4 entries
+    /// rather than allocating new intermediate page table frames. This avoids
+    /// allocating P3/P2/P1 frames for every task, significantly reducing
+    /// memory usage when creating/destroying many TAs.
     ///
     /// # Returns
     ///
     /// The ID of the newly created task page table (its P4 frame start address),
-    /// or `Err(Errno::ENOMEM)` if allocation fails.
-    pub fn create_task_page_table(
-        &self,
-        vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    ) -> Result<usize, Errno> {
+    /// or `Err(Errno::ENOMEM)` if the P4 frame allocation fails.
+    pub fn create_task_page_table(&self) -> Result<usize, Errno> {
         let pt = unsafe { mm::PageTable::new_top_level() };
-        if pt
-            .map_phys_frame_range(
-                vtl1_phys_frame_range,
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-            )
-            .is_err()
-        {
-            return Err(Errno::ENOMEM);
-        }
+
+        // Share kernel page table structures by copying PML4 entries from the
+        // base page table. This is safe because kernel mappings are never modified.
+        pt.copy_pml4_entries_from(&self.base_page_table);
 
         let pt = alloc::boxed::Box::new(pt);
         let task_pt_id: usize = pt.get_physical_frame().start_address().as_u64().truncate();
@@ -288,9 +309,8 @@ impl PageTableManager {
     /// Deletes a task page table by its ID.
     ///
     /// This function:
-    /// 1. Unmaps all non-kernel pages (returning physical frames to the allocator)
-    /// 2. Cleans up page table structure frames
-    /// 3. Drops the page table (deallocating the top-level frame)
+    /// 1. Clean up page table structure frames (P1-P3)
+    /// 2. Drop the page table (deallocating the top-level P4 frame)
     ///
     /// # Arguments
     ///
@@ -298,8 +318,9 @@ impl PageTableManager {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that no references or pointers to memory mapped
-    /// by this page table are held after deletion.
+    /// The caller must ensure that:
+    /// - All user data frames have been released before calling this function
+    /// - No references or pointers to memory mapped by this page table are held after deletion
     ///
     /// # Returns
     ///
@@ -324,9 +345,15 @@ impl PageTableManager {
         if let Some(pt) = task_pts.remove(&task_pt_id) {
             drop(task_pts);
 
-            // Safety: We're about to delete this page table, so it's safe to unmap all pages.
+            // Clear PML4 entries that point to the base page table's P3/P2/P1
+            // frames. Without this, cleanup_page_table_frames and Drop would
+            // free page table frames owned by the base page table.
+            pt.clear_shared_pml4_entries(&self.base_page_table);
+
+            // Safety: We're about to delete this page table, so it's safe to
+            // free the remaining (user-space) intermediate page table frames.
             unsafe {
-                pt.cleanup_user_mappings(Self::USER_ADDR_MIN, Self::USER_ADDR_MAX);
+                pt.cleanup_page_table_frames();
             }
             // The PageTable's Drop impl will deallocate the top-level (P4) frame
             Ok(())
@@ -509,6 +536,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
                 .ok_or(DeallocationError::Unaligned)?,
                 false,
                 true,
+                false,
             )
         }
     }
@@ -686,25 +714,20 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// The ID of the newly created task page table, or `Err(Errno)` on failure.
     pub fn create_task_page_table(&self) -> Result<usize, Errno> {
-        self.page_table_manager
-            .create_task_page_table(self.vtl1_phys_frame_range)
+        self.page_table_manager.create_task_page_table()
     }
 
     /// Deletes a task page table by its ID.
     ///
     /// This function:
-    /// 1. Unmaps all non-kernel pages (returning physical frames to the allocator)
-    /// 2. Cleans up page table structure frames
-    /// 3. Drops the page table (deallocating the top-level frame)
-    ///
-    /// Frames within the VTL1 kernel physical memory range are not deallocated
-    /// (they belong to the kernel). Only user-allocated frames are returned to
-    /// the allocator.
+    /// 1. Cleans up page table structure frames (P1-P3)
+    /// 2. Drops the page table (deallocating the top-level P4 frame)
     ///
     /// # Safety
     ///
-    /// The caller must ensure that no references or pointers to memory mapped
-    /// by this page table are held after deletion.
+    /// The caller must ensure that:
+    /// - All user data frames have been released before calling this function
+    /// - No references or pointers to memory mapped by this page table are held after deletion
     ///
     /// # Returns
     ///
@@ -1055,7 +1078,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Clear the existing mappings first.
-                unsafe { current_pt.unmap_pages(range, true, true).unwrap() };
+                unsafe { current_pt.unmap_pages(range, true, true, false).unwrap() };
             }
         }
         let flags = u32::from(initial_permissions.bits())
@@ -1077,7 +1100,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         unsafe {
             self.page_table_manager
                 .current_page_table()
-                .unmap_pages(range, true, true)
+                .unmap_pages(range, true, true, false)
         }
     }
 
@@ -1169,23 +1192,21 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     }
 }
 
-/// Checks whether the given physical addresses are contiguous with respect to ALIGN.
-///
-/// Note: This is a temporary check to let `VmapManager` work with this platform
-/// which does not yet support virtually contiguous mapping of non-contiguous physical pages
-/// (for now, it maps physical pages with a fixed offset).
 #[cfg(feature = "optee_syscall")]
-fn check_contiguity<const ALIGN: usize>(
-    addrs: &[PhysPageAddr<ALIGN>],
-) -> Result<(), PhysPointerError> {
+/// Checks whether the given physical addresses are contiguous with respect to ALIGN.
+fn is_contiguous<const ALIGN: usize>(addrs: &[PhysPageAddr<ALIGN>]) -> bool {
     for window in addrs.windows(2) {
         let first = window[0].as_usize();
         let second = window[1].as_usize();
-        if second != first.checked_add(ALIGN).ok_or(PhysPointerError::Overflow)? {
-            return Err(PhysPointerError::NonContiguousPages);
+        if let Some(expected) = first.checked_add(ALIGN) {
+            if second != expected {
+                return false;
+            }
+        } else {
+            return false;
         }
     }
-    Ok(())
+    true
 }
 
 #[cfg(feature = "optee_syscall")]
@@ -1195,72 +1216,132 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
-        // TODO: Remove this check once this platform supports virtually contiguous
-        // non-contiguous physical page mapping.
-        check_contiguity(pages)?;
-
         if pages.is_empty() {
             return Err(PhysPointerError::InvalidPhysicalAddress(0));
         }
-        let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
-        let phys_end = x86_64::PhysAddr::new(
-            pages
-                .last()
-                .unwrap()
-                .as_usize()
-                .checked_add(ALIGN)
-                .ok_or(PhysPointerError::Overflow)? as u64,
-        );
-        let frame_range = if ALIGN == PAGE_SIZE {
-            PhysFrame::range(
-                PhysFrame::<Size4KiB>::containing_address(phys_start),
-                PhysFrame::<Size4KiB>::containing_address(phys_end),
-            )
-        } else {
-            unimplemented!("ALIGN other than 4KiB is not supported yet")
-        };
 
+        if ALIGN != PAGE_SIZE {
+            unimplemented!("ALIGN other than 4KiB is not supported yet");
+        }
+
+        // TODO: Add `PageTableFlags::NO_EXECUTE` once DEP is enabled.
         let mut flags = PageTableFlags::PRESENT;
         if perms.contains(PhysPageMapPermissions::WRITE) {
             flags |= PageTableFlags::WRITABLE;
         }
 
-        if let Ok(page_addr) = self
-            .page_table_manager
-            .current_page_table()
-            .map_phys_frame_range(frame_range, flags)
-        {
-            Ok(PhysPageMapInfo {
-                base: page_addr,
-                size: pages.len() * ALIGN,
-            })
+        // If pages are contiguous, use `map_phys_frame_range` which is efficient and doesn't require vmap VA space.
+        if is_contiguous(pages) {
+            let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
+            let phys_end = x86_64::PhysAddr::new(
+                pages
+                    .last()
+                    .unwrap()
+                    .as_usize()
+                    .checked_add(ALIGN)
+                    .ok_or(PhysPointerError::Overflow)? as u64,
+            );
+            let frame_range = PhysFrame::range(
+                PhysFrame::<Size4KiB>::containing_address(phys_start),
+                PhysFrame::<Size4KiB>::containing_address(phys_end),
+            );
+
+            match self
+                .page_table_manager
+                .current_page_table()
+                .map_phys_frame_range(frame_range, flags)
+            {
+                Ok(page_addr) => Ok(PhysPageMapInfo {
+                    base: page_addr,
+                    size: pages.len() * ALIGN,
+                }),
+                Err(MapToError::PageAlreadyMapped(_)) => {
+                    Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
+                }
+                Err(MapToError::FrameAllocationFailed) => {
+                    Err(PhysPointerError::FrameAllocationFailed)
+                }
+                Err(MapToError::ParentEntryHugePage) => Err(
+                    PhysPointerError::InvalidPhysicalAddress(pages[0].as_usize()),
+                ),
+            }
         } else {
-            Err(PhysPointerError::InvalidPhysicalAddress(
-                pages[0].as_usize(),
-            ))
+            // Reject duplicate page addresses
+            {
+                let mut seen = hashbrown::HashSet::with_capacity(pages.len());
+                for page in pages {
+                    if !seen.insert(page.as_usize()) {
+                        return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));
+                    }
+                }
+            }
+
+            let frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = pages
+                .iter()
+                .map(|p| PhysFrame::containing_address(x86_64::PhysAddr::new(p.as_usize() as u64)))
+                .collect();
+
+            let base_va = vmap_allocator()
+                .allocate_va_and_register_map(&frames)
+                .map_err(|e| match e {
+                    crate::mm::vmap::VmapAllocError::EmptyInput => {
+                        PhysPointerError::InvalidPhysicalAddress(0)
+                    }
+                    crate::mm::vmap::VmapAllocError::DuplicateMapping => {
+                        PhysPointerError::AlreadyMapped(pages[0].as_usize())
+                    }
+                    crate::mm::vmap::VmapAllocError::VaSpaceExhausted => {
+                        PhysPointerError::VaSpaceExhausted
+                    }
+                })?;
+
+            match self
+                .page_table_manager
+                .current_page_table()
+                .map_non_contiguous_phys_frames(&frames, base_va, flags)
+            {
+                Ok(page_addr) => Ok(PhysPageMapInfo {
+                    base: page_addr,
+                    size: pages.len() * ALIGN,
+                }),
+                Err(e) => {
+                    let _ = vmap_allocator().unregister_allocation(base_va);
+                    match e {
+                        MapToError::PageAlreadyMapped(_) => {
+                            Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
+                        }
+                        MapToError::FrameAllocationFailed => {
+                            Err(PhysPointerError::FrameAllocationFailed)
+                        }
+                        MapToError::ParentEntryHugePage => Err(
+                            PhysPointerError::InvalidPhysicalAddress(pages[0].as_usize()),
+                        ),
+                    }
+                }
+            }
         }
     }
 
     unsafe fn vunmap(&self, vmap_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
-        if ALIGN == PAGE_SIZE {
-            let Some(page_range) = PageRange::<PAGE_SIZE>::new(
-                vmap_info.base as usize,
-                vmap_info.base.wrapping_add(vmap_info.size) as usize,
-            ) else {
-                return Err(PhysPointerError::UnalignedPhysicalAddress(
-                    vmap_info.base as usize,
-                    ALIGN,
-                ));
-            };
-            unsafe {
-                self.page_table_manager
-                    .current_page_table()
-                    .unmap_pages(page_range, false, true)
-                    .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))
-            }
-        } else {
-            unimplemented!("ALIGN other than 4KiB is not supported yet")
+        if ALIGN != PAGE_SIZE {
+            unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
+
+        let base_va = x86_64::VirtAddr::new(vmap_info.base as u64);
+
+        // Unmap the page table entries first. Only release the VA range back
+        // to the allocator when unmapping succeeds; if it fails, stale PTE
+        // entries remain and recycling the VA would cause collisions.
+        self.unmap_vtl0_pages(vmap_info.base, vmap_info.size)
+            .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))?;
+
+        if crate::mm::vmap::is_vmap_address(base_va) {
+            crate::mm::vmap::vmap_allocator()
+                .unregister_allocation(base_va)
+                .ok_or(PhysPointerError::Unmapped(vmap_info.base as usize))?;
+        }
+
+        Ok(())
     }
 
     fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
@@ -1284,23 +1365,20 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError> {
-        let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
-        let phys_end = x86_64::PhysAddr::new(
-            pages
-                .last()
-                .unwrap()
-                .as_usize()
-                .checked_add(ALIGN)
-                .ok_or(PhysPointerError::Overflow)? as u64,
-        );
-        let frame_range = if ALIGN == PAGE_SIZE {
-            PhysFrame::range(
-                PhysFrame::<Size4KiB>::containing_address(phys_start),
-                PhysFrame::<Size4KiB>::containing_address(phys_end),
-            )
-        } else {
-            unimplemented!("ALIGN other than 4KiB is not supported yet")
-        };
+        if ALIGN != PAGE_SIZE {
+            unimplemented!("ALIGN other than 4KiB is not supported yet");
+        }
+
+        // Build a RangeSet so that adjacent pages are coalesced into contiguous
+        // ranges, minimizing the number of hypercalls.
+        let mut range_set = rangemap::RangeSet::new();
+        for page in pages {
+            let start = page.as_usize() as u64;
+            let end = start
+                .checked_add(ALIGN as u64)
+                .ok_or(PhysPointerError::Overflow)?;
+            range_set.insert(start..end);
+        }
 
         let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
             // VTL1 wants to write data to the pages, preventing VTL0 from reading/executing the pages.
@@ -1312,8 +1390,17 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             // VTL1 no longer protects the pages.
             crate::mshv::heki::MemAttr::all()
         };
-        crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
-            .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))
+
+        for range in range_set.iter() {
+            let frame_range = PhysFrame::range(
+                PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
+                PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
+            );
+            crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
+                .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
+        }
+
+        Ok(())
     }
 }
 
