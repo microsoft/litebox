@@ -473,7 +473,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                             &mut inner,
                             Page::range_inclusive(
                                 start_page,
-                                start_page + (mapped_count as u64 - 1),
+                                start_page + (mapped_count as u64 - 1), // inclusive range
                             ),
                             &mut allocator,
                         );
@@ -488,6 +488,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
     /// Rollback helper: unmap the pages in `pages` and free any intermediate
     /// page-table frames (P1/P2/P3) that became empty.
+    ///
+    /// `pages` are inclusive as `clean_up_addr_range` expects an inclusive range.
     ///
     /// Note: The caller must already hold the page table lock (`self.inner`).
     /// This function accepts the locked `MappedPageTable` directly.
