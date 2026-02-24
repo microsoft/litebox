@@ -14,8 +14,8 @@ use core::ops::Range;
 
 use alloc::vec::Vec;
 use linux::{
-    CreatePagesFlags, MappingError, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler,
-    VmemProtectError, VmemUnmapError,
+    CreatePagesFlags, MappingError, PageFaultError, PageRange, VmArea, VmFlags, Vmem,
+    VmemPageFaultHandler, VmemProtectError, VmemUnmapError,
 };
 
 use crate::{
@@ -589,6 +589,39 @@ where
                 | MemoryRegionPermissions::WRITE
                 | MemoryRegionPermissions::EXEC,
         )
+    }
+
+    /// Register an already-allocated memory region in the VMA tracker.
+    ///
+    /// This is used when memory has been allocated by some means other than the normal
+    /// `create_*_pages` path (e.g., CoW mappings created directly by the platform), so that the
+    /// page manager tracks the region for future `mprotect`, `munmap`, etc.
+    ///
+    /// If `replace` is `true`, any overlapping tracked mappings are evicted from the tracker
+    /// (without calling the platform deallocator) before inserting. Otherwise, returns `None`
+    /// without registering if the provided `range` overlaps with any existing mapping.
+    ///
+    /// # Safety
+    ///
+    /// The `range` must be an already-mapped region with the given `permissions`.
+    #[must_use]
+    pub unsafe fn register_existing_mapping(
+        &self,
+        range: PageRange<ALIGN>,
+        permissions: MemoryRegionPermissions,
+        is_file_backed: bool,
+        replace: bool,
+    ) -> Option<()> {
+        let vma = VmArea::new(
+            VmFlags::from(permissions) | VmFlags::VM_MAY_ACCESS_FLAGS,
+            is_file_backed,
+        );
+        let mut vmem = self.vmem.write();
+        if !replace && vmem.overlapping(range.into()).next().is_some() {
+            return None;
+        }
+        vmem.register_existing_mapping_overwrite(range, vma);
+        Some(())
     }
 
     /// Returns all mappings in a vector.

@@ -785,6 +785,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             blksize: BLOCK_SIZE,
         })
     }
+
+    fn get_static_backing_data(&self, fd: &FileFd<Platform>) -> Option<&'static [u8]> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(fd)?;
+        match &entry.entry {
+            Descriptor::File { file, .. } => {
+                let file = file.read();
+                match &file.data {
+                    alloc::borrow::Cow::Borrowed(slice) => Some(*slice),
+                    alloc::borrow::Cow::Owned(_) => None,
+                }
+            }
+            Descriptor::Dir { .. } => None,
+        }
+    }
 }
 
 struct RootDir<Platform: sync::RawSyncPrimitivesProvider> {

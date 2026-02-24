@@ -76,18 +76,28 @@ pub enum InterceptionBackend {
 static REQUIRE_RTLD_AUDIT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-fn mmapped_file_data(path: impl AsRef<Path>) -> Result<&'static [u8]> {
+struct MmappedFile {
+    data: &'static [u8],
+    abs_path: PathBuf,
+}
+
+fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
     let path = path.as_ref();
-    let file = std::fs::File::open(path)?;
-    // SAFETY: We assume that the file given to us is not going to change _externally_ while in
-    // the middle of execution. Since we are mapping it as read-only and mapping it only once,
-    // we are not planning to change it either. With both these in mind, this call is safe.
-    //
-    // We need to leak the `Mmap` object, so that it stays alive until the end of the program,
-    // rather than being unmapped at function finish (i.e., to get the `'static` lifetime).
-    Ok(Box::leak(Box::new(unsafe { Mmap::map(&file) }.map_err(
-        |e| anyhow!("Could not read tar file at {}: {}", path.display(), e),
-    )?)))
+    let abs_path = std::path::absolute(path)
+        .map_err(|e| anyhow!("Could not get absolute path for {}: {}", path.display(), e))?;
+    let file = std::fs::File::open(&abs_path)?;
+    let data = {
+        // SAFETY: We assume that the file given to us is not going to change _externally_ while in
+        // the middle of execution. Since we are mapping it as read-only and mapping it only once,
+        // we are not planning to change it either. With both these in mind, this call is safe.
+        //
+        // We need to leak the `Mmap` object, so that it stays alive until the end of the program,
+        // rather than being unmapped at function finish (i.e., to get the `'static` lifetime).
+        Box::leak(Box::new(unsafe { Mmap::map(&file) }.map_err(|e| {
+            anyhow!("Could not read tar file at {}: {}", path.display(), e)
+        })?))
+    };
+    Ok(MmappedFile { data, abs_path })
 }
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -103,6 +113,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             "this should (hopefully soon) have a nicer interface to support loading in files"
         )
     }
+
+    let mut cow_eligible_regions: Vec<MmappedFile> = Vec::new();
 
     let (ancestor_modes_and_users, prog_data): (
         Vec<(litebox::fs::Mode, u32)>,
@@ -122,13 +134,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 )
             })
             .collect();
-        let data = mmapped_file_data(prog)?;
+        let file = mmapped_file(&prog)?;
         let data = if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(data, None)
+            litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
                 .unwrap()
                 .into()
         } else {
-            data.into()
+            let data = file.data.into();
+            cow_eligible_regions.push(file);
+            data
         };
         (modes, data)
     };
@@ -136,7 +150,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
             anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
         }
-        mmapped_file_data(tar_file)?
+        mmapped_file(tar_file)?.data
     } else {
         litebox::fs::tar_ro::EMPTY_TAR_FILE
     };
@@ -147,6 +161,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // systrap/sigsys interception, or binary rewriting interception. Currently
     // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
+
+    for file in cow_eligible_regions {
+        platform.register_cow_region(file.data, file.abs_path);
+    }
+
     litebox_platform_multiplex::set_platform(platform);
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
