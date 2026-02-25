@@ -392,6 +392,7 @@ in_guest:
 interrupt:
     .byte 0
     .align 4
+.globl pending_host_signals
 pending_host_signals:
     .long 0
     "
@@ -804,6 +805,7 @@ in_guest:
 interrupt:
     .byte 0
     .align 4
+.globl pending_host_signals
 pending_host_signals:
     .long 0
     "
@@ -1824,10 +1826,7 @@ fn register_exception_handlers() {
         }
 
         // Note that non-guest threads should block these signals, so it always fires on a guest thread.
-        let traditional_signals = &[
-            libc::SIGINT,
-            libc::SIGALRM,
-        ];
+        let traditional_signals = &[libc::SIGINT, libc::SIGALRM];
         for &sig in traditional_signals {
             unsafe {
                 let mut sa: libc::sigaction = core::mem::zeroed();
