@@ -29,6 +29,9 @@ Examples:
 
     # Save results to JSON
     python3 run_unixbench.py --output results.json
+
+    # Run on Windows with pre-prepared artifacts (from prepare_unixbench.py)
+    python run_unixbench.py --mode litebox --windows --prepared-dir ./prepared
 """
 
 import argparse
@@ -351,44 +354,16 @@ def prepare_litebox_rootfs(
     return tar_path, rewritten
 
 
-def run_litebox(
-    pgms_dir: Path,
-    bench: BenchmarkDef,
-    duration: int,
-    runner_path: Path,
-    work_dir: Path,
-    rewriter_path: Optional[Path],
-    use_cargo_rewriter: bool,
+def _run_litebox_cmd(
+    bench: BenchmarkDef, duration: int, cmd: list[str],
 ) -> Optional[BenchmarkResult]:
-    """Run a benchmark under LiteBox."""
-    prepared = prepare_litebox_rootfs(
-        pgms_dir, bench, work_dir, rewriter_path, use_cargo_rewriter,
-    )
-    if prepared is None:
-        return None
-
-    tar_path, rewritten = prepared
-
-    cmd = [
-        str(runner_path),
-        "--unstable",
-        "--interception-backend", "rewriter",
-        "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
-        "--env", "HOME=/",
-    ]
-
-    # Special env for execl
-    if bench.name == "execl":
-        cmd += ["--env", "UB_BINDIR=/pgms"]
-
-    cmd += ["--initial-files", str(tar_path)]
-    cmd += [str(rewritten)]
-
+    """Run a litebox command and parse the result."""
     # For fstime variants, use /tmp in the sandbox as the tmpdir
     litebox_tmpdir = Path("/tmp") if bench.binary == "fstime" else None
     cmd += bench.args(duration, litebox_tmpdir)
 
-    print(f"  Running: litebox_runner ... {rewritten.name} {' '.join(bench.args(duration, litebox_tmpdir))}")
+    display_args = ' '.join(bench.args(duration, litebox_tmpdir))
+    print(f"  Running: {Path(cmd[0]).name} ... {display_args}")
     t0 = time.monotonic()
     # Use a shorter timeout for alarm-based benchmarks under LiteBox,
     # since if SIGALRM isn't delivered the process will hang forever.
@@ -420,6 +395,97 @@ def run_litebox(
         name=bench.name, count=count, base=base, unit=unit,
         elapsed=elapsed, raw_stderr=stderr,
     )
+
+
+def run_litebox(
+    pgms_dir: Path,
+    bench: BenchmarkDef,
+    duration: int,
+    runner_path: Path,
+    work_dir: Path,
+    rewriter_path: Optional[Path],
+    use_cargo_rewriter: bool,
+) -> Optional[BenchmarkResult]:
+    """Run a benchmark under LiteBox on Linux."""
+    prepared = prepare_litebox_rootfs(
+        pgms_dir, bench, work_dir, rewriter_path, use_cargo_rewriter,
+    )
+    if prepared is None:
+        return None
+
+    tar_path, rewritten = prepared
+
+    cmd = [
+        str(runner_path),
+        "--unstable",
+        "--interception-backend", "rewriter",
+        "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+        "--env", "HOME=/",
+    ]
+
+    # Special env for execl
+    if bench.name == "execl":
+        cmd += ["--env", "UB_BINDIR=/pgms"]
+
+    cmd += ["--initial-files", str(tar_path)]
+    cmd += [str(rewritten)]
+
+    return _run_litebox_cmd(bench, duration, cmd)
+
+
+def run_litebox_windows(
+    bench: BenchmarkDef,
+    duration: int,
+    runner_path: Path,
+    prepared_dir: Path,
+) -> Optional[BenchmarkResult]:
+    """
+    Run a benchmark under LiteBox on Windows using pre-prepared artifacts.
+
+    Uses litebox_runner_linux_on_windows_userland with --rewrite-syscalls.
+    The binaries in the tar are already rewritten, but the main binary is
+    loaded directly by the runner and needs --rewrite-syscalls for it.
+    """
+    bench_dir = prepared_dir / bench.name
+    manifest_path = prepared_dir / "manifest.json"
+
+    if not manifest_path.exists():
+        print(f"  [SKIP] {bench.name}: manifest.json not found in {prepared_dir}")
+        return None
+
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    if bench.name not in manifest.get("benchmarks", {}):
+        print(f"  [SKIP] {bench.name}: not found in manifest")
+        return None
+
+    info = manifest["benchmarks"][bench.name]
+    tar_path = prepared_dir / info["tar"]
+    rewritten = prepared_dir / info["rewritten_binary"]
+
+    if not tar_path.exists():
+        print(f"  [SKIP] {bench.name}: tar not found at {tar_path}")
+        return None
+    if not rewritten.exists():
+        print(f"  [SKIP] {bench.name}: rewritten binary not found at {rewritten}")
+        return None
+
+    cmd = [
+        str(runner_path),
+        "--unstable",
+        "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+        "--env", "HOME=/",
+    ]
+
+    # Special env for execl
+    if bench.name == "execl":
+        cmd += ["--env", "UB_BINDIR=/pgms"]
+
+    cmd += ["--initial-files", str(tar_path)]
+    cmd += [str(rewritten)]
+
+    return _run_litebox_cmd(bench, duration, cmd)
 
 
 # ── Comparison & Reporting ──────────────────────────────────────────────────
@@ -614,6 +680,16 @@ def main():
         help="Skip building litebox binaries (use existing binaries as-is)",
     )
     parser.add_argument(
+        "--windows", action="store_true",
+        help="Run on Windows using litebox_runner_linux_on_windows_userland. "
+             "Requires --prepared-dir with artifacts from prepare_unixbench.py",
+    )
+    parser.add_argument(
+        "--prepared-dir", type=str, default=None,
+        help="Path to directory of pre-prepared artifacts from prepare_unixbench.py "
+             "(required for --windows mode)",
+    )
+    parser.add_argument(
         "--output", type=str, default=None,
         help="Save results to a JSON file",
     )
@@ -624,17 +700,44 @@ def main():
 
     args = parser.parse_args()
 
+    # ── Validate flags ──────────────────────────────────────────────────
+
+    is_windows_mode = args.windows
+    prepared_dir = Path(args.prepared_dir) if args.prepared_dir else None
+
+    if is_windows_mode:
+        if args.mode == "native":
+            print("Error: --windows cannot be combined with --mode native")
+            sys.exit(1)
+        if args.mode == "both":
+            # On Windows, there are no native Linux binaries to run
+            print("Note: --windows mode only supports LiteBox runs (no native).")
+            args.mode = "litebox"
+        if prepared_dir is None:
+            # Default to benchmark/unixbench/prepared/ if it exists
+            default_prepared = Path(__file__).resolve().parent / "prepared"
+            if default_prepared.exists():
+                prepared_dir = default_prepared
+            else:
+                print("Error: --windows requires --prepared-dir (or a prepared/ directory)")
+                print("Run prepare_unixbench.py on Linux/WSL first.")
+                sys.exit(1)
+        if not prepared_dir.exists():
+            print(f"Error: prepared directory not found at {prepared_dir}")
+            sys.exit(1)
+
     workspace_root = find_workspace_root()
     unixbench_dir = find_unixbench_dir(workspace_root)
     pgms_dir = unixbench_dir / "pgms"
 
-    if not unixbench_dir.exists():
-        print(f"Error: UnixBench not found at {unixbench_dir}")
-        print("Please extract the benchmark first:")
-        print(f"  cd {workspace_root / 'benchmark'} && unzip v6.0.0.zip")
-        sys.exit(1)
-
-    ensure_unixbench_built(unixbench_dir)
+    # On Windows with --prepared-dir, we don't need UnixBench source
+    if not is_windows_mode:
+        if not unixbench_dir.exists():
+            print(f"Error: UnixBench not found at {unixbench_dir}")
+            print("Please extract the benchmark first:")
+            print(f"  cd {workspace_root / 'benchmark'} && unzip v6.0.0.zip")
+            sys.exit(1)
+        ensure_unixbench_built(unixbench_dir)
 
     # Resolve litebox binaries
     run_litebox_mode = args.mode in ("both", "litebox")
@@ -646,6 +749,19 @@ def main():
             runner_path = Path(args.runner_path)
             if args.rewriter_path:
                 rewriter_path = Path(args.rewriter_path)
+        elif is_windows_mode:
+            # On Windows, auto-detect the runner
+            runner_name = "litebox_runner_linux_on_windows_userland"
+            if sys.platform == "win32":
+                runner_name += ".exe"
+            build_type = "release" if args.release else "debug"
+            runner_path = workspace_root / "target" / build_type / runner_name
+            if not runner_path.exists():
+                print(f"Error: Windows runner not found at {runner_path}")
+                print("Build it on Windows first:")
+                print(f"  cargo build -p litebox_runner_linux_on_windows_userland"
+                      + (" --release" if args.release else ""))
+                sys.exit(1)
         elif args.no_build:
             # Use existing binaries without building
             runner_path, rewriter_path = find_litebox_binaries(
@@ -663,7 +779,7 @@ def main():
                 workspace_root, args.release,
             )
 
-        if not args.use_cargo_rewriter and rewriter_path is None:
+        if not is_windows_mode and not args.use_cargo_rewriter and rewriter_path is None:
             print("Warning: litebox_syscall_rewriter binary not found, using cargo fallback")
             args.use_cargo_rewriter = True
 
@@ -677,11 +793,16 @@ def main():
         cleanup_work_dir = True
 
     print(f"Workspace root: {workspace_root}")
-    print(f"UnixBench dir:  {unixbench_dir}")
+    if not is_windows_mode:
+        print(f"UnixBench dir:  {unixbench_dir}")
     print(f"Work dir:       {work_dir}")
+    if is_windows_mode:
+        print(f"Platform:       Windows (litebox_runner_linux_on_windows)")
+        print(f"Prepared dir:   {prepared_dir}")
     if run_litebox_mode:
         print(f"Runner:         {runner_path}")
-        print(f"Rewriter:       {rewriter_path or 'cargo run'}")
+        if not is_windows_mode:
+            print(f"Rewriter:       {rewriter_path or 'cargo run'}")
     print(f"Benchmarks:     {', '.join(args.benchmarks)}")
     if args.duration is not None:
         print(f"Duration:       {args.duration}s (override)")
@@ -719,14 +840,20 @@ def main():
 
         # LiteBox runs
         if run_litebox_mode:
-            print(f"[LiteBox] {bench_name} ({duration}s x {iterations} iterations)")
+            label = "LiteBox-Win" if is_windows_mode else "LiteBox"
+            print(f"[{label}] {bench_name} ({duration}s x {iterations} iterations)")
             for i in range(iterations):
                 print(f"  Iteration {i + 1}/{iterations}")
-                result = run_litebox(
-                    pgms_dir, bench, duration,
-                    runner_path, work_dir, rewriter_path,
-                    args.use_cargo_rewriter,
-                )
+                if is_windows_mode:
+                    result = run_litebox_windows(
+                        bench, duration, runner_path, prepared_dir,
+                    )
+                else:
+                    result = run_litebox(
+                        pgms_dir, bench, duration,
+                        runner_path, work_dir, rewriter_path,
+                        args.use_cargo_rewriter,
+                    )
                 if result:
                     row.litebox_scores.append(result.score)
                     row.unit = row.unit or result.unit
