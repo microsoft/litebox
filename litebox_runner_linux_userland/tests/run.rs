@@ -570,19 +570,19 @@ fn test_runner_with_unixbench() {
     }
 
     let tests = [
-        ("pgms/dhry2reg", vec!["5"]), // requires `alarm`
+        ("pgms/dhry2reg", vec!["5"]),
         ("pgms/whetstone-double", vec![]),
-        // ("pgms/execl", vec!["5"]), // duration reduced from 30 to 5; need to fix path
-        // (
-        //     "pgms/fstime",
-        //     vec!["-c", "-t", "5", "-b", "1024", "-m", "2000"],
-        // ), // duration reduced from 30 to 5; requires `sync`
-        ("pgms/pipe", vec!["5"]), // requires `alarm`
-        // // ("pgms/context1", vec!["5"]), // requires `alarm`, `fork`
-        // // ("pgms/spawn", vec!["5"]), // requires `fork`
-        // ("pgms/syscall", vec!["5"]), // requires `alarm`, `umask`
-        ("pgms/hanoi", vec!["5"]),   // requires `alarm`
-        ("pgms/arithoh", vec!["5"]), // requires `alarm`
+        ("pgms/execl", vec!["5"]),
+        (
+            "pgms/fstime",
+            vec!["-c", "-t", "5", "-b", "1024", "-m", "2000"],
+        ),
+        ("pgms/pipe", vec!["5"]),
+        // ("pgms/context1", vec!["5"]), // requires `fork`
+        // ("pgms/spawn", vec!["5"]),    // requires `fork`
+        ("pgms/syscall", vec!["5"]),
+        ("pgms/hanoi", vec!["5"]),
+        ("pgms/arithoh", vec!["5"]),
     ];
     for (path, args) in tests {
         let path = unixbench_dir.join(path);
@@ -590,13 +590,23 @@ fn test_runner_with_unixbench() {
             .file_stem()
             .and_then(|s| s.to_str())
             .expect("failed to get file stem");
-        Runner::new(
-            Backend::Rewriter,
-            &path,
-            &format!("unixbench_{stem}_rewriter"),
-        )
-        .args(args)
-        .env(format!("UB_BINDIR={}", unixbench_dir.join("pgms").to_str().unwrap()).as_str())
-        .run();
+        let unique_name = format!("unixbench_{stem}_rewriter");
+        let mut runner = Runner::new(Backend::Rewriter, &path, &unique_name);
+        runner.args(args);
+
+        // The execl benchmark re-executes itself via execl($UB_BINDIR/execl, ...).
+        // Place the rewritten binary in the tar at /pgms/execl so it can find itself.
+        if stem == "execl" {
+            let rewritten_path = runner.cmd_path.clone();
+            runner
+                .env("UB_BINDIR=/pgms")
+                .with_fs_path(|tar_dir| {
+                    let pgms_dir = tar_dir.join("pgms");
+                    std::fs::create_dir_all(&pgms_dir).unwrap();
+                    std::fs::copy(&rewritten_path, pgms_dir.join("execl")).unwrap();
+                });
+        }
+
+        runner.run();
     }
 }
