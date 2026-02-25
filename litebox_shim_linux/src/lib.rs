@@ -1214,10 +1214,6 @@ mod test_utils {
     impl<FS: ShimFS> GlobalState<FS> {
         /// Make a new task with default values for testing.
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task<FS> {
-            // Register this test thread with the platform so that
-            // `current_thread()` and related functionality works.
-            litebox_platform_multiplex::platform().init_test_thread();
-
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
