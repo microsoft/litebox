@@ -31,7 +31,8 @@ use litebox_platform_lvbs::{
         vtl_switch::{vtl_switch, vtl_switch_init},
         vtl1_mem_layout::{
             VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE, VTL1_PML4E_PAGE,
-            VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address,
+            VTL1_PRE_POPULATED_MEMORY_SIZE, get_heap_start_address, get_text_end_address,
+            get_text_start_address,
         },
     },
     serial_println,
@@ -89,7 +90,23 @@ pub fn init() -> Option<&'static Platform> {
             );
 
             let pml4_table_addr = vtl1_start + (PAGE_SIZE * VTL1_PML4E_PAGE) as u64;
-            let platform = Platform::new(pml4_table_addr, vtl1_start, vtl1_end);
+
+            // Text section boundaries (relocated). These are used by the
+            // platform to mark code pages executable and everything else
+            // NO_EXECUTE (DEP).  Because `apply_relocations()` has already
+            // run, the linker symbols reflect the actual runtime addresses.
+            // With identity mapping (VA == PA) the virtual addresses equal
+            // the physical addresses.
+            let text_phys_start = x86_64::PhysAddr::new(get_text_start_address());
+            let text_phys_end = x86_64::PhysAddr::new(get_text_end_address());
+
+            let platform = Platform::new(
+                pml4_table_addr,
+                vtl1_start,
+                vtl1_end,
+                text_phys_start,
+                text_phys_end,
+            );
             ret = Some(platform);
             litebox_platform_multiplex::set_platform(platform);
 
