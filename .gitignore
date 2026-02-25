@@ -170,3 +170,21 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.toptal.com/developers/gitignore/api/rust,linux,windows,macos,emacs,vim,visualstudiocode
+
+### Python ###
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.venv/
+venv/
+.env
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
