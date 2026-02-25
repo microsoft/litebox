@@ -143,6 +143,30 @@ def build_rewriter(workspace_root: Path, release: bool) -> Path:
     return rewriter
 
 
+def build_rtld_audit(workspace_root: Path, output_dir: Path) -> Path:
+    """Build litebox_rtld_audit.so and return its path."""
+    rtld_audit_dir = workspace_root / "litebox_rtld_audit"
+    if not rtld_audit_dir.exists():
+        print(f"Error: litebox_rtld_audit source not found at {rtld_audit_dir}")
+        sys.exit(1)
+
+    so_path = output_dir / "litebox_rtld_audit.so"
+    print("Building litebox_rtld_audit.so...")
+    result = subprocess.run(
+        ["make", f"OUT_DIR={output_dir}"],
+        cwd=str(rtld_audit_dir),
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        print(f"Error: failed to build litebox_rtld_audit.so: {stderr[:500]}")
+        sys.exit(1)
+
+    assert so_path.exists(), f"litebox_rtld_audit.so not found at {so_path}"
+    print(f"Built litebox_rtld_audit.so -> {so_path}")
+    return so_path
+
+
 # ── Preparation ─────────────────────────────────────────────────────────────
 
 def prepare_benchmark(
@@ -152,6 +176,7 @@ def prepare_benchmark(
     rewriter: Path,
     output_dir: Path,
     rewritten_cache: dict[str, Path],
+    rtld_audit_path: Optional[Path] = None,
 ) -> bool:
     """
     Prepare a single benchmark: rewrite binary + deps, create tar.
@@ -209,6 +234,12 @@ def prepare_benchmark(
                 shutil.rmtree(dst, ignore_errors=True)
                 shutil.copytree(str(src), str(dst), dirs_exist_ok=True)
         print(f"  Reused cached dependencies from {binary_name}")
+
+    # Copy litebox_rtld_audit.so (not rewritten) into lib64/ in the tar
+    if rtld_audit_path and rtld_audit_path.exists():
+        dst_audit = tar_dir / "lib64" / "litebox_rtld_audit.so"
+        shutil.copy2(str(rtld_audit_path), str(dst_audit))
+        print(f"  Added /lib64/litebox_rtld_audit.so")
 
     # Special handling for execl: place rewritten binary at /pgms/execl in tar
     if bench_name == "execl":
@@ -302,6 +333,9 @@ def main():
         output_dir = Path(__file__).resolve().parent / "prepared"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build litebox_rtld_audit.so
+    rtld_audit_path = build_rtld_audit(workspace_root, output_dir)
+
     print(f"Workspace root: {workspace_root}")
     print(f"UnixBench dir:  {unixbench_dir}")
     print(f"Rewriter:       {rewriter}")
@@ -319,6 +353,7 @@ def main():
         ok = prepare_benchmark(
             pgms_dir, bench_name, binary_name,
             rewriter, output_dir, rewritten_cache,
+            rtld_audit_path,
         )
         if ok:
             prepared.append(bench_name)

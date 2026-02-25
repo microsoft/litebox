@@ -442,9 +442,8 @@ def run_litebox_windows(
     """
     Run a benchmark under LiteBox on Windows using pre-prepared artifacts.
 
-    Uses litebox_runner_linux_on_windows_userland with --rewrite-syscalls.
-    The binaries in the tar are already rewritten, but the main binary is
-    loaded directly by the runner and needs --rewrite-syscalls for it.
+    Uses litebox_runner_linux_on_windows_userland with pre-rewritten binaries
+    and litebox_rtld_audit.so (via LD_AUDIT) to patch shared library trampolines.
     """
     bench_dir = prepared_dir / bench.name
     manifest_path = prepared_dir / "manifest.json"
@@ -476,6 +475,7 @@ def run_litebox_windows(
         "--unstable",
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--env", "HOME=/",
+        "--env", "LD_AUDIT=/lib64/litebox_rtld_audit.so",
     ]
 
     # Special env for execl
