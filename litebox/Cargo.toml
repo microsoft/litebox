@@ -36,3 +36,6 @@ enforce_singleton_litebox_instance = []
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"
