@@ -1924,6 +1924,7 @@ unsafe extern "C-unwind" fn exception_handler(
 }
 
 unsafe extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext<'_>) {
+    thread_ctx.tls.is_in_guest.set(false);
     thread_ctx.call_shim(|shim, ctx, interrupt| {
         if interrupt {
             shim.interrupt(ctx)
