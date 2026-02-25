@@ -171,17 +171,6 @@ impl SigSet {
         }
     }
 
-    /// Removes and returns the lowest-numbered signal in the set, or `None` if
-    /// empty.
-    pub fn pop_lowest(&mut self) -> Option<Signal> {
-        if self.0 == 0 {
-            return None;
-        }
-        let bit = self.0.trailing_zeros();
-        self.0 &= !(1u64 << bit);
-        Some(Signal(bit.reinterpret_as_signed() + 1))
-    }
-
     pub fn as_u64(&self) -> u64 {
         self.0
     }

@@ -399,8 +399,6 @@ impl litebox::platform::SignalProvider for LinuxUserland {
 /// Atomically takes the per-thread pending host signal bitmask.
 fn take_pending_host_signals() -> litebox::shim::SigSet {
     // Atomically swap the per-thread pending signals with zero.
-    // `xchg` has an implicit lock prefix so it is safe against signal
-    // handler writes on this thread.
     // Only the low 32 bits are used (covers traditional signals 1-31).
     let lo: u32;
     unsafe {
@@ -955,7 +953,7 @@ unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) 
     );
 }
 
-/// Non-guest threads (e.g., network workers, background tasks) **must** call this
+/// Non-guest threads (e.g., network workers, background tasks) should call this
 /// function at the start of their execution so the kernel only delivers
 /// `SIGALRM` / `SIGINT` to guest threads, which have the proper signal-handler
 /// context to re-enter the shim.
@@ -1111,8 +1109,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 tv_usec: usecs,
             },
         };
-        // Safety: setitimer with valid arguments is safe. libc crate doesn't
-        // expose a wrapper, so we call via syscall().
+        // Safety: setitimer with valid arguments is safe.
         unsafe {
             libc::syscall(
                 libc::SYS_setitimer,
@@ -2425,10 +2422,6 @@ fn try_wake_wait_condvar(condvar_addr: usize) {
 
 /// Records a pending host signal in the `.tbss` bitmask and wakes any condvar
 /// the thread is blocked on.
-///
-/// This uses the **guest / signal-handler** TLS segment register, so it must
-/// only be called from a signal handler where the saved host TLS segment is
-/// valid.
 ///
 /// # Safety
 ///

@@ -1155,10 +1155,7 @@ impl<FS: ShimFS> Task<FS> {
     /// seconds remaining on a previously set alarm (rounded up), or 0 if none
     /// was set.
     ///
-    /// The alarm is per-process: all threads share the same alarm timer, and
-    /// SIGALRM is delivered to whichever thread next enters the shim. A
-    /// platform-level timer interrupt is also scheduled so that the signal is
-    /// delivered even if the calling thread is running in guest userspace.
+    /// The alarm is per-process: all threads share the same alarm timer.
     pub(crate) fn sys_alarm(&self, seconds: u32) -> u32 {
         let now = self.global.platform.now();
         let mut alarm = self.process().alarm_deadline.lock();

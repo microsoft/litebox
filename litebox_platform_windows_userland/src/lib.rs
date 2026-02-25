@@ -252,8 +252,7 @@ impl WindowsUserland {
             let _ = AddVectoredExceptionHandler(0, Some(vectored_exception_handler));
         }
 
-        // Register a console control handler so that Ctrl+C delivers SIGINT
-        // to all managed guest threads.
+        // Register a console control handler to receive Ctrl+C
         unsafe {
             windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
                 Some(ctrl_c_handler),
@@ -333,7 +332,6 @@ impl litebox::platform::Provider for WindowsUserland {}
 
 impl litebox::platform::SignalProvider for WindowsUserland {
     fn take_pending_signals(&self, mut f: impl FnMut(litebox::shim::Signal)) {
-        // Drain per-thread pending signals.
         let bits = get_tls_ptr()
             .map(|p| {
                 unsafe { &*p }
@@ -882,14 +880,11 @@ unsafe extern "system" fn timer_callback(context: *mut c_void, _timer_or_wait_fi
 /// When the user presses Ctrl+C, this sets the SIGINT bit on every active
 /// managed thread and interrupts them so the shim can deliver the signal.
 unsafe extern "system" fn ctrl_c_handler(ctrl_type: u32) -> i32 {
-    // CTRL_C_EVENT == 0
     if ctrl_type != windows_sys::Win32::System::Console::CTRL_C_EVENT {
         return 0; // FALSE — let the next handler deal with it
     }
 
-    // Pick one arbitrary thread to deliver the signal to. Clone the handle
-    // so we can release the global lock before calling `deliver_signal`
-    // (which may acquire per-thread locks).
+    // Pick one arbitrary thread to deliver the signal to.
     let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
 
     if let Some(thread) = thread {
@@ -1066,22 +1061,6 @@ impl ThreadHandle {
         if !target_tls.is_in_guest.get() {
             // Not running in the guest. The interrupt flag will be checked
             // before returning to the guest.
-            //
-            // If the thread has registered a wait condvar (via
-            // `on_wait_start`), wake it using the same CAS protocol
-            // as `WaitStateInner::wake()`. This transitions the
-            // condvar from WAITING → WOKEN and issues a futex wake
-            // so `WaitOnAddress` returns.
-            let condvar = target_tls.waiting_condvar.load(Ordering::Acquire);
-            if !condvar.is_null() {
-                // Safety: `condvar` points to a valid `RawMutex`
-                // inside a `WaitStateInner` (stable via Arc), set by
-                // `RawMutex::on_wait_start`. The target thread is
-                // suspended, so the pointer is valid.
-                litebox::event::wait::WaitState::<WindowsUserland>::try_wake_condvar(unsafe {
-                    &*condvar
-                });
-            }
             return;
         }
 
