@@ -494,6 +494,7 @@ in_guest:
 interrupt:
     .byte 0
     .align 4
+.globl pending_host_signals
 pending_host_signals:
     .long 0
     .align 8
@@ -909,6 +910,7 @@ in_guest:
 interrupt:
     .byte 0
     .align 4
+.globl pending_host_signals
 pending_host_signals:
     .long 0
     .align 4
