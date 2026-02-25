@@ -17,6 +17,17 @@ use litebox::{
 };
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
+/// Default gateway address from the guest's perspective (host-side TUN endpoint).
+const NINE_P_SERVER_ADDR: core::net::Ipv4Addr = core::net::Ipv4Addr::new(10, 0, 0, 1);
+/// Port the host-side 9P (diod) server listens on.
+const NINE_P_SERVER_PORT: u16 = 8888;
+/// Maximum 9P message size.
+const NINE_P_MSIZE: u32 = 65536;
+/// User identity for the 9P session.
+const NINE_P_USER: &str = "root";
+/// Remote directory exported by the 9P server.
+const NINE_P_ANAME: &str = "/tmp";
+
 type Platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel;
 type DefaultFS = litebox::fs::layered::FileSystem<
     Platform,
@@ -268,14 +279,20 @@ pub extern "C" fn sandbox_process_init(
     load_host_files_into_fs(&mut in_mem_fs);
 
     let socket_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
-        core::net::Ipv4Addr::new(10, 0, 0, 1),
-        8888,
+        NINE_P_SERVER_ADDR,
+        NINE_P_SERVER_PORT,
     ));
     let transport = shim
         .tcp_connection(socket_addr)
         .expect("failed to connect to 9p server");
-    let nine_p = litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/tmp")
-        .expect("failed to create 9P filesystem");
+    let nine_p = litebox::fs::nine_p::FileSystem::new(
+        litebox,
+        transport,
+        NINE_P_MSIZE,
+        NINE_P_USER,
+        NINE_P_ANAME,
+    )
+    .expect("failed to create 9P filesystem");
     let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
     let default_fs = litebox::fs::layered::FileSystem::new(
         litebox,

@@ -5,7 +5,7 @@
 //!
 //! This module provides a [`ShimTransport`] that implements the 9P transport traits
 //! (`litebox::fs::nine_p::transport::{Read, Write}`) by operating directly on a
-//! [`SocketFd`] via the [`GlobalState`] network methods. The socket is **not**
+//! `SocketFd` via the `GlobalState` network methods. The socket is **not**
 //! inserted into the guest-visible descriptor table, so it remains invisible to
 //! the guest program.
 
@@ -44,7 +44,7 @@ impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
     }
 }
 
-/// A 9P transport backed by a raw [`SocketFd`] and its [`NetworkProxy`].
+/// A 9P transport backed by a raw `SocketFd` and its [`NetworkProxy`].
 ///
 /// The socket lives in the litebox descriptor table (for metadata / proxy) but is
 /// **not** registered in the guest's file-descriptor table, keeping it invisible
@@ -52,13 +52,10 @@ impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
 ///
 /// All I/O goes through the non-blocking [`NetworkProxy`] methods directly
 /// (`try_read` / `try_write`), with spin-polling when data is not yet available.
-/// This avoids the need for a [`WaitState`](crate::wait::WaitState) or any
-/// association with a particular guest [`Task`](crate::Task).
-///
-/// The type is **not** generic over `FS` — the `FS`-dependent cleanup logic is
-/// type-erased behind a boxed [`DropGuard`].
+/// This avoids the need for a `WaitState` or any association with a particular
+/// guest `Task`.
 pub struct ShimTransport {
-    _drop_guard: Box<dyn DropGuard>,
+    drop_guard: Box<dyn DropGuard>,
     proxy: Arc<NetworkProxy<Platform>>,
 }
 
@@ -100,16 +97,13 @@ impl ShimTransport {
 
         let drop_guard = Box::new(SocketDropGuard { global, sockfd });
 
-        Ok(Self {
-            _drop_guard: drop_guard,
-            proxy,
-        })
+        Ok(Self { drop_guard, proxy })
     }
 }
 
 impl Drop for ShimTransport {
     fn drop(&mut self) {
-        self._drop_guard.close();
+        self.drop_guard.close();
     }
 }
 
