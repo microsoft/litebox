@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 //! VTL0 data format and parsing
+#![allow(clippy::trivially_copy_pass_by_ref)]
 
 use modular_bitfield::{
     bitfield,
