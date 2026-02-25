@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::ops::Range;
 use litebox::mm::linux::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
 use litebox::platform::page_mgmt;
 use litebox::utils::TruncateExt;
@@ -362,13 +363,20 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
-    /// Map physical frame range to the page table
+    /// Map physical frame range to the page table.
+    ///
+    /// Page frames whose physical addresses fall within `exec_ranges` are mapped
+    /// without `NO_EXECUTE`; all other frames are mapped with `NO_EXECUTE`.
+    ///
+    /// Parent (P2/P3) table entry flags never include `NO_EXECUTE` so that
+    /// the NX restriction is applied only at the leaf (P1) level.
     ///
     /// Note it does not rely on the page fault handler based mapping to avoid double faults.
     pub(crate) fn map_phys_frame_range(
         &self,
         frame_range: PhysFrameRange<Size4KiB>,
         flags: PageTableFlags,
+        exec_ranges: Option<&[Range<PhysAddr>]>,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
         let mut allocator = PageTableAllocator::<M>::new();
 
@@ -396,8 +404,30 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
             }
 
+            // When exec_ranges are provided, determine per-page flags based
+            // on whether the frame falls within an executable region.
+            let page_flags = if let Some(ranges) = exec_ranges {
+                let frame_addr = target_frame.start_address();
+                let is_exec = ranges.iter().any(|r| r.contains(&frame_addr));
+                if is_exec {
+                    // W^X: if the page is executable, it should not be writable.
+                    (flags & !PageTableFlags::NO_EXECUTE) & !PageTableFlags::WRITABLE
+                } else {
+                    flags | PageTableFlags::NO_EXECUTE
+                }
+            } else {
+                flags
+            };
+            let table_flags = page_flags - PageTableFlags::NO_EXECUTE; // parent entries should not have NO_EXECUTE
+
             match unsafe {
-                inner.map_to_with_table_flags(page, target_frame, flags, flags, &mut allocator)
+                inner.map_to_with_table_flags(
+                    page,
+                    target_frame,
+                    page_flags,
+                    table_flags,
+                    &mut allocator,
+                )
             } {
                 Ok(_) => {}
                 Err(e) => return Err(e),

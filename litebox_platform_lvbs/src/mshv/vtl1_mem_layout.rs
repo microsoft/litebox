@@ -39,6 +39,9 @@ pub const VTL1_INIT_HEAP_SIZE: usize = 1024 * 1024;
 unsafe extern "C" {
     static _memory_base: u8;
     static _heap_start: u8;
+    static _text_start: u8;
+    static _text_end: u8;
+    static _hvcall_page_start: u8;
 }
 
 #[inline]
@@ -54,6 +57,24 @@ pub fn get_heap_start_address() -> u64 {
 #[inline]
 pub fn get_address_of_special_page(page: usize) -> u64 {
     get_memory_base_address() + (page as u64) * PAGE_SIZE as u64
+}
+
+/// Returns the start address of the VTL1 kernel text (code) section.
+#[inline]
+pub fn get_text_start_address() -> u64 {
+    &raw const _text_start as u64
+}
+
+/// Returns the end address (exclusive) of the VTL1 kernel text (code) section.
+#[inline]
+pub fn get_text_end_address() -> u64 {
+    &raw const _text_end as u64
+}
+
+/// Returns the start address of the Hyper-V hypercall code page.
+#[inline]
+pub fn get_hvcall_page_start_address() -> u64 {
+    &raw const _hvcall_page_start as u64
 }
 
 /// Errors for VTL memory operations.

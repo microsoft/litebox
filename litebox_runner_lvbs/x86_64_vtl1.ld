@@ -38,6 +38,16 @@ SECTIONS
         _bss_end = .;
     }
 
+    /* Hyper-V hypercall code page: Hyper-V sets up executable code here at runtime
+       via wrmsr to HV_X64_MSR_HYPERCALL. Call to this page results in a hypercall.
+       Placed in its own page-aligned section so it can be marked executable in
+       the page tables (DEP). */
+    .hvcall_page : ALIGN(0x1000) {
+        _hvcall_page_start = .;
+        KEEP(*(.hvcall_page))
+        . = _hvcall_page_start + 0x1000;
+    }
+
     /* Relocation section for position-independent execution */
     .rela.dyn : ALIGN(0x200000) {
         _rela_start = .;

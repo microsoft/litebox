@@ -377,15 +377,59 @@ pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
     host: core::marker::PhantomData<Host>,
 }
 
-// TODO: implement pointer validation to ensure the pointers are in user space.
-type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
-    litebox::platform::common_providers::userspace_pointers::NoValidation,
-    T,
->;
-type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
-    litebox::platform::common_providers::userspace_pointers::NoValidation,
-    T,
->;
+/// [`litebox::platform::common_providers::userspace_pointers::ValidateAccess`]
+/// implementation for LVBS that provides SMAP support.
+pub struct LvbsValidateAccess;
+
+impl litebox::platform::common_providers::userspace_pointers::ValidateAccess
+    for LvbsValidateAccess
+{
+    fn validate<T>(ptr: *mut T) -> Option<*mut T> {
+        let addr = ptr as usize;
+        let end = addr.checked_add(core::mem::size_of::<T>())?;
+        if addr >= USER_ADDR_MIN && end <= USER_ADDR_MAX {
+            Some(ptr)
+        } else {
+            None
+        }
+    }
+
+    fn validate_slice<T>(ptr: *mut [T]) -> Option<*mut T> {
+        let base = ptr.cast::<T>();
+        let addr = base as usize;
+        let byte_len = ptr.len().checked_mul(core::mem::size_of::<T>())?;
+        let end = addr.checked_add(byte_len)?;
+        if addr >= USER_ADDR_MIN && end <= USER_ADDR_MAX {
+            Some(base)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn with_user_memory_access<R>(f: impl FnOnce() -> R) -> R {
+        // STAC: Set AC flag to temporarily allow supervisor access to user pages.
+        // Safety: STAC is a privileged instruction that only modifies the AC flag
+        // in RFLAGS. It has no side effects beyond enabling SMAP bypass.
+        unsafe {
+            core::arch::asm!("stac", options(nomem, nostack, preserves_flags));
+        }
+        let result = f();
+        // CLAC: Clear AC flag to re-enable SMAP protection.
+        // Safety: CLAC is a privileged instruction that only modifies the AC flag
+        // in RFLAGS. It has no side effects beyond re-enabling SMAP enforcement.
+        unsafe {
+            core::arch::asm!("clac", options(nomem, nostack, preserves_flags));
+        }
+        result
+    }
+}
+
+type UserConstPtr<T> =
+    litebox::platform::common_providers::userspace_pointers::UserConstPtr<LvbsValidateAccess, T>;
+type UserMutPtr<T> =
+    litebox::platform::common_providers::userspace_pointers::UserMutPtr<LvbsValidateAccess, T>;
 
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
@@ -431,40 +475,127 @@ impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
 
 impl<Host: HostInterface> LinuxKernel<Host> {
     /// This function initializes the VTL1 kernel platform (mostly the kernel page table).
-    /// `init_page_table_addr` specifies the physical address of the initial page table prepared by the VTL0 kernel.
-    /// `phys_start` and `phys_end` specify the entire range of physical memory that is reserved for the VTL1 kernel.
-    /// Since the VTL0 kernel does not fully map this physical address range to the initial page table, this function
-    /// creates and maintains a kernel page table covering the entire VTL1 physical memory range. The caller must
-    /// ensure that the heap has enough space for this page table creation.
+    ///
+    /// It performs a two-phase page-table bootstrap:
+    ///
+    /// 1. **Early phase**: the VTL0-provided page table at `init_page_table_addr` is
+    ///    extended so that the entire VTL1 physical range is identity-mapped. This is
+    ///    required because VTL0 only pre-populates a small initial window and the VTL1
+    ///    heap allocator needs access to all VTL1 memory.
+    ///
+    /// 2. **DEP phase**: a *new* top-level (PML4) page table is allocated from the
+    ///    heap, populated with the same identity mapping but with proper No-Execute (NX)
+    ///    permissions, and loaded via CR3. Pages inside the kernel text section
+    ///    (`text_phys_start..text_phys_end`) and the Hyper-V hypercall code page are
+    ///    mapped executable; every other page is marked `NO_EXECUTE`.
+    ///
+    /// `text_phys_start` / `text_phys_end` must be page-aligned physical addresses
+    /// obtained from the linker symbols `_text_start` / `_text_end` (after
+    /// relocations have been applied).
     ///
     /// # Panics
     ///
-    /// Panics if the heap is not initialized yet or it does not have enough space to allocate page table entries.
-    /// Panics if `phys_start` or `phys_end` is invalid
+    /// Panics if the heap is not initialized yet or it does not have enough space to
+    /// allocate page table entries, or if `phys_start` / `phys_end` is invalid.
     pub fn new(
         init_page_table_addr: x86_64::PhysAddr,
         phys_start: x86_64::PhysAddr,
         phys_end: x86_64::PhysAddr,
+        text_phys_start: x86_64::PhysAddr,
+        text_phys_end: x86_64::PhysAddr,
     ) -> &'static Self {
-        let pt = unsafe { mm::PageTable::new(init_page_table_addr) };
+        // Phase 1: extend the early page table (from VTL0) to cover all VTL1 memory
+        let early_pt: mm::PageTable<PAGE_SIZE> =
+            unsafe { mm::PageTable::new(init_page_table_addr) };
         let physframe_start = PhysFrame::containing_address(phys_start);
         let physframe_end = PhysFrame::containing_address(phys_end.align_up(Size4KiB::SIZE));
-        if pt
+        let vtl1_range = PhysFrame::range(physframe_start, physframe_end);
+        if early_pt
             .map_phys_frame_range(
-                PhysFrame::range(physframe_start, physframe_end),
+                vtl1_range,
                 PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                None,
             )
             .is_err()
         {
-            panic!("Failed to map VTL1 physical memory");
+            panic!("Failed to map VTL1 physical memory to early page table");
+        }
+
+        // Phase 2: create a new base page table with DEP enforcement
+        //
+        // Build the list of physical address ranges that must remain executable:
+        //   1. The kernel .text section
+        //   2. The Hyper-V hypercall code page (defined in the linker script;
+        //      the hypervisor writes executable code into it at runtime)
+        #[allow(unused_mut)]
+        let mut exec_ranges = alloc::vec![text_phys_start..text_phys_end];
+        #[cfg(not(test))]
+        {
+            use crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address;
+            let hvcall_start = get_hvcall_page_start_address();
+            exec_ranges.push(
+                x86_64::PhysAddr::new(hvcall_start)
+                    ..x86_64::PhysAddr::new(hvcall_start + PAGE_SIZE as u64),
+            );
+        }
+
+        let base_pt = unsafe { mm::PageTable::new_top_level() };
+        if base_pt
+            .map_phys_frame_range(
+                vtl1_range,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                Some(&exec_ranges),
+            )
+            .is_err()
+        {
+            panic!("Failed to map VTL1 physical memory to base page table with DEP");
+        }
+
+        // Enable the NX (No-eXecute) bit in IA32_EFER before loading the new
+        // page table. Without EFER.NXE set, the CPU treats bit 63 (NX/XD) of PTEs
+        // as reserved; loading a CR3 whose page tables have that bit set would
+        // trigger a reserved-bit violation.
+        crate::arch::enable_dep();
+
+        // Switch to the new base page table.
+        // Safety: the new page table identity-maps the entire VTL1 memory range,
+        // including the code currently being executed and the stack.
+        base_pt.load();
+
+        // The page table's Drop would try to `mem_free_pages` the
+        // PML4 frame, but that frame was pre-populated by VTL0 and was
+        // never allocated from the heap. We must skip the destructor.
+        core::mem::forget(early_pt);
+
+        // Reclaim the VTL0-setup page table frames (PML4E, PDPE, PDE, and
+        // PTE pages). These are VTL1 physical memory that VTL0 used for
+        // the initial page table but are no longer needed after the CR3
+        // switch above.
+        #[cfg(not(test))]
+        {
+            use crate::mshv::vtl1_mem_layout::{
+                VSM_SK_PTE_PAGES_COUNT, VTL1_PML4E_PAGE, VTL1_PTE_0_PAGE,
+            };
+            let early_pt_start: usize =
+                TruncateExt::<usize>::truncate(phys_start.as_u64()) + VTL1_PML4E_PAGE * PAGE_SIZE;
+            let early_pt_size: usize =
+                (VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT - VTL1_PML4E_PAGE) * PAGE_SIZE;
+            // Safety: the early page table frames are no longer referenced
+            // (CR3 now points to `base_pt`) and fall within VTL1's memory.
+            unsafe {
+                <crate::host::LvbsLinuxKernel as crate::mm::MemoryProvider>::mem_fill_pages(
+                    early_pt_start,
+                    early_pt_size,
+                );
+            }
         }
 
         // There is only one long-running platform ever expected, thus this leak is perfectly ok in
         // order to simplify usage of the platform.
         alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
             host_and_task: core::marker::PhantomData,
-            page_table_manager: PageTableManager::new(pt),
-            vtl1_phys_frame_range: PhysFrame::range(physframe_start, physframe_end),
+            page_table_manager: PageTableManager::new(base_pt),
+            vtl1_phys_frame_range: vtl1_range,
             vtl0_kernel_info: Vtl0KernelInfo::new(),
         }))
     }
@@ -498,10 +629,12 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             return Err(MapToError::FrameAllocationFailed);
         }
 
+        let flags = flags | PageTableFlags::NO_EXECUTE;
+
         Ok((
             self.page_table_manager
                 .current_page_table()
-                .map_phys_frame_range(frame_range, flags)?,
+                .map_phys_frame_range(frame_range, flags, None)?,
             usize::try_from(frame_range.len()).unwrap() * PAGE_SIZE,
         ))
     }
@@ -707,6 +840,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     }
 
     /// Create a new task page table for VTL1 user space and returns its ID.
+    ///
+    /// The kernel address space is duplicated from the base page table,
+    /// including its DEP policy (kernel text executable, everything else
+    /// `NO_EXECUTE`).
     ///
     /// See [`PageTableManager`] for security notes on KPTI.
     ///
@@ -1224,8 +1361,8 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
-        // TODO: Add `PageTableFlags::NO_EXECUTE` once DEP is enabled.
-        let mut flags = PageTableFlags::PRESENT;
+        // VTL0 memory must never be executable from VTL1 (DEP).
+        let mut flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
         if perms.contains(PhysPageMapPermissions::WRITE) {
             flags |= PageTableFlags::WRITABLE;
         }
@@ -1249,7 +1386,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             match self
                 .page_table_manager
                 .current_page_table()
-                .map_phys_frame_range(frame_range, flags)
+                .map_phys_frame_range(frame_range, flags, None)
             {
                 Ok(page_addr) => Ok(PhysPageMapInfo {
                     base: page_addr,
