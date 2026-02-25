@@ -332,14 +332,11 @@ impl litebox::platform::Provider for WindowsUserland {}
 
 impl litebox::platform::SignalProvider for WindowsUserland {
     fn take_pending_signals(&self, mut f: impl FnMut(litebox::shim::Signal)) {
-        let bits = get_tls_ptr()
-            .map(|p| {
-                unsafe { &*p }
-                    .pending_host_signals
-                    .swap(0, Ordering::SeqCst)
-            })
-            .unwrap_or(0);
-
+        let bits = get_tls_ptr().map_or(0, |p| {
+            unsafe { &*p }
+                .pending_host_signals
+                .swap(0, Ordering::SeqCst)
+        });
         let sigs = litebox::shim::SigSet::from_u64(u64::from(bits));
         for signal in sigs {
             f(signal);
@@ -855,7 +852,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         // Ensure the module-wide TLS slot is allocated.
         ensure_tls_index();
         let tls = TlsState::new();
-        ThreadHandle::run_with_handle(&tls, || f())
+        ThreadHandle::run_with_handle(&tls, f)
     }
 }
 
@@ -1206,6 +1203,7 @@ impl RawMutex {
         }
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn block_or_maybe_timeout(
         &self,
         val: u32,
