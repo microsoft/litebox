@@ -326,9 +326,9 @@ def main():
     else:
         rewriter = build_rewriter(workspace_root, args.release)
 
-    # Output directory
+    # Output directory (must be absolute for Makefile invocations with different cwd)
     if args.output_dir:
-        output_dir = Path(args.output_dir)
+        output_dir = Path(args.output_dir).resolve()
     else:
         output_dir = Path(__file__).resolve().parent / "prepared"
     output_dir.mkdir(parents=True, exist_ok=True)
