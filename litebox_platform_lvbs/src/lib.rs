@@ -406,6 +406,7 @@ impl litebox::platform::common_providers::userspace_pointers::ValidateAccess
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline]
     fn with_user_memory_access<R>(f: impl FnOnce() -> R) -> R {
         // STAC: Set AC flag to temporarily allow supervisor access to user pages.
