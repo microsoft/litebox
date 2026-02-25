@@ -10,7 +10,7 @@ use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use litebox::mm::linux::PageRange;
-use litebox::platform::Instant as _;
+use litebox::platform::RawMutex as _;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
