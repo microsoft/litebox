@@ -1326,8 +1326,9 @@ pub(crate) enum ThreadInitState {
 
 /// Global session ID pool (Linux pidmap style).
 ///
-/// Uses spinlock-protected bitmap for recyclable IDs (1..=MAX_RECYCLABLE_SESSION_ID),
-/// with fallback to one-time IDs beyond that range.
+/// Uses [`IdPool`](litebox::utils::id_pool::IdPool) for recyclable IDs
+/// (1..=MAX_RECYCLABLE_SESSION_ID), with fallback to one-time IDs beyond
+/// that range.
 ///
 /// With MAX_RECYCLABLE_SESSION_ID = 65535:
 /// - Bitmap memory usage: (65535 + 1) bits = 8 KB
@@ -1338,23 +1339,25 @@ pub(crate) enum ThreadInitState {
 /// Design notes:
 /// - A single TA instance can serve many concurrent sessions (no per-instance cap),
 ///   so the bitmap must cover realistic peak concurrency.
-/// - Allocation uses `last_id` as a hint for O(1) amortized scans; worst-case O(n)
+/// - Allocation uses wrap-around scanning for O(n/64) amortized cost; worst-case
 ///   full scan only occurs when the bitmap is nearly full.
-/// - 8 KB is modest for the secure world (with a small amount of memory) and avoids falling
-///   into the non-recyclable fallback path under normal workloads. Fallback IDs are
+/// - ~8 KB is modest for the secure world and avoids falling into the
+///   non-recyclable fallback path under normal workloads. Fallback IDs are
 ///   a one-way leak (never recycled).
 pub(crate) struct SessionIdPool {
-    bitmap: bitvec::vec::BitVec, // bit[id] set = in use; bit 0 unused (session ID 0 is invalid)
-    last_id: u32,                // for wrap-around scanning
-    fallback_next: u32,          // one-time IDs when bitmap exhausted
+    /// Recyclable ID pool. Pool ID `p` maps to session ID `p + 1`.
+    pool: litebox::utils::id_pool::IdPool,
+    /// Next one-time ID when the recyclable pool is exhausted.
+    fallback_next: u32,
 }
 
 fn session_id_pool() -> &'static spin::mutex::SpinMutex<SessionIdPool> {
     static POOL: spin::once::Once<spin::mutex::SpinMutex<SessionIdPool>> = spin::once::Once::new();
     POOL.call_once(|| {
         spin::mutex::SpinMutex::new(SessionIdPool {
-            bitmap: bitvec::bitvec![0; SessionIdPool::MAX_RECYCLABLE_SESSION_ID as usize + 1],
-            last_id: 0,
+            pool: litebox::utils::id_pool::IdPool::with_capacity(
+                SessionIdPool::MAX_RECYCLABLE_SESSION_ID,
+            ),
             fallback_next: SessionIdPool::MAX_RECYCLABLE_SESSION_ID + 1,
         })
     })
@@ -1373,18 +1376,9 @@ impl SessionIdPool {
     pub fn allocate() -> Option<u32> {
         let mut pool = session_id_pool().lock();
 
-        let start = if pool.last_id >= Self::MAX_RECYCLABLE_SESSION_ID {
-            1
-        } else {
-            pool.last_id + 1
-        };
-
-        for id in (start..=Self::MAX_RECYCLABLE_SESSION_ID).chain(1..start) {
-            if !pool.bitmap[id as usize] {
-                pool.bitmap.set(id as usize, true);
-                pool.last_id = id;
-                return Some(id);
-            }
+        // Try recyclable pool first (pool ID 0 → session ID 1, etc.)
+        if let Some(id) = pool.pool.allocate() {
+            return Some(id + 1);
         }
 
         // Bitmap exhausted - use fallback one-time IDs if available
@@ -1402,8 +1396,7 @@ impl SessionIdPool {
             return;
         }
 
-        let mut pool = session_id_pool().lock();
-        pool.bitmap.set(session_id as usize, false);
+        session_id_pool().lock().pool.recycle(session_id - 1);
     }
 
     pub fn get_pta_session_id() -> u32 {
