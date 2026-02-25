@@ -23,18 +23,6 @@ use alloc::vec::Vec;
 /// - **Fixed-capacity** ([`with_capacity`](Self::with_capacity)): bitmap is
 ///   pre-allocated and never grows. [`allocate`](Self::allocate) returns `None`
 ///   when all slots are in use.
-///
-/// # Examples
-///
-/// ```
-/// use litebox::utils::id_pool::IdPool;
-///
-/// let mut pool = IdPool::new();
-/// let a = pool.allocate().unwrap(); // 0
-/// let b = pool.allocate().unwrap(); // 1
-/// pool.recycle(a);
-/// let c = pool.allocate().unwrap(); // 0 (recycled)
-/// ```
 pub struct IdPool {
     /// Bitmap: bit set = ID in use.
     /// Word `w`, bit `b` → ID `w * 64 + b`.
