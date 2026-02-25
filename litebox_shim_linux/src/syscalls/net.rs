@@ -915,7 +915,7 @@ impl<FS: ShimFS> Task<FS> {
         })?;
         self.do_socket(domain, ty, flags, protocol)
     }
-    fn do_socket(
+    pub(crate) fn do_socket(
         &self,
         domain: AddressFamily,
         ty: SockType,
@@ -1267,7 +1267,7 @@ impl<FS: ShimFS> Task<FS> {
         let sockaddr = read_sockaddr_from_user(sockaddr, addrlen)?;
         self.do_connect(fd, sockaddr)
     }
-    fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
+    pub(crate) fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         self.files.borrow().with_socket(
             sockfd,
             |fd| {
@@ -1339,17 +1339,16 @@ impl<FS: ShimFS> Task<FS> {
         let sockaddr = addr
             .map(|addr| read_sockaddr_from_user(addr, addrlen as usize))
             .transpose()?;
-        self.do_sendto(fd, buf, len, flags, sockaddr)
+        let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
+        self.do_sendto(fd, &buf, flags, sockaddr)
     }
-    fn do_sendto(
+    pub(crate) fn do_sendto(
         &self,
         sockfd: u32,
-        buf: ConstPtr<u8>,
-        len: usize,
+        buf: &[u8],
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
-        let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
         self.files.borrow().with_socket(
             sockfd,
             |fd| {
@@ -1358,14 +1357,14 @@ impl<FS: ShimFS> Task<FS> {
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 self.global
-                    .sendto(&self.wait_cx(), fd, &buf, flags, sockaddr)
+                    .sendto(&self.wait_cx(), fd, buf, flags, sockaddr)
             },
             |file| {
                 let addr = sockaddr
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                file.sendto(self, &buf, flags, addr)
+                file.sendto(self, buf, flags, addr)
             },
         )
     }
@@ -1444,14 +1443,16 @@ impl<FS: ShimFS> Task<FS> {
         addr: Option<MutPtr<u8>>,
         addrlen: MutPtr<u32>,
     ) -> Result<usize, Errno> {
+        const MAX_LEN: usize = 4096;
         let Ok(sockfd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
         let mut source_addr = None;
+        let mut buffer = [0u8; MAX_LEN];
+        let recv_buf = &mut buffer[..MAX_LEN.min(len)];
         let size = self.do_recvfrom(
             sockfd,
-            buf,
-            len,
+            recv_buf,
             flags,
             if addr.is_some() {
                 Some(&mut source_addr)
@@ -1459,6 +1460,8 @@ impl<FS: ShimFS> Task<FS> {
                 None
             },
         )?;
+        buf.copy_from_slice(0, &recv_buf[..size.min(recv_buf.len())])
+            .ok_or(Errno::EFAULT)?;
         if let Some(src_addr) = source_addr
             && let Some(sock_ptr) = addr
         {
@@ -1466,57 +1469,53 @@ impl<FS: ShimFS> Task<FS> {
         }
         Ok(size)
     }
-    fn do_recvfrom(
+    pub(crate) fn do_recvfrom(
         &self,
         sockfd: u32,
-        buf: MutPtr<u8>,
-        len: usize,
+        buf: &mut [u8],
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
         let want_source = source_addr.is_some();
-        let (size, addr) = self.files.borrow().with_socket(
-            sockfd,
-            |fd| {
-                const MAX_LEN: usize = 4096;
-                let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
-                let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
-                let mut addr = None;
-                let size = self.global.receive(
-                    &self.wait_cx(),
-                    fd,
-                    buffer,
-                    flags,
-                    if want_source { Some(&mut addr) } else { None },
-                )?;
-                let src_addr = addr.map(SocketAddress::Inet);
-                if !flags.contains(ReceiveFlags::TRUNC) {
-                    assert!(size <= len, "{size} should be smaller than {len}");
-                }
-                buf.copy_from_slice(0, &buffer[..size.min(buffer.len())])
-                    .ok_or(Errno::EFAULT)?;
-                Ok((size, src_addr))
-            },
-            |file| {
-                const MAX_LEN: usize = 4096;
-                let mut buffer: [u8; MAX_LEN] = [0; MAX_LEN];
-                let buffer: &mut [u8] = &mut buffer[..MAX_LEN.min(len)];
+        let files = self.files.borrow();
+        let file_table = files.file_descriptors.read();
+        let (size, addr) = match file_table.get_fd(sockfd).ok_or(Errno::EBADF)? {
+            Descriptor::LiteBoxRawFd(raw_fd) => {
+                let raw_fd = *raw_fd;
+                drop(file_table);
+                files.with_socket_fd(raw_fd, |fd| {
+                    let mut addr = None;
+                    let size = self.global.receive(
+                        &self.wait_cx(),
+                        fd,
+                        buf,
+                        flags,
+                        if want_source { Some(&mut addr) } else { None },
+                    )?;
+                    let src_addr = addr.map(SocketAddress::Inet);
+                    Ok((size, src_addr))
+                })?
+            }
+            Descriptor::Unix { file, .. } => {
+                let file = file.clone();
+                drop(file_table);
                 let mut addr = None;
                 let size = file.recvfrom(
                     &self.wait_cx(),
-                    buffer,
+                    buf,
                     flags,
                     if want_source { Some(&mut addr) } else { None },
                 )?;
                 let src_addr = addr.map(SocketAddress::Unix);
-                if !flags.contains(ReceiveFlags::TRUNC) {
-                    assert!(size <= len, "{size} should be smaller than {len}");
-                }
-                buf.copy_from_slice(0, &buffer[..size.min(buffer.len())])
-                    .ok_or(Errno::EFAULT)?;
-                Ok((size, src_addr))
-            },
-        )?;
+                (size, src_addr)
+            }
+            _ => return Err(Errno::ENOTSOCK),
+        };
+
+        if !flags.contains(ReceiveFlags::TRUNC) {
+            let len = buf.len();
+            assert!(size <= len, "{size} should be smaller than {len}");
+        }
 
         if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
             *source_addr = Some(addr);
@@ -1846,36 +1845,16 @@ mod tests {
     };
 
     use super::SocketAddress;
-    use crate::{ConstPtr, MutPtr};
+    use crate::{ConstPtr, MutPtr, syscalls::tests::init_platform};
 
     extern crate alloc;
     extern crate std;
 
     const TUN_IP_ADDR: [u8; 4] = [10, 0, 0, 2];
     const TUN_IP_ADDR_STR: &str = "10.0.0.2";
+    const TUN_DEVICE_NAME: &str = "tun99";
     const SERVER_PORT: u16 = 8080;
     const CLIENT_PORT: u16 = 8081;
-
-    fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate::DefaultFS> {
-        let task = crate::syscalls::tests::init_platform(tun_device_name);
-        let global = task.global.clone();
-        if tun_device_name.is_some() {
-            // Start a background thread to perform network interaction
-            // Naive implementation for testing purpose only
-            std::thread::spawn(move || {
-                loop {
-                    while global
-                        .net
-                        .lock()
-                        .perform_platform_interaction()
-                        .call_again_immediately()
-                    {}
-                    core::hint::spin_loop();
-                }
-            });
-        }
-        task
-    }
 
     fn close_socket(task: &crate::Task<crate::DefaultFS>, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
@@ -2007,9 +1986,8 @@ mod tests {
 
         match option {
             "sendto" => {
-                let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
                 let n = task
-                    .do_sendto(client_fd, ptr, buf.len(), SendFlags::empty(), None)
+                    .do_sendto(client_fd, buf.as_bytes(), SendFlags::empty(), None)
                     .expect("Failed to send data");
                 assert_eq!(n, buf.len());
                 let output = child_handle
@@ -2065,12 +2043,10 @@ mod tests {
                     }
                 }
                 let mut recv_buf = [0u8; 48];
-                let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
                 let n = task
                     .do_recvfrom(
                         client_fd,
-                        recv_ptr,
-                        recv_buf.len(),
+                        &mut recv_buf,
                         if test_trunc {
                             ReceiveFlags::TRUNC
                         } else {
@@ -2100,12 +2076,12 @@ mod tests {
         test_trunc: bool,
         option: &'static str,
     ) {
-        let task = init_platform(Some("tun99"));
+        let task = init_platform(Some(TUN_DEVICE_NAME));
         test_tcp_socket_as_server(&task, TUN_IP_ADDR, port, is_nonblocking, test_trunc, option);
     }
 
     fn test_tcp_socket_send(is_nonblocking: bool, test_trunc: bool) {
-        let task = init_platform(Some("tun99"));
+        let task = init_platform(Some(TUN_DEVICE_NAME));
         test_tcp_socket_as_server(
             &task,
             TUN_IP_ADDR,
@@ -2151,7 +2127,7 @@ mod tests {
 
     #[test]
     fn test_tun_tcp_connection_refused() {
-        let task = init_platform(Some("tun99"));
+        let task = init_platform(Some(TUN_DEVICE_NAME));
         let socket_fd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");
@@ -2174,7 +2150,7 @@ mod tests {
 
     #[test]
     fn test_tun_tcp_socket_as_client() {
-        let task = init_platform(Some("tun99"));
+        let task = init_platform(Some(TUN_DEVICE_NAME));
 
         let child_handle = std::thread::spawn(|| {
             std::process::Command::new("nc")
@@ -2202,12 +2178,10 @@ mod tests {
             .expect("failed to connect to server");
 
         let buf = "Hello, world!";
-        let ptr = ConstPtr::from_usize(buf.as_ptr().expose_provenance());
-        let len = buf.len();
         let n = task
-            .do_sendto(client_fd, ptr, len, SendFlags::empty(), None)
+            .do_sendto(client_fd, buf.as_bytes(), SendFlags::empty(), None)
             .unwrap();
-        assert_eq!(n, len);
+        assert_eq!(n, buf.len());
 
         let linger = litebox_common_linux::Linger {
             onoff: 1,   // enable linger
@@ -2233,7 +2207,7 @@ mod tests {
     }
 
     fn blocking_udp_server_socket(test_trunc: bool, is_nonblocking: bool) {
-        let task = init_platform(Some("tun99"));
+        let task = init_platform(Some(TUN_DEVICE_NAME));
 
         // Server socket and bind
         let server_fd = task
@@ -2293,7 +2267,6 @@ mod tests {
 
         // Server receives and inspects sender addr
         let mut recv_buf = [0u8; 48];
-        let recv_ptr = crate::MutPtr::from_usize(recv_buf.as_mut_ptr() as usize);
         let mut sender_addr = None;
         let mut recv_flags = ReceiveFlags::empty();
         if test_trunc {
@@ -2309,15 +2282,15 @@ mod tests {
                 assert_eq!(fd, server_fd);
             }
         }
+        let recv_len = if test_trunc {
+            8 // intentionally small size to test truncation
+        } else {
+            recv_buf.len()
+        };
         let n = task
             .do_recvfrom(
                 server_fd,
-                recv_ptr,
-                if test_trunc {
-                    8 // intentionally small size to test truncation
-                } else {
-                    recv_buf.len()
-                },
+                &mut recv_buf[..recv_len],
                 recv_flags,
                 Some(&mut sender_addr),
             )
@@ -2358,7 +2331,7 @@ mod tests {
     fn test_tun_udp_client_socket_without_server() {
         // We do not support loopback yet, so this test only checks that
         // the client can send packets without a server.
-        let task = init_platform(Some("tun99"));
+        let task = init_platform(Some(TUN_DEVICE_NAME));
 
         // Client socket and explicit bind
         let client_fd = task
@@ -2377,11 +2350,9 @@ mod tests {
 
         // Send from client to server
         let msg = "Hello without connect()";
-        let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
         task.do_sendto(
             client_fd,
-            msg_ptr,
-            msg.len(),
+            msg.as_bytes(),
             SendFlags::empty(),
             Some(server_addr.clone()),
         )
@@ -2401,8 +2372,7 @@ mod tests {
 
         // Now client can send without specifying addr
         let msg = "Hello with connect()";
-        let msg_ptr = ConstPtr::from_usize(msg.as_ptr().expose_provenance());
-        task.do_sendto(client_fd, msg_ptr, msg.len(), SendFlags::empty(), None)
+        task.do_sendto(client_fd, msg.as_bytes(), SendFlags::empty(), None)
             .expect("failed to sendto");
 
         close_socket(&task, client_fd);
@@ -2410,7 +2380,7 @@ mod tests {
 
     #[test]
     fn test_tun_tcp_sockopt() {
-        let task = init_platform(Some("tun99"));
+        let task = init_platform(Some(TUN_DEVICE_NAME));
         let sockfd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");
@@ -2552,8 +2522,7 @@ mod unix_tests {
             let n = task
                 .do_sendto(
                     server_fd,
-                    ConstPtr::from_usize(msg1.as_ptr() as usize),
-                    msg1.len(),
+                    msg1.as_bytes(),
                     SendFlags::empty(),
                     Some(client_addr.clone()),
                 )
@@ -2565,8 +2534,7 @@ mod unix_tests {
             let n = task
                 .do_recvfrom(
                     client_fd,
-                    MutPtr::from_usize(buf.as_mut_ptr() as usize),
-                    buf.len(),
+                    &mut buf,
                     ReceiveFlags::empty(),
                     Some(&mut source),
                 )
@@ -2580,8 +2548,7 @@ mod unix_tests {
             let n = task
                 .do_sendto(
                     client_fd,
-                    ConstPtr::from_usize(msg2.as_ptr() as usize),
-                    msg2.len(),
+                    msg2.as_bytes(),
                     SendFlags::empty(),
                     Some(server_addr),
                 )
@@ -2593,8 +2560,7 @@ mod unix_tests {
             let n = task
                 .do_recvfrom(
                     server_fd,
-                    MutPtr::from_usize(buf.as_mut_ptr() as usize),
-                    buf.len(),
+                    &mut buf,
                     ReceiveFlags::empty(),
                     Some(&mut source),
                 )
@@ -2636,36 +2602,18 @@ mod unix_tests {
             ));
             let msg1 = "Hello, ";
             let n = task
-                .do_sendto(
-                    server_conn,
-                    ConstPtr::from_usize(msg1.as_ptr() as usize),
-                    msg1.len(),
-                    SendFlags::empty(),
-                    None,
-                )
+                .do_sendto(server_conn, msg1.as_bytes(), SendFlags::empty(), None)
                 .expect("sendto failed");
             assert_eq!(n, msg1.len());
             let msg2 = "world!";
             let n = task
-                .do_sendto(
-                    server_conn,
-                    ConstPtr::from_usize(msg2.as_ptr() as usize),
-                    msg2.len(),
-                    SendFlags::empty(),
-                    None,
-                )
+                .do_sendto(server_conn, msg2.as_bytes(), SendFlags::empty(), None)
                 .expect("sendto failed");
             assert_eq!(n, msg2.len());
 
             let mut buf = [0u8; 64];
             let n = task
-                .do_recvfrom(
-                    client_fd,
-                    MutPtr::from_usize(buf.as_mut_ptr() as usize),
-                    buf.len(),
-                    ReceiveFlags::empty(),
-                    None,
-                )
+                .do_recvfrom(client_fd, &mut buf, ReceiveFlags::empty(), None)
                 .expect("recvfrom failed");
             assert_eq!(n, msg1.len() + msg2.len());
             assert_eq!(&buf[..n], b"Hello, world!");
@@ -2765,13 +2713,7 @@ mod unix_tests {
             for (i, client_fd) in client_fds.iter().enumerate() {
                 let msg = alloc::format!("message from connection {i}");
                 let n = task
-                    .do_sendto(
-                        *client_fd,
-                        ConstPtr::from_usize(msg.as_ptr() as usize),
-                        msg.len(),
-                        SendFlags::empty(),
-                        None,
-                    )
+                    .do_sendto(*client_fd, msg.as_bytes(), SendFlags::empty(), None)
                     .expect("sendto failed");
                 assert_eq!(n, msg.len());
             }
@@ -2807,13 +2749,7 @@ mod unix_tests {
                 ppoll(&task, *server_conn_fd, Events::IN);
             }
             let n = task
-                .do_recvfrom(
-                    *server_conn_fd,
-                    MutPtr::from_usize(buf.as_mut_ptr() as usize),
-                    buf.len(),
-                    ReceiveFlags::empty(),
-                    None,
-                )
+                .do_recvfrom(*server_conn_fd, &mut buf, ReceiveFlags::empty(), None)
                 .expect("recvfrom failed");
             assert_eq!(n, msg.len());
             assert_eq!(&buf[..n], msg.as_bytes());
@@ -2944,13 +2880,7 @@ mod unix_tests {
                 ppoll(&task, sock2, Events::IN);
             }
             let n = task
-                .do_recvfrom(
-                    sock2,
-                    MutPtr::from_usize(buf.as_mut_ptr() as usize),
-                    buf.len(),
-                    ReceiveFlags::empty(),
-                    None,
-                )
+                .do_recvfrom(sock2, &mut buf, ReceiveFlags::empty(), None)
                 .expect("recvfrom failed");
             assert_eq!(&buf[..n], b"Message from sock1");
         });
@@ -2958,14 +2888,8 @@ mod unix_tests {
         std::thread::sleep(core::time::Duration::from_millis(100));
         // Send from sock1 to sock2
         let msg1 = "Message from sock1";
-        task.do_sendto(
-            sock1,
-            ConstPtr::from_usize(msg1.as_ptr().expose_provenance()),
-            msg1.len(),
-            SendFlags::empty(),
-            None,
-        )
-        .expect("sendto failed");
+        task.do_sendto(sock1, msg1.as_bytes(), SendFlags::empty(), None)
+            .expect("sendto failed");
 
         task.spawn_clone_for_test(move |task| {
             // Receive on sock1 (from sock2)
@@ -2974,13 +2898,7 @@ mod unix_tests {
                 ppoll(&task, sock1, Events::IN);
             }
             let n = task
-                .do_recvfrom(
-                    sock1,
-                    MutPtr::from_usize(buf.as_mut_ptr() as usize),
-                    buf.len(),
-                    ReceiveFlags::empty(),
-                    None,
-                )
+                .do_recvfrom(sock1, &mut buf, ReceiveFlags::empty(), None)
                 .expect("recvfrom failed");
             assert_eq!(&buf[..n], b"Message from sock2");
         });
@@ -2988,14 +2906,8 @@ mod unix_tests {
         std::thread::sleep(core::time::Duration::from_millis(100));
         // Send from sock2 to sock1
         let msg2 = "Message from sock2";
-        task.do_sendto(
-            sock2,
-            ConstPtr::from_usize(msg2.as_ptr().expose_provenance()),
-            msg2.len(),
-            SendFlags::empty(),
-            None,
-        )
-        .expect("sendto failed");
+        task.do_sendto(sock2, msg2.as_bytes(), SendFlags::empty(), None)
+            .expect("sendto failed");
 
         std::thread::sleep(core::time::Duration::from_millis(500));
         close_socket(&task, sock1);
@@ -3029,13 +2941,7 @@ mod unix_tests {
         let mut buf = [0u8; 16];
         let start = std::time::Instant::now();
         let err = task
-            .do_recvfrom(
-                sock1,
-                MutPtr::from_usize(buf.as_mut_ptr() as usize),
-                buf.len(),
-                ReceiveFlags::empty(),
-                None,
-            )
+            .do_recvfrom(sock1, &mut buf, ReceiveFlags::empty(), None)
             .unwrap_err();
         let elapsed = start.elapsed();
         assert_eq!(err, Errno::ETIMEDOUT);

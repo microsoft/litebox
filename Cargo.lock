@@ -1017,6 +1017,7 @@ dependencies = [
  "seq-macro",
  "spin 0.9.8",
  "syscalls",
+ "tempfile",
  "thiserror",
  "zerocopy",
 ]
