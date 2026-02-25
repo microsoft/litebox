@@ -193,3 +193,6 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+
+### Benchmark ###
+benchmark/unixbench/prepared/

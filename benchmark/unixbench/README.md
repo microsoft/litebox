@@ -99,3 +99,45 @@ Use `--output results.json` to get machine-readable results:
   }
 }
 ```
+
+## Running on Windows
+
+LiteBox can run Linux UnixBench binaries on Windows using `litebox_runner_linux_on_windows_userland`. This is a two-step process:
+
+### Step 1: Prepare on Linux/WSL
+
+Run `prepare_unixbench.py` on Linux/WSL to compile UnixBench, rewrite binaries, and create tar files:
+
+```bash
+# Prepare all benchmarks
+python3 benchmark/unixbench/prepare_unixbench.py --release
+
+# Prepare specific benchmarks only
+python3 benchmark/unixbench/prepare_unixbench.py --benchmarks dhry2reg pipe --release
+```
+
+This creates `benchmark/unixbench/prepared/` containing:
+- Per-benchmark directories with `rootfs.tar` and rewritten binaries
+- A `manifest.json` describing the artifacts
+
+### Step 2: Run on Windows
+
+Build the Windows runner, then run benchmarks using the prepared artifacts:
+
+```powershell
+# Build the Windows runner
+cargo build -p litebox_runner_linux_on_windows_userland --release
+
+# Run benchmarks
+python run_unixbench.py --mode litebox --windows --prepared-dir ./prepared --release
+
+# Override duration for a quick test
+python run_unixbench.py --mode litebox --windows --prepared-dir ./prepared --duration 5 --iterations 1
+
+# Or specify the runner path explicitly
+python run_unixbench.py --mode litebox --windows --prepared-dir ./prepared --runner-path target\release\litebox_runner_linux_on_windows_userland.exe
+```
+
+**Key differences from Linux mode:**
+- No `--interception-backend` or `--rewrite-syscalls` needed — binaries are already pre-rewritten
+- No native baseline (Linux binaries can't run natively on Windows)
