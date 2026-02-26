@@ -34,7 +34,7 @@ mod alloc {
     }
 
     impl crate::mm::MemoryProvider for super::LvbsLinuxKernel {
-        const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(0);
+        const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
         const PRIVATE_PTE_MASK: u64 = 0;
 
         fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
@@ -50,6 +50,24 @@ mod alloc {
         unsafe fn mem_fill_pages(start: usize, size: usize) {
             unsafe { LVBS_ALLOCATOR.fill_pages(start, size) };
         }
+    }
+}
+
+#[cfg(test)]
+impl crate::mm::MemoryProvider for LvbsLinuxKernel {
+    const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
+    const PRIVATE_PTE_MASK: u64 = 0;
+
+    fn mem_allocate_pages(_order: u32) -> Option<*mut u8> {
+        unimplemented!("not used in tests")
+    }
+
+    unsafe fn mem_free_pages(_ptr: *mut u8, _order: u32) {
+        unimplemented!("not used in tests")
+    }
+
+    unsafe fn mem_fill_pages(_start: usize, _size: usize) {
+        unimplemented!("not used in tests")
     }
 }
 
