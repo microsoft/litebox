@@ -842,7 +842,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         let ok = unsafe {
             Win32_Threading::SetWaitableTimer(
                 timer_handle,
-                &due_time_100ns,
+                &raw const due_time_100ns,
                 0,                // no repeat
                 None,             // no completion routine
                 std::ptr::null(), // no arg
