@@ -498,6 +498,7 @@ interrupt:
 pending_host_signals:
     .long 0
     .align 8
+.globl wait_condvar_addr
 wait_condvar_addr:
     .quad 0
     "
@@ -914,6 +915,7 @@ interrupt:
 pending_host_signals:
     .long 0
     .align 4
+.globl wait_condvar_addr
 wait_condvar_addr:
     .long 0
     "
