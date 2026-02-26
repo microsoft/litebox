@@ -201,8 +201,8 @@ pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&
     reason = "unclear why clippy things this might not be used, but also doesn't like an 'expect' here either"
 )]
 pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name: &str) -> bool {
-    // For tar files, we need to consider the entire directory tree as input
-    // We'll create a hash of all files in the tar_dir
+    // For tar files, we need to consider the entire directory tree as input.
+    // We'll create a fingerprint of all files in the tar_dir
     let mut all_files = Vec::new();
     if let Ok(entries) = walkdir::WalkDir::new(tar_dir)
         .into_iter()
@@ -210,12 +210,17 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
     {
         for entry in entries {
             if entry.file_type().is_file() {
-                all_files.push(entry.path().to_path_buf());
+                let path = entry.path().to_path_buf();
+                if path.extension().is_some_and(|ext| ext == "cache-checksum") {
+                    continue;
+                }
+                all_files.push(path);
             }
         }
     } else {
         return false;
     }
+    all_files.sort();
 
     // Convert to Path refs for the caching function
     let input_paths: Vec<&Path> = all_files.iter().map(std::path::PathBuf::as_path).collect();
@@ -225,15 +230,17 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
     let mut args = vec![
         // ustar format allows longer file names
         "--format=ustar",
+        "--exclude=*.cache-checksum",
         "-cvf",
         tar_filename.as_str(),
     ];
     // collect all entries in the tar_dir
-    let all_entries = tar_dir
+    let mut all_entries = tar_dir
         .read_dir()
         .expect("Failed to read tar directory")
         .filter_map(|entry| entry.map(|e| e.file_name()).ok())
         .collect::<Vec<_>>();
+    all_entries.sort();
     for entry in &all_entries {
         args.push(entry.to_str().unwrap());
     }
