@@ -41,6 +41,11 @@ impl RuntimeFiles {
             if guest_path.is_empty() || !guest_path.starts_with('/') {
                 anyhow::bail!("Invalid guest runtime path '{guest_path}', expected absolute path");
             }
+            if files.contains_key(guest_path) {
+                anyhow::bail!(
+                    "Duplicate --runtime-file guest path '{guest_path}'. Use unique guest paths such as /usr/lib/dyld or /usr/lib/libSystem.B.dylib"
+                );
+            }
             files.insert(guest_path.to_string(), mmapped_file_data(host_path)?);
         }
         Ok(Self { files })
@@ -55,7 +60,13 @@ impl RuntimeFileResolver for RuntimeFiles {
 
 fn mmapped_file_data(path: impl AsRef<Path>) -> Result<&'static [u8]> {
     let path = path.as_ref();
-    let file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path).map_err(|e| {
+        anyhow!(
+            "Could not open runtime/program file at {}: {}",
+            path.display(),
+            e
+        )
+    })?;
     // SAFETY: We assume that the file given to us is not going to change externally while in
     // the middle of execution. Since we are mapping it as read-only and mapping it only once,
     // we are not planning to change it either.
@@ -68,6 +79,10 @@ fn mmapped_file_data(path: impl AsRef<Path>) -> Result<&'static [u8]> {
 
 /// Run macOS x86_64 Mach-O programs with LiteBox on Linux.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    if cli_args.program_and_arguments.is_empty() {
+        anyhow::bail!("No program path was provided");
+    }
+
     // Memory-map the binary file
     let binary_data = mmapped_file_data(&cli_args.program_and_arguments[0])?;
     let runtime_files = RuntimeFiles::from_cli(&cli_args.runtime_files)?;
@@ -93,7 +108,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .collect();
 
     // Load the program
-    let program = shim.load_program_with_runtime_files(binary_data, argv, envp, &runtime_files)?;
+    let program = shim
+        .load_program_with_runtime_files(binary_data, argv, envp, &runtime_files)
+        .map_err(|e| anyhow!(
+            "Failed to load Mach-O program. If this is a dynamic binary, provide runtime mappings like --runtime-file /usr/lib/dyld=<host_dyld> and required dylibs. Original error: {e}"
+        ))?;
 
     // Run the program
     unsafe {
