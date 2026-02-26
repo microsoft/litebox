@@ -78,18 +78,29 @@ def _whetstone_args(_duration: int, tmpdir=None) -> list[str]:
 
 
 def _fstime_args(duration: int, tmpdir=None) -> list[str]:
-    d = str(tmpdir) if tmpdir else "/tmp"
-    return ["-c", "-t", str(duration), "-d", d, "-b", "1024", "-m", "2000"]
+    # tmpdir=None means omit -d (use CWD); this is needed for LiteBox
+    # which does not support chdir.
+    args = ["-c", "-t", str(duration)]
+    if tmpdir is not None:
+        args += ["-d", str(tmpdir)]
+    args += ["-b", "1024", "-m", "2000"]
+    return args
 
 
 def _fsbuffer_args(duration: int, tmpdir=None) -> list[str]:
-    d = str(tmpdir) if tmpdir else "/tmp"
-    return ["-c", "-t", str(duration), "-d", d, "-b", "256", "-m", "500"]
+    args = ["-c", "-t", str(duration)]
+    if tmpdir is not None:
+        args += ["-d", str(tmpdir)]
+    args += ["-b", "256", "-m", "500"]
+    return args
 
 
 def _fsdisk_args(duration: int, tmpdir=None) -> list[str]:
-    d = str(tmpdir) if tmpdir else "/tmp"
-    return ["-c", "-t", str(duration), "-d", d, "-b", "4096", "-m", "8000"]
+    args = ["-c", "-t", str(duration)]
+    if tmpdir is not None:
+        args += ["-d", str(tmpdir)]
+    args += ["-b", "4096", "-m", "8000"]
+    return args
 
 
 BENCHMARKS: dict[str, BenchmarkDef] = {
@@ -360,11 +371,11 @@ def _run_litebox_cmd(
     bench: BenchmarkDef, duration: int, cmd: list[str],
 ) -> Optional[BenchmarkResult]:
     """Run a litebox command and parse the result."""
-    # For fstime variants, use /tmp in the sandbox as the tmpdir
-    litebox_tmpdir = Path("/tmp") if bench.binary == "fstime" else None
-    cmd += bench.args(duration, litebox_tmpdir)
+    # For fstime variants, omit -d so fstime uses the CWD instead of calling
+    # chdir(), which LiteBox does not support.
+    cmd += bench.args(duration)
 
-    display_args = ' '.join(bench.args(duration, litebox_tmpdir))
+    display_args = ' '.join(bench.args(duration))
     print(f"  Running: {Path(cmd[0]).name} ... {display_args}")
     t0 = time.monotonic()
     # Use a shorter timeout for alarm-based benchmarks under LiteBox,
