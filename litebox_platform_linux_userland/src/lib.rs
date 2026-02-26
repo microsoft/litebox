@@ -1114,6 +1114,83 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     }
 }
 
+impl litebox::platform::TimerProvider for LinuxUserland {
+    type TimerHandle = ITimerHandle;
+
+    const SUPPORTS_TIMER: bool = true;
+
+    fn create_timer(&self, signal: litebox::shim::Signal) -> Self::TimerHandle {
+        // TODO: support signals other than SIGALRM once we register handlers
+        // for them.
+        assert_eq!(
+            signal,
+            litebox::shim::Signal::SIGALRM,
+            "only SIGALRM is currently supported; register a handler for the \
+             requested signal before removing this assertion"
+        );
+
+        // Create a POSIX per-process timer that delivers the requested signal
+        // when it fires.  Unlike `setitimer(ITIMER_REAL)`, `timer_create`
+        // supports multiple independent timers.
+        let mut sev: libc::sigevent = unsafe { core::mem::zeroed() };
+        sev.sigev_notify = libc::SIGEV_SIGNAL;
+        sev.sigev_signo = signal.as_raw().cast_signed();
+
+        let mut timer_id: libc::timer_t = std::ptr::null_mut();
+        let ret =
+            unsafe { libc::timer_create(libc::CLOCK_MONOTONIC, &raw mut sev, &raw mut timer_id) };
+        assert!(
+            ret == 0,
+            "timer_create failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        ITimerHandle(timer_id)
+    }
+}
+
+/// A timer handle backed by POSIX `timer_create` / `timer_settime`.
+///
+/// Each handle owns an independent kernel timer, so multiple timers can
+/// coexist without interfering with each other.
+pub struct ITimerHandle(libc::timer_t);
+
+// Safety: `timer_t` is an opaque kernel handle safe to send across threads.
+unsafe impl Send for ITimerHandle {}
+// Safety: `timer_settime` is thread-safe for a given timer.
+unsafe impl Sync for ITimerHandle {}
+
+impl Drop for ITimerHandle {
+    fn drop(&mut self) {
+        // Safety: we own the timer and it will not be used after drop.
+        unsafe {
+            libc::timer_delete(self.0);
+        }
+    }
+}
+
+impl litebox::platform::TimerHandle for ITimerHandle {
+    fn set_timer(&self, duration: core::time::Duration) {
+        let its = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: duration.as_secs().cast_signed().truncate(),
+                tv_nsec: duration.subsec_nanos().cast_signed().into(),
+            },
+        };
+        // Safety: valid timer id and itimerspec.
+        let ret = unsafe { libc::timer_settime(self.0, 0, &raw const its, std::ptr::null_mut()) };
+        assert!(
+            ret == 0,
+            "timer_settime failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 impl litebox::platform::RawMutexProvider for LinuxUserland {
     type RawMutex = RawMutex;
 }
