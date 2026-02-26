@@ -17,9 +17,11 @@ use alloc::vec::Vec;
 ///
 /// Two usage modes:
 ///
-/// - **Growable** ([`new`](Self::new)): bitmap starts empty and grows one word
-///   (64 IDs) at a time. [`allocate`](Self::allocate) returns `None` only when
-///   the `u32` ID space is exhausted.
+/// - **Growable** ([`new`](Self::new) / [`with_max_capacity`](Self::with_max_capacity)):
+///   bitmap starts empty and grows one word (64 IDs) at a time up to the
+///   specified cap (default [`DEFAULT_MAX_CAP`]).
+///   [`allocate`](Self::allocate) returns `None` when all slots within the
+///   cap are in use.
 /// - **Fixed-capacity** ([`with_capacity`](Self::with_capacity)): bitmap is
 ///   pre-allocated and never grows. [`allocate`](Self::allocate) returns `None`
 ///   when all slots are in use.
@@ -32,10 +34,18 @@ pub struct IdPool {
     hint: u32,
     /// Number of valid IDs the pool currently tracks (`0..max_ids`).
     /// For fixed-capacity pools this equals the constructor argument.
-    /// For growable pools this grows in steps of 64.
+    /// For growable pools this grows in steps of 64 up to `max_cap`.
     max_ids: u32,
-    /// Whether the bitmap is allowed to grow when exhausted.
-    growable: bool,
+    /// Upper bound on `max_ids`. Growth stops when `max_ids >= max_cap`.
+    /// Equal to `max_ids` for fixed-capacity pools (no growth).
+    ///
+    /// For growable pools this must be a multiple of 64, matching the
+    /// word-at-a-time growth in [`grow`](Self::grow). The code works
+    /// without this constraint, but this ensures that `max_ids` always
+    /// lands exactly on `max_cap` (never overshoots), i.e., every bit in
+    /// the last bitmap word is valid and `find_free` never needs to discard
+    /// out-of-range bits. It's also easier to reason about the correctness.
+    max_cap: u32,
 }
 
 impl Default for IdPool {
@@ -44,18 +54,38 @@ impl Default for IdPool {
     }
 }
 
+/// Default maximum capacity for [`IdPool::new`]: 65536 IDs.
+const DEFAULT_MAX_CAP: u32 = 65536;
+
 impl IdPool {
     /// Create an empty, growable pool.
     ///
     /// The bitmap starts empty and grows one word (64 IDs) at a time as
-    /// needed.
+    /// needed, up to [`DEFAULT_MAX_CAP`] IDs.
     #[must_use]
     pub const fn new() -> Self {
+        Self::with_max_capacity(DEFAULT_MAX_CAP)
+    }
+
+    /// Create an empty, growable pool capped at `max_cap` IDs.
+    ///
+    /// The bitmap starts empty and grows one word (64 IDs) at a time as
+    /// needed, but will not grow beyond `max_cap` IDs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_cap` is not a multiple of 64.
+    #[must_use]
+    pub const fn with_max_capacity(max_cap: u32) -> Self {
+        assert!(
+            max_cap.is_multiple_of(64),
+            "max_cap must be a multiple of 64"
+        );
         Self {
             bitmap: Vec::new(),
             hint: u32::MAX,
             max_ids: 0,
-            growable: true,
+            max_cap,
         }
     }
 
@@ -70,7 +100,7 @@ impl IdPool {
             bitmap: vec![0u64; words],
             hint: u32::MAX,
             max_ids: num_ids,
-            growable: false,
+            max_cap: num_ids,
         }
     }
 
@@ -93,19 +123,32 @@ impl IdPool {
             }
         }
 
-        if self.growable { self.grow() } else { None }
+        if self.max_ids < self.max_cap {
+            self.grow()
+        } else {
+            None
+        }
     }
 
     /// Mark an ID as free so it can be reused.
     ///
-    /// IDs beyond the current capacity and already-free IDs are silently
+    /// # Panics
+    ///
+    /// Debug-asserts that `id` is within the pool's current range
+    /// (`id < max_ids`). In release builds, out-of-range IDs are silently
     /// ignored.
     pub fn recycle(&mut self, id: u32) {
+        debug_assert!(
+            id < self.max_ids,
+            "recycled ID {id} is out of range (max_ids = {})",
+            self.max_ids
+        );
+        if id >= self.max_ids {
+            return;
+        }
         let word = id as usize / 64;
         let bit = id % 64;
-        if let Some(w) = self.bitmap.get_mut(word) {
-            *w &= !(1u64 << bit);
-        }
+        self.bitmap[word] &= !(1u64 << bit);
     }
 
     /// Scan for a free ID starting at `start`, wrapping around through
@@ -160,16 +203,12 @@ impl IdPool {
     /// Grow the bitmap by one word and allocate the first ID from it.
     fn grow(&mut self) -> Option<u32> {
         let new_id = self.max_ids;
-        // Guard: bitmap.len() * 64 must fit in u32.
-        if self.bitmap.len() >= u32::MAX as usize / 64 {
+        let new_max = self.max_ids.checked_add(64)?.min(self.max_cap);
+        if new_max == self.max_ids {
             return None;
         }
         self.bitmap.push(1); // mark bit 0 of the new word as in-use
-        // Safety of truncation: the guard above ensures bitmap.len() * 64 fits in u32.
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            self.max_ids = (self.bitmap.len() as u32) * 64;
-        }
+        self.max_ids = new_max;
         self.hint = new_id;
         Some(new_id)
     }
@@ -269,10 +308,25 @@ mod tests {
     }
 
     #[test]
-    fn recycle_out_of_range_does_not_panic() {
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "out of range")]
+    fn recycle_out_of_range_panics_in_debug() {
         let mut pool = IdPool::with_capacity(10);
         pool.recycle(100);
-        pool.recycle(u32::MAX);
+    }
+
+    #[test]
+    fn growable_with_cap() {
+        let mut pool = IdPool::with_max_capacity(128);
+        for i in 0..128 {
+            assert_eq!(pool.allocate(), Some(i));
+        }
+        // Cap reached — no further growth
+        assert_eq!(pool.allocate(), None);
+        // Recycle and re-allocate within the cap
+        pool.recycle(42);
+        assert_eq!(pool.allocate(), Some(42));
+        assert_eq!(pool.allocate(), None);
     }
 
     #[test]

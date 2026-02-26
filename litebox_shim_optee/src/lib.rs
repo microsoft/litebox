@@ -1330,10 +1330,10 @@ pub(crate) enum ThreadInitState {
 /// (1..=MAX_RECYCLABLE_SESSION_ID), with fallback to one-time IDs beyond
 /// that range.
 ///
-/// With MAX_RECYCLABLE_SESSION_ID = 65535:
-/// - Bitmap memory usage: (65535 + 1) bits = 8 KB
-/// - Recyclable IDs: 1..=65535 (65535 IDs)
-/// - Fallback (non-recyclable) IDs: 65536..=0xffff_fffd (~4.3B IDs, excluding PTA_SESSION_ID)
+/// With MAX_RECYCLABLE_SESSION_ID = 65536:
+/// - Bitmap memory usage: 65536 bits = 8 KB
+/// - Recyclable IDs: 1..=65536 (65536 IDs)
+/// - Fallback (non-recyclable) IDs: 65537..=0xffff_fffd (~4.3B IDs, excluding PTA_SESSION_ID)
 /// - PTA_SESSION_ID (0xffff_fffe) is reserved and never allocated
 ///
 /// Design notes:
@@ -1365,7 +1365,7 @@ fn session_id_pool() -> &'static spin::mutex::SpinMutex<SessionIdPool> {
 
 impl SessionIdPool {
     /// Maximum recyclable session ID tracked by the bitmap.
-    const MAX_RECYCLABLE_SESSION_ID: u32 = 65535;
+    const MAX_RECYCLABLE_SESSION_ID: u32 = 65536;
     /// Reserved session ID for PTA.
     const PTA_SESSION_ID: u32 = 0xffff_fffe;
 
