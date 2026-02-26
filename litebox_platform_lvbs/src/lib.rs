@@ -98,23 +98,26 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 //  0xFFFF_C000_0000_0000  ├─────────────────────────────────┤
 //                         │ Direct map region (64 TiB)      │
 //                         │ VA = PA + GVA_OFFSET            │
-//                         │ VTL1 memory always mapped;      │
 //                         │ VTL0 memory mapped on demand    │
+//                         │                                 │
+//                         │  ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄    │
+//                         │  VTL1 PA range = unmapped gap   │
+//                         │  ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄    │
+//                         │                                 │
 //  0xFFFF_8000_0000_0000  └─────────────────────────────────┘ ← GVA_OFFSET
 //
-// Low canonical half  (0x0000_0000_0000_0000 .. 0x0000_7FFF_FFFF_FFFF):
+// Low canonical half  (0x0000_0000_0000_0000 .. 0x0000_7FFF_FFFF_F000):
 //  0x0000_7FFF_FFFF_F000  ┌─────────────────────────────────┐ ← USER_ADDR_MAX
 //                         │ User address space (~128 TiB)   │
 //                         │ mmap / TA memory                │
 //  0x0000_0000_0001_0000  └─────────────────────────────────┘ ← USER_ADDR_MIN
 //
-// The entire low canonical half is available for user space since the
-// kernel direct map has moved to the high canonical half.
-//
 // The 64 TiB direct map reservation ensures that any physical address
 // up to 64 TiB can be mapped via the simple PA + GVA_OFFSET formula
 // without colliding with the vmap region. A 1 TiB guard gap between
 // the direct map and the vmap region catches stray accesses.
+// VTL1 memory is never mapped in the direct map; it lives exclusively
+// in the VTL1 kernel region at KERNEL_OFFSET.
 //
 // The VTL1 kernel region at the top of the address space maps the
 // entire VTL1 kernel via PA + KERNEL_OFFSET. A 1 TiB guard gap
@@ -141,6 +144,7 @@ pub const KERNEL_OFFSET: u64 = KERNEL_START as u64;
 
 /// Maximum virtual address (exclusive) for user-space allocations.
 /// This is the top of the low canonical half (4-level paging).
+/// The last page (0x0000_7FFF_FFFF_F000 .. 0x0000_7FFF_FFFF_FFFF) reserved as a guard page.
 const USER_ADDR_MAX: usize = 0x0000_7FFF_FFFF_F000;
 
 /// Minimum virtual address for user-space allocations.
@@ -1383,7 +1387,8 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             flags |= PageTableFlags::WRITABLE;
         }
 
-        // If pages are contiguous, use `map_phys_frame_range` which is efficient and doesn't require vmap VA space.
+        // If pages are contiguous, use `map_phys_frame_range_direct` which is efficient and
+        // doesn't require vmap VA space.
         if is_contiguous(pages) {
             let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
             let phys_end = x86_64::PhysAddr::new(
@@ -1402,7 +1407,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             match self
                 .page_table_manager
                 .current_page_table()
-                .map_phys_frame_range(frame_range, flags, None)
+                .map_phys_frame_range_direct(frame_range, flags, None)
             {
                 Ok(page_addr) => Ok(PhysPageMapInfo {
                     base: page_addr,

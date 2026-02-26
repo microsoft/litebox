@@ -50,7 +50,10 @@ const _: () = assert!(
 // use this stack only for per-core VTL startup
 pub const VTL1_KERNEL_STACK_PAGE: usize = VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT;
 
-// TODO: get addresses from VTL call params rather than use these static indexes
+// TODO: VTL1_BOOT_PARAMS_PAGE and VTL1_CMDLINE_PAGE will be removed in an
+// upcoming PR: boot parameters will be passed as arguments to _start() instead.
+// When that lands, VTL1_REMAP_PDPT_PAGE should follow VTL1_KERNEL_STACK_PAGE
+// directly.
 pub const VTL1_BOOT_PARAMS_PAGE: usize = VTL1_KERNEL_STACK_PAGE + 1;
 pub const VTL1_CMDLINE_PAGE: usize = VTL1_BOOT_PARAMS_PAGE + 1;
 
