@@ -811,39 +811,74 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
             return;
         }
 
-        let due_time_ms: u32 = {
-            let ms = delay.as_millis();
-            u32::try_from(ms).unwrap_or(u32::MAX)
-        };
-
         // Use the provided thread handle or fall back to the current thread.
         let thread = match thread {
             Some(t) => t.clone(),
             None => self.current_thread(),
         };
 
-        // Pack the target thread handle into a heap allocation that the timer
-        // callback will free.
-        let ctx = Box::into_raw(Box::new(TimerCallbackContext { thread }));
+        // Create a high-resolution waitable timer.
+        // `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` gives sub-millisecond
+        // precision regardless of the global timer resolution.
+        let timer_handle = unsafe {
+            Win32_Threading::CreateWaitableTimerExW(
+                std::ptr::null(), // no security attributes
+                std::ptr::null(), // unnamed
+                Win32_Threading::CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                Win32_Threading::TIMER_ALL_ACCESS,
+            )
+        };
+        assert!(
+            !timer_handle.is_null(),
+            "CreateWaitableTimerExW failed: {}",
+            std::io::Error::last_os_error()
+        );
 
-        let mut timer_handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
-        // Safety: CreateTimerQueueTimer is safe with valid arguments.
-        // We pass NULL for the timer queue to use the default timer queue.
-        // WT_EXECUTEONLYONCE ensures the callback fires only once.
+        // Due time is in 100 ns intervals; negative means relative.
+        let due_time_100ns: i64 = {
+            let intervals = delay.as_nanos() / 100;
+            -(i64::try_from(intervals).unwrap_or(i64::MAX))
+        };
         let ok = unsafe {
-            windows_sys::Win32::System::Threading::CreateTimerQueueTimer(
-                &raw mut timer_handle,
-                std::ptr::null_mut(), // default timer queue
-                Some(timer_callback),
-                ctx.cast(),
-                due_time_ms,
-                0, // no repeat
-                windows_sys::Win32::System::Threading::WT_EXECUTEONLYONCE,
+            Win32_Threading::SetWaitableTimer(
+                timer_handle,
+                &due_time_100ns,
+                0,                // no repeat
+                None,             // no completion routine
+                std::ptr::null(), // no arg
+                0,                // don't resume from suspend
             )
         };
         assert!(
             ok != 0,
-            "CreateTimerQueueTimer failed: {}",
+            "SetWaitableTimer failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // Pack the target thread handle and timer handle into a heap
+        // allocation that the callback will free.
+        let ctx = Box::into_raw(Box::new(TimerCallbackContext {
+            thread,
+            timer_handle,
+        }));
+
+        // Register a threadpool wait so the callback fires when the timer
+        // signals. `WT_EXECUTEONLYONCE` means the wait is automatically
+        // unregistered after the callback returns.
+        let mut wait_handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        let ok = unsafe {
+            Win32_Threading::RegisterWaitForSingleObject(
+                &raw mut wait_handle,
+                timer_handle,
+                Some(timer_callback),
+                ctx.cast(),
+                Win32_Threading::INFINITE,
+                Win32_Threading::WT_EXECUTEONLYONCE,
+            )
+        };
+        assert!(
+            ok != 0,
+            "RegisterWaitForSingleObject failed: {}",
             std::io::Error::last_os_error()
         );
     }
@@ -856,19 +891,23 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
     }
 }
 
-/// Context passed to the Windows timer-queue callback, carrying the target
-/// thread handle so the callback can directly interrupt the right thread.
+/// Context passed to the timer-pool callback, carrying the target thread
+/// handle and the waitable timer handle for cleanup.
 struct TimerCallbackContext {
     thread: ThreadHandle,
+    timer_handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
-/// Timer callback invoked by the Windows timer queue threadpool when an alarm fires.
+/// Timer callback invoked by the threadpool when a high-resolution waitable
+/// timer fires.
 ///
 /// Sets the SIGALRM bit in the target thread's `pending_host_signals`, then
 /// interrupts the thread to ensure signal-delivery code runs promptly.
 unsafe extern "system" fn timer_callback(context: *mut c_void, _timer_or_wait_fired: bool) {
     // Safety: `context` was created via `Box::into_raw` in `schedule_interrupt`.
     let ctx = unsafe { Box::from_raw(context.cast::<TimerCallbackContext>()) };
+    // Close the waitable timer handle now that it has fired.
+    unsafe { Win32_Foundation::CloseHandle(ctx.timer_handle) };
     ctx.thread.deliver_signal(litebox::shim::Signal::SIGALRM);
 }
 
@@ -1349,7 +1388,7 @@ impl litebox::platform::TimeProvider for WindowsUserland {
 }
 
 /// 100ns units returned by `QueryUnbiasedInterruptTimePrecise`.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Instant(u64);
 
 impl litebox::platform::Instant for Instant {
