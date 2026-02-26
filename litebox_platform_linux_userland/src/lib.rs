@@ -1177,8 +1177,8 @@ impl litebox::platform::TimerHandle for ITimerHandle {
                 tv_nsec: 0,
             },
             it_value: libc::timespec {
-                tv_sec: duration.as_secs().cast_signed(),
-                tv_nsec: duration.subsec_nanos().cast_signed().into(),
+                tv_sec: duration.as_secs().cast_signed().truncate(),
+                tv_nsec: duration.subsec_nanos().cast_signed() as _,
             },
         };
         // Safety: valid timer id and itimerspec.
