@@ -5,10 +5,12 @@
 //!
 //! Supports parsing and mapping static x86_64 Mach-O binaries.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use object::LittleEndian;
 use object::macho::{
-    CPU_TYPE_X86_64, LC_MAIN, LC_SEGMENT_64, LC_UNIXTHREAD, MH_EXECUTE, MachHeader64,
+    CPU_TYPE_X86_64, LC_LOAD_DYLIB, LC_LOAD_DYLINKER, LC_LOAD_WEAK_DYLIB, LC_MAIN,
+    LC_REEXPORT_DYLIB, LC_SEGMENT_64, LC_UNIXTHREAD, MH_DYLINKER, MH_EXECUTE, MachHeader64,
     SegmentCommand64,
 };
 use object::read::macho::MachHeader;
@@ -23,6 +25,10 @@ pub struct MachoParsedFile {
     entry_point: u64,
     /// Segments to load
     segments: Vec<SegmentInfo>,
+    /// Optional dynamic runtime linker path (`LC_LOAD_DYLINKER`)
+    runtime_linker_path: Option<String>,
+    /// All required dynamic library paths (`LC_LOAD_DYLIB` variants)
+    required_dylibs: Vec<String>,
 }
 
 /// Information about a segment to load
@@ -66,6 +72,8 @@ pub enum MachoParseError {
     InvalidLoadCommand,
     #[error("No entry point found")]
     NoEntryPoint,
+    #[error("Invalid load command string")]
+    InvalidLoadCommandString,
     #[error("File too small")]
     FileTooSmall,
 }
@@ -126,14 +134,18 @@ impl MachoParsedFile {
             return Err(MachoParseError::UnsupportedCpuType);
         }
 
-        // Check file type (must be executable)
-        if header.filetype(endian) != MH_EXECUTE {
+        // Check file type (execute image or dynamic linker image)
+        let file_type = header.filetype(endian);
+        if file_type != MH_EXECUTE && file_type != MH_DYLINKER {
             return Err(MachoParseError::UnsupportedFileType);
         }
 
         let mut segments = Vec::new();
         let mut entry_point: Option<u64> = None;
+        let mut entryoff_from_lc_main: Option<u64> = None;
         let mut text_vmaddr: u64 = 0;
+        let mut runtime_linker_path: Option<String> = None;
+        let mut required_dylibs = Vec::new();
 
         // Parse load commands
         let mut load_commands = header
@@ -168,11 +180,13 @@ impl MachoParsedFile {
                     });
                 }
                 LC_MAIN => {
-                    // LC_MAIN provides entryoff relative to __TEXT segment
+                    // LC_MAIN provides entryoff relative to __TEXT segment.
+                    // We defer conversion to a virtual address until all load commands
+                    // are scanned because __TEXT may appear after LC_MAIN.
                     let entry_data = cmd
                         .data::<object::macho::EntryPointCommand<LittleEndian>>()
                         .map_err(|_| MachoParseError::InvalidLoadCommand)?;
-                    entry_point = Some(text_vmaddr + entry_data.entryoff.get(endian));
+                    entryoff_from_lc_main = Some(entry_data.entryoff.get(endian));
                 }
                 LC_UNIXTHREAD => {
                     // LC_UNIXTHREAD contains raw thread state with rip
@@ -196,7 +210,19 @@ impl MachoParsedFile {
                         }
                     }
                 }
+                LC_LOAD_DYLINKER => {
+                    runtime_linker_path = Some(parse_lc_string(cmd.raw_data())?);
+                }
+                LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB => {
+                    required_dylibs.push(parse_lc_string(cmd.raw_data())?);
+                }
                 _ => {}
+            }
+        }
+
+        if entry_point.is_none() {
+            if let Some(entryoff) = entryoff_from_lc_main {
+                entry_point = Some(text_vmaddr + entryoff);
             }
         }
 
@@ -205,6 +231,8 @@ impl MachoParsedFile {
         Ok(MachoParsedFile {
             entry_point,
             segments,
+            runtime_linker_path,
+            required_dylibs,
         })
     }
 
@@ -220,11 +248,36 @@ impl MachoParsedFile {
         &self.segments
     }
 
+    /// Return the dynamic runtime linker path if this file is dynamically linked.
+    #[must_use]
+    pub fn runtime_linker_path(&self) -> Option<&str> {
+        self.runtime_linker_path.as_deref()
+    }
+
+    /// Return required dylib paths for diagnostics and validation.
+    #[must_use]
+    pub fn required_dylibs(&self) -> &[String] {
+        &self.required_dylibs
+    }
+
     /// Load the Mach-O file into memory using the provided reader and mapper.
     pub fn load<R: ReadAt, M: MapMemory>(
         &self,
         reader: &mut R,
         mapper: &mut M,
+    ) -> Result<MappingInfo, MachoLoadError<M::Error>>
+    where
+        M::Error: From<R::Error>,
+    {
+        self.load_with_slide(reader, mapper, 0)
+    }
+
+    /// Load the Mach-O file into memory with a virtual-address slide.
+    pub fn load_with_slide<R: ReadAt, M: MapMemory>(
+        &self,
+        reader: &mut R,
+        mapper: &mut M,
+        slide: usize,
     ) -> Result<MappingInfo, MachoLoadError<M::Error>>
     where
         M::Error: From<R::Error>,
@@ -241,7 +294,7 @@ impl MachoParsedFile {
                 continue;
             }
 
-            let addr = segment.vmaddr as usize;
+            let addr = segment.vmaddr as usize + slide;
             let len = (segment.vmsize as usize).next_multiple_of(page_size);
 
             // Track the highest mapped address
@@ -273,8 +326,30 @@ impl MachoParsedFile {
         }
 
         Ok(MappingInfo {
-            entry_point: self.entry_point as usize,
+            entry_point: self.entry_point as usize + slide,
             brk,
         })
     }
+}
+
+fn parse_lc_string(raw_cmd_data: &[u8]) -> Result<String, MachoParseError> {
+    if raw_cmd_data.len() < 12 {
+        return Err(MachoParseError::InvalidLoadCommandString);
+    }
+    let name_offset = u32::from_le_bytes(
+        raw_cmd_data[8..12]
+            .try_into()
+            .map_err(|_| MachoParseError::InvalidLoadCommandString)?,
+    ) as usize;
+    if name_offset >= raw_cmd_data.len() {
+        return Err(MachoParseError::InvalidLoadCommandString);
+    }
+    let str_bytes = &raw_cmd_data[name_offset..];
+    let nul_idx = str_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(MachoParseError::InvalidLoadCommandString)?;
+    let value = core::str::from_utf8(&str_bytes[..nul_idx])
+        .map_err(|_| MachoParseError::InvalidLoadCommandString)?;
+    Ok(String::from(value))
 }

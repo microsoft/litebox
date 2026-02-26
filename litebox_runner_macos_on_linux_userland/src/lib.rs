@@ -6,7 +6,9 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox_platform_multiplex::Platform;
+use litebox_shim_bsd::RuntimeFileResolver;
 use memmap2::Mmap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 extern crate alloc;
@@ -20,6 +22,35 @@ pub struct CliArgs {
     /// Environment variables passed to the program (`K=V` pairs)
     #[arg(long = "env")]
     pub environment_variables: Vec<String>,
+    /// Add a runtime file mapping as `guest_path=host_path` (e.g. `/dyld-litebox=./dyld_stub_macos`)
+    #[arg(long = "runtime-file")]
+    pub runtime_files: Vec<String>,
+}
+
+struct RuntimeFiles {
+    files: BTreeMap<String, &'static [u8]>,
+}
+
+impl RuntimeFiles {
+    fn from_cli(entries: &[String]) -> Result<Self> {
+        let mut files = BTreeMap::new();
+        for entry in entries {
+            let (guest_path, host_path) = entry.split_once('=').ok_or_else(|| {
+                anyhow!("Invalid --runtime-file value '{entry}', expected guest=host")
+            })?;
+            if guest_path.is_empty() || !guest_path.starts_with('/') {
+                anyhow::bail!("Invalid guest runtime path '{guest_path}', expected absolute path");
+            }
+            files.insert(guest_path.to_string(), mmapped_file_data(host_path)?);
+        }
+        Ok(Self { files })
+    }
+}
+
+impl RuntimeFileResolver for RuntimeFiles {
+    fn read_file(&self, path: &str) -> Option<&[u8]> {
+        self.files.get(path).copied()
+    }
 }
 
 fn mmapped_file_data(path: impl AsRef<Path>) -> Result<&'static [u8]> {
@@ -39,6 +70,7 @@ fn mmapped_file_data(path: impl AsRef<Path>) -> Result<&'static [u8]> {
 pub fn run(cli_args: CliArgs) -> Result<()> {
     // Memory-map the binary file
     let binary_data = mmapped_file_data(&cli_args.program_and_arguments[0])?;
+    let runtime_files = RuntimeFiles::from_cli(&cli_args.runtime_files)?;
 
     // Initialize the platform
     let platform = Platform::new(None);
@@ -61,7 +93,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .collect();
 
     // Load the program
-    let program = shim.load_program(binary_data, argv, envp)?;
+    let program = shim.load_program_with_runtime_files(binary_data, argv, envp, &runtime_files)?;
 
     // Run the program
     unsafe {

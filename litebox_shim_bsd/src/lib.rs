@@ -10,6 +10,8 @@
 extern crate alloc;
 
 use alloc::ffi::CString;
+use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox::LiteBox;
@@ -59,6 +61,10 @@ impl litebox::shim::EnterShim for BsdShimEntrypoints {
         // Set instruction pointer and stack pointer from loaded values
         ctx.rip = self.task.entry_point;
         ctx.rsp = self.task.stack_top;
+        if let Some(main_entry) = self.task.dynamic_main_entry {
+            ctx.rdi = main_entry;
+            ctx.rsi = self.task.stack_top;
+        }
         // Linux x86_64 user-mode selectors/flags.
         ctx.cs = 0x33;
         ctx.ss = 0x2b;
@@ -106,6 +112,7 @@ struct Task {
     global: Arc<GlobalState>,
     entry_point: usize,
     stack_top: usize,
+    dynamic_main_entry: Option<usize>,
 }
 
 impl Task {
@@ -138,12 +145,19 @@ impl Task {
                 }
             }
             _ => {
-                // Return -ENOSYS (38 on macOS)
+                self.log_unknown_syscall(nr);
+                // Return -ENOSYS (78 on macOS)
                 // On macOS, errors are returned as negative values
-                ctx.rax = (-38isize) as usize;
+                ctx.rax = (-78isize) as usize;
                 ContinueOperation::Resume
             }
         }
+    }
+
+    fn log_unknown_syscall(&self, nr: u64) {
+        let msg = format!("litebox_shim_bsd: unimplemented macOS syscall 0x{nr:x}\n");
+        let _ =
+            litebox_platform_multiplex::platform().write_to(StdioOutStream::Stderr, msg.as_bytes());
     }
 
     fn do_write(&self, fd: i32, ptr: usize, count: usize) -> isize {
@@ -221,6 +235,24 @@ pub enum LoadError {
     Load(#[source] litebox::mm::linux::MappingError),
     #[error("Failed to create stack")]
     StackCreation,
+    #[error("Dynamic runtime linker '{0}' was not provided")]
+    MissingRuntimeLinker(String),
+    #[error("Failed to parse dynamic runtime linker: {0}")]
+    RuntimeLinkerParse(#[source] MachoParseError),
+}
+
+/// Runtime file resolver used to provide dyld and dylibs for dynamic Mach-O execution.
+pub trait RuntimeFileResolver {
+    /// Read a file by guest path.
+    fn read_file(&self, path: &str) -> Option<&[u8]>;
+}
+
+struct EmptyRuntimeFileResolver;
+
+impl RuntimeFileResolver for EmptyRuntimeFileResolver {
+    fn read_file(&self, _path: &str) -> Option<&[u8]> {
+        None
+    }
 }
 
 impl BsdShim {
@@ -230,6 +262,18 @@ impl BsdShim {
         binary_data: &[u8],
         argv: Vec<CString>,
         envp: Vec<CString>,
+    ) -> Result<LoadedProgram, LoadError> {
+        let resolver = EmptyRuntimeFileResolver;
+        self.load_program_with_runtime_files(binary_data, argv, envp, &resolver)
+    }
+
+    /// Load a program from binary data, optionally resolving runtime files for dynamic images.
+    pub fn load_program_with_runtime_files(
+        &self,
+        binary_data: &[u8],
+        argv: Vec<CString>,
+        envp: Vec<CString>,
+        runtime_files: &dyn RuntimeFileResolver,
     ) -> Result<LoadedProgram, LoadError> {
         // Parse the Mach-O file
         let parsed = MachoParsedFile::parse(binary_data)?;
@@ -247,6 +291,48 @@ impl BsdShim {
             litebox_common_bsd::loader::MachoLoadError::InvalidSegment => LoadError::StackCreation,
         })?;
 
+        for dylib in parsed.required_dylibs() {
+            if runtime_files.read_file(dylib).is_none() {
+                let msg = format!(
+                    "litebox_shim_bsd: runtime bundle missing dylib '{}'\n",
+                    dylib
+                );
+                let _ = litebox_platform_multiplex::platform()
+                    .write_to(StdioOutStream::Stderr, msg.as_bytes());
+            }
+        }
+
+        let mut dynamic_main_entry = None;
+        let mut entry_point = mapping_info.entry_point;
+        if let Some(runtime_linker_path) = parsed.runtime_linker_path() {
+            if let Some(linker_data) = runtime_files.read_file(runtime_linker_path) {
+                let linker_parsed =
+                    MachoParsedFile::parse(linker_data).map_err(LoadError::RuntimeLinkerParse)?;
+                let mut linker_reader = loader::SliceReader::new(linker_data);
+                let linker_slide = 0x1_0000_0000usize;
+                let linker_mapping = linker_parsed
+                    .load_with_slide(&mut linker_reader, &mut mapper, linker_slide)
+                    .map_err(|e| match e {
+                        litebox_common_bsd::loader::MachoLoadError::Map(e) => LoadError::Load(e),
+                        litebox_common_bsd::loader::MachoLoadError::Io(_) => {
+                            LoadError::StackCreation
+                        }
+                        litebox_common_bsd::loader::MachoLoadError::InvalidSegment => {
+                            LoadError::StackCreation
+                        }
+                    })?;
+                dynamic_main_entry = Some(mapping_info.entry_point);
+                entry_point = linker_mapping.entry_point;
+            } else if !parsed.required_dylibs().is_empty() {
+                let msg = format!(
+                    "litebox_shim_bsd: runtime linker '{}' not provided; continuing with main entry\n",
+                    runtime_linker_path
+                );
+                let _ = litebox_platform_multiplex::platform()
+                    .write_to(StdioOutStream::Stderr, msg.as_bytes());
+            }
+        }
+
         // Create a stack
         let stack_size = 8 * 1024 * 1024; // 8 MB
         let stack_top = loader::create_stack(&self.0.pm, stack_size, &argv, &envp)
@@ -254,8 +340,9 @@ impl BsdShim {
 
         let task = Task {
             global: self.0.clone(),
-            entry_point: mapping_info.entry_point,
+            entry_point,
             stack_top,
+            dynamic_main_entry,
         };
 
         let entrypoints = BsdShimEntrypoints {
