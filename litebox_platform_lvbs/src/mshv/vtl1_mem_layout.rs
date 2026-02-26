@@ -24,6 +24,29 @@ pub const VTL1_PDPE_PAGE: usize = 3;
 pub const VTL1_PDE_PAGE: usize = 4;
 pub const VTL1_PTE_0_PAGE: usize = 5;
 
+/// PDPT page for the Phase 1 high-canonical PML4 entry. Placed after the
+/// VTL0-reserved special pages (GDT, TSS, PT pages, stack, boot params,
+/// cmdline) so that all 8 VTL0 PTE pages remain available for the
+/// high-canonical mapping. This page is within the VTL0 identity-mapped
+/// 16 MiB region but is otherwise unused memory.
+pub const VTL1_REMAP_PDPT_PAGE: usize = VTL1_CMDLINE_PAGE + 1;
+
+/// PDE page for the Phase 1 high-canonical mapping. PDE entries point to
+/// all 8 VTL0 PTE pages (pages 5–12) to establish 4KB-granularity mappings
+/// covering the full 16 MiB of VTL1 pre-populated memory.
+pub const VTL1_REMAP_PDE_PAGE: usize = VTL1_REMAP_PDPT_PAGE + 1;
+
+/// Number of VTL0 PTE pages available for the Phase 1 high-canonical mapping.
+/// All 8 PTE pages are used, covering 8 * 2 MiB = 16 MiB.
+///
+/// This must fit in a single PDE page (≤ 512 entries) because Phase 1
+/// allocates only one PDE page for the high-canonical mapping.
+pub const VTL1_REMAP_PTE_COUNT: usize = VSM_SK_PTE_PAGES_COUNT;
+const _: () = assert!(
+    VTL1_REMAP_PTE_COUNT <= PTES_PER_PAGE,
+    "Phase 1 remap assumes all PTE pages fit in a single PDE page"
+);
+
 // use this stack only for per-core VTL startup
 pub const VTL1_KERNEL_STACK_PAGE: usize = VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT;
 
@@ -42,6 +65,8 @@ unsafe extern "C" {
     static _text_start: u8;
     static _text_end: u8;
     static _hvcall_page_start: u8;
+    static _rela_start: u8;
+    static _rela_end: u8;
 }
 
 #[inline]
@@ -75,6 +100,18 @@ pub fn get_text_end_address() -> u64 {
 #[inline]
 pub fn get_hvcall_page_start_address() -> u64 {
     &raw const _hvcall_page_start as u64
+}
+
+/// Returns the start address of the `.rela.dyn` section.
+#[inline]
+pub fn get_rela_start_address() -> u64 {
+    &raw const _rela_start as u64
+}
+
+/// Returns the end address (exclusive) of the `.rela.dyn` section.
+#[inline]
+pub fn get_rela_end_address() -> u64 {
+    &raw const _rela_end as u64
 }
 
 /// Errors for VTL memory operations.

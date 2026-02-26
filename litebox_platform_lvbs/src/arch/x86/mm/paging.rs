@@ -124,10 +124,6 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
 }
 
 impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
-    pub(crate) unsafe fn new(item: PhysAddr) -> Self {
-        unsafe { Self::init(item) }
-    }
-
     pub(crate) fn map_pages(
         &self,
         range: PageRange<ALIGN>,

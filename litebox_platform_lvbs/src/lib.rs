@@ -88,26 +88,33 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 //  0xFFFF_CFFF_FFFF_F000  ┌─────────────────────────────────┐ ← VMAP_END
 //                         │ vmap region  (~16 TiB)          │
 //                         │ non-contiguous PA→VA mappings   │
-//  0xFFFF_C000_0000_0000  └─────────────────────────────────┘ ← VMAP_START
+//  0xFFFF_C000_0000_0000  ├─────────────────────────────────┤ ← VMAP_START
+//                         │ Direct map region (64 TiB)      │
+//                         │ VA = PA + GVA_OFFSET            │
+//                         │ VTL1 memory always mapped;      │
+//                         │ VTL0 memory mapped on demand    │
+//  0xFFFF_8000_0000_0000  └─────────────────────────────────┘ ← GVA_OFFSET
 //
 // Low canonical half  (0x0000_0000_0000_0000 .. 0x0000_7FFF_FFFF_FFFF):
 //  0x0000_7FFF_FFFF_F000  ┌─────────────────────────────────┐ ← USER_ADDR_MAX
-//                         │ User address space (~64 TiB)    │
+//                         │ User address space (~128 TiB)   │
 //                         │ mmap / TA memory                │
-//  0x0000_3FFF_FFFF_F000  ├─────────────────────────────────┤ ← USER_ADDR_MIN
-//                         │ Identity-mapped (VA == PA)      │
-//                         │ up to 64 TiB of physical memory │
-//  0x0000_0000_0000_0000  └─────────────────────────────────┘
+//  0x0000_0000_0001_0000  └─────────────────────────────────┘ ← USER_ADDR_MIN
 //
-// Identity-mapped region covers [0, USER_ADDR_MIN) in the low canonical half.
-// 4-level paging supports up to 64 TiB of physical memory (46-bit MAXPHYADDR),
-// so 64 TiB of identity-map VA space is sufficient.
-// USER_ADDR_MIN..USER_ADDR_MAX is reserved for user-space allocations.
-// VMAP_START..VMAP_END is in the high canonical half for vmap mappings.
+// The entire low canonical half is available for user space since the
+// kernel direct map has moved to the high canonical half.
+//
+// The 64 TiB direct map reservation ensures that any physical address
+// up to 64 TiB can be mapped via the simple PA + GVA_OFFSET formula
+// without colliding with the vmap region.
+
+/// Offset added to any physical address to obtain the corresponding kernel
+/// virtual address in the high-canonical direct map.
+pub const GVA_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
 /// Start of the vmap virtual address region.
-/// Placed in the high (negative) canonical address range so it does not
-/// compete with identity-mapped or user-space addresses in the low half.
+/// Placed immediately above the 64 TiB direct map reservation at
+/// GVA_OFFSET, in the high (negative) canonical address range.
 pub(crate) const VMAP_START: usize = 0xFFFF_C000_0000_0000;
 
 /// End of the vmap virtual address region (exclusive).
@@ -115,17 +122,15 @@ pub(crate) const VMAP_START: usize = 0xFFFF_C000_0000_0000;
 pub(crate) const VMAP_END: usize = 0xFFFF_CFFF_FFFF_F000;
 
 /// Maximum virtual address (exclusive) for user-space allocations.
-/// This is set to (1 << 47) - PAGE_SIZE (upper limit of 4-level paging).
-const USER_ADDR_MAX: usize = 0x7FFF_FFFF_F000;
-
-/// Size of the user address space range.
-const USER_ADDR_RANGE_SIZE: usize = 0x4000_0000_0000; // 64 TiB
+/// This is the top of the low canonical half (4-level paging).
+const USER_ADDR_MAX: usize = 0x0000_7FFF_FFFF_F000;
 
 /// Minimum virtual address for user-space allocations.
 ///
-/// Kernel memory uses low addresses (identity mapped: VA == PA).
-/// User memory uses addresses in range [`USER_ADDR_MIN`, `USER_ADDR_MAX`).
-const USER_ADDR_MIN: usize = USER_ADDR_MAX - USER_ADDR_RANGE_SIZE;
+/// Start above the first 64 KiB to avoid mapping the zero page and
+/// to provide a guard region against NULL pointer dereferences.
+/// <https://cateee.net/lkddb/web-lkddb/LSM_MMAP_MIN_ADDR.html>
+const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
 
 /// Manages base and task page tables.
 ///
@@ -474,54 +479,75 @@ impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
 }
 
 impl<Host: HostInterface> LinuxKernel<Host> {
-    /// This function initializes the VTL1 kernel platform (mostly the kernel page table).
+    /// Initializes the VTL1 kernel platform, building the base page table
+    /// with Data Execution Prevention (DEP).
     ///
-    /// It performs a two-phase page-table bootstrap:
+    /// A *new* top-level (PML4) page table is allocated from the heap, populated
+    /// with a high-canonical direct mapping (`VA = PA + GVA_OFFSET`) covering the
+    /// entire kernel physical range, and loaded via CR3. Pages inside the kernel
+    /// text section (`text_phys_start..text_phys_end`) and the Hyper-V hypercall
+    /// code page are mapped executable; every other page is marked `NO_EXECUTE`.
     ///
-    /// 1. **Early phase**: the VTL0-provided page table at `init_page_table_addr` is
-    ///    extended so that the entire VTL1 physical range is identity-mapped. This is
-    ///    required because VTL0 only pre-populates a small initial window and the VTL1
-    ///    heap allocator needs access to all VTL1 memory.
+    /// # Prerequisites
     ///
-    /// 2. **DEP phase**: a *new* top-level (PML4) page table is allocated from the
-    ///    heap, populated with the same identity mapping but with proper No-Execute (NX)
-    ///    permissions, and loaded via CR3. Pages inside the kernel text section
-    ///    (`text_phys_start..text_phys_end`) and the Hyper-V hypercall code page are
-    ///    mapped executable; every other page is marked `NO_EXECUTE`.
+    /// The caller must ensure the following conditions are met before
+    /// invoking this function:
     ///
-    /// `text_phys_start` / `text_phys_end` must be page-aligned physical addresses
-    /// obtained from the linker symbols `_text_start` / `_text_end` (after
-    /// relocations have been applied).
+    /// 1. **High-canonical address space**: The CPU must be executing at
+    ///    high-canonical virtual addresses (`VA >= GVA_OFFSET`). All code
+    ///    and stack references must use relocated high-canonical pointers.
+    ///
+    /// 2. **ELF relocations fully applied**: All `R_X86_64_RELATIVE`
+    ///    relocations must have been processed for the final (high-canonical)
+    ///    link address. Linker-emitted symbols (e.g., `_text_start`,
+    ///    `_text_end`, `_hvcall_page_start`) must resolve to correct
+    ///    high-canonical addresses.
+    ///
+    /// 3. **Global allocator seeded**: The heap must contain enough free
+    ///    memory to allocate the Phase 2 page table frames (e.g., ~256 KiB for
+    ///    128 MiB of physical memory).
+    ///
+    /// 4. **Early page table active**: CR3 must reference an early page
+    ///    table that identity-maps (or otherwise maps) at least the kernel
+    ///    code and stack at high-canonical addresses. This function
+    ///    replaces it with the new base page table; it must only be
+    ///    called once.
+    ///
+    /// # Post-conditions
+    ///
+    /// After this function returns:
+    ///
+    /// - CR3 points to the new base page table covering the **full** kernel
+    ///   physical range with DEP enforcement.
+    /// - The previous trampoline page table frames (early page table pages and
+    ///   any Phase 1 scratch pages) are no longer referenced and may be
+    ///   reclaimed by the caller.
+    /// - Memory beyond the initial pre-populated region is now mapped and
+    ///   can be added to the global allocator.
+    ///
+    /// # Arguments
+    ///
+    /// * `phys_start` / `phys_end`: Page-aligned physical address range of
+    ///   the entire VTL1 memory.
+    /// * `text_phys_start` / `text_phys_end`: Page-aligned physical address
+    ///   range of the kernel `.text` section (converted to PA after
+    ///   relocation).
     ///
     /// # Panics
     ///
-    /// Panics if the heap is not initialized yet or it does not have enough space to
-    /// allocate page table entries, or if `phys_start` / `phys_end` is invalid.
+    /// Panics if the heap is not seeded, if any address argument is invalid
+    /// or misaligned, or if the text section falls outside the VTL1 range.
     pub fn new(
-        init_page_table_addr: x86_64::PhysAddr,
         phys_start: x86_64::PhysAddr,
         phys_end: x86_64::PhysAddr,
         text_phys_start: x86_64::PhysAddr,
         text_phys_end: x86_64::PhysAddr,
     ) -> &'static Self {
-        // Phase 1: extend the early page table (from VTL0) to cover all VTL1 memory
-        let early_pt: mm::PageTable<PAGE_SIZE> =
-            unsafe { mm::PageTable::new(init_page_table_addr) };
         let physframe_start = PhysFrame::containing_address(phys_start);
         let physframe_end = PhysFrame::containing_address(phys_end.align_up(Size4KiB::SIZE));
         let vtl1_range = PhysFrame::range(physframe_start, physframe_end);
-        if early_pt
-            .map_phys_frame_range(
-                vtl1_range,
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-                None,
-            )
-            .is_err()
-        {
-            panic!("Failed to map VTL1 physical memory to early page table");
-        }
 
-        // Phase 2: create a new base page table with DEP enforcement
+        // Create the base page table with DEP enforcement.
         //
         // Build the list of physical address ranges that must remain executable:
         //   1. The kernel .text section
@@ -532,11 +558,11 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         #[cfg(not(test))]
         {
             use crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address;
-            let hvcall_start = get_hvcall_page_start_address();
-            exec_ranges.push(
-                x86_64::PhysAddr::new(hvcall_start)
-                    ..x86_64::PhysAddr::new(hvcall_start + PAGE_SIZE as u64),
+            // get_hvcall_page_start_address() now returns a virtual address (two-phase relocation).
+            let hvcall_phys = <crate::host::LvbsLinuxKernel as crate::mm::MemoryProvider>::va_to_pa(
+                x86_64::VirtAddr::new(get_hvcall_page_start_address()),
             );
+            exec_ranges.push(hvcall_phys..hvcall_phys + PAGE_SIZE as u64);
         }
 
         let base_pt = unsafe { mm::PageTable::new_top_level() };
@@ -558,37 +584,11 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         crate::arch::enable_dep();
 
         // Switch to the new base page table.
-        // Safety: the new page table identity-maps the entire VTL1 memory range,
-        // including the code currently being executed and the stack.
+        // Safety: the new page table maps the entire VTL1 memory range at
+        // high-canonical addresses, including the code and stack currently
+        // in use. The Phase 1 trampoline page table (VTL0's PML4) is no
+        // longer needed.
         base_pt.load();
-
-        // The page table's Drop would try to `mem_free_pages` the
-        // PML4 frame, but that frame was pre-populated by VTL0 and was
-        // never allocated from the heap. We must skip the destructor.
-        core::mem::forget(early_pt);
-
-        // Reclaim the VTL0-setup page table frames (PML4E, PDPE, PDE, and
-        // PTE pages). These are VTL1 physical memory that VTL0 used for
-        // the initial page table but are no longer needed after the CR3
-        // switch above.
-        #[cfg(not(test))]
-        {
-            use crate::mshv::vtl1_mem_layout::{
-                VSM_SK_PTE_PAGES_COUNT, VTL1_PML4E_PAGE, VTL1_PTE_0_PAGE,
-            };
-            let early_pt_start: usize =
-                TruncateExt::<usize>::truncate(phys_start.as_u64()) + VTL1_PML4E_PAGE * PAGE_SIZE;
-            let early_pt_size: usize =
-                (VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT - VTL1_PML4E_PAGE) * PAGE_SIZE;
-            // Safety: the early page table frames are no longer referenced
-            // (CR3 now points to `base_pt`) and fall within VTL1's memory.
-            unsafe {
-                <crate::host::LvbsLinuxKernel as crate::mm::MemoryProvider>::mem_fill_pages(
-                    early_pt_start,
-                    early_pt_size,
-                );
-            }
-        }
 
         // There is only one long-running platform ever expected, thus this leak is perfectly ok in
         // order to simplify usage of the platform.
@@ -1193,10 +1193,8 @@ pub trait HostInterface: 'static {
 }
 
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
-    // Use a high address for user space to separate from kernel identity-mapped memory.
-    // Kernel memory uses low addresses (identity mapped: VA == PA).
-    // User memory allocated via mmap uses high addresses (VA >= TASK_ADDR_MIN).
-    // This allows easy identification of user vs kernel pages during cleanup.
+    // User space occupies the low canonical half (0 .. 0x0000_7FFF_FFFF_FFFF).
+    // Kernel memory lives in the high canonical half (direct map at GVA_OFFSET).
     const TASK_ADDR_MIN: usize = USER_ADDR_MIN;
     const TASK_ADDR_MAX: usize = USER_ADDR_MAX;
 

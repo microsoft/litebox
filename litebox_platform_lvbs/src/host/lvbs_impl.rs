@@ -34,7 +34,7 @@ mod alloc {
     }
 
     impl crate::mm::MemoryProvider for super::LvbsLinuxKernel {
-        const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(0);
+        const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
         const PRIVATE_PTE_MASK: u64 = 0;
 
         fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
