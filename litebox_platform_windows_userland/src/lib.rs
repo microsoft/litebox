@@ -876,7 +876,10 @@ impl litebox::platform::TimerHandle for TimerHandle {
             let intervals = duration.as_nanos() / 100;
             -(i64::try_from(intervals).unwrap_or(i64::MAX))
         };
-        let due_time = unsafe { std::mem::transmute::<i64, FILETIME>(due_time_100ns) };
+        let due_time = FILETIME {
+            dwLowDateTime: due_time_100ns as u32,
+            dwHighDateTime: (due_time_100ns >> 32) as u32,
+        };
 
         // Arm the threadpool timer. The callback registered at creation
         // time will fire after `duration` elapses.
