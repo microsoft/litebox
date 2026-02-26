@@ -252,6 +252,14 @@ impl WindowsUserland {
             let _ = AddVectoredExceptionHandler(0, Some(vectored_exception_handler));
         }
 
+        // Register a console control handler to receive Ctrl+C
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                Some(ctrl_c_handler),
+                1, // TRUE — add the handler
+            );
+        }
+
         Box::leak(Box::new(platform))
     }
 
@@ -322,20 +330,26 @@ impl WindowsUserland {
 
 impl litebox::platform::Provider for WindowsUserland {}
 
-/// Runs a guest thread using the provided shim and the given initial context.
+impl litebox::platform::SignalProvider for WindowsUserland {
+    fn take_pending_signals(&self, mut f: impl FnMut(litebox::shim::Signal)) {
+        let bits = get_tls_ptr().map_or(0, |p| {
+            unsafe { &*p }
+                .pending_host_signals
+                .swap(0, Ordering::SeqCst)
+        });
+        let sigs = litebox::shim::SigSet::from_u64(u64::from(bits));
+        for signal in sigs {
+            f(signal);
+        }
+    }
+}
+
+/// Ensures the module-wide TLS slot index ([`TLS_INDEX`]) has been allocated.
 ///
-/// This will run until the thread terminates.
-///
-/// # Safety
-/// The context must be valid guest context.
-#[expect(
-    clippy::missing_panics_doc,
-    reason = "the caller cannot control whether this will panic"
-)]
-pub unsafe fn run_thread(
-    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &mut litebox_common_linux::PtRegs,
-) {
+/// This must be called before any code that reads `TLS_INDEX`. Both
+/// [`run_thread`] (guest threads) and [`run_test_thread`](WindowsUserland::run_test_thread)
+/// (test threads) go through here.
+fn ensure_tls_index() {
     // Allocate a TLS slot for this module if not already done. This is used as
     // a place to store data across calls to the guest, since all the registers
     // are used by the guest and will be clobbered.
@@ -353,6 +367,19 @@ pub unsafe fn run_thread(
         );
         TLS_INDEX.store(index, Ordering::Relaxed);
     });
+}
+
+/// Runs a guest thread using the provided shim and the given initial context.
+///
+/// This will run until the thread terminates.
+///
+/// # Safety
+/// The context must be valid guest context.
+pub unsafe fn run_thread(
+    shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    ensure_tls_index();
     run_thread_inner(&shim, ctx);
 }
 
@@ -360,25 +387,11 @@ fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
-    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
-    let tls_state = TlsState {
-        host_sp: Cell::new(core::ptr::null_mut()),
-        host_bp: Cell::new(core::ptr::null_mut()),
-        guest_context_top: std::ptr::from_mut(ctx).wrapping_add(1).into(),
-        scratch: 0.into(),
-        is_in_guest: false.into(),
-        interrupt: false.into(),
-        continue_context: Box::default(),
-    };
-    unsafe {
-        windows_sys::Win32::System::Threading::TlsSetValue(
-            tls_index,
-            core::ptr::from_ref(&tls_state).cast(),
-        );
-    }
-    let _tls_guard = litebox::utils::defer(|| unsafe {
-        windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null());
-    });
+    let tls_state = TlsState::new();
+    tls_state
+        .guest_context_top
+        .set(std::ptr::from_mut(ctx).wrapping_add(1));
+
     let mut thread_ctx = ThreadContext {
         shim,
         ctx,
@@ -400,6 +413,46 @@ struct TlsState {
     interrupt: Cell<bool>,
     continue_context:
         Box<std::cell::UnsafeCell<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>>,
+    /// Bitmask of pending host-originated signals for this thread.
+    pending_host_signals: AtomicU32,
+    /// Pointer to the `RawMutex` currently being waited on via
+    /// `WaitOnAddress`, or null if not waiting.
+    ///
+    /// Set by [`RawMutex::on_wait_start`] and cleared by
+    /// [`RawMutex::on_wait_end`].
+    waiting_condvar: std::sync::atomic::AtomicPtr<RawMutex>,
+}
+
+impl TlsState {
+    /// Creates a new `TlsState` with all fields zeroed / defaulted.
+    fn new() -> Self {
+        Self {
+            host_sp: Cell::new(core::ptr::null_mut()),
+            host_bp: Cell::new(core::ptr::null_mut()),
+            guest_context_top: core::ptr::null_mut::<litebox_common_linux::PtRegs>().into(),
+            scratch: 0.into(),
+            is_in_guest: false.into(),
+            interrupt: false.into(),
+            continue_context: Box::default(),
+            pending_host_signals: AtomicU32::new(0),
+            waiting_condvar: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+}
+
+/// Stores `tls` in the current thread's Windows TLS slot.
+///
+/// # Safety
+///
+/// The caller must ensure `tls` remains valid for the duration of its use.
+unsafe fn install_tls(tls: &TlsState) {
+    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
+    unsafe {
+        windows_sys::Win32::System::Threading::TlsSetValue(
+            tls_index,
+            core::ptr::from_ref(tls).cast(),
+        );
+    }
 }
 
 fn get_tls_ptr() -> Option<*const TlsState> {
@@ -407,9 +460,12 @@ fn get_tls_ptr() -> Option<*const TlsState> {
     if tls_index == u32::MAX {
         return None;
     }
-    Some(unsafe {
-        windows_sys::Win32::System::Threading::TlsGetValue(tls_index).cast::<TlsState>()
-    })
+    let ptr =
+        unsafe { windows_sys::Win32::System::Threading::TlsGetValue(tls_index).cast::<TlsState>() };
+    if ptr.is_null() {
+        return None;
+    }
+    Some(ptr)
 }
 
 /// Runs the guest thread until it terminates.
@@ -747,6 +803,32 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
             thread.interrupt(current.as_ref());
         });
     }
+
+    fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
+        // Ensure the module-wide TLS slot is allocated.
+        ensure_tls_index();
+        let tls = TlsState::new();
+        ThreadHandle::run_with_handle(&tls, f)
+    }
+}
+
+/// Console control handler registered via `SetConsoleCtrlHandler`.
+///
+/// When the user presses Ctrl+C, this sets the SIGINT bit on every active
+/// managed thread and interrupts them so the shim can deliver the signal.
+unsafe extern "system" fn ctrl_c_handler(ctrl_type: u32) -> i32 {
+    if ctrl_type != windows_sys::Win32::System::Console::CTRL_C_EVENT {
+        return 0; // FALSE — let the next handler deal with it
+    }
+
+    // Pick one arbitrary thread to deliver the signal to.
+    let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
+
+    if let Some(thread) = thread {
+        thread.deliver_signal(litebox::shim::Signal::SIGINT);
+    }
+
+    1 // TRUE — we handled it
 }
 
 #[derive(Clone)]
@@ -764,32 +846,89 @@ thread_local! {
     static CURRENT_THREAD_HANDLE: RefCell<Option<ThreadHandle>> = const { RefCell::new(None) };
 }
 
+/// Global registry of all active managed thread handles.
+///
+/// The Ctrl+C handler picks a thread from this list to deliver SIGINT.
+/// Threads are registered in [`ThreadHandle::run_with_handle`] and
+/// removed when the guard drops.
+///
+/// TODO: This global list only works when we support a single process. For
+/// multi-process support, each process (or `WindowsUserland` instance) should
+/// track its own thread list.
+static ACTIVE_THREADS: Mutex<alloc::vec::Vec<ThreadHandle>> = Mutex::new(alloc::vec::Vec::new());
+
 impl ThreadHandle {
-    /// Runs `f`, ensuring that [`CURRENT_THREAD_HANDLE`] is set while in the call to `f`.
-    fn run_with_handle<R>(tls: &TlsState, f: impl FnOnce() -> R) -> R {
+    /// Creates a [`ThreadHandle`] referencing the calling OS thread.
+    fn for_current_thread(tls: &TlsState) -> ThreadHandle {
         let win_handle = unsafe {
             std::os::windows::io::BorrowedHandle::borrow_raw(
                 windows_sys::Win32::System::Threading::GetCurrentThread(),
             )
         };
-        let handle = ThreadHandle(Arc::new(Mutex::new(Some(ThreadHandleInner {
+        ThreadHandle(Arc::new(Mutex::new(Some(ThreadHandleInner {
             handle: win_handle
                 .try_clone_to_owned()
                 .expect("failed to clone current thread handle"),
             tls: SendConstPtr(tls),
-        }))));
+        }))))
+    }
+
+    /// Runs `f`, ensuring that [`CURRENT_THREAD_HANDLE`] is set while in the call to `f`.
+    fn run_with_handle<R>(tls: &TlsState, f: impl FnOnce() -> R) -> R {
+        // Safety: `tls_state` lives for the duration of this call.
+        unsafe { install_tls(tls) };
+
+        let handle = Self::for_current_thread(tls);
+        ACTIVE_THREADS.lock().unwrap().push(handle.clone());
         CURRENT_THREAD_HANDLE.with_borrow_mut(|current| {
             assert!(
                 current.is_none(),
-                "nested run_with_handle calls are not supported"
+                "thread is already registered with LiteBox",
             );
-            *current = Some(handle);
+            *current = Some(handle.clone());
         });
-        let _guard = litebox::utils::defer(|| {
+        let _guard = litebox::utils::defer(move || {
             let current = CURRENT_THREAD_HANDLE.take().unwrap();
+            // Remove from the global registry.
+            ACTIVE_THREADS
+                .lock()
+                .unwrap()
+                .retain(|h| !Arc::ptr_eq(&h.0, &current.0));
             *current.0.lock().unwrap() = None;
+            let tls_index = TLS_INDEX.load(Ordering::Relaxed);
+            unsafe {
+                windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null())
+            };
         });
         f()
+    }
+
+    /// Sets a pending signal on this thread, wakes it from any condvar wait,
+    /// and interrupts it so the shim processes the signal promptly.
+    fn deliver_signal(&self, signal: litebox::shim::Signal) {
+        let bit: u32 = 1 << (signal.as_raw() - 1);
+
+        // Set the pending signal bit and wake the condvar in one lock scope.
+        {
+            let inner = self.0.lock().unwrap();
+            if let Some(inner) = inner.as_ref() {
+                // Safety: the TLS pointer is valid as long as the thread is
+                // alive, and we hold the thread handle lock.
+                let tls = unsafe { &*inner.tls.0 };
+                tls.pending_host_signals.fetch_or(bit, Ordering::SeqCst);
+
+                let condvar = tls.waiting_condvar.load(Ordering::Acquire);
+                if !condvar.is_null() {
+                    // Safety: `condvar` points to a valid `RawMutex` inside a
+                    // `WaitStateInner`, set by `RawMutex::on_wait_start`.
+                    litebox::event::wait::WaitState::<WindowsUserland>::try_wake_condvar(unsafe {
+                        &*condvar
+                    });
+                }
+            }
+        }
+
+        self.interrupt(None);
     }
 
     /// Interrupt the thread represented by this handle, where `current` is the
@@ -858,7 +997,7 @@ impl ThreadHandle {
 
         if !target_tls.is_in_guest.get() {
             // Not running in the guest. The interrupt flag will be checked
-            // before returning to the guest, so just resume.
+            // before returning to the guest.
             return;
         }
 
@@ -1004,17 +1143,12 @@ impl RawMutex {
         }
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn block_or_maybe_timeout(
         &self,
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        // We immediately wake up (without even hitting syscalls) if we can clearly see that the
-        // value is different.
-        if self.inner.load(Ordering::SeqCst) != val {
-            return Err(ImmediatelyWokenUp);
-        }
-
         // Compute timeout in ms
         let timeout_ms = match timeout {
             None => Win32_Threading::INFINITE, // no timeout
@@ -1024,9 +1158,11 @@ impl RawMutex {
             }
         };
 
+        let wait_addr = (&raw const self.inner).cast::<c_void>().cast_mut();
+
         let ok = unsafe {
             Win32_Threading::WaitOnAddress(
-                (&raw const self.inner).cast::<c_void>(),
+                wait_addr.cast_const(),
                 (&raw const val).cast::<c_void>(),
                 std::mem::size_of::<u32>(),
                 timeout_ms,
@@ -1036,18 +1172,10 @@ impl RawMutex {
         if ok {
             Ok(UnblockedOrTimedOut::Unblocked)
         } else {
-            // Check why WaitOnAddress failed
             let err = unsafe { GetLastError() };
             match err {
-                Win32_Foundation::ERROR_TIMEOUT => {
-                    // Timed out
-                    Ok(UnblockedOrTimedOut::TimedOut)
-                }
-                e => {
-                    // Other error, possibly spurious wakeup or value changed
-                    // Continue the loop to check the value again
-                    panic!("Unexpected error={e} for WaitOnAddress");
-                }
+                Win32_Foundation::ERROR_TIMEOUT => Ok(UnblockedOrTimedOut::TimedOut),
+                e => panic!("Unexpected error={e} for WaitOnAddress"),
             }
         }
     }
@@ -1058,6 +1186,20 @@ impl litebox::platform::RawMutex for RawMutex {
 
     fn underlying_atomic(&self) -> &AtomicU32 {
         &self.inner
+    }
+
+    fn on_wait_start(&self) {
+        if let Some(tls) = get_tls_ptr().map(|p| unsafe { &*p }) {
+            tls.waiting_condvar
+                .store(std::ptr::from_ref(self).cast_mut(), Ordering::Release);
+        }
+    }
+
+    fn on_wait_end(&self) {
+        if let Some(tls) = get_tls_ptr().map(|p| unsafe { &*p }) {
+            tls.waiting_condvar
+                .store(std::ptr::null_mut(), Ordering::Release);
+        }
     }
 
     fn wake_many(&self, n: usize) -> usize {
@@ -1147,7 +1289,7 @@ impl litebox::platform::TimeProvider for WindowsUserland {
 }
 
 /// 100ns units returned by `QueryUnbiasedInterruptTimePrecise`.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Instant(u64);
 
 impl litebox::platform::Instant for Instant {
@@ -1720,6 +1862,7 @@ unsafe extern "C-unwind" fn exception_handler(
 }
 
 unsafe extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext<'_>) {
+    thread_ctx.tls.is_in_guest.set(false);
     thread_ctx.call_shim(|shim, ctx, interrupt| {
         if interrupt {
             shim.interrupt(ctx)

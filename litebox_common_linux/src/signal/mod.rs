@@ -102,6 +102,17 @@ impl TryFrom<i32> for Signal {
         }
     }
 }
+impl TryFrom<Signal> for litebox::shim::Signal {
+    type Error = Signal;
+
+    fn try_from(value: Signal) -> Result<Self, Self::Error> {
+        match value {
+            Signal::SIGINT => Ok(Self::SIGINT),
+            Signal::SIGALRM => Ok(Self::SIGALRM),
+            _ => Err(value),
+        }
+    }
+}
 
 /// The default disposition of a signal.
 pub enum SignalDisposition {

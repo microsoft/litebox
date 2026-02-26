@@ -95,6 +95,33 @@ pub trait ThreadProvider: RawPointerProvider {
     /// [`EnterShim`]: crate::shim::EnterShim
     /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
     fn interrupt_thread(&self, thread: &Self::ThreadHandle);
+
+    /// Runs `f` on the current thread after performing any platform-specific
+    /// thread registration needed for [`current_thread`](Self::current_thread)
+    /// and related functionality to work.
+    ///
+    /// This is intended for test threads that do not go through the normal
+    /// [`spawn_thread`](Self::spawn_thread) / guest entry path. The platform
+    /// sets up thread state before calling `f` and tears it down afterward.
+    ///
+    /// The default implementation simply calls `f()` with no additional setup.
+    /// Platforms that require explicit thread registration should override this.
+    fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
+}
+
+/// Provider for consuming platform-originating signals.
+///
+/// Platforms can record signals (e.g., `SIGINT`) and the shim should call
+/// [`SignalProvider::take_pending_signals`] to consume them.
+pub trait SignalProvider {
+    /// Atomically take all pending asynchronous signals (e.g., SIGINT and SIGALRM)
+    /// for the current thread, passing each one to `f`.
+    ///
+    /// Platforms that support asynchronous signals should override this method.
+    #[allow(unused_variables, reason = "no-op by default")]
+    fn take_pending_signals(&self, f: impl FnMut(crate::shim::Signal)) {}
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the
@@ -249,6 +276,22 @@ pub trait RawMutex: Send + Sync + 'static {
     fn wake_all(&self) -> usize {
         self.wake_many(i32::MAX as usize)
     }
+
+    /// Called when a thread enters an interruptible wait on this mutex.
+    ///
+    /// Platforms can use this to store the condvar address in thread-local
+    /// storage so that signal handlers can wake the thread via
+    /// [`try_wake_condvar`](crate::event::wait::WaitState::try_wake_condvar).
+    ///
+    /// This is a no-op by default.
+    fn on_wait_start(&self) {}
+
+    /// Called when a thread leaves an interruptible wait on this mutex.
+    ///
+    /// Platforms should clear any state set by [`on_wait_start`](Self::on_wait_start).
+    ///
+    /// This is a no-op by default.
+    fn on_wait_end(&self) {}
 
     /// If the underlying value is `val`, block until a wake operation wakes us up.
     ///

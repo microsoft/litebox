@@ -156,12 +156,12 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
             .0
             .set_state(ThreadState::RUNNING_IN_HOST, Ordering::Relaxed);
     }
-}
 
-impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
-    /// Wakes up the thread if it is waiting (but not if it is running in the guest).
-    fn wake(&self) {
-        let condvar = &self.condvar;
+    /// Attempts to wake a thread that is in the WAITING state, then issuing a futex wake.
+    ///
+    /// Returns `true` if the thread was woken. Returns `false` if the thread was
+    /// not in the WAITING state.
+    pub fn try_wake_condvar(condvar: &Platform::RawMutex) {
         let v = condvar.underlying_atomic().fetch_update(
             Ordering::Release,
             Ordering::Relaxed,
@@ -185,6 +185,13 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
                 core::sync::atomic::fence(Ordering::Release);
             }
         }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
+    /// Wakes up the thread if it is waiting (but not if it is running in the guest).
+    fn wake(&self) {
+        WaitState::<Platform>::try_wake_condvar(&self.condvar);
     }
 
     fn state_for_assert(&self) -> ThreadState {
@@ -374,6 +381,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// evaluating the wait and interrupt conditions so that wakeups are not
     /// missed.
     fn start_wait(&self) {
+        self.waker.0.condvar.on_wait_start();
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);
@@ -384,6 +392,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         self.waker
             .0
             .set_state(ThreadState::RUNNING_IN_HOST, Ordering::Relaxed);
+        self.waker.0.condvar.on_wait_end();
     }
 
     /// Checks whether the wait should be interrupted. If not, then performs
