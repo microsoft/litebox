@@ -1,221 +1,239 @@
-# Plan: macOS Dynamic Hello World on Linux Userland Runner
+# Plan: BSD/macOS Syscall Expansion for Running Real Programs
 
 ## Objective
 
-Enable LiteBox to run a **dynamically linked x86_64 Mach-O Hello World** on Linux userland, building on the already-working static Mach-O path.
+Move from assembly-only smoke tests to **real macOS user programs** (initially simple Zig-built binaries), by substantially expanding BSD/macOS syscall support in the BSD path.
 
 Success means:
-1. The macOS dynamic executable starts via `dyld`.
-2. Required dependent dylibs load successfully.
-3. Program prints `Hello, World!` and exits with status 0 under `litebox_runner_macos_on_linux_userland`.
+1. A dynamically linked x86_64 Mach-O program built with Zig can start under `litebox_runner_macos_on_linux_userland`.
+2. Program executes meaningful libc/runtime behavior (not just direct `write`/`exit`) and exits cleanly.
 
 ---
 
-## Current State
+## Current Baseline (Already Achieved)
 
-What already works:
-- Workspace contains:
-  - `litebox_common_bsd`
-  - `litebox_shim_bsd`
-  - `litebox_runner_macos_on_linux_userland`
-- Static Mach-O loading and execution path exists.
-- `SYS_WRITE` and `SYS_EXIT` are implemented in the BSD shim.
-- Seccomp-based syscall interception is wired through the multiplex platform.
-- A static test binary exists in `litebox_runner_macos_on_linux_userland/test_binaries`.
+- Dynamic two-image startup path exists (main image + runtime linker handoff).
+- Runtime linker file injection is supported by the macOS-on-linux runner (`--runtime-file`).
+- Static and dynamic assembly samples run via:
+  - `make test-static`
+  - `make test-dynamic`
+- Early syscall diagnostics are present for unknown macOS syscall numbers.
 
-Key gap to close:
-- Dynamic Mach-O execution requires `dyld` + dylib loading and a larger syscall/loader surface than static binaries.
+Primary remaining gap:
+- Syscall surface is still too small for real user programs and libc/runtime startup paths.
 
 ---
 
 ## Scope
 
 ### In scope
-- Evolve the existing BSD crates to support dynamically linked x86_64 Mach-O binaries.
-- Add loader metadata and runtime behavior needed for `dyld`-first startup.
-- Add enough BSD syscall handling for dynamic Hello World to complete.
-- Add reproducible validation artifacts/commands for dynamic Hello World.
+- Expand syscall constants + handlers on the BSD/macOS path.
+- Improve argument decoding, errno behavior, and syscall diagnostics.
+- Add Zig-based real-program test assets and reproducible invocation flow.
+- Add gdb-based debugging workflow for syscall/entry faults.
 
-### Out of scope (for this phase)
-- Full macOS syscall coverage.
-- Full Objective-C/Cocoa runtime support.
-- Universal binary / arm64 Mach-O support.
-- Kernel-mode or non-userland platform changes.
+### Explicitly out of scope
+- Any edits to Linux/common Linux/shim Linux/platform crates beyond referencing them.
+- Any edits to `litebox` crate itself.
+- Full macOS parity (kernel APIs, Objective-C runtime, GUI stacks, arm64 Mach-O).
+- Platform changes.
 
 ---
 
-## Design Direction
+## Design Principles for This Phase
 
-Adopt the same high-level model LiteBox already uses for Linux ELF dynamic binaries:
-- Parse executable metadata to discover the runtime linker.
-- Load main image first, then load runtime linker image.
-- Transfer control to linker entry point.
-- Keep seccomp interception as the syscall capture mechanism.
+1. **BSD-first implementation**
+   - Implement in:
+     - `litebox_common_bsd`
+     - `litebox_shim_bsd`
+     - `litebox_runner_macos_on_linux_userland`
+   - Linux path is reference-only; do not modify it.
 
-For Mach-O, this means:
-- Main executable and `dyld` are both guest images.
-- `dyld` performs relocation/binding for dependent dylibs.
-- LiteBox provides enough memory mapping + syscall + filesystem behavior for `dyld` and the test program to run.
+2. **Trace-driven syscall bring-up**
+   - Run target binary.
+   - Record first failing syscall and call-site context.
+   - Implement minimal correct semantics.
+   - Repeat until program works.
+
+3. **Correctness over breadth**
+   - Prefer a smaller set of accurate syscalls over broad stubs.
+   - Return macOS-appropriate negative errno values for unsupported edges.
+
+4. **Debuggability first**
+   - Add actionable logs for unimplemented and malformed syscall invocations.
+   - Use gdb routinely to inspect RIP/RSP/register state at crashes.
 
 ---
 
 ## Workstreams
 
-## 1) Mach-O Parse/Load Extensions (`litebox_common_bsd`)
+## 1) Syscall Inventory and Prioritization (`litebox_common_bsd` + `litebox_shim_bsd`)
 
 ### Goals
-- Extend loader metadata beyond static-only fields so dynamic launch decisions can be made.
+- Identify the real syscall set required by Zig-built test programs and startup runtime.
 
 ### Deliverables
-- Parse and expose dynamic-link-relevant load commands:
-  - `LC_LOAD_DYLINKER` path
-  - Required dylib commands (`LC_LOAD_DYLIB`, etc.) for diagnostics/validation
-  - Entry point details (`LC_MAIN` and fallback behavior)
-- Add parsed output type(s) capturing:
-  - Main image segments
-  - Preferred load behavior (fixed vs slide-aware where needed)
-  - Runtime linker path
-- Tighten parser error taxonomy for malformed/unsupported dynamic binaries.
+- Prioritized syscall matrix with status: `missing` / `partial` / `implemented` / `validated`.
+- Initial target set likely to include (exact list validated by traces):
+  - file I/O (`open`, `open_nocancel`, `read`, `pread`, `close`, `fcntl`, `ioctl`)
+  - memory (`mmap`, `munmap`, `mprotect`)
+  - process/thread basics (`getpid`, `issetugid`, `csops`-style probes if encountered)
+  - metadata/time (`fstat`, `stat64`-like variants, `gettimeofday`, `clock_gettime` variants)
+  - signal/tls/runtime glue as required by observed startup path.
+- Expanded constant coverage in `litebox_common_bsd/src/syscall_nr.rs`.
 
 ### Notes
-- Keep parser `no_std` and avoid new dependencies unless strictly necessary.
-- Maintain compatibility with existing static path.
+- Linux shim syscall organization is a reference for structure and error mapping style only.
 
 ---
 
-## 2) Dynamic Program Loader Flow (`litebox_shim_bsd`)
+## 2) BSD Shim Syscall Handler Expansion (`litebox_shim_bsd/src/lib.rs` + modules)
 
 ### Goals
-- Introduce a two-image startup model: main Mach-O + runtime linker Mach-O.
+- Add practical syscall implementations needed for libc/runtime and simple CLI programs.
 
 ### Deliverables
-- New load path in shim loader module that:
-  1. Loads main image.
-  2. Resolves and loads linker image (`dyld`) from guest-visible filesystem path.
-  3. Sets process entrypoint to linker entrypoint (not main image entrypoint).
-- Stack/setup updates required for dynamic launch compatibility.
-- Keep existing static flow as fallback when no dynamic linker is specified.
+- Structured syscall dispatch (group related syscalls into helper modules where needed).
+- Implemented handlers with:
+  - guest pointer validation,
+  - correct return conventions,
+  - consistent errno mapping,
+  - deterministic behavior for unsupported flags/options.
+- Improved diagnostics:
+  - syscall number + key args in debug logs,
+  - one-line failure reason for unsupported semantics.
 
 ### Notes
-- Reuse Linux shim architecture patterns where applicable (`litebox_shim_linux/src/loader/elf.rs`).
-- Keep page mapping through existing `PageManager` APIs.
+- Keep behavior minimal but real (avoid fake success when state changes are required).
 
 ---
 
-## 3) Guest Filesystem Inputs for dyld + dylibs
+## 3) Runtime Filesystem and Path Behavior (`litebox_runner_macos_on_linux_userland`)
 
 ### Goals
-- Ensure runtime linker and dependent libraries are visible to the guest process.
+- Make real-program runtime inputs manageable and repeatable.
 
 ### Deliverables
-- Runner-side mechanism to provide dynamic runtime files (expected minimal option for this phase):
-  - deterministic rootfs/tar input containing executable + `dyld` + required dylibs
-- Path resolution behavior documented (e.g., where `LC_LOAD_DYLINKER` and dylib paths resolve from).
-- Clear startup errors when required runtime files are missing.
+- Runner-side conventions for runtime artifacts:
+  - executable,
+  - runtime linker (`dyld`),
+  - required dylibs.
+- Clear docs/examples for `--runtime-file` mapping strategy.
+- Helpful startup failures for missing runtime paths.
 
 ### Notes
-- Favor reusing existing LiteBox FS layers and patterns from Linux runner.
-- Keep this minimal: just enough to run dynamic Hello World.
+- Keep this lightweight for now (no large packaging framework unless needed).
 
 ---
 
-## 4) BSD Syscall Surface Expansion (minimum viable for dynamic Hello)
+## 4) Zig-Based Validation Assets (`test_binaries`)
 
 ### Goals
-- Implement the syscall subset required by `dyld` and Hello World runtime.
+- Validate with realistic binaries compiled from C/Zig source instead of hand-written assembly.
 
 ### Deliverables
-- Add syscall numbers/constants needed for dynamic path in `litebox_common_bsd::syscall_nr`.
-- Implement corresponding handlers in `litebox_shim_bsd`.
-- Improve unknown-syscall diagnostics (debug logging/tracing) to support iterative bring-up.
-
-### Expected workflow
-1. Run dynamic binary.
-2. Capture first failing syscall.
-3. Implement syscall with minimal correct semantics.
-4. Repeat until Hello World succeeds.
+- Add Zig-oriented test assets in `litebox_runner_macos_on_linux_userland/test_binaries`:
+  - at least one simple dynamically linked program,
+  - at least one program exercising file + memory + metadata syscalls.
+- Extend Makefile targets, e.g.:
+  - `build-zig-samples`
+  - `test-zig-basic`
+  - `test-zig-io`
+- Document expected toolchain invocation (host Zig cross-compiling to x86_64 macOS target).
 
 ### Notes
-- Prioritize correctness over breadth.
-- Return accurate errno-style failures for unimplemented edge cases.
+- Keep assembly tests as quick smoke checks; Zig tests become the primary integration signal.
 
 ---
 
-## 5) Validation Assets and Developer Workflow
+## 5) gdb-Centric Debug Workflow and Documentation
 
 ### Goals
-- Make dynamic Hello World bring-up reproducible.
+- Standardize failure triage for crashes and syscall bring-up.
 
 ### Deliverables
-- Add/adjust test binaries tooling in `litebox_runner_macos_on_linux_userland/test_binaries` for dynamic sample generation.
-- Add a documented run path for dynamic sample (build + run commands).
-- Add at least one automated smoke test where feasible (or scripted manual check if test harness limitations apply).
-
-### Build/quality gates
-- `cargo fmt`
-- `cargo build -p litebox_runner_macos_on_linux_userland`
-- `cargo clippy --all-targets --all-features`
-- Targeted runner invocation for dynamic sample
+- Debug playbook section in plan/docs with command patterns:
+  - run runner under gdb,
+  - capture `bt`, `info registers`, disassembly around RIP,
+  - correlate traps with shim syscall logs.
+- Suggested workflow:
+  1. Reproduce with smallest Zig binary.
+  2. Gather syscall trace / unknown syscall logs.
+  3. If crash: use gdb to identify faulting address/register contract mismatch.
+  4. Implement/fix syscall or ABI setup.
+  5. Re-run targeted test and then broader sample set.
 
 ---
 
 ## Milestones
 
-### M1: Dynamic metadata plumbing
-- Mach-O parser exposes linker path and dynamic metadata.
-- Shim can distinguish static vs dynamic executable.
+### M1: Syscall baseline map complete
+- First-pass syscall inventory from Zig samples exists.
+- Prioritized implementation order is documented.
 
-### M2: dyld launch handoff
-- Shim loads `dyld` and transfers control to linker entry.
-- Process reaches early `dyld` execution before first unsupported syscall failure.
+### M2: Runtime startup syscall minimum
+- libc/runtime initialization path reaches `main` for Zig basic sample.
+- No crash before first meaningful user code.
 
-### M3: Runtime syscall completeness for Hello World
-- Required syscall subset implemented.
-- Dynamic Hello World prints expected output.
+### M3: Real program functionality
+- Zig basic + I/O sample both complete successfully under runner.
+- Failures produce actionable logs rather than silent faults.
 
-### M4: Stabilization
-- Error messages and docs are clear.
-- Formatting/lint/build checks pass for touched crates.
+### M4: Stabilization and polish
+- Static + dynamic assembly tests still pass.
+- Zig tests are reproducible.
+- Build/lint checks for touched crates pass.
 
 ---
 
-## Primary Code Areas
+## Primary Code Areas (Next Stage)
 
-- `litebox_common_bsd/src/loader.rs`
 - `litebox_common_bsd/src/syscall_nr.rs`
 - `litebox_shim_bsd/src/lib.rs`
-- `litebox_shim_bsd/src/loader/mod.rs`
+- `litebox_shim_bsd/src/loader/mod.rs` (if ABI setup updates are needed)
 - `litebox_runner_macos_on_linux_userland/src/lib.rs`
 - `litebox_runner_macos_on_linux_userland/test_binaries/Makefile`
+- `litebox_runner_macos_on_linux_userland/test_binaries/*` (new Zig test assets)
 
-Reference patterns to mirror:
-- `litebox_common_linux/src/loader.rs` (dynamic interpreter model)
-- `litebox_shim_linux/src/loader/elf.rs` (main + interpreter loading flow)
-- `litebox_runner_linux_userland/src/lib.rs` (filesystem/runtime bootstrapping patterns)
+Reference-only (do not modify):
+- `litebox_common_linux/src/loader.rs`
+- `litebox_shim_linux/src/loader/elf.rs`
+- `litebox_runner_linux_userland/src/lib.rs`
 
 ---
 
 ## Risks and Mitigations
 
-1. **dyld behavior needs more ABI details than current stack/setup provides**
-   - Mitigation: stage bring-up with explicit diagnostics at handoff boundary.
+1. **Syscall growth becomes unbounded**
+   - Mitigation: strict Zig-test-driven prioritization; defer rare/sysadmin APIs.
 
-2. **Dynamic runtime needs files not present in minimal environment**
-   - Mitigation: define deterministic runtime bundle input and fail fast on missing paths.
+2. **ABI mismatches cause hard crashes**
+   - Mitigation: mandatory gdb triage for segfaults and explicit register-state checks.
 
-3. **Syscall surface growth may sprawl**
-   - Mitigation: strict “dynamic Hello World first” syscall prioritization and trace-driven implementation.
+3. **Errno/flag semantics drift from macOS expectations**
+   - Mitigation: centralize errno mapping and add targeted negative tests.
 
-4. **Address mapping collisions for additional images**
-   - Mitigation: reuse proven page-mapping patterns and add explicit mapping failure diagnostics.
+4. **Runtime file layout complexity**
+   - Mitigation: keep deterministic `--runtime-file` conventions and fail-fast diagnostics.
 
 ---
 
-## Definition of Done
+## Build / Validation Gates
 
-The plan is complete when all are true:
-1. `cargo build -p litebox_runner_macos_on_linux_userland` succeeds.
-2. Runner can launch a **dynamically linked** x86_64 Mach-O Hello World under Linux userland.
-3. Program prints `Hello, World!` and exits with status 0.
-4. The dynamic startup path (runtime linker + dylib inputs) is documented and reproducible.
-5. Static path remains functional.
+- `cargo fmt`
+- `cargo build -p litebox_runner_macos_on_linux_userland`
+- `cargo clippy --all-targets --all-features` (workspace-level as needed)
+- `make test-static`
+- `make test-dynamic`
+- Zig-based tests (`make test-zig-*` targets once added)
+
+---
+
+## Definition of Done (This Next Stage)
+
+This stage is complete when all are true:
+1. At least two real Zig-built macOS binaries (non-assembly) run successfully under `litebox_runner_macos_on_linux_userland`.
+2. Required syscall subset is implemented on BSD path with clear diagnostics for remaining gaps.
+3. Crash triage workflow using gdb is documented and proven on at least one failure case.
+4. Static and dynamic assembly smoke tests remain green.
+5. No Linux/common Linux/platform/litebox crates were modified for this stage.
