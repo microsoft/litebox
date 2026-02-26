@@ -804,85 +804,6 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         });
     }
 
-    const SUPPORTS_SCHEDULE_INTERRUPT: bool = true;
-
-    fn schedule_interrupt(&self, thread: Option<&Self::ThreadHandle>, delay: core::time::Duration) {
-        if delay.is_zero() {
-            return;
-        }
-
-        // Use the provided thread handle or fall back to the current thread.
-        let thread = match thread {
-            Some(t) => t.clone(),
-            None => self.current_thread(),
-        };
-
-        // Create a high-resolution waitable timer.
-        // `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` gives sub-millisecond
-        // precision regardless of the global timer resolution.
-        let timer_handle = unsafe {
-            Win32_Threading::CreateWaitableTimerExW(
-                std::ptr::null(), // no security attributes
-                std::ptr::null(), // unnamed
-                Win32_Threading::CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                Win32_Threading::TIMER_ALL_ACCESS,
-            )
-        };
-        assert!(
-            !timer_handle.is_null(),
-            "CreateWaitableTimerExW failed: {}",
-            std::io::Error::last_os_error()
-        );
-
-        // Due time is in 100 ns intervals; negative means relative.
-        let due_time_100ns: i64 = {
-            let intervals = delay.as_nanos() / 100;
-            -(i64::try_from(intervals).unwrap_or(i64::MAX))
-        };
-        let ok = unsafe {
-            Win32_Threading::SetWaitableTimer(
-                timer_handle,
-                &raw const due_time_100ns,
-                0,                // no repeat
-                None,             // no completion routine
-                std::ptr::null(), // no arg
-                0,                // don't resume from suspend
-            )
-        };
-        assert!(
-            ok != 0,
-            "SetWaitableTimer failed: {}",
-            std::io::Error::last_os_error()
-        );
-
-        // Pack the target thread handle and timer handle into a heap
-        // allocation that the callback will free.
-        let ctx = Box::into_raw(Box::new(TimerCallbackContext {
-            thread,
-            timer_handle,
-        }));
-
-        // Register a threadpool wait so the callback fires when the timer
-        // signals. `WT_EXECUTEONLYONCE` means the wait is automatically
-        // unregistered after the callback returns.
-        let mut wait_handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
-        let ok = unsafe {
-            Win32_Threading::RegisterWaitForSingleObject(
-                &raw mut wait_handle,
-                timer_handle,
-                Some(timer_callback),
-                ctx.cast(),
-                Win32_Threading::INFINITE,
-                Win32_Threading::WT_EXECUTEONLYONCE,
-            )
-        };
-        assert!(
-            ok != 0,
-            "RegisterWaitForSingleObject failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Ensure the module-wide TLS slot is allocated.
         ensure_tls_index();
@@ -891,24 +812,109 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
     }
 }
 
-/// Context passed to the timer-pool callback, carrying the target thread
-/// handle and the waitable timer handle for cleanup.
-struct TimerCallbackContext {
-    thread: ThreadHandle,
-    timer_handle: windows_sys::Win32::Foundation::HANDLE,
+impl litebox::platform::TimerProvider for WindowsUserland {
+    type TimerHandle = TimerHandle;
+
+    const SUPPORTS_TIMER: bool = true;
+
+    fn create_timer(&self, signal: litebox::shim::Signal) -> Self::TimerHandle {
+        // Shared context between the timer handle and the threadpool callback.
+        // The callback reads `thread` to know which thread to signal.
+        let ctx = Arc::new(TimerCallbackContext { signal });
+
+        // Create a threadpool timer with the callback registered up-front.
+        // The callback fires whenever the timer is armed via
+        // `SetThreadpoolTimer` and the due time elapses.
+        let tp_timer = unsafe {
+            Win32_Threading::CreateThreadpoolTimer(
+                Some(threadpool_timer_callback),
+                Arc::into_raw(ctx.clone()) as *mut c_void,
+                std::ptr::null(),
+            )
+        };
+        assert!(
+            tp_timer != 0,
+            "CreateThreadpoolTimer failed: {}",
+            std::io::Error::last_os_error()
+        );
+        TimerHandle { tp_timer, ctx }
+    }
 }
 
-/// Timer callback invoked by the threadpool when a high-resolution waitable
-/// timer fires.
+pub struct TimerHandle {
+    tp_timer: Win32_Threading::PTP_TIMER,
+    ctx: Arc<TimerCallbackContext>,
+}
+
+// Safety: PTP_TIMER is an opaque kernel handle safe to send across threads.
+unsafe impl Send for TimerHandle {}
+unsafe impl Sync for TimerHandle {}
+
+impl Drop for TimerHandle {
+    fn drop(&mut self) {
+        // Cancel any pending callback, wait for in-flight callbacks to
+        // complete, then close the threadpool timer.
+        unsafe {
+            Win32_Threading::SetThreadpoolTimer(self.tp_timer, std::ptr::null(), 0, 0);
+            Win32_Threading::WaitForThreadpoolTimerCallbacks(self.tp_timer, 1);
+            Win32_Threading::CloseThreadpoolTimer(self.tp_timer);
+        }
+        // Drop the Arc ref that was passed to CreateThreadpoolTimer.
+        // After WaitForThreadpoolTimerCallbacks + CloseThreadpoolTimer the
+        // callback will never run again, so this is safe.
+        unsafe {
+            Arc::from_raw(Arc::as_ptr(&self.ctx));
+        }
+    }
+}
+
+impl litebox::platform::TimerHandle for TimerHandle {
+    fn set_timer(&self, duration: core::time::Duration) {
+        // Due time is in 100 ns intervals; negative means relative.
+        // Pack into a FILETIME for SetThreadpoolTimer.
+        let due_time_100ns: i64 = {
+            let intervals = duration.as_nanos() / 100;
+            -(i64::try_from(intervals).unwrap_or(i64::MAX))
+        };
+        let due_time = unsafe { std::mem::transmute::<i64, FILETIME>(due_time_100ns) };
+
+        // Arm the threadpool timer. The callback registered at creation
+        // time will fire after `duration` elapses.
+        unsafe {
+            Win32_Threading::SetThreadpoolTimer(
+                self.tp_timer,
+                &raw const due_time,
+                0, // no repeat
+                0, // no window
+            );
+        }
+    }
+}
+
+/// Context shared between the `TimerHandle` and the threadpool timer callback.
+struct TimerCallbackContext {
+    signal: litebox::shim::Signal,
+}
+
+/// Threadpool timer callback registered via `CreateThreadpoolTimer`.
 ///
-/// Sets the SIGALRM bit in the target thread's `pending_host_signals`, then
-/// interrupts the thread to ensure signal-delivery code runs promptly.
-unsafe extern "system" fn timer_callback(context: *mut c_void, _timer_or_wait_fired: bool) {
-    // Safety: `context` was created via `Box::into_raw` in `schedule_interrupt`.
-    let ctx = unsafe { Box::from_raw(context.cast::<TimerCallbackContext>()) };
-    // Close the waitable timer handle now that it has fired.
-    unsafe { Win32_Foundation::CloseHandle(ctx.timer_handle) };
-    ctx.thread.deliver_signal(litebox::shim::Signal::SIGALRM);
+/// Picks an arbitrary active thread and delivers the signal. This mirrors
+/// POSIX semantics where `SIGALRM` is process-directed — any thread may
+/// handle it.
+unsafe extern "system" fn threadpool_timer_callback(
+    _instance: Win32_Threading::PTP_CALLBACK_INSTANCE,
+    context: *mut c_void,
+    _timer: Win32_Threading::PTP_TIMER,
+) {
+    // Safety: `context` is an `Arc<TimerCallbackContext>` that was turned into
+    // a raw pointer via `Arc::into_raw` in `create_timer`.
+    let ctx = unsafe { Arc::from_raw(context.cast::<TimerCallbackContext>()) };
+    let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
+    if let Some(thread) = thread {
+        thread.deliver_signal(ctx.signal);
+    }
+    // Don't drop the Arc, since the timer may fire again and we need the context to still be valid.
+    let _ = Arc::into_raw(ctx);
 }
 
 /// Console control handler registered via `SetConsoleCtrlHandler`.

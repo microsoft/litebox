@@ -15,13 +15,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
-use litebox::platform::RawMutPointer as _;
 use litebox::platform::ThreadProvider;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
     ThreadLocalStorageProvider as _,
 };
+use litebox::platform::{RawMutPointer as _, TimerHandle, TimerProvider};
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
@@ -127,8 +127,12 @@ pub(crate) struct Process {
     pub(crate) limits: ResourceLimits,
     /// Process-wide alarm timer deadline. When this instant passes, SIGALRM is
     /// delivered to an arbitrary thread in the process.
-    pub(crate) alarm_deadline:
-        Mutex<Platform, Option<<Platform as litebox::platform::TimeProvider>::Instant>>,
+    pub(crate) alarm_timer: Mutex<Platform, Option<Alarm>>,
+}
+
+pub(crate) struct Alarm {
+    pub(crate) handle: <Platform as litebox::platform::TimerProvider>::TimerHandle,
+    pub(crate) deadline: <Platform as litebox::platform::TimeProvider>::Instant,
 }
 
 /// The locked portion of the process state.
@@ -164,7 +168,7 @@ impl Process {
                 threads: BTreeMap::from_iter([(pid, remote)]),
             }),
             limits: ResourceLimits::default(),
-            alarm_deadline: Mutex::new(None),
+            alarm_timer: Mutex::new(None),
         }
     }
 
@@ -1156,14 +1160,14 @@ impl<FS: ShimFS> Task<FS> {
     /// was set.
     ///
     /// The alarm is per-process: all threads share the same alarm timer.
-    pub(crate) fn sys_alarm(&self, seconds: u32) -> u32 {
+    pub(crate) fn sys_alarm(&self, seconds: u32) -> Result<u32, Errno> {
+        let mut alarm = self.process().alarm_timer.lock();
+        let old_alarm = alarm.take();
         let now = self.global.platform.now();
-        let mut alarm = self.process().alarm_deadline.lock();
-
         // Get remaining seconds from any previous alarm (rounded up per Linux semantics).
-        let remaining = match *alarm {
-            Some(deadline) => {
-                match deadline.checked_duration_since(&now) {
+        let (remaining, handle) = match old_alarm {
+            Some(alarm) => {
+                let remain = match alarm.deadline.checked_duration_since(&now) {
                     Some(dur) if !dur.is_zero() => {
                         let secs = dur.as_secs();
                         let extra = u64::from(dur.subsec_nanos() > 0);
@@ -1171,25 +1175,35 @@ impl<FS: ShimFS> Task<FS> {
                         u32::try_from(secs + extra).unwrap_or(u32::MAX)
                     }
                     _ => 0, // Deadline already passed or is now.
-                }
+                };
+                (remain, Some(alarm.handle))
             }
-            None => 0,
+            None => (0, None),
         };
 
         // Set new alarm or cancel.
-        if seconds > 0 {
+        let new_alarm = if seconds > 0 {
             let delay = Duration::from_secs(u64::from(seconds));
-            *alarm = now.checked_add(delay);
-
-            // Schedule a platform-level timer to interrupt a thread
-            // when the alarm fires, ensuring SIGALRM delivery even if the
-            // guest is executing in userspace.
-            self.global.platform.schedule_interrupt(None, delay);
+            let new_deadline = now.checked_add(delay).ok_or(Errno::EINVAL)?;
+            let handle = match handle {
+                Some(handle) => handle,
+                None => self
+                    .global
+                    .platform
+                    .create_timer(litebox::shim::Signal::SIGALRM),
+            };
+            let new_alarm = Alarm {
+                handle,
+                deadline: new_deadline,
+            };
+            new_alarm.handle.set_timer(delay);
+            Some(new_alarm)
         } else {
-            *alarm = None;
-        }
+            None
+        };
+        *alarm = new_alarm;
 
-        remaining
+        Ok(remaining)
     }
 
     /// Handle syscall `getpid`.
@@ -1665,7 +1679,7 @@ mod tests {
         let task = crate::syscalls::tests::init_platform(None);
         <litebox_platform_multiplex::Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             // Set a 1-second alarm.
-            assert_eq!(task.sys_alarm(1), 0);
+            assert_eq!(task.sys_alarm(1).unwrap(), 0);
 
             // Block in a nanosleep longer than the alarm
             let mut remain = Timespec {
@@ -1697,7 +1711,7 @@ mod tests {
             );
 
             // The alarm should be consumed (deadline cleared).
-            let remaining = task.sys_alarm(0);
+            let remaining = task.sys_alarm(0).unwrap();
             assert_eq!(remaining, 0, "alarm should have been cleared by check");
         });
     }
@@ -1710,9 +1724,9 @@ mod tests {
 
         let task = crate::syscalls::tests::init_platform(None);
         <litebox_platform_multiplex::Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
-            assert_eq!(task.sys_alarm(1), 0);
+            assert_eq!(task.sys_alarm(1).unwrap(), 0);
             // Cancel before it fires.
-            let remaining = task.sys_alarm(0);
+            let remaining = task.sys_alarm(0).unwrap();
             assert!(remaining >= 1, "alarm should still have had time remaining");
 
             // A short nanosleep past the original deadline should complete
@@ -1764,7 +1778,7 @@ mod tests {
             .expect("rt_sigaction failed");
 
             // Set a 1-second alarm and block in a short nanosleep.
-            assert_eq!(task.sys_alarm(1), 0);
+            assert_eq!(task.sys_alarm(1).unwrap(), 0);
             let mut request = Timespec {
                 tv_sec: 3,
                 tv_nsec: 0,

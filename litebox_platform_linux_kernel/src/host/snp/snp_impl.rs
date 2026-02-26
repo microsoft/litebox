@@ -268,6 +268,14 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     }
 }
 
+impl litebox::platform::TimerProvider for SnpLinuxKernel {
+    type TimerHandle = litebox::platform::trivial_providers::StubTimerHandle;
+
+    fn create_timer(&self, _signal: litebox::shim::Signal) -> Self::TimerHandle {
+        todo!("TimerProvider not yet implemented for SnpLinuxKernel")
+    }
+}
+
 impl bindings::SnpVmplRequestArgs {
     #[inline]
     fn new_request(code: u32, size: u32, args: ArgsArray) -> Self {

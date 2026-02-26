@@ -96,24 +96,6 @@ pub trait ThreadProvider: RawPointerProvider {
     /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
     fn interrupt_thread(&self, thread: &Self::ThreadHandle);
 
-    /// Similar to [`interrupt_thread`], but allows for a `delay` before the interrupt
-    /// takes effect.
-    ///
-    /// If `thread` is `Some`, the interrupt targets that specific thread.
-    /// Otherwise, the platform chooses the target.
-    ///
-    /// Platforms that support this operation should override this and set
-    /// [`SUPPORTS_SCHEDULE_INTERRUPT`](Self::SUPPORTS_SCHEDULE_INTERRUPT)
-    /// to `true`.
-    ///
-    /// [`interrupt_thread`]: Self::interrupt_thread
-    #[allow(unused_variables, reason = "no-op by default")]
-    fn schedule_interrupt(&self, thread: Option<&Self::ThreadHandle>, delay: core::time::Duration) {
-    }
-
-    /// Whether this platform implements [`schedule_interrupt`](Self::schedule_interrupt).
-    const SUPPORTS_SCHEDULE_INTERRUPT: bool = false;
-
     /// Runs `f` on the current thread after performing any platform-specific
     /// thread registration needed for [`current_thread`](Self::current_thread)
     /// and related functionality to work.
@@ -126,6 +108,35 @@ pub trait ThreadProvider: RawPointerProvider {
     /// Platforms that require explicit thread registration should override this.
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         f()
+    }
+}
+
+/// Timer support for proactive signal delivery.
+///
+/// Platforms that can schedule asynchronous callbacks (e.g., POSIX `setitimer`,
+/// Windows threadpool timers) should set [`SUPPORTS_TIMER`](Self::SUPPORTS_TIMER)
+/// to `true`.
+pub trait TimerProvider {
+    /// The platform-specific timer handle type.
+    type TimerHandle: TimerHandle;
+
+    /// Whether this platform supports [`TimerProvider`] for proactive timer delivery.
+    const SUPPORTS_TIMER: bool = false;
+
+    /// Create a new one-shot timer that delivers `signal` when it fires.
+    fn create_timer(&self, signal: crate::shim::Signal) -> Self::TimerHandle;
+}
+
+/// A handle to a platform timer created by [`TimerProvider::create_timer`].
+pub trait TimerHandle {
+    /// Arm (or re-arm) the timer to fire after `duration` elapses.
+    ///
+    /// If the timer is already armed, the previous deadline is replaced.
+    /// A zero duration cancels the timer without firing.
+    fn set_timer(&self, duration: core::time::Duration);
+
+    fn cancel_timer(&self) {
+        self.set_timer(core::time::Duration::from_secs(0));
     }
 }
 
