@@ -41,13 +41,19 @@ pub trait MemoryProvider {
     /// The caller must ensure that the memory range is valid and not used by any others.
     unsafe fn mem_fill_pages(start: usize, size: usize);
 
-    /// Obtain physical address (PA) of a page given its VA
-    fn va_to_pa(va: VirtAddr) -> PhysAddr {
+    /// Obtain physical address (PA) of a page given its direct-map VA.
+    ///
+    /// The direct map covers all physical memory via `VA = PA + GVA_OFFSET`.
+    /// Use this for VTL0 / external physical memory.
+    fn va_to_pa_direct(va: VirtAddr) -> PhysAddr {
         PhysAddr::new_truncate(va - Self::GVA_OFFSET)
     }
 
-    /// Obtain virtual address (VA) of a page given its PA
-    fn pa_to_va(pa: PhysAddr) -> VirtAddr {
+    /// Obtain the direct-map virtual address (VA) of a page given its PA.
+    ///
+    /// The direct map covers all physical memory via `VA = PA + GVA_OFFSET`.
+    /// Use this for VTL0 / external physical memory.
+    fn pa_to_va_direct(pa: PhysAddr) -> VirtAddr {
         let pa = pa.as_u64() & !Self::PRIVATE_PTE_MASK;
         let va = VirtAddr::new_truncate(pa + Self::GVA_OFFSET.as_u64());
         #[cfg(feature = "optee_syscall")]
@@ -56,6 +62,20 @@ pub trait MemoryProvider {
             "VA {va:#x} is out of range for direct mapping"
         );
         va
+    }
+
+    /// Obtain physical address (PA) of a page given its kernel VA.
+    ///
+    /// The VTL1 kernel region maps kernel memory via `VA = PA + KERNEL_OFFSET`.
+    fn va_to_pa(va: VirtAddr) -> PhysAddr {
+        PhysAddr::new_truncate(va.as_u64() - crate::KERNEL_OFFSET)
+    }
+
+    /// Obtain the kernel virtual address (VA) of a page given its PA.
+    ///
+    /// The VTL1 kernel region maps kernel memory via `VA = PA + KERNEL_OFFSET`.
+    fn pa_to_va(pa: PhysAddr) -> VirtAddr {
+        VirtAddr::new_truncate(pa.as_u64() + crate::KERNEL_OFFSET)
     }
 
     /// Set physical address as private via mask.

@@ -85,10 +85,17 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 // VTL1 virtual address space layout (4-level paging, canonical range)
 //
 // High canonical half (0xFFFF_8000_0000_0000 .. 0xFFFF_FFFF_FFFF_FFFF):
-//  0xFFFF_CFFF_FFFF_F000  ┌─────────────────────────────────┐ ← VMAP_END
-//                         │ vmap region  (~16 TiB)          │
+//  0xFFFF_FFFF_FFFF_FFFF  ┌─────────────────────────────────┐
+//                         │ VTL1 kernel region (~30 TiB)    │
+//                         │ VA = PA + KERNEL_OFFSET         │
+//  0xFFFF_E200_0000_0000  ├─────────────────────────────────┤ ← KERNEL_START
+//                         │ guard gap (1 TiB)               │
+//  0xFFFF_E0FF_FFFF_F000  ├─────────────────────────────────┤ ← VMAP_END
+//                         │ vmap region (32 TiB)            │
 //                         │ non-contiguous PA→VA mappings   │
-//  0xFFFF_C000_0000_0000  ├─────────────────────────────────┤ ← VMAP_START
+//  0xFFFF_C100_0000_0000  ├─────────────────────────────────┤ ← VMAP_START
+//                         │ guard gap (1 TiB)               │
+//  0xFFFF_C000_0000_0000  ├─────────────────────────────────┤
 //                         │ Direct map region (64 TiB)      │
 //                         │ VA = PA + GVA_OFFSET            │
 //                         │ VTL1 memory always mapped;      │
@@ -106,20 +113,31 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 //
 // The 64 TiB direct map reservation ensures that any physical address
 // up to 64 TiB can be mapped via the simple PA + GVA_OFFSET formula
-// without colliding with the vmap region.
+// without colliding with the vmap region. A 1 TiB guard gap between
+// the direct map and the vmap region catches stray accesses.
+//
+// The VTL1 kernel region at the top of the address space maps the
+// entire VTL1 kernel via PA + KERNEL_OFFSET. A 1 TiB guard gap
+// separates it from the vmap region.
 
 /// Offset added to any physical address to obtain the corresponding kernel
 /// virtual address in the high-canonical direct map.
 pub const GVA_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
 /// Start of the vmap virtual address region.
-/// Placed immediately above the 64 TiB direct map reservation at
-/// GVA_OFFSET, in the high (negative) canonical address range.
-pub(crate) const VMAP_START: usize = 0xFFFF_C000_0000_0000;
+pub(crate) const VMAP_START: usize = 0xFFFF_C100_0000_0000;
 
 /// End of the vmap virtual address region (exclusive).
-/// Provides ~16 TiB of virtual address space for vmap allocations.
-pub(crate) const VMAP_END: usize = 0xFFFF_CFFF_FFFF_F000;
+/// Provides 32 TiB of virtual address space for vmap allocations.
+pub(crate) const VMAP_END: usize = 0xFFFF_E0FF_FFFF_F000;
+
+/// Start of the VTL1 kernel virtual address region.
+pub const KERNEL_START: usize = 0xFFFF_E200_0000_0000;
+
+/// Offset added to any physical address to obtain the corresponding
+/// VTL1 kernel virtual address. Analogous to `GVA_OFFSET` for the
+/// direct map, but for the VTL1 kernel region.
+pub const KERNEL_OFFSET: u64 = KERNEL_START as u64;
 
 /// Maximum virtual address (exclusive) for user-space allocations.
 /// This is the top of the low canonical half (4-level paging).
@@ -483,7 +501,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// with Data Execution Prevention (DEP).
     ///
     /// A *new* top-level (PML4) page table is allocated from the heap, populated
-    /// with a high-canonical direct mapping (`VA = PA + GVA_OFFSET`) covering the
+    /// with a high-canonical mapping (`VA = PA + KERNEL_OFFSET`) covering the
     /// entire kernel physical range, and loaded via CR3. Pages inside the kernel
     /// text section (`text_phys_start..text_phys_end`) and the Hyper-V hypercall
     /// code page are mapped executable; every other page is marked `NO_EXECUTE`.
@@ -494,7 +512,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// invoking this function:
     ///
     /// 1. **High-canonical address space**: The CPU must be executing at
-    ///    high-canonical virtual addresses (`VA >= GVA_OFFSET`). All code
+    ///    high-canonical virtual addresses (`VA >= KERNEL_OFFSET`). All code
     ///    and stack references must use relocated high-canonical pointers.
     ///
     /// 2. **ELF relocations fully applied**: All `R_X86_64_RELATIVE`
@@ -634,7 +652,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         Ok((
             self.page_table_manager
                 .current_page_table()
-                .map_phys_frame_range(frame_range, flags, None)?,
+                .map_phys_frame_range_direct(frame_range, flags, None)?,
             usize::try_from(frame_range.len()).unwrap() * PAGE_SIZE,
         ))
     }
@@ -1194,7 +1212,7 @@ pub trait HostInterface: 'static {
 
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
     // User space occupies the low canonical half (0 .. 0x0000_7FFF_FFFF_FFFF).
-    // Kernel memory lives in the high canonical half (direct map at GVA_OFFSET).
+    // Kernel memory lives in the high canonical half (at KERNEL_OFFSET).
     const TASK_ADDR_MIN: usize = USER_ADDR_MIN;
     const TASK_ADDR_MAX: usize = USER_ADDR_MAX;
 

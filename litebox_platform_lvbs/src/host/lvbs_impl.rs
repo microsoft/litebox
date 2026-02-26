@@ -53,6 +53,24 @@ mod alloc {
     }
 }
 
+#[cfg(test)]
+impl crate::mm::MemoryProvider for LvbsLinuxKernel {
+    const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
+    const PRIVATE_PTE_MASK: u64 = 0;
+
+    fn mem_allocate_pages(_order: u32) -> Option<*mut u8> {
+        unimplemented!("not used in tests")
+    }
+
+    unsafe fn mem_free_pages(_ptr: *mut u8, _order: u32) {
+        unimplemented!("not used in tests")
+    }
+
+    unsafe fn mem_fill_pages(_start: usize, _size: usize) {
+        unimplemented!("not used in tests")
+    }
+}
+
 impl LvbsLinuxKernel {
     // TODO: replace it with actual implementation (e.g., atomically increment PID/TID)
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {

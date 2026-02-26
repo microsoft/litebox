@@ -9,7 +9,8 @@ use crate::{
         instrs::{rdmsr, wrmsr},
     },
     debug_serial_println,
-    host::{hv_hypercall_page_address, per_cpu_variables::with_per_cpu_variables},
+    host::{LvbsLinuxKernel, hv_hypercall_page_address, per_cpu_variables::with_per_cpu_variables},
+    mm::MemoryProvider,
     mshv::{
         HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET, HV_HYPERCALL_REP_START_MASK,
         HV_HYPERCALL_REP_START_OFFSET, HV_HYPERCALL_RESULT_MASK, HV_HYPERCALL_VARHEAD_OFFSET,
@@ -83,10 +84,10 @@ pub fn init() -> Result<(), HypervError> {
     debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
 
     with_per_cpu_variables(|per_cpu_variables| {
-        // hv_vp_assist_page_as_u64() now returns a virtual address (two-phase relocation).
-        let vp_assist_gpa = per_cpu_variables
-            .hv_vp_assist_page_as_u64()
-            .wrapping_sub(crate::GVA_OFFSET);
+        let vp_assist_gpa = LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(
+            per_cpu_variables.hv_vp_assist_page_as_u64(),
+        ))
+        .as_u64();
         wrmsr(
             HV_X64_MSR_VP_ASSIST_PAGE,
             vp_assist_gpa | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
@@ -119,8 +120,11 @@ pub fn init() -> Result<(), HypervError> {
         );
     }
 
-    // hv_hypercall_page_address() now returns a virtual address (two-phase relocation).
-    let hvcall_gpa = hv_hypercall_page_address().wrapping_sub(crate::GVA_OFFSET);
+    // `hv_hypercall_page_address()` returns different values depending on the relocation phase
+    // because it reads a linker symbol. At this point two-phase relocation is complete, so it
+    // returns a VTL1 kernel VA.
+    let hvcall_gpa =
+        LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(hv_hypercall_page_address())).as_u64();
     wrmsr(
         HV_X64_MSR_HYPERCALL,
         hvcall_gpa | u64::from(HV_X64_MSR_HYPERCALL_ENABLE),
@@ -130,10 +134,10 @@ pub fn init() -> Result<(), HypervError> {
     }
 
     with_per_cpu_variables(|per_cpu_variables| {
-        // hv_simp_page_as_u64() now returns a virtual address (two-phase relocation).
-        let simp_gpa = per_cpu_variables
-            .hv_simp_page_as_u64()
-            .wrapping_sub(crate::GVA_OFFSET);
+        let simp_gpa = LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(
+            per_cpu_variables.hv_simp_page_as_u64(),
+        ))
+        .as_u64();
         wrmsr(
             HV_X64_MSR_SIMP,
             simp_gpa | u64::from(HV_X64_MSR_SIMP_ENABLE),
@@ -173,9 +177,10 @@ pub fn hv_result_success(status: u64) -> bool {
     hv_result(status) == HV_STATUS_SUCCESS
 }
 
-/// Convert a guest virtual address pointer to a Guest Physical Address (GPA)
+/// Convert a VTL1 kernel pointer to a Guest Physical Address (GPA)
 /// for use in hypercall input/output parameters.
 ///
+/// The pointer must be in the VTL1 kernel VA region (`PA + KERNEL_OFFSET`).
 /// Null pointers are preserved as-is (the hypervisor ignores null GPA
 /// pointers when there are no input/output parameters).
 #[inline]
@@ -184,7 +189,7 @@ fn ptr_to_gpa(ptr: *const core::ffi::c_void) -> u64 {
     if va == 0 {
         0
     } else {
-        va.wrapping_sub(crate::GVA_OFFSET)
+        LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(va)).as_u64()
     }
 }
 

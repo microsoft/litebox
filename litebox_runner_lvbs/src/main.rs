@@ -30,8 +30,8 @@ struct Elf64Rela {
 
 const R_X86_64_RELATIVE: u64 = 8;
 
-/// GVA_OFFSET: the offset added to PA to get the kernel VA.
-const GVA_OFFSET: u64 = litebox_platform_lvbs::GVA_OFFSET;
+/// KERNEL_OFFSET: the offset added to PA to get the VTL1 kernel VA.
+const KERNEL_OFFSET: u64 = litebox_platform_lvbs::KERNEL_OFFSET;
 
 /// Page table entry flags for Phase 1 mappings (present + writable).
 const PTE_TABLE_FLAGS: u64 = PageTableFlags::PRESENT.bits() | PageTableFlags::WRITABLE.bits();
@@ -125,7 +125,7 @@ unsafe fn apply_relocations() {
 }
 
 /// Remap VTL1 kernel pages from identity-mapped low-canonical addresses to
-/// high-canonical addresses (VA = PA + GVA_OFFSET).
+/// high-canonical addresses (VA = PA + KERNEL_OFFSET).
 ///
 /// # Two-Phase Page Table Setup
 ///
@@ -135,7 +135,7 @@ unsafe fn apply_relocations() {
 /// │                                                                     │
 /// │ VTL0 left us with an identity map: VA == PA via PML4[0].            │
 /// │ We add a HIGH-canonical mapping into the SAME PML4 so that          │
-/// │ VA = PA + 0xFFFF_8000_0000_0000 also reaches the same frames.       │
+/// │ VA = PA + KERNEL_OFFSET also reaches the same frames.               │
 /// │ Then jump to continue_boot at the high VA and fix RSP.              │
 /// │                                                                     │
 /// │ PML4 (page 2, from VTL0)                                            │
@@ -189,7 +189,7 @@ unsafe fn apply_relocations() {
 ///
 ///   PML4[0] → PDPT (page 3) → PDE (page 4) → PTE pages 5–12
 ///
-/// Because `GVA_OFFSET` is 2 MiB-aligned, adding it to a PA does not change
+/// Because `KERNEL_OFFSET` is 2 MiB-aligned, adding it to a PA does not change
 /// the PDE or PTE indices — only the PML4 and PDPT indices differ. This
 /// means the existing PTE pages can be **reused as-is** for the
 /// high-canonical mapping; we only need a new PDPT page and a new PDE page.
@@ -207,7 +207,7 @@ unsafe fn apply_relocations() {
 ///
 /// ## Algorithm
 ///
-/// 1. Compute PML4/PDPT/PDE indices from `memory_base + GVA_OFFSET`.
+/// 1. Compute PML4/PDPT/PDE indices from `memory_base + KERNEL_OFFSET`.
 /// 2. Zero and populate a PDPT page (page 16).
 /// 3. Zero and populate a PDE page (page 17) pointing to all 8 VTL0 PTE
 ///    pages 5–12 (4KB page mappings, no huge pages).
@@ -226,7 +226,7 @@ unsafe fn remap_to_high_canonical() -> ! {
     let memory_base = vtl1_mem_layout::get_memory_base_address();
 
     // Compute the high-canonical VA of the start of VTL1 memory.
-    let high_va_base = memory_base.wrapping_add(GVA_OFFSET);
+    let high_va_base = memory_base.wrapping_add(KERNEL_OFFSET);
 
     // Compute page table indices for high_va_base.
     let high_va = VirtAddr::new(high_va_base);
@@ -282,7 +282,7 @@ unsafe fn remap_to_high_canonical() -> ! {
     x86_64::instructions::tlb::flush_all();
 
     let trampoline_pa = high_canonical_trampoline as *const () as u64;
-    let trampoline_high = trampoline_pa + GVA_OFFSET;
+    let trampoline_high = trampoline_pa + KERNEL_OFFSET;
 
     unsafe {
         asm!(
@@ -301,7 +301,7 @@ unsafe fn remap_to_high_canonical() -> ! {
 unsafe extern "C" fn high_canonical_trampoline() -> ! {
     // 1. Adjust RSP from low-canonical (PA-based) to high-canonical.
     // 2. Phase 1b: Re-apply ELF relocations so every GOT slot now points to
-    //    high-canonical VAs (addend + memory_base + GVA_OFFSET).
+    //    high-canonical VAs (addend + memory_base + KERNEL_OFFSET).
     // 3. Tail-jump to _ap_start (common BSP + AP entry point).
     naked_asm!(
         "mov rax, {offset}",
@@ -309,7 +309,7 @@ unsafe extern "C" fn high_canonical_trampoline() -> ! {
         "and rsp, -16",
         "call {apply_reloc}",
         "jmp {ap_start}",
-        offset = const GVA_OFFSET,
+        offset = const KERNEL_OFFSET,
         apply_reloc = sym apply_relocations,
         ap_start = sym _ap_start,
     );
