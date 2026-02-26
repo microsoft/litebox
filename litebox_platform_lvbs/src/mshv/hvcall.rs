@@ -9,7 +9,8 @@ use crate::{
         instrs::{rdmsr, wrmsr},
     },
     debug_serial_println,
-    host::{hv_hypercall_page_address, per_cpu_variables::with_per_cpu_variables},
+    host::{LvbsLinuxKernel, hv_hypercall_page_address, per_cpu_variables::with_per_cpu_variables},
+    mm::MemoryProvider,
     mshv::{
         HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET, HV_HYPERCALL_REP_START_MASK,
         HV_HYPERCALL_REP_START_OFFSET, HV_HYPERCALL_RESULT_MASK, HV_HYPERCALL_VARHEAD_OFFSET,
@@ -83,13 +84,15 @@ pub fn init() -> Result<(), HypervError> {
     debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
 
     with_per_cpu_variables(|per_cpu_variables| {
+        let vp_assist_gpa = LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(
+            per_cpu_variables.hv_vp_assist_page_as_u64(),
+        ))
+        .as_u64();
         wrmsr(
             HV_X64_MSR_VP_ASSIST_PAGE,
-            per_cpu_variables.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
+            vp_assist_gpa | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE,
         );
-        if rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
-            == per_cpu_variables.hv_vp_assist_page_as_u64() | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE
-        {
+        if rdmsr(HV_X64_MSR_VP_ASSIST_PAGE) == vp_assist_gpa | HV_X64_MSR_VP_ASSIST_PAGE_ENABLE {
             Ok(())
         } else {
             Err(HypervError::InvalidAssistPage)
@@ -117,24 +120,29 @@ pub fn init() -> Result<(), HypervError> {
         );
     }
 
+    // `hv_hypercall_page_address()` returns different values depending on the relocation phase
+    // because it reads a linker symbol. At this point two-phase relocation is complete, so it
+    // returns a VTL1 kernel VA.
+    let hvcall_gpa =
+        LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(hv_hypercall_page_address())).as_u64();
     wrmsr(
         HV_X64_MSR_HYPERCALL,
-        hv_hypercall_page_address() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE),
+        hvcall_gpa | u64::from(HV_X64_MSR_HYPERCALL_ENABLE),
     );
-    if rdmsr(HV_X64_MSR_HYPERCALL)
-        != hv_hypercall_page_address() | u64::from(HV_X64_MSR_HYPERCALL_ENABLE)
-    {
+    if rdmsr(HV_X64_MSR_HYPERCALL) != hvcall_gpa | u64::from(HV_X64_MSR_HYPERCALL_ENABLE) {
         return Err(HypervError::InvalidHypercallPage);
     }
 
     with_per_cpu_variables(|per_cpu_variables| {
+        let simp_gpa = LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(
+            per_cpu_variables.hv_simp_page_as_u64(),
+        ))
+        .as_u64();
         wrmsr(
             HV_X64_MSR_SIMP,
-            per_cpu_variables.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE),
+            simp_gpa | u64::from(HV_X64_MSR_SIMP_ENABLE),
         );
-        if rdmsr(HV_X64_MSR_SIMP)
-            == per_cpu_variables.hv_simp_page_as_u64() | u64::from(HV_X64_MSR_SIMP_ENABLE)
-        {
+        if rdmsr(HV_X64_MSR_SIMP) == simp_gpa | u64::from(HV_X64_MSR_SIMP_ENABLE) {
             Ok(())
         } else {
             Err(HypervError::InvalidSimpPage)
@@ -169,18 +177,36 @@ pub fn hv_result_success(status: u64) -> bool {
     hv_result(status) == HV_STATUS_SUCCESS
 }
 
+/// Convert a VTL1 kernel pointer to a Guest Physical Address (GPA)
+/// for use in hypercall input/output parameters.
+///
+/// The pointer must be in the VTL1 kernel VA region (`PA + KERNEL_OFFSET`).
+/// Null pointers are preserved as-is (the hypervisor ignores null GPA
+/// pointers when there are no input/output parameters).
+#[inline]
+fn ptr_to_gpa(ptr: *const core::ffi::c_void) -> u64 {
+    let va = ptr as u64;
+    if va == 0 {
+        0
+    } else {
+        LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(va)).as_u64()
+    }
+}
+
 /// Hyper-V Hypercall using the hypercall page
 pub fn hv_do_hypercall(
     control: u64,
     input: *const core::ffi::c_void,
     output: *mut core::ffi::c_void,
 ) -> Result<u64, HypervCallError> {
+    let input_gpa = ptr_to_gpa(input);
+    let output_gpa = ptr_to_gpa(output.cast_const());
     let mut status: u64;
     unsafe {
         asm!(
             "call rax",
-            in("rax") hv_hypercall_page_address(), in("rcx") control, in("rdx") input,
-            in("r8") output, lateout("rax") status, options(nostack)
+            in("rax") hv_hypercall_page_address(), in("rcx") control, in("rdx") input_gpa,
+            in("r8") output_gpa, lateout("rax") status, options(nostack)
         );
     }
 

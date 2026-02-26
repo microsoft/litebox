@@ -208,12 +208,12 @@ fn hvcall_enable_vp_vtl(
 }
 
 unsafe extern "C" {
-    static _start: u8;
+    static _ap_start: u8;
 }
 
 #[inline]
 fn get_entry() -> u64 {
-    &raw const _start as u64
+    &raw const _ap_start as u64
 }
 
 /// Hyper-V Hypercall to initialize VTL (VTL1 for now) for a core (except core 0)
@@ -228,7 +228,11 @@ pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
         return Ok(0);
     }
 
-    let rip: u64 = get_entry() as *const () as u64;
+    // After two-phase relocation, linker symbols (`_start`, `_memory_base`, etc.)
+    // resolve to high-canonical VAs directly. The Phase 2 page table only
+    // has high-canonical mappings, so these are ready to use as-is for the
+    // AP's initial VP context.
+    let rip: u64 = get_entry();
     let rsp = get_address_of_special_page(VTL1_KERNEL_STACK_PAGE) + PAGE_SIZE as u64 - 1;
     let tss = get_address_of_special_page(VTL1_TSS_PAGE);
 
