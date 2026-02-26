@@ -88,7 +88,7 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 //  0xFFFF_FFFF_FFFF_FFFF  ┌─────────────────────────────────┐
 //                         │ VTL1 kernel region (~30 TiB)    │
 //                         │ VA = PA + KERNEL_OFFSET         │
-//  0xFFFF_E200_0000_0000  ├─────────────────────────────────┤ ← KERNEL_START
+//  0xFFFF_E200_0000_0000  ├─────────────────────────────────┤ ← KERNEL_OFFSET
 //                         │ guard gap (1 TiB)               │
 //  0xFFFF_E0FF_FFFF_F000  ├─────────────────────────────────┤ ← VMAP_END
 //                         │ vmap region (32 TiB)            │
@@ -134,13 +134,10 @@ pub(crate) const VMAP_START: usize = 0xFFFF_C100_0000_0000;
 /// Provides 32 TiB of virtual address space for vmap allocations.
 pub(crate) const VMAP_END: usize = 0xFFFF_E0FF_FFFF_F000;
 
-/// Start of the VTL1 kernel virtual address region.
-pub const KERNEL_START: usize = 0xFFFF_E200_0000_0000;
-
 /// Offset added to any physical address to obtain the corresponding
 /// VTL1 kernel virtual address. Analogous to `GVA_OFFSET` for the
 /// direct map, but for the VTL1 kernel region.
-pub const KERNEL_OFFSET: u64 = KERNEL_START as u64;
+pub const KERNEL_OFFSET: u64 = 0xFFFF_E200_0000_0000;
 
 /// Maximum virtual address (exclusive) for user-space allocations.
 /// This is the top of the low canonical half (4-level paging).

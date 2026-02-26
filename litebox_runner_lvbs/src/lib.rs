@@ -71,7 +71,9 @@ pub fn init() -> Option<&'static Platform> {
                 Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
             }
             debug_serial_println!(
-                "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
+                "heap: seed init region (pages {}..+{:#x}): VA {:#x}, size {:#x}",
+                VTL1_INIT_HEAP_START_PAGE,
+                mem_fill_size,
                 mem_fill_start,
                 mem_fill_size
             );
@@ -96,7 +98,7 @@ pub fn init() -> Option<&'static Platform> {
                 Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
             }
             debug_serial_println!(
-                "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
+                "heap: add pre-populated region (_heap_start..Phase 1 end): VA {:#x}, size {:#x}",
                 mem_fill_start,
                 mem_fill_size
             );
@@ -121,7 +123,7 @@ pub fn init() -> Option<&'static Platform> {
                     Platform::mem_fill_pages(rela_virt, rela_size);
                 }
                 debug_serial_println!(
-                    "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
+                    "heap: reclaim .rela.dyn section: VA {:#x}, size {:#x}",
                     rela_virt,
                     rela_size
                 );
@@ -147,12 +149,14 @@ pub fn init() -> Option<&'static Platform> {
                     Platform::mem_fill_pages(early_pt_start, early_pt_size);
                 }
                 debug_serial_println!(
-                    "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
+                    "heap: reclaim early page table frames (pages {}..{}): VA {:#x}, size {:#x}",
+                    VTL1_PML4E_PAGE,
+                    VTL1_PML4E_PAGE + (early_pt_size / PAGE_SIZE),
                     early_pt_start,
                     early_pt_size
                 );
 
-                // Reclaim Phase 1 PDPT and PDE pages (pages 16–17)
+                // Reclaim Phase 1 PDPT and PDE pages
                 let remap_pt_pa = vtl1_start + (VTL1_REMAP_PDPT_PAGE * PAGE_SIZE) as u64;
                 let remap_pt_start: usize =
                     TruncateExt::<usize>::truncate(Platform::pa_to_va(remap_pt_pa).as_u64());
@@ -162,7 +166,9 @@ pub fn init() -> Option<&'static Platform> {
                     Platform::mem_fill_pages(remap_pt_start, remap_pt_size);
                 }
                 debug_serial_println!(
-                    "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
+                    "heap: reclaim Phase 1 remap PT frames (pages {}..{}): VA {:#x}, size {:#x}",
+                    VTL1_REMAP_PDPT_PAGE,
+                    VTL1_REMAP_PDE_PAGE + 1,
                     remap_pt_start,
                     remap_pt_size
                 );
@@ -177,7 +183,7 @@ pub fn init() -> Option<&'static Platform> {
                 Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
             }
             debug_serial_println!(
-                "adding a range of memory to the global allocator: start = {:#x}, size = {:#x}",
+                "heap: add remaining VTL1 memory (post Phase 2): VA {:#x}, size {:#x}",
                 mem_fill_start,
                 mem_fill_size
             );
