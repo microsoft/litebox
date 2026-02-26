@@ -1085,43 +1085,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         thread.interrupt();
     }
 
-    const SUPPORTS_SCHEDULE_INTERRUPT: bool = true;
-
-    fn schedule_interrupt(&self, thread: Option<&Self::ThreadHandle>, delay: std::time::Duration) {
-        if delay.is_zero() {
-            return;
-        }
-
-        if thread.is_some() {
-            unimplemented!("targeted interrupts are not implemented yet");
-        }
-
-        // Arm a one-shot timer. When it fires, the kernel delivers
-        // SIGALRM to a guest thread (non-guest threads should block SIGALRM), and
-        // `interrupt_signal_handler` re-enters the shim via `interrupt_callback`.
-        let secs = delay.as_secs().cast_signed();
-        let usecs = libc::suseconds_t::from(delay.subsec_micros().cast_signed());
-        let itimer = libc::itimerval {
-            it_interval: libc::timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            },
-            it_value: libc::timeval {
-                tv_sec: secs.truncate(),
-                tv_usec: usecs,
-            },
-        };
-        // Safety: setitimer with valid arguments is safe.
-        unsafe {
-            libc::syscall(
-                libc::SYS_setitimer,
-                libc::ITIMER_REAL,
-                &raw const itimer,
-                std::ptr::null_mut::<libc::itimerval>(),
-            );
-        }
-    }
-
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
         // to mirror the TLS base used in guest context, so that test threads can use the
@@ -1148,6 +1111,83 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         }
 
         ThreadHandle::run_with_handle(f)
+    }
+}
+
+impl litebox::platform::TimerProvider for LinuxUserland {
+    type TimerHandle = ITimerHandle;
+
+    const SUPPORTS_TIMER: bool = true;
+
+    fn create_timer(&self, signal: litebox::shim::Signal) -> Self::TimerHandle {
+        // TODO: support signals other than SIGALRM once we register handlers
+        // for them.
+        assert_eq!(
+            signal,
+            litebox::shim::Signal::SIGALRM,
+            "only SIGALRM is currently supported; register a handler for the \
+             requested signal before removing this assertion"
+        );
+
+        // Create a POSIX per-process timer that delivers the requested signal
+        // when it fires.  Unlike `setitimer(ITIMER_REAL)`, `timer_create`
+        // supports multiple independent timers.
+        let mut sev: libc::sigevent = unsafe { core::mem::zeroed() };
+        sev.sigev_notify = libc::SIGEV_SIGNAL;
+        sev.sigev_signo = signal.as_raw().cast_signed();
+
+        let mut timer_id: libc::timer_t = std::ptr::null_mut();
+        let ret =
+            unsafe { libc::timer_create(libc::CLOCK_MONOTONIC, &raw mut sev, &raw mut timer_id) };
+        assert!(
+            ret == 0,
+            "timer_create failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        ITimerHandle(timer_id)
+    }
+}
+
+/// A timer handle backed by POSIX `timer_create` / `timer_settime`.
+///
+/// Each handle owns an independent kernel timer, so multiple timers can
+/// coexist without interfering with each other.
+pub struct ITimerHandle(libc::timer_t);
+
+// Safety: `timer_t` is an opaque kernel handle safe to send across threads.
+unsafe impl Send for ITimerHandle {}
+// Safety: `timer_settime` is thread-safe for a given timer.
+unsafe impl Sync for ITimerHandle {}
+
+impl Drop for ITimerHandle {
+    fn drop(&mut self) {
+        // Safety: we own the timer and it will not be used after drop.
+        unsafe {
+            libc::timer_delete(self.0);
+        }
+    }
+}
+
+impl litebox::platform::TimerHandle for ITimerHandle {
+    fn set_timer(&self, duration: core::time::Duration) {
+        let its = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: duration.as_secs().cast_signed(),
+                tv_nsec: duration.subsec_nanos().cast_signed().into(),
+            },
+        };
+        // Safety: valid timer id and itimerspec.
+        let ret = unsafe { libc::timer_settime(self.0, 0, &raw const its, std::ptr::null_mut()) };
+        assert!(
+            ret == 0,
+            "timer_settime failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
