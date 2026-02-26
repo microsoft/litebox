@@ -1,0 +1,13 @@
+[package]
+name = "litebox_common_bsd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+litebox = { path = "../litebox", version = "0.1.0" }
+object = { version = "0.36", default-features = false, features = ["macho", "read_core"] }
+thiserror = { version = "2.0", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[lints]
+workspace = true

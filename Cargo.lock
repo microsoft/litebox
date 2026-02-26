@@ -806,6 +806,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_common_bsd"
+version = "0.1.0"
+dependencies = [
+ "litebox",
+ "object",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_common_linux"
 version = "0.1.0"
 dependencies = [
@@ -971,6 +981,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_macos_on_linux_userland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "litebox_common_linux",
+ "litebox_platform_linux_userland",
+ "litebox_platform_multiplex",
+ "litebox_shim_bsd",
+ "memmap2",
+]
+
+[[package]]
 name = "litebox_runner_optee_on_linux_userland"
 version = "0.1.0"
 dependencies = [
@@ -999,6 +1022,17 @@ dependencies = [
  "litebox_platform_linux_kernel",
  "litebox_platform_multiplex",
  "litebox_shim_linux",
+]
+
+[[package]]
+name = "litebox_shim_bsd"
+version = "0.1.0"
+dependencies = [
+ "litebox",
+ "litebox_common_bsd",
+ "litebox_common_linux",
+ "litebox_platform_multiplex",
+ "thiserror",
 ]
 
 [[package]]
