@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 ///
 /// - **Growable** ([`new`](Self::new) / [`with_max_capacity`](Self::with_max_capacity)):
 ///   bitmap starts empty and grows one word (64 IDs) at a time up to the
-///   specified cap (default [`DEFAULT_MAX_CAP`]).
+///   specified cap (default 65536).
 ///   [`allocate`](Self::allocate) returns `None` when all slots within the
 ///   cap are in use.
 /// - **Fixed-capacity** ([`with_capacity`](Self::with_capacity)): bitmap is
@@ -61,7 +61,7 @@ impl IdPool {
     /// Create an empty, growable pool.
     ///
     /// The bitmap starts empty and grows one word (64 IDs) at a time as
-    /// needed, up to [`DEFAULT_MAX_CAP`] IDs.
+    /// needed, up to `DEFAULT_MAX_CAP` (65536) IDs.
     #[must_use]
     pub const fn new() -> Self {
         Self::with_max_capacity(DEFAULT_MAX_CAP)
