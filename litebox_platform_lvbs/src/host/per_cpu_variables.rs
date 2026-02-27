@@ -4,13 +4,11 @@
 //! Per-CPU VTL1 kernel variables
 
 use crate::{
-    arch::{MAX_CORES, gdt, get_core_id, instrs::rdmsr},
+    arch::{MAX_CORES, gdt, instrs::rdmsr},
     host::bootparam::get_num_possible_cpus,
     mshv::{
-        HV_REGISTER_VP_INDEX, HvMessagePage, HvVpAssistPage,
-        vsm::{ControlRegMap, NUM_CONTROL_REGS},
-        vtl_switch::VtlState,
-        vtl1_mem_layout::PAGE_SIZE,
+        HV_REGISTER_VP_INDEX, HvMessagePage, HvVpAssistPage, vsm::ControlRegMap,
+        vtl_switch::VtlState, vtl1_mem_layout::PAGE_SIZE,
     },
 };
 use aligned_vec::avec;
@@ -165,42 +163,6 @@ impl PerCpuVariables {
         pcv_asm.set_vtl1_xsave_mask(vtl1_xsave_mask);
     }
 }
-
-/// per-CPU variables for core 0 (or BSP). This must use static memory because kernel heap is not ready.
-static mut BSP_VARIABLES: PerCpuVariables = PerCpuVariables {
-    hv_vp_assist_page: [0u8; PAGE_SIZE],
-    hv_simp_page: [0u8; PAGE_SIZE],
-    double_fault_stack: [0u8; DOUBLE_FAULT_STACK_SIZE],
-    _guard_page_0: [0u8; PAGE_SIZE],
-    exception_stack: [0u8; EXCEPTION_STACK_SIZE],
-    kernel_stack: [0u8; KERNEL_STACK_SIZE],
-    _guard_page_1: [0u8; PAGE_SIZE],
-    hvcall_input: [0u8; PAGE_SIZE],
-    hvcall_output: [0u8; PAGE_SIZE],
-    vtl0_state: VtlState {
-        rbp: 0,
-        rax: 0,
-        rbx: 0,
-        rcx: 0,
-        rdx: 0,
-        rsi: 0,
-        rdi: 0,
-        r8: 0,
-        r9: 0,
-        r10: 0,
-        r11: 0,
-        r12: 0,
-        r13: 0,
-        r14: 0,
-        r15: 0,
-    },
-    vtl0_locked_regs: ControlRegMap {
-        entries: [(0, 0); NUM_CONTROL_REGS],
-    },
-    gdt: const { None },
-    tls: VirtAddr::zero(),
-    vp_index: u32::MAX,
-};
 
 /// Specify the layout of PerCpuVariables for Assembly area.
 ///
@@ -509,23 +471,18 @@ where
 
 /// Get or initialize a `RefCell` that contains a pointer to the current core's per-CPU variables.
 /// This `RefCell` is expected to be stored in the GS register.
+///
+/// Before calling this for the BSP, the caller must have already called
+/// [`allocate_bsp_per_cpu_variables`] to heap-allocate and register the BSP's entry.
 fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut PerCpuVariables>> {
     let gsbase = unsafe { rdgsbase() };
     if gsbase == 0 {
-        let core_id = get_core_id();
-        let refcell_wrapper = if core_id == 0 {
-            let addr = &raw mut BSP_VARIABLES;
-            unsafe {
-                PER_CPU_VARIABLE_ADDRESSES[0] = RefCellWrapper::new(addr);
-                &PER_CPU_VARIABLE_ADDRESSES[0]
-            }
-        } else {
-            assert!(
-                unsafe { PER_CPU_VARIABLE_ADDRESSES_IDX < MAX_CORES },
-                "PER_CPU_VARIABLE_ADDRESSES_IDX exceeds MAX_CORES",
-            );
-            unsafe { &PER_CPU_VARIABLE_ADDRESSES[PER_CPU_VARIABLE_ADDRESSES_IDX] }
-        };
+        assert!(
+            unsafe { PER_CPU_VARIABLE_ADDRESSES_IDX < MAX_CORES },
+            "PER_CPU_VARIABLE_ADDRESSES_IDX exceeds MAX_CORES",
+        );
+        let refcell_wrapper =
+            unsafe { &PER_CPU_VARIABLE_ADDRESSES[PER_CPU_VARIABLE_ADDRESSES_IDX] };
         unsafe {
             PER_CPU_VARIABLE_ADDRESSES_IDX += 1;
         }
@@ -552,9 +509,37 @@ fn get_or_init_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut Pe
     }
 }
 
-/// Allocate per-CPU variables in heap for all possible cores. We expect that the BSP will call
+/// Allocate the BSP's per-CPU variables on the heap.
+///
+/// Must be called **before** [`init_per_cpu_variables`] on the BSP so that the
+/// GS-based lookup finds a valid entry.  The caller must have already seeded the
+/// global heap with enough memory for a slab-backed allocation (≥ 2 MiB).
+///
+/// # Panics
+/// Panics if the heap allocation fails.
+pub fn allocate_bsp_per_cpu_variables() {
+    let mut per_cpu_variables = Box::<PerCpuVariables>::new_uninit();
+    // Safety: `PerCpuVariables` is too large for the stack, so we zero-init
+    // via `write_bytes` then fix up `vp_index` to the `u32::MAX` sentinel
+    // before calling `assume_init`.
+    let per_cpu_variables = unsafe {
+        let ptr = per_cpu_variables.as_mut_ptr();
+        ptr.write_bytes(0, 1);
+        (*ptr).vp_index = u32::MAX;
+        per_cpu_variables.assume_init()
+    };
+    unsafe {
+        PER_CPU_VARIABLE_ADDRESSES[0] = RefCellWrapper::new(Box::into_raw(per_cpu_variables));
+    }
+}
+
+/// Allocate per-CPU variables in heap for all possible AP cores. We expect that the BSP will call
 /// this function to allocate per-CPU variables for other APs because our per-CPU variables are
 /// huge such that each AP without a proper stack cannot allocate its own per-CPU variables.
+///
+/// The BSP's entry (`PER_CPU_VARIABLE_ADDRESSES[0]`) must already be populated via
+/// [`allocate_bsp_per_cpu_variables`].
+///
 /// # Panics
 /// Panics if the number of possible CPUs exceeds `MAX_CORES`
 pub fn allocate_per_cpu_variables() {
@@ -566,14 +551,13 @@ pub fn allocate_per_cpu_variables() {
         "# of possible CPUs ({num_cores}) exceeds MAX_CORES",
     );
 
-    // Allocate xsave area for BSP (core 0)
+    // Allocate xsave area for BSP
     with_per_cpu_variables_asm(|pcv_asm| {
         PerCpuVariables::allocate_xsave_area(pcv_asm);
     });
 
     // TODO: use `cpu_online_mask` to selectively allocate per-CPU variables only for online CPUs.
-    // Note. `PER_CPU_VARIABLE_ADDRESSES[0]` is expected to be already initialized to point to
-    // `BSP_VARIABLES` before calling this function by `get_or_init_refcell_of_per_cpu_variables()`.
+    // `PER_CPU_VARIABLE_ADDRESSES[0]` is already initialized by `allocate_bsp_per_cpu_variables()`.
     #[allow(clippy::needless_range_loop)]
     for i in 1..num_cores {
         let mut per_cpu_variables = Box::<PerCpuVariables>::new_uninit();

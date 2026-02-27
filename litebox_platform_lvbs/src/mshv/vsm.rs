@@ -7,7 +7,6 @@
 use crate::mshv::mem_integrity::parse_modinfo;
 use crate::mshv::ringbuffer::set_ringbuffer;
 use crate::{
-    arch::get_core_id,
     debug_serial_print, debug_serial_println,
     host::{
         bootparam::get_vtl1_memory_info,
@@ -67,9 +66,9 @@ const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
 
 static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
 
-pub(crate) fn init() {
+pub(crate) fn init(is_bsp: bool) {
     assert!(
-        !(get_core_id() == 0 && mshv_vsm_configure_partition().is_err()),
+        !(is_bsp && mshv_vsm_configure_partition().is_err()),
         "Failed to configure VSM partition"
     );
 
@@ -83,7 +82,7 @@ pub(crate) fn init() {
         "Failed to secure VTL0 configuration"
     );
 
-    if get_core_id() == 0 {
+    if is_bsp {
         if let Ok((start, size)) = get_vtl1_memory_info() {
             debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, start + size);
             if protect_physical_memory_range(
