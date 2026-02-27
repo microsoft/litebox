@@ -31,6 +31,8 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -68,8 +70,33 @@ def find_workspace_root() -> Path:
     return script_dir.parent
 
 
+UNIXBENCH_URL = "https://github.com/kdlucas/byte-unixbench/archive/refs/tags/v6.0.0.zip"
+UNIXBENCH_ZIP = "v6.0.0.zip"
+UNIXBENCH_EXTRACTED_DIR = "byte-unixbench-6.0.0"
+
+
 def find_unixbench_dir(workspace_root: Path) -> Path:
-    return workspace_root / "benchmark" / "byte-unixbench-6.0.0" / "UnixBench"
+    return workspace_root / "benchmark" / "unixbench" / UNIXBENCH_EXTRACTED_DIR / "UnixBench"
+
+
+def ensure_unixbench_downloaded(workspace_root: Path) -> None:
+    """Download and extract UnixBench if it is not already present."""
+    bench_dir = workspace_root / "benchmark" / "unixbench"
+    bench_dir.mkdir(parents=True, exist_ok=True)
+    extracted = bench_dir / UNIXBENCH_EXTRACTED_DIR
+    if extracted.exists():
+        return
+
+    zip_path = bench_dir / UNIXBENCH_ZIP
+    if not zip_path.exists():
+        print(f"Downloading UnixBench from {UNIXBENCH_URL} ...")
+        urllib.request.urlretrieve(UNIXBENCH_URL, str(zip_path))
+        print(f"Downloaded to {zip_path}")
+
+    print(f"Extracting {zip_path} ...")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(str(bench_dir))
+    print(f"Extracted to {extracted}")
 
 
 def ensure_unixbench_built(unixbench_dir: Path):
@@ -299,14 +326,9 @@ def main():
     args = parser.parse_args()
 
     workspace_root = find_workspace_root()
+    ensure_unixbench_downloaded(workspace_root)
     unixbench_dir = find_unixbench_dir(workspace_root)
     pgms_dir = unixbench_dir / "pgms"
-
-    if not unixbench_dir.exists():
-        print(f"Error: UnixBench not found at {unixbench_dir}")
-        print("Please extract the benchmark first:")
-        print(f"  cd {workspace_root / 'benchmark'} && unzip v6.0.0.zip")
-        sys.exit(1)
 
     ensure_unixbench_built(unixbench_dir)
 
