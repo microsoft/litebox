@@ -3,9 +3,7 @@
 
 //! Global Descriptor Table (GDT) and Task State Segment (TSS)
 
-use crate::host::per_cpu_variables::{
-    PerCpuVariablesAsm, with_per_cpu_variables_asm, with_per_cpu_variables_mut,
-};
+use crate::host::per_cpu_variables::with_per_cpu_variables;
 use alloc::boxed::Box;
 use x86_64::{
     PrivilegeLevel, VirtAddr,
@@ -82,10 +80,8 @@ impl Default for GdtWrapper {
 }
 
 fn setup_gdt_tss() {
-    let double_fault_stack_top =
-        with_per_cpu_variables_asm(PerCpuVariablesAsm::get_double_fault_stack_ptr);
-    let exception_stack_top =
-        with_per_cpu_variables_asm(PerCpuVariablesAsm::get_exception_stack_ptr);
+    let double_fault_stack_top = with_per_cpu_variables(|pcv| pcv.asm.get_double_fault_stack_ptr());
+    let exception_stack_top = with_per_cpu_variables(|pcv| pcv.asm.get_exception_stack_ptr());
 
     let mut tss = Box::new(AlignedTss(TaskStateSegment::new()));
     // TSS.IST1: dedicated stack for double faults
@@ -123,8 +119,8 @@ fn setup_gdt_tss() {
         load_tss(gdt.selectors.tss);
     }
 
-    with_per_cpu_variables_mut(|per_cpu_variables| {
-        per_cpu_variables.gdt = Some(gdt);
+    with_per_cpu_variables(|per_cpu_variables| {
+        per_cpu_variables.gdt.set(Some(gdt));
     });
 }
 

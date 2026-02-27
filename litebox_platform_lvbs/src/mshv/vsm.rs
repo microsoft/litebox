@@ -7,12 +7,11 @@
 use crate::mshv::mem_integrity::parse_modinfo;
 use crate::mshv::ringbuffer::set_ringbuffer;
 use crate::{
-    arch::get_core_id,
     debug_serial_print, debug_serial_println,
     host::{
         bootparam::get_vtl1_memory_info,
         linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
-        per_cpu_variables::with_per_cpu_variables_mut,
+        per_cpu_variables::with_per_cpu_variables,
     },
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
@@ -67,9 +66,9 @@ const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
 
 static CPU_ONLINE_MASK: Once<Box<CpuMask>> = Once::new();
 
-pub(crate) fn init() {
+pub(crate) fn init(is_bsp: bool) {
     assert!(
-        !(get_core_id() == 0 && mshv_vsm_configure_partition().is_err()),
+        !(is_bsp && mshv_vsm_configure_partition().is_err()),
         "Failed to configure VSM partition"
     );
 
@@ -83,7 +82,7 @@ pub(crate) fn init() {
         "Failed to secure VTL0 configuration"
     );
 
-    if get_core_id() == 0 {
+    if is_bsp {
         if let Ok((start, size)) = get_vtl1_memory_info() {
             debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, start + size);
             if protect_physical_memory_range(
@@ -1007,14 +1006,18 @@ impl ControlRegMap {
 
 #[allow(clippy::unnecessary_wraps)]
 fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
-    let reg_names = with_per_cpu_variables_mut(|per_cpu_variables| {
-        per_cpu_variables.vtl0_locked_regs.init();
-        per_cpu_variables.vtl0_locked_regs.reg_names()
+    let reg_names = with_per_cpu_variables(|per_cpu_variables| {
+        let mut regs = per_cpu_variables.vtl0_locked_regs.get();
+        regs.init();
+        per_cpu_variables.vtl0_locked_regs.set(regs);
+        regs.reg_names()
     });
     for reg_name in reg_names {
         if let Ok(value) = hvcall_get_vp_vtl0_registers(reg_name) {
-            with_per_cpu_variables_mut(|per_cpu_variables| {
-                per_cpu_variables.vtl0_locked_regs.set(reg_name, value);
+            with_per_cpu_variables(|per_cpu_variables| {
+                let mut regs = per_cpu_variables.vtl0_locked_regs.get();
+                regs.set(reg_name, value);
+                per_cpu_variables.vtl0_locked_regs.set(regs);
             });
         }
     }
