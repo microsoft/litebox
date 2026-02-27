@@ -96,6 +96,11 @@ fn mmapped_file_data(path: impl AsRef<Path>) -> Result<&'static [u8]> {
 ///
 /// Returns an error if the program path cannot be resolved, directories along the path are
 /// inaccessible, or the initial filesystem cannot be set up.
+///
+/// # Panics
+///
+/// May still panic if internal filesystem operations (e.g., in-memory mkdir/chown/open) or
+/// syscall rewriting fail unexpectedly.
 pub fn run(cli_args: CliArgs) -> Result<()> {
     if !cli_args.insert_files.is_empty() {
         unimplemented!(
@@ -117,8 +122,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .map(|path| {
                 let metadata = path.metadata()
                     .with_context(|| format!("Could not read metadata for '{}'. Ensure the path exists and is accessible.", path.display()))?;
-                let mode = litebox::fs::Mode::from_bits(metadata.st_mode())
-                    .ok_or_else(|| anyhow!("Invalid file mode bits {:#o} for '{}'", metadata.st_mode(), path.display()))?;
+                let mode = litebox::fs::Mode::from_bits_truncate(metadata.st_mode());
                 Ok((mode, metadata.st_uid()))
             })
             .collect();
@@ -256,7 +260,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // We need to get the file path before enabling seccomp
-    let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+    let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))
+        .with_context(|| format!("Could not resolve absolute path for program '{}'", &cli_args.program_and_arguments[0]))?;
     let prog_path = prog.to_str().ok_or_else(|| {
         anyhow!(
             "Could not convert program path {:?} to a string",
