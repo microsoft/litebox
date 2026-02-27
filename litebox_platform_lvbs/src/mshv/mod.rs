@@ -925,11 +925,11 @@ impl HvPendingExceptionEvent {
 #[cfg(not(test))]
 #[inline]
 pub(crate) fn is_hvcall_ready() -> bool {
-    use crate::host::per_cpu_variables::with_per_cpu_variables_asm;
+    use crate::host::per_cpu_variables::with_per_cpu_variables;
     // The VTL return address is configured only after the hypercall page
     // has been set up, so a non-zero value indicates that hypercalls are
     // available.
-    with_per_cpu_variables_asm(|pcv| pcv.get_vtl_return_addr() != 0)
+    with_per_cpu_variables(|pcv| pcv.asm.get_vtl_return_addr() != 0)
 }
 
 #[cfg(test)]

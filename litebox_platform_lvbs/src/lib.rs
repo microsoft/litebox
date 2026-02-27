@@ -2063,10 +2063,10 @@ unsafe extern "C" fn exception_handler(
             kernel_mode: true,
         }
     } else {
-        use crate::host::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables_asm};
+        use crate::host::per_cpu_variables::with_per_cpu_variables;
         use litebox::utils::TruncateExt as _;
         litebox::shim::ExceptionInfo {
-            exception: with_per_cpu_variables_asm(PerCpuVariablesAsm::get_exception),
+            exception: with_per_cpu_variables(|pcv| pcv.asm.get_exception()),
             error_code: thread_ctx.ctx.orig_rax.truncate(),
             cr2,
             kernel_mode: false,

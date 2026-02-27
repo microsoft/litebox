@@ -7,12 +7,12 @@
 
 use core::arch::{asm, naked_asm};
 use litebox_platform_lvbs::{
-    arch::{
-        enable_extended_states, enable_fsgsbase, enable_smep_smap, get_core_id, instrs::hlt_loop,
-    },
+    arch::{enable_extended_states, enable_fsgsbase, enable_smep_smap, instrs::hlt_loop},
     host::{
         bootparam::parse_boot_info,
-        per_cpu_variables::{PerCpuVariablesAsm, init_per_cpu_variables},
+        per_cpu_variables::{
+            PerCpuVariablesAsm, allocate_per_cpu_variables, init_per_cpu_variables,
+        },
     },
     mshv::vtl1_mem_layout::{self, VTL1_REMAP_PDE_PAGE, VTL1_REMAP_PDPT_PAGE},
     serial_println,
@@ -296,44 +296,61 @@ unsafe fn remap_to_high_canonical() -> ! {
 /// Trampoline executed at the high-canonical address after Phase 1 remap.
 ///
 /// Adjusts RSP from low-canonical (PA-based) to high-canonical, re-applies
-/// ELF relocations for the final link address, and tail-jumps to `_ap_start`.
+/// ELF relocations for the final link address, and tail-jumps to
+/// `common_start` with `is_bsp = true`.
 #[unsafe(naked)]
 unsafe extern "C" fn high_canonical_trampoline() -> ! {
     // 1. Adjust RSP from low-canonical (PA-based) to high-canonical.
     // 2. Phase 1b: Re-apply ELF relocations so every GOT slot now points to
     //    high-canonical VAs (addend + memory_base + KERNEL_OFFSET).
-    // 3. Tail-jump to _ap_start (common BSP + AP entry point).
+    // 3. Set edi = 1 (is_bsp = true) and tail-jump to common_start.
     naked_asm!(
         "mov rax, {offset}",
         "add rsp, rax",
         "and rsp, -16",
         "call {apply_reloc}",
-        "jmp {ap_start}",
+        "mov edi, 1",
+        "jmp {common_start}",
         offset = const KERNEL_OFFSET,
         apply_reloc = sym apply_relocations,
-        ap_start = sym _ap_start,
+        common_start = sym common_start,
     );
 }
 
-/// Common entry point for all cores after high-canonical page table setup.
-///
-/// - **BSP**: reached via `high_canonical_trampoline()` after Phase 1 remap + re-relocation
-/// - **APs**: entered directly by Hyper-V via `hvcall_enable_vp_vtl` (the VP
-///   context's RIP is set to this symbol). APs inherit the BSP's CR3 (Phase 2
-///   page table with full 128 MiB mapped), so they already run at high-canonical
-///   VAs and need no remap.
+/// AP entry point: Entered directly by Hyper-V via `hvcall_enable_vp_vtl`
+/// (the VP context's RIP is set to this symbol). APs inherit the BSP's CR3,
+/// so they already run at high-canonical VAs and need no remap.
 #[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _ap_start() -> ! {
+    unsafe { common_start(false) }
+}
+
+/// Shared boot path for BSP and AP cores.
+///
+/// When `is_bsp` is `true`, seeds the initial heap.
+unsafe extern "C" fn common_start(is_bsp: bool) -> ! {
     enable_fsgsbase();
     enable_extended_states();
+
+    if is_bsp {
+        litebox_runner_lvbs::seed_initial_heap();
+    }
+
+    // Each core heap-allocates its own PerCpuVariables and sets GSBASE
+    // to point at it (assembly fields are at GS offset 0).
+    allocate_per_cpu_variables();
+
     init_per_cpu_variables();
 
+    // Switch to the kernel stack and tail-call kernel_main with is_bsp
+    let is_bsp_u32 = u32::from(is_bsp);
     unsafe {
         asm!(
             "mov rsp, gs:[{kernel_sp_off}]",
             "call {kernel_main}",
             kernel_sp_off = const { PerCpuVariablesAsm::kernel_stack_ptr_offset() },
+            in("edi") is_bsp_u32,
             kernel_main = sym kernel_main
         );
     }
@@ -360,9 +377,8 @@ pub unsafe extern "C" fn _start() -> ! {
     }
 }
 
-unsafe extern "C" fn kernel_main() -> ! {
-    let core_id = get_core_id();
-    if core_id == 0 {
+unsafe extern "C" fn kernel_main(is_bsp: bool) -> ! {
+    if is_bsp {
         serial_println!("==============================");
         serial_println!(" Hello from LiteBox for LVBS! ");
         serial_println!("==============================");
@@ -370,7 +386,7 @@ unsafe extern "C" fn kernel_main() -> ! {
         parse_boot_info();
     }
 
-    let platform = litebox_runner_lvbs::init();
+    let platform = litebox_runner_lvbs::init(is_bsp);
 
     enable_smep_smap();
 

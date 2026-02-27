@@ -3,7 +3,7 @@
 
 use crate::{
     debug_serial_println,
-    host::per_cpu_variables::{with_per_cpu_variables, with_per_cpu_variables_mut},
+    host::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         DEFAULT_REG_PIN_MASK, HV_REGISTER_PENDING_EVENT0, HV_X64_REGISTER_APIC_BASE,
         HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER,
@@ -55,19 +55,15 @@ pub enum InterceptedRegisterName {
 /// - Failed to raise VTL0 GP fault
 /// - Intercepted write to unknown MSR/register
 pub fn vsm_handle_intercept() {
-    let simp_page = with_per_cpu_variables_mut(|per_cpu_variables| unsafe {
-        &mut *per_cpu_variables.hv_simp_page_as_mut_ptr()
-    });
+    // Extract the intercept message from the SIMP page and clear it,
+    // all within the `with_per_cpu_variables` scope.
+    let msg = with_per_cpu_variables(|pcv| pcv.take_sint_message(0));
 
-    let msg_type = simp_page.sint_message[0].header.message_type;
-    simp_page.sint_message[0].header.message_type = HvMessageType::None.into();
-    let payload = simp_page.sint_message[0].payload;
-
-    match HvMessageType::try_from(msg_type).unwrap() {
+    match HvMessageType::try_from(msg.header.message_type).unwrap() {
         HvMessageType::GpaIntercept => {
             let int_msg = unsafe {
-                let ptr = payload.as_ptr().cast::<HvMemInterceptMessage>();
-                &(*ptr) as &HvMemInterceptMessage
+                let ptr = core::ptr::addr_of!(msg.payload).cast::<HvMemInterceptMessage>();
+                &*ptr
             };
 
             let gpa = int_msg.gpa;
@@ -76,8 +72,8 @@ pub fn vsm_handle_intercept() {
         }
         HvMessageType::MsrIntercept => {
             let int_msg = unsafe {
-                let ptr = payload.as_ptr().cast::<HvMsrInterceptMessage>();
-                &(*ptr) as &HvMsrInterceptMessage
+                let ptr = core::ptr::addr_of!(msg.payload).cast::<HvMsrInterceptMessage>();
+                &*ptr
             };
 
             let msr_index = int_msg.msr;
@@ -110,8 +106,8 @@ pub fn vsm_handle_intercept() {
         }
         HvMessageType::RegisterIntercept => {
             let int_msg = unsafe {
-                let ptr = payload.as_ptr().cast::<HvInterceptMessage>();
-                &(*ptr) as &HvInterceptMessage
+                let ptr = core::ptr::addr_of!(msg.payload).cast::<HvInterceptMessage>();
+                &*ptr
             };
 
             let reg_name = int_msg.reg_name;
@@ -141,6 +137,7 @@ pub fn vsm_handle_intercept() {
             }
         }
         _ => {
+            let msg_type = msg.header.message_type;
             debug_serial_println!(
                 "VSM: Ignore unknown synthetic interrupt message type {msg_type:#x}"
             );
@@ -176,7 +173,7 @@ fn validate_and_continue_vtl0_register_write(
     int_msg_hdr: &HvInterceptMessageHeader,
 ) {
     let allowed_value = with_per_cpu_variables(|per_cpu_variables| {
-        per_cpu_variables.vtl0_locked_regs.get(reg_name)
+        per_cpu_variables.vtl0_locked_regs.get().get(reg_name)
     });
     if let Some(allowed_value) = allowed_value {
         if value & mask == allowed_value {

@@ -5,7 +5,7 @@
 
 use crate::{
     Errno, HostInterface, arch::ioport::serial_print_string,
-    host::per_cpu_variables::with_per_cpu_variables_mut,
+    host::per_cpu_variables::with_per_cpu_variables,
 };
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
@@ -87,14 +87,14 @@ impl LvbsLinuxKernel {
 
 unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
     fn get_thread_local_storage() -> *mut () {
-        let tls = with_per_cpu_variables_mut(|pcv| pcv.tls);
+        let tls = with_per_cpu_variables(|pcv| pcv.tls.get());
         tls.as_mut_ptr::<()>()
     }
 
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
-        with_per_cpu_variables_mut(|pcv| {
-            let old = pcv.tls;
-            pcv.tls = x86_64::VirtAddr::new(value as u64);
+        with_per_cpu_variables(|pcv| {
+            let old = pcv.tls.get();
+            pcv.tls.set(x86_64::VirtAddr::new(value as u64));
             old.as_u64() as *mut ()
         })
     }

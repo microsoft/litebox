@@ -5,10 +5,7 @@
 
 use crate::host::{
     hv_hypercall_page_address,
-    per_cpu_variables::{
-        PerCpuVariables, PerCpuVariablesAsm, with_per_cpu_variables, with_per_cpu_variables_asm,
-        with_per_cpu_variables_mut,
-    },
+    per_cpu_variables::{PerCpuVariables, PerCpuVariablesAsm, with_per_cpu_variables},
 };
 use crate::mshv::{
     HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets,
@@ -99,13 +96,13 @@ static VTL1_VP_MASK: AtomicVpMask = AtomicVpMask::new();
 /// Mark the current VP as executing in VTL1.
 #[inline]
 fn vtl1_vp_enter() {
-    VTL1_VP_MASK.set(with_per_cpu_variables_mut(PerCpuVariables::vp_index) as usize);
+    VTL1_VP_MASK.set(with_per_cpu_variables(PerCpuVariables::vp_index) as usize);
 }
 
 /// Remove the current VP from the VTL1 mask (it is returning to VTL0).
 #[inline]
 fn vtl1_vp_exit() {
-    VTL1_VP_MASK.clear(with_per_cpu_variables_mut(PerCpuVariables::vp_index) as usize);
+    VTL1_VP_MASK.clear(with_per_cpu_variables(PerCpuVariables::vp_index) as usize);
 }
 
 /// Return the current VTL1 VP mask for use in TLB flush hypercalls.
@@ -128,7 +125,7 @@ pub(crate) fn vtl1_vp_mask() -> [u64; HV_FLUSH_EX_VP_SET_BANKS] {
 #[cfg(not(test))]
 #[inline]
 pub(crate) fn is_only_vp_in_vtl1() -> bool {
-    VTL1_VP_MASK.is_single_vp(with_per_cpu_variables_mut(PerCpuVariables::vp_index))
+    VTL1_VP_MASK.is_single_vp(with_per_cpu_variables(PerCpuVariables::vp_index))
 }
 
 // ============================================================================
@@ -365,8 +362,8 @@ fn handle_vtl_entry() -> Option<[u64; NUM_VTLCALL_PARAMS]> {
 /// Returns `None` if the entry reason is not a valid `VtlEntryReason`.
 #[inline]
 fn get_vtl_entry_reason() -> Option<VtlEntryReason> {
-    let reason = with_per_cpu_variables(|per_cpu_variables| unsafe {
-        (*per_cpu_variables.hv_vp_assist_page_as_ptr()).vtl_entry_reason
+    let reason = with_per_cpu_variables(|per_cpu_variables| {
+        per_cpu_variables.with_vp_assist_page(|page| page.vtl_entry_reason)
     });
     VtlEntryReason::try_from(reason).ok()
 }
@@ -374,13 +371,15 @@ fn get_vtl_entry_reason() -> Option<VtlEntryReason> {
 /// Get the VTL call parameters from the saved VTL0 state.
 #[inline]
 fn get_vtlcall_params() -> [u64; NUM_VTLCALL_PARAMS] {
-    with_per_cpu_variables(|per_cpu_variables| per_cpu_variables.vtl0_state.get_vtlcall_params())
+    with_per_cpu_variables(|per_cpu_variables| {
+        per_cpu_variables.vtl0_state.get().get_vtlcall_params()
+    })
 }
 
 /// Set the VTL return value that will be returned to VTL0.
 #[inline]
 fn set_vtl_return_value(value: i64) {
-    with_per_cpu_variables_mut(|per_cpu_variables| {
+    with_per_cpu_variables(|per_cpu_variables| {
         per_cpu_variables.set_vtl_return_value(value.reinterpret_as_unsigned());
     });
 }
@@ -402,8 +401,8 @@ pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), VsmError> {
     let vtl_return_address = hvcall_page
         .checked_add(usize::from(code_page_offsets.vtl_return_offset()))
         .ok_or(VsmError::CodePageOffsetOverflow)?;
-    with_per_cpu_variables_asm(|pcv_asm| {
-        pcv_asm.set_vtl_return_addr(vtl_return_address);
+    with_per_cpu_variables(|pcv| {
+        pcv.asm.set_vtl_return_addr(vtl_return_address);
     });
     Ok(())
 }
@@ -480,7 +479,7 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
             // one buffer at a time. At this point, the CPU's tracking might rely on VTL0's
             // buffer (if VTL0 called XRSTOR). Thus, we shouldn't use XSAVEOPT until XRSTOR
             // re-establishes tracking for VTL1's buffer.
-            with_per_cpu_variables_asm(PerCpuVariablesAsm::reset_vtl1_xsaved);
+            with_per_cpu_variables(|pcv| pcv.asm.reset_vtl1_xsaved());
 
             return params;
         }
