@@ -376,6 +376,10 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     fn start_wait(&self) {
         self.waker
             .0
+            .platform
+            .on_interruptible_wait_start(self.waker);
+        self.waker
+            .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);
     }
 
@@ -384,6 +388,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         self.waker
             .0
             .set_state(ThreadState::RUNNING_IN_HOST, Ordering::Relaxed);
+        self.waker.0.platform.on_interruptible_wait_end();
     }
 
     /// Checks whether the wait should be interrupted. If not, then performs

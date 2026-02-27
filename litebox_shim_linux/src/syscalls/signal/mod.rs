@@ -36,6 +36,8 @@ use litebox_platform_multiplex::Platform;
 pub(crate) struct SignalState {
     /// Pending thread signals.
     pending: RefCell<PendingSignals>,
+    /// Pending process signals (shared across all threads).
+    shared_pending: Arc<Mutex<Platform, PendingSignals>>,
     /// Currently blocked signals.
     blocked: Cell<SigSet>,
     /// Signal handlers.
@@ -50,6 +52,7 @@ impl SignalState {
     pub fn new_process() -> Self {
         Self {
             pending: RefCell::new(PendingSignals::new()),
+            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
             blocked: Cell::new(SigSet::empty()),
             handlers: RefCell::new(Arc::new(SignalHandlers::new())),
             altstack: Cell::new(SigAltStack {
@@ -72,6 +75,8 @@ impl SignalState {
         Self {
             // Reset pending
             pending: RefCell::new(PendingSignals::new()),
+            // Share process-wide pending signals
+            shared_pending: self.shared_pending.clone(),
             // Preserve blocked
             blocked: Cell::new(self.blocked.get()),
             // Share handlers across tasks
@@ -281,7 +286,7 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
 
 /// Creates a `Siginfo` for a signal sent by a user process via `kill()`,
 /// `tkill()`, or `tgkill()`.
-fn siginfo_kill(signal: Signal) -> Siginfo {
+pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
     Siginfo {
         signo: signal.as_i32(),
         errno: 0,
@@ -527,24 +532,38 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Returns whether there are any pending signals that can be delivered.
     pub(crate) fn has_pending_signals(&self) -> bool {
-        let pending = self.signals.pending.borrow().pending & !self.signals.blocked.get();
-        !pending.is_empty()
+        let blocked = self.signals.blocked.get();
+        let thread_pending = self.signals.pending.borrow().pending & !blocked;
+        if !thread_pending.is_empty() {
+            return true;
+        }
+        let shared_pending = self.signals.shared_pending.lock().pending & !blocked;
+        !shared_pending.is_empty()
     }
 
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
         loop {
-            let mut pending = self.signals.pending.borrow_mut();
-            let Some(signal) = pending.next(self.signals.blocked.get()) else {
-                break;
+            let blocked = self.signals.blocked.get();
+            let (signal, siginfo) = {
+                let mut pending = self.signals.pending.borrow_mut();
+                if let Some(signal) = pending.next(blocked) {
+                    (signal, pending.remove(signal))
+                } else {
+                    // Then try shared pending.
+                    let mut shared = self.signals.shared_pending.lock();
+                    if let Some(signal) = shared.next(blocked) {
+                        (signal, shared.remove(signal))
+                    } else {
+                        break;
+                    }
+                }
             };
             if self.is_exiting() {
                 // Don't deliver any more signals if exiting.
                 return;
             }
 
-            let siginfo: Siginfo = pending.remove(signal);
-            drop(pending);
             let action = self.signals.handlers.borrow().inner.lock()[signal].action;
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
@@ -586,11 +605,54 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    pub(crate) fn take_pending_signals(&self, sig: litebox::shim::Signal) {
+        let signal = match sig {
+            litebox::shim::Signal::SIGALRM => litebox_common_linux::signal::Signal::SIGALRM,
+            litebox::shim::Signal::SIGINT => litebox_common_linux::signal::Signal::SIGINT,
+            _ => unimplemented!(),
+        };
+        self.send_shared_signal(signal, siginfo_kill(signal));
+    }
+
+    /// Returns whether the given signal is currently being ignored.
+    fn is_signal_ignored(&self, signal: Signal) -> bool {
+        // SIGKILL and SIGSTOP can never be ignored.
+        if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
+            return false;
+        }
+        // Blocked signals are never ignored, since the signal handler may
+        // change by the time it is unblocked.
+        if self.signals.blocked.get().contains(signal) {
+            return false;
+        }
+        let handlers = self.signals.handlers.borrow();
+        let inner = handlers.inner.lock();
+        match inner[signal].action.sigaction {
+            SIG_IGN => true,
+            SIG_DFL => matches!(signal.default_disposition(), SignalDisposition::Ignore),
+            _ => false,
+        }
+    }
+
     /// Only supports sending signals to self for now.
-    fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
+    pub(crate) fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
+        if self.is_signal_ignored(signal) {
+            return;
+        }
         self.signals
             .pending
             .borrow_mut()
+            .push(&self.process().limits, signal, siginfo);
+    }
+
+    /// Sends a process-directed signal (stored in shared_pending).
+    pub(crate) fn send_shared_signal(&self, signal: Signal, siginfo: Siginfo) {
+        if self.is_signal_ignored(signal) {
+            return;
+        }
+        self.signals
+            .shared_pending
+            .lock()
             .push(&self.process().limits, signal, siginfo);
     }
 

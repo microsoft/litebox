@@ -1508,6 +1508,8 @@ impl<FS: ShimFS> Task<FS> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_arch_prctl() {
@@ -1605,5 +1607,80 @@ mod tests {
             &long_name[..litebox_common_linux::TASK_COMM_LEN - 1],
             "prctl get_name returned unexpected comm for too long name"
         );
+    }
+
+    /// Installing a custom handler for SIGINT: a background OS thread sends
+    /// a real SIGINT via `libc::kill`, which should interrupt a blocking sleep
+    /// with `EINTR`.
+    /// Target Linux only because it use tgkill syscall to send signal to specific thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_sigint_with_custom_handler() {
+        use litebox_common_linux::signal::{SaFlags, SigAction, SigSet, Signal};
+        use litebox_common_linux::{ClockId, TimerFlags, Timespec};
+
+        let callback_addr = 0x1000usize; // dummy non-null address for the callback
+        let task = crate::syscalls::tests::init_platform(None);
+        <litebox_platform_multiplex::Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            let act = SigAction {
+                sigaction: callback_addr,
+                flags: SaFlags::RESTORER,
+                #[cfg(target_pointer_width = "64")]
+                __pad: 0,
+                restorer: 0,
+                mask: SigSet::empty(),
+            };
+            let act_ptr = crate::ConstPtr::from_ptr(&raw const act);
+            task.sys_rt_sigaction(
+                Signal::SIGINT,
+                Some(act_ptr),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .expect("rt_sigaction failed");
+
+            // Spawn a plain OS thread that sends a real SIGINT to this
+            // specific thread after a short delay, giving it time to enter nanosleep.
+            let pid = unsafe { libc::getpid() };
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+            let handle = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                // Safety: sending a signal to a thread in our own process is always valid.
+                let ret = unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGINT) };
+                assert_eq!(ret, 0, "tgkill failed");
+            });
+
+            let mut request = Timespec {
+                tv_sec: 10,
+                tv_nsec: 0,
+            };
+            let result = task.sys_clock_nanosleep(
+                ClockId::Monotonic,
+                TimerFlags::empty(),
+                litebox_common_linux::TimeParam::Timespec64(crate::MutPtr::from_ptr(
+                    &raw mut request,
+                )),
+                litebox_common_linux::TimeParam::None,
+            );
+            assert_eq!(
+                result,
+                Err(litebox_common_linux::errno::Errno::EINTR),
+                "nanosleep should be interrupted by SIGINT from background thread"
+            );
+
+            // `process_signals` is called when about to switch back to userspace, so simulate that here.
+            let mut stack = [0u8; 4096];
+            #[cfg(target_arch = "x86_64")]
+            let mut regs = litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
+            #[cfg(target_arch = "x86")]
+            let mut regs = litebox_common_linux::PtRegs { esp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
+            task.process_signals(&mut regs);
+            assert_eq!(
+                regs.get_ip(), callback_addr,
+                "after processing signals, execution should be redirected to the custom handler"
+            );
+
+            handle.join().expect("background thread panicked");
+        });
     }
 }

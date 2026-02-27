@@ -95,6 +95,33 @@ pub trait ThreadProvider: RawPointerProvider {
     /// [`EnterShim`]: crate::shim::EnterShim
     /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
     fn interrupt_thread(&self, thread: &Self::ThreadHandle);
+
+    /// Runs `f` on the current thread after performing any platform-specific
+    /// thread registration needed for [`current_thread`](Self::current_thread)
+    /// and related functionality to work.
+    ///
+    /// This is intended for test threads that do not go through the normal
+    /// [`spawn_thread`](Self::spawn_thread) / guest entry path. The platform
+    /// sets up thread state before calling `f` and tears it down afterward.
+    ///
+    /// The default implementation simply calls `f()` with no additional setup.
+    /// Platforms that require explicit thread registration should override this.
+    fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
+}
+
+/// Provider for consuming platform-originating signals.
+///
+/// Platforms can record signals (e.g., `SIGINT`) and the shim should call
+/// [`SignalProvider::take_pending_signals`] to consume them.
+pub trait SignalProvider {
+    /// Atomically take all pending asynchronous signals (e.g., SIGINT and SIGALRM)
+    /// for the current thread, passing each one to `f`.
+    ///
+    /// Platforms that support asynchronous signals should override this method.
+    #[allow(unused_variables, reason = "no-op by default")]
+    fn take_pending_signals(&self, f: impl FnMut(crate::shim::Signal)) {}
 }
 
 /// Punch through any functionality for a particular platform that is not explicitly part of the
@@ -220,6 +247,25 @@ where
 /// A provider of raw mutexes
 pub trait RawMutexProvider {
     type RawMutex: RawMutex;
+
+    /// Called when a thread enters an interruptible wait.
+    ///
+    /// The passed `waker` should live at least until the thread leaves the interruptible
+    /// wait (i.e., [`on_interruptible_wait_end`](Self::on_interruptible_wait_end) is called).
+    /// The platform can use the `waker` to wake up the thread while it is in the interruptible wait.
+    ///
+    /// This is a no-op by default.
+    #[allow(unused_variables)]
+    fn on_interruptible_wait_start(&self, waker: &crate::event::wait::Waker<Self>)
+    where
+        Self: crate::sync::RawSyncPrimitivesProvider + Sized,
+    {
+    }
+
+    /// Called when a thread leaves an interruptible wait.
+    ///
+    /// This is a no-op by default.
+    fn on_interruptible_wait_end(&self) {}
 }
 
 /// A raw mutex/lock API; expected to roughly match (or even be implemented using) a Linux futex.
