@@ -71,16 +71,15 @@ impl<FS: ShimFS> FilesState<FS> {
 }
 
 /// Path in the file system
-enum FsPath<P: path::Arg> {
+#[derive(Debug)]
+enum FsPath {
     /// Absolute path
-    Absolute { path: P },
-    /// Path is relative to `cwd`
-    CwdRelative { path: P },
+    Absolute { path: CString },
     /// Current working directory
     Cwd,
     /// Path is relative to a file descriptor
-    #[expect(dead_code, reason = "currently unused, might want to use later")]
-    FdRelative { fd: u32, path: P },
+    #[allow(dead_code)]
+    FdRelative { fd: u32, path: CString },
     /// Fd
     Fd(u32),
 }
@@ -88,26 +87,43 @@ enum FsPath<P: path::Arg> {
 /// Maximum size of a file path
 pub const PATH_MAX: usize = 4096;
 
-impl<P: path::Arg> FsPath<P> {
-    fn new(dirfd: i32, path: P) -> Result<Self, Errno> {
+impl FsPath {
+    /// Create a new `FsPath` from a dirfd and path.
+    ///
+    /// CWD-relative paths are resolved immediately to absolute paths
+    /// using the CWD obtained lazily from `get_cwd` (only called when needed).
+    fn new(
+        dirfd: i32,
+        path: impl path::Arg,
+        get_cwd: impl FnOnce() -> String,
+    ) -> Result<Self, Errno> {
         let path_str = path.as_rust_str()?;
         if path_str.len() > PATH_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
         let fs_path = if path_str.starts_with('/') {
-            FsPath::Absolute { path }
+            let cpath = CString::new(path_str.to_string()).map_err(|_| Errno::EINVAL)?;
+            FsPath::Absolute { path: cpath }
         } else if dirfd >= 0 {
             let dirfd = u32::try_from(dirfd).expect("dirfd >= 0");
             if path_str.is_empty() {
                 FsPath::Fd(dirfd)
             } else {
-                FsPath::FdRelative { fd: dirfd, path }
+                let cpath = CString::new(path_str.to_string()).map_err(|_| Errno::EINVAL)?;
+                FsPath::FdRelative {
+                    fd: dirfd,
+                    path: cpath,
+                }
             }
         } else if dirfd == litebox_common_linux::AT_FDCWD {
             if path_str.is_empty() {
                 FsPath::Cwd
             } else {
-                FsPath::CwdRelative { path }
+                // Resolve CWD-relative path to absolute.
+                let cwd = get_cwd();
+                let abs = alloc::format!("{cwd}{path_str}");
+                let cpath = CString::new(abs).map_err(|_| Errno::EINVAL)?;
+                FsPath::Absolute { path: cpath }
             }
         } else {
             return Err(Errno::EBADF);
@@ -177,12 +193,11 @@ impl<FS: ShimFS> Task<FS> {
         flags: OFlags,
         mode: Mode,
     ) -> Result<u32, Errno> {
-        let fs_path = FsPath::new(dirfd, pathname)?;
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         match fs_path {
-            FsPath::Absolute { path } | FsPath::CwdRelative { path } => {
-                self.sys_open(path, flags, mode)
-            }
-            FsPath::Cwd => self.sys_open("", flags, mode),
+            FsPath::Absolute { path } => self.sys_open(path, flags, mode),
+            FsPath::Cwd => self.sys_open(get_cwd(), flags, mode),
             FsPath::Fd(_fd) => {
                 log_unsupported!("openat with FsPath::Fd");
                 Err(Errno::EINVAL)
@@ -230,21 +245,13 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        let fs_path = FsPath::new(dirfd, pathname)?;
+        let fs_path = FsPath::new(dirfd, pathname, || self.fs.borrow().cwd.read().clone())?;
         match fs_path {
             FsPath::Absolute { path } => {
                 if flags.contains(AtFlags::AT_REMOVEDIR) {
                     self.global.fs.rmdir(path).map_err(Errno::from)
                 } else {
                     self.global.fs.unlink(path).map_err(Errno::from)
-                }
-            }
-            FsPath::CwdRelative { path } => {
-                let resolved = self.resolve_path(path)?;
-                if flags.contains(AtFlags::AT_REMOVEDIR) {
-                    self.global.fs.rmdir(resolved).map_err(Errno::from)
-                } else {
-                    self.global.fs.unlink(resolved).map_err(Errno::from)
                 }
             }
             FsPath::Cwd => Err(Errno::EINVAL),
@@ -641,6 +648,7 @@ impl<FS: ShimFS> Task<FS> {
         pathname: impl path::Arg,
         mode: litebox_common_linux::AccessFlags,
     ) -> Result<(), Errno> {
+        let pathname = self.resolve_path(pathname)?;
         let status = self.global.fs.file_status(pathname)?;
         if mode == litebox_common_linux::AccessFlags::F_OK {
             return Ok(());
@@ -697,16 +705,14 @@ impl<FS: ShimFS> Task<FS> {
         pathname: impl path::Arg,
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
-        let fspath = FsPath::new(dirfd, pathname)?;
+        let fspath = FsPath::new(dirfd, pathname, || self.fs.borrow().cwd.read().clone())?;
         let path = match fspath {
-            FsPath::Absolute { path } => self.do_readlink(path.normalized()?.as_str()),
+            FsPath::Absolute { path } => {
+                self.do_readlink(path.to_str().map_err(|_| Errno::EINVAL)?)
+            }
             FsPath::Cwd => {
                 let cwd = self.fs.borrow().cwd.read().clone();
                 self.do_readlink(&cwd)
-            }
-            FsPath::CwdRelative { path } => {
-                let resolved = self.resolve_path(path)?;
-                self.do_readlink(resolved.to_str().map_err(|_| Errno::EINVAL)?)
             }
             FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
         }?;
@@ -911,6 +917,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `stat`
     pub fn sys_stat(&self, pathname: impl path::Arg) -> Result<FileStat, Errno> {
+        let pathname = self.resolve_path(pathname)?;
         self.do_stat(pathname, true)
     }
 
@@ -920,6 +927,7 @@ impl<FS: ShimFS> Task<FS> {
     /// then it returns information about the link itself, not the file that the link refers to.
     /// TODO: we do not support symbolic links yet.
     pub fn sys_lstat(&self, pathname: impl path::Arg) -> Result<FileStat, Errno> {
+        let pathname = self.resolve_path(pathname)?;
         self.do_stat(pathname, false)
     }
 
@@ -950,16 +958,13 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let files = self.files.borrow();
-        let fs_path = FsPath::new(dirfd, pathname)?;
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         let fstat: FileStat = match fs_path {
             FsPath::Absolute { path } => {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
             }
-            FsPath::CwdRelative { path } => {
-                let resolved = self.resolve_path(path)?;
-                self.do_stat(resolved, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
-            }
-            FsPath::Cwd => self.global.fs.file_status("")?.into(),
+            FsPath::Cwd => self.global.fs.file_status(get_cwd())?.into(),
             FsPath::Fd(fd) => files
                 .file_descriptors
                 .read()
@@ -1992,5 +1997,185 @@ impl<FS: ShimFS> Task<FS> {
             |_fd| todo!("net"),
             |_fd| todo!("pipes"),
         )?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::String;
+    use litebox::fs::Mode;
+
+    extern crate std;
+
+    // ── FsPath::new tests ────────────────────────────────────────────
+
+    #[test]
+    fn fspath_absolute_ignores_cwd() {
+        // Absolute paths should never invoke the get_cwd closure.
+        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "/usr/bin", || {
+            panic!("get_cwd should not be called for absolute paths")
+        })
+        .unwrap();
+        assert!(matches!(fp, FsPath::Absolute { path } if path.to_str().unwrap() == "/usr/bin"));
+    }
+
+    #[test]
+    fn fspath_relative_resolves_with_cwd() {
+        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "foo/bar", || {
+            String::from("/home/")
+        })
+        .unwrap();
+        assert!(
+            matches!(fp, FsPath::Absolute { path } if path.to_str().unwrap() == "/home/foo/bar")
+        );
+    }
+
+    #[test]
+    fn fspath_empty_path_at_fdcwd_returns_cwd_variant() {
+        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "", || {
+            panic!("get_cwd should not be called for empty Cwd path")
+        })
+        .unwrap();
+        assert!(matches!(fp, FsPath::Cwd));
+    }
+
+    #[test]
+    fn fspath_positive_fd_empty_path_returns_fd() {
+        let fp = FsPath::new(5, "", || panic!("should not be called")).unwrap();
+        assert!(matches!(fp, FsPath::Fd(5)));
+    }
+
+    #[test]
+    fn fspath_positive_fd_with_path_returns_fd_relative() {
+        let fp = FsPath::new(3, "subdir/file.txt", || panic!("should not be called")).unwrap();
+        assert!(
+            matches!(fp, FsPath::FdRelative { fd: 3, path } if path.to_str().unwrap() == "subdir/file.txt")
+        );
+    }
+
+    #[test]
+    fn fspath_bad_dirfd_returns_ebadf() {
+        let err = FsPath::new(-1, "file.txt", || panic!("should not be called")).unwrap_err();
+        assert_eq!(err, Errno::EBADF);
+    }
+
+    #[test]
+    fn fspath_path_too_long_returns_enametoolong() {
+        let long_path = "a".repeat(PATH_MAX + 1);
+        let err = FsPath::new(litebox_common_linux::AT_FDCWD, long_path.as_str(), || {
+            String::from("/")
+        })
+        .unwrap_err();
+        assert_eq!(err, Errno::ENAMETOOLONG);
+    }
+
+    // ── sys_getcwd / sys_chdir integration tests ─────────────────────
+
+    #[test]
+    fn getcwd_default_is_root() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let mut buf = [0u8; 256];
+        let len = task.sys_getcwd(&mut buf).unwrap();
+        let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap(); // strip NUL
+        assert_eq!(cwd, "/");
+    }
+
+    #[test]
+    fn chdir_and_getcwd_round_trip() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Create a directory to chdir into.
+        task.sys_mkdir("/test_chdir_dir", 0o777).unwrap();
+
+        task.sys_chdir("/test_chdir_dir").unwrap();
+
+        let mut buf = [0u8; 256];
+        let len = task.sys_getcwd(&mut buf).unwrap();
+        let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
+        assert_eq!(cwd, "/test_chdir_dir/");
+    }
+
+    #[test]
+    fn chdir_nonexistent_returns_enoent() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let err = task.sys_chdir("/does_not_exist").unwrap_err();
+        assert_eq!(err, Errno::ENOENT);
+    }
+
+    #[test]
+    fn chdir_to_file_returns_enotdir() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Create a regular file.
+        let fd = task
+            .sys_open(
+                "/test_chdir_file",
+                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let _ = task.sys_close(i32::try_from(fd).unwrap());
+
+        let err = task.sys_chdir("/test_chdir_file").unwrap_err();
+        assert_eq!(err, Errno::ENOTDIR);
+    }
+
+    #[test]
+    fn getcwd_erange_when_buffer_too_small() {
+        let task = crate::syscalls::tests::init_platform(None);
+        // "/" + NUL = 2 bytes; a 1-byte buffer should fail.
+        let mut buf = [0u8; 1];
+        let err = task.sys_getcwd(&mut buf).unwrap_err();
+        assert_eq!(err, Errno::ERANGE);
+    }
+
+    #[test]
+    fn chdir_relative_path() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Create nested dirs: /rel_parent/rel_child
+        task.sys_mkdir("/rel_parent", 0o777).unwrap();
+        task.sys_mkdir("/rel_parent/rel_child", 0o777).unwrap();
+
+        // chdir to /rel_parent first
+        task.sys_chdir("/rel_parent").unwrap();
+
+        // Now chdir with a relative path
+        task.sys_chdir("rel_child").unwrap();
+
+        let mut buf = [0u8; 256];
+        let len = task.sys_getcwd(&mut buf).unwrap();
+        let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
+        assert_eq!(cwd, "/rel_parent/rel_child/");
+    }
+
+    #[test]
+    fn open_relative_path_after_chdir() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Create /open_cwd_dir and chdir into it.
+        task.sys_mkdir("/open_cwd_dir", 0o777).unwrap();
+        task.sys_chdir("/open_cwd_dir").unwrap();
+
+        // Create a file via relative path (should resolve against CWD).
+        let fd = task
+            .sys_open(
+                "relative_file.txt",
+                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let _ = task.sys_close(i32::try_from(fd).unwrap());
+
+        // Verify the file exists at the absolute path.
+        let fd2 = task
+            .sys_open(
+                "/open_cwd_dir/relative_file.txt",
+                litebox::fs::OFlags::RDONLY,
+                Mode::empty(),
+            )
+            .unwrap();
+        let _ = task.sys_close(i32::try_from(fd2).unwrap());
     }
 }
