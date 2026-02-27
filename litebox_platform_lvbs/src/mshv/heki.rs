@@ -7,12 +7,13 @@ use crate::{
 };
 use core::mem;
 use litebox::utils::TruncateExt;
+use modular_bitfield::Specifier;
 use num_enum::TryFromPrimitive;
 use x86_64::{
-    PhysAddr, VirtAddr,
+    PhysAddr,
     structures::paging::{PageSize, Size4KiB},
 };
-use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -43,8 +44,9 @@ pub(crate) fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
     flags
 }
 
-#[derive(Default, Debug, TryFromPrimitive, PartialEq)]
-#[repr(u64)]
+#[derive(Default, Debug, TryFromPrimitive, PartialEq, Specifier)]
+#[bits = 16]
+#[repr(u16)]
 pub enum HekiKdataType {
     SystemCerts = 0,
     RevocationCerts = 1,
@@ -53,22 +55,36 @@ pub enum HekiKdataType {
     KernelData = 4,
     PatchInfo = 5,
     KexecTrampoline = 6,
+    SymbolInfo = 7,
+    ModuleInfo = 8,
+    PermInfo = 9,
+    KexecInfo = 10,
+    DataPage = 0xff,
     #[default]
-    Unknown = 0xffff_ffff_ffff_ffff,
+    Unknown = 0xffff,
+}
+
+#[derive(Debug, TryFromPrimitive, PartialEq)]
+#[repr(u16)]
+pub enum HekiSymbolInfoType {
+    SymbolTable = 0,
+    GplSymbolTable = 1,
+    SymbolStringTable = 2,
+    Unknown = 0xffff,
 }
 
 #[derive(Default, Debug, TryFromPrimitive, PartialEq)]
-#[repr(u64)]
+#[repr(u16)]
 pub enum HekiKexecType {
     KexecImage = 0,
     KexecKernelBlob = 1,
     KexecPages = 2,
     #[default]
-    Unknown = 0xffff_ffff_ffff_ffff,
+    Unknown = 0xffff,
 }
 
 #[derive(Clone, Copy, Default, Debug, TryFromPrimitive, PartialEq)]
-#[repr(u64)]
+#[repr(u16)]
 pub enum ModMemType {
     Text = 0,
     Data = 1,
@@ -80,7 +96,7 @@ pub enum ModMemType {
     ElfBuffer = 7,
     Patch = 8,
     #[default]
-    Unknown = 0xffff_ffff_ffff_ffff,
+    Unknown = 0xffff,
 }
 
 pub(crate) fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
@@ -102,149 +118,6 @@ pub(crate) fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
     }
 
     mem_attr
-}
-
-/// `HekiRange` is a generic container for various types of memory ranges.
-/// It has an `attributes` field which can be interpreted differently based on the context like
-/// `MemAttr`, `KdataType`, `ModMemType`, or `KexecType`.
-#[derive(Default, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
-#[repr(C, packed)]
-pub struct HekiRange {
-    pub va: u64,
-    pub pa: u64,
-    pub epa: u64,
-    pub attributes: u64,
-}
-
-impl HekiRange {
-    #[inline]
-    pub fn is_aligned<U>(&self, align: U) -> bool
-    where
-        U: Into<u64> + Copy,
-    {
-        let va = self.va;
-        let pa = self.pa;
-        let epa = self.epa;
-
-        VirtAddr::new(va).is_aligned(align)
-            && PhysAddr::new(pa).is_aligned(align)
-            && PhysAddr::new(epa).is_aligned(align)
-    }
-
-    #[inline]
-    pub fn mem_attr(&self) -> Option<MemAttr> {
-        let attr = self.attributes;
-        MemAttr::from_bits(attr)
-    }
-
-    #[inline]
-    pub fn mod_mem_type(&self) -> ModMemType {
-        let attr = self.attributes;
-        ModMemType::try_from(attr).unwrap_or(ModMemType::Unknown)
-    }
-
-    #[inline]
-    pub fn heki_kdata_type(&self) -> HekiKdataType {
-        let attr = self.attributes;
-        HekiKdataType::try_from(attr).unwrap_or(HekiKdataType::Unknown)
-    }
-
-    #[inline]
-    pub fn heki_kexec_type(&self) -> HekiKexecType {
-        let attr = self.attributes;
-        HekiKexecType::try_from(attr).unwrap_or(HekiKexecType::Unknown)
-    }
-
-    pub fn is_valid(&self) -> bool {
-        let va = self.va;
-        let pa = self.pa;
-        let epa = self.epa;
-        let Ok(pa) = PhysAddr::try_new(pa) else {
-            return false;
-        };
-        let Ok(epa) = PhysAddr::try_new(epa) else {
-            return false;
-        };
-        !(VirtAddr::try_new(va).is_err()
-            || epa < pa
-            || (self.mem_attr().is_none()
-                && self.heki_kdata_type() == HekiKdataType::Unknown
-                && self.heki_kexec_type() == HekiKexecType::Unknown
-                && self.mod_mem_type() == ModMemType::Unknown))
-    }
-}
-
-impl core::fmt::Debug for HekiRange {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let va = self.va;
-        let pa = self.pa;
-        let epa = self.epa;
-        let attr = self.attributes;
-        f.debug_struct("HekiRange")
-            .field("va", &format_args!("{va:#x}"))
-            .field("pa", &format_args!("{pa:#x}"))
-            .field("epa", &format_args!("{epa:#x}"))
-            .field("attr", &format_args!("{attr:#x}"))
-            .field("type", &format_args!("{:?}", self.heki_kdata_type()))
-            .field("size", &format_args!("{:?}", self.epa - self.pa))
-            .finish()
-    }
-}
-
-#[expect(clippy::cast_possible_truncation)]
-pub const HEKI_MAX_RANGES: usize =
-    ((PAGE_SIZE as u32 - u64::BITS * 3 / 8) / core::mem::size_of::<HekiRange>() as u32) as usize;
-
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout)]
-#[repr(align(4096))]
-#[repr(C)]
-pub struct HekiPage {
-    /// Pointer to next page (stored as u64 since we don't dereference it)
-    pub next: u64,
-    pub next_pa: u64,
-    pub nranges: u64,
-    pub ranges: [HekiRange; HEKI_MAX_RANGES],
-    pad: u64,
-}
-
-impl HekiPage {
-    pub fn new() -> Self {
-        // Safety: all fields are valid when zeroed (u64 zeros, array of zeroed HekiRange)
-        Self::new_zeroed()
-    }
-
-    pub fn is_valid(&self) -> bool {
-        if PhysAddr::try_new(self.next_pa).is_err() {
-            return false;
-        }
-        let Some(nranges) = usize::try_from(self.nranges)
-            .ok()
-            .filter(|&n| n <= HEKI_MAX_RANGES)
-        else {
-            return false;
-        };
-        for heki_range in &self.ranges[..nranges] {
-            if !heki_range.is_valid() {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-impl Default for HekiPage {
-    fn default() -> Self {
-        Self::new_zeroed()
-    }
-}
-
-impl<'a> IntoIterator for &'a HekiPage {
-    type Item = &'a HekiRange;
-    type IntoIter = core::slice::Iter<'a, HekiRange>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.ranges[..usize::try_from(self.nranges).unwrap_or(0)].iter()
-    }
 }
 
 #[derive(Default, Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -294,12 +167,12 @@ impl HekiPatch {
     }
 }
 
-#[derive(Default, Clone, Copy, Debug, PartialEq)]
-#[repr(u32)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, TryFromPrimitive)]
+#[repr(u16)]
 pub enum HekiPatchType {
     JumpLabel = 0,
     #[default]
-    Unknown = 0xffff_ffff,
+    Unknown = 0xffff,
 }
 
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, KnownLayout)]
@@ -329,6 +202,7 @@ impl HekiPatchInfo {
     }
 }
 
+#[derive(FromBytes, KnownLayout, Immutable)]
 #[repr(C)]
 #[allow(clippy::struct_field_names)]
 // TODO: Account for kernel config changing the size and meaning of the field members
@@ -357,40 +231,6 @@ impl HekiKernelSymbol {
                 value_offset: (*ksym_ptr).value_offset,
                 name_offset: (*ksym_ptr).name_offset,
                 namespace_offset: (*ksym_ptr).namespace_offset,
-            })
-        }
-    }
-}
-
-#[repr(C)]
-#[allow(clippy::struct_field_names)]
-pub struct HekiKernelInfo {
-    pub ksymtab_start: *const HekiKernelSymbol,
-    pub ksymtab_end: *const HekiKernelSymbol,
-    pub ksymtab_gpl_start: *const HekiKernelSymbol,
-    pub ksymtab_gpl_end: *const HekiKernelSymbol,
-    // Skip unused arch info
-}
-
-impl HekiKernelInfo {
-    const KINFO_LEN: usize = mem::size_of::<HekiKernelInfo>();
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, VsmError> {
-        if bytes.len() < Self::KINFO_LEN {
-            return Err(VsmError::BufferTooSmall("HekiKernelInfo"));
-        }
-
-        #[allow(clippy::cast_ptr_alignment)]
-        let kinfo_ptr = bytes.as_ptr().cast::<HekiKernelInfo>();
-        assert!(kinfo_ptr.is_aligned(), "kinfo_ptr is not aligned");
-
-        // SAFETY: Casting from vtl0 buffer that contained the struct
-        unsafe {
-            Ok(HekiKernelInfo {
-                ksymtab_start: (*kinfo_ptr).ksymtab_start,
-                ksymtab_end: (*kinfo_ptr).ksymtab_end,
-                ksymtab_gpl_start: (*kinfo_ptr).ksymtab_gpl_start,
-                ksymtab_gpl_end: (*kinfo_ptr).ksymtab_gpl_end,
             })
         }
     }

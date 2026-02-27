@@ -5,6 +5,7 @@
 
 pub mod error;
 pub(crate) mod heki;
+pub(crate) mod heki_data;
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
 mod hvcall_vp;
