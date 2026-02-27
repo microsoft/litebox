@@ -11,7 +11,7 @@ use litebox_platform_lvbs::{
     host::{
         bootparam::parse_boot_info,
         per_cpu_variables::{
-            PerCpuVariablesAsm, allocate_bsp_per_cpu_variables, init_per_cpu_variables,
+            PerCpuVariablesAsm, allocate_own_per_cpu_variables, init_per_cpu_variables,
         },
     },
     mshv::vtl1_mem_layout::{self, VTL1_REMAP_PDE_PAGE, VTL1_REMAP_PDPT_PAGE},
@@ -329,21 +329,24 @@ pub unsafe extern "C" fn _ap_start() -> ! {
 
 /// Shared boot path for BSP and AP cores.
 ///
-/// When `is_bsp` is `true`, seeds the initial heap and heap-allocates the
-/// BSP's per-CPU variables before the common sequence.
+/// When `is_bsp` is `true`, seeds the initial heap first.  Then every core
+/// heap-allocates its own per-CPU variables (APs can do this because the
+/// heap is already available and they enter VTL1 one at a time on the
+/// shared 4 KiB boot stack).
 ///
-/// Common sequence: enable CPU features → init per-CPU variables →
-/// switch to kernel stack → `kernel_main(is_bsp)`.
+/// Common sequence: enable CPU features → allocate own PCV →
+/// init per-CPU variables → switch to kernel stack → `kernel_main(is_bsp)`.
 unsafe extern "C" fn common_start(is_bsp: bool) -> ! {
     enable_fsgsbase();
     enable_extended_states();
 
     if is_bsp {
-        // Seed the heap and heap-allocate the BSP's per-CPU variables so
-        // init_per_cpu_variables() finds a valid entry via the GS lookup.
         litebox_runner_lvbs::seed_initial_heap();
-        allocate_bsp_per_cpu_variables();
     }
+
+    // Each core heap-allocates its own PerCpuVariables, RefCellWrapper, and
+    // XSAVE areas, then sets GSBASE.
+    allocate_own_per_cpu_variables();
 
     init_per_cpu_variables();
 

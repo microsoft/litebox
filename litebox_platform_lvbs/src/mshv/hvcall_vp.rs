@@ -233,6 +233,10 @@ pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
     // has high-canonical mappings, so these are ready to use as-is for the
     // AP's initial VP context.
     let rip: u64 = get_entry();
+    // SAFETY: We assume that, during initialization, no APs concurrently enters VTL1 and
+    // thus share the same stack pointer. If we plan to support concurrent AP/VTL1
+    // initialization in the future, we should provide seperate stack pointers for
+    // each AP (which might be problematic if there are several 100s of APs).
     let rsp = get_address_of_special_page(VTL1_KERNEL_STACK_PAGE) + PAGE_SIZE as u64 - 1;
     let tss = get_address_of_special_page(VTL1_TSS_PAGE);
 

@@ -22,7 +22,7 @@ use litebox_common_optee::{
 use litebox_platform_lvbs::{
     arch::{gdt, instrs::hlt_loop, interrupts},
     debug_serial_println,
-    host::{bootparam::get_vtl1_memory_info, per_cpu_variables::allocate_per_cpu_variables},
+    host::{bootparam::get_vtl1_memory_info, per_cpu_variables},
     mm::MemoryProvider,
     mshv::{
         NUM_VTLCALL_PARAMS, VsmFunction, hvcall,
@@ -31,10 +31,10 @@ use litebox_platform_lvbs::{
         vtl_switch::{vtl_switch, vtl_switch_init},
         vtl1_mem_layout::{
             VSM_SK_PTE_PAGES_COUNT, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE,
-            VTL1_KERNEL_STACK_PAGE, VTL1_PML4E_PAGE, VTL1_PRE_POPULATED_MEMORY_SIZE,
-            VTL1_PTE_0_PAGE, VTL1_REMAP_PDE_PAGE, VTL1_REMAP_PDPT_PAGE, get_heap_start_address,
-            get_memory_base_address, get_rela_end_address, get_rela_start_address,
-            get_text_end_address, get_text_start_address,
+            VTL1_PML4E_PAGE, VTL1_PRE_POPULATED_MEMORY_SIZE, VTL1_PTE_0_PAGE, VTL1_REMAP_PDE_PAGE,
+            VTL1_REMAP_PDPT_PAGE, get_heap_start_address, get_memory_base_address,
+            get_rela_end_address, get_rela_start_address, get_text_end_address,
+            get_text_start_address,
         },
     },
     serial_println,
@@ -165,22 +165,9 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
                 early_pt_size
             );
 
-            // Reclaim the initial 4 KiB boot stack page. BSP has already
-            // switched to the per-CPU kernel stack, so this page is unused.
-            let boot_stack_pa = vtl1_start + (VTL1_KERNEL_STACK_PAGE * PAGE_SIZE) as u64;
-            let boot_stack_start: usize =
-                TruncateExt::<usize>::truncate(Platform::pa_to_va(boot_stack_pa).as_u64());
-            // Safety: BSP is running on the kernel stack; the boot stack page
-            // is no longer referenced.
-            unsafe {
-                Platform::mem_fill_pages(boot_stack_start, PAGE_SIZE);
-            }
-            debug_serial_println!(
-                "heap: reclaim boot stack page (page {}): VA {:#x}, size {:#x}",
-                VTL1_KERNEL_STACK_PAGE,
-                boot_stack_start,
-                PAGE_SIZE
-            );
+            // NOTE: The 4 KiB boot stack page (VTL1_KERNEL_STACK_PAGE) is NOT
+            // reclaimed here.  APs reuse it as their initial RSP when they
+            // enter VTL1 via `hvcall_enable_vp_vtl`.
 
             // Reclaim Phase 1 PDPT and PDE pages
             let remap_pt_pa = vtl1_start + (VTL1_REMAP_PDPT_PAGE * PAGE_SIZE) as u64;
@@ -213,12 +200,15 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
             mem_fill_size
         );
 
-        allocate_per_cpu_variables();
-
         Some(platform)
     } else {
         None
     };
+
+    // Allocate XSAVE areas now that we are on the kernel stack (the CPUID
+    // queries and aligned-vec allocations need more stack than the 4 KiB
+    // boot stack provides).
+    per_cpu_variables::allocate_own_xsave_area();
 
     if let Err(e) = hvcall::init(is_bsp) {
         panic!("Err: {:?}", e);
