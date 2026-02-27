@@ -9,43 +9,15 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
+use crate::utils::id_pool::IdPool;
 
 use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::transport::{self, Read, Write};
 
-/// ID generator for fids
-struct IdGenerator {
-    next: u32,
-    free_ids: Vec<u32>,
-}
-
-impl IdGenerator {
-    const fn new() -> Self {
-        IdGenerator {
-            next: 0,
-            free_ids: Vec::new(),
-        }
-    }
-
-    fn next(&mut self) -> Result<u32, Error> {
-        if let Some(id) = self.free_ids.pop() {
-            Ok(id)
-        } else {
-            let id = self.next;
-            self.next = self.next.checked_add(1).ok_or(Error::Io)?;
-            Ok(id)
-        }
-    }
-
-    fn free(&mut self, id: u32) {
-        self.free_ids.push(id);
-    }
-}
-
 /// Fid generator with thread-safe access
 struct FidGenerator<Platform: RawSyncPrimitivesProvider> {
-    inner: Mutex<Platform, IdGenerator>,
+    inner: Mutex<Platform, IdPool>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Default for FidGenerator<Platform> {
@@ -58,18 +30,18 @@ impl<Platform: RawSyncPrimitivesProvider> FidGenerator<Platform> {
     /// Create a new fid generator
     fn new() -> Self {
         FidGenerator {
-            inner: Mutex::new(IdGenerator::new()),
+            inner: Mutex::new(IdPool::new()),
         }
     }
 
     /// Allocate a new fid
     fn next(&self) -> Result<u32, Error> {
-        self.inner.lock().next()
+        self.inner.lock().allocate().ok_or(Error::Io)
     }
 
     /// Release a fid for reuse
     fn free(&self, id: u32) {
-        self.inner.lock().free(id);
+        self.inner.lock().recycle(id);
     }
 }
 

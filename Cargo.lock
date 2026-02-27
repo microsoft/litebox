@@ -1027,7 +1027,6 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "arrayvec",
- "bitvec",
  "ctr",
  "elf",
  "hashbrown",
