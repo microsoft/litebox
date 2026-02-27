@@ -1105,7 +1105,7 @@ impl ThreadHandle {
 
         if !target_tls.is_in_guest.get() {
             // Not running in the guest. The interrupt flag will be checked
-            // before returning to the guest.
+            // before returning to the guest, so just resume.
             return;
         }
 
@@ -1251,7 +1251,6 @@ impl RawMutex {
         }
     }
 
-    #[allow(clippy::unnecessary_wraps)]
     fn block_or_maybe_timeout(
         &self,
         val: u32,
@@ -1266,11 +1265,9 @@ impl RawMutex {
             }
         };
 
-        let wait_addr = (&raw const self.inner).cast::<c_void>().cast_mut();
-
         let ok = unsafe {
             Win32_Threading::WaitOnAddress(
-                wait_addr.cast_const(),
+                (&raw const self.inner).cast::<c_void>(),
                 (&raw const val).cast::<c_void>(),
                 std::mem::size_of::<u32>(),
                 timeout_ms,
@@ -1280,6 +1277,7 @@ impl RawMutex {
         if ok {
             Ok(UnblockedOrTimedOut::Unblocked)
         } else {
+            // Check why WaitOnAddress failed
             let err = unsafe { GetLastError() };
             match err {
                 Win32_Foundation::ERROR_TIMEOUT => Ok(UnblockedOrTimedOut::TimedOut),
@@ -1397,7 +1395,7 @@ impl litebox::platform::TimeProvider for WindowsUserland {
 }
 
 /// 100ns units returned by `QueryUnbiasedInterruptTimePrecise`.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
 impl litebox::platform::Instant for Instant {
