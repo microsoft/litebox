@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
@@ -92,11 +92,15 @@ fn mmapped_file_data(path: impl AsRef<Path>) -> Result<&'static [u8]> {
 
 /// Run Linux programs with LiteBox on unmodified Linux
 ///
+/// # Errors
+///
+/// Returns an error if the program path cannot be resolved, directories along the path are
+/// inaccessible, or the initial filesystem cannot be set up.
+///
 /// # Panics
 ///
-/// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
-/// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
-/// message could be thrown instead.
+/// May still panic if internal filesystem operations (e.g., in-memory mkdir/chown/open) or
+/// syscall rewriting fail unexpectedly.
 pub fn run(cli_args: CliArgs) -> Result<()> {
     if !cli_args.insert_files.is_empty() {
         unimplemented!(
@@ -108,20 +112,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         Vec<(litebox::fs::Mode, u32)>,
         alloc::borrow::Cow<'static, [u8]>,
     ) = {
-        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))
+            .with_context(|| format!("Could not resolve absolute path for program '{}'", &cli_args.program_and_arguments[0]))?;
         let ancestors: Vec<_> = prog.ancestors().collect();
-        let modes: Vec<_> = ancestors
+        let modes: Result<Vec<_>> = ancestors
             .into_iter()
             .rev()
             .skip(1)
             .map(|path| {
-                let metadata = path.metadata().unwrap();
-                (
-                    litebox::fs::Mode::from_bits(metadata.st_mode()).unwrap(),
-                    metadata.st_uid(),
-                )
+                let metadata = path.metadata()
+                    .with_context(|| format!("Could not read metadata for '{}'. Ensure the path exists and is accessible.", path.display()))?;
+                let mode = litebox::fs::Mode::from_bits_truncate(metadata.st_mode());
+                Ok((mode, metadata.st_uid()))
             })
             .collect();
+        let modes = modes?;
         let data = mmapped_file_data(prog)?;
         let data = if cli_args.rewrite_syscalls {
             litebox_syscall_rewriter::hook_syscalls_in_elf(data, None)
@@ -152,7 +157,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let litebox = shim_builder.litebox();
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
-        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))
+            .with_context(|| format!("Could not resolve absolute path for program '{}'", &cli_args.program_and_arguments[0]))?;
         let ancestors: Vec<_> = prog.ancestors().collect();
         let mut prev_user = 0;
         for (path, &mode_and_user) in ancestors
@@ -254,7 +260,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // We need to get the file path before enabling seccomp
-    let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+    let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0]))
+        .with_context(|| format!("Could not resolve absolute path for program '{}'", &cli_args.program_and_arguments[0]))?;
     let prog_path = prog.to_str().ok_or_else(|| {
         anyhow!(
             "Could not convert program path {:?} to a string",
