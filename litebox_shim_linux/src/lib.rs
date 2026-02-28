@@ -713,6 +713,9 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Mkdir { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_mkdir(path, mode))),
+            SyscallRequest::Chdir { pathname } => pathname
+                .to_cstring()
+                .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
