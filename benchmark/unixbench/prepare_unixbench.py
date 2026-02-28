@@ -223,7 +223,7 @@ def prepare_benchmark(
         shutil.rmtree(tar_dir)
 
     # Create directory structure in tar
-    for d in ["lib64", "lib/x86_64-linux-gnu", "lib32", "out", "tmp"]:
+    for d in ["lib64", "lib/x86_64-linux-gnu", "lib32", "out"]:
         (tar_dir / d).mkdir(parents=True, exist_ok=True)
 
     # Rewrite the main binary (use cache to avoid re-rewriting fstime 3 times)

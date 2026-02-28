@@ -212,6 +212,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             open_file(&mut in_mem, prog_unix_path.as_str(), last.0);
         }
 
+        // Create /tmp so programs (e.g., fstime) can use it as a writable scratch directory.
+        // This must live in the in-mem layer rather than tar_ro, which is read-only.
+        in_mem.with_root_privileges(|fs| {
+            fs.mkdir("/tmp", litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO)
+                .unwrap();
+            fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
+        });
+
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
         shim_builder.default_fs(in_mem, tar_ro)
     };

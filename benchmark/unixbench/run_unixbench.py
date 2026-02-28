@@ -361,7 +361,8 @@ def _run_litebox_cmd(
 ) -> Optional[BenchmarkResult]:
     """Run a litebox command and parse the result."""
     # For fstime variants, use /tmp in the sandbox as the tmpdir.
-    litebox_tmpdir = Path("/tmp") if bench.binary == "fstime" else None
+    # Use a plain string (not Path) so Windows doesn't convert / to \.
+    litebox_tmpdir = "/tmp" if bench.binary == "fstime" else None
     cmd += bench.args(duration, litebox_tmpdir)
 
     display_args = ' '.join(bench.args(duration, litebox_tmpdir))
