@@ -15,7 +15,7 @@ fn runner_binary() -> String {
 }
 
 /// Regression test for #650: running with a nonexistent program path should
-/// produce a clear error message instead of panicking.
+/// produce a clear, contextual error message instead of panicking.
 #[test]
 fn test_nonexistent_program_returns_error_not_panic() {
     let output = Command::new(runner_binary())
@@ -35,5 +35,13 @@ fn test_nonexistent_program_returns_error_not_panic() {
     assert!(
         !stderr.contains("panicked at"),
         "Runner panicked instead of returning an error.\nStderr: {stderr}"
+    );
+
+    // It SHOULD contain a contextual error message about the path
+    assert!(
+        stderr.contains("Could not resolve absolute path")
+            || stderr.contains("Could not read metadata"),
+        "Expected a contextual error message about path resolution or metadata, \
+         but got:\nStderr: {stderr}"
     );
 }
