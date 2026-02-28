@@ -1613,7 +1613,7 @@ mod tests {
     /// a real SIGINT via `libc::kill`, which should interrupt a blocking sleep
     /// with `EINTR`.
     /// Target Linux only because it use tgkill syscall to send signal to specific thread.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", debug_assertions))]
     #[test]
     fn test_sigint_with_custom_handler() {
         use litebox_common_linux::signal::{SaFlags, SigAction, SigSet, Signal};

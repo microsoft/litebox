@@ -1087,6 +1087,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         thread.interrupt();
     }
 
+    #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
         // to mirror the TLS base used in guest context, so that test threads can use the

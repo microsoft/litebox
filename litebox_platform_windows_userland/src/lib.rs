@@ -455,6 +455,12 @@ unsafe fn install_tls(tls: &TlsState) {
     }
 }
 
+/// Clears the current thread's Windows TLS slot.
+fn uninstall_tls() {
+    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
+    unsafe { windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null()) };
+}
+
 fn get_tls_ptr() -> Option<*const TlsState> {
     let tls_index = TLS_INDEX.load(Ordering::Relaxed);
     if tls_index == u32::MAX {
@@ -804,6 +810,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         });
     }
 
+    #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Ensure the module-wide TLS slot is allocated.
         ensure_tls_index();
@@ -895,10 +902,7 @@ impl ThreadHandle {
                 .unwrap()
                 .retain(|h| !Arc::ptr_eq(&h.0, &current.0));
             *current.0.lock().unwrap() = None;
-            let tls_index = TLS_INDEX.load(Ordering::Relaxed);
-            unsafe {
-                windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null())
-            };
+            uninstall_tls();
         });
         f()
     }

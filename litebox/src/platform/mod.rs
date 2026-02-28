@@ -106,6 +106,7 @@ pub trait ThreadProvider: RawPointerProvider {
     ///
     /// The default implementation simply calls `f()` with no additional setup.
     /// Platforms that require explicit thread registration should override this.
+    #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         f()
     }
