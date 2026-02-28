@@ -774,12 +774,27 @@ def main():
             if args.rewriter_path:
                 rewriter_path = Path(args.rewriter_path)
         elif is_windows_mode:
-            # On Windows, auto-detect the runner
+            # On Windows, build (or locate) the runner
             runner_name = "litebox_runner_linux_on_windows_userland"
             if sys.platform == "win32":
                 runner_name += ".exe"
             build_type = "release" if args.release else "debug"
             runner_path = workspace_root / "target" / build_type / runner_name
+
+            if not args.no_build:
+                build_cmd = [
+                    "cargo", "build",
+                    "-p", "litebox_runner_linux_on_windows_userland",
+                ]
+                if args.release:
+                    build_cmd.append("--release")
+                print(f"Building Windows runner ({build_type})...")
+                result = subprocess.run(build_cmd, cwd=str(workspace_root))
+                if result.returncode != 0:
+                    print(f"Error: cargo build failed (exit {result.returncode})")
+                    sys.exit(1)
+                print("Build complete.")
+
             if not runner_path.exists():
                 print(f"Error: Windows runner not found at {runner_path}")
                 print("Build it on Windows first:")
