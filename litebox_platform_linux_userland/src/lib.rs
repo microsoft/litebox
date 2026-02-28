@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
+use std::unimplemented;
 
 use litebox::fs::OFlags;
 use litebox::platform::UnblockedOrTimedOut;
@@ -27,6 +28,84 @@ use zerocopy::{FromBytes, IntoBytes};
 mod syscall_intercept;
 
 extern crate alloc;
+
+// ---------------------------------------------------------------------------
+// TLS (`.tbss`) access helpers
+//
+// On x86_64, the ELF TLS model uses `@tpoff`; on x86 it uses `@ntpoff`.
+// At guest-host transitions we swap `fs` and `gs`, so after the swap the host TLS base
+// is in the normal segment register. Before the swap (e.g. in a signal
+// handler that fires while the guest is running), the host TLS base is
+// in the *saved* segment register (`gs` on x86_64, `fs` on x86).
+//
+// The macros below produce string literals so they can be used inside
+// `concat!()` within `core::arch::asm!()`.
+// ---------------------------------------------------------------------------
+
+/// TLS relocation suffix: `"@tpoff"` on x86_64, `"@ntpoff"` on x86.
+#[cfg(target_arch = "x86_64")]
+macro_rules! tls_suffix {
+    () => {
+        "@tpoff"
+    };
+}
+#[cfg(target_arch = "x86")]
+macro_rules! tls_suffix {
+    () => {
+        "@ntpoff"
+    };
+}
+
+/// Segment register used for TLS after the fs/gs swap (normal host context).
+#[cfg(target_arch = "x86_64")]
+macro_rules! tls_seg {
+    () => {
+        "fs"
+    };
+}
+#[cfg(target_arch = "x86")]
+macro_rules! tls_seg {
+    () => {
+        "gs"
+    };
+}
+
+/// Segment register where the host TLS base is saved before the swap
+/// (signal handler context while the guest is running).
+#[cfg(target_arch = "x86_64")]
+macro_rules! saved_tls_seg {
+    () => {
+        "gs"
+    };
+}
+#[cfg(target_arch = "x86")]
+macro_rules! saved_tls_seg {
+    () => {
+        "fs"
+    };
+}
+
+/// Full TLS memory operand for a `.tbss` variable in normal host context
+/// (after the fs/gs swap).
+///
+/// Example: `tls!("pending_host_signals")` expands to
+/// `"fs:pending_host_signals@tpoff"` on x86_64.
+macro_rules! tls {
+    ($var:literal) => {
+        concat!(tls_seg!(), ":", $var, tls_suffix!())
+    };
+}
+
+/// Full TLS memory operand for a `.tbss` variable accessed via the *saved*
+/// segment register (before the fs/gs swap, e.g. from a signal handler).
+///
+/// Example: `saved_tls!("in_guest")` expands to
+/// `"gs:in_guest@tpoff"` on x86_64.
+macro_rules! saved_tls {
+    ($var:literal) => {
+        concat!(saved_tls_seg!(), ":", $var, tls_suffix!())
+    };
+}
 
 /// The userland Linux platform.
 ///
@@ -308,6 +387,31 @@ impl LinuxUserland {
 
 impl litebox::platform::Provider for LinuxUserland {}
 
+impl litebox::platform::SignalProvider for LinuxUserland {
+    fn take_pending_signals(&self, mut f: impl FnMut(litebox::shim::Signal)) {
+        let sigs = take_pending_host_signals();
+        for sig in sigs {
+            f(sig);
+        }
+    }
+}
+
+/// Atomically takes the per-thread pending host signal bitmask.
+fn take_pending_host_signals() -> litebox::shim::SigSet {
+    // Atomically swap the per-thread pending signals with zero.
+    // Only the low 32 bits are used (covers traditional signals 1-31).
+    let lo: u32;
+    unsafe {
+        core::arch::asm!(
+            "xor {tmp:e}, {tmp:e}",
+            concat!("xchg DWORD PTR ", tls!("pending_host_signals"), ", {tmp:e}"),
+            tmp = out(reg) lo,
+            options(nostack)
+        );
+    }
+    litebox::shim::SigSet::from_u64(u64::from(lo))
+}
+
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates or returns.
@@ -389,6 +493,14 @@ in_guest:
 .globl interrupt
 interrupt:
     .byte 0
+    .align 4
+.globl pending_host_signals
+pending_host_signals:
+    .long 0
+    .align 8
+.globl wait_waker_addr
+wait_waker_addr:
+    .quad 0
     "
 );
 
@@ -798,6 +910,14 @@ in_guest:
 .globl interrupt
 interrupt:
     .byte 0
+    .align 4
+.globl pending_host_signals
+pending_host_signals:
+    .long 0
+    .align 4
+.global wait_waker_addr
+wait_waker_addr:
+    .long 0
     "
 );
 
@@ -835,6 +955,46 @@ unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) 
         "jmp fs:scratch@ntpoff", // jump to the guest
         "switch_to_guest_end:",
     );
+}
+
+/// Non-guest threads (e.g., network workers, background tasks) should call this
+/// function at the start of their execution so the kernel only delivers
+/// `SIGALRM` / `SIGINT` to guest threads, which have the proper signal-handler
+/// context to re-enter the shim.
+fn block_guest_signals() {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut set);
+        libc::sigaddset(&raw mut set, libc::SIGALRM);
+        libc::sigaddset(&raw mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+    }
+}
+
+/// Spawn a non-guest ("host") thread that automatically blocks guest interrupt
+/// signals before running `f`.
+///
+/// Every background thread created by a runner (network workers, I/O helpers,
+/// etc.) should use this function instead of [`std::thread::spawn`] to ensure
+/// that `SIGALRM` and `SIGINT` are only delivered to guest threads.
+///
+/// # Example
+///
+/// ```ignore
+/// let handle = litebox_platform_linux_userland::spawn_host_thread(move || {
+///     // This thread will never receive SIGALRM or SIGINT.
+///     do_background_work();
+/// });
+/// ```
+pub fn spawn_host_thread<F, T>(f: F) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        block_guest_signals();
+        f()
+    })
 }
 
 fn thread_start(
@@ -926,10 +1086,63 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     fn interrupt_thread(&self, thread: &Self::ThreadHandle) {
         thread.interrupt();
     }
+
+    #[cfg(debug_assertions)]
+    fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
+        // Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
+        // to mirror the TLS base used in guest context, so that test threads can use the
+        // same TLS access code as guest threads.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!(
+                "rdfsbase {tmp}",
+                "wrgsbase {tmp}",
+                tmp = out(reg) _,
+                options(nostack, preserves_flags),
+            );
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            unsafe {
+                core::arch::asm!(
+                    "mov {tmp:x}, gs",
+                    "mov fs, {tmp:x}",
+                    tmp = out(reg) _,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+
+        ThreadHandle::run_with_handle(f)
+    }
 }
 
 impl litebox::platform::RawMutexProvider for LinuxUserland {
     type RawMutex = RawMutex;
+
+    fn on_interruptible_wait_start(&self, waker: &litebox::event::wait::Waker<Self>)
+    where
+        Self: litebox::sync::RawSyncPrimitivesProvider,
+    {
+        let waker_ptr = waker as *const litebox::event::wait::Waker<Self>;
+        unsafe {
+            core::arch::asm!(
+                concat!("mov ", tls!("wait_waker_addr"), ", {}"),
+                in(reg) waker_ptr,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    fn on_interruptible_wait_end(&self) {
+        unsafe {
+            core::arch::asm!(
+                concat!("mov ", tls!("wait_waker_addr"), ", {zero}"),
+                zero = in(reg) 0usize,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
 }
 
 pub struct RawMutex {
@@ -949,30 +1162,21 @@ impl RawMutex {
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        // We immediately wake up (without even hitting syscalls) if we can clearly see that the
-        // value is different.
-        if self.inner.load(Ordering::SeqCst) != val {
-            return Err(ImmediatelyWokenUp);
-        }
-
         // We wait on the futex, with a timeout if needed
-        loop {
-            break match futex_timeout(
-                &self.inner,
-                FutexOperation::Wait,
-                /* expected value */ val,
-                timeout,
-                /* ignored */ None,
-            ) {
-                Ok(0) => Ok(UnblockedOrTimedOut::Unblocked),
-                Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
-                Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
-                Err(syscalls::Errno::EINTR) => continue,
-                Err(e) => {
-                    panic!("Unexpected errno={e} for FUTEX_WAIT")
-                }
-                _ => unreachable!(),
-            };
+        match futex_timeout(
+            &self.inner,
+            FutexOperation::Wait,
+            /* expected value */ val,
+            timeout,
+            /* ignored */ None,
+        ) {
+            Ok(0) | Err(syscalls::Errno::EINTR) => Ok(UnblockedOrTimedOut::Unblocked),
+            Err(syscalls::Errno::EAGAIN) => Err(ImmediatelyWokenUp),
+            Err(syscalls::Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
+            Err(e) => {
+                panic!("Unexpected errno={e} for FUTEX_WAIT")
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -1618,14 +1822,8 @@ impl ThreadContext<'_> {
         // now (by calling into the shim), and it might be set again by the shim
         // before returning.
         unsafe {
-            #[cfg(target_arch = "x86_64")]
             core::arch::asm!(
-                "mov BYTE PTR fs:interrupt@tpoff, 0",
-                options(nostack, preserves_flags)
-            );
-            #[cfg(target_arch = "x86")]
-            core::arch::asm!(
-                "mov BYTE PTR gs:interrupt@ntpoff, 0",
+                concat!("mov BYTE PTR ", tls!("interrupt"), ", 0"),
                 options(nostack, preserves_flags)
             );
         }
@@ -1752,6 +1950,25 @@ fn register_exception_handlers() {
                     sig,
                     Some(&sa),
                     &mut NEXT_SA[sig.reinterpret_as_unsigned() as usize],
+                );
+            }
+        }
+
+        // Note that non-guest threads should block these signals, so it always fires on a guest thread.
+        let traditional_signals = &[libc::SIGINT, libc::SIGALRM];
+        for &sig in traditional_signals {
+            unsafe {
+                let mut sa: libc::sigaction = core::mem::zeroed();
+                sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+                sa.sa_sigaction = interrupt_signal_handler as *const () as usize;
+                // Block the interrupt signal while handling signals
+                libc::sigaddset(&raw mut sa.sa_mask, interrupt_signal);
+                let mut old_sa = core::mem::zeroed();
+                sigaction(sig, Some(&sa), &mut old_sa);
+                assert_eq!(
+                    old_sa.sa_sigaction,
+                    libc::SIG_DFL,
+                    "signal {sig} handler already installed",
                 );
             }
         }
@@ -2156,12 +2373,112 @@ unsafe fn next_signal_handler(
     }
 }
 
+/// Async-signal-safe wake of a thread blocked in an interruptible wait.
+///
+/// This is the signal-handler counterpart of `WaitStateInner::wake()`: it
+/// CAS's the condvar from WAITING to WOKEN and issues a futex wake so the
+/// blocked thread returns from `futex_wait`.
+///
+/// `waker_addr` is the raw address read from the `wait_waker_addr` TLS
+/// variable (0 means no waker is registered).
+fn try_wake_wait_waker(waker_addr: usize) {
+    if waker_addr == 0 {
+        return;
+    }
+    // SAFETY: waker_addr points to a valid Waker<LinuxUserland> whose
+    // lifetime spans the entire interruptible wait, set by
+    // RawMutexProvider::on_interruptible_wait_start.
+    let waker = unsafe { &*(waker_addr as *const litebox::event::wait::Waker<LinuxUserland>) };
+    waker.wake();
+}
+
+/// Records a pending host signal in the `.tbss` bitmask and wakes any condvar
+/// the thread is blocked on.
+///
+/// # Safety
+///
+/// Must be called from a signal handler on a guest thread whose saved host TLS
+/// segment register is valid.
+unsafe fn record_pending_signal(signal: litebox::shim::Signal) {
+    let mask: u32 = 1u32 << (signal.as_raw() - 1);
+    unsafe {
+        core::arch::asm!(
+            concat!("lock or DWORD PTR ", saved_tls!("pending_host_signals"), ", {mask:e}"),
+            mask = in(reg) mask,
+            options(nostack)
+        );
+    }
+    let waker_addr: usize;
+    unsafe {
+        core::arch::asm!(
+            concat!("mov {}, ", saved_tls!("wait_waker_addr")),
+            out(reg) waker_addr,
+            options(nostack, preserves_flags)
+        );
+    }
+    try_wake_wait_waker(waker_addr);
+}
+
 /// Signal handler for interrupt signals.
 unsafe fn interrupt_signal_handler(
-    _signum: libc::c_int,
+    signum: libc::c_int,
     _info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    let raise_signal = |signum: libc::c_int| {
+        // block the signal on this non-guest thread so the kernel won't
+        // deliver it here again, then re-raise as process-directed so a
+        // guest thread picks it up.
+        //
+        // This should only be called by test threads (spawned via cargo test).
+        // Other non-guest threads like network worker threads should have already blocked these signals.
+        unsafe {
+            let mut set: libc::sigset_t = core::mem::zeroed();
+            libc::sigemptyset(&raw mut set);
+            libc::sigaddset(&raw mut set, signum);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+            libc::kill(libc::getpid(), signum);
+        }
+    };
+
+    // Record host-originated signals (SIGINT, SIGALRM, etc.) in the
+    // per-thread pending bitmask so the shim can forward them to the guest.
+    // TODO: no realtime signal support for now.
+    if signum > 0 && signum < 32 {
+        // Only record signals that can be forwarded to the guest as
+        // litebox::shim::Signal. Unknown signals are silently dropped.
+        let Ok(signal) = litebox_common_linux::signal::Signal::try_from(signum) else {
+            return;
+        };
+        let Ok(signal) = litebox::shim::Signal::try_from(signal) else {
+            return;
+        };
+
+        // Check whether the saved host TLS segment is valid (i.e. this is a
+        // guest thread). If not, re-raise the signal process-wide.
+        let is_guest_thread;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let gsbase: u64;
+            unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
+            is_guest_thread = gsbase != 0;
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            let fs: u16;
+            unsafe { core::arch::asm!("mov {:x}, fs", out(reg) fs, options(nostack, nomem)) };
+            is_guest_thread = fs != 0;
+        }
+
+        if is_guest_thread {
+            // SAFETY: we verified the saved host TLS segment is valid above.
+            unsafe { record_pending_signal(signal) };
+        } else {
+            raise_signal(signum);
+            return;
+        }
+    }
+
     // The interrupt signal can arrive in different contexts:
     // 1. The thread is running in the host at the beginning of the syscall
     //    handler. Do nothing--the syscall handler will handle the interrupt.

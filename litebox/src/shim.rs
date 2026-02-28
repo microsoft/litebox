@@ -133,3 +133,108 @@ impl Exception {
     /// #PF
     pub const PAGE_FAULT: Self = Self(14);
 }
+
+/// A signal number.
+///
+/// Signal numbers are 1-based and must be in the range 1–63.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Signal(u32);
+
+impl Signal {
+    /// SIGINT (signal 2) — interrupt from keyboard (Ctrl+C).
+    pub const SIGINT: Self = Self(2);
+    /// SIGALRM (signal 14) — timer signal from `alarm`.
+    pub const SIGALRM: Self = Self(14);
+
+    /// Create a `Signal` from a raw signal number.
+    ///
+    /// Returns `None` if `signum` is outside the valid range 1–63.
+    pub const fn from_raw(signum: u32) -> Option<Self> {
+        if signum >= 1 && signum <= 63 {
+            Some(Self(signum))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the raw signal number.
+    pub const fn as_raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// A set of [`Signal`]s, stored as a 64-bit bitmask.
+///
+/// Bit `(signum - 1)` is set when signal `signum` is present in the set.
+/// Because signal numbers are 1-based and capped at 63, all 63 possible
+/// signals fit in a single `u64`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SigSet(u64);
+
+impl SigSet {
+    /// An empty signal set.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Returns `true` if the set contains no signals.
+    pub const fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// Adds `signal` to the set.
+    pub const fn add(&mut self, signal: Signal) {
+        self.0 |= 1 << (signal.0 - 1);
+    }
+
+    /// Returns a new set that is `self` with `signal` added.
+    #[must_use]
+    pub const fn with(self, signal: Signal) -> Self {
+        Self(self.0 | (1 << (signal.0 - 1)))
+    }
+
+    /// Removes `signal` from the set.
+    pub const fn remove(&mut self, signal: Signal) {
+        self.0 &= !(1 << (signal.0 - 1));
+    }
+
+    /// Returns `true` if the set contains `signal`.
+    pub const fn contains(&self, signal: Signal) -> bool {
+        (self.0 & (1 << (signal.0 - 1))) != 0
+    }
+
+    /// Removes and returns the lowest-numbered signal in the set, or `None`
+    /// if empty.
+    pub fn pop_lowest(&mut self) -> Option<Signal> {
+        if self.0 == 0 {
+            return None;
+        }
+        let bit = self.0.trailing_zeros();
+        self.0 &= !(1u64 << bit);
+        // bit is 0–62, so bit + 1 is 1–63 — always valid.
+        Some(Signal(bit + 1))
+    }
+
+    /// Creates a `SigSet` from a raw `u64` bitmask.
+    pub const fn from_u64(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// Returns the underlying `u64` bitmask.
+    pub const fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Iterator for SigSet {
+    type Item = Signal;
+
+    fn next(&mut self) -> Option<Signal> {
+        self.pop_lowest()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let count = self.0.count_ones() as usize;
+        (count, Some(count))
+    }
+}
