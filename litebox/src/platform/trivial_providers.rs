@@ -8,8 +8,18 @@
 
 use super::{
     Punchthrough, PunchthroughError, PunchthroughProvider, PunchthroughToken, RawConstPointer,
-    RawMutPointer,
+    RawMutPointer, TimerHandle,
 };
+
+/// A [`TimerHandle`] stub for platforms that have not yet implemented
+/// [`super::TimerProvider`]. All methods panic with `todo!()`.
+pub struct StubTimerHandle(());
+
+impl TimerHandle for StubTimerHandle {
+    fn set_timer(&self, _duration: core::time::Duration) {
+        todo!("TimerProvider not yet implemented for this platform")
+    }
+}
 use zerocopy::{FromBytes, IntoBytes};
 
 /// A trivial provider, useful when no punchthrough is necessary.
