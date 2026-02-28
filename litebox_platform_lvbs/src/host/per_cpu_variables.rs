@@ -12,7 +12,7 @@ use crate::{
 };
 use aligned_vec::avec;
 use alloc::boxed::Box;
-use core::cell::{Cell, OnceCell, UnsafeCell};
+use core::cell::{Cell, UnsafeCell};
 use core::mem::offset_of;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::{rdgsbase, wrgsbase};
@@ -44,13 +44,20 @@ pub struct PerCpuVariables {
     _guard_page_1: [u8; PAGE_SIZE],
     hvcall_input: UnsafeCell<[u8; PAGE_SIZE]>,
     hvcall_output: UnsafeCell<[u8; PAGE_SIZE]>,
-    pub vtl0_state: Cell<VtlState>,
-    pub vtl0_locked_regs: Cell<ControlRegMap>,
-    pub gdt: Cell<Option<&'static gdt::GdtWrapper>>,
-    pub tls: Cell<VirtAddr>,
+    /// VTL0 general-purpose register state, saved/restored by assembly
+    /// (`SAVE_VTL_STATE_ASM`/`LOAD_VTL_STATE_ASM`) via raw pushes/pops to
+    /// the address cached in `PerCpuVariablesAsm::vtl0_state_top_addr`.
+    /// Rust code accesses it only between save and load (i.e., while VTL1
+    /// is executing), so there is no data race with the assembly.
+    pub(crate) vtl0_state: Cell<VtlState>,
+    pub(crate) vtl0_locked_regs: Cell<ControlRegMap>,
+    pub(crate) gdt: Cell<Option<&'static gdt::GdtWrapper>>,
+    pub(crate) tls: Cell<VirtAddr>,
     /// Cached VP index from the hypervisor.  Lazily initialized on first access
     /// via `rdmsr(HV_REGISTER_VP_INDEX)` and immutable thereafter.
-    vp_index: OnceCell<u32>,
+    /// Uses `u32::MAX` as the "uninitialized" sentinel (valid VP indices are
+    /// always < `MAX_CORES`).
+    vp_index: Cell<u32>,
 }
 
 // Hyper-V pages and hypercall I/O pages must be page-aligned.
@@ -92,7 +99,7 @@ impl PerCpuVariables {
     }
 
     pub(crate) fn hv_simp_page_as_u64(&self) -> u64 {
-        &raw const self.hv_simp_page as u64
+        self.hv_simp_page.get() as u64
     }
 
     pub(crate) fn hv_hypercall_input_page_as_mut_ptr(&self) -> *mut [u8; PAGE_SIZE] {
@@ -113,19 +120,23 @@ impl PerCpuVariables {
     /// the lifetime of the core).
     ///
     /// The value is lazily initialized on first access via `rdmsr` and cached
-    /// in a [`OnceCell`] for all subsequent reads.
+    /// in a `Cell<u32>` (with `u32::MAX` as the uninitialized sentinel) for
+    /// all subsequent reads.
     ///
     /// # Panics
     /// Panics if the VP index returned by the hypervisor is ≥ `MAX_CORES`.
     pub fn vp_index(&self) -> u32 {
-        *self.vp_index.get_or_init(|| {
-            let vp_index: u32 = rdmsr(HV_REGISTER_VP_INDEX).truncate();
-            assert!(
-                vp_index < u32::try_from(MAX_CORES).unwrap(),
-                "VP index {vp_index} exceeds the configured processor mask"
-            );
-            vp_index
-        })
+        let idx = self.vp_index.get();
+        if idx != u32::MAX {
+            return idx;
+        }
+        let vp_index: u32 = rdmsr(HV_REGISTER_VP_INDEX).truncate();
+        assert!(
+            vp_index < u32::try_from(MAX_CORES).unwrap(),
+            "VP index {vp_index} exceeds the configured processor mask"
+        );
+        self.vp_index.set(vp_index);
+        vp_index
     }
 
     /// Return kernel code, user code, and user data segment selectors
@@ -442,12 +453,15 @@ fn get_per_cpu_variables_ptr() -> *mut PerCpuVariables {
 pub fn allocate_own_per_cpu_variables() {
     let mut per_cpu_variables = Box::<PerCpuVariables>::new_uninit();
     // Safety: `PerCpuVariables` is too large for the stack, so we zero-init
-    // via `write_bytes`.  Zero is valid for all field types:
-    // arrays of u8, Cell<T>, UnsafeCell<T>, OnceCell<T> (zero = None),
-    // VtlState, ControlRegMap, etc.
+    // via `write_bytes` then fix up the `vp_index` sentinel.  Zero is valid
+    // for all other field types:
+    // - `[u8; N]`, `VtlState`, `ControlRegMap`: all-zeroes is their default.
+    // - `Cell<T>` / `UnsafeCell<T>`: `#[repr(transparent)]`, same as inner T.
     let per_cpu_variables = unsafe {
         let ptr = per_cpu_variables.as_mut_ptr();
         ptr.write_bytes(0, 1);
+        // Set the "uninitialized" sentinel for vp_index (0 is a valid VP index).
+        core::ptr::addr_of_mut!((*ptr).vp_index).write(Cell::new(u32::MAX));
         per_cpu_variables.assume_init()
     };
 
@@ -488,7 +502,12 @@ pub fn init_per_cpu_variables() {
                 & !(STACK_ALIGNMENT - 1);
         let exception_sp = TruncateExt::<usize>::truncate(per_cpu_variables.exception_stack_top())
             & !(STACK_ALIGNMENT - 1);
-        // Cell<VtlState> is #[repr(transparent)], so its address equals the inner T's address.
+        // `Cell<VtlState>` is `#[repr(transparent)]`, so its address equals
+        // the inner `VtlState`'s address.  Assembly code (`SAVE_VTL_STATE_ASM`
+        // / `LOAD_VTL_STATE_ASM`) pushes/pops registers directly to/from this
+        // address.  This is sound because the assembly executes outside any
+        // Rust reference scope and the Cell is only accessed in Rust between
+        // the save and load points (i.e., while VTL1 is executing).
         let vtl0_state_top_addr =
             TruncateExt::<usize>::truncate(&raw const per_cpu_variables.vtl0_state as u64)
                 + core::mem::size_of::<VtlState>();
