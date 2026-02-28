@@ -477,7 +477,7 @@ pub fn allocate_own_per_cpu_variables() {
 ///
 /// Must be called **after** [`allocate_own_per_cpu_variables`] (so GSBASE is
 /// set) and **after** switching to the kernel stack — the CPUID queries and
-/// `avec!` allocations inside [`PerCpuVariables::allocate_xsave_area`] use
+/// `avec!` allocations inside `PerCpuVariables::allocate_xsave_area` use
 /// significant stack space that exceeds the 4 KiB boot stack.
 pub fn allocate_own_xsave_area() {
     with_per_cpu_variables_asm(|pcv_asm| {
