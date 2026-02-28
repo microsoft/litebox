@@ -605,6 +605,24 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Check whether the process-wide alarm deadline has passed and, if so,
+    /// enqueue `SIGALRM`.
+    pub(crate) fn check_alarm_deadline(&self) {
+        use litebox::platform::TimeProvider as _;
+        let mut alarm = self.process().alarm_timer.lock();
+        if alarm
+            .as_ref()
+            .is_some_and(|alarm| self.global.platform.now() >= alarm.deadline)
+        {
+            *alarm = None;
+            drop(alarm);
+            self.send_shared_signal(
+                litebox_common_linux::signal::Signal::SIGALRM,
+                siginfo_kill(litebox_common_linux::signal::Signal::SIGALRM),
+            );
+        }
+    }
+
     pub(crate) fn take_pending_signals(&self, sig: litebox::shim::Signal) {
         let signal = match sig {
             litebox::shim::Signal::SIGALRM => litebox_common_linux::signal::Signal::SIGALRM,

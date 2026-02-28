@@ -819,6 +819,112 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
     }
 }
 
+impl litebox::platform::TimerProvider for WindowsUserland {
+    type TimerHandle = TimerHandle;
+
+    const SUPPORTS_TIMER: bool = true;
+
+    fn create_timer(&self, signal: litebox::shim::Signal) -> Self::TimerHandle {
+        let ctx = Box::new(TimerCallbackContext { signal });
+
+        // Create a threadpool timer with the callback registered up-front.
+        // The callback fires whenever the timer is armed via
+        // `SetThreadpoolTimer` and the due time elapses.
+        //
+        // Safety: We pass a raw pointer to `ctx` which is heap-allocated via
+        // `Box` and lives as long as the `TimerHandle`. The `Drop` impl
+        // cancels and waits for all in-flight callbacks before the `Box` is
+        // dropped, so the pointer remains valid for every callback invocation.
+        let tp_timer = unsafe {
+            Win32_Threading::CreateThreadpoolTimer(
+                Some(threadpool_timer_callback),
+                &raw const *ctx as *mut c_void,
+                std::ptr::null(),
+            )
+        };
+        assert!(
+            tp_timer != 0,
+            "CreateThreadpoolTimer failed: {}",
+            std::io::Error::last_os_error()
+        );
+        TimerHandle {
+            tp_timer,
+            _ctx: ctx,
+        }
+    }
+}
+
+pub struct TimerHandle {
+    tp_timer: Win32_Threading::PTP_TIMER,
+    /// Prevent the context from being dropped while the timer is alive.
+    /// The raw pointer passed to the threadpool callback points into this box.
+    _ctx: Box<TimerCallbackContext>,
+}
+
+impl Drop for TimerHandle {
+    fn drop(&mut self) {
+        // Cancel any pending callback, wait for in-flight callbacks to
+        // complete, then close the threadpool timer.
+        //
+        // After this sequence completes the callback will never run again, so
+        // it is safe to let `self.ctx` (the `Box`) drop normally.
+        unsafe {
+            Win32_Threading::SetThreadpoolTimer(self.tp_timer, std::ptr::null(), 0, 0);
+            Win32_Threading::WaitForThreadpoolTimerCallbacks(self.tp_timer, 1);
+            Win32_Threading::CloseThreadpoolTimer(self.tp_timer);
+        }
+    }
+}
+
+impl litebox::platform::TimerHandle for TimerHandle {
+    fn set_timer(&self, duration: core::time::Duration) {
+        // Due time is in 100 ns intervals; negative means relative.
+        // Pack into a FILETIME for SetThreadpoolTimer.
+        let due_time_100ns: i64 = {
+            let intervals = duration.as_nanos() / 100;
+            -(i64::try_from(intervals).unwrap_or(i64::MAX))
+        };
+        let due_time = FILETIME {
+            dwLowDateTime: due_time_100ns.cast_unsigned().truncate(),
+            dwHighDateTime: (due_time_100ns >> 32).cast_unsigned().truncate(),
+        };
+
+        // Arm the threadpool timer. The callback registered at creation
+        // time will fire after `duration` elapses.
+        unsafe {
+            Win32_Threading::SetThreadpoolTimer(
+                self.tp_timer,
+                &raw const due_time,
+                0, // no repeat
+                0, // no window
+            );
+        }
+    }
+}
+
+/// Context shared between the `TimerHandle` and the threadpool timer callback.
+struct TimerCallbackContext {
+    signal: litebox::shim::Signal,
+}
+
+/// Threadpool timer callback registered via `CreateThreadpoolTimer`.
+///
+/// Picks an arbitrary active thread and delivers the signal.
+unsafe extern "system" fn threadpool_timer_callback(
+    _instance: Win32_Threading::PTP_CALLBACK_INSTANCE,
+    context: *mut c_void,
+    _timer: Win32_Threading::PTP_TIMER,
+) {
+    // Safety: `context` points to the `TimerCallbackContext` owned by the
+    // `TimerHandle`. The handle's `Drop` impl waits for all in-flight
+    // callbacks before dropping the context, so this reference is valid.
+    let ctx = unsafe { &*context.cast::<TimerCallbackContext>() };
+    let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
+    if let Some(thread) = thread {
+        thread.deliver_signal(ctx.signal);
+    }
+}
+
 /// Console control handler registered via `SetConsoleCtrlHandler`.
 ///
 /// When the user presses Ctrl+C, this sets the SIGINT bit on every active

@@ -112,6 +112,33 @@ pub trait ThreadProvider: RawPointerProvider {
     }
 }
 
+/// Timer support for proactive signal delivery.
+///
+/// Platforms that support this should set [`SUPPORTS_TIMER`](Self::SUPPORTS_TIMER)
+/// to `true`.
+pub trait TimerProvider {
+    /// The platform-specific timer handle type.
+    type TimerHandle: TimerHandle;
+
+    /// Whether this platform supports [`TimerProvider`] for proactive timer delivery.
+    const SUPPORTS_TIMER: bool = false;
+
+    /// Create a new one-shot timer that delivers `signal` when it fires.
+    fn create_timer(&self, signal: crate::shim::Signal) -> Self::TimerHandle;
+}
+
+/// A handle to a platform timer created by [`TimerProvider::create_timer`].
+///
+/// Dropping the handle **must** cancel any pending timer and ensure that the
+/// associated callback will not fire after the drop returns.
+pub trait TimerHandle {
+    /// Arm (or re-arm) the timer to fire after `duration` elapses.
+    ///
+    /// If the timer is already armed, the previous deadline is replaced.
+    /// A zero duration cancels the timer without firing.
+    fn set_timer(&self, duration: core::time::Duration);
+}
+
 /// Provider for consuming platform-originating signals.
 ///
 /// Platforms can record signals (e.g., `SIGINT`) and the shim should call
