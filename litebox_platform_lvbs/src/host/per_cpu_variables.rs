@@ -12,7 +12,7 @@ use crate::{
 };
 use aligned_vec::avec;
 use alloc::boxed::Box;
-use core::cell::{Cell, RefCell};
+use core::cell::{Cell, OnceCell, UnsafeCell};
 use core::mem::offset_of;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::{rdgsbase, wrgsbase};
@@ -23,24 +23,43 @@ pub const EXCEPTION_STACK_SIZE: usize = PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
 
 /// Per-CPU VTL1 kernel variables
-#[repr(align(4096))]
-#[derive(Clone, Copy)]
+///
+/// `PerCpuVariablesAsm` must be the first field so that assembly code
+/// can access it at GS offset 0 (guaranteed by `#[repr(C)]`).
+#[repr(C, align(4096))]
 pub struct PerCpuVariables {
-    hv_vp_assist_page: [u8; PAGE_SIZE],
-    hv_simp_page: [u8; PAGE_SIZE],
+    /// Assembly-accessible fields at GS offset 0 (`gs:[offset]` in inline asm).
+    ///
+    /// All fields use `Cell<T>` for interior mutability, so they can be accessed
+    /// through `&PerCpuVariables` without requiring `&mut`.
+    pub(crate) asm: PerCpuVariablesAsm,
+    /// The hypervisor writes to this page asynchronously (e.g., `vtl_entry_reason`),
+    /// so `UnsafeCell` is required for soundness even though Rust only reads it.
+    hv_vp_assist_page: UnsafeCell<[u8; PAGE_SIZE]>,
+    hv_simp_page: UnsafeCell<[u8; PAGE_SIZE]>,
     double_fault_stack: [u8; DOUBLE_FAULT_STACK_SIZE],
     _guard_page_0: [u8; PAGE_SIZE],
     exception_stack: [u8; EXCEPTION_STACK_SIZE],
     kernel_stack: [u8; KERNEL_STACK_SIZE],
     _guard_page_1: [u8; PAGE_SIZE],
-    hvcall_input: [u8; PAGE_SIZE],
-    hvcall_output: [u8; PAGE_SIZE],
-    pub vtl0_state: VtlState,
-    pub vtl0_locked_regs: ControlRegMap,
-    pub gdt: Option<&'static gdt::GdtWrapper>,
-    pub tls: VirtAddr,
-    pub vp_index: u32,
+    hvcall_input: UnsafeCell<[u8; PAGE_SIZE]>,
+    hvcall_output: UnsafeCell<[u8; PAGE_SIZE]>,
+    pub vtl0_state: Cell<VtlState>,
+    pub vtl0_locked_regs: Cell<ControlRegMap>,
+    pub gdt: Cell<Option<&'static gdt::GdtWrapper>>,
+    pub tls: Cell<VirtAddr>,
+    /// Cached VP index from the hypervisor.  Lazily initialized on first access
+    /// via `rdmsr(HV_REGISTER_VP_INDEX)` and immutable thereafter.
+    vp_index: OnceCell<u32>,
 }
+
+// Hyper-V pages and hypercall I/O pages must be page-aligned.
+// These compile-time assertions guard against layout regressions
+// (e.g., inserting a non-page-sized field before the HV pages).
+const _: () = assert!(offset_of!(PerCpuVariables, hv_vp_assist_page) % PAGE_SIZE == 0);
+const _: () = assert!(offset_of!(PerCpuVariables, hv_simp_page) % PAGE_SIZE == 0);
+const _: () = assert!(offset_of!(PerCpuVariables, hvcall_input) % PAGE_SIZE == 0);
+const _: () = assert!(offset_of!(PerCpuVariables, hvcall_output) % PAGE_SIZE == 0);
 
 impl PerCpuVariables {
     const XSAVE_ALIGNMENT: usize = 64; // XSAVE and XRSTORE require a 64-byte aligned buffer
@@ -61,53 +80,57 @@ impl PerCpuVariables {
     }
 
     pub fn hv_vp_assist_page_as_ptr(&self) -> *const HvVpAssistPage {
-        (&raw const self.hv_vp_assist_page).cast::<HvVpAssistPage>()
+        self.hv_vp_assist_page.get().cast::<HvVpAssistPage>()
     }
 
     pub(crate) fn hv_vp_assist_page_as_u64(&self) -> u64 {
-        &raw const self.hv_vp_assist_page as u64
+        self.hv_vp_assist_page.get() as u64
     }
 
-    pub(crate) fn hv_simp_page_as_mut_ptr(&mut self) -> *mut HvMessagePage {
-        (&raw mut self.hv_simp_page).cast::<HvMessagePage>()
+    pub(crate) fn hv_simp_page_as_mut_ptr(&self) -> *mut HvMessagePage {
+        self.hv_simp_page.get().cast::<HvMessagePage>()
     }
 
     pub(crate) fn hv_simp_page_as_u64(&self) -> u64 {
         &raw const self.hv_simp_page as u64
     }
 
-    pub(crate) fn hv_hypercall_input_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
-        &raw mut self.hvcall_input
+    pub(crate) fn hv_hypercall_input_page_as_mut_ptr(&self) -> *mut [u8; PAGE_SIZE] {
+        self.hvcall_input.get()
     }
 
-    pub(crate) fn hv_hypercall_output_page_as_mut_ptr(&mut self) -> *mut [u8; PAGE_SIZE] {
-        &raw mut self.hvcall_output
+    pub(crate) fn hv_hypercall_output_page_as_mut_ptr(&self) -> *mut [u8; PAGE_SIZE] {
+        self.hvcall_output.get()
     }
 
-    pub fn set_vtl_return_value(&mut self, value: u64) {
-        self.vtl0_state.r8 = value; // LVBS uses R8 to return a value from VTL1 to VTL0
+    pub fn set_vtl_return_value(&self, value: u64) {
+        let mut state = self.vtl0_state.get();
+        state.r8 = value; // LVBS uses R8 to return a value from VTL1 to VTL0
+        self.vtl0_state.set(state);
     }
 
     /// Return the cached Hyper-V VP index for this core (which never changes during
     /// the lifetime of the core).
     ///
+    /// The value is lazily initialized on first access via `rdmsr` and cached
+    /// in a [`OnceCell`] for all subsequent reads.
+    ///
     /// # Panics
     /// Panics if the VP index returned by the hypervisor is ≥ `MAX_CORES`.
-    pub fn vp_index(&mut self) -> u32 {
-        if self.vp_index == u32::MAX {
+    pub fn vp_index(&self) -> u32 {
+        *self.vp_index.get_or_init(|| {
             let vp_index: u32 = rdmsr(HV_REGISTER_VP_INDEX).truncate();
             assert!(
                 vp_index < u32::try_from(MAX_CORES).unwrap(),
                 "VP index {vp_index} exceeds the configured processor mask"
             );
-            self.vp_index = vp_index;
-        }
-        self.vp_index
+            vp_index
+        })
     }
 
     /// Return kernel code, user code, and user data segment selectors
     pub(crate) fn get_segment_selectors(&self) -> Option<(u16, u16, u16)> {
-        self.gdt.map(gdt::GdtWrapper::get_segment_selectors)
+        self.gdt.get().map(gdt::GdtWrapper::get_segment_selectors)
     }
 
     /// Allocate XSAVE areas for saving/restoring the extended states of each core.
@@ -163,9 +186,9 @@ impl PerCpuVariables {
     }
 }
 
-/// Specify the layout of PerCpuVariables for Assembly area.
+/// Assembly-accessible per-CPU fields at the start of [`PerCpuVariables`].
 ///
-/// Unlike `litebox_platform_linux_userland`, this kernel platform does't rely on
+/// Unlike `litebox_platform_linux_userland`, this kernel platform doesn't rely on
 /// the `tbss` section to specify FS/GS offsets for per CPU variables because
 /// there is no ELF loader that will set up it.
 ///
@@ -174,10 +197,13 @@ impl PerCpuVariables {
 /// mode transitions (i.e., ring transitions through iretq/syscall) unlike userland
 /// platforms.
 ///
-/// TODO: Consider unifying with `PerCpuVariables` if possible.
+/// Page-aligned (`align(4096)`) so that the following fields in
+/// [`PerCpuVariables`] (HV pages, stacks, etc.) remain page-aligned.
+/// The alignment only adds trailing padding — it does not change
+/// the offsets of individual fields within this struct.
 #[non_exhaustive]
 #[cfg(target_arch = "x86_64")]
-#[repr(C)]
+#[repr(C, align(4096))]
 #[derive(Clone)]
 pub struct PerCpuVariablesAsm {
     /// Initial kernel stack pointer to reset the kernel stack on VTL switch
@@ -341,157 +367,70 @@ impl PerCpuVariablesAsm {
     }
 }
 
-/// Wrapper struct to maintain `RefCell` along with `PerCpuVariablesAsm`.
-/// This struct allows assembly code to read/write some PerCpuVariables area via the GS register (e.g., to
-/// save/restore RIP/RSP). Currently, `PerCpuVariables` is protected by `RefCell` such that
-/// assembly code cannot easily access it.
-///
-/// TODO: Let's consider whether we should maintain these two types of Per CPU variable areas (for Rust and
-/// assembly, respectively). This design secures Rust-side access to `PerCpuVariables` with `RefCell`,
-/// but it might be unnecessarily complex. Instead, we could use assembly code in all cases, but
-/// this might be unsafe.
-#[repr(C)]
-pub struct RefCellWrapper<T> {
-    /// Make some PerCpuVariablesAsm area be accessible via the GS register. This is mainly for assembly code
-    pcv_asm: PerCpuVariablesAsm,
-    /// RefCell which will be stored in the GS register
-    inner: RefCell<T>,
-}
-impl<T> RefCellWrapper<T> {
-    pub const fn new(value: T) -> Self {
-        Self {
-            pcv_asm: PerCpuVariablesAsm {
-                kernel_stack_ptr: Cell::new(0),
-                double_fault_stack_ptr: Cell::new(0),
-                exception_stack_ptr: Cell::new(0),
-                vtl_return_addr: Cell::new(0),
-                scratch: Cell::new(0),
-                vtl0_state_top_addr: Cell::new(0),
-                cur_kernel_stack_ptr: Cell::new(0),
-                cur_kernel_base_ptr: Cell::new(0),
-                user_context_top_addr: Cell::new(0),
-                vtl0_xsave_area_addr: Cell::new(0),
-                vtl0_xsave_mask_lo: Cell::new(0),
-                vtl0_xsave_mask_hi: Cell::new(0),
-                vtl1_kernel_xsave_area_addr: Cell::new(0),
-                vtl1_user_xsave_area_addr: Cell::new(0),
-                vtl1_xsave_mask_lo: Cell::new(0),
-                vtl1_xsave_mask_hi: Cell::new(0),
-                vtl1_kernel_xsaved: Cell::new(0),
-                vtl1_user_xsaved: Cell::new(0),
-                exception_trapno: Cell::new(0),
-            },
-            inner: RefCell::new(value),
-        }
-    }
-    pub fn get_refcell(&self) -> &RefCell<T> {
-        &self.inner
-    }
-}
-
-/// Execute a closure with a reference to the current core's per-CPU variables.
+/// Execute a closure with a shared reference to the current core's per-CPU variables.
 ///
 /// # Safety
-/// This function assumes the following:
-/// - The GSBASE register values of individual cores must be properly set (i.e., they must be different).
-/// - `get_core_id()` must return distinct APIC IDs for different cores.
-///
-/// If we cannot guarantee these assumptions, this function may result in unsafe or undefined behaviors.
+/// The GSBASE register must point to a valid, heap-allocated `PerCpuVariables`
+/// (set by [`allocate_own_per_cpu_variables`]).  Each core must have a distinct
+/// GSBASE value.
 ///
 /// # Panics
-/// Panics if GSBASE is not set, it contains a non-canonical address, or no per-CPU variables are allocated.
-/// Panics if this function is recursively called (`BorrowMutError`).
+/// Panics if GSBASE is not set or contains a non-canonical address.
 pub fn with_per_cpu_variables<F, R>(f: F) -> R
 where
     F: FnOnce(&PerCpuVariables) -> R,
     R: Sized + 'static,
 {
-    let Some(refcell) = get_refcell_of_per_cpu_variables() else {
-        panic!("No per-CPU variables are allocated");
-    };
-    let borrow = refcell.borrow();
-    let per_cpu_variables = unsafe { &**borrow };
-
-    f(per_cpu_variables)
+    let ptr = get_per_cpu_variables_ptr();
+    // Safety: per-CPU data is exclusive to this core; no other core can
+    // access it.
+    let pcv = unsafe { &*ptr };
+    f(pcv)
 }
 
-/// Execute a closure with a mutable reference to the current core's per-CPU variables.
+/// Execute a closure with a reference to the current core's assembly-accessible
+/// per-CPU variables ([`PerCpuVariablesAsm`]).
 ///
-/// # Safety
-/// This function assumes the following:
-/// - The GSBASE register values of individual cores must be properly set (i.e., they must be different).
-/// - `get_core_id()` must return distinct APIC IDs for different cores.
-///
-/// If we cannot guarantee these assumptions, this function may result in unsafe or undefined behaviors.
+/// This accesses only the `Cell`-based fields at the start of `PerCpuVariables`,
+/// which support interior mutability and can be safely shared.
 ///
 /// # Panics
-/// Panics if GSBASE is not set, it contains a non-canonical address, or no per-CPU variables are allocated.
-/// Panics if this function is recursively called (`BorrowMutError`).
-pub fn with_per_cpu_variables_mut<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut PerCpuVariables) -> R,
-    R: Sized + 'static,
-{
-    let Some(refcell) = get_refcell_of_per_cpu_variables() else {
-        panic!("No per-CPU variables are allocated");
-    };
-    let mut borrow = refcell.borrow_mut();
-    let per_cpu_variables = unsafe { &mut **borrow };
-
-    f(per_cpu_variables)
-}
-
-/// Execute a closure with a reference to the current PerCpuVariablesAsm.
-///
-/// # Panics
-/// Panics if GSBASE is not set or it contains a non-canonical address.
+/// Panics if GSBASE is not set or contains a non-canonical address.
 pub fn with_per_cpu_variables_asm<F, R>(f: F) -> R
 where
     F: FnOnce(&PerCpuVariablesAsm) -> R,
     R: Sized + 'static,
 {
-    let pcv_asm_addr = unsafe {
-        let gsbase = rdgsbase();
-        let addr = VirtAddr::try_new(gsbase as u64).expect("GS contains a non-canonical address");
-        addr.as_ptr::<RefCellWrapper<*mut PerCpuVariables>>()
-            .cast::<PerCpuVariablesAsm>()
-    };
-    let pcv_asm = unsafe { &*pcv_asm_addr };
-
+    let ptr = get_per_cpu_variables_ptr();
+    // Safety: `asm` is the first field (#[repr(C)]) so its address equals
+    // the struct address.  All fields are Cell-based, so &-access is safe.
+    let pcv_asm = unsafe { &(*ptr).asm };
     f(pcv_asm)
 }
 
-/// Get the `RefCell` that contains a pointer to the current core's per-CPU variables.
+/// Get a raw pointer to the current core's `PerCpuVariables` from GSBASE.
 ///
-/// The caller must have already called [`allocate_own_per_cpu_variables`] so that
-/// GSBASE points to a valid heap-allocated `RefCellWrapper`.
-///
-/// Returns `None` if the inner pointer is still null (PCV not yet allocated).
-fn get_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut PerCpuVariables>> {
+/// # Panics
+/// Panics if GSBASE is zero or non-canonical.
+fn get_per_cpu_variables_ptr() -> *mut PerCpuVariables {
     let gsbase = unsafe { rdgsbase() };
     assert!(
         gsbase != 0,
         "GSBASE not set — call allocate_own_per_cpu_variables() first"
     );
-    let addr = VirtAddr::try_new(gsbase as u64).expect("GS contains a non-canonical address");
-    // Safety: GSBASE was set by `allocate_own_per_cpu_variables` to point at a
-    // leaked `Box<RefCellWrapper<*mut PerCpuVariables>>`.
-    let refcell_wrapper = unsafe { &*addr.as_ptr::<RefCellWrapper<*mut PerCpuVariables>>() };
-    let refcell = refcell_wrapper.get_refcell();
-    if refcell.borrow().is_null() {
-        None
-    } else {
-        Some(refcell)
-    }
+    let _ = VirtAddr::try_new(gsbase as u64).expect("GS contains a non-canonical address");
+    gsbase as *mut PerCpuVariables
 }
 
-/// Heap-allocate this core's per-CPU variables, `RefCellWrapper`, and XSAVE
-/// areas, then set GSBASE to point at the wrapper.
+/// Heap-allocate this core's per-CPU variables and set GSBASE to point at them.
 ///
 /// Every core (BSP and AP) calls this exactly once during its boot path,
 /// **before** [`init_per_cpu_variables`].  Because APs enter VTL1 one at a
 /// time (via `hvcall_enable_vp_vtl`), they share the 4 KiB boot stack page
 /// and can safely heap-allocate here.
+///
+/// GSBASE will point directly at the `PerCpuVariables` struct, so assembly
+/// code can access the `asm` field at GS offset 0 (guaranteed by `#[repr(C)]`).
 ///
 /// The caller must have already:
 ///   1. Enabled FSGSBASE (`enable_fsgsbase()`).
@@ -503,24 +442,18 @@ fn get_refcell_of_per_cpu_variables() -> Option<&'static RefCell<*mut PerCpuVari
 pub fn allocate_own_per_cpu_variables() {
     let mut per_cpu_variables = Box::<PerCpuVariables>::new_uninit();
     // Safety: `PerCpuVariables` is too large for the stack, so we zero-init
-    // via `write_bytes` then fix up `vp_index` to the `u32::MAX` sentinel
-    // before calling `assume_init`.
+    // via `write_bytes`.  Zero is valid for all field types:
+    // arrays of u8, Cell<T>, UnsafeCell<T>, OnceCell<T> (zero = None),
+    // VtlState, ControlRegMap, etc.
     let per_cpu_variables = unsafe {
         let ptr = per_cpu_variables.as_mut_ptr();
         ptr.write_bytes(0, 1);
-        (*ptr).vp_index = u32::MAX;
         per_cpu_variables.assume_init()
     };
 
-    // Heap-allocate the RefCellWrapper and leak it (lives for the core's
-    // lifetime).  GSBASE will point here so assembly code can access
-    // PerCpuVariablesAsm at GS offset 0.
-    let wrapper = Box::leak(Box::new(RefCellWrapper::new(Box::into_raw(
-        per_cpu_variables,
-    ))));
-
-    // Set GSBASE so that subsequent GS-relative accesses find this wrapper.
-    let addr = &raw const *wrapper as u64;
+    // Leak the box so it lives for the core's lifetime.
+    let pcv = Box::leak(per_cpu_variables);
+    let addr = &raw const *pcv as u64;
     unsafe {
         wrgsbase(addr.truncate());
     }
@@ -547,7 +480,7 @@ pub fn allocate_own_xsave_area() {
 /// Panics if the per-CPU variables are not properly initialized.
 pub fn init_per_cpu_variables() {
     const STACK_ALIGNMENT: usize = 16;
-    with_per_cpu_variables_mut(|per_cpu_variables| {
+    with_per_cpu_variables(|per_cpu_variables| {
         let kernel_sp = TruncateExt::<usize>::truncate(per_cpu_variables.kernel_stack_top())
             & !(STACK_ALIGNMENT - 1);
         let double_fault_sp =
@@ -555,15 +488,18 @@ pub fn init_per_cpu_variables() {
                 & !(STACK_ALIGNMENT - 1);
         let exception_sp = TruncateExt::<usize>::truncate(per_cpu_variables.exception_stack_top())
             & !(STACK_ALIGNMENT - 1);
+        // Cell<VtlState> is #[repr(transparent)], so its address equals the inner T's address.
         let vtl0_state_top_addr =
             TruncateExt::<usize>::truncate(&raw const per_cpu_variables.vtl0_state as u64)
                 + core::mem::size_of::<VtlState>();
-        with_per_cpu_variables_asm(|pcv_asm| {
-            pcv_asm.set_kernel_stack_ptr(kernel_sp);
-            pcv_asm.set_double_fault_stack_ptr(double_fault_sp);
-            pcv_asm.set_exception_stack_ptr(exception_sp);
-            pcv_asm.set_vtl0_state_top_addr(vtl0_state_top_addr);
-        });
+        per_cpu_variables.asm.set_kernel_stack_ptr(kernel_sp);
+        per_cpu_variables
+            .asm
+            .set_double_fault_stack_ptr(double_fault_sp);
+        per_cpu_variables.asm.set_exception_stack_ptr(exception_sp);
+        per_cpu_variables
+            .asm
+            .set_vtl0_state_top_addr(vtl0_state_top_addr);
     });
 }
 

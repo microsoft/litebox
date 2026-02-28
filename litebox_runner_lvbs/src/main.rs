@@ -344,8 +344,8 @@ unsafe extern "C" fn common_start(is_bsp: bool) -> ! {
         litebox_runner_lvbs::seed_initial_heap();
     }
 
-    // Each core heap-allocates its own PerCpuVariables, RefCellWrapper, and
-    // XSAVE areas, then sets GSBASE.
+    // Each core heap-allocates its own PerCpuVariables and sets GSBASE
+    // to point at it (assembly fields are at GS offset 0).
     allocate_own_per_cpu_variables();
 
     init_per_cpu_variables();

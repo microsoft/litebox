@@ -4,7 +4,7 @@
 //! Global Descriptor Table (GDT) and Task State Segment (TSS)
 
 use crate::host::per_cpu_variables::{
-    PerCpuVariablesAsm, with_per_cpu_variables_asm, with_per_cpu_variables_mut,
+    PerCpuVariablesAsm, with_per_cpu_variables, with_per_cpu_variables_asm,
 };
 use alloc::boxed::Box;
 use x86_64::{
@@ -123,8 +123,8 @@ fn setup_gdt_tss() {
         load_tss(gdt.selectors.tss);
     }
 
-    with_per_cpu_variables_mut(|per_cpu_variables| {
-        per_cpu_variables.gdt = Some(gdt);
+    with_per_cpu_variables(|per_cpu_variables| {
+        per_cpu_variables.gdt.set(Some(gdt));
     });
 }
 

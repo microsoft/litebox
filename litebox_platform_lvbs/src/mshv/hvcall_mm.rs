@@ -12,7 +12,7 @@ use crate::mshv::{
     vtl_switch::{is_only_vp_in_vtl1, vtl1_vp_mask},
 };
 use crate::{
-    host::per_cpu_variables::with_per_cpu_variables_mut,
+    host::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         HV_PARTITION_ID_SELF, HVCALL_MODIFY_VTL_PROTECTION_MASK, HvInputModifyVtlProtectionMask,
         HvInputVtl, HvPageProtFlags,
@@ -49,7 +49,7 @@ pub fn hv_modify_vtl_protection_mask(
     num_pages: u64,
     page_access: HvPageProtFlags,
 ) -> Result<u64, HypervCallError> {
-    let hvin = with_per_cpu_variables_mut(|per_cpu_variables| unsafe {
+    let hvin = with_per_cpu_variables(|per_cpu_variables| unsafe {
         &mut *per_cpu_variables
             .hv_hypercall_input_page_as_mut_ptr()
             .cast::<HvInputModifyVtlProtectionMask>()
@@ -110,7 +110,7 @@ pub(crate) fn hv_flush_virtual_address_space() -> Result<(), HypervCallError> {
         "caller is in VTL1 but VP mask is empty"
     );
 
-    let input = with_per_cpu_variables_mut(|pcv| unsafe {
+    let input = with_per_cpu_variables(|pcv| unsafe {
         &mut *pcv
             .hv_hypercall_input_page_as_mut_ptr()
             .cast::<HvInputFlushVirtualAddressSpaceEx>()
@@ -168,7 +168,7 @@ pub(crate) fn hv_flush_virtual_address_list(
         "caller is in VTL1 but VP mask is empty"
     );
 
-    let input = with_per_cpu_variables_mut(|pcv| unsafe {
+    let input = with_per_cpu_variables(|pcv| unsafe {
         &mut *pcv
             .hv_hypercall_input_page_as_mut_ptr()
             .cast::<HvInputFlushVirtualAddressListEx>()

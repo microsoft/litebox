@@ -11,7 +11,7 @@ use crate::{
     host::{
         bootparam::get_vtl1_memory_info,
         linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
-        per_cpu_variables::with_per_cpu_variables_mut,
+        per_cpu_variables::with_per_cpu_variables,
     },
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
@@ -1006,14 +1006,18 @@ impl ControlRegMap {
 
 #[allow(clippy::unnecessary_wraps)]
 fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
-    let reg_names = with_per_cpu_variables_mut(|per_cpu_variables| {
-        per_cpu_variables.vtl0_locked_regs.init();
-        per_cpu_variables.vtl0_locked_regs.reg_names()
+    let reg_names = with_per_cpu_variables(|per_cpu_variables| {
+        let mut regs = per_cpu_variables.vtl0_locked_regs.get();
+        regs.init();
+        per_cpu_variables.vtl0_locked_regs.set(regs);
+        regs.reg_names()
     });
     for reg_name in reg_names {
         if let Ok(value) = hvcall_get_vp_vtl0_registers(reg_name) {
-            with_per_cpu_variables_mut(|per_cpu_variables| {
-                per_cpu_variables.vtl0_locked_regs.set(reg_name, value);
+            with_per_cpu_variables(|per_cpu_variables| {
+                let mut regs = per_cpu_variables.vtl0_locked_regs.get();
+                regs.set(reg_name, value);
+                per_cpu_variables.vtl0_locked_regs.set(regs);
             });
         }
     }
