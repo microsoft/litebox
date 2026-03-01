@@ -10,6 +10,7 @@ use core::{
 };
 
 use litebox::utils::ReinterpretUnsignedExt as _;
+use litebox::utils::TruncateExt as _;
 use litebox_common_linux::CloneFlags;
 
 use super::ghcb::ghcb_prints;
@@ -618,6 +619,22 @@ impl HostInterface for HostSnpInterface {
                 buf.len() as u64,
             ],
         })
+    }
+
+    fn current_system_time() -> core::time::Duration {
+        const NR_SYSCALL_CLOCK_GETTIME: u32 = 228;
+        let mut t = litebox_common_linux::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let ret = Self::syscalls(SyscallN::<2, NR_SYSCALL_CLOCK_GETTIME> {
+            args: [
+                0, /* CLOCK_REALTIME */
+                core::ptr::from_mut(&mut t) as u64,
+            ],
+        });
+        assert!(ret.is_ok(), "clock_gettime failed");
+        core::time::Duration::new(t.tv_sec.reinterpret_as_unsigned(), t.tv_nsec.truncate())
     }
 
     fn terminate_process(code: i32) -> ! {
