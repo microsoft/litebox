@@ -10,13 +10,14 @@ use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use litebox::mm::linux::PageRange;
+use litebox::platform::Instant as _;
+use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
     DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider,
     Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider,
     UnblockedOrTimedOut,
 };
-use litebox::platform::{RawMutex as _, RawPointerProvider};
 use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
 
@@ -38,6 +39,11 @@ pub struct LinuxKernel<Host: HostInterface> {
     // Invariant in `Host`: <https://doc.rust-lang.org/nomicon/phantom-data.html#table-of-phantomdata-patterns>
     host_and_task: core::marker::PhantomData<fn(Host) -> Host>,
     page_table: mm::PageTable<4096>,
+    /// The system time captured at boot, used together with [`boot_instant`](Self::boot_instant)
+    /// to derive the current system time from the monotonic clock.
+    boot_system_time: core::time::Duration,
+    /// The monotonic instant captured at boot.
+    boot_instant: Instant,
 }
 
 impl<Host: HostInterface> core::fmt::Debug for LinuxKernel<Host> {
@@ -111,12 +117,20 @@ impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
 
 impl<Host: HostInterface> LinuxKernel<Host> {
     pub fn new(init_page_table_addr: x86_64::PhysAddr) -> &'static Self {
+        // Capture the initial system time and monotonic instant so that
+        // subsequent `current_time` calls can be derived from the monotonic
+        // clock without additional host calls.
+        let boot_system_time = Host::current_system_time();
+        let boot_instant = Instant::now();
+
         // There is only one long-running platform ever expected, thus this leak is perfectly ok in
         // order to simplify usage of the platform.
         alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
             host_and_task: core::marker::PhantomData,
             // TODO: Update the init physaddr
             page_table: unsafe { mm::PageTable::new(init_page_table_addr) },
+            boot_system_time,
+            boot_instant,
         }))
     }
 
@@ -180,33 +194,16 @@ impl<Host: HostInterface> RawMutex<Host> {
         val: u32,
         timeout: Option<core::time::Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        loop {
-            // No need to wait if the value already changed.
-            if self
-                .underlying_atomic()
-                .load(core::sync::atomic::Ordering::Relaxed)
-                != val
-            {
-                return Err(ImmediatelyWokenUp);
+        match Host::block_or_maybe_timeout(&self.inner, val, timeout) {
+            Ok(()) | Err(Errno::EINTR) => Ok(UnblockedOrTimedOut::Unblocked),
+            Err(Errno::EAGAIN) => {
+                // If the futex value does not match val, then the call fails
+                // immediately with the error EAGAIN.
+                Err(ImmediatelyWokenUp)
             }
-
-            let ret = Host::block_or_maybe_timeout(&self.inner, val, timeout);
-
-            match ret {
-                Ok(()) => {
-                    return Ok(UnblockedOrTimedOut::Unblocked);
-                }
-                Err(Errno::EAGAIN | Errno::EINTR) => {
-                    // If the futex value does not match val, then the call fails
-                    // immediately with the error EAGAIN.
-                    return Err(ImmediatelyWokenUp);
-                }
-                Err(Errno::ETIMEDOUT) => {
-                    return Ok(UnblockedOrTimedOut::TimedOut);
-                }
-                Err(e) => {
-                    todo!("Error: {:?}", e);
-                }
+            Err(Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
+            Err(e) => {
+                todo!("Error: {:?}", e);
             }
         }
     }
@@ -223,7 +220,9 @@ impl<Host: HostInterface> DebugLogProvider for LinuxKernel<Host> {
 pub struct Instant(u64);
 
 /// An implementation of [`litebox::platform::SystemTime`]
-pub struct SystemTime();
+pub struct SystemTime {
+    inner: core::time::Duration,
+}
 
 impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     type Instant = Instant;
@@ -234,7 +233,19 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     }
 
     fn current_time(&self) -> Self::SystemTime {
-        unimplemented!()
+        // Derive the current system time from the monotonic clock elapsed
+        // since boot, avoiding repeated host calls.
+        //
+        // NOTE: Because the system time is only sampled once at boot and
+        // subsequent values are computed from the monotonic clock, the returned
+        // time will drift from the real system time if the host's clock
+        // is adjusted after boot (e.g. NTP step, manual set, leap-second).
+        let elapsed = Instant::now()
+            .checked_duration_since(&self.boot_instant)
+            .unwrap_or(core::time::Duration::ZERO);
+        SystemTime {
+            inner: self.boot_system_time + elapsed,
+        }
     }
 }
 
@@ -275,13 +286,14 @@ impl Instant {
 }
 
 impl litebox::platform::SystemTime for SystemTime {
-    const UNIX_EPOCH: Self = SystemTime();
+    const UNIX_EPOCH: Self = SystemTime {
+        inner: core::time::Duration::ZERO,
+    };
 
-    fn duration_since(
-        &self,
-        _earlier: &Self,
-    ) -> Result<core::time::Duration, core::time::Duration> {
-        unimplemented!()
+    fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration> {
+        self.inner
+            .checked_sub(earlier.inner)
+            .ok_or_else(|| earlier.inner.checked_sub(self.inner).unwrap())
     }
 }
 
@@ -394,6 +406,10 @@ pub trait HostInterface: 'static {
     fn read_from_stdin(buf: &mut [u8]) -> Result<usize, Errno>;
 
     fn write_to(stream: litebox::platform::StdioOutStream, buf: &[u8]) -> Result<usize, Errno>;
+
+    /// Returns the current system time as a [`Duration`](core::time::Duration) since the
+    /// UNIX epoch.
+    fn current_system_time() -> core::time::Duration;
 
     /// For Debugging
     fn log(msg: &str);
