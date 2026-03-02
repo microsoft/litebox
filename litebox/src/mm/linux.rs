@@ -315,6 +315,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         self.vmas.iter()
     }
 
+    /// Insert an already-allocated region (e.g., via CoW) without calling the platform allocator.
+    ///
+    /// Any existing tracked mappings that overlap `range` are silently removed from tracking
+    /// (without calling the platform deallocator) before inserting. Use [`Self::overlapping`] to
+    /// check for overlap before running this if needed.
+    pub(super) fn register_existing_mapping_overwrite(
+        &mut self,
+        range: PageRange<ALIGN>,
+        vma: VmArea,
+    ) {
+        self.vmas.insert(range.into(), vma);
+    }
+
     /// Gets an iterator over all the stored ranges that are
     /// either partially or completely overlapped by the given range.
     pub(super) fn overlapping(

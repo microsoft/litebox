@@ -172,6 +172,25 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// Note that the returned ranges should be `ALIGN`-aligned.
     fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>>;
+
+    /// Attempt to allocate pages with copy-on-write semantics backed by static data.
+    ///
+    /// This method allows platforms that support it to create CoW mappings instead of performing
+    /// expensive page-by-page memory copies. This is particularly useful when mapping pre-loaded
+    /// file data that was mmap'd by the host.
+    ///
+    /// The default implementation returns unsupported CoW. Platforms that DO support COW should
+    /// override this method to unlock better performance.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn try_allocate_cow_pages(
+        &self,
+        suggested_start: usize,
+        source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
+        Err(CowAllocationError::UnsupportedByPlatform)
+    }
 }
 
 /// Behavior when allocating pages at a fixed address.
@@ -242,4 +261,30 @@ pub enum PermissionUpdateError {
     Unaligned,
     #[error("provided range contains unallocated pages")]
     Unallocated,
+}
+
+/// Possible errors for [`PageManagementProvider::try_allocate_cow_pages`]
+///
+/// ```text
+///  ____________________
+/// ( Maybe the grass is )
+/// ( greener on the     )
+/// ( other side?        )
+///  --------------------
+///         o   ^__^
+///          o  (oo)\_______
+///             (__)\       )\/\
+///                 ||----w |
+///                 ||     ||
+/// ```
+#[derive(Error, Debug)]
+pub enum CowAllocationError {
+    #[error("copy-on-write page allocation is not supported for this particular platform")]
+    UnsupportedByPlatform,
+    #[error("source region is not copy-on-writable")]
+    UnsupportedSourceRegion,
+    #[error("unaligned request")]
+    Unaligned,
+    #[error("internal failure in creating CoW pages")]
+    InternalFailure,
 }
