@@ -6,7 +6,6 @@
 #![no_main]
 
 use core::arch::{asm, naked_asm};
-use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_platform_lvbs::{
     arch::{enable_extended_states, enable_fsgsbase, enable_smep_smap, instrs::hlt_loop},
     host::{
@@ -20,21 +19,6 @@ use litebox_platform_lvbs::{
 };
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
-
-/// Spinlock protecting the shared AP boot stack (`VTL1_KERNEL_STACK_PAGE`).
-///
-/// All APs receive the same initial RSP via `hvcall_enable_vp_vtl`. VTL0
-/// controls when APs enter VTL1, so multiple APs may start concurrently.
-/// Each AP spin-acquires this lock before touching the boot stack, and
-/// releases it after switching to its own heap-allocated per-CPU kernel stack.
-static AP_BOOT_STACK_LOCK: AtomicBool = AtomicBool::new(false);
-
-/// Release the AP boot stack spinlock.
-///
-/// Called after the current core has switched RSP to its per-CPU kernel stack.
-extern "C" fn release_boot_stack_lock() {
-    AP_BOOT_STACK_LOCK.store(false, Ordering::Release);
-}
 
 /// ELF64 relocation entry
 #[repr(C)]
@@ -336,32 +320,10 @@ unsafe extern "C" fn high_canonical_trampoline() -> ! {
 /// AP entry point: Entered directly by Hyper-V via `hvcall_enable_vp_vtl`
 /// (the VP context's RIP is set to this symbol). APs inherit the BSP's CR3,
 /// so they already run at high-canonical VAs and need no remap.
-///
-/// # Safety
-///
-/// Must only be used as the initial RIP for an AP's VP context.
-#[unsafe(naked)]
+#[expect(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _ap_start() -> ! {
-    naked_asm!(
-        // Spin-acquire the AP boot stack lock entirely in registers.
-        // No stack usage is permitted until the lock is held, because
-        // another AP may still be running on this same stack.
-        "lea rcx, [rip + {lock}]",
-        "2:",
-        "mov al, 1",
-        "xchg byte ptr [rcx], al",
-        "test al, al",
-        "jz 3f",
-        "pause",
-        "jmp 2b",
-        "3:",
-        // This AP has acquired the lock and exclusively owns the boot stack.
-        "xor edi, edi", // is_bsp = false
-        "jmp {common_start}",
-        lock = sym AP_BOOT_STACK_LOCK,
-        common_start = sym common_start,
-    );
+    unsafe { common_start(false) }
 }
 
 /// Shared boot path for BSP and AP cores.
@@ -385,19 +347,11 @@ unsafe extern "C" fn common_start(is_bsp: bool) -> ! {
     let is_bsp_u32 = u32::from(is_bsp);
     unsafe {
         asm!(
-            // Now use this core's heap-allocated kernel stack.
             "mov rsp, gs:[{kernel_sp_off}]",
-            // The boot stack is no longer in use. Release the AP boot stack
-            // spinlock so the next AP can proceed. For the BSP this is a
-            // harmless no-op (the lock was never held).
-            "push rdi",
-            "call {release_lock}",
-            "pop rdi",
             "call {kernel_main}",
             kernel_sp_off = const { PerCpuVariablesAsm::kernel_stack_ptr_offset() },
             in("edi") is_bsp_u32,
-            release_lock = sym release_boot_stack_lock,
-            kernel_main = sym kernel_main,
+            kernel_main = sym kernel_main
         );
     }
 
