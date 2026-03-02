@@ -119,7 +119,7 @@ fn compute_file_summary(path: &Path) -> std::io::Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let size = metadata.len();
-    Ok(format!("{}:{}", mtime.as_nanos(), size))
+    Ok(format!("{}:{}:{}", path.display(), mtime.as_nanos(), size))
 }
 
 fn compute_string_hash(content: &str) -> String {
