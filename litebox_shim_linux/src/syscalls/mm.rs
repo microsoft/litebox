@@ -156,6 +156,11 @@ impl<FS: ShimFS> Task<FS> {
             perms
         };
 
+        // XXX: `try_allocate_cow_pages` and `register_existing_mapping` are not called under a
+        // unified lock, so there is a theoretical race if two threads concurrently attempt a
+        // fixed-address mapping with replacement at the same address. In practice this is benign:
+        // if a program races like this both threads will register the same mapping anyway. Updating
+        // to a begin/attempt/commit scheme could close this race window entirely.
         match <_ as PageManagementProvider<{ PAGE_SIZE }>>::try_allocate_cow_pages(
             litebox_platform_multiplex::platform(),
             suggested_addr.unwrap_or(0),
