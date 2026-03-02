@@ -386,34 +386,66 @@ fn test_runner_with_python() {
     println!("Detected PYTHONHOME: {python_home}");
     let python_sys_path = run_python(&["-c", "import sys; print(':'.join(sys.path))"]);
     println!("Detected PYTHONPATH: {python_sys_path}");
+    let python_home = python_home.trim().to_string();
+    let python_home_dir = PathBuf::from(&python_home);
+    let python_lib_paths = python_sys_path
+        .split(':')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .filter(|path| path.starts_with(&python_home_dir))
+        .collect::<Vec<_>>();
+
+    let python_lib_paths_str = python_lib_paths
+        .iter()
+        .map(|path| path.to_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(":");
+
+    let mut paths_to_stage = std::collections::BTreeSet::new();
+    paths_to_stage.insert(python_home_dir);
+    paths_to_stage.extend(python_lib_paths.iter().cloned());
+
     Runner::new(Backend::Rewriter, &python_path, "python_rewriter")
         .args(["-c", HELLO_WORLD_PY])
         .envs([
-            &format!("PYTHONHOME={}", python_home.trim()),
-            &format!("PYTHONPATH={}", python_sys_path.trim()),
+            &format!("PYTHONHOME={python_home}"),
+            &format!("PYTHONPATH={python_lib_paths_str}"),
             // LiteBox does not support timestamp yet, so pre-compiled .pyc files are not usable.
             // Avoid creating .pyc files as tar filesystem is read-only.
             "PYTHONDONTWRITEBYTECODE=1",
         ])
         .with_fs_path(|out_dir| {
-            for each in python_sys_path.split(':') {
-                if each.is_empty() || !each.starts_with("/usr") {
+            for source_path in &paths_to_stage {
+                if !source_path.exists() {
                     continue;
                 }
-                let python_lib_src = Path::new(each);
-                if python_lib_src.is_dir() {
-                    let python_lib_dst = out_dir.join(&each[1..]); // remove leading '/'
+
+                if source_path.is_file() {
+                    let dest_path = out_dir.join(source_path.strip_prefix("/").unwrap());
+                    if !dest_path.exists() {
+                        if let Some(parent) = dest_path.parent() {
+                            std::fs::create_dir_all(parent).unwrap();
+                        }
+                        std::fs::copy(source_path, dest_path).unwrap();
+                    }
+                    continue;
+                }
+
+                if source_path.is_dir() {
+                    let python_lib_dst = out_dir.join(source_path.strip_prefix("/").unwrap());
                     if !python_lib_dst.exists() {
                         std::fs::create_dir_all(&python_lib_dst).unwrap();
                         println!(
                             "Copying python3 lib from {} to {}",
-                            python_lib_src.to_str().unwrap(),
-                            python_lib_dst.to_str().unwrap()
+                            source_path.display(),
+                            python_lib_dst.display()
                         );
                         let output = std::process::Command::new("cp")
                             .args([
                                 "-rpL", // -r for recursive, -p to preserve attributes, -L to dereference symbolic links
-                                python_lib_src.to_str().unwrap(),
+                                source_path.to_str().unwrap(),
                                 python_lib_dst.parent().unwrap().to_str().unwrap(),
                             ])
                             .output()
@@ -424,15 +456,16 @@ fn test_runner_with_python() {
                             std::str::from_utf8(output.stderr.as_slice()).unwrap()
                         );
                     }
-                    let known_exts = ["py", "pyc", "txt", "css", "ps1", "rst"];
-                    // rewrite all files under the python lib directory except those with known extensions
-                    for entry in walkdir::WalkDir::new(python_lib_src)
+
+                    // Rewrite shared objects (.so, .so.1, .so.1.2.3, etc.) under the python lib directory.
+                    for entry in walkdir::WalkDir::new(source_path)
                         .into_iter()
                         .filter_map(std::result::Result::ok)
                         .filter(|e| {
                             e.path()
-                                .extension()
-                                .is_some_and(|ext| !known_exts.contains(&ext.to_str().unwrap()))
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|name| name.contains(".so"))
                         })
                     {
                         let so_file = entry.path();
@@ -443,9 +476,7 @@ fn test_runner_with_python() {
                             so_file_dest.display()
                         );
                         let success = common::rewrite_with_cache(so_file, &so_file_dest, &[]);
-                        if entry.path().extension().is_some_and(|ext| ext == "so") {
-                            assert!(success, "failed to rewrite {} file", so_file.display());
-                        }
+                        assert!(success, "failed to rewrite {} file", so_file.display());
                     }
                 }
             }
