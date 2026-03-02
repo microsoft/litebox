@@ -131,8 +131,9 @@ impl<FS: ShimFS> Task<FS> {
             return None;
         }
 
-        // TODO(jb): Do we ever need to do NoReplace?
-        let fixed_behavior = if flags.contains(MapFlags::MAP_FIXED) {
+        let fixed_behavior = if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
+            FixedAddressBehavior::NoReplace
+        } else if flags.contains(MapFlags::MAP_FIXED) {
             FixedAddressBehavior::Replace
         } else {
             FixedAddressBehavior::Hint
