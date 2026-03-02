@@ -311,17 +311,7 @@ fn hook_syscalls_in_section(
     dl_sysinfo_int80: Option<u64>,
     trampoline_data: &mut Vec<u8>,
 ) -> Result<()> {
-    // Disassemble the section
-    let mut decoder = iced_x86::Decoder::new(
-        match arch {
-            Arch::X86_32 => 32,
-            Arch::X86_64 => 64,
-        },
-        section_data,
-        iced_x86::DecoderOptions::NONE,
-    );
-    decoder.set_ip(section_base_addr);
-    let instructions = decoder.iter().collect::<Vec<_>>();
+    let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
     for (i, inst) in instructions.iter().enumerate() {
         // Forward search for `syscall` / `int 0x80` / `call DWORD PTR gs:0x10`
         match arch {
@@ -499,23 +489,81 @@ fn get_control_transfer_targets(
     let mut control_transfer_targets = HashSet::new();
     for s in text_sections {
         let section_data = section_slice(input_binary, s)?;
-        // Disassemble the section
-        let mut decoder = iced_x86::Decoder::new(
-            match arch {
-                Arch::X86_32 => 32,
-                Arch::X86_64 => 64,
-            },
-            section_data,
-            iced_x86::DecoderOptions::NONE,
-        );
-        decoder.set_ip(s.vaddr);
-        control_transfer_targets.extend(decoder.into_iter().filter_map(|inst| {
+        let instructions = decode_section_instructions(arch, section_data, s.vaddr)?;
+        control_transfer_targets.extend(instructions.into_iter().filter_map(|inst| {
             let target = inst.near_branch_target();
             (target != 0).then_some(target)
         }));
     }
 
     Ok(control_transfer_targets)
+}
+
+const MAX_X86_INSTRUCTION_LEN: usize = 15;
+const CHUNK_OVERLAP_LEN: usize = MAX_X86_INSTRUCTION_LEN - 1;
+const TARGET_DECODE_CHUNK_LEN: usize = 8 * 1024 * 1024;
+
+fn bytes_until_next_4g_boundary(ptr: *const u8) -> usize {
+    let low = (ptr as u64) & 0xFFFF_FFFF;
+    let dist = (1u64 << 32) - low;
+    usize::try_from(dist).unwrap_or(usize::MAX)
+}
+
+// NOTE: We need to do this 4GiB boundary checking due to an iced-x86 bug which
+// has been fixed (see https://github.com/icedland/iced/pull/697) but not
+// released onto crates.io.  We handle it by making sure that we are only ever
+// sending iced-x86 inputs that are fully within the 4GiB scope.
+fn decode_section_instructions(
+    arch: Arch,
+    section_data: &[u8],
+    section_base_addr: u64,
+) -> Result<Vec<iced_x86::Instruction>> {
+    let bitness = match arch {
+        Arch::X86_32 => 32,
+        Arch::X86_64 => 64,
+    };
+
+    let mut instructions = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < section_data.len() {
+        let remaining = &section_data[offset..];
+        let boundary_cap = remaining
+            .len()
+            .min(bytes_until_next_4g_boundary(remaining.as_ptr()));
+        assert!(boundary_cap > 0);
+
+        let chunk_advance_len = boundary_cap.min(TARGET_DECODE_CHUNK_LEN);
+        let decode_window_len = remaining.len().min(chunk_advance_len + CHUNK_OVERLAP_LEN);
+        let chunk_start_ip = section_base_addr + offset as u64;
+        let chunk_end_ip = chunk_start_ip + chunk_advance_len as u64;
+
+        let mut decoder = iced_x86::Decoder::new(
+            bitness,
+            &remaining[..decode_window_len],
+            iced_x86::DecoderOptions::NONE,
+        );
+        decoder.set_ip(chunk_start_ip);
+
+        for inst in &mut decoder {
+            if inst.len() == 0 {
+                return Err(Error::DisassemblyFailure(format!(
+                    "iced-x86 decoded zero-length instruction at {:#x}",
+                    inst.ip()
+                )));
+            }
+
+            if inst.ip() >= chunk_end_ip {
+                break;
+            }
+
+            instructions.push(inst);
+        }
+
+        offset = offset.checked_add(chunk_advance_len).unwrap();
+    }
+
+    Ok(instructions)
 }
 
 /// Returns the section data slice from `buf` corresponding to `section`, or an error if out of bounds.
