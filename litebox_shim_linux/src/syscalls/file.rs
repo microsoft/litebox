@@ -246,7 +246,8 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        let fs_path = FsPath::new(dirfd, pathname, || self.fs.borrow().cwd.read().clone())?;
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         match fs_path {
             FsPath::Absolute { path } => {
                 if flags.contains(AtFlags::AT_REMOVEDIR) {
@@ -707,7 +708,8 @@ impl<FS: ShimFS> Task<FS> {
         pathname: impl path::Arg,
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
-        let fspath = FsPath::new(dirfd, pathname, || self.fs.borrow().cwd.read().clone())?;
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fspath = FsPath::new(dirfd, pathname, get_cwd)?;
         let path = match fspath {
             FsPath::Absolute { path } => {
                 self.do_readlink(path.to_str().map_err(|_| Errno::EINVAL)?)
