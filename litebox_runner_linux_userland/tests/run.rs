@@ -404,7 +404,7 @@ fn test_runner_with_python() {
         .join(":");
 
     let mut paths_to_stage = std::collections::BTreeSet::new();
-    paths_to_stage.insert(python_home_dir);
+    // paths_to_stage.insert(python_home_dir);
     paths_to_stage.extend(python_lib_paths.iter().cloned());
 
     Runner::new(Backend::Rewriter, &python_path, "python_rewriter")
@@ -492,6 +492,8 @@ fn test_runner_with_python() {
                     }
                 }
             }
+
+            let _ = std::fs::remove_file(out_dir.join("usr/lib/x86_64-linux-gnu/gconv/gconv-modules.cache"));
         })
         .run();
 }
