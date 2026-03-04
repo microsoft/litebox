@@ -461,11 +461,23 @@ fn test_runner_with_python() {
                     for entry in walkdir::WalkDir::new(source_path)
                         .into_iter()
                         .filter_map(std::result::Result::ok)
+                        .filter(|e| e.file_type().is_file())
                         .filter(|e| {
                             e.path()
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .is_some_and(|name| name.contains(".so"))
+                        })
+                        // Skip non-ELF files (e.g., linker scripts like libcurses.so)
+                        .filter(|e| {
+                            let mut magic = [0u8; 4];
+                            std::fs::File::open(e.path())
+                                .and_then(|mut f| {
+                                    use std::io::Read;
+                                    f.read_exact(&mut magic)
+                                })
+                                .is_ok()
+                                && magic == *b"\x7fELF"
                         })
                     {
                         let so_file = entry.path();

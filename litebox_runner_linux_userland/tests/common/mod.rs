@@ -169,6 +169,11 @@ pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&
         output_path.display()
     );
 
+    // Remove the existing output file if present.
+    if output_path.exists() {
+        std::fs::remove_file(output_path).unwrap();
+    }
+
     let output = std::process::Command::new(&cargo)
         .args(args)
         .output()
