@@ -1,0 +1,13 @@
+[package]
+name = "litebox_packager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.97"
+clap = { version = "4.5.33", features = ["derive"] }
+litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
+tar = "0.4"
+
+[lints]
+workspace = true

@@ -19,7 +19,15 @@ fn main() {
         .env("ARCH", target_arch);
     if std::env::var("PROFILE").unwrap_or_default() == "debug" {
         make_cmd.env("DEBUG", "1");
+    } else {
+        // Explicitly remove DEBUG to prevent inheriting it from the
+        // parent environment, which would cause the C library to be
+        // built with debug prints enabled.
+        make_cmd.env_remove("DEBUG");
     }
+    // Force rebuild in case CFLAGS changed (e.g., debug -> release) but
+    // the source did not.
+    let _ = std::fs::remove_file(out_dir.join("litebox_rtld_audit.so"));
     let output = make_cmd
         .output()
         .expect("Failed to execute make for rtld_audit");
