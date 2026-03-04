@@ -229,12 +229,11 @@ pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
     // has high-canonical mappings, so these are ready to use as-is for the
     // AP's initial VP context.
     let rip: u64 = get_entry();
-    // SAFETY: We dont support concurrent AP/VTL initialization and thus share
-    // the same stack pointer. If we plan to support concurrent initialization,
-    // we should provide seperate stack pointers for each AP (which might not
-    // scale if there are several 100s of APs).
+    // All APs share this single boot stack. `_ap_start` spin-acquires
+    // `AP_BOOT_STACK_LOCK` before touching the stack and releases it after
+    // switching to a per-CPU kernel stack, so concurrent AP entry is safe.
     //
-    // This RSP is part of `HV_INITIAL_VP_CONTEXT` provided to the Hyper-V
+    // This RSP is part of `HV_INITIAL_VP_CONTEXT` provided to Hyper-V
     // via `HvCallEnableVpVtl`. It is expected to be 16-byte aligned.
     let rsp = get_address_of_special_page(VTL1_KERNEL_STACK_PAGE) + PAGE_SIZE as u64;
     let tss = get_address_of_special_page(VTL1_TSS_PAGE);
