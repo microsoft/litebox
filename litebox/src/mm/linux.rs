@@ -55,6 +55,27 @@ bitflags::bitflags! {
     }
 }
 
+impl VmFlags {
+    /// Compute the default `VM_MAY*` and `VM_SHARED` flags for a mapping.
+    ///
+    /// Write permission (`VM_MAYWRITE`) is restricted only for shared **file-backed**
+    /// mappings, because writes cannot be propagated back to the underlying file.
+    pub(super) fn may_flags_for_mapping(shared: bool, file_backed: bool) -> Self {
+        let restrict_write = shared && file_backed;
+        let may = if restrict_write {
+            Self::VM_MAY_ACCESS_FLAGS & !Self::VM_MAYWRITE
+        } else {
+            Self::VM_MAY_ACCESS_FLAGS
+        };
+        let shared_flag = if shared {
+            Self::VM_SHARED
+        } else {
+            Self::empty()
+        };
+        may | shared_flag
+    }
+}
+
 impl From<MemoryRegionPermissions> for VmFlags {
     fn from(value: MemoryRegionPermissions) -> Self {
         let mut flags = VmFlags::empty();
@@ -120,6 +141,8 @@ bitflags::bitflags! {
         /// When combined with [`Self::FIXED_ADDR`], fail with [`AllocationError::AddressInUse`]
         /// if any part of the range is already mapped, instead of replacing existing mappings.
         const NOREPLACE = 1 << 5;
+        /// The mapping is shared.
+        const SHARED = 1 << 6;
     }
 }
 
@@ -808,13 +831,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         flags: CreatePagesFlags,
         perms: MemoryRegionPermissions,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        let shared = flags.contains(CreatePagesFlags::SHARED);
+        let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
         unsafe {
             self.create_mapping(
                 suggested_new_address,
                 length,
                 VmArea::new(
                     VmFlags::from(perms)
-                        | VmFlags::VM_MAY_ACCESS_FLAGS
+                        | VmFlags::may_flags_for_mapping(shared, file_backed)
                         | if flags.contains(CreatePagesFlags::IS_STACK) {
                             VmFlags::VM_GROWSDOWN
                         } else {
