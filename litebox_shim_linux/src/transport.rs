@@ -131,10 +131,7 @@ impl transport::Write for ShimTransport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
+#[cfg(not(target_os = "windows"))]
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -151,10 +148,6 @@ mod tests {
     use super::*;
 
     const TUN_DEVICE_NAME: &str = "tun99";
-
-    // -----------------------------------------------------------------------
-    // diod server management (mirrors litebox/src/fs/nine_p/tests.rs)
-    // -----------------------------------------------------------------------
 
     fn find_free_port() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind to port 0");
@@ -213,10 +206,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Test helpers
-    // -----------------------------------------------------------------------
-
     /// Helper to create a `SocketAddr` for connection.
     fn socket_addr(ip: [u8; 4], port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(
@@ -229,8 +218,6 @@ mod tests {
         task: &crate::Task<crate::DefaultFS>,
         server: &DiodServer,
     ) -> nine_p::FileSystem<crate::Platform, ShimTransport> {
-        // The diod server is reachable at the gateway address (10.0.0.1) from the shim's
-        // network perspective, since the TUN device bridges to the host.
         let addr = socket_addr([10, 0, 0, 1], server.port);
         let transport = ShimTransport::connect(task.global.clone(), addr)
             .expect("failed to connect to 9P server via shim network");
