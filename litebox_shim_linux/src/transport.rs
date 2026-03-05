@@ -131,7 +131,8 @@ impl transport::Write for ShimTransport {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+// require network support
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     extern crate std;
