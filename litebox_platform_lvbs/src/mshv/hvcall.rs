@@ -4,10 +4,7 @@
 //! Hyper-V Hypercall functions
 
 use crate::{
-    arch::{
-        get_core_id,
-        instrs::{rdmsr, wrmsr},
-    },
+    arch::instrs::{rdmsr, wrmsr},
     debug_serial_println,
     host::{LvbsLinuxKernel, hv_hypercall_page_address, per_cpu_variables::with_per_cpu_variables},
     mm::MemoryProvider,
@@ -56,29 +53,17 @@ fn generate_guest_id(dinfo1: u64, kernver: u64, dinfo2: u64) -> u64 {
 fn check_hyperv() -> Result<(), HypervError> {
     use core::arch::x86_64::__cpuid_count as cpuid_count;
 
-    #[allow(
-        unused_unsafe,
-        reason = "cpuid_count is safe on stable 1.94+ but unsafe on nightly 1.91"
-    )]
-    let result = unsafe { cpuid_count(CPU_VERSION_INFO, 0x0) };
+    let result = cpuid_count(CPU_VERSION_INFO, 0x0);
     if result.ecx & HYPERV_HYPERVISOR_PRESENT_BIT == 0 {
         return Err(HypervError::NonVirtualized);
     }
 
-    #[allow(
-        unused_unsafe,
-        reason = "cpuid_count is safe on stable 1.94+ but unsafe on nightly 1.91"
-    )]
-    let result = unsafe { cpuid_count(HYPERV_CPUID_INTERFACE, 0x0) };
+    let result = cpuid_count(HYPERV_CPUID_INTERFACE, 0x0);
     if result.eax != HV_CPUID_SIGNATURE_EAX {
         return Err(HypervError::NonHyperv);
     }
 
-    #[allow(
-        unused_unsafe,
-        reason = "cpuid_count is safe on stable 1.94+ but unsafe on nightly 1.91"
-    )]
-    let result = unsafe { cpuid_count(HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, 0x0) };
+    let result = cpuid_count(HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, 0x0);
     if result.eax < HYPERV_CPUID_IMPLEMENT_LIMITS {
         return Err(HypervError::NoVTLSupport);
     }
@@ -87,10 +72,11 @@ fn check_hyperv() -> Result<(), HypervError> {
 }
 
 /// Enable Hyper-V Hypercalls by initializing MSR and VP registers (for a core)
+///
 /// # Panics
 /// Panics if the underlying hardware/platform is not Hyper-V
 /// Panics if the MSR/VP registers writes fail
-pub fn init() -> Result<(), HypervError> {
+pub fn init(is_bsp: bool) -> Result<(), HypervError> {
     check_hyperv()?;
 
     debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
@@ -125,7 +111,7 @@ pub fn init() -> Result<(), HypervError> {
     if guest_id != rdmsr(HV_X64_MSR_GUEST_OS_ID) {
         return Err(HypervError::InvalidGuestOSID);
     }
-    if get_core_id() == 0 {
+    if is_bsp {
         debug_serial_println!(
             "HV_X64_MSR_GUEST_OS_ID: {:#x}",
             rdmsr(HV_X64_MSR_GUEST_OS_ID)
@@ -168,13 +154,13 @@ pub fn init() -> Result<(), HypervError> {
     sint.set_auto_eoi(true);
 
     wrmsr(HV_X64_MSR_SINT0, sint.as_uint64());
-    if get_core_id() == 0 {
+    if is_bsp {
         debug_serial_println!("HV_X64_MSR_SINT0: {:#x}", rdmsr(HV_X64_MSR_SINT0));
     }
 
     wrmsr(HV_X64_MSR_SCONTROL, u64::from(HV_X64_MSR_SCONTROL_ENABLE));
 
-    vsm::init();
+    vsm::init(is_bsp);
 
     Ok(())
 }
