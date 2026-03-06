@@ -180,6 +180,7 @@ impl<FS: ShimFS> Task<FS> {
                         permissions,
                         true,
                         fixed_behavior == FixedAddressBehavior::Replace,
+                        flags.contains(MapFlags::MAP_SHARED),
                     )
                 }
                 .unwrap();
@@ -254,9 +255,23 @@ impl<FS: ShimFS> Task<FS> {
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
         }
+
+        // MAP_SHARED is partially supported:
+        // - Anonymous shared mappings are fully supported (no backing file concerns).
+        //   Note: since fork is not yet supported, shared anonymous mappings behave
+        //   identically to private ones (no cross-process sharing occurs).
+        // - File-backed shared mappings are read-only: writable permission is rejected
+        //   upfront and cannot be added later via mprotect, because writes cannot be
+        //   propagated back to the underlying file.
+        if flags.contains(MapFlags::MAP_SHARED)
+            && prot.contains(ProtFlags::PROT_WRITE)
+            && !flags.contains(MapFlags::MAP_ANONYMOUS)
+        {
+            todo!("MAP_SHARED with PROT_WRITE on file-backed mappings is not supported");
+        }
+
         if flags.intersects(
-            MapFlags::MAP_SHARED
-                | MapFlags::MAP_32BIT
+            MapFlags::MAP_32BIT
                 | MapFlags::MAP_GROWSDOWN
                 | MapFlags::MAP_LOCKED
                 | MapFlags::MAP_NONBLOCK
@@ -636,6 +651,94 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, Errno::ENOMEM);
+    }
+
+    #[test]
+    fn test_map_shared_anonymous() {
+        let task = init_platform(None);
+
+        // MAP_SHARED | MAP_ANON with PROT_READ should succeed
+        let addr = task
+            .sys_mmap(
+                0,
+                0x2000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_ANON | MapFlags::MAP_SHARED,
+                -1,
+                0,
+            )
+            .unwrap();
+
+        // Reading should work
+        let _val: u8 = addr.read_at_offset(0).unwrap();
+
+        // Anonymous shared mappings allow permission changes including write
+        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+            .unwrap();
+        addr.write_slice_at_offset(0, &[0xab; 0x10]).unwrap();
+        assert_eq!(addr.read_at_offset(0).unwrap(), 0xab_u8);
+
+        // mprotect to read-only or read-exec should also succeed
+        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ)
+            .unwrap();
+        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+
+        task.sys_munmap(addr, 0x2000).unwrap();
+    }
+
+    #[test]
+    fn test_map_shared_anonymous_writable() {
+        let task = init_platform(None);
+
+        // MAP_SHARED | MAP_ANON with PROT_WRITE should succeed
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_SHARED,
+                -1,
+                0,
+            )
+            .unwrap();
+
+        addr.write_slice_at_offset(0, &[0xcd; 0x10]).unwrap();
+        assert_eq!(addr.read_at_offset(0).unwrap(), 0xcd_u8);
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+    }
+
+    #[test]
+    fn test_map_shared_readonly_file() {
+        let task = init_platform(None);
+
+        let content = b"Hello, shared!";
+        let fd = task
+            .sys_open("shared.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        assert_eq!(task.sys_write(fd, content, None).unwrap(), content.len());
+
+        // MAP_SHARED with PROT_READ on a file should succeed
+        let addr = task
+            .sys_mmap(0, 0x1000, ProtFlags::PROT_READ, MapFlags::MAP_SHARED, fd, 0)
+            .unwrap();
+
+        // Data should match
+        assert_eq!(
+            addr.to_owned_slice(content.len()).unwrap().as_ref(),
+            content.as_slice(),
+        );
+
+        // mprotect to add write permission should fail
+        let err = task
+            .sys_mprotect(addr, 0x1000, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+            .unwrap_err();
+        assert_eq!(err, Errno::EACCES);
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_close(fd).unwrap();
     }
 
     #[test]

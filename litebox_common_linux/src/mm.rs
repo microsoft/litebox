@@ -59,6 +59,10 @@ pub fn do_mmap<
             CreatePagesFlags::MAP_FILE,
             !flags.contains(MapFlags::MAP_ANONYMOUS),
         );
+        create_flags.set(
+            CreatePagesFlags::SHARED,
+            flags.contains(MapFlags::MAP_SHARED),
+        );
         create_flags
     };
     let suggested_addr = match suggested_addr {

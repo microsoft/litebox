@@ -611,9 +611,10 @@ where
         permissions: MemoryRegionPermissions,
         is_file_backed: bool,
         replace: bool,
+        shared: bool,
     ) -> Option<()> {
         let vma = VmArea::new(
-            VmFlags::from(permissions) | VmFlags::VM_MAY_ACCESS_FLAGS,
+            VmFlags::from(permissions) | VmFlags::may_flags_for_mapping(shared, is_file_backed),
             is_file_backed,
         );
         let mut vmem = self.vmem.write();
