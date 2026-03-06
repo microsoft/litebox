@@ -2,4 +2,4 @@
 # Use a nightly toolchain that matches the workspace's stable version (1.91.x).
 # Nightly is required for `-Z build-std` to compile core/alloc with SSE support.
 # When updating stable, find a nightly date with the same version number.
-channel = "nightly-2025-09-01"
+channel = "nightly-2025-12-31"
