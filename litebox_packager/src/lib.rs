@@ -186,6 +186,23 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
         });
     }
 
+    // Include the rtld audit library so the rewriter backend can load it.
+    #[cfg(target_arch = "x86_64")]
+    {
+        const RTLD_AUDIT_TAR_PATH: &str = "lib/litebox_rtld_audit.so";
+        if !added_tar_paths.insert(RTLD_AUDIT_TAR_PATH.to_string()) {
+            bail!(
+                "tar already contains {RTLD_AUDIT_TAR_PATH} -- \
+                 remove the conflicting entry or use --no-rewrite"
+            );
+        }
+        tar_entries.push(TarEntry {
+            tar_path: RTLD_AUDIT_TAR_PATH.to_string(),
+            data: include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).to_vec(),
+            mode: 0o755,
+        });
+    }
+
     // --- Phase 4: Build tar ---
     eprintln!("Creating {}...", args.output.display());
     build_tar(&tar_entries, &args.output)?;
