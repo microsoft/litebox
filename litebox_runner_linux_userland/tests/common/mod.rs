@@ -169,6 +169,14 @@ pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&
         output_path.display()
     );
 
+    // Ensure the parent directory exists, then remove any stale output file.
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    if output_path.exists() {
+        std::fs::remove_file(output_path).unwrap();
+    }
+
     let output = std::process::Command::new(&cargo)
         .args(args)
         .output()
