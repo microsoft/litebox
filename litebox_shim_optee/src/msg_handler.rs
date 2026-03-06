@@ -185,13 +185,38 @@ pub fn handle_optee_smc_args(
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
                 rpc_args: None,
+                msg_args_phys_addr: msg_args_addr as u64,
             })
         }
-        OpteeSmcFunction::CallWithRpcArg | OpteeSmcFunction::CallWithRegdArg => {
+        OpteeSmcFunction::CallWithRpcArg => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
             let msg_args_addr: usize = msg_args_addr.truncate();
             let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
-            Ok(OpteeSmcResult::CallWithArg { msg_args, rpc_args })
+            Ok(OpteeSmcResult::CallWithArg {
+                msg_args,
+                rpc_args,
+                msg_args_phys_addr: msg_args_addr as u64,
+            })
+        }
+        OpteeSmcFunction::CallWithRegdArg => {
+            // `OpteeMsgArgs` is located at the offset specified in args[3] within the shared memory region pointed by args[1]:args[2].
+            let (shm_ref, offset) = smc.optee_regd_shm_ref_and_offset()?;
+            let shm_info = shm_ref_map()
+                .get(shm_ref)
+                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            let page_index = (shm_info.page_offset + offset) / PAGE_SIZE;
+            let offset_in_page = (shm_info.page_offset + offset) % PAGE_SIZE;
+            if page_index >= shm_info.page_addrs.len() {
+                return Err(OpteeSmcReturnCode::EBadAddr);
+            }
+            let msg_args_addr = shm_info.page_addrs[page_index].as_usize() + offset_in_page;
+
+            let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
+            Ok(OpteeSmcResult::CallWithArg {
+                msg_args,
+                rpc_args,
+                msg_args_phys_addr: msg_args_addr as u64,
+            })
         }
         OpteeSmcFunction::ExchangeCapabilities => {
             // TODO: update the below when we support more features

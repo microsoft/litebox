@@ -417,10 +417,6 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
     let Ok(mut smc_args) = (unsafe { smc_args_ptr.read_at_offset(0) }) else {
         return make_error_response(OpteeSmcReturnCode::EBadAddr);
     };
-    let Ok(msg_args_phys_addr) = smc_args.optee_msg_args_phys_addr() else {
-        smc_args.set_return_code(OpteeSmcReturnCode::EBadAddr);
-        return *smc_args;
-    };
     let Ok(smc_result) = handle_optee_smc_args(&mut smc_args) else {
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
         return *smc_args;
@@ -428,6 +424,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
     if let OpteeSmcResult::CallWithArg {
         msg_args,
         rpc_args: _,
+        msg_args_phys_addr,
     } = smc_result
     {
         let mut msg_args = *msg_args;
