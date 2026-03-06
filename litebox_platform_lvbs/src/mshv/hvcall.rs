@@ -56,16 +56,28 @@ fn generate_guest_id(dinfo1: u64, kernver: u64, dinfo2: u64) -> u64 {
 fn check_hyperv() -> Result<(), HypervError> {
     use core::arch::x86_64::__cpuid_count as cpuid_count;
 
+    #[allow(
+        unused_unsafe,
+        reason = "cpuid_count is safe on stable 1.94+ but unsafe on nightly 1.91"
+    )]
     let result = unsafe { cpuid_count(CPU_VERSION_INFO, 0x0) };
     if result.ecx & HYPERV_HYPERVISOR_PRESENT_BIT == 0 {
         return Err(HypervError::NonVirtualized);
     }
 
+    #[allow(
+        unused_unsafe,
+        reason = "cpuid_count is safe on stable 1.94+ but unsafe on nightly 1.91"
+    )]
     let result = unsafe { cpuid_count(HYPERV_CPUID_INTERFACE, 0x0) };
     if result.eax != HV_CPUID_SIGNATURE_EAX {
         return Err(HypervError::NonHyperv);
     }
 
+    #[allow(
+        unused_unsafe,
+        reason = "cpuid_count is safe on stable 1.94+ but unsafe on nightly 1.91"
+    )]
     let result = unsafe { cpuid_count(HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, 0x0) };
     if result.eax < HYPERV_CPUID_IMPLEMENT_LIMITS {
         return Err(HypervError::NoVTLSupport);

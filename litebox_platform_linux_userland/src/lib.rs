@@ -1314,7 +1314,7 @@ fn futex_timeout(
     timeout: Option<Duration>,
     uaddr2: Option<&AtomicU32>,
 ) -> Result<usize, syscalls::Errno> {
-    let uaddr: *const AtomicU32 = uaddr as _;
+    let uaddr: *const AtomicU32 = std::ptr::from_ref(uaddr);
     let futex_op: i32 = futex_op as _;
     let timeout = timeout.map(|t| {
         const TEN_POWER_NINE: u128 = 1_000_000_000;
@@ -1368,7 +1368,7 @@ fn futex_val2(
     val2: u32,
     uaddr2: Option<&AtomicU32>,
 ) -> Result<usize, syscalls::Errno> {
-    let uaddr: *const AtomicU32 = uaddr as _;
+    let uaddr: *const AtomicU32 = std::ptr::from_ref(uaddr);
     let futex_op: i32 = futex_op as _;
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
@@ -2011,7 +2011,7 @@ fn signal_handler_exit_guest(
             guest_context_top = out(reg) guest_context_top,
             options(nostack, preserves_flags)
         };
-        Some(guest_context_top.offset(-1))
+        Some(guest_context_top.sub(1))
     }
 }
 

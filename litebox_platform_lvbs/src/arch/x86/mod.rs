@@ -26,6 +26,10 @@ pub(crate) use x86_64::structures::paging::mapper::{MappedFrame, TranslateResult
 pub fn get_core_id() -> usize {
     const CPU_VERSION_INFO: u32 = 1;
 
+    #[allow(
+        unused_unsafe,
+        reason = "cpuid_count is safe on stable 1.94+ but unsafe on nightly 1.91"
+    )]
     let result = unsafe { cpuid_count(CPU_VERSION_INFO, 0x0) };
     let apic_id = (result.ebx >> 24) & 0xff;
 
@@ -100,6 +104,10 @@ pub fn write_kernel_gsbase_msr(addr: VirtAddr) {
 #[cfg(target_arch = "x86_64")]
 pub fn enable_dep() {
     // CPUID.80000001h:EDX bit 20 = NX support
+    #[allow(
+        unused_unsafe,
+        reason = "cpuid_count is safe on stable 1.94+ but unsafe on nightly 1.91"
+    )]
     let ext_features = unsafe { cpuid_count(0x8000_0001, 0) };
     assert!(
         ext_features.edx & (1 << 20) != 0,
@@ -127,6 +135,10 @@ pub fn enable_dep() {
 #[cfg(target_arch = "x86_64")]
 pub fn enable_smep_smap() {
     // CPUID.07h:EBX bit 7 = SMEP, bit 20 = SMAP
+    #[allow(
+        unused_unsafe,
+        reason = "cpuid_count is safe on stable 1.94+ but unsafe on nightly 1.91"
+    )]
     let structured_features = unsafe { cpuid_count(0x07, 0) };
     assert!(
         structured_features.ebx & (1 << 7) != 0,
