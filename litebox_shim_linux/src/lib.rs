@@ -45,6 +45,7 @@ pub(crate) mod channel;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
+pub mod transport;
 mod wait;
 
 pub type DefaultFS = LinuxFS;
@@ -294,6 +295,17 @@ impl<FS: ShimFS> LinuxShim<FS> {
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
         self.0.net.lock().perform_platform_interaction()
+    }
+
+    /// Establish a TCP connection to the given address.
+    ///
+    /// Returns a [`transport::ShimTransport`] that can be used as a
+    /// byte-stream transport (e.g., for a 9P filesystem client).
+    pub fn tcp_connection(
+        &self,
+        addr: core::net::SocketAddr,
+    ) -> Result<transport::ShimTransport, Errno> {
+        transport::ShimTransport::connect(self.0.clone(), addr)
     }
 }
 
