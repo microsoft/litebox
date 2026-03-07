@@ -14,8 +14,18 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use oci_client::client::{ClientConfig, ClientProtocol, ImageData};
+use oci_client::config::ConfigFile;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
+
+/// Parsed OCI image execution configuration (ENTRYPOINT, CMD, ENV, WORKDIR).
+#[derive(Debug, Default)]
+pub struct ImageConfig {
+    pub entrypoint: Option<Vec<String>>,
+    pub cmd: Option<Vec<String>>,
+    pub env: Option<Vec<String>>,
+    pub working_dir: Option<String>,
+}
 
 /// Result of pulling and extracting an OCI image.
 pub struct ExtractedImage {
@@ -24,6 +34,8 @@ pub struct ExtractedImage {
     pub tempdir: tempfile::TempDir,
     /// Path to the rootfs inside the temp directory.
     pub rootfs_path: PathBuf,
+    /// Parsed image config (ENTRYPOINT, CMD, ENV, WORKDIR).
+    pub config: ImageConfig,
 }
 
 /// Result of scanning an extracted rootfs for files to package.
@@ -137,10 +149,131 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         eprintln!("  Rootfs extracted to {}", rootfs_path.display());
     }
 
+    // Parse image config for ENTRYPOINT, CMD, ENV, WORKDIR.
+    let config = match ConfigFile::try_from(image_data.config) {
+        Ok(cf) => {
+            let exec_config = cf.config.as_ref();
+            let ic = ImageConfig {
+                entrypoint: exec_config.and_then(|c| c.entrypoint.clone()),
+                cmd: exec_config.and_then(|c| c.cmd.clone()),
+                env: exec_config.and_then(|c| c.env.clone()),
+                working_dir: exec_config.and_then(|c| c.working_dir.clone()),
+            };
+            if verbose {
+                eprintln!(
+                    "  Image config: ENTRYPOINT={:?} CMD={:?} WORKDIR={:?} ENV=({} vars)",
+                    ic.entrypoint,
+                    ic.cmd,
+                    ic.working_dir,
+                    ic.env.as_ref().map_or(0, Vec::len)
+                );
+            }
+            ic
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: failed to parse image config: {e}; entrypoint.sh will not be generated"
+            );
+            ImageConfig::default()
+        }
+    };
+
     Ok(ExtractedImage {
         tempdir,
         rootfs_path,
+        config,
     })
+}
+
+/// Generate a `litebox/entrypoint.sh` shell script from the OCI image config.
+///
+/// The script:
+/// 1. Exports all `ENV` variables from the image config
+/// 2. `cd`s to `WORKDIR` (defaults to `/`)
+/// 3. If the caller passes arguments (`"$@"`), executes them directly
+/// 4. Otherwise falls back to the image's ENTRYPOINT/CMD as the default command
+///
+/// This allows the runner to either pass a command explicitly:
+///   `/litebox/entrypoint.sh python3 -c 'print("hi")'`
+/// or rely on the image default:
+///   `/litebox/entrypoint.sh`
+///
+/// Returns `None` if the image config has no ENV, WORKDIR, ENTRYPOINT, or CMD
+/// (i.e., the script would be a no-op).
+pub fn generate_entrypoint_script(config: &ImageConfig) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let has_entrypoint = config.entrypoint.as_ref().is_some_and(|v| !v.is_empty());
+    let has_cmd = config.cmd.as_ref().is_some_and(|v| !v.is_empty());
+    let has_env = config.env.as_ref().is_some_and(|v| !v.is_empty());
+    let has_workdir = config.working_dir.as_deref().is_some_and(|w| !w.is_empty());
+
+    if !has_entrypoint && !has_cmd && !has_env && !has_workdir {
+        return None;
+    }
+
+    let mut script = String::from("#!/bin/sh\n");
+
+    // Export ENV vars.
+    if let Some(env_vars) = &config.env {
+        for var in env_vars {
+            // Each var is "KEY=VALUE". Shell-quote the value.
+            if let Some(eq_idx) = var.find('=') {
+                let key = &var[..eq_idx];
+                let value = &var[eq_idx + 1..];
+                let _ = writeln!(script, "export {key}='{}'", shell_escape(value));
+            }
+        }
+    }
+
+    // cd to WORKDIR.
+    let workdir = config
+        .working_dir
+        .as_deref()
+        .filter(|w| !w.is_empty())
+        .unwrap_or("/");
+    let _ = writeln!(script, "cd '{}'", shell_escape(workdir));
+
+    // Build the exec line.
+    //
+    // If the caller passes arguments, run those as the command.
+    // Otherwise fall back to the image's ENTRYPOINT + CMD.
+    let quote = |args: &[String]| -> String {
+        args.iter()
+            .map(|a| format!("'{}'", shell_escape(a)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    // Build the default command from ENTRYPOINT and/or CMD.
+    let default_cmd = if has_entrypoint && has_cmd {
+        let ep = config.entrypoint.as_deref().unwrap_or_default();
+        let cmd = config.cmd.as_deref().unwrap_or_default();
+        format!("{} {}", quote(ep), quote(cmd))
+    } else if has_entrypoint {
+        quote(config.entrypoint.as_deref().unwrap_or_default())
+    } else if has_cmd {
+        quote(config.cmd.as_deref().unwrap_or_default())
+    } else {
+        String::new()
+    };
+
+    if default_cmd.is_empty() {
+        // No default command — just exec whatever the caller passes.
+        let _ = writeln!(script, "exec \"$@\"");
+    } else {
+        let _ = write!(
+            script,
+            "if [ $# -gt 0 ]; then\n  exec \"$@\"\nelse\n  exec {default_cmd}\nfi\n",
+        );
+    }
+
+    Some(script)
+}
+
+/// Escape single quotes for use inside single-quoted shell strings.
+fn shell_escape(s: &str) -> String {
+    s.replace('\'', "'\\''")
 }
 
 /// Extract a single OCI layer (tar or tar+gzip) into the rootfs directory.
