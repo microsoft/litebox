@@ -331,7 +331,6 @@ fn run_dynamic_linked_prog_with_rewriter(
 
     // Run litebox_runner_linux_on_windows_userland with the tar file
     let mut args = vec![
-        "--unstable",
         // Tell ld where to find the libraries.
         // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
         // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.

@@ -159,7 +159,7 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Include extra files.
+    // Include extra files (these files will not be rewritten).
     for inc in &includes {
         if !added_tar_paths.insert(inc.tar_path.clone()) {
             bail!(

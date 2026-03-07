@@ -39,8 +39,7 @@ pub struct CliArgs {
     ///
     /// All ELF binaries should be pre-rewritten with the syscall rewriter
     /// (e.g., via `litebox-packager`).
-    #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath,
-          requires = "unstable", help_heading = "Unstable Options")]
+    #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
     pub initial_files: PathBuf,
 }
 
