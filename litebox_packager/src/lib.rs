@@ -262,23 +262,45 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
     let mut added_tar_paths: BTreeSet<String> =
         tar_entries.iter().map(|e| e.tar_path.clone()).collect();
 
-    // --- Phase 4: Generate entrypoint.sh from image config ---
-    if let Some(script) = oci::generate_entrypoint_script(&extracted.config) {
-        const ENTRYPOINT_TAR_PATH: &str = "litebox/entrypoint.sh";
-        if added_tar_paths.insert(ENTRYPOINT_TAR_PATH.to_string()) {
+    // --- Phase 4: Store config.json and generate config_and_run.sh from image config ---
+
+    // Always store the raw OCI config JSON for future use.
+    {
+        const CONFIG_JSON_TAR_PATH: &str = "litebox/config.json";
+        if added_tar_paths.insert(CONFIG_JSON_TAR_PATH.to_string()) {
             if args.verbose {
-                eprintln!("  Generating {ENTRYPOINT_TAR_PATH} from image config");
+                eprintln!(
+                    "  Storing {CONFIG_JSON_TAR_PATH} ({} bytes)",
+                    extracted.config_json.len()
+                );
             }
             tar_entries.push(TarEntry {
-                tar_path: ENTRYPOINT_TAR_PATH.to_string(),
+                tar_path: CONFIG_JSON_TAR_PATH.to_string(),
+                data: extracted.config_json,
+                mode: 0o644,
+            });
+        } else {
+            eprintln!("warning: tar already contains {CONFIG_JSON_TAR_PATH}, skipping");
+        }
+    }
+
+    {
+        const CONFIG_AND_RUN_TAR_PATH: &str = "litebox/config_and_run.sh";
+        let script = oci::generate_config_and_run_script(&extracted.config);
+        if added_tar_paths.insert(CONFIG_AND_RUN_TAR_PATH.to_string()) {
+            if args.verbose {
+                eprintln!("  Generating {CONFIG_AND_RUN_TAR_PATH} from image config");
+            }
+            tar_entries.push(TarEntry {
+                tar_path: CONFIG_AND_RUN_TAR_PATH.to_string(),
                 data: script.into_bytes(),
                 mode: 0o755,
             });
         } else {
-            eprintln!("warning: tar already contains {ENTRYPOINT_TAR_PATH}, skipping generation");
+            eprintln!(
+                "warning: tar already contains {CONFIG_AND_RUN_TAR_PATH}, skipping generation"
+            );
         }
-    } else {
-        eprintln!("note: image has no ENTRYPOINT or CMD; litebox/entrypoint.sh not generated");
     }
 
     finalize_tar(tar_entries, added_tar_paths, args)?;

@@ -718,10 +718,10 @@ impl OciRunner {
     }
 }
 
-/// Test running `echo` from an `alpine:latest` OCI image via entrypoint.sh.
+/// Test running `echo` from an `alpine:latest` OCI image via config_and_run.sh.
 ///
-/// Runs `/bin/sh /litebox/entrypoint.sh echo ...` to validate that the
-/// generated entrypoint script correctly exports ENV vars (PATH) and
+/// Runs `/bin/sh /litebox/config_and_run.sh echo ...` to validate that the
+/// generated config_and_run script correctly exports ENV vars (PATH) and
 /// dispatches to the given command via `exec "$@"`.
 ///
 /// Run with:
@@ -732,10 +732,10 @@ impl OciRunner {
 #[test]
 #[ignore = "Requires network access to pull OCI image from Docker Hub"]
 fn test_alpine_echo_oci() {
-    // Run through entrypoint.sh to validate ENV setup and command dispatch.
+    // Run through config_and_run.sh to validate ENV setup and command dispatch.
     let output = OciRunner::new("docker.io/library/alpine:latest", "/bin/sh", "alpine_echo")
         .args([
-            "/litebox/entrypoint.sh",
+            "/litebox/config_and_run.sh",
             "echo",
             "Hello from Alpine via LiteBox!",
         ])
@@ -749,7 +749,7 @@ fn test_alpine_echo_oci() {
     );
 }
 
-/// Test that alpine entrypoint.sh correctly exports PATH from the image config.
+/// Test that alpine config_and_run.sh correctly exports PATH from the image config.
 ///
 /// Run with:
 /// ```
@@ -760,7 +760,7 @@ fn test_alpine_echo_oci() {
 #[ignore = "Requires network access to pull OCI image from Docker Hub"]
 fn test_alpine_entrypoint_env_oci() {
     let output = OciRunner::new("docker.io/library/alpine:latest", "/bin/sh", "alpine_env")
-        .args(["/litebox/entrypoint.sh", "/bin/sh", "-c", "echo $PATH"])
+        .args(["/litebox/config_and_run.sh", "/bin/sh", "-c", "echo $PATH"])
         .output();
 
     let stdout = String::from_utf8_lossy(&output);
@@ -768,16 +768,16 @@ fn test_alpine_entrypoint_env_oci() {
     // Alpine image config sets PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     assert!(
         path.contains("/usr/local/bin") && path.contains("/usr/sbin"),
-        "entrypoint.sh did not export PATH from image config: {path}"
+        "config_and_run.sh did not export PATH from image config: {path}"
     );
 }
 
-/// Test running Python from a `python:3.12-slim` OCI image via entrypoint.sh.
+/// Test running Python from a `python:3.12-slim` OCI image via config_and_run.sh.
 ///
-/// Runs `/bin/sh /litebox/entrypoint.sh python3 -c ...` to validate that the
-/// generated entrypoint script correctly exports ENV vars (PYTHON_VERSION,
+/// Runs `/bin/sh /litebox/config_and_run.sh python3 -c ...` to validate that the
+/// generated config_and_run script correctly exports ENV vars (PYTHON_VERSION,
 /// LANG, PATH, etc.) and dispatches to the given command. The Python script
-/// reads `PYTHON_VERSION` from the environment to prove the entrypoint set it.
+/// reads `PYTHON_VERSION` from the environment to prove the config_and_run script set it.
 ///
 /// This test pulls the image from Docker Hub, packages it with
 /// `litebox_packager --oci-image`, and runs a hello-world script. It requires
@@ -792,14 +792,14 @@ fn test_alpine_entrypoint_env_oci() {
 #[test]
 #[ignore = "Requires network access to pull OCI image from Docker Hub"]
 fn test_python_slim_oci() {
-    // Run through entrypoint.sh so ENV vars from the image config are set.
+    // Run through config_and_run.sh so ENV vars from the image config are set.
     let output = OciRunner::new(
         "docker.io/library/python:3.12-slim",
         "/bin/sh",
         "python_slim",
     )
     .args([
-        "/litebox/entrypoint.sh",
+        "/litebox/config_and_run.sh",
         "python3",
         "-c",
         "import os; v = os.environ.get('PYTHON_VERSION', 'MISSING'); print(f'Hello from Python {v} via LiteBox!')",
@@ -808,11 +808,11 @@ fn test_python_slim_oci() {
 
     let stdout = String::from_utf8_lossy(&output);
     let trimmed = stdout.trim();
-    // The entrypoint.sh exports PYTHON_VERSION from the image config,
+    // The config_and_run.sh exports PYTHON_VERSION from the image config,
     // so the output should contain the actual version, not "MISSING".
     assert!(
         trimmed.starts_with("Hello from Python 3.12") && trimmed.ends_with("via LiteBox!"),
-        "unexpected python output (entrypoint.sh may not have exported PYTHON_VERSION): {trimmed}"
+        "unexpected python output (config_and_run.sh may not have exported PYTHON_VERSION): {trimmed}"
     );
 }
 

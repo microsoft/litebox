@@ -36,6 +36,8 @@ pub struct ExtractedImage {
     pub rootfs_path: PathBuf,
     /// Parsed image config (ENTRYPOINT, CMD, ENV, WORKDIR).
     pub config: ImageConfig,
+    /// Raw OCI image config JSON blob (the full config descriptor data).
+    pub config_json: Vec<u8>,
 }
 
 /// Result of scanning an extracted rootfs for files to package.
@@ -149,6 +151,9 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         eprintln!("  Rootfs extracted to {}", rootfs_path.display());
     }
 
+    // Save the raw config JSON before parsing (try_from consumes it).
+    let config_json = image_data.config.data.to_vec();
+
     // Parse image config for ENTRYPOINT, CMD, ENV, WORKDIR.
     let config = match ConfigFile::try_from(image_data.config) {
         Ok(cf) => {
@@ -172,7 +177,7 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         }
         Err(e) => {
             eprintln!(
-                "warning: failed to parse image config: {e}; entrypoint.sh will not be generated"
+                "warning: failed to parse image config: {e}; config_and_run.sh will not be generated"
             );
             ImageConfig::default()
         }
@@ -182,10 +187,11 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         tempdir,
         rootfs_path,
         config,
+        config_json,
     })
 }
 
-/// Generate a `litebox/entrypoint.sh` shell script from the OCI image config.
+/// Generate a `litebox/config_and_run.sh` shell script from the OCI image config.
 ///
 /// The script:
 /// 1. Exports all `ENV` variables from the image config
@@ -194,23 +200,18 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
 /// 4. Otherwise falls back to the image's ENTRYPOINT/CMD as the default command
 ///
 /// This allows the runner to either pass a command explicitly:
-///   `/litebox/entrypoint.sh python3 -c 'print("hi")'`
+///   `/litebox/config_and_run.sh python3 -c 'print("hi")'`
 /// or rely on the image default:
-///   `/litebox/entrypoint.sh`
+///   `/litebox/config_and_run.sh`
 ///
-/// Returns `None` if the image config has no ENV, WORKDIR, ENTRYPOINT, or CMD
-/// (i.e., the script would be a no-op).
-pub fn generate_entrypoint_script(config: &ImageConfig) -> Option<String> {
+/// Always generates a script — even if the image has no ENV, WORKDIR,
+/// ENTRYPOINT, or CMD, the script will simply `exec "$@"` so callers can
+/// use `config_and_run.sh` uniformly without checking whether it exists.
+pub fn generate_config_and_run_script(config: &ImageConfig) -> String {
     use std::fmt::Write as _;
 
     let has_entrypoint = config.entrypoint.as_ref().is_some_and(|v| !v.is_empty());
     let has_cmd = config.cmd.as_ref().is_some_and(|v| !v.is_empty());
-    let has_env = config.env.as_ref().is_some_and(|v| !v.is_empty());
-    let has_workdir = config.working_dir.as_deref().is_some_and(|w| !w.is_empty());
-
-    if !has_entrypoint && !has_cmd && !has_env && !has_workdir {
-        return None;
-    }
 
     let mut script = String::from("#!/bin/sh\n");
 
@@ -268,7 +269,7 @@ pub fn generate_entrypoint_script(config: &ImageConfig) -> Option<String> {
         );
     }
 
-    Some(script)
+    script
 }
 
 /// Escape single quotes for use inside single-quoted shell strings.
