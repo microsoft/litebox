@@ -617,12 +617,6 @@ fn resolve_in_rootfs(path: &Path, rootfs: &Path, max_depth: u32) -> Option<PathB
     resolve_in_rootfs(&resolved, rootfs, max_depth - 1)
 }
 
-/// Add a `tempfile` dependency (used only at runtime, not a user-facing dep).
-/// This module uses `tempfile::tempdir()` for the extracted rootfs.
-///
-/// Note: We need tempfile as a dependency. Adding it here as a reminder -
-/// it's listed in the Cargo.toml dev-dependencies section of the reference
-/// implementation but we need it as a normal dependency.
 #[cfg(test)]
 mod tests {
     use super::*;

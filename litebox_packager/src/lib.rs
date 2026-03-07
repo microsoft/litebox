@@ -5,6 +5,7 @@
 // dependency discovery and other Linux-specific functionality.
 #![cfg(target_os = "linux")]
 
+#[cfg(target_arch = "x86_64")]
 pub mod oci;
 
 use anyhow::{Context, bail};
@@ -87,7 +88,15 @@ fn parse_include(spec: &str) -> anyhow::Result<IncludeEntry> {
 /// Run the packaging tool.
 pub fn run(args: CliArgs) -> anyhow::Result<()> {
     if let Some(ref image_ref) = args.oci_image {
-        return run_oci(image_ref, &args);
+        #[cfg(target_arch = "x86_64")]
+        {
+            return run_oci(image_ref, &args);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = image_ref;
+            bail!("--oci-image is only supported on x86_64");
+        }
     }
 
     // --- Phase 1: Validate inputs ---
@@ -191,6 +200,7 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
 }
 
 /// Run the packager in OCI mode: pull image, extract rootfs, rewrite ELFs, build tar.
+#[cfg(target_arch = "x86_64")]
 fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
     // --- Phase 1: Pull and extract OCI image ---
     eprintln!("Pulling OCI image: {image_ref}");
