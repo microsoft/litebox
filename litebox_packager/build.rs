@@ -6,28 +6,23 @@ use std::path::PathBuf;
 const RTLD_AUDIT_DIR: &str = "../litebox_rtld_audit";
 
 fn main() {
-    let mut make_cmd = std::process::Command::new("make");
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     if target_arch != "x86_64" {
-        // XXX: Currently 32-bit x86 is unsupported (unimplemented), skip building
         return;
     }
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let mut make_cmd = std::process::Command::new("make");
     make_cmd
         .current_dir(RTLD_AUDIT_DIR)
         .env("OUT_DIR", &out_dir)
-        .env("ARCH", target_arch);
-    if std::env::var("PROFILE").unwrap_or_default() == "debug" {
-        make_cmd.env("DEBUG", "1");
-    } else {
-        // Explicitly remove DEBUG to prevent inheriting it from the
-        // parent environment, which would cause the C library to be
-        // built with debug prints enabled.
-        make_cmd.env_remove("DEBUG");
-    }
-    // Force rebuild in case CFLAGS changed (e.g., debug -> release) but
-    // the source did not.
+        .env("ARCH", &target_arch);
+    // Always build without DEBUG for the packager -- packaged binaries are
+    // release artifacts.
+    make_cmd.env_remove("DEBUG");
+    // Force rebuild in case a stale artifact exists from a different config.
     let _ = std::fs::remove_file(out_dir.join("litebox_rtld_audit.so"));
+
     let output = make_cmd
         .output()
         .expect("Failed to execute make for rtld_audit");
@@ -39,7 +34,7 @@ fn main() {
     );
     assert!(
         out_dir.join("litebox_rtld_audit.so").exists(),
-        "Build failed to create necessary file"
+        "Build failed to create litebox_rtld_audit.so"
     );
 
     println!("cargo:rerun-if-changed={RTLD_AUDIT_DIR}/rtld_audit.c");

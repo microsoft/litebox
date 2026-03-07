@@ -1,6 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+//! Tests for the Windows userland runner.
+//!
+//! **NOTE:** These tests depend on pre-built Linux ELF binaries in `tests/test-bins/`,
+//! including `litebox_rtld_audit.so`, shared libraries (`libc.so.6`, `ld-linux-x86-64.so.2`),
+//! and test executables. These binaries must be rebuilt on Linux and re-committed whenever
+//! the corresponding source code changes (e.g., `litebox_rtld_audit/rtld_audit.c`).
+
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
 mod common;
@@ -288,12 +295,18 @@ fn run_dynamic_linked_prog_with_rewriter(
     // Install the required files (e.g., scripts) to tar directory's /out
     install_files(tar_src_path.join("out"));
 
+    // Copy the hooked binary into the tar source directory
+    let hooked_tar_dir = tar_src_path.join("bin");
+    std::fs::create_dir_all(&hooked_tar_dir).unwrap();
+    std::fs::copy(&hooked_path, hooked_tar_dir.join(&prog_name_hooked)).unwrap();
+
     // tar
     let tar_target_file = std::path::Path::new(&out_path).join("rootfs_rewriter.tar");
     let tar_data = std::process::Command::new("tar")
         .args([
             "-cvf",
             tar_target_file.to_str().unwrap(),
+            "bin",
             "lib",
             "lib64",
             "out",
@@ -313,9 +326,11 @@ fn run_dynamic_linked_prog_with_rewriter(
             env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").to_string()
         });
 
-    // Run litebox_runner_linux_on_windows_userland with the tar file and the compiled executable
+    // The program path refers to the tar-internal path.
+    let prog_tar_path = format!("/bin/{prog_name_hooked}");
+
+    // Run litebox_runner_linux_on_windows_userland with the tar file
     let mut args = vec![
-        "--unstable",
         // Tell ld where to find the libraries.
         // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
         // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
@@ -323,10 +338,8 @@ fn run_dynamic_linked_prog_with_rewriter(
         "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--initial-files",
         tar_target_file.to_str().unwrap(),
-        "--env",
-        "LD_AUDIT=/lib64/litebox_rtld_audit.so",
     ];
-    args.push(hooked_path.to_str().unwrap());
+    args.push(&prog_tar_path);
     args.extend_from_slice(cmd_args);
 
     let mut command = std::process::Command::new(&binary_path);
@@ -348,7 +361,7 @@ fn test_testcase_dynamic_with_rewriter() {
         ("libc.so.6", "/lib/x86_64-linux-gnu"),
         ("ld-linux-x86-64.so.2", "/lib64"),
     ];
-    let libs_without_rewrite = [("litebox_rtld_audit.so", "/lib64")];
+    let libs_without_rewrite = [("litebox_rtld_audit.so", "/lib")];
 
     // Run
     run_dynamic_linked_prog_with_rewriter(

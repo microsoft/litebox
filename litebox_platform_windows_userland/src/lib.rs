@@ -226,15 +226,18 @@ impl WindowsUserland {
         // `TASK_ADDR_MIN` and `TASK_ADDR_MAX`.
         // Will remove these prints once we have a better way to replace
         // the current `const` values in PageManagementProvider.
-        println!("System information.");
-        println!(
-            "=> Max user address: {:#x}",
-            sys_info.lpMaximumApplicationAddress as usize
-        );
-        println!(
-            "=> Min user address: {:#x}",
-            sys_info.lpMinimumApplicationAddress as usize
-        );
+        #[cfg(debug_assertions)]
+        {
+            println!("System information.");
+            println!(
+                "=> Max user address: {:#x}",
+                sys_info.lpMaximumApplicationAddress as usize
+            );
+            println!(
+                "=> Min user address: {:#x}",
+                sys_info.lpMinimumApplicationAddress as usize
+            );
+        }
 
         let reserved_pages = Self::read_memory_maps();
 
