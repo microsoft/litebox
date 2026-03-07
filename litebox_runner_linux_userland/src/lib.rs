@@ -141,6 +141,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
 
+    // When loading from tar, the program path is a guest-internal path and must
+    // be absolute — LiteBox does not resolve programs via PATH.
+    if cli_args.program_from_tar && !cli_args.program_and_arguments[0].starts_with('/') {
+        anyhow::bail!(
+            "--program-from-tar requires an absolute path (e.g., /usr/bin/ls), \
+             got: {}",
+            cli_args.program_and_arguments[0]
+        );
+    }
+
     let mut cow_eligible_regions: Vec<MmappedFile> = Vec::new();
 
     // When --program-from-tar is set, the program binary is already in the tar file,
@@ -322,8 +332,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         shim_builder.default_fs(in_mem, tar_ro)
     };
 
-    // We need to get the file path before enabling seccomp
-    let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+    // We need to get the file path before enabling seccomp.
+    // For --program-from-tar the path is already validated as absolute above,
+    // so use it directly instead of resolving against the host CWD.
+    let prog = if cli_args.program_from_tar {
+        PathBuf::from(&cli_args.program_and_arguments[0])
+    } else {
+        std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap()
+    };
     let prog_path = prog.to_str().ok_or_else(|| {
         anyhow!(
             "Could not convert program path {:?} to a string",
