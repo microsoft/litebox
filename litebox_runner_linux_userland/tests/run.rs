@@ -530,6 +530,212 @@ fn test_tun_with_tcp_socket() {
     child.join().unwrap();
 }
 
+// ---------------------------------------------------------------------------
+// OCI image tests
+// ---------------------------------------------------------------------------
+
+/// Runner for OCI-packaged programs.
+///
+/// Uses `litebox_packager --oci-image` to pull and package a container image,
+/// then invokes `litebox_runner_linux_userland` with `--program-from-tar`.
+#[cfg(target_arch = "x86_64")]
+struct OciRunner {
+    command: std::process::Command,
+    tar_path: PathBuf,
+    unique_name: String,
+    program: String,
+    program_args: Vec<OsString>,
+    has_run: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl OciRunner {
+    /// Create a new OCI runner for the given image reference.
+    ///
+    /// `image_ref` is a standard OCI image reference (e.g.,
+    /// `docker.io/library/python:3.12-slim`). `program` is the absolute path
+    /// to the program inside the container image (e.g.,
+    /// `/usr/local/bin/python3.12`).
+    fn new(image_ref: &str, program: &str, unique_name: &str) -> Self {
+        let dir_path = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        let tar_path = dir_path.join(format!("oci_{unique_name}.tar"));
+
+        // Run the packager to produce the tar (uses cargo run).
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+
+        // Check cache: if the tar already exists, skip re-packaging.
+        // The cache key is just the image ref + unique_name. Re-pulling
+        // on source changes is handled by `cargo run` rebuilding the
+        // packager automatically.
+        if tar_path.exists() {
+            println!(
+                "Using cached OCI tar for {unique_name}: {}",
+                tar_path.display()
+            );
+        } else {
+            println!("Packaging OCI image {image_ref} -> {}", tar_path.display());
+            let output = std::process::Command::new(&cargo)
+                .args([
+                    "run",
+                    "-p",
+                    "litebox_packager",
+                    "--",
+                    "--oci-image",
+                    image_ref,
+                    "-o",
+                    tar_path.to_str().unwrap(),
+                ])
+                .output()
+                .expect("failed to run litebox_packager");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("{stderr}");
+            assert!(
+                output.status.success(),
+                "litebox_packager failed for {image_ref}: {stderr}"
+            );
+            println!("Packaged OCI image to {}", tar_path.display());
+        }
+
+        // Build the runner command.
+        let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
+
+        let mut command = std::process::Command::new(binary_path);
+        command.args([
+            "--unstable",
+            "--interception-backend",
+            "rewriter",
+            "--env",
+            "LD_LIBRARY_PATH=/lib64:/lib32:/lib:/usr/lib/x86_64-linux-gnu:/usr/local/lib",
+            "--env",
+            "HOME=/",
+        ]);
+
+        Self {
+            command,
+            tar_path,
+            unique_name: unique_name.to_owned(),
+            program: program.to_owned(),
+            program_args: Vec::new(),
+            has_run: false,
+        }
+    }
+
+    fn env(&mut self, env: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        self.command.arg("--env").arg(env);
+        self
+    }
+
+    fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        self.program_args.push(arg.as_ref().to_os_string());
+        self
+    }
+
+    fn args(&mut self, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> &mut Self {
+        for arg in args {
+            self.arg(arg);
+        }
+        self
+    }
+
+    #[allow(dead_code)]
+    fn run(&mut self) {
+        self.run_inner(false);
+    }
+
+    #[must_use]
+    fn output(&mut self) -> Vec<u8> {
+        self.run_inner(true)
+    }
+
+    fn run_inner(&mut self, capture_stdout: bool) -> Vec<u8> {
+        assert!(!self.has_run, "OciRunner::run called twice");
+        self.has_run = true;
+
+        self.command
+            .arg("--initial-files")
+            .arg(&self.tar_path)
+            .arg("--program-from-tar")
+            .arg(&self.program)
+            .args(&self.program_args)
+            .stderr(std::process::Stdio::inherit());
+        if !capture_stdout {
+            self.command.stdout(std::process::Stdio::inherit());
+        }
+        println!(
+            "Running OCI test '{}': {:?}",
+            self.unique_name, self.command
+        );
+        let output = self
+            .command
+            .output()
+            .expect("failed to run litebox_runner_linux_userland");
+        assert!(
+            output.status.success(),
+            "litebox_runner_linux_userland failed for OCI test '{}': {}",
+            self.unique_name,
+            output.status
+        );
+        output.stdout
+    }
+}
+
+/// Test running `echo` from an `alpine:latest` OCI image under litebox.
+///
+/// Alpine is small (~7 MB) so this test is fast enough to run as a required
+/// (non-ignored) test. The first run pulls the image from Docker Hub; the
+/// packaged tar is cached for subsequent runs.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_alpine_echo_oci() {
+    let output = OciRunner::new(
+        "docker.io/library/alpine:latest",
+        "/bin/echo",
+        "alpine_echo",
+    )
+    .args(["Hello from Alpine via LiteBox!"])
+    .output();
+
+    let stdout = String::from_utf8_lossy(&output);
+    assert_eq!(
+        stdout.trim(),
+        "Hello from Alpine via LiteBox!",
+        "unexpected echo output: {stdout}"
+    );
+}
+
+/// Test running Python from a `python:3.12-slim` OCI image under litebox.
+///
+/// This test pulls the image from Docker Hub, packages it with
+/// `litebox_packager --oci-image`, and runs a hello-world script. It requires
+/// network access and is slow on first run (~60s to pull + package), so it is
+/// ignored by default.
+///
+/// Run with:
+/// ```
+/// cargo test --package litebox_runner_linux_userland --test run --release -- test_python_slim_oci --exact --nocapture --ignored
+/// ```
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "Requires network access to pull OCI image from Docker Hub"]
+fn test_python_slim_oci() {
+    let output = OciRunner::new(
+        "docker.io/library/python:3.12-slim",
+        "/usr/local/bin/python3.12",
+        "python_slim",
+    )
+    .env("PYTHONDONTWRITEBYTECODE=1")
+    .args(["-c", "print('Hello from Python via LiteBox!')"])
+    .output();
+
+    let stdout = String::from_utf8_lossy(&output);
+    assert_eq!(
+        stdout.trim(),
+        "Hello from Python via LiteBox!",
+        "unexpected python output: {stdout}"
+    );
+}
+
 /// Test network performance with iperf3
 ///
 /// To run it with release build and see output, use:
