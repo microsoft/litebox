@@ -13,7 +13,6 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use tar::{Builder, Header};
 
 /// Package Linux ELF programs for execution under LiteBox.
@@ -35,6 +34,7 @@ pub struct CliArgs {
     pub input_files: Vec<PathBuf>,
 
     /// Pull and package an OCI container image instead of local files.
+    /// Only public (anonymous) registries are currently supported.
     /// Example: docker.io/library/alpine:latest
     #[arg(
         long = "oci-image",
@@ -85,7 +85,6 @@ fn parse_include(spec: &str) -> anyhow::Result<IncludeEntry> {
 }
 
 /// Run the packaging tool.
-#[allow(clippy::missing_panics_doc)] // Mutex::lock unwrap — cannot be poisoned here
 pub fn run(args: CliArgs) -> anyhow::Result<()> {
     if let Some(ref image_ref) = args.oci_image {
         return run_oci(image_ref, &args);
@@ -107,18 +106,6 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
             Ok(abs)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let includes: Vec<IncludeEntry> = args
-        .include
-        .iter()
-        .map(|s| parse_include(s))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    for inc in &includes {
-        if !inc.host_path.exists() {
-            bail!("included file does not exist: {}", inc.host_path.display());
-        }
-    }
 
     let no_rewrite: BTreeSet<PathBuf> = args
         .no_rewrite
@@ -151,7 +138,6 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
     eprintln!("Rewriting {} unique ELF files...", file_map.len());
 
     let file_map_vec: Vec<(&PathBuf, &Vec<PathBuf>)> = file_map.iter().collect();
-    let added_tar_paths = Mutex::new(BTreeSet::<String>::new());
     let verbose = args.verbose;
 
     let par_results: Vec<anyhow::Result<Vec<TarEntry>>> = file_map_vec
@@ -178,86 +164,28 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
                     .to_str()
                     .with_context(|| format!("non-UTF8 path: {}", path.display()))?;
                 let tar_path = tar_path.strip_prefix('/').unwrap_or(tar_path).to_string();
-                let mut guard = added_tar_paths.lock().unwrap();
-                if guard.insert(tar_path.clone()) {
-                    entries.push(TarEntry {
-                        tar_path,
-                        data: rewritten.clone(),
-                        mode,
-                    });
-                }
+                entries.push(TarEntry {
+                    tar_path,
+                    data: rewritten.clone(),
+                    mode,
+                });
             }
             Ok(entries)
         })
         .collect();
 
-    // Flatten results, propagating any errors
+    // Flatten results, deduplicating by tar path.
+    let mut added_tar_paths = BTreeSet::<String>::new();
     let mut tar_entries: Vec<TarEntry> = Vec::new();
     for result in par_results {
-        tar_entries.extend(result?);
+        for entry in result? {
+            if added_tar_paths.insert(entry.tar_path.clone()) {
+                tar_entries.push(entry);
+            }
+        }
     }
 
-    let mut added_tar_paths = added_tar_paths.into_inner().unwrap();
-
-    // Include extra files (these files will not be rewritten).
-    for inc in &includes {
-        if !added_tar_paths.insert(inc.tar_path.clone()) {
-            bail!(
-                "duplicate tar path from --include: '{}' (already present from input files or dependencies)",
-                inc.tar_path
-            );
-        }
-        let data = std::fs::read(&inc.host_path)
-            .with_context(|| format!("failed to read included file {}", inc.host_path.display()))?;
-        let mode = std::fs::metadata(&inc.host_path)
-            .map(|m| m.mode())
-            .unwrap_or(0o644);
-        if args.verbose {
-            eprintln!(
-                "  including {} as {}",
-                inc.host_path.display(),
-                inc.tar_path
-            );
-        }
-        tar_entries.push(TarEntry {
-            tar_path: inc.tar_path.clone(),
-            data,
-            mode,
-        });
-    }
-
-    // Include the rtld audit library so the rewriter backend can load it.
-    #[cfg(target_arch = "x86_64")]
-    {
-        const RTLD_AUDIT_TAR_PATH: &str = "lib/litebox_rtld_audit.so";
-        if !added_tar_paths.insert(RTLD_AUDIT_TAR_PATH.to_string()) {
-            bail!(
-                "tar already contains {RTLD_AUDIT_TAR_PATH} -- \
-                 remove the conflicting entry or use --no-rewrite"
-            );
-        }
-        tar_entries.push(TarEntry {
-            tar_path: RTLD_AUDIT_TAR_PATH.to_string(),
-            data: include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).to_vec(),
-            mode: 0o755,
-        });
-    }
-
-    // --- Phase 4: Build tar ---
-    eprintln!("Creating {}...", args.output.display());
-    build_tar(&tar_entries, &args.output)?;
-
-    let tar_size = std::fs::metadata(&args.output)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    #[allow(clippy::cast_precision_loss)]
-    let tar_size_mb = tar_size as f64 / 1_048_576.0;
-    eprintln!(
-        "Created {} ({} entries, {:.1} MB)",
-        args.output.display(),
-        tar_entries.len(),
-        tar_size_mb
-    );
+    finalize_tar(tar_entries, added_tar_paths, &args)?;
 
     Ok(())
 }
@@ -321,15 +249,34 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
         tar_entries.push(result?);
     }
 
-    // Include extra files (not rewritten).
+    let added_tar_paths: BTreeSet<String> =
+        tar_entries.iter().map(|e| e.tar_path.clone()).collect();
+
+    finalize_tar(tar_entries, added_tar_paths, args)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared finalization: includes, rtld audit injection, tar build, size report
+// ---------------------------------------------------------------------------
+
+/// Append `--include` files, inject the rtld audit library, build the output
+/// tar, and print a size summary.
+///
+/// Both host mode and OCI mode call this after producing their rewritten
+/// `TarEntry` list.
+fn finalize_tar(
+    mut tar_entries: Vec<TarEntry>,
+    mut added_tar_paths: BTreeSet<String>,
+    args: &CliArgs,
+) -> anyhow::Result<()> {
+    // Parse and append --include files.
     let includes: Vec<IncludeEntry> = args
         .include
         .iter()
         .map(|s| parse_include(s))
         .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let mut added_tar_paths: BTreeSet<String> =
-        tar_entries.iter().map(|e| e.tar_path.clone()).collect();
 
     for inc in &includes {
         if !inc.host_path.exists() {
@@ -337,7 +284,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
         }
         if !added_tar_paths.insert(inc.tar_path.clone()) {
             bail!(
-                "duplicate tar path from --include: '{}' (already present from rootfs)",
+                "duplicate tar path from --include: '{}' (already present)",
                 inc.tar_path
             );
         }
@@ -346,7 +293,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
         let mode = std::fs::metadata(&inc.host_path)
             .map(|m| m.mode())
             .unwrap_or(0o644);
-        if verbose {
+        if args.verbose {
             eprintln!(
                 "  including {} as {}",
                 inc.host_path.display(),
@@ -360,7 +307,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
         });
     }
 
-    // Include the rtld audit library.
+    // Include the rtld audit library so the rewriter backend can load it.
     #[cfg(target_arch = "x86_64")]
     {
         const RTLD_AUDIT_TAR_PATH: &str = "lib/litebox_rtld_audit.so";
@@ -377,7 +324,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
         });
     }
 
-    // --- Phase 4: Build tar ---
+    // Build tar.
     eprintln!("Creating {}...", args.output.display());
     build_tar(&tar_entries, &args.output)?;
 

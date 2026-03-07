@@ -7,7 +7,7 @@
 //! extracts its filesystem layers into a temporary rootfs directory, then
 //! walks the rootfs to discover all ELF files for syscall rewriting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -57,6 +57,12 @@ pub struct RootfsEntry {
 ///
 /// Layers are applied in order (bottom-up), handling whiteout files for
 /// layer deletions per the OCI image spec.
+///
+/// # Authentication
+///
+/// Currently only anonymous (unauthenticated) pulls are supported. Private
+/// registries or images that require credentials will fail with an
+/// authorization error from the registry.
 pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<ExtractedImage> {
     // Parse the image reference
     let reference: Reference = image_ref
@@ -68,7 +74,10 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     }
 
     // Create async runtime for the OCI client (which is async-based)
-    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create tokio runtime")?;
 
     let image_data = rt.block_on(async {
         let config = ClientConfig {
@@ -155,11 +164,24 @@ fn is_gzip_data(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b
 }
 
+/// A hard link whose target was not yet extracted when encountered.
+struct DeferredHardLink {
+    /// Destination path inside the rootfs (where the hard link should be created).
+    target: PathBuf,
+    /// Source path inside the rootfs (the file the hard link points to).
+    link_source: PathBuf,
+}
+
 /// Extract a tar archive into the rootfs, handling OCI whiteout files.
+///
+/// Hard links whose targets appear later in the archive are collected during
+/// the first pass and resolved after all regular entries have been extracted.
 fn extract_tar<R: Read>(reader: R, rootfs: &Path) -> anyhow::Result<()> {
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_unpack_xattrs(true);
+
+    let mut deferred_links: Vec<DeferredHardLink> = Vec::new();
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result.context("failed to read tar entry")?;
@@ -218,18 +240,22 @@ fn extract_tar<R: Read>(reader: R, rootfs: &Path) -> anyhow::Result<()> {
                 .link_name()?
                 .context("hard link entry has no link name")?
                 .into_owned();
-            let link_target = rootfs.join(&link_name);
-            if link_target.exists() {
-                std::fs::copy(&link_target, &target).with_context(|| {
+            let link_source = rootfs.join(&link_name);
+            if link_source.exists() {
+                std::fs::copy(&link_source, &target).with_context(|| {
                     format!(
                         "failed to copy hard link target {} -> {}",
-                        link_target.display(),
+                        link_source.display(),
                         target.display()
                     )
                 })?;
+            } else {
+                // Target hasn't been extracted yet — defer to second pass.
+                deferred_links.push(DeferredHardLink {
+                    target,
+                    link_source,
+                });
             }
-            // If the target doesn't exist yet, skip silently — it may appear
-            // in a later entry or layer and isn't critical for packaging.
             continue;
         }
 
@@ -237,6 +263,30 @@ fn extract_tar<R: Read>(reader: R, rootfs: &Path) -> anyhow::Result<()> {
         entry
             .unpack(&target)
             .with_context(|| format!("failed to unpack entry: {path_str}"))?;
+    }
+
+    // Second pass: resolve deferred hard links now that all entries are extracted.
+    for link in &deferred_links {
+        if link.link_source.exists() {
+            if let Some(parent) = link.target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&link.link_source, &link.target).with_context(|| {
+                format!(
+                    "failed to copy deferred hard link {} -> {}",
+                    link.link_source.display(),
+                    link.target.display()
+                )
+            })?;
+        } else {
+            // Target still doesn't exist after the full layer extraction —
+            // this is unusual but not fatal; warn and skip.
+            eprintln!(
+                "  warning: hard link target {} not found after full extraction, skipping {}",
+                link.link_source.display(),
+                link.target.display()
+            );
+        }
     }
 
     Ok(())
@@ -328,6 +378,10 @@ pub fn scan_rootfs(rootfs: &Path, verbose: bool) -> anyhow::Result<RootfsFileMap
     // additional tar entries under the symlink's path prefix. For example, if
     // `lib64` → `usr/lib64`, then `usr/lib64/ld-linux-x86-64.so.2` also
     // appears as `lib64/ld-linux-x86-64.so.2` in the tar.
+
+    // Build a set of existing tar paths for O(1) duplicate checks.
+    let mut tar_paths: HashSet<String> = files.values().map(|e| e.tar_path.clone()).collect();
+
     for (symlink_host_path, resolved_dir) in &dir_symlinks {
         let symlink_rel = symlink_host_path
             .strip_prefix(rootfs)
@@ -369,8 +423,8 @@ pub fn scan_rootfs(rootfs: &Path, verbose: bool) -> anyhow::Result<RootfsFileMap
             // original entry under the resolved directory.
             let map_key = symlink_host_path.join(entry_rel);
 
-            // Skip if we already have this tar path (from a previous walk).
-            if files.values().any(|e| e.tar_path == tar_path) {
+            // Skip if we already have this tar path.
+            if !tar_paths.insert(tar_path.clone()) {
                 continue;
             }
 

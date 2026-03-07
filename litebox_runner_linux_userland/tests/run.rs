@@ -563,16 +563,54 @@ impl OciRunner {
         // Run the packager to produce the tar (uses cargo run).
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
-        // Check cache: if the tar already exists, skip re-packaging.
-        // The cache key is just the image ref + unique_name. Re-pulling
-        // on source changes is handled by `cargo run` rebuilding the
-        // packager automatically.
-        if tar_path.exists() {
-            println!(
-                "Using cached OCI tar for {unique_name}: {}",
-                tar_path.display()
+        // Check cache: rebuild if the tar doesn't exist or if the packager
+        // binary is newer than the cached tar (i.e., the packager was
+        // recompiled since the tar was produced).
+        let needs_rebuild = if tar_path.exists() {
+            // Build the packager first (no-op if already up-to-date) so we
+            // can check its binary mtime.
+            let build_output = std::process::Command::new(&cargo)
+                .args(["build", "-p", "litebox_packager", "--message-format=short"])
+                .stderr(std::process::Stdio::inherit())
+                .output()
+                .expect("failed to build litebox_packager");
+            assert!(
+                build_output.status.success(),
+                "cargo build -p litebox_packager failed"
             );
+
+            // Find the packager binary in the target directory. It lives next
+            // to the runner binary, which we know the path of.
+            let runner_bin = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+                .unwrap_or_else(|_| {
+                    env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string()
+                });
+            let packager_bin = Path::new(&runner_bin)
+                .parent()
+                .expect("runner binary has no parent dir")
+                .join("litebox_packager");
+
+            if packager_bin.exists() {
+                let packager_mtime = std::fs::metadata(&packager_bin)
+                    .and_then(|m| m.modified())
+                    .ok();
+                let tar_mtime = std::fs::metadata(&tar_path).and_then(|m| m.modified()).ok();
+                match (packager_mtime, tar_mtime) {
+                    (Some(p), Some(t)) => p > t,
+                    _ => true, // can't compare, rebuild to be safe
+                }
+            } else {
+                // Can't find the binary — fall through to rebuild.
+                true
+            }
         } else {
+            true
+        };
+
+        if needs_rebuild {
+            if tar_path.exists() {
+                println!("Packager binary is newer than cached tar, re-packaging {unique_name}...");
+            }
             println!("Packaging OCI image {image_ref} -> {}", tar_path.display());
             let output = std::process::Command::new(&cargo)
                 .args([
@@ -594,6 +632,11 @@ impl OciRunner {
                 "litebox_packager failed for {image_ref}: {stderr}"
             );
             println!("Packaged OCI image to {}", tar_path.display());
+        } else {
+            println!(
+                "Using cached OCI tar for {unique_name}: {}",
+                tar_path.display()
+            );
         }
 
         // Build the runner command.

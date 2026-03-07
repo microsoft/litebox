@@ -13,9 +13,8 @@ oci-spec = { version = "0.9", features = ["image"] }
 rayon = "1.10"
 tar = "0.4"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt"] }
 walkdir = "2.0"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [lints]
 workspace = true
