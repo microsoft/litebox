@@ -8,7 +8,7 @@ anyhow = "1.0.97"
 clap = { version = "4.5.33", features = ["derive"] }
 flate2 = "1.1"
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
-oci-client = "0.16"
+oci-client = { version = "0.16", default-features = false, features = ["native-tls"] }
 oci-spec = { version = "0.9", features = ["image"] }
 rayon = "1.10"
 tar = "0.4"
