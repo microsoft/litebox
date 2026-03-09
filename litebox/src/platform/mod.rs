@@ -262,7 +262,7 @@ pub trait RawMutexProvider {
     /// This is a no-op by default.
     ///
     /// [`Waker::wake`]: crate::event::wait::Waker::wake
-    #[allow(unused_variables)]
+    #[expect(unused_variables)]
     fn update_waker(&self, waker: Option<crate::event::wait::Waker<Self>>)
     where
         Self: crate::sync::RawSyncPrimitivesProvider + Sized,
