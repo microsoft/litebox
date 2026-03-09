@@ -85,6 +85,9 @@ impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, H
 }
 
 impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
+impl<Host: HostInterface> litebox::platform::SignalProvider for LinuxKernel<Host> {
+    type Signal = litebox_common_linux::signal::Signal;
+}
 
 // TODO: implement pointer validation to ensure the pointers are in user space.
 type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<

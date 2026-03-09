@@ -374,6 +374,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// evaluating the wait and interrupt conditions so that wakeups are not
     /// missed.
     fn start_wait(&self) {
+        self.waker.0.platform.update_waker(Some(self.waker.clone()));
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);
@@ -384,6 +385,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         self.waker
             .0
             .set_state(ThreadState::RUNNING_IN_HOST, Ordering::Relaxed);
+        self.waker.0.platform.update_waker(None);
     }
 
     /// Checks whether the wait should be interrupted. If not, then performs
