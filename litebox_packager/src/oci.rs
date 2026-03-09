@@ -3,18 +3,20 @@
 
 //! OCI image pulling and rootfs extraction.
 //!
-//! Pulls an OCI container image from a registry via `skopeo` into a
-//! temporary OCI Image Layout directory, then parses the layout using
-//! `oci-spec` and extracts the filesystem layers into a temporary rootfs
-//! directory for syscall rewriting.
+//! Pulls an OCI container image from a registry (e.g., Docker Hub, GHCR),
+//! extracts its filesystem layers into a temporary rootfs directory, then
+//! walks the rootfs to discover all ELF files for syscall rewriting.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
-use oci_spec::image::{Arch, ImageConfiguration, ImageIndex, ImageManifest, MediaType, Os};
+use anyhow::Context;
+use oci_client::client::{ClientConfig, ClientProtocol, ImageData};
+use oci_client::config::ConfigFile;
+use oci_client::secrets::RegistryAuth;
+use oci_client::{Client, Reference};
 
 /// Parsed OCI image execution configuration (ENTRYPOINT, CMD, ENV, WORKDIR).
 #[derive(Debug, Default)]
@@ -62,9 +64,6 @@ pub struct RootfsEntry {
 
 /// Pull an OCI image from a registry and extract its layers into a temp directory.
 ///
-/// Uses `skopeo copy` to fetch the image into a temporary OCI Image Layout
-/// directory, then parses the layout with `oci-spec` and extracts layers.
-///
 /// Supports standard image references like:
 /// - `docker.io/library/alpine:latest`
 /// - `alpine:latest` (defaults to docker.io/library/)
@@ -75,76 +74,76 @@ pub struct RootfsEntry {
 ///
 /// # Authentication
 ///
-/// Authentication is delegated to `skopeo` (which reads the system
-/// credential helpers and Docker config).
+/// Currently only anonymous (unauthenticated) pulls are supported. Private
+/// registries or images that require credentials will fail with an
+/// authorization error from the registry.
 pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<ExtractedImage> {
-    // Pull with skopeo into a temp directory.
-    if verbose {
-        eprintln!("Pulling image via skopeo: {image_ref}");
-    }
-    let skopeo_dir = tempfile::tempdir().context("failed to create temp directory for skopeo")?;
-    let oci_dest = format!("oci:{}:latest", skopeo_dir.path().display());
-
-    let status = std::process::Command::new("skopeo")
-        .args(["copy", &format!("docker://{image_ref}"), &oci_dest])
-        .status()
-        .context(
-            "failed to execute skopeo — is it installed? \
-             (install with: apt-get install skopeo)",
-        )?;
-
-    if !status.success() {
-        bail!(
-            "skopeo copy failed (exit {}). Make sure the image reference \
-             is valid and the registry is reachable: {image_ref}",
-            status.code().unwrap_or(-1),
-        );
-    }
-
-    let layout_dir = skopeo_dir.path();
-
-    // --- Parse the OCI Image Layout ---
-    let index_path = layout_dir.join("index.json");
-    let index = ImageIndex::from_file(&index_path)
-        .with_context(|| format!("failed to parse {}", index_path.display()))?;
-
-    // Resolve the image manifest for linux/amd64.
-    let manifest_path = resolve_manifest_path(layout_dir, &index, verbose)?;
-    let manifest = ImageManifest::from_file(&manifest_path)
-        .with_context(|| format!("failed to parse manifest {}", manifest_path.display()))?;
+    // Parse the image reference
+    let reference: Reference = image_ref
+        .parse()
+        .with_context(|| format!("invalid OCI image reference: {image_ref}"))?;
 
     if verbose {
-        eprintln!("  Manifest has {} layer(s)", manifest.layers().len());
+        eprintln!("Pulling image: {reference}");
     }
 
-    // Read the raw config JSON blob.
-    let config_blob_path = blob_path(layout_dir, manifest.config().digest().as_ref());
-    let config_json = std::fs::read(&config_blob_path)
-        .with_context(|| format!("failed to read config blob {}", config_blob_path.display()))?;
+    // Create async runtime for the OCI client (which is async-based)
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create tokio runtime")?;
 
-    // Create temp directory for rootfs extraction.
+    let image_data = rt.block_on(async {
+        let config = ClientConfig {
+            protocol: ClientProtocol::Https,
+            ..Default::default()
+        };
+        let client = Client::new(config);
+
+        // Authenticate (anonymous for public images)
+        let auth = RegistryAuth::Anonymous;
+
+        if verbose {
+            eprintln!("  Fetching manifest...");
+        }
+
+        // Pull the full image (manifest + all layers)
+        let image_data: ImageData = client
+            .pull(
+                &reference,
+                &auth,
+                vec![
+                    oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
+                    oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE,
+                    oci_client::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
+                ],
+            )
+            .await
+            .with_context(|| format!("failed to pull image {reference}"))?;
+
+        if verbose {
+            eprintln!("  Pulled {} layer(s)", image_data.layers.len());
+        }
+
+        Ok::<_, anyhow::Error>(image_data)
+    })?;
+
+    // Create temp directory for extraction
     let tempdir = tempfile::tempdir().context("failed to create temporary directory for rootfs")?;
     let rootfs_path = tempdir.path().join("rootfs");
     std::fs::create_dir_all(&rootfs_path).context("failed to create rootfs directory")?;
 
-    // Extract layers in order (bottom layer first).
-    for (i, layer_desc) in manifest.layers().iter().enumerate() {
-        let layer_blob = blob_path(layout_dir, layer_desc.digest().as_ref());
-        let data = std::fs::read(&layer_blob)
-            .with_context(|| format!("failed to read layer blob {}", layer_blob.display()))?;
-
+    // Extract layers in order (bottom layer first)
+    for (i, layer) in image_data.layers.iter().enumerate() {
         if verbose {
             eprintln!(
-                "  Extracting layer {}/{} ({} bytes, {})...",
+                "  Extracting layer {}/{} ({} bytes)...",
                 i + 1,
-                manifest.layers().len(),
-                data.len(),
-                layer_desc.media_type(),
+                image_data.layers.len(),
+                layer.data.len()
             );
         }
-
-        let media_type_str = layer_desc.media_type().to_string();
-        extract_layer(&data, &media_type_str, &rootfs_path)
+        extract_layer(&layer.data, &layer.media_type, &rootfs_path)
             .with_context(|| format!("failed to extract layer {}", i + 1))?;
     }
 
@@ -152,31 +151,33 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         eprintln!("  Rootfs extracted to {}", rootfs_path.display());
     }
 
+    // Save the raw config JSON before parsing (try_from consumes it).
+    let config_json = image_data.config.data.to_vec();
+
     // Parse image config for ENTRYPOINT, CMD, ENV, WORKDIR.
-    let config = match ImageConfiguration::from_reader(config_json.as_slice()) {
-        Ok(ic) => {
-            let exec_config = ic.config();
-            let parsed = ImageConfig {
-                entrypoint: exec_config.as_ref().and_then(|c| c.entrypoint().clone()),
-                cmd: exec_config.as_ref().and_then(|c| c.cmd().clone()),
-                env: exec_config.as_ref().and_then(|c| c.env().clone()),
-                working_dir: exec_config.as_ref().and_then(|c| c.working_dir().clone()),
+    let config = match ConfigFile::try_from(image_data.config) {
+        Ok(cf) => {
+            let exec_config = cf.config.as_ref();
+            let ic = ImageConfig {
+                entrypoint: exec_config.and_then(|c| c.entrypoint.clone()),
+                cmd: exec_config.and_then(|c| c.cmd.clone()),
+                env: exec_config.and_then(|c| c.env.clone()),
+                working_dir: exec_config.and_then(|c| c.working_dir.clone()),
             };
             if verbose {
                 eprintln!(
                     "  Image config: ENTRYPOINT={:?} CMD={:?} WORKDIR={:?} ENV=({} vars)",
-                    parsed.entrypoint,
-                    parsed.cmd,
-                    parsed.working_dir,
-                    parsed.env.as_ref().map_or(0, Vec::len)
+                    ic.entrypoint,
+                    ic.cmd,
+                    ic.working_dir,
+                    ic.env.as_ref().map_or(0, Vec::len)
                 );
             }
-            parsed
+            ic
         }
         Err(e) => {
             eprintln!(
-                "warning: failed to parse image config: {e}; \
-                 config_and_run.sh will not be generated"
+                "warning: failed to parse image config: {e}; config_and_run.sh will not be generated"
             );
             ImageConfig::default()
         }
@@ -188,133 +189,6 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         config,
         config_json,
     })
-}
-
-/// Resolve the path to the linux/amd64 image manifest blob within an OCI
-/// Image Layout directory.
-///
-/// The `index.json` may reference:
-/// 1. A single `ImageManifest` directly.
-/// 2. An `ImageIndex` (multi-arch / fat manifest) that in turn contains
-///    per-platform `ImageManifest` descriptors.
-///
-/// In case (2) we pick the `linux/amd64` entry.
-fn resolve_manifest_path(
-    layout_dir: &Path,
-    index: &ImageIndex,
-    verbose: bool,
-) -> anyhow::Result<PathBuf> {
-    let manifests = index.manifests();
-    if manifests.is_empty() {
-        bail!("OCI index.json has no manifests");
-    }
-
-    for desc in manifests {
-        let mt = desc.media_type();
-        let path = blob_path(layout_dir, desc.digest().as_ref());
-
-        if *mt == MediaType::ImageManifest {
-            // Direct image manifest — use it (assume correct platform for
-            // single-manifest indexes produced by skopeo with a platform
-            // filter or local builds).
-            if verbose {
-                eprintln!("  Using manifest blob {}", desc.digest());
-            }
-            return Ok(path);
-        }
-
-        if *mt == MediaType::ImageIndex {
-            // Nested image index (fat manifest) — look inside for linux/amd64.
-            if verbose {
-                eprintln!("  Resolving nested image index {}", desc.digest());
-            }
-            let nested_index = ImageIndex::from_file(&path).with_context(|| {
-                format!("failed to parse nested image index {}", path.display())
-            })?;
-            return resolve_platform_manifest(layout_dir, &nested_index, verbose);
-        }
-
-        // Docker manifest list uses a different media type string.
-        let mt_str = mt.to_string();
-        if mt_str.contains("manifest.list") || mt_str.contains("manifest.v2") {
-            // Treat manifest.list as an image index, and manifest.v2 as an
-            // image manifest (Docker V2 Schema 2).
-            if mt_str.contains("manifest.list") {
-                if verbose {
-                    eprintln!(
-                        "  Resolving Docker manifest list {} ({})",
-                        desc.digest(),
-                        mt_str
-                    );
-                }
-                let nested_index = ImageIndex::from_file(&path).with_context(|| {
-                    format!("failed to parse Docker manifest list {}", path.display())
-                })?;
-                return resolve_platform_manifest(layout_dir, &nested_index, verbose);
-            }
-            if verbose {
-                eprintln!(
-                    "  Using Docker manifest blob {} ({})",
-                    desc.digest(),
-                    mt_str
-                );
-            }
-            return Ok(path);
-        }
-    }
-
-    // Fallback: use the first manifest entry regardless of media type.
-    let first = &manifests[0];
-    let path = blob_path(layout_dir, first.digest().as_ref());
-    if verbose {
-        eprintln!(
-            "  Falling back to first manifest entry {} ({})",
-            first.digest(),
-            first.media_type()
-        );
-    }
-    Ok(path)
-}
-
-/// Pick the linux/amd64 manifest from a multi-platform image index.
-fn resolve_platform_manifest(
-    layout_dir: &Path,
-    index: &ImageIndex,
-    verbose: bool,
-) -> anyhow::Result<PathBuf> {
-    for desc in index.manifests() {
-        if let Some(platform) = desc.platform()
-            && *platform.architecture() == Arch::Amd64
-            && *platform.os() == Os::Linux
-        {
-            let path = blob_path(layout_dir, desc.digest().as_ref());
-            if verbose {
-                eprintln!("  Selected linux/amd64 manifest {}", desc.digest());
-            }
-            return Ok(path);
-        }
-    }
-    bail!(
-        "no linux/amd64 manifest found in image index (available platforms: {})",
-        index
-            .manifests()
-            .iter()
-            .filter_map(|d| d.platform().as_ref().map(|p| format!(
-                "{}/{}",
-                p.os(),
-                p.architecture()
-            )))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-}
-
-/// Return the blob path for a given digest string (e.g. `sha256:abcdef...`
-/// → `<layout_dir>/blobs/sha256/abcdef...`).
-fn blob_path(layout_dir: &Path, digest: &str) -> PathBuf {
-    // Digest format is "algorithm:hex", e.g. "sha256:abc123..."
-    let (algo, hex) = digest.split_once(':').unwrap_or(("sha256", digest));
-    layout_dir.join("blobs").join(algo).join(hex)
 }
 
 /// Generate a `litebox/config_and_run.sh` shell script from the OCI image config.
