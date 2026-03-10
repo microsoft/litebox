@@ -163,36 +163,70 @@ mod tests {
     }
 
     impl DiodServer {
+        const MAX_START_ATTEMPTS: usize = 5;
+
         fn start() -> Self {
             let export_dir = tempfile::tempdir().expect("failed to create temp dir");
             let export_path = export_dir.path().to_path_buf();
-            let port = find_free_port();
 
-            let child = std::process::Command::new("diod")
-                .args([
-                    "--foreground",
-                    "--no-auth",
-                    "--export",
-                    export_dir.path().to_str().unwrap(),
-                    "--listen",
-                    &std::format!("0.0.0.0:{port}"),
-                    "--nwthreads",
-                    "1",
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("failed to start diod – is it installed? (`apt install diod`)");
+            for attempt in 0..Self::MAX_START_ATTEMPTS {
+                let port = find_free_port();
 
-            // Give the server time to start listening.
-            std::thread::sleep(std::time::Duration::from_millis(500));
+                let mut child = std::process::Command::new("diod")
+                    .args([
+                        "--foreground",
+                        "--no-auth",
+                        "--export",
+                        export_dir.path().to_str().unwrap(),
+                        "--listen",
+                        &std::format!("0.0.0.0:{port}"),
+                        "--nwthreads",
+                        "1",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("failed to start diod – is it installed? (`apt install diod`)");
 
-            Self {
-                child,
-                port,
-                _export_dir: export_dir,
-                export_path,
+                if Self::wait_until_ready(&mut child, port) {
+                    return Self {
+                        child,
+                        port,
+                        _export_dir: export_dir,
+                        export_path,
+                    };
+                }
+
+                let _ = child.kill();
+                let _ = child.wait();
+                if attempt + 1 < Self::MAX_START_ATTEMPTS {
+                    std::eprintln!(
+                        "diod failed to bind to port {port}, retrying ({}/{})…",
+                        attempt + 1,
+                        Self::MAX_START_ATTEMPTS,
+                    );
+                }
             }
+
+            panic!(
+                "failed to start diod after {} attempts",
+                Self::MAX_START_ATTEMPTS,
+            );
+        }
+
+        fn wait_until_ready(child: &mut std::process::Child, port: u16) -> bool {
+            use std::net::TcpStream;
+            let addr = std::format!("127.0.0.1:{port}");
+            for _ in 0..50 {
+                if let Some(_status) = child.try_wait().ok().flatten() {
+                    return false;
+                }
+                if TcpStream::connect(&addr).is_ok() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            false
         }
 
         fn export_path(&self) -> &Path {
@@ -204,6 +238,14 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
+            if let Some(mut stderr) = self.child.stderr.take() {
+                use std::io::Read as _;
+                let mut output = std::string::String::new();
+                let _ = stderr.read_to_string(&mut output);
+                if !output.is_empty() {
+                    std::eprintln!("--- diod stderr ---\n{output}\n--- end diod stderr ---");
+                }
+            }
         }
     }
 
