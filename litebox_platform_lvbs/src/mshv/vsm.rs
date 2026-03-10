@@ -7,7 +7,7 @@
 use crate::mshv::mem_integrity::parse_modinfo;
 use crate::mshv::ringbuffer::set_ringbuffer;
 use crate::{
-    debug_serial_print, debug_serial_println,
+    debug_serial_println,
     host::{
         bootparam::get_vtl1_memory_info,
         linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
@@ -126,11 +126,14 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
         return Err(VsmError::CpuOnlineMaskCopyFailed);
     };
 
-    debug_serial_print!("cpu_online_mask: ");
-    cpu_mask.for_each_cpu(|cpu_id| {
-        debug_serial_print!("{}, ", cpu_id);
-    });
-    debug_serial_println!("");
+    #[cfg(debug_assertions)]
+    {
+        crate::debug_serial_print!("cpu_online_mask: ");
+        cpu_mask.for_each_cpu(|cpu_id| {
+            crate::debug_serial_print!("{}, ", cpu_id);
+        });
+        debug_serial_println!("");
+    }
 
     // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
     let Some(mut boot_signal_page_buf) = (unsafe {

@@ -20,7 +20,7 @@ use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;
 pub const EXCEPTION_STACK_SIZE: usize = PAGE_SIZE;
-pub const KERNEL_STACK_SIZE: usize = 10 * PAGE_SIZE;
+pub const KERNEL_STACK_SIZE: usize = 32 * PAGE_SIZE;
 
 /// Per-CPU VTL1 kernel variables
 #[repr(C, align(4096))]
@@ -293,6 +293,10 @@ pub struct PerCpuVariablesAsm {
     vtl1_user_xsaved: Cell<u8>,
     /// Exception info: exception vector number
     exception_trapno: Cell<u8>,
+    /// Set to 1 while inside `run_thread_arch` where TA is running or
+    /// handling its syscalls/exceptions. Analogous to
+    /// `is_in_guest` on the userland platforms.
+    is_in_user: Cell<u8>,
 }
 
 impl PerCpuVariablesAsm {
@@ -395,6 +399,9 @@ impl PerCpuVariablesAsm {
     }
     pub const fn exception_trapno_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, exception_trapno)
+    }
+    pub const fn is_in_user_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, is_in_user)
     }
     pub fn get_exception(&self) -> litebox::shim::Exception {
         litebox::shim::Exception(self.exception_trapno.get())
