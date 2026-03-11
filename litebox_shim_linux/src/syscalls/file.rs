@@ -266,6 +266,9 @@ impl<FS: ShimFS> Task<FS> {
                 |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
                 |_fd| todo!("net"),
                 |_fd| todo!("pipes"),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
             ),
             _ => Err(Errno::EINVAL),
         }
@@ -340,6 +343,9 @@ impl<FS: ShimFS> Task<FS> {
                                 .read(&self.wait_cx(), fd, &mut buf.borrow_mut())
                                 .map_err(Errno::from)
                         },
+                        |_fd| Err(Errno::EINVAL),
+                        |_fd| todo!("migrate before PR"),
+                        |_fd| todo!("migrate before PR"),
                     )
                     .flatten()
             }
@@ -397,6 +403,9 @@ impl<FS: ShimFS> Task<FS> {
                                 .write(&self.wait_cx(), fd, buf)
                                 .map_err(Errno::from)
                         },
+                        |_fd| Err(Errno::EINVAL),
+                        |_fd| todo!("migrate before PR"),
+                        |_fd| todo!("migrate before PR"),
                     )
                     .flatten()
             }
@@ -461,6 +470,9 @@ impl<FS: ShimFS> Task<FS> {
                 .run_on_raw_fd(
                     *raw_fd,
                     |fd| files.fs.seek(fd, offset, whence).map_err(Errno::from),
+                    |_| Err(Errno::ESPIPE),
+                    |_| Err(Errno::ESPIPE),
+                    |_| Err(Errno::ESPIPE),
                     |_| Err(Errno::ESPIPE),
                     |_| Err(Errno::ESPIPE),
                 )
@@ -611,6 +623,9 @@ impl<FS: ShimFS> Task<FS> {
                         },
                         |_fd| todo!("net"),
                         |_fd| todo!("pipes"),
+                        |_fd| Err(Errno::EINVAL),
+                        |_fd| todo!("epoll"),
+                        |_fd| todo!("unix"),
                     )
                     .flatten()?,
                 Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
@@ -696,6 +711,9 @@ impl<FS: ShimFS> Task<FS> {
                             })
                         },
                         |_fd| todo!("pipes"),
+                        |_fd| Err(Errno::EINVAL),
+                        |_fd| todo!("epoll"),
+                        |_fd| todo!("unix"),
                     )
                     .flatten()
             }
@@ -849,6 +867,9 @@ impl<FS: ShimFS> Descriptor<FS> {
                             ..Default::default()
                         })
                     },
+                    |_fd| todo!("migrate before PR"),
+                    |_fd| todo!("migrate before PR"),
+                    |_fd| todo!("migrate before PR"),
                 )
                 .flatten()?,
             Descriptor::Eventfd { .. } => FileStat {
@@ -922,6 +943,9 @@ impl<FS: ShimFS> Descriptor<FS> {
                 |fd| get_flags(global, fd),
                 |fd| get_flags(global, fd),
                 |fd| get_flags(global, fd),
+                |fd| get_flags(global, fd),
+                |fd| get_flags(global, fd),
+                |fd| get_flags(global, fd),
             ),
             Descriptor::Eventfd { close_on_exec, .. }
             | Descriptor::Epoll { close_on_exec, .. }
@@ -954,6 +978,9 @@ impl<FS: ShimFS> Descriptor<FS> {
         match self {
             Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
                 *raw_fd,
+                |fd| set_flags(global, fd, flags),
+                |fd| set_flags(global, fd, flags),
+                |fd| set_flags(global, fd, flags),
                 |fd| set_flags(global, fd, flags),
                 |fd| set_flags(global, fd, flags),
                 |fd| set_flags(global, fd, flags),
@@ -1104,6 +1131,9 @@ impl<FS: ShimFS> Task<FS> {
                             };
                             Ok(dirn | flags)
                         },
+                        |_fd| todo!("migrate before PR"),
+                        |_fd| todo!("migrate before PR"),
+                        |_fd| todo!("migrate before PR"),
                     )
                     .flatten()?
                     .bits()),
@@ -1183,6 +1213,9 @@ impl<FS: ShimFS> Task<FS> {
                                 )
                                 .map_err(Errno::from)
                         },
+                        |_fd| todo!("migrate before PR"),
+                        |_fd| todo!("migrate before PR"),
+                        |_fd| todo!("migrate before PR"),
                     )??,
                     Descriptor::Eventfd { file, .. } => {
                         toggle_flags!(file);
@@ -1218,6 +1251,9 @@ impl<FS: ShimFS> Task<FS> {
                         },
                         |_fd| todo!("net"),
                         |_fd| todo!("pipes"),
+                        |_fd| todo!("migrate before PR"),
+                        |_fd| todo!("migrate before PR"),
+                        |_fd| todo!("migrate before PR"),
                     )
                     .flatten()
             }
@@ -1240,6 +1276,9 @@ impl<FS: ShimFS> Task<FS> {
                         },
                         |_fd| todo!("net"),
                         |_fd| todo!("pipes"),
+                        |_fd| todo!("migrate before PR"),
+                        |_fd| todo!("migrate before PR"),
+                        |_fd| todo!("migrate before PR"),
                     )
                     .flatten()
             }
@@ -1509,6 +1548,9 @@ impl<FS: ShimFS> Task<FS> {
     self.global.pipes                                .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
                                     .map_err(Errno::from)
                             },
+                            |_fd| todo!("migrate before PR"),
+                            |_fd| todo!("migrate before PR"),
+                            |_fd| todo!("migrate before PR"),
                         )
                         .flatten()?;
                     }
@@ -1535,6 +1577,9 @@ impl<FS: ShimFS> Task<FS> {
                     },
                     |_fd| todo!("net"),
                     |_fd| todo!("pipes"),
+                    |_fd| todo!("migrate before PR"),
+                    |_fd| todo!("migrate before PR"),
+                    |_fd| todo!("migrate before PR"),
                 )?,
                 Descriptor::Eventfd { close_on_exec, .. }
                 | Descriptor::Epoll { close_on_exec, .. }
@@ -1556,6 +1601,9 @@ impl<FS: ShimFS> Task<FS> {
                             Err(Errno::ENOTTY)
                         }
                     },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                 )?,
@@ -1917,6 +1965,9 @@ impl<FS: ShimFS> Task<FS> {
                     |fd| dup(&self.global, &files, fd, close_on_exec),
                     |fd| dup(&self.global, &files, fd, close_on_exec),
                     |fd| dup(&self.global, &files, fd, close_on_exec),
+                    |fd| dup(&self.global, &files, fd, close_on_exec),
+                    |fd| dup(&self.global, &files, fd, close_on_exec),
+                    |fd| dup(&self.global, &files, fd, close_on_exec),
                 )?
             }
             Descriptor::Eventfd { file, .. } => Ok(Descriptor::Eventfd {
@@ -2081,6 +2132,9 @@ impl<FS: ShimFS> Task<FS> {
             },
             |_fd| todo!("net"),
             |_fd| todo!("pipes"),
+            |_fd| todo!("migrate before PR"),
+            |_fd| todo!("migrate before PR"),
+            |_fd| todo!("migrate before PR"),
         )?
     }
 }

@@ -118,6 +118,9 @@ impl<FS: ShimFS> Task<FS> {
                 |typed_fd| files.fs.get_static_backing_data(typed_fd),
                 |_| None,
                 |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
             )
             .ok()??;
 

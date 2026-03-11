@@ -511,44 +511,44 @@ enum Descriptor<FS: ShimFS> {
     },
 }
 
-/// A strongly-typed FD.
-///
-/// This enum only ever stores `Arc<TypedFd<..>>`s, and should not store any additional data
-/// alongside them (i.e., it is a trivial tagged union across the subsystems being used).
-enum StrongFd<FS: ShimFS> {
-    FileSystem(Arc<TypedFd<FS>>),
-    Network(Arc<TypedFd<Network<Platform>>>),
-    Pipes(Arc<TypedFd<Pipes<Platform>>>),
-}
-impl<FS: ShimFS> StrongFd<FS> {
-    fn from_raw(files: &syscalls::file::FilesState<FS>, fd: usize) -> Result<Self, Errno> {
-        let rds = files.raw_descriptor_store.read();
-        if let Ok(fd) = rds.fd_from_raw_integer::<FS>(fd) {
-            return Ok(StrongFd::FileSystem(fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd) {
-            return Ok(StrongFd::Network(fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer::<Pipes<Platform>>(fd) {
-            return Ok(StrongFd::Pipes(fd));
-        }
-        Err(Errno::EBADF)
-    }
-}
-
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn run_on_raw_fd<R>(
         &self,
         fd: usize,
         fs: impl FnOnce(&TypedFd<FS>) -> R,
         net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
         pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
+        eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem>) -> R,
+        epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<FS>>) -> R,
+        unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>) -> R,
     ) -> Result<R, Errno> {
-        match StrongFd::<FS>::from_raw(self, fd)? {
-            StrongFd::FileSystem(fd) => Ok(fs(&fd)),
-            StrongFd::Network(fd) => Ok(net(&fd)),
-            StrongFd::Pipes(fd) => Ok(pipes(&fd)),
+        let rds = self.raw_descriptor_store.read();
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(fs(&fd));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(net(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(pipes(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(eventfd(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(epoll(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(unix(&fd));
+        }
+        Err(Errno::EBADF)
     }
 }
 
