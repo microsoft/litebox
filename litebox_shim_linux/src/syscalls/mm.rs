@@ -109,7 +109,7 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         let raw_fd = match files.file_descriptors.read().get_fd(fd)? {
             crate::Descriptor::LiteBoxRawFd(raw_fd) => *raw_fd,
-            _ => return None,
+            crate::Descriptor::__Unused(_) => unreachable!(),
         };
 
         let static_data = files

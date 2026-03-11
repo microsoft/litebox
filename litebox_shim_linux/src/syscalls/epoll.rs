@@ -617,7 +617,6 @@ mod test {
     use alloc::sync::Arc;
     use litebox::event::Events;
     use litebox::event::wait::WaitState;
-    use litebox::utils::ReinterpretUnsignedExt as _;
     use litebox_common_linux::{EfdFlags, EpollEvent};
     use litebox_platform_multiplex::platform;
 
@@ -642,7 +641,7 @@ mod test {
             .litebox
             .descriptor_table_mut()
             .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
-        let files = Arc::new(FilesState::new());
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
         let Ok(raw_fd) = files.insert_raw_fd(typed) else {
             unreachable!()
         };
@@ -731,24 +730,19 @@ mod test {
         let task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
-        let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
-            0,
-            EfdFlags::empty(),
-        ));
+        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::empty());
 
-        let fd = 10i32;
-        let descriptor = crate::Descriptor::Eventfd {
-            file: eventfd.clone(),
-            close_on_exec: core::sync::atomic::AtomicBool::new(false),
-        };
-
+        let typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
         let no_fds = FilesState::new(task.files.borrow().fs.clone());
-        let fds = FilesState::new(task.files.borrow().fs.clone());
-        let _ = fds.file_descriptors.write().insert_at(
-            &task,
-            descriptor,
-            fd.reinterpret_as_unsigned() as usize,
-        );
+        let fds = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(raw_fd) = fds.insert_raw_fd(typed) else {
+            unreachable!()
+        };
+        let fd = i32::try_from(raw_fd).unwrap();
         set.add_fd(fd, Events::IN);
 
         let revents = |set: &super::PollSet| {
@@ -761,14 +755,36 @@ mod test {
             .unwrap();
         assert_eq!(revents(&set), Events::NVAL);
 
-        eventfd
-            .write(&WaitState::new(platform()).context(), 1)
-            .unwrap();
+        {
+            let typed = fds
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                .unwrap();
+            task.global
+                .litebox
+                .descriptor_table()
+                .with_entry(&typed, |entry| {
+                    entry.write(&WaitState::new(platform()).context(), 1)
+                });
+        }
         set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
 
-        eventfd.read(&WaitState::new(platform()).context()).unwrap();
+        {
+            let typed = fds
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                .unwrap();
+            task.global
+                .litebox
+                .descriptor_table()
+                .with_entry(&typed, |entry| {
+                    entry.read(&WaitState::new(platform()).context())
+                });
+        }
         set.wait(
             &task.global,
             &WaitState::new(platform())
@@ -780,11 +796,21 @@ mod test {
         assert!(revents(&set).is_empty());
 
         // spawn a thread to write to the eventfd
-        let copied_eventfd = eventfd.clone();
+        let global = task.global.clone();
+        let fds_for_thread = Arc::clone(&fds);
         std::thread::spawn(move || {
-            copied_eventfd
-                .write(&WaitState::new(platform()).context(), 1)
+            let typed = fds_for_thread
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
                 .unwrap();
+            let handle = global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&typed)
+                .unwrap();
+            let _ =
+                handle.with_entry(|entry| entry.write(&WaitState::new(platform()).context(), 1));
         });
 
         set.wait(&task.global, &WaitState::new(platform()).context(), &fds)

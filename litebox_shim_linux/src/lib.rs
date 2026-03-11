@@ -497,18 +497,8 @@ impl<FS: ShimFS> Task<FS> {
 
 enum Descriptor<FS: ShimFS> {
     LiteBoxRawFd(usize),
-    Eventfd {
-        file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
-        close_on_exec: core::sync::atomic::AtomicBool,
-    },
-    Epoll {
-        file: alloc::sync::Arc<syscalls::epoll::EpollFile<FS>>,
-        close_on_exec: core::sync::atomic::AtomicBool,
-    },
-    Unix {
-        file: alloc::sync::Arc<syscalls::unix::UnixSocket<FS>>,
-        close_on_exec: core::sync::atomic::AtomicBool,
-    },
+    // XXX(jb) this entire type will go away before the PR
+    __Unused(core::marker::PhantomData<FS>),
 }
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {

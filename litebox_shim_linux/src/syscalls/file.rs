@@ -270,7 +270,7 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
             ),
-            _ => Err(Errno::EINVAL),
+            Descriptor::__Unused(_) => Err(Errno::EINVAL),
         }
         .flatten()
     }
@@ -343,29 +343,44 @@ impl<FS: ShimFS> Task<FS> {
                                 .read(&self.wait_cx(), fd, &mut buf.borrow_mut())
                                 .map_err(Errno::from)
                         },
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                let buf = &mut buf.borrow_mut();
+                                if buf.len() < size_of::<u64>() {
+                                    return Err(Errno::EINVAL);
+                                }
+                                let value = file.read(&self.wait_cx())?;
+                                buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+                                Ok(size_of::<u64>())
+                            })
+                        },
                         |_fd| Err(Errno::EINVAL),
-                        |_fd| todo!("migrate before PR"),
-                        |_fd| todo!("migrate before PR"),
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                file.recvfrom(
+                                    &self.wait_cx(),
+                                    &mut buf.borrow_mut(),
+                                    litebox_common_linux::ReceiveFlags::empty(),
+                                    None,
+                                )
+                            })
+                        },
                     )
                     .flatten()
             }
-            Descriptor::Epoll { .. } => Err(Errno::EINVAL),
-            Descriptor::Eventfd { file, .. } => {
-                let file = file.clone();
-                drop(file_table);
-                if buf.len() < size_of::<u64>() {
-                    return Err(Errno::EINVAL);
-                }
-                let value = file.read(&self.wait_cx())?;
-                buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
-                Ok(size_of::<u64>())
-            }
-            Descriptor::Unix { file, .. } => file.recvfrom(
-                &self.wait_cx(),
-                buf,
-                litebox_common_linux::ReceiveFlags::empty(),
-                None,
-            ),
+            Descriptor::__Unused(_) => unreachable!("delete before PR"),
         }
     }
 
@@ -403,26 +418,43 @@ impl<FS: ShimFS> Task<FS> {
                                 .write(&self.wait_cx(), fd, buf)
                                 .map_err(Errno::from)
                         },
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                let value: u64 = u64::from_le_bytes(
+                                    buf[..size_of::<u64>()]
+                                        .try_into()
+                                        .map_err(|_| Errno::EINVAL)?,
+                                );
+                                file.write(&self.wait_cx(), value)
+                            })
+                        },
                         |_fd| Err(Errno::EINVAL),
-                        |_fd| todo!("migrate before PR"),
-                        |_fd| todo!("migrate before PR"),
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                file.sendto(
+                                    self,
+                                    buf,
+                                    litebox_common_linux::SendFlags::empty(),
+                                    None,
+                                )
+                            })
+                        },
                     )
                     .flatten()
             }
-            Descriptor::Epoll { .. } => Err(Errno::EINVAL),
-            Descriptor::Eventfd { file, .. } => {
-                let file = file.clone();
-                drop(file_table);
-                let value: u64 = u64::from_le_bytes(
-                    buf[..size_of::<u64>()]
-                        .try_into()
-                        .map_err(|_| Errno::EINVAL)?,
-                );
-                file.write(&self.wait_cx(), value)
-            }
-            Descriptor::Unix { file, .. } => {
-                file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
-            }
+            Descriptor::__Unused(_) => unreachable!("delete before PR"),
         };
         if let Err(Errno::EPIPE) = res {
             unimplemented!("send SIGPIPE to the current task");
@@ -477,9 +509,7 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Err(Errno::ESPIPE),
                 )
                 .flatten(),
-            Descriptor::Epoll { .. } | Descriptor::Eventfd { .. } | Descriptor::Unix { .. } => {
-                Err(Errno::ESPIPE)
-            }
+            Descriptor::__Unused(_) => unreachable!("delete before PR"),
         }
     }
 
@@ -556,9 +586,7 @@ impl<FS: ShimFS> Task<FS> {
                 // early-handled the "raw FD not found" case.
                 unreachable!()
             }
-            Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                Ok(())
-            }
+            Descriptor::__Unused(_) => unreachable!("delete before PR"),
         }
     }
 
@@ -623,14 +651,12 @@ impl<FS: ShimFS> Task<FS> {
                         },
                         |_fd| todo!("net"),
                         |_fd| todo!("pipes"),
+                        |_fd| todo!("eventfd"),
                         |_fd| Err(Errno::EINVAL),
-                        |_fd| todo!("epoll"),
                         |_fd| todo!("unix"),
                     )
                     .flatten()?,
-                Descriptor::Epoll { .. } => return Err(Errno::EINVAL),
-                Descriptor::Eventfd { .. } => todo!(),
-                Descriptor::Unix { .. } => todo!(),
+                Descriptor::__Unused(_) => unreachable!("delete before PR"),
             };
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
@@ -711,15 +737,13 @@ impl<FS: ShimFS> Task<FS> {
                             })
                         },
                         |_fd| todo!("pipes"),
+                        |_fd| todo!("eventfd"),
                         |_fd| Err(Errno::EINVAL),
-                        |_fd| todo!("epoll"),
                         |_fd| todo!("unix"),
                     )
                     .flatten()
             }
-            Descriptor::Epoll { .. } => Err(Errno::EINVAL),
-            Descriptor::Eventfd { .. } => todo!(),
-            Descriptor::Unix { .. } => todo!(),
+            Descriptor::__Unused(_) => unreachable!("delete before PR"),
         };
         if let Err(Errno::EPIPE) = res {
             unimplemented!("send SIGPIPE to the current task");
@@ -867,55 +891,59 @@ impl<FS: ShimFS> Descriptor<FS> {
                             ..Default::default()
                         })
                     },
-                    |_fd| todo!("migrate before PR"),
-                    |_fd| todo!("migrate before PR"),
-                    |_fd| todo!("migrate before PR"),
+                    |_fd| {
+                        Ok(FileStat {
+                            // TODO: give correct values
+                            st_dev: 0,
+                            st_ino: 0,
+                            st_nlink: 1,
+                            st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
+                            st_uid: 0,
+                            st_gid: 0,
+                            st_rdev: 0,
+                            st_size: 0,
+                            st_blksize: 4096,
+                            st_blocks: 0,
+                            ..Default::default()
+                        })
+                    },
+                    |_fd| {
+                        Ok(FileStat {
+                            // TODO: give correct values
+                            st_dev: 0,
+                            st_ino: 0,
+                            st_nlink: 1,
+                            st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
+                            st_uid: 0,
+                            st_gid: 0,
+                            st_rdev: 0,
+                            st_size: 0,
+                            st_blksize: 0,
+                            st_blocks: 0,
+                            ..Default::default()
+                        })
+                    },
+                    |_fd| {
+                        Ok(FileStat {
+                            // TODO: give correct values
+                            st_dev: 0,
+                            st_ino: 0,
+                            st_nlink: 1,
+                            st_mode: (litebox_common_linux::InodeType::Socket as u32
+                                | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+                            .truncate(),
+                            st_uid: 0,
+                            st_gid: 0,
+                            st_rdev: 0,
+                            st_size: 0,
+                            st_blksize: 4096,
+                            st_blocks: 0,
+                            ..Default::default()
+                        })
+                    },
                 )
                 .flatten()?,
-            Descriptor::Eventfd { .. } => FileStat {
-                // TODO: give correct values
-                st_dev: 0,
-                st_ino: 0,
-                st_nlink: 1,
-                st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                st_uid: 0,
-                st_gid: 0,
-                st_rdev: 0,
-                st_size: 0,
-                st_blksize: 4096,
-                st_blocks: 0,
-                ..Default::default()
-            },
-            Descriptor::Epoll { .. } => FileStat {
-                // TODO: give correct values
-                st_dev: 0,
-                st_ino: 0,
-                st_nlink: 1,
-                st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                st_uid: 0,
-                st_gid: 0,
-                st_rdev: 0,
-                st_size: 0,
-                st_blksize: 0,
-                st_blocks: 0,
-                ..Default::default()
-            },
-            Descriptor::Unix { .. } => FileStat {
-                // TODO: give correct values
-                st_dev: 0,
-                st_ino: 0,
-                st_nlink: 1,
-                st_mode: (litebox_common_linux::InodeType::Socket as u32
-                    | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
-                .truncate(),
-                st_uid: 0,
-                st_gid: 0,
-                st_rdev: 0,
-                st_size: 0,
-                st_blksize: 4096,
-                st_blocks: 0,
-                ..Default::default()
-            },
+            Descriptor::__Unused(_) => unreachable!("delete before PR"),
         };
         Ok(fstat)
     }
@@ -947,15 +975,7 @@ impl<FS: ShimFS> Descriptor<FS> {
                 |fd| get_flags(global, fd),
                 |fd| get_flags(global, fd),
             ),
-            Descriptor::Eventfd { close_on_exec, .. }
-            | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => Ok(
-                if close_on_exec.load(core::sync::atomic::Ordering::Relaxed) {
-                    FileDescriptorFlags::FD_CLOEXEC
-                } else {
-                    FileDescriptorFlags::empty()
-                },
-            ),
+            Descriptor::__Unused(_) => unreachable!("delete before PR"),
         }
     }
     fn set_file_descriptor_flags(
@@ -985,14 +1005,7 @@ impl<FS: ShimFS> Descriptor<FS> {
                 |fd| set_flags(global, fd, flags),
                 |fd| set_flags(global, fd, flags),
             )?,
-            Descriptor::Eventfd { close_on_exec, .. }
-            | Descriptor::Epoll { close_on_exec, .. }
-            | Descriptor::Unix { close_on_exec, .. } => {
-                close_on_exec.store(
-                    flags.contains(FileDescriptorFlags::FD_CLOEXEC),
-                    core::sync::atomic::Ordering::Relaxed,
-                );
-            }
+            Descriptor::__Unused(_) => unreachable!("delete before PR"),
         }
         Ok(())
     }
@@ -1131,15 +1144,40 @@ impl<FS: ShimFS> Task<FS> {
                             };
                             Ok(dirn | flags)
                         },
-                        |_fd| todo!("migrate before PR"),
-                        |_fd| todo!("migrate before PR"),
-                        |_fd| todo!("migrate before PR"),
+                        |fd| {
+                            // TODO: Consider shared metadata table?
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| Ok(file.get_status()))
+                        },
+                        |fd| {
+                            // TODO: Consider shared metadata table?
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| Ok(file.get_status()))
+                        },
+                        |fd| {
+                            // TODO: Consider shared metadata table?
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| Ok(file.get_status()))
+                        },
                     )
                     .flatten()?
                     .bits()),
-                Descriptor::Eventfd { file, .. } => Ok(file.get_status().bits()),
-                Descriptor::Epoll { file, .. } => Ok(file.get_status().bits()),
-                Descriptor::Unix { file, .. } => Ok(file.get_status().bits()),
+                Descriptor::__Unused(_) => unreachable!("delete before PR"),
             },
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
@@ -1148,14 +1186,14 @@ impl<FS: ShimFS> Task<FS> {
                     | OFlags::DIRECT
                     | OFlags::NOATIME;
                 macro_rules! toggle_flags {
-                    ($t:ident) => {
+                    ($t:ident) => {{
                         let diff = $t.get_status() ^ flags;
                         if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
                             todo!("unsupported flags");
                         }
                         $t.set_status(flags & setfl_mask, true);
                         $t.set_status(flags.complement() & setfl_mask, false);
-                    };
+                    }};
                 }
                 match desc {
                     Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
@@ -1213,17 +1251,31 @@ impl<FS: ShimFS> Task<FS> {
                                 )
                                 .map_err(Errno::from)
                         },
-                        |_fd| todo!("migrate before PR"),
-                        |_fd| todo!("migrate before PR"),
-                        |_fd| todo!("migrate before PR"),
+                        |fd| {
+                            // TODO: Consider shared metadata table?
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| toggle_flags!(file));
+                            Ok(())
+                        },
+                        |_fd| todo!("epoll"),
+                        |fd| {
+                            // TODO: Consider shared metadata table?
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| toggle_flags!(file));
+                            Ok(())
+                        },
                     )??,
-                    Descriptor::Eventfd { file, .. } => {
-                        toggle_flags!(file);
-                    }
-                    Descriptor::Epoll { .. } => todo!(),
-                    Descriptor::Unix { file, .. } => {
-                        toggle_flags!(file);
-                    }
+                    Descriptor::__Unused(_) => unreachable!("delete before PR"),
                 }
                 Ok(0)
             }
@@ -1432,20 +1484,28 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let eventfd = super::eventfd::EventFile::new(u64::from(initval), flags);
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let typed = dt.insert::<super::eventfd::EventfdSubsystem>(eventfd);
+        if flags.contains(EfdFlags::CLOEXEC) {
+            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        drop(dt);
         let files = self.files.borrow();
+        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+            self.global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&typed)
+                .unwrap();
+            Errno::EMFILE
+        })?;
         files
             .file_descriptors
             .write()
-            .insert(
-                self,
-                Descriptor::Eventfd {
-                    file: alloc::sync::Arc::new(eventfd),
-                    close_on_exec: core::sync::atomic::AtomicBool::new(
-                        flags.contains(EfdFlags::CLOEXEC),
-                    ),
-                },
-            )
-            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
+            .insert(self, Descriptor::LiteBoxRawFd(raw_fd))
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
+        Ok(raw_fd.truncate())
     }
 
     fn stdio_ioctl(
@@ -1548,19 +1608,46 @@ impl<FS: ShimFS> Task<FS> {
     self.global.pipes                                .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
                                     .map_err(Errno::from)
                             },
-                            |_fd| todo!("migrate before PR"),
-                            |_fd| todo!("migrate before PR"),
-                            |_fd| todo!("migrate before PR"),
+                            |fd| {
+                                let handle = self
+                                    .global
+                                    .litebox
+                                    .descriptor_table()
+                                    .entry_handle(fd)
+                                    .ok_or(Errno::EBADF)?;
+                                handle.with_entry(|file| {
+                                    file.set_status(OFlags::NONBLOCK, val != 0);
+                                });
+                                Ok(())
+                            },
+                            |fd| {
+                                let handle = self
+                                    .global
+                                    .litebox
+                                    .descriptor_table()
+                                    .entry_handle(fd)
+                                    .ok_or(Errno::EBADF)?;
+                                handle.with_entry(|file| {
+                                    file.set_status(OFlags::NONBLOCK, val != 0);
+                                });
+                                Ok(())
+                            },
+                            |fd| {
+                                let handle = self
+                                    .global
+                                    .litebox
+                                    .descriptor_table()
+                                    .entry_handle(fd)
+                                    .ok_or(Errno::EBADF)?;
+                                handle.with_entry(|file| {
+                                    file.set_status(OFlags::NONBLOCK, val != 0);
+                                });
+                                Ok(())
+                            },
                         )
                         .flatten()?;
                     }
-                    Descriptor::Eventfd { file, .. } => file.set_status(OFlags::NONBLOCK, val != 0),
-                    Descriptor::Epoll { file, .. } => {
-                        file.set_status(OFlags::NONBLOCK, val != 0);
-                    }
-                    Descriptor::Unix { file, .. } => {
-                        file.set_status(OFlags::NONBLOCK, val != 0);
-                    }
+                    Descriptor::__Unused(_) => unreachable!("delete before PR"),
                 }
                 Ok(0)
             }
@@ -1577,16 +1664,32 @@ impl<FS: ShimFS> Task<FS> {
                     },
                     |_fd| todo!("net"),
                     |_fd| todo!("pipes"),
-                    |_fd| todo!("migrate before PR"),
-                    |_fd| todo!("migrate before PR"),
-                    |_fd| todo!("migrate before PR"),
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        Ok(0)
+                    },
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        Ok(0)
+                    },
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                        Ok(0)
+                    },
                 )?,
-                Descriptor::Eventfd { close_on_exec, .. }
-                | Descriptor::Epoll { close_on_exec, .. }
-                | Descriptor::Unix { close_on_exec, .. } => {
-                    close_on_exec.store(true, core::sync::atomic::Ordering::Relaxed);
-                    Ok(0)
-                }
+                Descriptor::__Unused(_) => unreachable!("delete before PR"),
             },
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
@@ -1607,9 +1710,7 @@ impl<FS: ShimFS> Task<FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                 )?,
-                Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
-                    Err(Errno::ENOTTY)
-                }
+                Descriptor::__Unused(_) => unreachable!("delete before PR"),
             },
             _ => {
                 #[cfg(debug_assertions)]
@@ -1626,20 +1727,28 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let epoll_file = super::epoll::EpollFile::new();
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let typed = dt.insert::<super::epoll::EpollSubsystem<FS>>(epoll_file);
+        if flags.contains(EpollCreateFlags::EPOLL_CLOEXEC) {
+            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        drop(dt);
         let files = self.files.borrow();
+        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+            self.global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&typed)
+                .unwrap();
+            Errno::EMFILE
+        })?;
         files
             .file_descriptors
             .write()
-            .insert(
-                self,
-                Descriptor::Epoll {
-                    file: alloc::sync::Arc::new(epoll_file),
-                    close_on_exec: core::sync::atomic::AtomicBool::new(
-                        flags.contains(EpollCreateFlags::EPOLL_CLOEXEC),
-                    ),
-                },
-            )
-            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
+            .insert(self, Descriptor::LiteBoxRawFd(raw_fd))
+            .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
+        Ok(raw_fd.truncate())
     }
 
     /// Handle syscall `epoll_ctl`
@@ -1711,30 +1820,46 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             None
         };
-        let epoll_file = {
+        let handle = {
             let files = self.files.borrow();
             let locked_file_descriptors = files.file_descriptors.read();
             match locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)? {
-                Descriptor::Epoll { file, .. } => file.clone(),
-                _ => return Err(Errno::EBADF),
+                Descriptor::LiteBoxRawFd(raw_fd) => {
+                    let Ok(fd) = files
+                        .raw_descriptor_store
+                        .read()
+                        .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<FS>>(
+                        *raw_fd,
+                    ) else {
+                        return Err(Errno::EBADF);
+                    };
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(&fd)
+                        .ok_or(Errno::EBADF)?
+                }
+                Descriptor::__Unused(_) => unreachable!("delete before PR"),
             }
         };
-        match epoll_file.wait(
-            &self.global,
-            &self.wait_cx().with_timeout(timeout),
-            maxevents,
-        ) {
-            Ok(epoll_events) => {
-                if !epoll_events.is_empty() {
-                    events
-                        .copy_from_slice(0, &epoll_events)
-                        .ok_or(Errno::EFAULT)?;
+        handle.with_entry(|epoll_file| {
+            match epoll_file.wait(
+                &self.global,
+                &self.wait_cx().with_timeout(timeout),
+                maxevents,
+            ) {
+                Ok(epoll_events) => {
+                    if !epoll_events.is_empty() {
+                        events
+                            .copy_from_slice(0, &epoll_events)
+                            .ok_or(Errno::EFAULT)?;
+                    }
+                    Ok(epoll_events.len())
                 }
-                Ok(epoll_events.len())
+                Err(WaitError::TimedOut) => Ok(0),
+                Err(WaitError::Interrupted) => Err(Errno::EINTR),
             }
-            Err(WaitError::TimedOut) => Ok(0),
-            Err(WaitError::Interrupted) => Err(Errno::EINTR),
-        }
+        })
     }
 
     /// Handle syscall `ppoll`.
@@ -1970,18 +2095,7 @@ impl<FS: ShimFS> Task<FS> {
                     |fd| dup(&self.global, &files, fd, close_on_exec),
                 )?
             }
-            Descriptor::Eventfd { file, .. } => Ok(Descriptor::Eventfd {
-                file: file.clone(),
-                close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
-            }),
-            Descriptor::Epoll { file, .. } => Ok(Descriptor::Epoll {
-                file: file.clone(),
-                close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
-            }),
-            Descriptor::Unix { file, .. } => Ok(Descriptor::Unix {
-                file: file.clone(),
-                close_on_exec: core::sync::atomic::AtomicBool::new(close_on_exec),
-            }),
+            Descriptor::__Unused(_) => unreachable!("delete before PR"),
         }
     }
 

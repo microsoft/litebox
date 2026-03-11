@@ -7,7 +7,6 @@ use core::{
     ffi::CStr,
     mem::offset_of,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::atomic::AtomicBool,
 };
 
 use alloc::string::ToString;
@@ -28,8 +27,8 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    AddressFamily, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
-    SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
+    AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType,
+    SocketOption, SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -57,22 +56,6 @@ macro_rules! convert_flags {
 pub(crate) type SocketFd = litebox::net::SocketFd<Platform>;
 
 impl<FS: ShimFS> super::file::FilesState<FS> {
-    fn with_socket_fd<R>(
-        &self,
-        raw_fd: usize,
-        f: impl FnOnce(&SocketFd) -> Result<R, Errno>,
-    ) -> Result<R, Errno> {
-        let rds = self.raw_descriptor_store.read();
-        match rds.fd_from_raw_integer(raw_fd) {
-            Ok(fd) => {
-                drop(rds);
-                f(&fd)
-            }
-            Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
-            Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => Err(Errno::ENOTSOCK),
-        }
-    }
-
     /// Helper to dispatch socket operations based on socket type (INET vs Unix).
     ///
     /// This method handles the common pattern of:
@@ -85,24 +68,30 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
     /// For Unix sockets, the `unix_op` closure is called with a cloned Arc to the socket.
     fn with_socket<R>(
         &self,
+        global: &GlobalState<FS>,
         sockfd: u32,
         inet_op: impl FnOnce(&SocketFd) -> Result<R, Errno>,
-        unix_op: impl FnOnce(Arc<UnixSocket<FS>>) -> Result<R, Errno>,
+        unix_op: impl FnOnce(&UnixSocket<FS>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
-        let file_table = self.file_descriptors.read();
-        match file_table.get_fd(sockfd).ok_or(Errno::EBADF)? {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                let raw_fd = *raw_fd;
-                drop(file_table);
-                self.with_socket_fd(raw_fd, inet_op)
-            }
-            Descriptor::Unix { file, .. } => {
-                let file = file.clone();
-                drop(file_table);
-                unix_op(file)
-            }
-            _ => Err(Errno::ENOTSOCK),
+        let raw_fd = sockfd as usize;
+        let inet_fd = {
+            let rds = self.raw_descriptor_store.read();
+            rds.fd_from_raw_integer(raw_fd).ok()
+        };
+        if let Some(fd) = inet_fd {
+            return inet_op(&fd);
         }
+        let unix = self
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
+            .map_err(|_| Errno::ENOTSOCK)?;
+        let handle = global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&unix)
+            .ok_or(Errno::EBADF)?;
+        handle.with_entry(|entry| unix_op(entry))
     }
 }
 
@@ -955,10 +944,24 @@ impl<FS: ShimFS> Task<FS> {
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
                 let socket = UnixSocket::new(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
-                Descriptor::Unix {
-                    file: Arc::new(socket),
-                    close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
+                let typed = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(socket);
+                if flags.contains(SockFlags::CLOEXEC) {
+                    let old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                    assert!(old.is_none());
                 }
+                let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    Errno::EMFILE
+                })?;
+                Descriptor::LiteBoxRawFd(raw_fd)
             }
             AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
             _ => unimplemented!(),
@@ -1003,15 +1006,30 @@ impl<FS: ShimFS> Task<FS> {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
                 let (sock1, sock2) =
                     UnixSocket::new_connected_pair(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
-                let file1 = Descriptor::Unix {
-                    file: Arc::new(sock1),
-                    close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
-                };
-                let file2 = Descriptor::Unix {
-                    file: Arc::new(sock2),
-                    close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
-                };
-                (file1, file2)
+                let files = self.files.borrow();
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                let typed1 = dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(sock1);
+                let typed2 = dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(sock2);
+                if flags.contains(SockFlags::CLOEXEC) {
+                    let old = dt.set_fd_metadata(&typed1, FileDescriptorFlags::FD_CLOEXEC);
+                    assert!(old.is_none());
+                    let old = dt.set_fd_metadata(&typed2, FileDescriptorFlags::FD_CLOEXEC);
+                    assert!(old.is_none());
+                }
+                drop(dt);
+                let raw_fd1 = files.insert_raw_fd(typed1).map_err(|typed| {
+                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    Errno::EMFILE
+                })?;
+                let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
+                    self.do_close(Descriptor::LiteBoxRawFd(raw_fd1)).unwrap();
+                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    Errno::EMFILE
+                })?;
+                (
+                    Descriptor::LiteBoxRawFd(raw_fd1),
+                    Descriptor::LiteBoxRawFd(raw_fd2),
+                )
             }
             AddressFamily::INET | AddressFamily::INET6 | AddressFamily::NETLINK => {
                 return Err(Errno::EOPNOTSUPP);
@@ -1199,6 +1217,7 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         let want_peer = peer.is_some();
         let (file, peer_addr) = files.with_socket(
+            &self.global,
             sockfd,
             |fd| {
                 let sock_type = self.global.get_socket_type(fd)?;
@@ -1222,13 +1241,19 @@ impl<FS: ShimFS> Task<FS> {
                 let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);
                 let accepted_file = file.accept(&self.wait_cx(), flags, socket_addr.as_mut())?;
                 let peer_addr = socket_addr.map(SocketAddress::Unix);
-                Ok((
-                    Descriptor::Unix {
-                        file: Arc::new(accepted_file),
-                        close_on_exec: AtomicBool::new(flags.contains(SockFlags::CLOEXEC)),
-                    },
-                    peer_addr,
-                ))
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                let typed =
+                    dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(accepted_file);
+                if flags.contains(SockFlags::CLOEXEC) {
+                    let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                    assert!(old.is_none());
+                }
+                drop(dt);
+                let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    Errno::EMFILE
+                })?;
+                Ok((Descriptor::LiteBoxRawFd(raw_fd), peer_addr))
             },
         )?;
 
@@ -1262,6 +1287,7 @@ impl<FS: ShimFS> Task<FS> {
     }
     fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         self.files.borrow().with_socket(
+            &self.global,
             sockfd,
             |fd| {
                 let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
@@ -1289,6 +1315,7 @@ impl<FS: ShimFS> Task<FS> {
     }
     fn do_bind(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         self.files.borrow().with_socket(
+            &self.global,
             sockfd,
             |fd| {
                 let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
@@ -1310,6 +1337,7 @@ impl<FS: ShimFS> Task<FS> {
     }
     fn do_listen(&self, sockfd: u32, backlog: u16) -> Result<(), Errno> {
         self.files.borrow().with_socket(
+            &self.global,
             sockfd,
             |fd| self.global.listen(fd, backlog),
             |file| file.listen(backlog, &self.global),
@@ -1343,6 +1371,7 @@ impl<FS: ShimFS> Task<FS> {
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
         self.files.borrow().with_socket(
+            &self.global,
             sockfd,
             |fd| {
                 let sockaddr = sockaddr
@@ -1401,6 +1430,7 @@ impl<FS: ShimFS> Task<FS> {
             .to_owned_slice(msg.msg_iovlen)
             .ok_or(Errno::EFAULT)?;
         self.files.borrow().with_socket(
+            &self.global,
             sockfd,
             |fd| {
                 let sock_addr = sock_addr
@@ -1476,33 +1506,38 @@ impl<FS: ShimFS> Task<FS> {
             Descriptor::LiteBoxRawFd(raw_fd) => {
                 let raw_fd = *raw_fd;
                 drop(file_table);
-                files.with_socket_fd(raw_fd, |fd| {
-                    let mut addr = None;
-                    let size = self.global.receive(
-                        &self.wait_cx(),
-                        fd,
-                        buf,
-                        flags,
-                        if want_source { Some(&mut addr) } else { None },
-                    )?;
-                    let src_addr = addr.map(SocketAddress::Inet);
-                    Ok((size, src_addr))
-                })?
+                // We need to do this cell dance because otherwise Rust can't recognize that the two
+                // closures are mutually exclusive.
+                let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
+                files.with_socket(
+                    &self.global,
+                    raw_fd.truncate(),
+                    |fd| {
+                        let mut addr = None;
+                        let size = self.global.receive(
+                            &self.wait_cx(),
+                            fd,
+                            &mut buf.borrow_mut(),
+                            flags,
+                            if want_source { Some(&mut addr) } else { None },
+                        )?;
+                        let src_addr = addr.map(SocketAddress::Inet);
+                        Ok((size, src_addr))
+                    },
+                    |entry| {
+                        let mut addr = None;
+                        let size = entry.recvfrom(
+                            &self.wait_cx(),
+                            &mut buf.borrow_mut(),
+                            flags,
+                            if want_source { Some(&mut addr) } else { None },
+                        )?;
+                        let src_addr = addr.map(SocketAddress::Unix);
+                        Ok((size, src_addr))
+                    },
+                )?
             }
-            Descriptor::Unix { file, .. } => {
-                let file = file.clone();
-                drop(file_table);
-                let mut addr = None;
-                let size = file.recvfrom(
-                    &self.wait_cx(),
-                    buf,
-                    flags,
-                    if want_source { Some(&mut addr) } else { None },
-                )?;
-                let src_addr = addr.map(SocketAddress::Unix);
-                (size, src_addr)
-            }
-            _ => return Err(Errno::ENOTSOCK),
+            Descriptor::__Unused(_) => unreachable!(),
         };
 
         if !flags.contains(ReceiveFlags::TRUNC) {
@@ -1541,6 +1576,7 @@ impl<FS: ShimFS> Task<FS> {
         optlen: usize,
     ) -> Result<(), Errno> {
         self.files.borrow().with_socket(
+            &self.global,
             sockfd,
             |fd| self.global.setsockopt(fd, optname, optval, optlen),
             |file| file.setsockopt(&self.global, optname, optval, optlen),
@@ -1584,6 +1620,7 @@ impl<FS: ShimFS> Task<FS> {
         len: u32,
     ) -> Result<usize, Errno> {
         self.files.borrow().with_socket(
+            &self.global,
             sockfd,
             |fd| self.global.getsockopt(fd, optname, optval, len),
             |file| file.getsockopt(&self.global, optname, optval, len),
@@ -1605,6 +1642,7 @@ impl<FS: ShimFS> Task<FS> {
     }
     fn do_getsockname(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
         self.files.borrow().with_socket(
+            &self.global,
             sockfd,
             |fd| {
                 self.global
@@ -1633,6 +1671,7 @@ impl<FS: ShimFS> Task<FS> {
     }
     fn do_getpeername(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
         self.files.borrow().with_socket(
+            &self.global,
             sockfd,
             |fd| {
                 self.global
