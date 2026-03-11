@@ -1017,6 +1017,7 @@ impl litebox::platform::RawPointerProvider for FreeBSDUserland {
 // umtx_op helper
 // ---------------------------------------------------------------------------
 
+#[expect(clippy::similar_names, reason = "tv_sec/tv_nsec and pid/ppid are standard POSIX names")]
 fn umtx_op_operation_timeout(
     obj: &AtomicU32,
     op: freebsd_types::UmtxOpOperation,
@@ -1025,7 +1026,6 @@ fn umtx_op_operation_timeout(
 ) -> Result<usize, isize> {
     let obj_ptr = core::ptr::from_ref(obj) as usize;
     let op: i32 = op as _;
-    #[expect(clippy::similar_names, reason = "tv_sec and tv_nsec are standard POSIX field names")]
     let timeout_spec = timeout.map(|t| {
         let tv_sec = t.as_secs().cast_signed();
         let tv_nsec = i64::from(t.subsec_nanos());
@@ -1041,12 +1041,13 @@ fn umtx_op_operation_timeout(
         (obj_ptr, 0)
     };
 
+    #[expect(clippy::cast_sign_loss, reason = "umtx op codes are small positive values")]
+    let op = op as usize;
+
     unsafe {
         syscalls::syscall5(
             syscalls::Sysno::UmtxOp,
             obj_ptr,
-            #[expect(clippy::cast_sign_loss, reason = "umtx op codes are small positive values")]
-            let op = op as usize;
             op,
             val,
             uaddr,
