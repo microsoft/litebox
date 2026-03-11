@@ -174,8 +174,8 @@ impl FreeBSDUserland {
                 .expect("thr_self failed");
         }
         let pid = i32::try_from(tid).expect("tid should fit in i32");
-        let ppid = unsafe { syscalls::syscall0(syscalls::Sysno::Getppid) }
-            .expect("Failed to get PPID");
+        let ppid =
+            unsafe { syscalls::syscall0(syscalls::Sysno::Getppid) }.expect("Failed to get PPID");
         let ppid: i32 = ppid.try_into().expect("ppid should fit in i32");
 
         litebox_common_linux::TaskParams {
@@ -377,8 +377,11 @@ wait_waker_addr:
 // switch_to_guest_start, switch_to_guest_end).
 // Without this, `--gc-sections` may discard them in test builds.
 #[used]
-static _KEEP_ASM_FUNCTIONS: [unsafe extern "C-unwind" fn(&mut ThreadContext, *mut litebox_common_linux::PtRegs, u8); 1] =
-    [run_thread_arch];
+static _KEEP_ASM_FUNCTIONS: [unsafe extern "C-unwind" fn(
+    &mut ThreadContext,
+    *mut litebox_common_linux::PtRegs,
+    u8,
+); 1] = [run_thread_arch];
 #[used]
 static _KEEP_SWITCH_TO_GUEST: [unsafe extern "C" fn(&litebox_common_linux::PtRegs) -> !; 1] =
     [switch_to_guest];
@@ -962,11 +965,9 @@ impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
                 Ok(0)
             }
             PunchthroughSyscall::GetFsBase => Ok(get_guest_fsbase()),
-            _ => {
-                Err(litebox::platform::PunchthroughError::Unimplemented(
-                    "PunchthroughToken for FreeBSDUserland",
-                ))
-            }
+            _ => Err(litebox::platform::PunchthroughError::Unimplemented(
+                "PunchthroughToken for FreeBSDUserland",
+            )),
         }
     }
 }
@@ -1096,7 +1097,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
             | freebsd_types::MapFlags::MAP_ANONYMOUS
             | (match fixed_address_behavior {
                 FixedAddressBehavior::Replace => freebsd_types::MapFlags::MAP_FIXED,
-                FixedAddressBehavior::NoReplace => freebsd_types::MapFlags::MAP_FIXED | freebsd_types::MapFlags::MAP_EXCL,
+                FixedAddressBehavior::NoReplace => {
+                    freebsd_types::MapFlags::MAP_FIXED | freebsd_types::MapFlags::MAP_EXCL
+                }
                 FixedAddressBehavior::Hint => freebsd_types::MapFlags::empty(),
             } | if can_grow_down {
                 freebsd_types::MapFlags::MAP_STACK
@@ -1382,10 +1385,7 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Copy signal context into the guest context structure.
-fn copy_signal_context(
-    regs: &mut litebox_common_linux::PtRegs,
-    context: *mut libc::c_void,
-) {
+fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: *mut libc::c_void) {
     // SAFETY: The context pointer is guaranteed to be a valid ucontext_t by the
     // signal handler calling convention.
     let uc = unsafe { &*(context as *const libc::ucontext_t) };
@@ -1513,7 +1513,10 @@ unsafe extern "C" fn exception_signal_handler(
             options(nostack, preserves_flags, readonly),
         );
     }
-    let regs = unsafe { &mut *((guest_ctx_top - size_of::<litebox_common_linux::PtRegs>()) as *mut litebox_common_linux::PtRegs) };
+    let regs = unsafe {
+        &mut *((guest_ctx_top - size_of::<litebox_common_linux::PtRegs>())
+            as *mut litebox_common_linux::PtRegs)
+    };
     copy_signal_context(regs, context);
 
     // Restore host fsbase
@@ -1523,14 +1526,7 @@ unsafe extern "C" fn exception_signal_handler(
             options(nostack, preserves_flags),
         );
     }
-    set_signal_return(
-        context,
-        exception_callback,
-        0,
-        trapno,
-        error,
-        cr2,
-    );
+    set_signal_return(context, exception_callback, 0, trapno, error, cr2);
 }
 
 /// Signal handler for interrupt signals (SIGINT, SIGALRM, and the RT interrupt signal).
@@ -1584,7 +1580,10 @@ unsafe extern "C" fn interrupt_signal_handler(
             options(nostack, preserves_flags, readonly),
         );
     }
-    let regs = unsafe { &mut *((guest_ctx_top - size_of::<litebox_common_linux::PtRegs>()) as *mut litebox_common_linux::PtRegs) };
+    let regs = unsafe {
+        &mut *((guest_ctx_top - size_of::<litebox_common_linux::PtRegs>())
+            as *mut litebox_common_linux::PtRegs)
+    };
     copy_signal_context(regs, context);
 
     unsafe {
