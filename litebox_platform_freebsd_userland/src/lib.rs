@@ -61,9 +61,8 @@ impl FreeBSDUserland {
     fn read_proc_self_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
         let path = SELFPROC_MAPS_PATH;
 
-        let c_path = match std::ffi::CString::new(path) {
-            Ok(p) => p,
-            Err(_) => return alloc::vec::Vec::new(),
+        let Ok(c_path) = std::ffi::CString::new(path) else {
+            return alloc::vec::Vec::new();
         };
 
         let fd = unsafe {
@@ -75,9 +74,8 @@ impl FreeBSDUserland {
             )
         };
 
-        let fd = match fd {
-            Ok(fd) => fd,
-            Err(_) => return alloc::vec::Vec::new(),
+        let Ok(fd) = fd else {
+            return alloc::vec::Vec::new();
         };
 
         let mut buf = [0u8; 8192];
@@ -122,9 +120,8 @@ impl FreeBSDUserland {
             return alloc::vec::Vec::new();
         }
 
-        let content = match core::str::from_utf8(&buf[..total_read]) {
-            Ok(s) => s,
-            Err(_) => return alloc::vec::Vec::new(),
+        let Ok(content) = core::str::from_utf8(&buf[..total_read]) else {
+            return alloc::vec::Vec::new();
         };
 
         let mut reserved_pages = alloc::vec::Vec::new();
@@ -144,14 +141,12 @@ impl FreeBSDUserland {
             let start_str = parts[0].strip_prefix("0x").unwrap_or(parts[0]);
             let end_str = parts[1].strip_prefix("0x").unwrap_or(parts[1]);
 
-            let start = match usize::from_str_radix(start_str, 16) {
-                Ok(addr) => addr,
-                Err(_) => continue,
+            let Ok(start) = usize::from_str_radix(start_str, 16) else {
+                continue;
             };
 
-            let end = match usize::from_str_radix(end_str, 16) {
-                Ok(addr) => addr,
-                Err(_) => continue,
+            let Ok(end) = usize::from_str_radix(end_str, 16) else {
+                continue;
             };
 
             if start <= end {
@@ -170,7 +165,7 @@ impl FreeBSDUserland {
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
         let mut tid: isize = 0;
         unsafe {
-            syscalls::syscall1(syscalls::Sysno::ThrSelf, &mut tid as *mut isize as usize)
+            syscalls::syscall1(syscalls::Sysno::ThrSelf, &raw mut tid as *mut isize as usize)
                 .expect("thr_self failed");
         }
         let pid = i32::try_from(tid).expect("tid should fit in i32");
@@ -890,7 +885,7 @@ impl litebox::platform::TimeProvider for FreeBSDUserland {
         let t = unsafe { t.assume_init() };
         Instant {
             inner: Duration::new(
-                t.tv_sec.reinterpret_as_unsigned().into(),
+                t.tv_sec.reinterpret_as_unsigned(),
                 t.tv_nsec.reinterpret_as_unsigned().truncate(),
             ),
         }
@@ -902,7 +897,7 @@ impl litebox::platform::TimeProvider for FreeBSDUserland {
         let t = unsafe { t.assume_init() };
         SystemTime {
             inner: Duration::new(
-                t.tv_sec.reinterpret_as_unsigned().into(),
+                t.tv_sec.reinterpret_as_unsigned(),
                 t.tv_nsec.reinterpret_as_unsigned().truncate(),
             ),
         }
@@ -1027,11 +1022,11 @@ fn umtx_op_operation_timeout(
     val: usize,
     timeout: Option<Duration>,
 ) -> Result<usize, isize> {
-    let obj_ptr = obj as *const AtomicU32 as usize;
+    let obj_ptr = core::ptr::from_ref(obj) as usize;
     let op: i32 = op as _;
     let timeout_spec = timeout.map(|t| {
-        let tv_sec = t.as_secs() as i64;
-        let tv_nsec = t.subsec_nanos() as i64;
+        let tv_sec = t.as_secs().cast_signed();
+        let tv_nsec = i64::from(t.subsec_nanos());
         libc::timespec { tv_sec, tv_nsec }
     });
 
@@ -1048,13 +1043,13 @@ fn umtx_op_operation_timeout(
         syscalls::syscall5(
             syscalls::Sysno::UmtxOp,
             obj_ptr,
-            op as usize,
-            val as usize,
+            op.cast_unsigned(),
+            val,
             uaddr,
             uaddr2,
         )
     }
-    .map_err(|err| i32::from(err) as isize)
+    .map_err(|err| isize::from(i32::from(err)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,7 +1115,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Fr
                     .bits()
                     .reinterpret_as_unsigned() as usize,
                 map_flags.bits().reinterpret_as_unsigned() as usize,
-                -1isize as usize,
+                (-1isize).cast_unsigned(),
                 0,
             )
         }
@@ -1385,10 +1380,15 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Copy signal context into the guest context structure.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "register values are reinterpreted between i64 and usize on x86_64"
+)]
 fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: *mut libc::c_void) {
     // SAFETY: The context pointer is guaranteed to be a valid ucontext_t by the
     // signal handler calling convention.
-    let uc = unsafe { &*(context as *const libc::ucontext_t) };
+    let uc = unsafe { &*context.cast::<libc::ucontext_t>() };
     let mc = &uc.uc_mcontext;
     regs.r15 = mc.mc_r15 as usize;
     regs.r14 = mc.mc_r14 as usize;
@@ -1415,6 +1415,11 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: *mut li
 
 /// Modify the signal context to jump to a different instruction address when
 /// the signal handler returns.
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::ptr_as_ptr,
+    reason = "register values are reinterpreted between usize and i64 on x86_64"
+)]
 fn set_signal_return(
     context: *mut libc::c_void,
     target: unsafe extern "C" fn(),
@@ -1449,25 +1454,31 @@ unsafe extern "C" fn record_pending_signal(signal: litebox_common_linux::signal:
 }
 
 /// Signal handler for exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    reason = "register values are reinterpreted between i64 and usize on x86_64"
+)]
 unsafe extern "C" fn exception_signal_handler(
-    _sig: i32,
+    sig: i32,
     info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
 ) {
     // SAFETY: The context pointer is guaranteed to be a valid ucontext_t by the
     // signal handler calling convention.
-    let uc = unsafe { &*(context as *const libc::ucontext_t) };
+    let uc = unsafe { &*context.cast::<libc::ucontext_t>() };
     let rip = uc.uc_mcontext.mc_rip as usize;
 
     // Before checking TLS state (which may not be initialized), check the
     // exception table for fallible memory access recovery. This handles the
     // case where host code (e.g. read_u8_fallible) triggers a SIGSEGV.
-    if _sig == libc::SIGSEGV {
-        if let Some(fixup) = litebox::mm::exception_table::search_exception_tables(rip) {
-            let uc_mut = unsafe { &mut *(context as *mut libc::ucontext_t) };
-            uc_mut.uc_mcontext.mc_rip = fixup as i64;
-            return;
-        }
+    if sig == libc::SIGSEGV
+        && let Some(fixup) = litebox::mm::exception_table::search_exception_tables(rip)
+    {
+        let uc_mut = unsafe { &mut *context.cast::<libc::ucontext_t>() };
+        uc_mut.uc_mcontext.mc_rip = fixup as i64;
+        return;
     }
 
     // If we are in host code (not in guest), just record the signal and return.
@@ -1530,12 +1541,17 @@ unsafe extern "C" fn exception_signal_handler(
 }
 
 /// Signal handler for interrupt signals (SIGINT, SIGALRM, and the RT interrupt signal).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "register values are reinterpreted between i64 and usize on x86_64"
+)]
 unsafe extern "C" fn interrupt_signal_handler(
     sig: i32,
     _info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
 ) {
-    let uc = unsafe { &*(context as *const libc::ucontext_t) };
+    let uc = unsafe { &*context.cast::<libc::ucontext_t>() };
     let rip = uc.uc_mcontext.mc_rip as usize;
 
     if sig == libc::SIGINT {

@@ -59,11 +59,11 @@ impl Errno {
 #[derive(Error, Debug)]
 pub(crate) enum ErrnoConversionError {
     #[error("Expected positive error number")]
-    ExpectedPositive,
+    Negative,
     #[error("Error number cannot be zero")]
-    ExpectedNonZero,
+    Zero,
     #[error("Error number is unexpectedly large")]
-    ExpectedSmallEnough,
+    TooLarge,
 }
 
 impl TryFrom<i32> for Errno {
@@ -71,7 +71,7 @@ impl TryFrom<i32> for Errno {
     fn try_from(value: i32) -> Result<Self, Self::Error> {
         let value: u32 = value
             .try_into()
-            .or(Err(ErrnoConversionError::ExpectedPositive))?;
+            .or(Err(ErrnoConversionError::Negative))?;
         Self::try_from(value)
     }
 }
@@ -80,7 +80,7 @@ impl TryFrom<u32> for Errno {
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         let value: u8 = value
             .try_into()
-            .or(Err(ErrnoConversionError::ExpectedSmallEnough))?;
+            .or(Err(ErrnoConversionError::TooLarge))?;
         Self::try_from(value)
     }
 }
@@ -88,11 +88,11 @@ impl TryFrom<u8> for Errno {
     type Error = ErrnoConversionError;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         let value =
-            core::num::NonZeroU8::new(value).ok_or(ErrnoConversionError::ExpectedNonZero)?;
+            core::num::NonZeroU8::new(value).ok_or(ErrnoConversionError::Zero)?;
         if value.get() <= Self::MAX.value.get() {
             Ok(Self { value })
         } else {
-            Err(ErrnoConversionError::ExpectedSmallEnough)
+            Err(ErrnoConversionError::TooLarge)
         }
     }
 }
