@@ -166,7 +166,7 @@ impl FreeBSDUserland {
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
         let mut tid: isize = 0;
         unsafe {
-            syscalls::syscall1(syscalls::Sysno::ThrSelf, &raw mut tid as *mut isize as usize)
+            syscalls::syscall1(syscalls::Sysno::ThrSelf, &raw mut tid as usize)
                 .expect("thr_self failed");
         }
         let pid = i32::try_from(tid).expect("tid should fit in i32");
@@ -1055,7 +1055,6 @@ fn umtx_op_operation_timeout(
         )
     }
     .map_err(|err| {
-        #[expect(clippy::cast_sign_loss, reason = "errno values are small positive integers")]
         let e = i32::from(err) as isize;
         e
     })

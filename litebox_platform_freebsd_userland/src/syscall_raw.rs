@@ -59,7 +59,13 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "errno values are small positive integers that fit in i32"
+            )]
+            let errno = ret as i32;
+            Err(crate::errno::Errno::try_from(errno).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -83,7 +89,13 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "errno values are small positive integers that fit in i32"
+            )]
+            let errno = ret as i32;
+            Err(crate::errno::Errno::try_from(errno).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -108,7 +120,13 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "errno values are small positive integers that fit in i32"
+            )]
+            let errno = ret as i32;
+            Err(crate::errno::Errno::try_from(errno).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -139,7 +157,13 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "errno values are small positive integers that fit in i32"
+            )]
+            let errno = ret as i32;
+            Err(crate::errno::Errno::try_from(errno).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
@@ -176,7 +200,13 @@ pub(crate) mod syscalls {
             );
         }
         if carry != 0 {
-            Err(crate::errno::Errno::try_from(ret as i32).unwrap_or(crate::errno::Errno::EINVAL))
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "errno values are small positive integers that fit in i32"
+            )]
+            let errno = ret as i32;
+            Err(crate::errno::Errno::try_from(errno).unwrap_or(crate::errno::Errno::EINVAL))
         } else {
             Ok(ret)
         }
