@@ -15,6 +15,7 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError, Waker},
     },
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
@@ -22,6 +23,13 @@ use litebox_platform_multiplex::Platform;
 
 use super::file::FilesState;
 use crate::{Descriptor, GlobalState, ShimFS, StrongFd};
+
+#[expect(dead_code)]
+pub(crate) struct EpollSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>);
+impl<FS: ShimFS> FdEnabledSubsystem for EpollSubsystem<FS> {
+    type Entry = EpollFile<FS>;
+}
+impl<FS: ShimFS> FdEnabledSubsystemEntry for EpollFile<FS> {}
 
 bitflags::bitflags! {
     /// Linux's epoll flags.
