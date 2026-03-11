@@ -60,19 +60,51 @@ impl FsState {
 pub(crate) struct FilesState<FS: ShimFS> {
     /// The filesystem implementation, shared across tasks that share file system.
     pub(crate) fs: alloc::sync::Arc<FS>,
-    pub file_descriptors: litebox::sync::RwLock<Platform, Descriptors<FS>>,
-    pub raw_descriptor_store: litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
+    // XXX(jb): file_descriptors should go away from here "soon" (before the PR)
+    pub(crate) file_descriptors: litebox::sync::RwLock<Platform, Descriptors<FS>>,
+    pub(crate) raw_descriptor_store:
+        litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
+    max_fd: Option<usize>,
 }
 
 impl<FS: ShimFS> FilesState<FS> {
-    pub fn new(fs: alloc::sync::Arc<FS>) -> Self {
+    pub(crate) fn new(fs: alloc::sync::Arc<FS>) -> Self {
         Self {
             fs,
             file_descriptors: litebox::sync::RwLock::new(Descriptors::new()),
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
+            max_fd: None,
         }
+    }
+
+    pub(crate) fn set_max_fd(&mut self, max_fd: usize) {
+        if self.max_fd.is_some() {
+            // We probably should consider whether soft/hard rlimits and such start to play a role
+            // here. For now, I am just allowing one time setting so that we can make progress.
+            unimplemented!()
+        }
+        self.max_fd = Some(max_fd);
+    }
+
+    // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
+    // Err(typed_fd)
+    pub(crate) fn insert_raw_fd<Subsystem: FdEnabledSubsystem>(
+        &self,
+        typed_fd: TypedFd<Subsystem>,
+    ) -> Result<usize, TypedFd<Subsystem>> {
+        // XXX(jb): should we try to somehow enforce that it is set at the smallest
+        // available/unassigned FD number?
+        let mut rds = self.raw_descriptor_store.write();
+        let raw_fd = rds.fd_into_raw_integer(typed_fd);
+        if let Some(max_fd) = self.max_fd
+            && raw_fd > max_fd
+        {
+            let orig = rds.fd_consume_raw_integer::<Subsystem>(raw_fd).unwrap();
+            return Err(alloc::sync::Arc::into_inner(orig).unwrap());
+        }
+        Ok(raw_fd)
     }
 }
 
@@ -185,7 +217,10 @@ impl<FS: ShimFS> Task<FS> {
             };
         }
         let files = self.files.borrow();
-        let raw_fd = files.raw_descriptor_store.write().fd_into_raw_integer(file);
+        let raw_fd = files.insert_raw_fd(file).map_err(|file| {
+            files.fs.close(&file).unwrap();
+            Errno::EMFILE
+        })?;
         files
             .file_descriptors
             .write()
@@ -448,42 +483,66 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn do_close(&self, desc: Descriptor<FS>) -> Result<(), Errno> {
-        let files = self.files.borrow();
         match desc {
             Descriptor::LiteBoxRawFd(raw_fd) => {
+                let files = self.files.borrow();
                 let mut rds = files.raw_descriptor_store.write();
                 match rds.fd_consume_raw_integer(raw_fd) {
                     Ok(fd) => {
                         drop(rds);
-                        files.fs.close(&fd).map_err(Errno::from)
+                        return files.fs.close(&fd).map_err(Errno::from);
                     }
-                    Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
+                    Err(litebox::fd::ErrRawIntFd::NotFound) => {
+                        return Err(Errno::EBADF);
+                    }
                     Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                        match rds
-                        .fd_consume_raw_integer::<litebox::net::Network<litebox_platform_multiplex::Platform>>(raw_fd)
-                    {
-                        Ok(fd) => {
-                            drop(rds);
-                            self.global.close_socket(&self.wait_cx(), fd)
-                        },
-                        Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
-                        Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                            match rds.fd_consume_raw_integer::<litebox::pipes::Pipes<litebox_platform_multiplex::Platform>>(raw_fd) {
-                                Ok(fd) => {
-                                    drop(rds);
-                                    self.global.pipes.close(&fd).map_err(Errno::from)
-                                }
-                                Err(litebox::fd::ErrRawIntFd::NotFound) => Err(Errno::EBADF),
-                                Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                                    // We currently only have fs, net and pipes FDs at the moment,
-                                    // if/when we add more, we need to expand this out too.
-                                    unreachable!()
-                                }
-                            }
-                        }
-                    }
+                        // fallthrough
                     }
                 }
+                if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
+                    drop(rds);
+                    return self.global.close_socket(&self.wait_cx(), fd);
+                }
+                if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
+                    drop(rds);
+                    return self.global.pipes.close(&fd).map_err(Errno::from);
+                }
+                if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+                {
+                    drop(rds);
+                    let entry = {
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        dt.remove(&fd)
+                    };
+                    drop(entry);
+                    return Ok(());
+                }
+                if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
+                {
+                    drop(rds);
+                    let entry = {
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        dt.remove(&fd)
+                    };
+                    drop(entry);
+                    return Ok(());
+                }
+                if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+                {
+                    drop(rds);
+                    let entry = {
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        dt.remove(&fd)
+                    };
+                    drop(entry);
+                    return Ok(());
+                }
+                // All the above cases should cover all the known subsystems, and we've already
+                // early-handled the "raw FD not found" case.
+                unreachable!()
             }
             Descriptor::Eventfd { .. } | Descriptor::Epoll { .. } | Descriptor::Unix { .. } => {
                 Ok(())
@@ -1302,9 +1361,20 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let files = self.files.borrow();
-        let mut rds = files.raw_descriptor_store.write();
-        let wr_raw_fd = rds.fd_into_raw_integer(writer);
-        let rd_raw_fd = rds.fd_into_raw_integer(reader);
+        let wr_raw_fd = files.insert_raw_fd(writer).map_err(|writer| {
+            self.global.pipes.close(&writer).unwrap();
+            Errno::EMFILE
+        })?;
+        let rd_raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
+            let writer = files
+                .raw_descriptor_store
+                .write()
+                .fd_consume_raw_integer(wr_raw_fd)
+                .unwrap();
+            self.global.pipes.close(&writer).unwrap();
+            self.global.pipes.close(&reader).unwrap();
+            Errno::EMFILE
+        })?;
         let mut fds = files.file_descriptors.write();
         let w = fds
             .insert(self, Descriptor::LiteBoxRawFd(wr_raw_fd))

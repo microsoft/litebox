@@ -798,7 +798,7 @@ impl<FS: ShimFS> Task<FS> {
 }
 
 // TODO: enforce the following limits:
-const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
+pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
 
 struct AtomicRlimit {

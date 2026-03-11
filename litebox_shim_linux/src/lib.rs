@@ -230,7 +230,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
             egid,
         } = task;
 
-        let files = Arc::new(syscalls::file::FilesState::new(fs));
+        let mut files = syscalls::file::FilesState::new(fs);
+        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
+        let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
 
         let entrypoints = crate::LinuxShimEntrypoints {

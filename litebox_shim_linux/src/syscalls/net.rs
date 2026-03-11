@@ -947,12 +947,10 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
-                Descriptor::LiteBoxRawFd(
-                    files
-                        .raw_descriptor_store
-                        .write()
-                        .fd_into_raw_integer(socket),
-                )
+                let Ok(raw_fd) = files.insert_raw_fd(socket) else {
+                    unimplemented!()
+                };
+                Descriptor::LiteBoxRawFd(raw_fd)
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
@@ -1215,15 +1213,10 @@ impl<FS: ShimFS> Task<FS> {
                     .global
                     .initialize_socket(&accepted_file, sock_type, flags);
                 proxy.set_state(SocketState::Connected);
-                Ok((
-                    Descriptor::LiteBoxRawFd(
-                        files
-                            .raw_descriptor_store
-                            .write()
-                            .fd_into_raw_integer(accepted_file),
-                    ),
-                    peer_addr,
-                ))
+                let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
+                    unimplemented!()
+                };
+                Ok((Descriptor::LiteBoxRawFd(raw_fd), peer_addr))
             },
             |file| {
                 let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);

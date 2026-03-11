@@ -643,10 +643,9 @@ mod test {
             .descriptor_table_mut()
             .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
         let files = Arc::new(FilesState::new());
-        let raw_fd = files
-            .raw_descriptor_store
-            .write()
-            .fd_into_raw_integer(typed);
+        let Ok(raw_fd) = files.insert_raw_fd(typed) else {
+            unreachable!()
+        };
         let descriptor = super::EpollDescriptor::try_from(&files, raw_fd).unwrap();
         epoll
             .add_interest(
