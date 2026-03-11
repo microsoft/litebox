@@ -693,14 +693,13 @@ impl RawDescriptorStorage {
     multi_subsystem_generic! {invoke_matching_subsystem_4, typed_fd_at_raw_4, f1 S1, f2 S2, f3 S3, f4 S4}
 }
 
-/// LiteBox subsystems that support having file descriptors.
+/// A LiteBox subsystem that support having file descriptors.
 pub trait FdEnabledSubsystem: Sized {
-    #[doc(hidden)]
+    /// The per-FD entry type stored in the descriptor table for this subsystem
     type Entry: FdEnabledSubsystemEntry + 'static;
 }
 
-/// Entries for a specific [`FdEnabledSubsystem`]
-#[doc(hidden)]
+/// A per-FD entry stored in the descriptor table for a specific [`FdEnabledSubsystem`]
 pub trait FdEnabledSubsystemEntry: Send + Sync + core::any::Any {}
 
 /// Possible errors from [`RawDescriptorStorage::fd_from_raw_integer`] and
