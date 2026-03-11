@@ -162,7 +162,10 @@ impl FreeBSDUserland {
         clippy::missing_panics_doc,
         reason = "panicking only on failures of documented FreeBSD contracts"
     )]
-    #[expect(clippy::similar_names, reason = "pid and ppid are standard POSIX terms")]
+    #[expect(
+        clippy::similar_names,
+        reason = "pid and ppid are standard POSIX terms"
+    )]
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
         let mut tid: isize = 0;
         unsafe {
@@ -1017,7 +1020,10 @@ impl litebox::platform::RawPointerProvider for FreeBSDUserland {
 // umtx_op helper
 // ---------------------------------------------------------------------------
 
-#[expect(clippy::similar_names, reason = "tv_sec/tv_nsec and pid/ppid are standard POSIX names")]
+#[expect(
+    clippy::similar_names,
+    reason = "tv_sec/tv_nsec and pid/ppid are standard POSIX names"
+)]
 fn umtx_op_operation_timeout(
     obj: &AtomicU32,
     op: freebsd_types::UmtxOpOperation,
@@ -1041,20 +1047,14 @@ fn umtx_op_operation_timeout(
         (obj_ptr, 0)
     };
 
-    #[expect(clippy::cast_sign_loss, reason = "umtx op codes are small positive values")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "umtx op codes are small positive values"
+    )]
     let op = op as usize;
 
-    unsafe {
-        syscalls::syscall5(
-            syscalls::Sysno::UmtxOp,
-            obj_ptr,
-            op,
-            val,
-            uaddr,
-            uaddr2,
-        )
-    }
-    .map_err(|err| i32::from(err) as isize)
+    unsafe { syscalls::syscall5(syscalls::Sysno::UmtxOp, obj_ptr, op, val, uaddr, uaddr2) }
+        .map_err(|err| i32::from(err) as isize)
 }
 
 // ---------------------------------------------------------------------------
