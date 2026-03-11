@@ -162,6 +162,7 @@ impl FreeBSDUserland {
         clippy::missing_panics_doc,
         reason = "panicking only on failures of documented FreeBSD contracts"
     )]
+    #[expect(clippy::similar_names, reason = "pid and ppid are standard POSIX terms")]
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
         let mut tid: isize = 0;
         unsafe {
@@ -1024,6 +1025,7 @@ fn umtx_op_operation_timeout(
 ) -> Result<usize, isize> {
     let obj_ptr = core::ptr::from_ref(obj) as usize;
     let op: i32 = op as _;
+    #[expect(clippy::similar_names, reason = "tv_sec and tv_nsec are standard POSIX field names")]
     let timeout_spec = timeout.map(|t| {
         let tv_sec = t.as_secs().cast_signed();
         let tv_nsec = i64::from(t.subsec_nanos());
@@ -1043,13 +1045,19 @@ fn umtx_op_operation_timeout(
         syscalls::syscall5(
             syscalls::Sysno::UmtxOp,
             obj_ptr,
-            op.cast_unsigned(),
+            #[expect(clippy::cast_sign_loss, reason = "umtx op codes are small positive values")]
+            let op = op as usize;
+            op,
             val,
             uaddr,
             uaddr2,
         )
     }
-    .map_err(|err| isize::from(i32::from(err)))
+    .map_err(|err| {
+        #[expect(clippy::cast_sign_loss, reason = "errno values are small positive integers")]
+        let e = i32::from(err) as isize;
+        e
+    })
 }
 
 // ---------------------------------------------------------------------------

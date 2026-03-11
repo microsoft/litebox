@@ -1,7 +1,5 @@
 #![allow(non_camel_case_types)]
 
-use bitflags;
-
 pub(crate) const STDOUT_FILENO: i32 = 1;
 pub(crate) const STDERR_FILENO: i32 = 2;
 
