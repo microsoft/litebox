@@ -1142,13 +1142,13 @@ where
                     port: lp.port(),
                 };
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
-                let _ = socket.bind(local_endpoint).map_err(|e| {
+                socket.bind(local_endpoint).map_err(|e| {
                     self.local_port_allocator.deallocate(lp);
                     match e {
                         udp::BindError::InvalidState => BindError::AlreadyBound,
                         udp::BindError::Unaddressable => unreachable!(),
                     }
-                });
+                })?;
             }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
