@@ -36,7 +36,6 @@ use crate::{
     syscalls::net::{SocketOptionValue, SocketOptions},
 };
 
-#[expect(dead_code)]
 pub(crate) struct UnixSocketSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>);
 impl<FS: ShimFS> FdEnabledSubsystem for UnixSocketSubsystem<FS> {
     type Entry = UnixSocket<FS>;

@@ -20,7 +20,6 @@ use litebox::{
 use litebox_common_linux::{EfdFlags, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
-#[expect(dead_code)]
 pub(crate) struct EventfdSubsystem;
 impl FdEnabledSubsystem for EventfdSubsystem {
     type Entry = EventFile<Platform>;

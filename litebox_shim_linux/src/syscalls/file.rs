@@ -1543,20 +1543,26 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let files = self.files.borrow();
-        let locked_file_descriptors = files.file_descriptors.read();
-        let epoll_entry = locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)?;
-        let Descriptor::Epoll { file: epoll, .. } = epoll_entry else {
-            return Err(Errno::EBADF);
-        };
 
-        let file = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
-        let file_descriptor = super::epoll::EpollDescriptor::try_from(&files, file)?;
+        let epoll_fd = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(epfd as usize)
+            .map_err(|_| Errno::EBADF)?;
+        let file_descriptor = super::epoll::EpollDescriptor::try_from(&files, fd as usize)?;
+
         let event = if op == litebox_common_linux::EpollOp::EpollCtlDel {
             None
         } else {
             Some(event.read_at_offset(0).ok_or(Errno::EFAULT)?)
         };
-        epoll.epoll_ctl(&self.global, op, fd, &file_descriptor, event)
+        let handle = self
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&epoll_fd)
+            .ok_or(Errno::EBADF)?;
+        handle.with_entry(|entry| entry.epoll_ctl(&self.global, op, fd, &file_descriptor, event))
     }
 
     /// Handle syscall `epoll_pwait`
