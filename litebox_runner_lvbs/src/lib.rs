@@ -501,7 +501,17 @@ fn handle_open_session(
     // Slow path: atomically reserve a creation slot. This re-checks the
     // single-instance cache under a lock to close the TOCTOU window, prevents
     // duplicate UUID loading, and enforces the instance capacity limit.
-    match session_manager().reserve_creation_slot(&ta_uuid)? {
+    // The slot is automatically released when the closure returns.
+    match session_manager().with_creation_slot(&ta_uuid, || {
+        open_session_new_instance(
+            msg_args,
+            msg_args_phys_addr,
+            existing,
+            params,
+            ta_uuid,
+            &ta_req_info,
+        )
+    })? {
         CreationReservation::ExistingSingleInstance(existing) => open_session_single_instance(
             msg_args,
             msg_args_phys_addr,
@@ -510,20 +520,7 @@ fn handle_open_session(
             ta_uuid,
             &ta_req_info,
         ),
-        CreationReservation::SlotReserved => {
-            let result = open_session_new_instance(
-                msg_args,
-                msg_args_phys_addr,
-                params,
-                ta_uuid,
-                client_identity,
-                &ta_req_info,
-            );
-            // Release the creation slot on both success and failure.
-            // On success the instance is now tracked by session/cache maps.
-            session_manager().release_creation_slot(&ta_uuid);
-            result
-        }
+        CreationReservation::SlotReserved => Ok(()),
     }
 }
 
@@ -701,9 +698,8 @@ fn open_session_single_instance(
 
 /// Create a new TA instance for a session.
 ///
-/// The caller must have already reserved a creation slot via
-/// [`SessionManager::reserve_creation_slot`] and is responsible for
-/// calling [`SessionManager::release_creation_slot`] after this returns.
+/// The caller must invoke this inside [`SessionManager::with_creation_slot`]
+/// to ensure a creation slot is held during execution and released afterward.
 ///
 /// If ldelf loading or OpenSession entry point fails, the page table is torn down.
 /// Per OP-TEE OS semantics: if OpenSession returns non-success, cleanup happens.
@@ -715,7 +711,7 @@ fn open_session_new_instance(
     client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
-    // Instance capacity is enforced by reserve_creation_slot() in the caller.
+    // Instance capacity is enforced by with_creation_slot() in the caller.
 
     // Create and switch to new page table
     let task_pt_id = create_task_page_table()?;

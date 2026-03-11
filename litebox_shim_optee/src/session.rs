@@ -315,13 +315,12 @@ impl Drop for SessionIdGuard {
     }
 }
 
-/// Result of [`SessionManager::reserve_creation_slot`].
+/// Result of [`SessionManager::with_creation_slot`].
 pub enum CreationReservation {
     /// An existing single-instance TA was found (another core cached it
     /// between our initial lookup and the reservation). Reuse this instance.
     ExistingSingleInstance(Arc<SpinMutex<TaInstance>>),
-    /// A slot was reserved. The caller MUST call
-    /// [`SessionManager::release_creation_slot`] when done (success or failure).
+    /// The creation closure ran successfully inside the reserved slot.
     SlotReserved,
 }
 
@@ -449,9 +448,9 @@ impl SessionManager {
         self.instance_count() >= MAX_TA_INSTANCES
     }
 
-    /// Atomically reserve a slot for creating a new TA instance.
+    /// Atomically reserve a creation slot, run the closure, then release.
     ///
-    /// This performs the following checks under a single lock:
+    /// Performs the following checks under a single lock before calling `f`:
     /// 1. Re-checks the single-instance cache (handles TOCTOU with the
     ///    caller's earlier `get_single_instance` check).
     /// 2. Rejects if another core is already loading the same UUID
@@ -459,44 +458,52 @@ impl SessionManager {
     /// 3. Rejects if the instance count (including pending) would exceed
     ///    `MAX_TA_INSTANCES` (returns `ENomem`).
     ///
-    /// On `SlotReserved`, the caller **must** call [`release_creation_slot`]
-    /// on both success and error paths.
-    pub fn reserve_creation_slot(
+    /// If an existing single-instance TA is found in step 1, returns
+    /// `CreationReservation::ExistingSingleInstance` without calling `f`.
+    /// Otherwise, calls `f` while the slot is reserved and guarantees the
+    /// slot is released when `f` returns (success or error).
+    pub fn with_creation_slot<F>(
         &self,
         uuid: &TeeUuid,
-    ) -> Result<CreationReservation, OpteeSmcReturnCode> {
-        let mut state = self.creation_state.lock();
+        f: F,
+    ) -> Result<CreationReservation, OpteeSmcReturnCode>
+    where
+        F: FnOnce() -> Result<(), OpteeSmcReturnCode>,
+    {
+        {
+            let mut state = self.creation_state.lock();
 
-        // Re-check single-instance cache under the creation lock to close
-        // the TOCTOU window between the caller's get_single_instance() and here.
-        if let Some(existing) = self.single_instance_cache.get(uuid) {
-            return Ok(CreationReservation::ExistingSingleInstance(existing));
+            // Re-check single-instance cache under the creation lock to close
+            // the TOCTOU window between the caller's get_single_instance() and here.
+            if let Some(existing) = self.single_instance_cache.get(uuid) {
+                return Ok(CreationReservation::ExistingSingleInstance(existing));
+            }
+
+            // Another core is already loading this UUID. Tell the VTL0 driver to retry.
+            if state.pending_uuids.contains(uuid) {
+                return Err(OpteeSmcReturnCode::EThreadLimit);
+            }
+
+            // Capacity check including in-flight creations.
+            let total = self.instance_count() + state.pending_count;
+            if total >= MAX_TA_INSTANCES {
+                return Err(OpteeSmcReturnCode::ENomem);
+            }
+
+            state.pending_uuids.insert(*uuid);
+            state.pending_count += 1;
+            // Lock drops here
         }
 
-        // Another core is already loading this UUID — tell the driver to retry.
-        if state.pending_uuids.contains(uuid) {
-            return Err(OpteeSmcReturnCode::EThreadLimit);
+        let result = f();
+
+        {
+            let mut state = self.creation_state.lock();
+            state.pending_uuids.remove(uuid);
+            state.pending_count = state.pending_count.saturating_sub(1);
         }
 
-        // Capacity check including in-flight creations.
-        let total = self.instance_count() + state.pending_count;
-        if total >= MAX_TA_INSTANCES {
-            return Err(OpteeSmcReturnCode::ENomem);
-        }
-
-        state.pending_uuids.insert(*uuid);
-        state.pending_count += 1;
-        Ok(CreationReservation::SlotReserved)
-    }
-
-    /// Release a creation slot previously reserved by [`reserve_creation_slot`].
-    ///
-    /// Must be called exactly once for every `SlotReserved` result, on both
-    /// success and error paths.
-    pub fn release_creation_slot(&self, uuid: &TeeUuid) {
-        let mut state = self.creation_state.lock();
-        state.pending_uuids.remove(uuid);
-        state.pending_count = state.pending_count.saturating_sub(1);
+        result.map(|()| CreationReservation::SlotReserved)
     }
 }
 
