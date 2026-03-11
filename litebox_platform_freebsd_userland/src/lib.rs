@@ -1054,10 +1054,7 @@ fn umtx_op_operation_timeout(
             uaddr2,
         )
     }
-    .map_err(|err| {
-        let e = i32::from(err) as isize;
-        e
-    })
+    .map_err(|err| i32::from(err) as isize)
 }
 
 // ---------------------------------------------------------------------------
