@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! FreeBSD host system call support.
 
 #[repr(i32)]

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Generated code for the [`super::Errno`] constants.
 //!
 //! This particular module itself is private, but defines all of the below within the public

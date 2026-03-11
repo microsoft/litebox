@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #![allow(non_camel_case_types)]
 
 pub(crate) const STDOUT_FILENO: i32 = 1;
