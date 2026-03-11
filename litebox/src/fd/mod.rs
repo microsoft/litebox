@@ -37,7 +37,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
-    pub(crate) fn insert<Subsystem: FdEnabledSubsystem>(
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics impossible due to type invariants"
+    )]
+    #[must_use]
+    pub fn insert<Subsystem: FdEnabledSubsystem>(
         &mut self,
         entry: impl Into<Subsystem::Entry>,
     ) -> TypedFd<Subsystem> {
@@ -104,7 +109,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// have been cleared out).
     ///
     /// If the `fd` was already closed out, then (obviously) it does not return an entry.
-    pub(crate) fn remove<Subsystem: FdEnabledSubsystem>(
+    pub fn remove<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
@@ -285,7 +290,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Use the entry at `fd` as read-only.
     ///
     /// If the `fd` has been closed, then skips applying `f` and returns `None`.
-    pub(crate) fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics impossible due to type invariants"
+    )]
+    pub fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&Subsystem::Entry) -> R,
@@ -300,7 +309,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Use the entry at `fd` as mutably.
     ///
     /// If the `fd` has been closed, then skips applying `f` and returns `None`.
-    pub(crate) fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics impossible due to type invariants"
+    )]
+    pub fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&mut Subsystem::Entry) -> R,
@@ -880,7 +893,6 @@ macro_rules! enable_fds_for_subsystem {
         $entry:ty;
         $(-> $fd:ident $(<$($fd_param:ident),*>)?;)?
     ) => {
-        #[allow(unused, reason = "NOTE(jayb): remove this lint before merging the PR")]
         #[doc(hidden)]
         // This wrapper type exists just to make sure `$entry` itself is not public, but we can
         // still satisfy requirements for `FdEnabledSubsystem`.
