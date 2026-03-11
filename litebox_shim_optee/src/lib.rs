@@ -38,8 +38,8 @@ pub mod ptr;
 
 // Re-export session management types for convenience
 pub use session::{
-    MAX_TA_INSTANCES, SessionEntry, SessionManager, SessionMap, SingleInstanceCache, TaInstance,
-    allocate_session_id,
+    CreationReservation, MAX_TA_INSTANCES, SessionEntry, SessionManager, SessionMap,
+    SingleInstanceCache, TaInstance, allocate_session_id,
 };
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
