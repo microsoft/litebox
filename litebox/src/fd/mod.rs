@@ -325,6 +325,20 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Some(f(entry.as_subsystem_mut::<Subsystem>()))
     }
 
+    /// Obtain a handle to the underlying entry for the `fd`.
+    ///
+    /// Similar to [`Self::with_entry`], except it does not require maintaining access to the table.
+    pub fn entry_handle<Subsystem: FdEnabledSubsystem>(
+        &self,
+        fd: &TypedFd<Subsystem>,
+    ) -> Option<EntryHandle<Platform, Subsystem>> {
+        // Since the typed FD should not have been created unless we had the correct subsystem in
+        // the first place, none of this should panic---if it does, someone has done a bad cast
+        // somewhere.
+        let entry = self.entries[fd.x.as_usize()?].as_ref()?;
+        Some(EntryHandle(Arc::clone(&entry.x), PhantomData))
+    }
+
     /// Use the entry at `internal_fd` as mutably.
     ///
     /// NOTE: Ideally, prefer using [`Self::with_entry_mut`] instead of this, since it provides a
@@ -499,6 +513,24 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             .unwrap()
             .metadata
             .insert(metadata)
+    }
+}
+
+/// A handle to a descriptor entry (via [`Descriptors::entry_handle`]) that can be used without
+/// maintaining access to the descriptor table itself.
+pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
+    Arc<RwLock<Platform, DescriptorEntry>>,
+    PhantomData<Subsystem>,
+);
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
+    EntryHandle<Platform, Subsystem>
+{
+    pub fn with_entry<R>(&self, f: impl FnOnce(&Subsystem::Entry) -> R) -> R {
+        f(self.0.read().as_subsystem::<Subsystem>())
+    }
+
+    pub fn with_entry_mut<R>(&self, f: impl FnOnce(&mut Subsystem::Entry) -> R) -> R {
+        f(self.0.write().as_subsystem_mut::<Subsystem>())
     }
 }
 
