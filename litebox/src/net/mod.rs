@@ -685,8 +685,10 @@ where
             // microseconds is roughly 250 years. If a system has been up for that long, then it
             // deserves to panic.
             i64::try_from(
-                self.zero_time
-                    .duration_since(&self.device.platform.now())
+                self.device
+                    .platform
+                    .now()
+                    .duration_since(&self.zero_time)
                     .as_micros(),
             )
             .unwrap(),
