@@ -26,7 +26,6 @@
 #define SNP_VMPL_CLONE_REQ 0xd
 #define SNP_VMPL_EXECVE_REQ 0xe
 #define SNP_VMPL_HANDLE_SIGNAL_REQ 0xf
-#define SNP_VMPL_LOAD_FILE_REQ 0x10
 #define SNP_VMPL_SEND_INTERRUPT_REQ 0x11
 // Do nothing, just return back to VMPL2 for measurement
 #define SNP_VMPL_IDLE_REQ 0xff
@@ -116,7 +115,9 @@ struct vsbox_task {
 	uint64_t status;
 	uint64_t alt_stack;
 	uint64_t robust_list;
-	unsigned long flags; // task_struct->thread_info->flags in Linux
+	/// Bitmask of dequeued signals forwarded from VMPL0.
+	/// Bit (1 << (signo - 1)) is set for each pending signal.
+	uint64_t pending_signals;
 	uint64_t mem_map; // VData<MemMAP>
 	/// Thread ID - the internal kernel "pid"
 	uint32_t pid;

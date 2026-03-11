@@ -551,6 +551,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         flags: super::OFlags,
         mode: super::Mode,
     ) -> Result<FileFd<Platform, T>, super::errors::OpenError> {
+        // TODO: we don't support non-blocking, so ignore that flag instead of returning an error
+        let flags = flags - OFlags::NONBLOCK;
         let currently_supported_oflags: OFlags = OFlags::RDONLY
             | OFlags::WRONLY
             | OFlags::RDWR

@@ -2271,7 +2271,7 @@ fn signal_handler_exit_guest(
             guest_context_top = out(reg) guest_context_top,
             options(nostack, preserves_flags)
         };
-        Some(guest_context_top.offset(-1))
+        Some(guest_context_top.sub(1))
     }
 }
 

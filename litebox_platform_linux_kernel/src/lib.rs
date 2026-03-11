@@ -10,7 +10,6 @@ use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
 use litebox::mm::linux::PageRange;
-use litebox::platform::Instant as _;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
@@ -85,9 +84,6 @@ impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, H
 }
 
 impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
-impl<Host: HostInterface> litebox::platform::SignalProvider for LinuxKernel<Host> {
-    type Signal = litebox_common_linux::signal::Signal;
-}
 
 // TODO: implement pointer validation to ensure the pointers are in user space.
 type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
@@ -155,7 +151,6 @@ pub struct RawMutex<Host: HostInterface> {
 unsafe impl<Host: HostInterface> Send for RawMutex<Host> {}
 unsafe impl<Host: HostInterface> Sync for RawMutex<Host> {}
 
-/// TODO: common mutex implementation could be moved to a shared crate
 impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
     const INIT: Self = Self::new();
 
@@ -236,6 +231,7 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     }
 
     fn current_time(&self) -> Self::SystemTime {
+        use litebox::platform::Instant as _;
         // Derive the current system time from the monotonic clock elapsed
         // since boot, avoiding repeated host calls.
         //

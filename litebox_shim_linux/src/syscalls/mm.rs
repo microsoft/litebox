@@ -115,7 +115,7 @@ impl<FS: ShimFS> Task<FS> {
         let static_data = files
             .run_on_raw_fd(
                 raw_fd,
-                |typed_fd| self.global.fs.get_static_backing_data(typed_fd),
+                |typed_fd| files.fs.get_static_backing_data(typed_fd),
                 |_| None,
                 |_| None,
             )

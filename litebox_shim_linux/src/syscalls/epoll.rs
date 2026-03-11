@@ -705,8 +705,8 @@ mod test {
             close_on_exec: core::sync::atomic::AtomicBool::new(false),
         };
 
-        let no_fds = FilesState::new();
-        let fds = FilesState::new();
+        let no_fds = FilesState::new(task.files.borrow().fs.clone());
+        let fds = FilesState::new(task.files.borrow().fs.clone());
         let _ = fds.file_descriptors.write().insert_at(
             &task,
             descriptor,

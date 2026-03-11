@@ -71,7 +71,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
         shim_builder.default_fs(in_mem, tar_ro)
     };
-    shim_builder.set_fs(initial_file_system);
+    let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     shim_builder.set_load_filter(fixup_env);
     let shim = shim_builder.build();
@@ -102,7 +102,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let program = shim
-        .load_program(platform.init_task(), prog_path, argv, envp)
+        .load_program(
+            initial_file_system,
+            platform.init_task(),
+            prog_path,
+            argv,
+            envp,
+        )
         .unwrap();
     unsafe {
         litebox_platform_windows_userland::run_thread(

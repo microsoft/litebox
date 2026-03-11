@@ -10,13 +10,27 @@ mod globals;
 
 extern crate alloc;
 
-use alloc::{borrow::ToOwned, string::ToString};
-use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
+use alloc::borrow::ToOwned;
+use litebox::{
+    fs::FileSystem as _,
+    utils::{ReinterpretUnsignedExt as _, TruncateExt as _},
+};
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
+
+type Platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel;
+type DefaultFS = litebox::fs::layered::FileSystem<
+    Platform,
+    litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::layered::FileSystem<
+        Platform,
+        litebox::fs::devices::FileSystem<Platform>,
+        litebox::fs::nine_p::FileSystem<Platform, litebox_shim_linux::transport::ShimTransport>,
+    >,
+>;
 
 // FUTURE: replace this with some kind of OnceLock, or just eliminate this
 // entirely (ideal).
-static mut SHIM: Option<litebox_shim_linux::LinuxShim<litebox_shim_linux::DefaultFS>> = None;
+static mut SHIM: Option<litebox_shim_linux::LinuxShim<DefaultFS>> = None;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn floating_point_handler(_pt_regs: &mut litebox_common_linux::PtRegs) {
@@ -113,73 +127,6 @@ pub extern "C" fn sandbox_kernel_init(
     litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::return_to_host();
 }
 
-/// Pre-defined file paths to load from host for testing purposes.
-/// Will remove this after we migrate 9p fs from VSBox to LiteBox, as we can directly access host files then.
-#[cfg(debug_assertions)]
-const HOST_FILE_PATHS: &[&str] = &[
-    "/out/hello",
-    "/out/efault",
-    "/out/thread_exit",
-    "/out/tcp_server",
-    // Add more paths as needed
-];
-
-/// Load pre-set files from host into the in-memory filesystem
-///
-/// This is a temporary solution before we migrate 9p fs from VSBox to LiteBox.
-#[cfg(debug_assertions)]
-fn load_host_files_into_fs<Platform: litebox::sync::RawSyncPrimitivesProvider>(
-    in_mem_fs: &mut litebox::fs::in_mem::FileSystem<Platform>,
-) {
-    use litebox::fs::FileSystem;
-
-    in_mem_fs.with_root_privileges(|fs| {
-        // Create /out directory if needed
-        let _ = fs.mkdir(
-            "/out",
-            litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-        );
-
-        for path in HOST_FILE_PATHS {
-            match litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::load_file_from_host(path) {
-                Ok(data) if !data.is_empty() => {
-                    // Create parent directories if needed
-                    if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p)
-                        && !parent.is_empty() {
-                            let _ = fs.mkdir(
-                                parent,
-                                litebox::fs::Mode::RWXU
-                                    | litebox::fs::Mode::RWXG
-                                    | litebox::fs::Mode::RWXO,
-                            );
-                        }
-
-                    // Create and initialize the file
-                    let mode =
-                        litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO; // executable
-                    let flags = litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY;
-                    if let Ok(fd) = fs.open(path, flags, mode) {
-                        fs.initialize_primarily_read_heavy_file(&fd, data.into());
-                        let _ = fs.close(&fd);
-                    }
-                }
-                Ok(_) => {
-                    // Empty file, skip
-                    litebox::log_println!(
-                        litebox_platform_multiplex::platform(),
-                        "File is empty, skipping\n"
-                    );
-                }
-                Err(e) => {
-                    let s = format_args!("Failed to load file {path}: {e}\n").to_string();
-                    // File not available from host or too large, skip
-                    litebox::log_println!(litebox_platform_multiplex::platform(), &s);
-                }
-            }
-        }
-    });
-}
-
 /// Initializes the sandbox process.
 #[unsafe(no_mangle)]
 pub extern "C" fn sandbox_process_init(
@@ -195,23 +142,9 @@ pub extern "C" fn sandbox_process_init(
     litebox::log_println!(platform, "sandbox_process_init called\n");
 
     litebox_platform_multiplex::set_platform(platform);
-    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    let litebox = shim_builder.litebox();
-    let in_mem_fs = {
-        #[cfg(debug_assertions)]
-        {
-            let mut fs = litebox::fs::in_mem::FileSystem::new(litebox);
-            load_host_files_into_fs(&mut fs);
-            fs
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            litebox::fs::in_mem::FileSystem::new(litebox)
-        }
-    };
-    let tar_ro =
-        litebox::fs::tar_ro::FileSystem::new(litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
-    shim_builder.set_fs(shim_builder.default_fs(in_mem_fs, tar_ro));
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let shim = shim_builder.build();
+    unsafe { SHIM = Some(shim) };
 
     let parse_args =
         |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
@@ -249,18 +182,56 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_INVALID_PARAM,
         );
     };
-    let shim = shim_builder.build();
-    unsafe { SHIM = Some(shim) };
 
-    // Loading a program may trigger page faults, so we need to set SHIM before this.
     let shim = &raw const SHIM;
     #[allow(clippy::missing_panics_doc)]
-    let program = match unsafe { (*shim).as_ref().expect("initialized") }.load_program(
-        platform.init_task(boot_params),
-        &program,
-        argv,
-        envp,
-    ) {
+    let shim = unsafe { (*shim).as_ref().expect("initialized") };
+    let litebox = shim.litebox();
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    in_mem_fs.with_root_privileges(|fs| {
+        let mode = litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO;
+        if let Err(litebox::fs::errors::MkdirError::AlreadyExists) = fs.mkdir("/tmp", mode) {
+            let _ = fs.chmod("/tmp", mode);
+        }
+    });
+
+    let socket_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+        core::net::Ipv4Addr::new(10, 0, 0, 1),
+        8888,
+    ));
+    let Ok(transport) = shim.tcp_connection(socket_addr) else {
+        ghcb_prints("failed to connect to 9p server");
+        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+            globals::SM_SEV_TERM_SET,
+            globals::SM_TERM_GENERAL,
+        );
+    };
+    let Ok(nine_p) =
+        litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/tmp")
+    else {
+        ghcb_prints("failed to create 9P filesystem");
+        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+            globals::SM_SEV_TERM_SET,
+            globals::SM_TERM_GENERAL,
+        );
+    };
+    let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
+    let default_fs = litebox::fs::layered::FileSystem::new(
+        litebox,
+        in_mem_fs,
+        litebox::fs::layered::FileSystem::new(
+            litebox,
+            dev_stdio,
+            nine_p,
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+        ),
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    );
+    let fs = alloc::sync::Arc::new(default_fs);
+
+    // Loading a program may trigger page faults, so we need to set SHIM before this.
+    let program = match shim.load_program(fs, platform.init_task(boot_params), &program, argv, envp)
+    {
         Ok(program) => program,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);
@@ -301,6 +272,7 @@ pub extern "C" fn sandbox_tun_read_write() {
         if let Some(shim) = unsafe { (*shim).as_ref() } {
             break shim;
         }
+        core::hint::spin_loop();
     };
     #[cfg(debug_assertions)]
     litebox::log_println!(
