@@ -486,29 +486,37 @@ fn handle_open_session(
     let client_identity = ta_req_info.client_identity;
     let params = &ta_req_info.params;
 
-    // Fast path: reuse a cached single-instance TA if one exists.
-    if let Some(existing) = session_manager().get_single_instance(&ta_uuid) {
-        return open_session_single_instance(
-            msg_args,
-            msg_args_phys_addr,
-            existing,
-            params,
-            ta_uuid,
-            &ta_req_info,
-        );
+    // Look up cached TA flags to determine single vs multi-instance.
+    // For the first-ever load of a UUID (no cached flags), conservatively
+    // assume single-instance to preserve all safety invariants.
+    let is_single_instance = session_manager()
+        .get_known_flags(&ta_uuid)
+        .is_none_or(|f| f.is_single_instance());
+
+    if is_single_instance {
+        // Fast path: Reuse a cached single-instance TA if one exists.
+        if let Some(existing) = session_manager().get_single_instance(&ta_uuid) {
+            return open_session_single_instance(
+                msg_args,
+                msg_args_phys_addr,
+                existing,
+                params,
+                ta_uuid,
+                &ta_req_info,
+            );
+        }
     }
 
-    // Slow path: atomically reserve a creation slot. This re-checks the
-    // single-instance cache under a lock to close the TOCTOU window, prevents
-    // duplicate UUID loading, and enforces the instance capacity limit.
-    // The slot is automatically released when the closure returns.
-    match session_manager().with_creation_slot(&ta_uuid, || {
+    // Create a new TA instance. For single-instance TAs, this also re-checks the cache
+    // under the lock and prevents concurrent instance creation of the same UUID.
+    // For multi-instance TAs, only the global capacity limit is enforced.
+    match session_manager().with_creation_slot(&ta_uuid, is_single_instance, || {
         open_session_new_instance(
             msg_args,
             msg_args_phys_addr,
-            existing,
             params,
             ta_uuid,
+            client_identity,
             &ta_req_info,
         )
     })? {
@@ -603,9 +611,6 @@ fn open_session_single_instance(
     let return_code: u32 = ctx.rax.truncate();
     let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
-    // Drop the lock before potential cleanup
-    drop(instance);
-
     // Per OP-TEE OS: if OpenSession fails, don't register the session
     // Reference: tee_ta_open_session() in tee_ta_manager.c
     if return_code != TeeResult::Success {
@@ -639,16 +644,10 @@ fn open_session_single_instance(
                     Some(ta_req_info),
                 )?;
 
-                // Re-acquire the TA lock BEFORE removing from cache and
-                // tearing down, so concurrent open_session_single_instance
-                // callers that cloned this Arc will fail try_lock().
-                let instance = instance_arc.lock();
-
                 session_manager().remove_single_instance(&ta_uuid);
 
                 // Safety: We are about to tear down this TA instance;
                 // no references to user-space memory will be held afterwards.
-                // The lock is held, so no other core can enter the TA.
                 unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
 
                 drop(instance);
@@ -660,6 +659,8 @@ fn open_session_single_instance(
                 return Ok(());
             }
         }
+
+        drop(instance);
 
         // Write error response back to normal world
         write_msg_args_to_normal_world(
@@ -673,6 +674,8 @@ fn open_session_single_instance(
 
         return Ok(());
     }
+
+    drop(instance);
 
     // Success: register session and disarm the guard (ownership transfers to session map)
     // Safe to unwrap: guard has not been disarmed yet.
@@ -711,8 +714,6 @@ fn open_session_new_instance(
     client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
-    // Instance capacity is enforced by with_creation_slot() in the caller.
-
     // Create and switch to new page table
     let task_pt_id = create_task_page_table()?;
 
@@ -874,7 +875,6 @@ fn open_session_new_instance(
         // no references to user-space memory will be held afterwards.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
-        // session_id_guard drops here, recycling the session ID
         return Ok(());
     }
 
@@ -999,9 +999,6 @@ fn handle_invoke_command(
         let ta_flags = session_entry.ta_flags;
         let instance_arc = session_entry.instance.clone();
 
-        // Drop the instance lock before cleanup
-        drop(instance);
-
         // Remove the session from the map
         session_manager().unregister_session(session_id);
 
@@ -1023,13 +1020,6 @@ fn handle_invoke_command(
         )?;
 
         if is_last_session {
-            // Re-acquire the TA lock BEFORE removing from cache and tearing
-            // down.  While we hold this lock, any concurrent
-            // open_session_single_instance will fail try_lock() and return
-            // EThreadLimit, preventing use of a page table that is about to
-            // be destroyed.
-            let instance = instance_arc.lock();
-
             // Clear single-instance cache if applicable
             if ta_flags.is_single_instance() {
                 session_manager().remove_single_instance(&ta_uuid);
@@ -1050,6 +1040,8 @@ fn handle_invoke_command(
             // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
             // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
             // cleaning it up. Currently we always clean up on panic.
+        } else {
+            drop(instance);
         }
 
         return Ok(());
@@ -1135,9 +1127,6 @@ fn handle_close_session(
     // Clone the instance Arc before dropping the lock for later cleanup check
     let instance_arc = session_entry.instance.clone();
 
-    // Drop the instance lock before removing from map
-    drop(instance);
-
     // Remove the session entry from the map
     let removed_entry = session_manager().unregister_session(session_id);
 
@@ -1153,20 +1142,13 @@ fn handle_close_session(
             // If this is a single-instance TA with keep_alive flag, don't remove it from memory.
             // Note: keep_alive is only meaningful for single-instance TAs.
             if entry.ta_flags.is_single_instance() && entry.ta_flags.is_keep_alive() {
+                drop(instance);
                 debug_serial_println!(
                     "CloseSession complete: session_id={}, TA kept alive (INSTANCE_KEEP_ALIVE flag)",
                     session_id
                 );
                 return Ok(());
             }
-
-            // Re-acquire the TA lock BEFORE removing from cache and tearing
-            // down.  While we hold this lock, any concurrent
-            // open_session_single_instance will fail try_lock() and return
-            // EThreadLimit, preventing use of a page table that is about to
-            // be destroyed.
-            let instance = entry.instance.lock();
-            let task_pt_id = instance.task_page_table_id;
 
             // Clear single-instance cache if this was a single-instance TA
             if entry.ta_flags.is_single_instance() {
@@ -1188,6 +1170,7 @@ fn handle_close_session(
             );
         }
     } else {
+        drop(instance);
         debug_serial_println!(
             "CloseSession complete: session_id={}, other sessions remaining on TA",
             session_id

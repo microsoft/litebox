@@ -329,9 +329,10 @@ pub enum CreationReservation {
 /// Guarded by a single lock to provide atomic capacity checks and
 /// duplicate-UUID prevention.
 struct CreationState {
-    /// UUIDs currently being loaded. Prevents two cores from simultaneously
-    /// creating a new instance for the same TA UUID (which would violate the
-    /// single-instance invariant if the TA turns out to have that flag).
+    /// UUIDs of single-instance TAs currently being loaded. Prevents multiple cores
+    /// from simultaneously creating a new instance for the same single-instance
+    /// TA UUID (which would violate the single-instance invariant).
+    /// Multi-instance TAs are not tracked here. They can be created concurrently.
     pending_uuids: HashSet<TeeUuid>,
     /// Number of instances currently being created (not yet registered).
     /// Added to [`SessionManager::instance_count`] for accurate capacity checks.
@@ -351,6 +352,8 @@ pub struct SessionManager {
     single_instance_cache: SingleInstanceCache,
     /// Coordination state for concurrent instance creation.
     creation_state: SpinMutex<CreationState>,
+    /// Cached TA flags by UUID, populated on first successful session registration.
+    known_flags: SpinMutex<HashMap<TeeUuid, TaFlags>>,
 }
 
 impl SessionManager {
@@ -363,6 +366,7 @@ impl SessionManager {
                 pending_uuids: HashSet::new(),
                 pending_count: 0,
             }),
+            known_flags: SpinMutex::new(HashMap::new()),
         }
     }
 
@@ -396,6 +400,14 @@ impl SessionManager {
         self.sessions.get_entry(session_id)
     }
 
+    /// Look up previously observed TA flags for a UUID.
+    ///
+    /// Returns `None` if this UUID has never been successfully loaded.
+    /// Callers should conservatively assume single-instance when `None`.
+    pub fn get_known_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
+        self.known_flags.lock().get(uuid).copied()
+    }
+
     /// Register a new session.
     pub fn register_session(
         &self,
@@ -404,6 +416,7 @@ impl SessionManager {
         ta_uuid: TeeUuid,
         ta_flags: TaFlags,
     ) {
+        self.known_flags.lock().entry(ta_uuid).or_insert(ta_flags);
         self.sessions
             .insert(session_id, instance, ta_uuid, ta_flags);
     }
@@ -448,23 +461,21 @@ impl SessionManager {
         self.instance_count() >= MAX_TA_INSTANCES
     }
 
-    /// Atomically reserve a creation slot, run the closure, then release.
+    /// Atomically reserve a creation slot and run `f` to create a new TA instance.
     ///
-    /// Performs the following checks under a single lock before calling `f`:
-    /// 1. Re-checks the single-instance cache (handles TOCTOU with the
-    ///    caller's earlier `get_single_instance` check).
-    /// 2. Rejects if another core is already loading the same UUID
-    ///    (returns `EThreadLimit` so the driver retries).
-    /// 3. Rejects if the instance count (including pending) would exceed
-    ///    `MAX_TA_INSTANCES` (returns `ENomem`).
+    /// Behavior depends on whether the TA is:
     ///
-    /// If an existing single-instance TA is found in step 1, returns
-    /// `CreationReservation::ExistingSingleInstance` without calling `f`.
-    /// Otherwise, calls `f` while the slot is reserved and guarantees the
-    /// slot is released when `f` returns (success or error).
+    /// - **Single-instance**: Re-checks the single-instance cache under the lock to
+    ///   close TOCTOU windows, and prevents duplicate concurrent creation of
+    ///   the same UUID via `pending_uuids`.
+    ///
+    /// - **Multi-instance**: Each session gets its own independent TA instance,
+    ///   matching OP-TEE OS behavior. Multiple cores may create instances of
+    ///   the same UUID concurrently.
     pub fn with_creation_slot<F>(
         &self,
         uuid: &TeeUuid,
+        is_single_instance: bool,
         f: F,
     ) -> Result<CreationReservation, OpteeSmcReturnCode>
     where
@@ -473,15 +484,20 @@ impl SessionManager {
         {
             let mut state = self.creation_state.lock();
 
-            // Re-check single-instance cache under the creation lock to close
-            // the TOCTOU window between the caller's get_single_instance() and here.
-            if let Some(existing) = self.single_instance_cache.get(uuid) {
-                return Ok(CreationReservation::ExistingSingleInstance(existing));
-            }
+            if is_single_instance {
+                // Re-check single-instance cache under the creation lock to close
+                // the TOCTOU window between the caller's get_single_instance() and here.
+                if let Some(existing) = self.single_instance_cache.get(uuid) {
+                    return Ok(CreationReservation::ExistingSingleInstance(existing));
+                }
 
-            // Another core is already loading this UUID. Tell the VTL0 driver to retry.
-            if state.pending_uuids.contains(uuid) {
-                return Err(OpteeSmcReturnCode::EThreadLimit);
+                // Another core is currently in the middle of creating an instance
+                // for this single-instance UUID. The instance isn't cached yet,
+                // so we cannot reuse it. Return EThreadLimit to have the
+                // normal-world driver wait and retry.
+                if state.pending_uuids.contains(uuid) {
+                    return Err(OpteeSmcReturnCode::EThreadLimit);
+                }
             }
 
             // Capacity check including in-flight creations.
@@ -490,16 +506,19 @@ impl SessionManager {
                 return Err(OpteeSmcReturnCode::ENomem);
             }
 
-            state.pending_uuids.insert(*uuid);
+            if is_single_instance {
+                state.pending_uuids.insert(*uuid);
+            }
             state.pending_count += 1;
-            // Lock drops here
         }
 
         let result = f();
 
         {
             let mut state = self.creation_state.lock();
-            state.pending_uuids.remove(uuid);
+            if is_single_instance {
+                state.pending_uuids.remove(uuid);
+            }
             state.pending_count = state.pending_count.saturating_sub(1);
         }
 
