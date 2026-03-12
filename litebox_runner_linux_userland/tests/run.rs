@@ -549,13 +549,35 @@ fn test_tun_and_runner_with_iperf3() {
         while !has_started_clone.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        std::thread::sleep(std::time::Duration::from_secs(5)); // wait a bit more to ensure server is ready
-        std::println!("Starting iperf3 client...");
-        let mut client = std::process::Command::new(&cloned_path)
-            .args(["-c", "10.0.0.2", "-P", NUM_CLIENTS.to_string().as_str()])
-            .spawn()
-            .expect("Failed to start iperf3 server");
-        client.wait().expect("Failed to wait on iperf3 client");
+        std::println!("Connecting iperf3 client...");
+        // Retry with a short connect-timeout instead of a fixed sleep, so we
+        // start the transfer as soon as the server is actually listening.
+        let mut connected = false;
+        for attempt in 1..=50 {
+            let status = std::process::Command::new(&cloned_path)
+                .args([
+                    "-c",
+                    "10.0.0.2",
+                    "-P",
+                    NUM_CLIENTS.to_string().leak(),
+                    "--connect-timeout",
+                    "50",
+                    "--time",
+                    "1",
+                ])
+                .status()
+                .expect("Failed to start iperf3 client");
+            if status.success() {
+                connected = true;
+                break;
+            }
+            std::eprintln!("iperf3 client attempt {attempt} failed, retrying");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            connected,
+            "iperf3 client failed to connect after 50 attempts"
+        );
     });
     let mut runner = Runner::new(Backend::Rewriter, &iperf3_path, "iperf3_server_rewriter");
     runner
