@@ -121,8 +121,9 @@ pub enum TimerCreationError {
 
 /// Timer support for proactive signal delivery.
 pub trait TimerProvider {
-    /// The platform-specific timer handle type.
+    /// The timer handle type.
     type TimerHandle: TimerHandle;
+    /// The signal type delivered by timers.
     type Signal;
 
     /// Create a new one-shot timer that delivers `signal` when it fires.
