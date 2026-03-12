@@ -7,7 +7,18 @@ edition = "2024"
 anyhow = "1.0.97"
 clap = { version = "4.5.33", features = ["derive"] }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
+rayon = "1.10"
 tar = "0.4"
+
+# OCI image support — only on x86_64 (the images we pull are amd64 and the
+# native-tls feature pulls in openssl-sys which requires a matching libssl).
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+flate2 = "1.1"
+oci-client = { version = "0.16", default-features = false, features = ["native-tls"] }
+oci-spec = { version = "0.9", features = ["image"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt"] }
+walkdir = "2.0"
 
 [lints]
 workspace = true

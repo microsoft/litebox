@@ -5,8 +5,12 @@
 // dependency discovery and other Linux-specific functionality.
 #![cfg(target_os = "linux")]
 
+#[cfg(target_arch = "x86_64")]
+pub mod oci;
+
 use anyhow::{Context, bail};
 use clap::Parser;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -17,12 +21,28 @@ use tar::{Builder, Header};
 /// Discovers shared library dependencies, rewrites all ELF files using the
 /// syscall rewriter, and produces a .tar suitable for use with
 /// `litebox-runner-linux-userland --initial-files`.
+///
+/// Supports two modes:
+/// - **Host mode** (default): Takes local ELF files, discovers dependencies via
+///   `ldd`, rewrites syscalls, and produces a tar.
+/// - **OCI mode** (`--oci-image`): Pulls a container image from a registry,
+///   extracts its rootfs, rewrites all executable ELFs, and produces a tar.
 #[derive(Parser, Debug)]
 #[command(name = "litebox-packager")]
 pub struct CliArgs {
-    /// ELF files to package.
-    #[arg(required = true)]
+    /// ELF files to package (host mode). Not used in OCI mode.
+    #[arg(required_unless_present = "oci_image")]
     pub input_files: Vec<PathBuf>,
+
+    /// Pull and package an OCI container image instead of local files.
+    /// Only public (anonymous) registries are currently supported.
+    /// Example: docker.io/library/alpine:latest
+    #[arg(
+        long = "oci-image",
+        value_name = "IMAGE_REF",
+        conflicts_with = "input_files"
+    )]
+    pub oci_image: Option<String>,
 
     /// Output tar file path.
     #[arg(short = 'o', long = "output", default_value = "litebox_packager.tar")]
@@ -67,6 +87,18 @@ fn parse_include(spec: &str) -> anyhow::Result<IncludeEntry> {
 
 /// Run the packaging tool.
 pub fn run(args: CliArgs) -> anyhow::Result<()> {
+    if let Some(ref image_ref) = args.oci_image {
+        #[cfg(target_arch = "x86_64")]
+        {
+            return run_oci(image_ref, &args);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = image_ref;
+            bail!("--oci-image is only supported on x86_64");
+        }
+    }
+
     // --- Phase 1: Validate inputs ---
     let input_files: Vec<PathBuf> = args
         .input_files
@@ -83,18 +115,6 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
             Ok(abs)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let includes: Vec<IncludeEntry> = args
-        .include
-        .iter()
-        .map(|s| parse_include(s))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    for inc in &includes {
-        if !inc.host_path.exists() {
-            bail!("included file does not exist: {}", inc.host_path.display());
-        }
-    }
 
     let no_rewrite: BTreeSet<PathBuf> = args
         .no_rewrite
@@ -121,49 +141,201 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
         input_files.len()
     );
 
-    // --- Phase 3: Rewrite ELFs ---
+    // --- Phase 3: Rewrite ELFs (parallel) ---
     // The litebox tar RO filesystem does not support symlinks, so each file is
     // placed as a regular file copy at every needed path.
     eprintln!("Rewriting {} unique ELF files...", file_map.len());
-    let mut tar_entries: Vec<TarEntry> = Vec::new();
-    let mut added_tar_paths: BTreeSet<String> = BTreeSet::new();
 
-    for (real_path, tar_paths) in &file_map {
-        let data = std::fs::read(real_path)
-            .with_context(|| format!("failed to read {}", real_path.display()))?;
-        let mode = std::fs::metadata(real_path)
-            .with_context(|| format!("failed to stat {}", real_path.display()))?
-            .mode();
+    let file_map_vec: Vec<(&PathBuf, &Vec<PathBuf>)> = file_map.iter().collect();
+    let verbose = args.verbose;
 
-        let rewritten = if no_rewrite.contains(real_path) {
-            if args.verbose {
-                eprintln!("  {} (skipped rewrite)", real_path.display());
-            }
-            data
-        } else {
-            rewrite_elf(&data, real_path, args.verbose)?
-        };
+    let par_results: Vec<anyhow::Result<Vec<TarEntry>>> = file_map_vec
+        .into_par_iter()
+        .map(|(real_path, tar_paths)| {
+            let data = std::fs::read(real_path)
+                .with_context(|| format!("failed to read {}", real_path.display()))?;
+            let mode = std::fs::metadata(real_path)
+                .with_context(|| format!("failed to stat {}", real_path.display()))?
+                .mode();
 
-        for path in tar_paths {
-            let tar_path = path
-                .to_str()
-                .with_context(|| format!("non-UTF8 path: {}", path.display()))?;
-            let tar_path = tar_path.strip_prefix('/').unwrap_or(tar_path).to_string();
-            if added_tar_paths.insert(tar_path.clone()) {
-                tar_entries.push(TarEntry {
+            let rewritten = if no_rewrite.contains(real_path) {
+                if verbose {
+                    eprintln!("  {} (skipped rewrite)", real_path.display());
+                }
+                data
+            } else {
+                rewrite_elf(&data, real_path, verbose)?
+            };
+
+            let mut entries = Vec::new();
+            for path in tar_paths {
+                let tar_path = path
+                    .to_str()
+                    .with_context(|| format!("non-UTF8 path: {}", path.display()))?;
+                let tar_path = tar_path.strip_prefix('/').unwrap_or(tar_path).to_string();
+                entries.push(TarEntry {
                     tar_path,
                     data: rewritten.clone(),
                     mode,
                 });
             }
+            Ok(entries)
+        })
+        .collect();
+
+    // Flatten results, deduplicating by tar path.
+    let mut added_tar_paths = BTreeSet::<String>::new();
+    let mut tar_entries: Vec<TarEntry> = Vec::new();
+    for result in par_results {
+        for entry in result? {
+            if added_tar_paths.insert(entry.tar_path.clone()) {
+                tar_entries.push(entry);
+            }
         }
     }
 
-    // Include extra files (these files will not be rewritten).
+    finalize_tar(tar_entries, added_tar_paths, &args)?;
+
+    Ok(())
+}
+
+/// Run the packager in OCI mode: pull image, extract rootfs, rewrite ELFs, build tar.
+#[cfg(target_arch = "x86_64")]
+fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
+    // --- Phase 1: Pull and extract OCI image ---
+    eprintln!("Pulling OCI image: {image_ref}");
+    let extracted = oci::pull_and_extract(image_ref, args.verbose)?;
+
+    // --- Phase 2: Scan rootfs for files ---
+    eprintln!("Scanning rootfs...");
+    let file_map = oci::scan_rootfs(&extracted.rootfs_path, args.verbose)?;
+
+    let no_rewrite: BTreeSet<PathBuf> = args
+        .no_rewrite
+        .iter()
+        .map(|p| {
+            std::fs::canonicalize(p).unwrap_or_else(|e| {
+                eprintln!(
+                    "warning: could not resolve --no-rewrite path '{}': {e}; \
+                     it may not match any discovered file",
+                    p.display()
+                );
+                p.clone()
+            })
+        })
+        .collect();
+
+    let exec_count = file_map.files.values().filter(|e| e.is_executable).count();
+    let total_count = file_map.files.len();
+    eprintln!("Found {total_count} files ({exec_count} executables to rewrite)");
+
+    // --- Phase 3: Rewrite ELFs in parallel ---
+    eprintln!("Rewriting {exec_count} executable ELF files...");
+    let verbose = args.verbose;
+    let file_entries: Vec<(PathBuf, oci::RootfsEntry)> = file_map.files.into_iter().collect();
+
+    let par_results: Vec<anyhow::Result<TarEntry>> = file_entries
+        .into_par_iter()
+        .map(|(_key_path, entry)| {
+            let data = std::fs::read(&entry.read_path)
+                .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
+
+            let rewritten = if entry.is_executable && !no_rewrite.contains(&entry.read_path) {
+                rewrite_elf(&data, &entry.read_path, verbose)?
+            } else {
+                data
+            };
+
+            Ok(TarEntry {
+                tar_path: entry.tar_path,
+                data: rewritten,
+                mode: entry.mode,
+            })
+        })
+        .collect();
+
+    let mut tar_entries: Vec<TarEntry> = Vec::with_capacity(par_results.len());
+    for result in par_results {
+        tar_entries.push(result?);
+    }
+
+    let mut added_tar_paths: BTreeSet<String> =
+        tar_entries.iter().map(|e| e.tar_path.clone()).collect();
+
+    // --- Phase 4: Store config.json and generate config_and_run.sh from image config ---
+
+    // Always store the raw OCI config JSON for future use.
+    {
+        const CONFIG_JSON_TAR_PATH: &str = "litebox/config.json";
+        if added_tar_paths.insert(CONFIG_JSON_TAR_PATH.to_string()) {
+            if args.verbose {
+                eprintln!(
+                    "  Storing {CONFIG_JSON_TAR_PATH} ({} bytes)",
+                    extracted.config_json.len()
+                );
+            }
+            tar_entries.push(TarEntry {
+                tar_path: CONFIG_JSON_TAR_PATH.to_string(),
+                data: extracted.config_json,
+                mode: 0o644,
+            });
+        } else {
+            eprintln!("warning: tar already contains {CONFIG_JSON_TAR_PATH}, skipping");
+        }
+    }
+
+    {
+        const CONFIG_AND_RUN_TAR_PATH: &str = "litebox/config_and_run.sh";
+        let script = oci::generate_config_and_run_script(&extracted.config);
+        if added_tar_paths.insert(CONFIG_AND_RUN_TAR_PATH.to_string()) {
+            if args.verbose {
+                eprintln!("  Generating {CONFIG_AND_RUN_TAR_PATH} from image config");
+            }
+            tar_entries.push(TarEntry {
+                tar_path: CONFIG_AND_RUN_TAR_PATH.to_string(),
+                data: script.into_bytes(),
+                mode: 0o755,
+            });
+        } else {
+            eprintln!(
+                "warning: tar already contains {CONFIG_AND_RUN_TAR_PATH}, skipping generation"
+            );
+        }
+    }
+
+    finalize_tar(tar_entries, added_tar_paths, args)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared finalization: includes, rtld audit injection, tar build, size report
+// ---------------------------------------------------------------------------
+
+/// Append `--include` files, inject the rtld audit library, build the output
+/// tar, and print a size summary.
+///
+/// Both host mode and OCI mode call this after producing their rewritten
+/// `TarEntry` list.
+fn finalize_tar(
+    mut tar_entries: Vec<TarEntry>,
+    mut added_tar_paths: BTreeSet<String>,
+    args: &CliArgs,
+) -> anyhow::Result<()> {
+    // Parse and append --include files.
+    let includes: Vec<IncludeEntry> = args
+        .include
+        .iter()
+        .map(|s| parse_include(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
     for inc in &includes {
+        if !inc.host_path.exists() {
+            bail!("included file does not exist: {}", inc.host_path.display());
+        }
         if !added_tar_paths.insert(inc.tar_path.clone()) {
             bail!(
-                "duplicate tar path from --include: '{}' (already present from input files or dependencies)",
+                "duplicate tar path from --include: '{}' (already present)",
                 inc.tar_path
             );
         }
@@ -203,7 +375,7 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
         });
     }
 
-    // --- Phase 4: Build tar ---
+    // Build tar.
     eprintln!("Creating {}...", args.output.display());
     build_tar(&tar_entries, &args.output)?;
 
@@ -378,11 +550,25 @@ fn discover_all_dependencies(
 // ELF rewriting
 // ---------------------------------------------------------------------------
 
+/// ELF magic bytes: `\x7fELF`.
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+
 /// Rewrite an ELF file's syscall instructions using the litebox syscall rewriter.
 ///
-/// If the file is not a supported ELF or has no syscalls, the original bytes are
-/// returned with a warning.
+/// Non-ELF files (shell scripts, data files with executable bits, etc.) are
+/// detected via a magic-byte check and returned unmodified without being sent
+/// through the rewriter. For actual ELF files, benign rewriter errors (already
+/// hooked, no syscalls, unsupported object, missing `.text`) are treated as
+/// warnings and the original bytes are returned.
 fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8>> {
+    // Fast-path: skip the rewriter entirely for non-ELF files.
+    if data.len() < 4 || data[..4] != ELF_MAGIC {
+        if verbose {
+            eprintln!("  {} (not ELF, skipping rewrite)", path.display());
+        }
+        return Ok(data.to_vec());
+    }
+
     match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
         Ok(rewritten) => {
             if verbose {
@@ -407,10 +593,12 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             Ok(data.to_vec())
         }
         Err(litebox_syscall_rewriter::Error::UnsupportedObjectFile) => {
-            eprintln!(
-                "  warning: {} is not a supported ELF, including as-is",
-                path.display()
-            );
+            if verbose {
+                eprintln!(
+                    "  warning: {} is not a supported ELF, including as-is",
+                    path.display()
+                );
+            }
             Ok(data.to_vec())
         }
         Err(litebox_syscall_rewriter::Error::NoTextSectionFound) => {
