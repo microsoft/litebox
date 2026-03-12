@@ -256,33 +256,30 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Note: each of the entries take locks, thus should not be held on to for too long, in order
     /// to prevent dead-locks.
     pub(crate) fn iter_mut<Subsystem: FdEnabledSubsystem>(
-        &mut self,
+        &self,
     ) -> impl Iterator<
         Item = (
             InternalFd,
             impl core::ops::DerefMut<Target = Subsystem::Entry>,
         ),
     > {
-        self.entries
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(i, entry)| {
-                entry.as_mut().and_then(|e| {
-                    let entry = e.write();
-                    if entry.matches_subsystem::<Subsystem>() {
-                        Some((
-                            InternalFd {
-                                raw: i.try_into().unwrap(),
-                            },
-                            crate::sync::RwLockWriteGuard::map(entry, |e| {
-                                e.as_subsystem_mut::<Subsystem>()
-                            }),
-                        ))
-                    } else {
-                        None
-                    }
-                })
+        self.entries.iter().enumerate().filter_map(|(i, entry)| {
+            entry.as_ref().and_then(|e| {
+                if !e.read().matches_subsystem::<Subsystem>() {
+                    return None;
+                }
+                let entry = e.write();
+                assert!(entry.matches_subsystem::<Subsystem>());
+                Some((
+                    InternalFd {
+                        raw: i.try_into().unwrap(),
+                    },
+                    crate::sync::RwLockWriteGuard::map(entry, |e| {
+                        e.as_subsystem_mut::<Subsystem>()
+                    }),
+                ))
             })
+        })
     }
 
     /// Use the entry at `fd` as read-only.
