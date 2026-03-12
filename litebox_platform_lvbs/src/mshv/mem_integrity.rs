@@ -4,7 +4,6 @@
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
 use crate::{
-    debug_serial_println,
     host::linux::ModuleSignature,
     mshv::{
         heki::{HekiPatch, POKE_MAX_OPCODE_SIZE},
@@ -38,6 +37,9 @@ use x509_cert::{
     der::{Decode, Encode, oid::ObjectIdentifier},
 };
 use zerocopy::FromBytes;
+
+#[cfg(debug_assertions)]
+use crate::debug_serial_println;
 
 /// This function validates the memory content of a loaded kernel module against the original ELF file.
 /// In particular, it checks whether the non-relocatable/patchable bytes of certain sections
@@ -115,7 +117,7 @@ pub fn validate_kernel_module_against_elf(
         )?;
 
         // load relocated/patched section
-        let section_in_memory = &section_memory_container[..];
+        let section_in_memory = &section_memory_container[..section_from_elf.len()];
 
         // check whether non-relocatable bytes are modified
         #[cfg(not(debug_assertions))]
@@ -124,7 +126,7 @@ pub fn validate_kernel_module_against_elf(
                 section_from_elf[reloc.clone()].copy_from_slice(&section_in_memory[reloc.clone()]);
             }
             if section_from_elf != section_in_memory {
-                debug_serial_println!(
+                crate::serial_println!(
                     "Found {} mismatches in {target_section_name}",
                     target_section_name
                 );
