@@ -896,7 +896,9 @@ impl<FS: ShimFS> Task<FS> {
             }
             match resource {
                 litebox_common_linux::RlimitResource::NOFILE => {
+                    let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
                     self.thread.process.limits.set_rlimit(resource, new_limit);
+                    self.files.borrow().set_max_fd(new_max_fd);
                 }
                 _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
             }

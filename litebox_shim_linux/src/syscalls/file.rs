@@ -23,7 +23,7 @@ use litebox_common_linux::{
 use litebox_platform_multiplex::Platform;
 
 use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {
@@ -62,7 +62,7 @@ pub(crate) struct FilesState<FS: ShimFS> {
     pub(crate) fs: alloc::sync::Arc<FS>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
-    max_fd: Option<usize>,
+    max_fd: AtomicUsize,
 }
 
 impl<FS: ShimFS> FilesState<FS> {
@@ -72,17 +72,12 @@ impl<FS: ShimFS> FilesState<FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
-            max_fd: None,
+            max_fd: AtomicUsize::new(usize::MAX),
         }
     }
 
-    pub(crate) fn set_max_fd(&mut self, max_fd: usize) {
-        if self.max_fd.is_some() {
-            // We probably should consider whether soft/hard rlimits and such start to play a role
-            // here. For now, I am just allowing one time setting so that we can make progress.
-            unimplemented!()
-        }
-        self.max_fd = Some(max_fd);
+    pub(crate) fn set_max_fd(&self, max_fd: usize) {
+        self.max_fd.store(max_fd, Ordering::Relaxed);
     }
 
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
@@ -95,9 +90,8 @@ impl<FS: ShimFS> FilesState<FS> {
         // available/unassigned FD number?
         let mut rds = self.raw_descriptor_store.write();
         let raw_fd = rds.fd_into_raw_integer(typed_fd);
-        if let Some(max_fd) = self.max_fd
-            && raw_fd > max_fd
-        {
+        let max_fd = self.max_fd.load(Ordering::Relaxed);
+        if raw_fd > max_fd {
             let orig = rds.fd_consume_raw_integer::<Subsystem>(raw_fd).unwrap();
             return Err(alloc::sync::Arc::into_inner(orig).unwrap());
         }
@@ -1970,7 +1964,7 @@ impl<FS: ShimFS> Task<FS> {
         }
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
         let files = self.files.borrow();
-        files.run_on_raw_fd(
+        let new_fd = files.run_on_raw_fd(
             file,
             |fd| dup(&self.global, &files, fd, close_on_exec, target),
             |fd| dup(&self.global, &files, fd, close_on_exec, target),
@@ -1978,7 +1972,18 @@ impl<FS: ShimFS> Task<FS> {
             |fd| dup(&self.global, &files, fd, close_on_exec, target),
             |fd| dup(&self.global, &files, fd, close_on_exec, target),
             |fd| dup(&self.global, &files, fd, close_on_exec, target),
-        )?
+        )??;
+        if target.is_none() {
+            let max_fd = self
+                .process()
+                .limits
+                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE);
+            if new_fd >= max_fd {
+                self.do_close(new_fd)?;
+                return Err(Errno::EMFILE);
+            }
+        }
+        Ok(new_fd)
     }
 
     /// Handle syscall `dup/dup2/dup3`

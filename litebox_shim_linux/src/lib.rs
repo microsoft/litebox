@@ -232,7 +232,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             egid,
         } = task;
 
-        let mut files = syscalls::file::FilesState::new(fs);
+        let files = syscalls::file::FilesState::new(fs);
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
         let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
@@ -377,100 +377,6 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
 type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
-struct Descriptors {
-    descriptors: Vec<Option<Descriptor>>,
-}
-
-impl Descriptors {
-    fn new() -> Self {
-        Self {
-            descriptors: vec![Some(0), Some(1), Some(2)],
-        }
-    }
-    /// Inserts a descriptor at the first available file descriptor number,
-    /// respecting the RLIMIT_NOFILE limit for the task.
-    ///
-    /// Returns the assigned file descriptor number, or the descriptor back on failure
-    /// if the limit is exceeded.
-    fn insert<FS: ShimFS>(
-        &mut self,
-        task: &Task<FS>,
-        descriptor: Descriptor,
-    ) -> Result<u32, Descriptor> {
-        self.insert_in_range(
-            descriptor,
-            0,
-            task.process()
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE),
-        )
-    }
-    /// Inserts a descriptor at the first available slot within the specified range [min_idx, max_idx).
-    ///
-    /// Automatically grows the descriptor table if needed. Returns the assigned file descriptor number,
-    /// or the descriptor back if no slot is found within the limit.
-    fn insert_in_range(
-        &mut self,
-        descriptor: Descriptor,
-        min_idx: usize,
-        max_idx: usize,
-    ) -> Result<u32, Descriptor> {
-        let idx = self
-            .descriptors
-            .iter()
-            .skip(min_idx)
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                self.descriptors.push(None);
-                self.descriptors.len() - 1
-            });
-        if idx >= max_idx {
-            return Err(descriptor);
-        }
-        let old = self.descriptors[idx].replace(descriptor);
-        assert!(old.is_none());
-        Ok(u32::try_from(idx).unwrap())
-    }
-    /// Attempts to insert a descriptor at a specific file descriptor number,
-    /// respecting the RLIMIT_NOFILE limit for the task.
-    ///
-    /// Returns the previous descriptor at that slot (if any), or the new descriptor back on failure
-    /// if the index exceeds the limit.
-    fn insert_at<FS: ShimFS>(
-        &mut self,
-        task: &Task<FS>,
-        descriptor: Descriptor,
-        idx: usize,
-    ) -> Result<Option<Descriptor>, Descriptor> {
-        if idx
-            >= task
-                .process()
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
-        {
-            return Err(descriptor);
-        }
-        if idx >= self.descriptors.len() {
-            self.descriptors.resize_with(idx + 1, Default::default);
-        }
-        Ok(self
-            .descriptors
-            .get_mut(idx)
-            .and_then(|v| v.replace(descriptor)))
-    }
-    fn remove(&mut self, fd: u32) -> Option<Descriptor> {
-        let fd = fd as usize;
-        self.descriptors.get_mut(fd)?.take()
-    }
-    fn get_fd(&self, fd: u32) -> Option<&Descriptor> {
-        self.descriptors.get(fd as usize)?.as_ref()
-    }
-
-    fn len(&self) -> usize {
-        self.descriptors.len()
-    }
-}
-
 impl<FS: ShimFS> Task<FS> {
     fn close_on_exec(&self) {
         let files = self.files.borrow();
@@ -484,9 +390,6 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 }
-
-/// A raw file descriptor index into the `RawDescriptorStorage`.
-type Descriptor = usize;
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     #[expect(clippy::too_many_arguments)]
