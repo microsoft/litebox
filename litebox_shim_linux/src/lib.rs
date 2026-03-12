@@ -474,22 +474,14 @@ impl Descriptors {
 impl<FS: ShimFS> Task<FS> {
     fn close_on_exec(&self) {
         let files = self.files.borrow();
-        files
-            .file_descriptors
-            .write()
-            .descriptors
-            .iter_mut()
-            .for_each(|slot| {
-                if let Some(raw_fd) = slot.take()
-                    && let Ok(flags) = get_file_descriptor_flags(raw_fd, &self.global, &files)
-                {
-                    if flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
-                        let _ = self.do_close(raw_fd);
-                    } else {
-                        *slot = Some(raw_fd);
-                    }
-                }
-            });
+        let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
+        for raw_fd in alive_fds {
+            if let Ok(flags) = get_file_descriptor_flags(raw_fd, &self.global, &files)
+                && flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
+            {
+                let _ = self.do_close(raw_fd);
+            }
+        }
     }
 }
 

@@ -666,6 +666,14 @@ impl RawDescriptorStorage {
         drop(underlying);
         Ok(ret)
     }
+
+    /// Returns an iterator over raw integer indices that are currently alive (i.e., occupied).
+    pub fn iter_alive(&self) -> impl Iterator<Item = usize> + '_ {
+        self.stored_fds
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
+    }
 }
 
 macro_rules! multi_subsystem_generic {

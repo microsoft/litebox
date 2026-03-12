@@ -966,15 +966,7 @@ impl<FS: ShimFS> Task<FS> {
             AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
             _ => unimplemented!(),
         };
-        files
-            .file_descriptors
-            .write()
-            .insert(self, file)
-            .map_err(|desc| {
-                self.do_close(desc)
-                    .expect("closing descriptor should succeed");
-                Errno::EMFILE
-            })
+        Ok(u32::try_from(file).unwrap())
     }
 
     pub(crate) fn sys_socketpair(
@@ -1036,34 +1028,7 @@ impl<FS: ShimFS> Task<FS> {
                 return Err(Errno::EAFNOSUPPORT);
             }
         };
-        let files = self.files.borrow();
-        let fd1 = files
-            .file_descriptors
-            .write()
-            .insert(self, desc1)
-            .map_err(|desc| {
-                self.do_close(desc)
-                    .expect("closing descriptor should succeed");
-            });
-        let Ok(fd1) = fd1 else {
-            self.do_close(desc2)
-                .expect("closing descriptor should succeed");
-            return Err(Errno::EMFILE);
-        };
-        let fd2 = files
-            .file_descriptors
-            .write()
-            .insert(self, desc2)
-            .map_err(|desc| {
-                self.do_close(desc)
-                    .expect("closing descriptor should succeed");
-            });
-        let Ok(fd2) = fd2 else {
-            self.sys_close(i32::try_from(fd1).unwrap())
-                .expect("close should succeed");
-            return Err(Errno::EMFILE);
-        };
-        Ok((fd1, fd2))
+        Ok((u32::try_from(desc1).unwrap(), u32::try_from(desc2).unwrap()))
     }
 }
 pub(crate) fn read_sockaddr_from_user(
@@ -1258,15 +1223,7 @@ impl<FS: ShimFS> Task<FS> {
             *peer = addr;
         }
 
-        files
-            .file_descriptors
-            .write()
-            .insert(self, file)
-            .map_err(|desc| {
-                self.do_close(desc)
-                    .expect("closing descriptor should succeed");
-                Errno::EMFILE
-            })
+        Ok(u32::try_from(file).unwrap())
     }
 
     /// Handle syscall `connect`
@@ -1498,11 +1455,8 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
-        let file_table = files.file_descriptors.read();
-        let raw_fd = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
+        let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
         let (size, addr) = {
-            let raw_fd = *raw_fd;
-            drop(file_table);
             // We need to do this cell dance because otherwise Rust can't recognize that the two
             // closures are mutually exclusive.
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);

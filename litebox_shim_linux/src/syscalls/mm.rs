@@ -102,12 +102,12 @@ impl<FS: ShimFS> Task<FS> {
             return None;
         }
 
-        let Ok(fd) = u32::try_from(fd) else {
+        let Ok(fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return None;
         };
 
         let files = self.files.borrow();
-        let raw_fd = *files.file_descriptors.read().get_fd(fd)?;
+        let raw_fd = fd;
 
         let static_data = files
             .run_on_raw_fd(
