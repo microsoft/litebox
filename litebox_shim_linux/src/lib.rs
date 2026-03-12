@@ -48,6 +48,8 @@ pub mod syscalls;
 pub mod transport;
 mod wait;
 
+use crate::syscalls::file::get_file_descriptor_flags;
+
 pub type DefaultFS = LinuxFS;
 
 pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
@@ -375,18 +377,14 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
 type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
-struct Descriptors<FS: ShimFS> {
-    descriptors: Vec<Option<Descriptor<FS>>>,
+struct Descriptors {
+    descriptors: Vec<Option<Descriptor>>,
 }
 
-impl<FS: ShimFS> Descriptors<FS> {
+impl Descriptors {
     fn new() -> Self {
         Self {
-            descriptors: vec![
-                Some(Descriptor::LiteBoxRawFd(0)),
-                Some(Descriptor::LiteBoxRawFd(1)),
-                Some(Descriptor::LiteBoxRawFd(2)),
-            ],
+            descriptors: vec![Some(0), Some(1), Some(2)],
         }
     }
     /// Inserts a descriptor at the first available file descriptor number,
@@ -394,11 +392,11 @@ impl<FS: ShimFS> Descriptors<FS> {
     ///
     /// Returns the assigned file descriptor number, or the descriptor back on failure
     /// if the limit is exceeded.
-    fn insert(
+    fn insert<FS: ShimFS>(
         &mut self,
         task: &Task<FS>,
-        descriptor: Descriptor<FS>,
-    ) -> Result<u32, Descriptor<FS>> {
+        descriptor: Descriptor,
+    ) -> Result<u32, Descriptor> {
         self.insert_in_range(
             descriptor,
             0,
@@ -413,10 +411,10 @@ impl<FS: ShimFS> Descriptors<FS> {
     /// or the descriptor back if no slot is found within the limit.
     fn insert_in_range(
         &mut self,
-        descriptor: Descriptor<FS>,
+        descriptor: Descriptor,
         min_idx: usize,
         max_idx: usize,
-    ) -> Result<u32, Descriptor<FS>> {
+    ) -> Result<u32, Descriptor> {
         let idx = self
             .descriptors
             .iter()
@@ -438,12 +436,12 @@ impl<FS: ShimFS> Descriptors<FS> {
     ///
     /// Returns the previous descriptor at that slot (if any), or the new descriptor back on failure
     /// if the index exceeds the limit.
-    fn insert_at(
+    fn insert_at<FS: ShimFS>(
         &mut self,
         task: &Task<FS>,
-        descriptor: Descriptor<FS>,
+        descriptor: Descriptor,
         idx: usize,
-    ) -> Result<Option<Descriptor<FS>>, Descriptor<FS>> {
+    ) -> Result<Option<Descriptor>, Descriptor> {
         if idx
             >= task
                 .process()
@@ -460,11 +458,11 @@ impl<FS: ShimFS> Descriptors<FS> {
             .get_mut(idx)
             .and_then(|v| v.replace(descriptor)))
     }
-    fn remove(&mut self, fd: u32) -> Option<Descriptor<FS>> {
+    fn remove(&mut self, fd: u32) -> Option<Descriptor> {
         let fd = fd as usize;
         self.descriptors.get_mut(fd)?.take()
     }
-    fn get_fd(&self, fd: u32) -> Option<&Descriptor<FS>> {
+    fn get_fd(&self, fd: u32) -> Option<&Descriptor> {
         self.descriptors.get(fd as usize)?.as_ref()
     }
 
@@ -482,24 +480,21 @@ impl<FS: ShimFS> Task<FS> {
             .descriptors
             .iter_mut()
             .for_each(|slot| {
-                if let Some(desc) = slot.take()
-                    && let Ok(flags) = desc.get_file_descriptor_flags(&self.global, &files)
+                if let Some(raw_fd) = slot.take()
+                    && let Ok(flags) = get_file_descriptor_flags(raw_fd, &self.global, &files)
                 {
                     if flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
-                        let _ = self.do_close(desc);
+                        let _ = self.do_close(raw_fd);
                     } else {
-                        *slot = Some(desc);
+                        *slot = Some(raw_fd);
                     }
                 }
             });
     }
 }
 
-enum Descriptor<FS: ShimFS> {
-    LiteBoxRawFd(usize),
-    // XXX(jb) this entire type will go away before the PR
-    __Unused(core::marker::PhantomData<FS>),
-}
+/// A raw file descriptor index into the `RawDescriptorStorage`.
+type Descriptor = usize;
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     #[expect(clippy::too_many_arguments)]

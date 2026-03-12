@@ -32,7 +32,7 @@ use litebox_common_linux::{
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::{ConstPtr, Descriptor, MutPtr};
+use crate::{ConstPtr, MutPtr};
 use crate::{GlobalState, ShimFS, Task};
 use crate::{
     Platform,
@@ -939,7 +939,7 @@ impl<FS: ShimFS> Task<FS> {
                 let Ok(raw_fd) = files.insert_raw_fd(socket) else {
                     unimplemented!()
                 };
-                Descriptor::LiteBoxRawFd(raw_fd)
+                raw_fd
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
@@ -961,7 +961,7 @@ impl<FS: ShimFS> Task<FS> {
                     let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
                     Errno::EMFILE
                 })?;
-                Descriptor::LiteBoxRawFd(raw_fd)
+                raw_fd
             }
             AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
             _ => unimplemented!(),
@@ -1022,14 +1022,11 @@ impl<FS: ShimFS> Task<FS> {
                     Errno::EMFILE
                 })?;
                 let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
-                    self.do_close(Descriptor::LiteBoxRawFd(raw_fd1)).unwrap();
+                    self.do_close(raw_fd1).unwrap();
                     let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
                     Errno::EMFILE
                 })?;
-                (
-                    Descriptor::LiteBoxRawFd(raw_fd1),
-                    Descriptor::LiteBoxRawFd(raw_fd2),
-                )
+                (raw_fd1, raw_fd2)
             }
             AddressFamily::INET | AddressFamily::INET6 | AddressFamily::NETLINK => {
                 return Err(Errno::EOPNOTSUPP);
@@ -1235,7 +1232,7 @@ impl<FS: ShimFS> Task<FS> {
                 let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
                     unimplemented!()
                 };
-                Ok((Descriptor::LiteBoxRawFd(raw_fd), peer_addr))
+                Ok((raw_fd, peer_addr))
             },
             |file| {
                 let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);
@@ -1253,7 +1250,7 @@ impl<FS: ShimFS> Task<FS> {
                     let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
                     Errno::EMFILE
                 })?;
-                Ok((Descriptor::LiteBoxRawFd(raw_fd), peer_addr))
+                Ok((raw_fd, peer_addr))
             },
         )?;
 
@@ -1503,7 +1500,7 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
         let (size, addr) = match file_table.get_fd(sockfd).ok_or(Errno::EBADF)? {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
+            raw_fd => {
                 let raw_fd = *raw_fd;
                 drop(file_table);
                 // We need to do this cell dance because otherwise Rust can't recognize that the two
@@ -1537,7 +1534,6 @@ impl<FS: ShimFS> Task<FS> {
                     },
                 )?
             }
-            Descriptor::__Unused(_) => unreachable!(),
         };
 
         if !flags.contains(ReceiveFlags::TRUNC) {

@@ -22,7 +22,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
-use crate::{ConstPtr, Descriptor, Descriptors, GlobalState, MutPtr, ShimFS, Task};
+use crate::{ConstPtr, Descriptors, GlobalState, MutPtr, ShimFS, Task};
 use core::sync::atomic::Ordering;
 
 /// Task state shared by `CLONE_FS`.
@@ -61,7 +61,7 @@ pub(crate) struct FilesState<FS: ShimFS> {
     /// The filesystem implementation, shared across tasks that share file system.
     pub(crate) fs: alloc::sync::Arc<FS>,
     // XXX(jb): file_descriptors should go away from here "soon" (before the PR)
-    pub(crate) file_descriptors: litebox::sync::RwLock<Platform, Descriptors<FS>>,
+    pub(crate) file_descriptors: litebox::sync::RwLock<Platform, Descriptors>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
     max_fd: Option<usize>,
@@ -224,7 +224,7 @@ impl<FS: ShimFS> Task<FS> {
         files
             .file_descriptors
             .write()
-            .insert(self, Descriptor::LiteBoxRawFd(raw_fd))
+            .insert(self, raw_fd)
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))
     }
 
@@ -259,20 +259,18 @@ impl<FS: ShimFS> Task<FS> {
         };
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
-        let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-        match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
-                *raw_fd,
+        let raw_fd = *file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+        files
+            .run_on_raw_fd(
+                raw_fd,
                 |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
                 |_fd| todo!("net"),
                 |_fd| todo!("pipes"),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
-            ),
-            Descriptor::__Unused(_) => Err(Errno::EINVAL),
-        }
-        .flatten()
+            )
+            .flatten()
     }
 
     /// Handle syscall `unlinkat`
@@ -311,77 +309,71 @@ impl<FS: ShimFS> Task<FS> {
         };
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
-        let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-        match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                let raw_fd = *raw_fd;
-                drop(file_table);
-                // We need to do this cell dance because otherwise Rust can't recognize that the two
-                // closures are mutually exclusive.
-                let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
-                files
-                    .run_on_raw_fd(
-                        raw_fd,
-                        |fd| {
-                            files
-                                .fs
-                                .read(fd, &mut buf.borrow_mut(), offset)
-                                .map_err(Errno::from)
-                        },
-                        |fd| {
-                            self.global.receive(
-                                &self.wait_cx(),
-                                fd,
-                                &mut buf.borrow_mut(),
-                                litebox_common_linux::ReceiveFlags::empty(),
-                                None,
-                            )
-                        },
-                        |fd| {
-                            self.global
-                                .pipes
-                                .read(&self.wait_cx(), fd, &mut buf.borrow_mut())
-                                .map_err(Errno::from)
-                        },
-                        |fd| {
-                            let handle = self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .entry_handle(fd)
-                                .ok_or(Errno::EBADF)?;
-                            handle.with_entry(|file| {
-                                let buf = &mut buf.borrow_mut();
-                                if buf.len() < size_of::<u64>() {
-                                    return Err(Errno::EINVAL);
-                                }
-                                let value = file.read(&self.wait_cx())?;
-                                buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
-                                Ok(size_of::<u64>())
-                            })
-                        },
-                        |_fd| Err(Errno::EINVAL),
-                        |fd| {
-                            let handle = self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .entry_handle(fd)
-                                .ok_or(Errno::EBADF)?;
-                            handle.with_entry(|file| {
-                                file.recvfrom(
-                                    &self.wait_cx(),
-                                    &mut buf.borrow_mut(),
-                                    litebox_common_linux::ReceiveFlags::empty(),
-                                    None,
-                                )
-                            })
-                        },
+        let raw_fd = *file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+        drop(file_table);
+        // We need to do this cell dance because otherwise Rust can't recognize that the two
+        // closures are mutually exclusive.
+        let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    files
+                        .fs
+                        .read(fd, &mut buf.borrow_mut(), offset)
+                        .map_err(Errno::from)
+                },
+                |fd| {
+                    self.global.receive(
+                        &self.wait_cx(),
+                        fd,
+                        &mut buf.borrow_mut(),
+                        litebox_common_linux::ReceiveFlags::empty(),
+                        None,
                     )
-                    .flatten()
-            }
-            Descriptor::__Unused(_) => unreachable!("delete before PR"),
-        }
+                },
+                |fd| {
+                    self.global
+                        .pipes
+                        .read(&self.wait_cx(), fd, &mut buf.borrow_mut())
+                        .map_err(Errno::from)
+                },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        let buf = &mut buf.borrow_mut();
+                        if buf.len() < size_of::<u64>() {
+                            return Err(Errno::EINVAL);
+                        }
+                        let value = file.read(&self.wait_cx())?;
+                        buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+                        Ok(size_of::<u64>())
+                    })
+                },
+                |_fd| Err(Errno::EINVAL),
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        file.recvfrom(
+                            &self.wait_cx(),
+                            &mut buf.borrow_mut(),
+                            litebox_common_linux::ReceiveFlags::empty(),
+                            None,
+                        )
+                    })
+                },
+            )
+            .flatten()
     }
 
     /// Handle syscall `write`
@@ -394,68 +386,57 @@ impl<FS: ShimFS> Task<FS> {
         };
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
-        let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-        let res = match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                let raw_fd = *raw_fd;
-                drop(file_table);
-                files
-                    .run_on_raw_fd(
-                        raw_fd,
-                        |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
-                        |fd| {
-                            self.global.sendto(
-                                &self.wait_cx(),
-                                fd,
-                                buf,
-                                litebox_common_linux::SendFlags::empty(),
-                                None,
-                            )
-                        },
-                        |fd| {
-                            self.global
-                                .pipes
-                                .write(&self.wait_cx(), fd, buf)
-                                .map_err(Errno::from)
-                        },
-                        |fd| {
-                            let handle = self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .entry_handle(fd)
-                                .ok_or(Errno::EBADF)?;
-                            handle.with_entry(|file| {
-                                let value: u64 = u64::from_le_bytes(
-                                    buf[..size_of::<u64>()]
-                                        .try_into()
-                                        .map_err(|_| Errno::EINVAL)?,
-                                );
-                                file.write(&self.wait_cx(), value)
-                            })
-                        },
-                        |_fd| Err(Errno::EINVAL),
-                        |fd| {
-                            let handle = self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .entry_handle(fd)
-                                .ok_or(Errno::EBADF)?;
-                            handle.with_entry(|file| {
-                                file.sendto(
-                                    self,
-                                    buf,
-                                    litebox_common_linux::SendFlags::empty(),
-                                    None,
-                                )
-                            })
-                        },
+        let raw_fd = *file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+        drop(file_table);
+        let res = files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
+                |fd| {
+                    self.global.sendto(
+                        &self.wait_cx(),
+                        fd,
+                        buf,
+                        litebox_common_linux::SendFlags::empty(),
+                        None,
                     )
-                    .flatten()
-            }
-            Descriptor::__Unused(_) => unreachable!("delete before PR"),
-        };
+                },
+                |fd| {
+                    self.global
+                        .pipes
+                        .write(&self.wait_cx(), fd, buf)
+                        .map_err(Errno::from)
+                },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        let value: u64 = u64::from_le_bytes(
+                            buf[..size_of::<u64>()]
+                                .try_into()
+                                .map_err(|_| Errno::EINVAL)?,
+                        );
+                        file.write(&self.wait_cx(), value)
+                    })
+                },
+                |_fd| Err(Errno::EINVAL),
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
+                    })
+                },
+            )
+            .flatten();
         if let Err(Errno::EPIPE) = res {
             unimplemented!("send SIGPIPE to the current task");
         }
@@ -496,21 +477,18 @@ impl<FS: ShimFS> Task<FS> {
         };
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
-        let desc = file_table.get_fd(fd).ok_or(Errno::EBADF)?;
-        match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => files
-                .run_on_raw_fd(
-                    *raw_fd,
-                    |fd| files.fs.seek(fd, offset, whence).map_err(Errno::from),
-                    |_| Err(Errno::ESPIPE),
-                    |_| Err(Errno::ESPIPE),
-                    |_| Err(Errno::ESPIPE),
-                    |_| Err(Errno::ESPIPE),
-                    |_| Err(Errno::ESPIPE),
-                )
-                .flatten(),
-            Descriptor::__Unused(_) => unreachable!("delete before PR"),
-        }
+        let raw_fd = *file_table.get_fd(fd).ok_or(Errno::EBADF)?;
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| files.fs.seek(fd, offset, whence).map_err(Errno::from),
+                |_| Err(Errno::ESPIPE),
+                |_| Err(Errno::ESPIPE),
+                |_| Err(Errno::ESPIPE),
+                |_| Err(Errno::ESPIPE),
+                |_| Err(Errno::ESPIPE),
+            )
+            .flatten()
     }
 
     /// Handle syscall `mkdir`
@@ -524,70 +502,59 @@ impl<FS: ShimFS> Task<FS> {
             .map_err(Errno::from)
     }
 
-    pub(crate) fn do_close(&self, desc: Descriptor<FS>) -> Result<(), Errno> {
-        match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                let files = self.files.borrow();
-                let mut rds = files.raw_descriptor_store.write();
-                match rds.fd_consume_raw_integer(raw_fd) {
-                    Ok(fd) => {
-                        drop(rds);
-                        return files.fs.close(&fd).map_err(Errno::from);
-                    }
-                    Err(litebox::fd::ErrRawIntFd::NotFound) => {
-                        return Err(Errno::EBADF);
-                    }
-                    Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                        // fallthrough
-                    }
-                }
-                if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
-                    drop(rds);
-                    return self.global.close_socket(&self.wait_cx(), fd);
-                }
-                if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
-                    drop(rds);
-                    return self.global.pipes.close(&fd).map_err(Errno::from);
-                }
-                if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-                {
-                    drop(rds);
-                    let entry = {
-                        let mut dt = self.global.litebox.descriptor_table_mut();
-                        dt.remove(&fd)
-                    };
-                    drop(entry);
-                    return Ok(());
-                }
-                if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
-                {
-                    drop(rds);
-                    let entry = {
-                        let mut dt = self.global.litebox.descriptor_table_mut();
-                        dt.remove(&fd)
-                    };
-                    drop(entry);
-                    return Ok(());
-                }
-                if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
-                {
-                    drop(rds);
-                    let entry = {
-                        let mut dt = self.global.litebox.descriptor_table_mut();
-                        dt.remove(&fd)
-                    };
-                    drop(entry);
-                    return Ok(());
-                }
-                // All the above cases should cover all the known subsystems, and we've already
-                // early-handled the "raw FD not found" case.
-                unreachable!()
+    pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
+        let files = self.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+        match rds.fd_consume_raw_integer(raw_fd) {
+            Ok(fd) => {
+                drop(rds);
+                return files.fs.close(&fd).map_err(Errno::from);
             }
-            Descriptor::__Unused(_) => unreachable!("delete before PR"),
+            Err(litebox::fd::ErrRawIntFd::NotFound) => {
+                return Err(Errno::EBADF);
+            }
+            Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
+                // fallthrough
+            }
         }
+        if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
+            drop(rds);
+            return self.global.close_socket(&self.wait_cx(), fd);
+        }
+        if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
+            drop(rds);
+            return self.global.pipes.close(&fd).map_err(Errno::from);
+        }
+        if let Ok(fd) = rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd) {
+            drop(rds);
+            let entry = {
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                dt.remove(&fd)
+            };
+            drop(entry);
+            return Ok(());
+        }
+        if let Ok(fd) = rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd) {
+            drop(rds);
+            let entry = {
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                dt.remove(&fd)
+            };
+            drop(entry);
+            return Ok(());
+        }
+        if let Ok(fd) = rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd) {
+            drop(rds);
+            let entry = {
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                dt.remove(&fd)
+            };
+            drop(entry);
+            return Ok(());
+        }
+        // All the above cases should cover all the known subsystems, and we've already
+        // early-handled the "raw FD not found" case.
+        unreachable!()
     }
 
     /// Handle syscall `close`
@@ -639,25 +606,22 @@ impl<FS: ShimFS> Task<FS> {
             // TODO: The data transfers performed by readv() and writev() are atomic: the data
             // written by writev() is written as a single block that is not intermingled with
             // output from writes in other processes
-            let size = match desc {
-                Descriptor::LiteBoxRawFd(raw_fd) => files
-                    .run_on_raw_fd(
-                        *raw_fd,
-                        |fd| {
-                            files
-                                .fs
-                                .read(fd, &mut kernel_buffer, None)
-                                .map_err(Errno::from)
-                        },
-                        |_fd| todo!("net"),
-                        |_fd| todo!("pipes"),
-                        |_fd| todo!("eventfd"),
-                        |_fd| Err(Errno::EINVAL),
-                        |_fd| todo!("unix"),
-                    )
-                    .flatten()?,
-                Descriptor::__Unused(_) => unreachable!("delete before PR"),
-            };
+            let size = files
+                .run_on_raw_fd(
+                    *desc,
+                    |fd| {
+                        files
+                            .fs
+                            .read(fd, &mut kernel_buffer, None)
+                            .map_err(Errno::from)
+                    },
+                    |_fd| todo!("net"),
+                    |_fd| todo!("pipes"),
+                    |_fd| todo!("eventfd"),
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| todo!("unix"),
+                )
+                .flatten()?;
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
                 .ok_or(Errno::EFAULT)?;
@@ -714,7 +678,7 @@ impl<FS: ShimFS> Task<FS> {
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         let res = match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
+            raw_fd => {
                 let raw_fd = *raw_fd;
                 drop(locked_file_descriptors); // drop before potentially blocking write
                 files
@@ -743,7 +707,6 @@ impl<FS: ShimFS> Task<FS> {
                     )
                     .flatten()
             }
-            Descriptor::__Unused(_) => unreachable!("delete before PR"),
         };
         if let Err(Errno::EPIPE) = res {
             unimplemented!("send SIGPIPE to the current task");
@@ -834,181 +797,171 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-impl<FS: ShimFS> Descriptor<FS> {
-    fn stat(&self, task: &Task<FS>) -> Result<FileStat, Errno> {
-        let fstat = match self {
-            Descriptor::LiteBoxRawFd(raw_fd) => task
-                .files
-                .borrow()
-                .run_on_raw_fd(
-                    *raw_fd,
-                    |fd| {
-                        task.files
-                            .borrow()
-                            .fs
-                            .fd_file_status(fd)
-                            .map(FileStat::from)
-                            .map_err(Errno::from)
-                    },
-                    |_fd| {
-                        Ok(FileStat {
-                            // TODO: give correct values
-                            st_dev: 0,
-                            st_ino: 0,
-                            st_nlink: 1,
-                            st_mode: (litebox_common_linux::InodeType::Socket as u32
-                                | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
-                            .truncate(),
-                            st_uid: 0,
-                            st_gid: 0,
-                            st_rdev: 0,
-                            st_size: 0,
-                            st_blksize: 4096,
-                            st_blocks: 0,
-                            ..Default::default()
-                        })
-                    },
-                    |fd| {
-                        let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
-                        let read_write_mode = match half_pipe_type {
-                            litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
-                            litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
-                        };
-                        Ok(FileStat {
-                            // TODO: give correct values
-                            st_dev: 0,
-                            st_ino: 0,
-                            st_nlink: 1,
-                            st_mode: (read_write_mode.bits()
-                                | litebox_common_linux::InodeType::NamedPipe as u32)
-                                .truncate(),
-                            st_uid: 0,
-                            st_gid: 0,
-                            st_rdev: 0,
-                            st_size: 0,
-                            st_blksize: 4096,
-                            st_blocks: 0,
-                            ..Default::default()
-                        })
-                    },
-                    |_fd| {
-                        Ok(FileStat {
-                            // TODO: give correct values
-                            st_dev: 0,
-                            st_ino: 0,
-                            st_nlink: 1,
-                            st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                            st_uid: 0,
-                            st_gid: 0,
-                            st_rdev: 0,
-                            st_size: 0,
-                            st_blksize: 4096,
-                            st_blocks: 0,
-                            ..Default::default()
-                        })
-                    },
-                    |_fd| {
-                        Ok(FileStat {
-                            // TODO: give correct values
-                            st_dev: 0,
-                            st_ino: 0,
-                            st_nlink: 1,
-                            st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                            st_uid: 0,
-                            st_gid: 0,
-                            st_rdev: 0,
-                            st_size: 0,
-                            st_blksize: 0,
-                            st_blocks: 0,
-                            ..Default::default()
-                        })
-                    },
-                    |_fd| {
-                        Ok(FileStat {
-                            // TODO: give correct values
-                            st_dev: 0,
-                            st_ino: 0,
-                            st_nlink: 1,
-                            st_mode: (litebox_common_linux::InodeType::Socket as u32
-                                | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
-                            .truncate(),
-                            st_uid: 0,
-                            st_gid: 0,
-                            st_rdev: 0,
-                            st_size: 0,
-                            st_blksize: 4096,
-                            st_blocks: 0,
-                            ..Default::default()
-                        })
-                    },
-                )
-                .flatten()?,
-            Descriptor::__Unused(_) => unreachable!("delete before PR"),
-        };
-        Ok(fstat)
-    }
+fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileStat, Errno> {
+    let fstat = task
+        .files
+        .borrow()
+        .run_on_raw_fd(
+            raw_fd,
+            |fd| {
+                task.files
+                    .borrow()
+                    .fs
+                    .fd_file_status(fd)
+                    .map(FileStat::from)
+                    .map_err(Errno::from)
+            },
+            |_fd| {
+                Ok(FileStat {
+                    // TODO: give correct values
+                    st_dev: 0,
+                    st_ino: 0,
+                    st_nlink: 1,
+                    st_mode: (litebox_common_linux::InodeType::Socket as u32
+                        | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+                    .truncate(),
+                    st_uid: 0,
+                    st_gid: 0,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 4096,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            },
+            |fd| {
+                let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
+                let read_write_mode = match half_pipe_type {
+                    litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
+                    litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
+                };
+                Ok(FileStat {
+                    // TODO: give correct values
+                    st_dev: 0,
+                    st_ino: 0,
+                    st_nlink: 1,
+                    st_mode: (read_write_mode.bits()
+                        | litebox_common_linux::InodeType::NamedPipe as u32)
+                        .truncate(),
+                    st_uid: 0,
+                    st_gid: 0,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 4096,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            },
+            |_fd| {
+                Ok(FileStat {
+                    // TODO: give correct values
+                    st_dev: 0,
+                    st_ino: 0,
+                    st_nlink: 1,
+                    st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
+                    st_uid: 0,
+                    st_gid: 0,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 4096,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            },
+            |_fd| {
+                Ok(FileStat {
+                    // TODO: give correct values
+                    st_dev: 0,
+                    st_ino: 0,
+                    st_nlink: 1,
+                    st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
+                    st_uid: 0,
+                    st_gid: 0,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 0,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            },
+            |_fd| {
+                Ok(FileStat {
+                    // TODO: give correct values
+                    st_dev: 0,
+                    st_ino: 0,
+                    st_nlink: 1,
+                    st_mode: (litebox_common_linux::InodeType::Socket as u32
+                        | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+                    .truncate(),
+                    st_uid: 0,
+                    st_gid: 0,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 4096,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            },
+        )
+        .flatten()?;
+    Ok(fstat)
+}
 
-    pub(crate) fn get_file_descriptor_flags(
-        &self,
+pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
+    raw_fd: usize,
+    global: &GlobalState<FS>,
+    files: &FilesState<FS>,
+) -> Result<FileDescriptorFlags, Errno> {
+    // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
+    // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
+    fn get_flags<FS: ShimFS, S: FdEnabledSubsystem>(
         global: &GlobalState<FS>,
-        files: &FilesState<FS>,
-    ) -> Result<FileDescriptorFlags, Errno> {
-        // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
-        // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
-        fn get_flags<FS: ShimFS, S: FdEnabledSubsystem>(
-            global: &GlobalState<FS>,
-            fd: &TypedFd<S>,
-        ) -> FileDescriptorFlags {
-            global
-                .litebox
-                .descriptor_table()
-                .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
-                .unwrap_or(FileDescriptorFlags::empty())
-        }
-        match self {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
-                *raw_fd,
-                |fd| get_flags(global, fd),
-                |fd| get_flags(global, fd),
-                |fd| get_flags(global, fd),
-                |fd| get_flags(global, fd),
-                |fd| get_flags(global, fd),
-                |fd| get_flags(global, fd),
-            ),
-            Descriptor::__Unused(_) => unreachable!("delete before PR"),
-        }
+        fd: &TypedFd<S>,
+    ) -> FileDescriptorFlags {
+        global
+            .litebox
+            .descriptor_table()
+            .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
+            .unwrap_or(FileDescriptorFlags::empty())
     }
-    fn set_file_descriptor_flags(
-        &self,
+    files.run_on_raw_fd(
+        raw_fd,
+        |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
+    )
+}
+
+fn set_file_descriptor_flags<FS: ShimFS>(
+    raw_fd: usize,
+    global: &GlobalState<FS>,
+    files: &FilesState<FS>,
+    flags: FileDescriptorFlags,
+) -> Result<(), Errno> {
+    fn set_flags<FS: ShimFS, S: FdEnabledSubsystem>(
         global: &GlobalState<FS>,
-        files: &FilesState<FS>,
+        fd: &TypedFd<S>,
         flags: FileDescriptorFlags,
-    ) -> Result<(), Errno> {
-        fn set_flags<FS: ShimFS, S: FdEnabledSubsystem>(
-            global: &GlobalState<FS>,
-            fd: &TypedFd<S>,
-            flags: FileDescriptorFlags,
-        ) {
-            let _old = global
-                .litebox
-                .descriptor_table_mut()
-                .set_fd_metadata(fd, flags);
-        }
-
-        match self {
-            Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
-                *raw_fd,
-                |fd| set_flags(global, fd, flags),
-                |fd| set_flags(global, fd, flags),
-                |fd| set_flags(global, fd, flags),
-                |fd| set_flags(global, fd, flags),
-                |fd| set_flags(global, fd, flags),
-                |fd| set_flags(global, fd, flags),
-            )?,
-            Descriptor::__Unused(_) => unreachable!("delete before PR"),
-        }
-        Ok(())
+    ) {
+        let _old = global
+            .litebox
+            .descriptor_table_mut()
+            .set_fd_metadata(fd, flags);
     }
+
+    files.run_on_raw_fd(
+        raw_fd,
+        |fd| set_flags(global, fd, flags),
+        |fd| set_flags(global, fd, flags),
+        |fd| set_flags(global, fd, flags),
+        |fd| set_flags(global, fd, flags),
+        |fd| set_flags(global, fd, flags),
+        |fd| set_flags(global, fd, flags),
+    )?;
+    Ok(())
 }
 
 impl<FS: ShimFS> Task<FS> {
@@ -1049,12 +1002,12 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
-        files
+        let raw_fd = *files
             .file_descriptors
             .read()
             .get_fd(fd)
-            .ok_or(Errno::EBADF)?
-            .stat(self)
+            .ok_or(Errno::EBADF)?;
+        descriptor_stat(raw_fd, self)
     }
 
     /// Handle syscall `newfstatat`
@@ -1077,12 +1030,14 @@ impl<FS: ShimFS> Task<FS> {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
             }
             FsPath::Cwd => files.fs.file_status(get_cwd())?.into(),
-            FsPath::Fd(fd) => files
-                .file_descriptors
-                .read()
-                .get_fd(fd)
-                .ok_or(Errno::EBADF)?
-                .stat(self)?,
+            FsPath::Fd(fd) => {
+                let raw_fd = *files
+                    .file_descriptors
+                    .read()
+                    .get_fd(fd)
+                    .ok_or(Errno::EBADF)?;
+                descriptor_stat(raw_fd, self)?
+            }
             FsPath::FdRelative { .. } => todo!(),
         };
         Ok(fstat)
@@ -1101,84 +1056,79 @@ impl<FS: ShimFS> Task<FS> {
         let locked_file_descriptors = files.file_descriptors.read();
         let desc = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
         match arg {
-            FcntlArg::GETFD => Ok(locked_file_descriptors
-                .get_fd(fd)
-                .ok_or(Errno::EBADF)?
-                .get_file_descriptor_flags(&self.global, &files)?
+            FcntlArg::GETFD => {
+                let raw_fd = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+                Ok(get_file_descriptor_flags(*raw_fd, &self.global, &files)?.bits())
+            }
+            FcntlArg::SETFD(flags) => {
+                let raw_fd = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
+                set_file_descriptor_flags(*raw_fd, &self.global, &files, flags).map(|()| 0)
+            }
+            FcntlArg::GETFL => Ok(files
+                .run_on_raw_fd(
+                    *desc,
+                    |fd| {
+                        Ok(self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |crate::StdioStatusFlags(flags)| {
+                                *flags & OFlags::STATUS_FLAGS_MASK
+                            })
+                            .unwrap_or(OFlags::empty()))
+                    },
+                    |fd| {
+                        Ok(self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |crate::syscalls::net::SocketOFlags(flags)| {
+                                *flags & OFlags::STATUS_FLAGS_MASK
+                            })
+                            .unwrap_or(OFlags::empty()))
+                    },
+                    |fd| {
+                        let pipes = &self.global.pipes;
+                        let flags = OFlags::from(pipes.get_flags(fd).map_err(Errno::from)?);
+                        let dirn = match pipes.half_pipe_type(fd)? {
+                            litebox::pipes::HalfPipeType::SenderHalf => OFlags::WRONLY,
+                            litebox::pipes::HalfPipeType::ReceiverHalf => OFlags::RDONLY,
+                        };
+                        Ok(dirn | flags)
+                    },
+                    |fd| {
+                        // TODO: Consider shared metadata table?
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| Ok(file.get_status()))
+                    },
+                    |fd| {
+                        // TODO: Consider shared metadata table?
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| Ok(file.get_status()))
+                    },
+                    |fd| {
+                        // TODO: Consider shared metadata table?
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| Ok(file.get_status()))
+                    },
+                )
+                .flatten()?
                 .bits()),
-            FcntlArg::SETFD(flags) => locked_file_descriptors
-                .get_fd(fd)
-                .ok_or(Errno::EBADF)?
-                .set_file_descriptor_flags(&self.global, &files, flags)
-                .map(|()| 0),
-            FcntlArg::GETFL => match desc {
-                Descriptor::LiteBoxRawFd(raw_fd) => Ok(files
-                    .run_on_raw_fd(
-                        *raw_fd,
-                        |fd| {
-                            Ok(self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .with_metadata(fd, |crate::StdioStatusFlags(flags)| {
-                                    *flags & OFlags::STATUS_FLAGS_MASK
-                                })
-                                .unwrap_or(OFlags::empty()))
-                        },
-                        |fd| {
-                            Ok(self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .with_metadata(fd, |crate::syscalls::net::SocketOFlags(flags)| {
-                                    *flags & OFlags::STATUS_FLAGS_MASK
-                                })
-                                .unwrap_or(OFlags::empty()))
-                        },
-                        |fd| {
-                            let pipes = &self.global.pipes;
-                            let flags = OFlags::from(pipes.get_flags(fd).map_err(Errno::from)?);
-                            let dirn = match pipes.half_pipe_type(fd)? {
-                                litebox::pipes::HalfPipeType::SenderHalf => OFlags::WRONLY,
-                                litebox::pipes::HalfPipeType::ReceiverHalf => OFlags::RDONLY,
-                            };
-                            Ok(dirn | flags)
-                        },
-                        |fd| {
-                            // TODO: Consider shared metadata table?
-                            let handle = self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .entry_handle(fd)
-                                .ok_or(Errno::EBADF)?;
-                            handle.with_entry(|file| Ok(file.get_status()))
-                        },
-                        |fd| {
-                            // TODO: Consider shared metadata table?
-                            let handle = self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .entry_handle(fd)
-                                .ok_or(Errno::EBADF)?;
-                            handle.with_entry(|file| Ok(file.get_status()))
-                        },
-                        |fd| {
-                            // TODO: Consider shared metadata table?
-                            let handle = self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .entry_handle(fd)
-                                .ok_or(Errno::EBADF)?;
-                            handle.with_entry(|file| Ok(file.get_status()))
-                        },
-                    )
-                    .flatten()?
-                    .bits()),
-                Descriptor::__Unused(_) => unreachable!("delete before PR"),
-            },
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
                     | OFlags::NONBLOCK
@@ -1195,98 +1145,92 @@ impl<FS: ShimFS> Task<FS> {
                         $t.set_status(flags.complement() & setfl_mask, false);
                     }};
                 }
-                match desc {
-                    Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
-                        *raw_fd,
-                        |fd| {
-                            self.global
-                                .litebox
-                                .descriptor_table_mut()
-                                .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| {
-                                    let diff = *f ^ flags;
-                                    if diff.intersects(
-                                        OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME,
-                                    ) {
-                                        todo!("unsupported flags");
-                                    }
-                                    f.toggle(diff);
-                                })
-                                .map_err(|err| match err {
-                                    MetadataError::ClosedFd => Errno::EBADF,
-                                    MetadataError::NoSuchMetadata => {
-                                        unimplemented!("SETFL on non-stdio")
-                                    }
-                                })
-                        },
-                        |fd| {
-                            self.global
-                                .litebox
-                                .descriptor_table_mut()
-                                .with_metadata_mut(fd, |crate::syscalls::net::SocketOFlags(f)| {
-                                    let diff = *f ^ flags;
-                                    if diff.intersects(
-                                        OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME,
-                                    ) {
-                                        todo!("unsupported flags");
-                                    }
-                                    f.toggle(diff);
-                                })
-                                .map_err(|err| match err {
-                                    MetadataError::ClosedFd => Errno::EBADF,
-                                    MetadataError::NoSuchMetadata => {
-                                        unreachable!("all sockets have SocketOFlags when created")
-                                    }
-                                })
-                        },
-                        |fd| {
-                            if flags.intersects(OFlags::NONBLOCK.complement()) {
-                                todo!("unsupported flags for pipes")
-                            }
-                            self.global
-                                .pipes
-                                .update_flags(
-                                    fd,
-                                    litebox::pipes::Flags::NON_BLOCKING,
-                                    flags.intersects(OFlags::NONBLOCK),
-                                )
-                                .map_err(Errno::from)
-                        },
-                        |fd| {
-                            // TODO: Consider shared metadata table?
-                            let handle = self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .entry_handle(fd)
-                                .ok_or(Errno::EBADF)?;
-                            handle.with_entry(|file| toggle_flags!(file));
-                            Ok(())
-                        },
-                        |_fd| todo!("epoll"),
-                        |fd| {
-                            // TODO: Consider shared metadata table?
-                            let handle = self
-                                .global
-                                .litebox
-                                .descriptor_table()
-                                .entry_handle(fd)
-                                .ok_or(Errno::EBADF)?;
-                            handle.with_entry(|file| toggle_flags!(file));
-                            Ok(())
-                        },
-                    )??,
-                    Descriptor::__Unused(_) => unreachable!("delete before PR"),
-                }
+                files.run_on_raw_fd(
+                    *desc,
+                    |fd| {
+                        self.global
+                            .litebox
+                            .descriptor_table_mut()
+                            .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| {
+                                let diff = *f ^ flags;
+                                if diff
+                                    .intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME)
+                                {
+                                    todo!("unsupported flags");
+                                }
+                                f.toggle(diff);
+                            })
+                            .map_err(|err| match err {
+                                MetadataError::ClosedFd => Errno::EBADF,
+                                MetadataError::NoSuchMetadata => {
+                                    unimplemented!("SETFL on non-stdio")
+                                }
+                            })
+                    },
+                    |fd| {
+                        self.global
+                            .litebox
+                            .descriptor_table_mut()
+                            .with_metadata_mut(fd, |crate::syscalls::net::SocketOFlags(f)| {
+                                let diff = *f ^ flags;
+                                if diff
+                                    .intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME)
+                                {
+                                    todo!("unsupported flags");
+                                }
+                                f.toggle(diff);
+                            })
+                            .map_err(|err| match err {
+                                MetadataError::ClosedFd => Errno::EBADF,
+                                MetadataError::NoSuchMetadata => {
+                                    unreachable!("all sockets have SocketOFlags when created")
+                                }
+                            })
+                    },
+                    |fd| {
+                        if flags.intersects(OFlags::NONBLOCK.complement()) {
+                            todo!("unsupported flags for pipes")
+                        }
+                        self.global
+                            .pipes
+                            .update_flags(
+                                fd,
+                                litebox::pipes::Flags::NON_BLOCKING,
+                                flags.intersects(OFlags::NONBLOCK),
+                            )
+                            .map_err(Errno::from)
+                    },
+                    |fd| {
+                        // TODO: Consider shared metadata table?
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| toggle_flags!(file));
+                        Ok(())
+                    },
+                    |_fd| todo!("epoll"),
+                    |fd| {
+                        // TODO: Consider shared metadata table?
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| toggle_flags!(file));
+                        Ok(())
+                    },
+                )??;
                 Ok(0)
             }
             FcntlArg::GETLK(lock) => {
-                let Descriptor::LiteBoxRawFd(raw_fd) = desc else {
-                    return Err(Errno::EBADF);
-                };
                 self.files
                     .borrow()
                     .run_on_raw_fd(
-                        *raw_fd,
+                        *desc,
                         |_fd| {
                             let mut flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
                             let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
@@ -1310,13 +1254,10 @@ impl<FS: ShimFS> Task<FS> {
                     .flatten()
             }
             FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
-                let Descriptor::LiteBoxRawFd(raw_fd) = desc else {
-                    return Err(Errno::EBADF);
-                };
                 self.files
                     .borrow()
                     .run_on_raw_fd(
-                        *raw_fd,
+                        *desc,
                         |_fd| {
                             let flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
                             let _ = litebox_common_linux::FlockType::try_from(flock.type_)
@@ -1468,10 +1409,10 @@ impl<FS: ShimFS> Task<FS> {
         })?;
         let mut fds = files.file_descriptors.write();
         let w = fds
-            .insert(self, Descriptor::LiteBoxRawFd(wr_raw_fd))
+            .insert(self, wr_raw_fd)
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
         let r = fds
-            .insert(self, Descriptor::LiteBoxRawFd(rd_raw_fd))
+            .insert(self, rd_raw_fd)
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
         Ok((r, w))
     }
@@ -1503,7 +1444,7 @@ impl<FS: ShimFS> Task<FS> {
         files
             .file_descriptors
             .write()
-            .insert(self, Descriptor::LiteBoxRawFd(raw_fd))
+            .insert(self, raw_fd)
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
         Ok(raw_fd.truncate())
     }
@@ -1577,141 +1518,139 @@ impl<FS: ShimFS> Task<FS> {
         match arg {
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                match desc {
-                    Descriptor::LiteBoxRawFd(raw_fd) => {
-                        self.files.borrow().run_on_raw_fd(
-                            *raw_fd,
-                            |_file_fd| {
-                                // TODO: stdio NONBLOCK?
-                                #[cfg(debug_assertions)]
-                                litebox::log_println!(
-                                    self.global.platform,
-                                    "Attempted to set non-blocking on raw fd; currently unimplemented"
-                                );
-                                Ok(())
-                            },
-                            |socket_fd| {
-                                if let Err(e) = self.global.litebox.descriptor_table_mut().with_metadata_mut(
+                self.files
+                    .borrow()
+                    .run_on_raw_fd(
+                        *desc,
+                        |_file_fd| {
+                            // TODO: stdio NONBLOCK?
+                            #[cfg(debug_assertions)]
+                            litebox::log_println!(
+                                self.global.platform,
+                                "Attempted to set non-blocking on raw fd; currently unimplemented"
+                            );
+                            Ok(())
+                        },
+                        |socket_fd| {
+                            if let Err(e) = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .with_metadata_mut(
                                     socket_fd,
                                     |crate::syscalls::net::SocketOFlags(flags)| {
                                         flags.set(OFlags::NONBLOCK, val != 0);
                                     },
-                                ) {
-                                    match e {
-                                        MetadataError::ClosedFd => return Err(Errno::EBADF),
-                                        MetadataError::NoSuchMetadata => unreachable!(),
-                                    }
+                                )
+                            {
+                                match e {
+                                    MetadataError::ClosedFd => return Err(Errno::EBADF),
+                                    MetadataError::NoSuchMetadata => unreachable!(),
                                 }
-                                Ok(())
-                            },
-                            |fd| {
-    self.global.pipes                                .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
-                                    .map_err(Errno::from)
-                            },
-                            |fd| {
-                                let handle = self
-                                    .global
-                                    .litebox
-                                    .descriptor_table()
-                                    .entry_handle(fd)
-                                    .ok_or(Errno::EBADF)?;
-                                handle.with_entry(|file| {
-                                    file.set_status(OFlags::NONBLOCK, val != 0);
-                                });
-                                Ok(())
-                            },
-                            |fd| {
-                                let handle = self
-                                    .global
-                                    .litebox
-                                    .descriptor_table()
-                                    .entry_handle(fd)
-                                    .ok_or(Errno::EBADF)?;
-                                handle.with_entry(|file| {
-                                    file.set_status(OFlags::NONBLOCK, val != 0);
-                                });
-                                Ok(())
-                            },
-                            |fd| {
-                                let handle = self
-                                    .global
-                                    .litebox
-                                    .descriptor_table()
-                                    .entry_handle(fd)
-                                    .ok_or(Errno::EBADF)?;
-                                handle.with_entry(|file| {
-                                    file.set_status(OFlags::NONBLOCK, val != 0);
-                                });
-                                Ok(())
-                            },
-                        )
-                        .flatten()?;
-                    }
-                    Descriptor::__Unused(_) => unreachable!("delete before PR"),
-                }
+                            }
+                            Ok(())
+                        },
+                        |fd| {
+                            self.global
+                                .pipes
+                                .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
+                                .map_err(Errno::from)
+                        },
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                file.set_status(OFlags::NONBLOCK, val != 0);
+                            });
+                            Ok(())
+                        },
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                file.set_status(OFlags::NONBLOCK, val != 0);
+                            });
+                            Ok(())
+                        },
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                file.set_status(OFlags::NONBLOCK, val != 0);
+                            });
+                            Ok(())
+                        },
+                    )
+                    .flatten()?;
                 Ok(0)
             }
-            IoctlArg::FIOCLEX => match desc {
-                Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
-                    *raw_fd,
-                    |fd| {
-                        let _old = self
-                            .global
-                            .litebox
-                            .descriptor_table_mut()
-                            .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-                        Ok(0)
-                    },
-                    |_fd| todo!("net"),
-                    |_fd| todo!("pipes"),
-                    |fd| {
-                        let _old = self
-                            .global
-                            .litebox
-                            .descriptor_table_mut()
-                            .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-                        Ok(0)
-                    },
-                    |fd| {
-                        let _old = self
-                            .global
-                            .litebox
-                            .descriptor_table_mut()
-                            .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-                        Ok(0)
-                    },
-                    |fd| {
-                        let _old = self
-                            .global
-                            .litebox
-                            .descriptor_table_mut()
-                            .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-                        Ok(0)
-                    },
-                )?,
-                Descriptor::__Unused(_) => unreachable!("delete before PR"),
-            },
+            IoctlArg::FIOCLEX => files.run_on_raw_fd(
+                *desc,
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
+                |_fd| todo!("net"),
+                |_fd| todo!("pipes"),
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
+            )?,
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
             | IoctlArg::TIOCGPTN(..)
-            | IoctlArg::TIOCGWINSZ(..) => match desc {
-                Descriptor::LiteBoxRawFd(raw_fd) => files.run_on_raw_fd(
-                    *raw_fd,
-                    |fd| {
-                        if self.is_stdio(&files.fs, fd)? {
-                            self.stdio_ioctl(&arg)
-                        } else {
-                            Err(Errno::ENOTTY)
-                        }
-                    },
-                    |_fd| Err(Errno::ENOTTY),
-                    |_fd| Err(Errno::ENOTTY),
-                    |_fd| Err(Errno::ENOTTY),
-                    |_fd| Err(Errno::ENOTTY),
-                    |_fd| Err(Errno::ENOTTY),
-                )?,
-                Descriptor::__Unused(_) => unreachable!("delete before PR"),
-            },
+            | IoctlArg::TIOCGWINSZ(..) => files.run_on_raw_fd(
+                *desc,
+                |fd| {
+                    if self.is_stdio(&files.fs, fd)? {
+                        self.stdio_ioctl(&arg)
+                    } else {
+                        Err(Errno::ENOTTY)
+                    }
+                },
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
+            )?,
             _ => {
                 #[cfg(debug_assertions)]
                 litebox::log_println!(self.global.platform, "\n\n\n{:?}\n\n\n", arg);
@@ -1746,7 +1685,7 @@ impl<FS: ShimFS> Task<FS> {
         files
             .file_descriptors
             .write()
-            .insert(self, Descriptor::LiteBoxRawFd(raw_fd))
+            .insert(self, raw_fd)
             .map_err(|desc| self.do_close(desc).err().unwrap_or(Errno::EMFILE))?;
         Ok(raw_fd.truncate())
     }
@@ -1824,7 +1763,7 @@ impl<FS: ShimFS> Task<FS> {
             let files = self.files.borrow();
             let locked_file_descriptors = files.file_descriptors.read();
             match locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)? {
-                Descriptor::LiteBoxRawFd(raw_fd) => {
+                raw_fd => {
                     let Ok(fd) = files
                         .raw_descriptor_store
                         .read()
@@ -1839,7 +1778,6 @@ impl<FS: ShimFS> Task<FS> {
                         .entry_handle(&fd)
                         .ok_or(Errno::EBADF)?
                 }
-                Descriptor::__Unused(_) => unreachable!("delete before PR"),
             }
         };
         handle.with_entry(|epoll_file| {
@@ -2064,39 +2002,32 @@ impl<FS: ShimFS> Task<FS> {
         Ok(count)
     }
 
-    fn do_dup(&self, file: &Descriptor<FS>, flags: OFlags) -> Result<Descriptor<FS>, Errno> {
+    fn do_dup(&self, file: &usize, flags: OFlags) -> Result<usize, Errno> {
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
         let files = self.files.borrow();
-        match file {
-            Descriptor::LiteBoxRawFd(raw_fd) => {
-                fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
-                    global: &GlobalState<FS>,
-                    files: &FilesState<FS>,
-                    fd: &TypedFd<S>,
-                    close_on_exec: bool,
-                ) -> Result<Descriptor<FS>, Errno> {
-                    let mut dt = global.litebox.descriptor_table_mut();
-                    let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
-                    if close_on_exec {
-                        let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
-                        assert!(old.is_none());
-                    }
-                    Ok(Descriptor::LiteBoxRawFd(
-                        files.raw_descriptor_store.write().fd_into_raw_integer(fd),
-                    ))
-                }
-                files.run_on_raw_fd(
-                    *raw_fd,
-                    |fd| dup(&self.global, &files, fd, close_on_exec),
-                    |fd| dup(&self.global, &files, fd, close_on_exec),
-                    |fd| dup(&self.global, &files, fd, close_on_exec),
-                    |fd| dup(&self.global, &files, fd, close_on_exec),
-                    |fd| dup(&self.global, &files, fd, close_on_exec),
-                    |fd| dup(&self.global, &files, fd, close_on_exec),
-                )?
+        fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
+            global: &GlobalState<FS>,
+            files: &FilesState<FS>,
+            fd: &TypedFd<S>,
+            close_on_exec: bool,
+        ) -> Result<usize, Errno> {
+            let mut dt = global.litebox.descriptor_table_mut();
+            let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
+            if close_on_exec {
+                let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
+                assert!(old.is_none());
             }
-            Descriptor::__Unused(_) => unreachable!("delete before PR"),
+            Ok(files.raw_descriptor_store.write().fd_into_raw_integer(fd))
         }
+        files.run_on_raw_fd(
+            *file,
+            |fd| dup(&self.global, &files, fd, close_on_exec),
+            |fd| dup(&self.global, &files, fd, close_on_exec),
+            |fd| dup(&self.global, &files, fd, close_on_exec),
+            |fd| dup(&self.global, &files, fd, close_on_exec),
+            |fd| dup(&self.global, &files, fd, close_on_exec),
+            |fd| dup(&self.global, &files, fd, close_on_exec),
+        )?
     }
 
     /// Handle syscall `dup/dup2/dup3`
@@ -2183,11 +2114,7 @@ impl<FS: ShimFS> Task<FS> {
         };
         let files = self.files.borrow();
         let locked_file_descriptors = files.file_descriptors.read();
-        let Descriptor::LiteBoxRawFd(raw_fd) =
-            locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?
-        else {
-            return Err(Errno::EBADF);
-        };
+        let raw_fd = locked_file_descriptors.get_fd(fd).ok_or(Errno::EBADF)?;
         files.run_on_raw_fd(
             *raw_fd,
             |file| {
