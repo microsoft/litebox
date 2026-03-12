@@ -415,6 +415,8 @@ const BENCHMARKS: &[(&str, BenchFn)] = benchtable![
     run_rewritten_hello_static,
     rewriter_node,
     run_rewritten_node,
+    rewriter_iperf3,
+    run_rewritten_iperf3,
     //
 ];
 
@@ -594,6 +596,125 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
             sh,
             "{project_root}/target/{mode}/litebox_runner_linux_userland --unstable --interception-backend rewriter --env HOME=/ --initial-files {tar_file} node_rewritten hello_world.js"
         ).run()?;
+    }
+    Ok(())
+}
+
+fn rewriter_iperf3(ctx: BenchCtx) -> Result<()> {
+    let BenchCtx {
+        sh,
+        cli_args: _,
+        project_root,
+        is_init,
+        lock_tracing: _,
+    } = ctx;
+    let iperf3 = locate_command(sh, "iperf3")?;
+    if is_init {
+        cmd!(sh, "cargo build -p litebox_syscall_rewriter --release").run()?;
+    } else {
+        cmd!(
+            sh,
+            "{project_root}/target/release/litebox_syscall_rewriter {iperf3} -o iperf3_rewritten"
+        )
+        .run()?;
+    }
+    Ok(())
+}
+
+fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
+    let BenchCtx {
+        sh,
+        cli_args: _,
+        project_root,
+        is_init,
+        lock_tracing,
+    } = ctx;
+    let tar_file = sh.current_dir().join("iperf3_rootfs.tar");
+    let release_mode = true;
+    if is_init {
+        rewriter_iperf3(ctx.with_init(true))?;
+        rewriter_iperf3(ctx.with_init(false))?;
+
+        let tar_base_dir = sh.current_dir().join("iperf3_tar_base");
+        sh.create_dir(&tar_base_dir)?;
+        let libs = find_dependencies(sh, "iperf3")?;
+        for lib in libs {
+            let dest_path = tar_base_dir
+                .join(lib.strip_prefix("/").unwrap_or_else(|_| {
+                    panic!("Library path '{}' is not absolute", lib.display())
+                }));
+            if let Some(parent) = dest_path.parent() {
+                sh.create_dir(parent)?;
+            }
+            cmd!(
+                sh,
+                "{project_root}/target/release/litebox_syscall_rewriter {lib} -o {dest_path}"
+            )
+            .run()?;
+        }
+
+        sh.remove_path(&tar_file)?;
+        cmd!(sh, "tar --format=ustar -C {tar_base_dir} -cvf {tar_file} .").run()?;
+        let release = release_mode.then_some("--release");
+        let features: &[&str] = if lock_tracing {
+            &["--features", "lock_tracing"]
+        } else {
+            &[]
+        };
+        cmd!(
+            sh,
+            "cargo build -p litebox_runner_linux_userland {release...} {features...}"
+        )
+        .run()?;
+    } else {
+        let mode = if release_mode { "release" } else { "debug" };
+        let iperf3_host = locate_command(sh, "iperf3")?;
+        let runner = format!(
+            "{}/target/{mode}/litebox_runner_linux_userland",
+            project_root.display()
+        );
+        let iperf3_rewritten = sh.current_dir().join("iperf3_rewritten");
+
+        // Spawn the sandboxed iperf3 server in a background thread so we can run the client
+        // from the host side. The server uses `-1` to exit after handling one client.
+        let server_handle = std::thread::spawn(move || -> Result<()> {
+            let sh = xshell::Shell::new()?;
+            cmd!(
+                sh,
+                "{runner} --unstable --interception-backend rewriter --env LD_LIBRARY_PATH=/lib64:/lib32:/lib --env HOME=/ --tun-device-name tun99 --initial-files {tar_file} {iperf3_rewritten} -s -1 -B 10.0.0.2"
+            ).run()?;
+            Ok(())
+        });
+
+        // Retry the client connection until the server is ready, using a short
+        // connect-timeout so we don't waste time sleeping for a fixed duration.
+        debug!("Connecting iperf3 client to sandboxed server");
+        let client_sh = xshell::Shell::new()?;
+        let max_attempts = 50;
+        for attempt in 1..=max_attempts {
+            let result = cmd!(
+                client_sh,
+                "{iperf3_host} -c 10.0.0.2 --bytes 1G --connect-timeout 50"
+            )
+            .quiet()
+            .ignore_stdout()
+            .ignore_stderr()
+            .run();
+            if result.is_ok() {
+                break;
+            }
+            if attempt == max_attempts {
+                return Err(anyhow!(
+                    "iperf3 client failed to connect after {max_attempts} attempts"
+                ));
+            }
+            debug!(attempt, "iperf3 client connection failed, retrying");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        server_handle
+            .join()
+            .map_err(|e| anyhow!("iperf3 server thread panicked: {e:?}"))??;
     }
     Ok(())
 }
