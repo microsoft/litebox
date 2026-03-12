@@ -957,11 +957,11 @@ impl<FS: ShimFS> Task<FS> {
                         .set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
                     assert!(old.is_none());
                 }
-                let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+
+                files.insert_raw_fd(typed).map_err(|typed| {
                     let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
                     Errno::EMFILE
-                })?;
-                raw_fd
+                })?
             }
             AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
             _ => unimplemented!(),
@@ -1499,41 +1499,40 @@ impl<FS: ShimFS> Task<FS> {
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
         let file_table = files.file_descriptors.read();
-        let (size, addr) = match file_table.get_fd(sockfd).ok_or(Errno::EBADF)? {
-            raw_fd => {
-                let raw_fd = *raw_fd;
-                drop(file_table);
-                // We need to do this cell dance because otherwise Rust can't recognize that the two
-                // closures are mutually exclusive.
-                let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
-                files.with_socket(
-                    &self.global,
-                    raw_fd.truncate(),
-                    |fd| {
-                        let mut addr = None;
-                        let size = self.global.receive(
-                            &self.wait_cx(),
-                            fd,
-                            &mut buf.borrow_mut(),
-                            flags,
-                            if want_source { Some(&mut addr) } else { None },
-                        )?;
-                        let src_addr = addr.map(SocketAddress::Inet);
-                        Ok((size, src_addr))
-                    },
-                    |entry| {
-                        let mut addr = None;
-                        let size = entry.recvfrom(
-                            &self.wait_cx(),
-                            &mut buf.borrow_mut(),
-                            flags,
-                            if want_source { Some(&mut addr) } else { None },
-                        )?;
-                        let src_addr = addr.map(SocketAddress::Unix);
-                        Ok((size, src_addr))
-                    },
-                )?
-            }
+        let raw_fd = file_table.get_fd(sockfd).ok_or(Errno::EBADF)?;
+        let (size, addr) = {
+            let raw_fd = *raw_fd;
+            drop(file_table);
+            // We need to do this cell dance because otherwise Rust can't recognize that the two
+            // closures are mutually exclusive.
+            let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
+            files.with_socket(
+                &self.global,
+                raw_fd.truncate(),
+                |fd| {
+                    let mut addr = None;
+                    let size = self.global.receive(
+                        &self.wait_cx(),
+                        fd,
+                        &mut buf.borrow_mut(),
+                        flags,
+                        if want_source { Some(&mut addr) } else { None },
+                    )?;
+                    let src_addr = addr.map(SocketAddress::Inet);
+                    Ok((size, src_addr))
+                },
+                |entry| {
+                    let mut addr = None;
+                    let size = entry.recvfrom(
+                        &self.wait_cx(),
+                        &mut buf.borrow_mut(),
+                        flags,
+                        if want_source { Some(&mut addr) } else { None },
+                    )?;
+                    let src_addr = addr.map(SocketAddress::Unix);
+                    Ok((size, src_addr))
+                },
+            )?
         };
 
         if !flags.contains(ReceiveFlags::TRUNC) {

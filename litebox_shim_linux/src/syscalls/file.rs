@@ -677,37 +677,33 @@ impl<FS: ShimFS> Task<FS> {
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        let res = match desc {
-            raw_fd => {
-                let raw_fd = *raw_fd;
-                drop(locked_file_descriptors); // drop before potentially blocking write
-                files
-                    .run_on_raw_fd(
-                        raw_fd,
-                        |fd| {
-                            write_to_iovec(iovs, |buf: &[u8]| {
-                                files.fs.write(fd, buf, None).map_err(Errno::from)
-                            })
-                        },
-                        |fd| {
-                            write_to_iovec(iovs, |buf| {
-                                self.global.sendto(
-                                    &self.wait_cx(),
-                                    fd,
-                                    buf,
-                                    litebox_common_linux::SendFlags::empty(),
-                                    None,
-                                )
-                            })
-                        },
-                        |_fd| todo!("pipes"),
-                        |_fd| todo!("eventfd"),
-                        |_fd| Err(Errno::EINVAL),
-                        |_fd| todo!("unix"),
-                    )
-                    .flatten()
-            }
-        };
+        let raw_fd = *desc;
+        drop(locked_file_descriptors); // drop before potentially blocking write
+        let res = files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    write_to_iovec(iovs, |buf: &[u8]| {
+                        files.fs.write(fd, buf, None).map_err(Errno::from)
+                    })
+                },
+                |fd| {
+                    write_to_iovec(iovs, |buf| {
+                        self.global.sendto(
+                            &self.wait_cx(),
+                            fd,
+                            buf,
+                            litebox_common_linux::SendFlags::empty(),
+                            None,
+                        )
+                    })
+                },
+                |_fd| todo!("pipes"),
+                |_fd| todo!("eventfd"),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| todo!("unix"),
+            )
+            .flatten();
         if let Err(Errno::EPIPE) = res {
             unimplemented!("send SIGPIPE to the current task");
         }
@@ -1277,7 +1273,7 @@ impl<FS: ShimFS> Task<FS> {
             }
             FcntlArg::DUPFD { cloexec, min_fd } => {
                 let new_file = self.do_dup(
-                    desc,
+                    *desc,
                     if cloexec {
                         OFlags::CLOEXEC
                     } else {
@@ -1762,22 +1758,21 @@ impl<FS: ShimFS> Task<FS> {
         let handle = {
             let files = self.files.borrow();
             let locked_file_descriptors = files.file_descriptors.read();
-            match locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)? {
-                raw_fd => {
-                    let Ok(fd) = files
+            {
+                let raw_fd = locked_file_descriptors.get_fd(epfd).ok_or(Errno::EBADF)?;
+                let Ok(fd) =
+                    files
                         .raw_descriptor_store
                         .read()
-                        .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<FS>>(
-                        *raw_fd,
-                    ) else {
-                        return Err(Errno::EBADF);
-                    };
-                    self.global
-                        .litebox
-                        .descriptor_table()
-                        .entry_handle(&fd)
-                        .ok_or(Errno::EBADF)?
-                }
+                        .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<FS>>(*raw_fd)
+                else {
+                    return Err(Errno::EBADF);
+                };
+                self.global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(&fd)
+                    .ok_or(Errno::EBADF)?
             }
         };
         handle.with_entry(|epoll_file| {
@@ -2002,9 +1997,7 @@ impl<FS: ShimFS> Task<FS> {
         Ok(count)
     }
 
-    fn do_dup(&self, file: &usize, flags: OFlags) -> Result<usize, Errno> {
-        let close_on_exec = flags.contains(OFlags::CLOEXEC);
-        let files = self.files.borrow();
+    fn do_dup(&self, file: usize, flags: OFlags) -> Result<usize, Errno> {
         fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
             global: &GlobalState<FS>,
             files: &FilesState<FS>,
@@ -2019,8 +2012,10 @@ impl<FS: ShimFS> Task<FS> {
             }
             Ok(files.raw_descriptor_store.write().fd_into_raw_integer(fd))
         }
+        let close_on_exec = flags.contains(OFlags::CLOEXEC);
+        let files = self.files.borrow();
         files.run_on_raw_fd(
-            *file,
+            file,
             |fd| dup(&self.global, &files, fd, close_on_exec),
             |fd| dup(&self.global, &files, fd, close_on_exec),
             |fd| dup(&self.global, &files, fd, close_on_exec),
@@ -2050,7 +2045,7 @@ impl<FS: ShimFS> Task<FS> {
             .read()
             .get_fd(oldfd)
             .ok_or(Errno::EBADF)
-            .map(|desc| self.do_dup(desc, flags.unwrap_or(OFlags::empty())))??;
+            .map(|desc| self.do_dup(*desc, flags.unwrap_or(OFlags::empty())))??;
         if let Some(newfd) = newfd {
             // dup2/dup3
             let Ok(newfd) = u32::try_from(newfd) else {
