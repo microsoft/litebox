@@ -513,11 +513,8 @@ where
 
     /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
     fn close_pending_sockets(&mut self) {
-        for (_, mut handle) in self
-            .litebox
-            .descriptor_table_mut()
-            .iter_mut::<Network<Platform>>()
-        {
+        let table = self.litebox.descriptor_table();
+        for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
             let socket_handle = &mut handle.entry;
             if socket_handle.consider_closed {
                 // check if there is pending data to be sent
