@@ -272,6 +272,11 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     }
 }
 
+impl litebox::platform::TimerProvider for SnpLinuxKernel {
+    type TimerHandle = litebox::platform::trivial_providers::UnsupportedTimerHandle;
+    type Signal = litebox_common_linux::signal::Signal;
+}
+
 impl bindings::SnpVmplRequestArgs {
     #[inline]
     fn new_request(code: u32, size: u32, args: ArgsArray) -> Self {

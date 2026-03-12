@@ -8,9 +8,19 @@
 
 use super::{
     Punchthrough, PunchthroughError, PunchthroughProvider, PunchthroughToken, RawConstPointer,
-    RawMutPointer,
+    RawMutPointer, TimerHandle,
 };
+
 use zerocopy::{FromBytes, IntoBytes};
+
+/// A [`TimerHandle`] for [`super::TimerProvider`].
+pub enum UnsupportedTimerHandle {}
+
+impl TimerHandle for UnsupportedTimerHandle {
+    fn set_timer(&self, _duration: core::time::Duration) {
+        unreachable!("TimerProvider is not supported for this platform");
+    }
+}
 
 /// A trivial provider, useful when no punchthrough is necessary.
 pub struct ImpossiblePunchthroughProvider {}

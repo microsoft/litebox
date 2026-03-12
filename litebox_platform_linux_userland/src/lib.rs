@@ -1177,6 +1177,79 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     }
 }
 
+impl litebox::platform::TimerProvider for LinuxUserland {
+    type TimerHandle = TimerHandle;
+    type Signal = litebox_common_linux::signal::Signal;
+
+    fn create_timer(
+        &self,
+        signal: Self::Signal,
+    ) -> Result<Self::TimerHandle, litebox::platform::TimerCreationError> {
+        // Create a POSIX per-process timer.  We always deliver via SIGALRM at
+        // the kernel level (whose handler is already registered) and encode the
+        // *desired* guest signal in `sigev_value.sival_int`.  The signal handler
+        // reads `si_value` when `si_code == SI_TIMER` to determine which guest
+        // signal to record.
+        let mut sev: libc::sigevent = unsafe { core::mem::zeroed() };
+        sev.sigev_notify = libc::SIGEV_SIGNAL;
+        sev.sigev_signo = libc::SIGALRM;
+        sev.sigev_value.sival_ptr = signal.as_i32() as *mut libc::c_void;
+
+        let mut timer_id: libc::timer_t = std::ptr::null_mut();
+        let ret =
+            unsafe { libc::timer_create(libc::CLOCK_MONOTONIC, &raw mut sev, &raw mut timer_id) };
+        assert!(
+            ret == 0,
+            "timer_create failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        Ok(TimerHandle(timer_id))
+    }
+}
+
+/// A timer handle backed by POSIX `timer_create` / `timer_settime`.
+///
+/// Each handle owns an independent kernel timer, so multiple timers can
+/// coexist without interfering with each other.
+pub struct TimerHandle(libc::timer_t);
+
+// Safety: `timer_t` is an opaque kernel handle safe to send across threads.
+unsafe impl Send for TimerHandle {}
+unsafe impl Sync for TimerHandle {}
+
+impl Drop for TimerHandle {
+    fn drop(&mut self) {
+        // Safety: we own the timer and it will not be used after drop.
+        unsafe {
+            libc::timer_delete(self.0);
+        }
+    }
+}
+
+impl litebox::platform::TimerHandle for TimerHandle {
+    fn set_timer(&self, duration: core::time::Duration) {
+        let its = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: duration.as_secs().cast_signed().truncate(),
+                #[cfg_attr(target_arch = "x86", expect(clippy::useless_conversion))]
+                tv_nsec: duration.subsec_nanos().cast_signed().into(),
+            },
+        };
+        // Safety: valid timer id and itimerspec.
+        let ret = unsafe { libc::timer_settime(self.0, 0, &raw const its, std::ptr::null_mut()) };
+        assert!(
+            ret == 0,
+            "timer_settime failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 impl litebox::platform::RawMutexProvider for LinuxUserland {
     type RawMutex = RawMutex;
 
@@ -2547,11 +2620,12 @@ unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
 /// Signal handler for interrupt signals.
 unsafe fn interrupt_signal_handler(
     signum: libc::c_int,
-    _info: &mut libc::siginfo_t,
+    info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    let raise_signal = |signum: libc::c_int| {
-        // block the signal on this non-guest thread so the kernel won't
+    #[cfg(debug_assertions)]
+    let raise_signal = |signum: libc::c_int, info: &libc::siginfo_t| {
+        // Block the signal on this non-guest thread so the kernel won't
         // deliver it here again, then re-raise as process-directed so a
         // guest thread picks it up.
         //
@@ -2562,7 +2636,8 @@ unsafe fn interrupt_signal_handler(
             libc::sigemptyset(&raw mut set);
             libc::sigaddset(&raw mut set, signum);
             libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
-            libc::kill(libc::getpid(), signum);
+            let val = info.si_value();
+            libc::sigqueue(libc::getpid(), signum, val);
         }
     };
 
@@ -2570,9 +2645,19 @@ unsafe fn interrupt_signal_handler(
     // per-thread pending bitmask so the shim can forward them to the guest.
     // TODO: no realtime signal support for now.
     if signum > 0 && signum < 32 {
+        // For timer-originated signals (and their re-raises via `sigqueue`),
+        // the desired guest signal is encoded in `si_value.sival_ptr`
+        // (set by `create_timer`).  For other sources (e.g. `kill()`), use
+        // the signal number directly.
+        let guest_signum = if info.si_code == libc::SI_TIMER || info.si_code == libc::SI_QUEUE {
+            unsafe { info.si_value().sival_ptr as libc::c_int }
+        } else {
+            signum
+        };
+
         // Only record signals that can be forwarded to the guest as
         // litebox_common_linux::signal::Signal. Unknown signals are silently dropped.
-        let Ok(signal) = litebox_common_linux::signal::Signal::try_from(signum) else {
+        let Ok(signal) = litebox_common_linux::signal::Signal::try_from(guest_signum) else {
             return;
         };
 
@@ -2596,7 +2681,8 @@ unsafe fn interrupt_signal_handler(
             // SAFETY: we verified the saved host TLS segment is valid above.
             unsafe { record_pending_signal(signal) };
         } else {
-            raise_signal(signum);
+            #[cfg(debug_assertions)]
+            raise_signal(signum, info);
             return;
         }
     }
