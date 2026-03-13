@@ -19,8 +19,15 @@ Example use cases include:
 - Run programs on top of SEV SNP
 - Running OP-TEE programs on Linux
 - Running on LVBS
+- Running unmodified Windows programs on Linux (100% framework complete - see [current status](./docs/windows_on_linux_status.md))
 
 ![LiteBox and related projects](./.figures/litebox.svg)
+
+## Documentation
+
+- [Workspace Setup Optimization Guide](./docs/workspace_setup_optimization.md) - Speed up your development workflow by 2-5x
+- [Windows on Linux Implementation Plan](./docs/windows_on_linux_implementation_plan.md) - Comprehensive design for running Windows programs on Linux with API tracing
+- [Windows on Linux Current Status](./docs/windows_on_linux_status.md) - Current implementation status, test coverage, and next steps
 
 ## Contributing
 

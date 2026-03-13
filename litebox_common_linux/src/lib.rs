@@ -914,12 +914,18 @@ impl TimeZone {
 #[non_exhaustive]
 #[derive(Debug, IntEnum)]
 pub enum ArchPrctlCode {
+    /// Set the 64-bit base for the GS register
+    #[cfg(target_arch = "x86_64")]
+    SetGs = 0x1001,
     /// Set the 64-bit base for the FS register
     #[cfg(target_arch = "x86_64")]
     SetFs = 0x1002,
     /// Return the 64-bit base value for the FS register of the calling thread
     #[cfg(target_arch = "x86_64")]
     GetFs = 0x1003,
+    /// Return the 64-bit base value for the GS register of the calling thread
+    #[cfg(target_arch = "x86_64")]
+    GetGs = 0x1004,
 
     /* CET (Control-flow Enforcement Technology) ralated operations; each of these simply will return EINVAL */
     CETStatus = 0x3001,
@@ -932,9 +938,13 @@ pub enum ArchPrctlCode {
 #[derive(Debug)]
 pub enum ArchPrctlArg<Platform: litebox::platform::RawPointerProvider> {
     #[cfg(target_arch = "x86_64")]
+    SetGs(usize),
+    #[cfg(target_arch = "x86_64")]
     SetFs(usize),
     #[cfg(target_arch = "x86_64")]
     GetFs(Platform::RawMutPointer<usize>),
+    #[cfg(target_arch = "x86_64")]
+    GetGs(Platform::RawMutPointer<usize>),
 
     CETStatus,
     CETDisable,
@@ -2688,9 +2698,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     .map_err(|_| unsupported_einval(format_args!("arch_prctl(code = {code})")))?;
                 let arg = match code {
                     #[cfg(target_arch = "x86_64")]
+                    ArchPrctlCode::SetGs => ArchPrctlArg::SetGs(ctx.sys_req_arg(1)),
+                    #[cfg(target_arch = "x86_64")]
                     ArchPrctlCode::SetFs => ArchPrctlArg::SetFs(ctx.sys_req_arg(1)),
                     #[cfg(target_arch = "x86_64")]
                     ArchPrctlCode::GetFs => ArchPrctlArg::GetFs(ctx.sys_req_ptr(1)),
+                    #[cfg(target_arch = "x86_64")]
+                    ArchPrctlCode::GetGs => ArchPrctlArg::GetGs(ctx.sys_req_ptr(1)),
                     ArchPrctlCode::CETStatus => ArchPrctlArg::CETStatus,
                     ArchPrctlCode::CETDisable => ArchPrctlArg::CETDisable,
                     ArchPrctlCode::CETLock => ArchPrctlArg::CETLock,
@@ -2861,12 +2875,18 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
 /// NOTE: It is assumed that all punchthroughs here are non-blocking.
 #[derive(Debug)]
 pub enum PunchthroughSyscall<'a, Platform: litebox::platform::RawPointerProvider> {
+    /// Set the GS base register to the value in `addr`.
+    #[cfg(target_arch = "x86_64")]
+    SetGsBase { addr: usize },
     /// Set the FS base register to the value in `addr`.
     #[cfg(target_arch = "x86_64")]
     SetFsBase { addr: usize },
     /// Return the current value of the FS base register.
     #[cfg(target_arch = "x86_64")]
     GetFsBase,
+    /// Return the current value of the GS base register.
+    #[cfg(target_arch = "x86_64")]
+    GetGsBase,
     #[cfg(target_arch = "x86")]
     SetThreadArea { user_desc: &'a mut UserDesc },
     /// An uninhabited variant to ensure the generics are referenced on all

@@ -43,9 +43,10 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
-// Thread-local storage for FS base state
+// Thread-local storage for FS and GS base state
 thread_local! {
     static THREAD_FS_BASE: Cell<usize> = const { Cell::new(0) };
+    static THREAD_GS_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The userland Windows platform.
@@ -70,7 +71,7 @@ impl core::fmt::Debug for WindowsUserland {
 unsafe impl Send for WindowsUserland {}
 unsafe impl Sync for WindowsUserland {}
 
-/// Helper functions for managing per-thread FS base
+/// Helper functions for managing per-thread FS and GS base
 impl WindowsUserland {
     /// Get the current thread's FS base state
     fn get_thread_fs_base() -> usize {
@@ -93,6 +94,29 @@ impl WindowsUserland {
     /// Initialize FS base state for a new thread
     fn init_thread_fs_base() {
         Self::set_thread_fs_base(0);
+    }
+
+    /// Get the current thread's GS base state
+    fn get_thread_gs_base() -> usize {
+        THREAD_GS_BASE.get()
+    }
+
+    /// Set the current thread's GS base
+    fn set_thread_gs_base(new_base: usize) {
+        THREAD_GS_BASE.set(new_base);
+        Self::restore_thread_gs_base();
+    }
+
+    /// Restore the current thread's GS base from saved state
+    fn restore_thread_gs_base() {
+        unsafe {
+            litebox_common_linux::wrgsbase(THREAD_GS_BASE.get());
+        }
+    }
+
+    /// Initialize GS base state for a new thread
+    fn init_thread_gs_base() {
+        Self::set_thread_gs_base(0);
     }
 }
 
@@ -246,8 +270,9 @@ impl WindowsUserland {
             sys_info: std::sync::RwLock::new(sys_info),
         };
 
-        // Initialize it's own fs-base (for the main thread)
+        // Initialize it's own fs-base and gs-base (for the main thread)
         WindowsUserland::init_thread_fs_base();
+        WindowsUserland::init_thread_gs_base();
 
         // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
         // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
@@ -1488,6 +1513,11 @@ impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
         >,
     > {
         match self.punchthrough {
+            PunchthroughSyscall::SetGsBase { addr } => {
+                // Use WindowsUserland's per-thread GS base management system
+                WindowsUserland::set_thread_gs_base(addr);
+                Ok(0)
+            }
             PunchthroughSyscall::SetFsBase { addr } => {
                 // Use WindowsUserland's per-thread FS base management system
                 WindowsUserland::set_thread_fs_base(addr);
@@ -1496,6 +1526,10 @@ impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
             PunchthroughSyscall::GetFsBase => {
                 // Use the stored FS base value from our per-thread storage
                 Ok(WindowsUserland::get_thread_fs_base())
+            }
+            PunchthroughSyscall::GetGsBase => {
+                // Use the stored GS base value from our per-thread storage
+                Ok(WindowsUserland::get_thread_gs_base())
             }
         }
     }
@@ -2064,6 +2098,7 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 
     fn clear_guest_thread_local_storage() {
         Self::init_thread_fs_base();
+        Self::init_thread_gs_base();
     }
 }
 

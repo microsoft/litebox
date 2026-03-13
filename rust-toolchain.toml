@@ -1,2 +1,4 @@
 [toolchain]
-channel = "stable"
+# Use nightly toolchain to support Rust 2024 edition features (let chains, etc.)
+# When Rust 2024 edition is stabilized, this can be changed back to "stable"
+channel = "nightly-2026-01-15"

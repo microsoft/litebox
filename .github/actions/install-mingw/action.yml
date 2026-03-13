@@ -1,0 +1,37 @@
+name: 'Install MinGW Cross-Compiler'
+description: 'Installs the mingw-w64 cross-compiler and optional extra apt packages, with apt cache'
+
+inputs:
+  extra-packages:
+    description: 'Space-separated list of extra apt packages to install alongside mingw-w64'
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Cache apt packages
+      id: cache-apt
+      uses: actions/cache@v4
+      with:
+        path: ~/apt-cache/archives
+        key: apt-mingw-w64-${{ inputs.extra-packages }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Install MinGW cross-compiler
+      shell: bash
+      run: |
+        PACKAGES="mingw-w64"
+        if [ -n "${{ inputs.extra-packages }}" ]; then
+          PACKAGES="${PACKAGES} ${{ inputs.extra-packages }}"
+        fi
+        mkdir -p ~/apt-cache/archives/partial
+        APT_OPTS="-o dir::cache::archives=${HOME}/apt-cache/archives"
+        if [ "${{ steps.cache-apt.outputs.cache-hit }}" != "true" ]; then
+          sudo apt-get update -y
+        fi
+        # shellcheck disable=SC2086
+        sudo apt-get ${APT_OPTS} install -y --no-download ${PACKAGES} || {
+          echo "apt-get install --no-download failed, retrying after 'apt-get update'..."
+          sudo apt-get update -y
+          # shellcheck disable=SC2086
+          sudo apt-get ${APT_OPTS} install -y ${PACKAGES}
+        }

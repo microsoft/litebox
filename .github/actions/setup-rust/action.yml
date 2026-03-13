@@ -1,0 +1,49 @@
+name: 'Setup Rust Toolchain'
+description: 'Reads the Rust channel from a toolchain file and installs it via rustup'
+
+inputs:
+  toolchain-file:
+    description: 'Path to the rust-toolchain.toml file to read the channel from'
+    default: 'rust-toolchain.toml'
+  targets:
+    description: 'Space-separated list of additional targets to install'
+    default: ''
+  components:
+    description: 'Comma-separated list of components to install (e.g. rustfmt,clippy)'
+    default: ''
+  set-default:
+    description: 'Whether to set this toolchain as the default and run rustup show'
+    default: 'false'
+  add-rust-src:
+    description: 'Whether to add the rust-src component (needed for build-std)'
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      shell: bash
+      run: |
+        RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' "${{ inputs.toolchain-file }}")
+        INSTALL_CMD="rustup toolchain install ${RUST_CHANNEL} --profile minimal --no-self-update"
+
+        if [ -n "${{ inputs.components }}" ]; then
+          INSTALL_CMD="${INSTALL_CMD} --component ${{ inputs.components }}"
+        fi
+
+        for target in ${{ inputs.targets }}; do
+          INSTALL_CMD="${INSTALL_CMD} --target ${target}"
+        done
+
+        eval "${INSTALL_CMD}"
+
+        if [ "${{ inputs.add-rust-src }}" = "true" ]; then
+          HOST_TRIPLE=$(rustc -Vv | grep '^host:' | cut -d' ' -f2)
+          rustup component add rust-src --toolchain "${RUST_CHANNEL}-${HOST_TRIPLE}"
+        fi
+
+        if [ "${{ inputs.set-default }}" = "true" ]; then
+          rustup default "${RUST_CHANNEL}"
+          rustup override set "${RUST_CHANNEL}"
+          rustup show
+        fi

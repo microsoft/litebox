@@ -1,0 +1,60 @@
+{
+	"name": "LiteBox Development",
+	"build": {
+		"dockerfile": "Dockerfile",
+		"context": ".."
+	},
+	
+	// Configure VS Code settings
+	"customizations": {
+		"vscode": {
+			// Extensions to install
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"vadimcn.vscode-lldb",
+				"tamasfe.even-better-toml"
+			],
+			
+			// VS Code settings
+			"settings": {
+				"rust-analyzer.cargo.features": "all",
+				"rust-analyzer.checkOnSave": true,
+				"rust-analyzer.check.command": "clippy",
+				"rust-analyzer.check.allTargets": true,
+				"rust-analyzer.procMacro.enable": true,
+				"editor.formatOnSave": true,
+				"[rust]": {
+					"editor.defaultFormatter": "rust-lang.rust-analyzer",
+					"editor.formatOnSave": true
+				},
+				"files.watcherExclude": {
+					"**/target/**": true
+				}
+			}
+		}
+	},
+	
+	// Mount the cargo registry and git cache for faster builds
+	"mounts": [
+		"source=litebox-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+		"source=litebox-cargo-git,target=/usr/local/cargo/git,type=volume"
+	],
+	
+	// Set environment variables
+	"remoteEnv": {
+		"RUST_BACKTRACE": "1",
+		"NODE_ENV": "development"
+	},
+	
+	// Post-create command to set up the environment and verify installations
+	"postCreateCommand": "rustc --version && cargo --version && cargo nextest --version && node --version && npm --version",
+	
+	// Features to add (optional)
+	"features": {},
+	
+	// Use 'forwardPorts' to make a list of ports inside the container available locally
+	"forwardPorts": [],
+	
+	// Use 'postStartCommand' to run commands after the container is started
+	"postStartCommand": ""
+}

@@ -6,6 +6,7 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
+use crate::user_context::UserContextMap;
 use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
 use core::{
     arch::asm,
@@ -48,6 +49,7 @@ pub mod arch;
 pub mod host;
 pub mod mm;
 pub mod mshv;
+pub(crate) mod user_context;
 
 pub mod syscall_entry;
 
@@ -394,6 +396,8 @@ pub struct LinuxKernel<Host: HostInterface> {
     page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
     vtl0_kernel_info: Vtl0KernelInfo,
+    #[allow(dead_code)]
+    user_contexts: UserContextMap,
 }
 
 pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
@@ -475,11 +479,16 @@ impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, H
         litebox::platform::PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
     > {
         let r = match self.punchthrough {
+            PunchthroughSyscall::SetGsBase { addr } => {
+                unsafe { litebox_common_linux::wrgsbase(addr) };
+                Ok(0)
+            }
             PunchthroughSyscall::SetFsBase { addr } => {
                 unsafe { litebox_common_linux::wrfsbase(addr) };
                 Ok(0)
             }
             PunchthroughSyscall::GetFsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
+            PunchthroughSyscall::GetGsBase => Ok(unsafe { litebox_common_linux::rdgsbase() }),
         };
         match r {
             Ok(v) => Ok(v),
@@ -621,6 +630,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             page_table_manager: PageTableManager::new(base_pt),
             vtl1_phys_frame_range: vtl1_range,
             vtl0_kernel_info: Vtl0KernelInfo::new(),
+            user_contexts: UserContextMap::new(),
         }))
     }
 
@@ -940,6 +950,24 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// Enable syscall support in the platform.
     pub fn enable_syscall_support() {
         syscall_entry::init();
+    }
+
+    /// Create a new page table for VTL1 user space.
+    #[allow(dead_code)]
+    pub(crate) fn new_user_page_table(&self) -> mm::PageTable<PAGE_SIZE> {
+        let pt = unsafe { mm::PageTable::new_top_level() };
+        if pt
+            .map_phys_frame_range(
+                self.vtl1_phys_frame_range,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                None,
+            )
+            .is_err()
+        {
+            panic!("Failed to map VTL1 physical memory");
+        }
+
+        pt
     }
 }
 

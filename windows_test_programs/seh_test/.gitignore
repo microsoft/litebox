@@ -1,0 +1,5 @@
+# Compiled Windows executables are build artifacts – do not commit them.
+*.exe
+
+# MSVC-ABI build intermediates (import libs, object files, stubs)
+build_msvc/

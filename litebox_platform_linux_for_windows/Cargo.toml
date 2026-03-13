@@ -1,0 +1,22 @@
+[package]
+name = "litebox_platform_linux_for_windows"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+## Enable pass-through to the host system's real Vulkan ICD loader
+## (`libvulkan.so.1`).  When this feature is active the 62 Vulkan stub
+## functions in `vulkan1.rs` dynamically load the real library via `dlopen`
+## and forward every call to it instead of returning stub error codes.
+## Requires `libvulkan1` (and optionally `mesa-vulkan-drivers`) to be
+## installed on the host at run-time.
+real_vulkan = []
+
+[dependencies]
+litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_shim_windows = { path = "../litebox_shim_windows/", version = "0.1.0" }
+thiserror = { version = "2.0.6", default-features = false }
+libc = "0.2.177"
+
+[lints]
+workspace = true

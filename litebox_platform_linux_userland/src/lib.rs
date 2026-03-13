@@ -274,11 +274,23 @@ impl LinuxUserland {
             file_length: data.len(),
         };
 
+        let end = start + data.len();
         let mut regions = self.cow_regions.write().unwrap();
+
+        // Check for any existing region whose start falls inside the new range.
         assert!(
-            regions.range(start..start + data.len()).next().is_none(),
+            regions.range(start..end).next().is_none(),
             "Attempting to register an overlapping region"
         );
+
+        // Check if the previous region (starting before `start`) extends into [start, end).
+        if let Some((&prev_start, prev_info)) = regions.range(..start).next_back() {
+            assert!(
+                prev_start + prev_info.file_length <= start,
+                "Attempting to register an overlapping region"
+            );
+        }
+
         let old = regions.insert(start, info);
         assert!(old.is_none());
     }
@@ -548,6 +560,9 @@ guest_context_top:
 .globl guest_fsbase
 guest_fsbase:
     .quad 0
+.globl guest_gsbase
+guest_gsbase:
+    .quad 0
 in_guest:
     .byte 0
 .globl interrupt
@@ -581,6 +596,30 @@ fn get_guest_fsbase() -> usize {
     unsafe {
         core::arch::asm! {
             "mov {}, fs:guest_fsbase@tpoff",
+            out(reg) value,
+            options(nostack, preserves_flags)
+        }
+    }
+    value
+}
+
+#[cfg(target_arch = "x86_64")]
+fn set_guest_gsbase(value: usize) {
+    unsafe {
+        core::arch::asm! {
+            "mov fs:guest_gsbase@tpoff, {}",
+            in(reg) value,
+            options(nostack, preserves_flags)
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn get_guest_gsbase() -> usize {
+    let value: usize;
+    unsafe {
+        core::arch::asm! {
+            "mov {}, fs:guest_gsbase@tpoff",
             out(reg) value,
             options(nostack, preserves_flags)
         }
@@ -1518,12 +1557,19 @@ impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
         match self.punchthrough {
             // We swap gs and fs before and after a syscall so at this point guest's fs base is stored in gs
             #[cfg(target_arch = "x86_64")]
+            PunchthroughSyscall::SetGsBase { addr } => {
+                set_guest_gsbase(addr);
+                Ok(0)
+            }
+            #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::SetFsBase { addr } => {
                 set_guest_fsbase(addr);
                 Ok(0)
             }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::GetFsBase => Ok(get_guest_fsbase()),
+            #[cfg(target_arch = "x86_64")]
+            PunchthroughSyscall::GetGsBase => Ok(get_guest_gsbase()),
             #[cfg(target_arch = "x86")]
             PunchthroughSyscall::SetThreadArea { user_desc } => {
                 set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
@@ -2297,7 +2343,7 @@ fn signal_handler_exit_guest(
             guest_context_top = out(reg) guest_context_top,
             options(nostack, preserves_flags)
         };
-        Some(guest_context_top.sub(1))
+        Some(guest_context_top.wrapping_sub(1))
     }
 }
 

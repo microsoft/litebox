@@ -70,11 +70,16 @@ impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, H
         litebox::platform::PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
     > {
         let r = match self.punchthrough {
+            PunchthroughSyscall::SetGsBase { addr } => {
+                unsafe { litebox_common_linux::wrgsbase(addr) };
+                Ok(0)
+            }
             PunchthroughSyscall::SetFsBase { addr } => {
                 unsafe { litebox_common_linux::wrfsbase(addr) };
                 Ok(0)
             }
             PunchthroughSyscall::GetFsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
+            PunchthroughSyscall::GetGsBase => Ok(unsafe { litebox_common_linux::rdgsbase() }),
         };
         match r {
             Ok(v) => Ok(v),

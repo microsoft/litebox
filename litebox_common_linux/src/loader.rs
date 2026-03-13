@@ -309,7 +309,10 @@ impl ElfParsedFile {
         }
 
         // The trampoline code should immediately precede the header.
-        if file_offset + trampoline_size as u64 != header_offset {
+        let expected_header_offset = file_offset
+            .checked_add(trampoline_size as u64)
+            .ok_or(ElfParseError::BadTrampoline)?;
+        if expected_header_offset != header_offset {
             return Err(ElfParseError::BadTrampoline);
         }
 

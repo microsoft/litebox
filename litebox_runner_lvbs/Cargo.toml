@@ -11,6 +11,7 @@ litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 litebox_shim_optee = { path = "../litebox_shim_optee/", version = "0.1.0" }
 spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
+hashbrown = { version = "0.15.2", default-features = false, features = ["inline-more"] }
 once_cell = { version = "1.21.3", default-features = false, features = ["race", "alloc"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]

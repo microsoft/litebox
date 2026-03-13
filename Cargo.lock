@@ -1508,6 +1508,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_platform_linux_for_windows"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "litebox",
+ "litebox_shim_windows",
+ "thiserror",
+]
+
+[[package]]
 name = "litebox_platform_linux_kernel"
 version = "0.1.0"
 dependencies = [
@@ -1632,6 +1642,7 @@ dependencies = [
 name = "litebox_runner_lvbs"
 version = "0.1.0"
 dependencies = [
+ "hashbrown",
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
@@ -1675,6 +1686,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_windows_on_linux_userland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_platform_linux_for_windows",
+ "litebox_shim_windows",
+]
+
+[[package]]
 name = "litebox_shim_linux"
 version = "0.1.0"
 dependencies = [
@@ -1711,6 +1734,17 @@ dependencies = [
  "num_enum",
  "once_cell",
  "spin 0.10.0",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
+name = "litebox_shim_windows"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.9.4",
+ "libc",
+ "litebox",
  "thiserror",
  "zerocopy",
 ]

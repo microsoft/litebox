@@ -511,30 +511,36 @@ impl PollSet {
         for entry in &mut self.entries {
             entry.revents = if entry.fd < 0 {
                 continue;
-            } else if let Some(file) = fds.get_fd(entry.fd.reinterpret_as_unsigned())
-                && let Ok(poll_descriptor) = EpollDescriptor::try_from(files, file)
-            {
-                let observer = if !is_ready && let Some(waker) = waker {
-                    // TODO: a separate allocation is necessary here
-                    // because registering an observer twice with two
-                    // different event masks results in the last one
-                    // replacing the first. If this is changed to
-                    // instead combine the new event mask into the existing
-                    // registration's mask, then we can use a single observer
-                    // for all entries.
-                    let observer = Arc::new(PollEntryObserver(waker.clone()));
-                    let weak = Arc::downgrade(&observer);
-                    entry.observer = Some(observer);
-                    Some(weak as _)
+            } else if let Some(file) = fds.get_fd(entry.fd.reinterpret_as_unsigned()) {
+                if let Ok(poll_descriptor) = EpollDescriptor::try_from(files, file) {
+                    let observer = if is_ready {
+                        // The poll set is already ready, or we have already
+                        // registered the observer for this entry.
+                        None
+                    } else if let Some(waker) = waker {
+                        // TODO: a separate allocation is necessary here
+                        // because registering an observer twice with two
+                        // different event masks results in the last one
+                        // replacing the first. If this is changed to
+                        // instead combine the new event mask into the existing
+                        // registration's mask, then we can use a single observer
+                        // for all entries.
+                        let observer = Arc::new(PollEntryObserver(waker.clone()));
+                        let weak = Arc::downgrade(&observer);
+                        entry.observer = Some(observer);
+                        Some(weak as _)
+                    } else {
+                        // The poll set is already ready, or we have already
+                        // registered the observer for this entry.
+                        None
+                    };
+                    // TODO: add machinery to unregister the observer to avoid leaks.
+                    poll_descriptor
+                        .poll(global, entry.mask, observer)
+                        .unwrap_or(Events::NVAL)
                 } else {
-                    // The poll set is already ready, or we have already
-                    // registered the observer for this entry.
-                    None
-                };
-                // TODO: add machinery to unregister the observer to avoid leaks.
-                poll_descriptor
-                    .poll(global, entry.mask, observer)
-                    .unwrap_or(Events::NVAL)
+                    Events::NVAL
+                }
             } else {
                 Events::NVAL
             };

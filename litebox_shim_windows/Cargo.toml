@@ -1,0 +1,17 @@
+[package]
+name = "litebox_shim_windows"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitflags = "2.9.0"
+libc = "0.2"
+litebox = { path = "../litebox/", version = "0.1.0" }
+thiserror = { version = "2.0.6", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[features]
+default = []
+
+[lints]
+workspace = true

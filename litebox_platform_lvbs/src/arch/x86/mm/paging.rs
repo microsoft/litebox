@@ -646,10 +646,24 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// To this end, we use this function to match the physical frame of the page table contained in each user
     /// context structure with the CR3 value in a system call context (before changing the page table).
     #[allow(clippy::similar_names)]
+    #[allow(dead_code)]
     pub(crate) fn get_physical_frame(&self) -> PhysFrame {
         let p4_va = core::ptr::from_ref::<PageTable>(self.inner.lock().level_4_table());
         let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
         PhysFrame::containing_address(p4_pa)
+    }
+
+    /// Clean up all page table frames except the top-level one (which is handled by `Drop`).
+    ///
+    /// # Safety
+    /// The caller is expected to unmap all non-page-table pages before calling this function.
+    /// Also, the caller must ensure no page table frame is shared with other page tables.
+    #[allow(dead_code)]
+    pub(crate) unsafe fn clean_up(&self) {
+        let mut allocator = PageTableAllocator::<M>::new();
+        unsafe {
+            self.inner.lock().clean_up(&mut allocator);
+        }
     }
 }
 

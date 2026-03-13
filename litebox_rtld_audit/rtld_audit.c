@@ -146,9 +146,10 @@ static uint64_t read_u64(const void *p) {
 }
 
 static size_t align_up(size_t val, size_t align) {
-  size_t result = (val + align - 1) & ~(align - 1);
-  // Check for overflow (result < val means we wrapped)
-  if (result < val) return (size_t)-1;
+  if (align == 0) return (size_t)-1;
+  size_t max_addend = align - 1;
+  if (val > (size_t)-1 - max_addend) return (size_t)-1;
+  size_t result = (val + max_addend) & ~max_addend;
   return result;
 }
 
@@ -201,7 +202,12 @@ int parse_object(const struct link_map *map) {
     }
   }
   max_addr = align_up(max_addr, 0x1000);
-  void *trampoline_addr = (void *)map->l_addr + max_addr;
+  if (max_addr == (size_t)-1 ||
+      (unsigned long)map->l_addr > (size_t)-1 - max_addr) {
+    syscall_print("[audit] invalid trampoline address\n", 36);
+    return 1;
+  }
+  void *trampoline_addr = (void *)((unsigned long)map->l_addr + max_addr);
   // The trampoline code has the syscall entry point at offset 0.
   syscall_entry = (syscall_stub_t)read_u64(trampoline_addr);
   if (syscall_entry == 0) {

@@ -23,10 +23,12 @@ pub(crate) use x86_64::structures::paging::mapper::{MappedFrame, TranslateResult
 
 /// Get the APIC ID of the current core.
 #[inline]
+#[allow(unused_unsafe)]
 pub fn get_core_id() -> usize {
     const CPU_VERSION_INFO: u32 = 1;
 
-    let result = cpuid_count(CPU_VERSION_INFO, 0x0);
+    // SAFETY: cpuid is safe to call on x86_64
+    let result = unsafe { cpuid_count(CPU_VERSION_INFO, 0x0) };
     let apic_id = (result.ebx >> 24) & 0xff;
 
     apic_id as usize

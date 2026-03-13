@@ -31,8 +31,7 @@ jobs:
       - name: Ensure that the main branch is fetched
         run: git fetch origin main:main
       - name: Set up Rust
-        run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update
+        uses: ./.github/actions/setup-rust
       - name: Set up cargo-semver-checks
         run: |
           curl -L --proto '=https' --tlsv1.2 -sSf https://github.com/obi1kenobi/cargo-semver-checks/releases/latest/download/cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz | tar xzvf -

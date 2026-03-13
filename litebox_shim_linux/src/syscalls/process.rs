@@ -395,6 +395,19 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<(), Errno> {
         match arg {
             #[cfg(target_arch = "x86_64")]
+            ArchPrctlArg::SetGs(addr) => {
+                let punchthrough = litebox_common_linux::PunchthroughSyscall::SetGsBase { addr };
+                let token = self
+                    .global
+                    .platform
+                    .get_punchthrough_token_for(punchthrough)
+                    .expect("Failed to get punchthrough token for SET_GS");
+                token.execute().map(|_| ()).map_err(|e| match e {
+                    litebox::platform::PunchthroughError::Failure(errno) => errno,
+                    _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+                })
+            }
+            #[cfg(target_arch = "x86_64")]
             ArchPrctlArg::SetFs(addr) => {
                 let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr };
                 let token = self
@@ -420,6 +433,21 @@ impl<FS: ShimFS> Task<FS> {
                     _ => unimplemented!("Unsupported punchthrough error {:?}", e),
                 })?;
                 addr.write_at_offset(0, fsbase).ok_or(Errno::EFAULT)?;
+                Ok(())
+            }
+            #[cfg(target_arch = "x86_64")]
+            ArchPrctlArg::GetGs(addr) => {
+                let punchthrough = litebox_common_linux::PunchthroughSyscall::GetGsBase;
+                let token = self
+                    .global
+                    .platform
+                    .get_punchthrough_token_for(punchthrough)
+                    .expect("Failed to get punchthrough token for GET_GS");
+                let gsbase = token.execute().map_err(|e| match e {
+                    litebox::platform::PunchthroughError::Failure(errno) => errno,
+                    _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+                })?;
+                addr.write_at_offset(0, gsbase).ok_or(Errno::EFAULT)?;
                 Ok(())
             }
             ArchPrctlArg::CETStatus | ArchPrctlArg::CETDisable | ArchPrctlArg::CETLock => {
@@ -1612,6 +1640,43 @@ mod tests {
         let ptr: crate::MutPtr<u8> = crate::MutPtr::from_usize(old_fs_base);
         task.sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize()))
             .expect("Failed to restore FS base");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    fn test_arch_prctl_gs() {
+        use crate::{MutPtr, syscalls::tests::init_platform};
+        use core::mem::MaybeUninit;
+        use litebox::platform::RawConstPointer;
+        use litebox_common_linux::ArchPrctlArg;
+
+        let task = init_platform(None);
+
+        // Save old GS base
+        let mut old_gs_base = MaybeUninit::<usize>::uninit();
+        let ptr = MutPtr::from_ptr(old_gs_base.as_mut_ptr());
+        task.sys_arch_prctl(ArchPrctlArg::GetGs(ptr))
+            .expect("Failed to get GS base");
+        let old_gs_base = unsafe { old_gs_base.assume_init() };
+
+        // Set new GS base
+        let mut new_gs_base: [u8; 16] = [0; 16];
+        let ptr = MutPtr::from_ptr(new_gs_base.as_mut_ptr());
+        task.sys_arch_prctl(ArchPrctlArg::SetGs(ptr.as_usize()))
+            .expect("Failed to set GS base");
+
+        // Verify new GS base
+        let mut current_gs_base = MaybeUninit::<usize>::uninit();
+        let ptr = MutPtr::from_ptr(current_gs_base.as_mut_ptr());
+        task.sys_arch_prctl(ArchPrctlArg::GetGs(ptr))
+            .expect("Failed to get GS base");
+        let current_gs_base = unsafe { current_gs_base.assume_init() };
+        assert_eq!(current_gs_base, new_gs_base.as_ptr() as usize);
+
+        // Restore old GS base
+        let ptr: crate::MutPtr<u8> = crate::MutPtr::from_usize(old_gs_base);
+        task.sys_arch_prctl(ArchPrctlArg::SetGs(ptr.as_usize()))
+            .expect("Failed to restore GS base");
     }
 
     #[test]

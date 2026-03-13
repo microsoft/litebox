@@ -1,0 +1,86 @@
+name: Sync Branch
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: sync-branch
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Sync sync-branch with upstream/main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebase sync-branch on upstream/main
+        env:
+          # Prevent git from opening an interactive editor at any point
+          GIT_EDITOR: "true"
+          GIT_SEQUENCE_EDITOR: "true"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/microsoft/litebox.git \
+            || git remote set-url upstream https://github.com/microsoft/litebox.git
+          git fetch upstream main
+          git checkout -B sync-branch origin/main
+
+          # Start the rebase; capture exit code without failing the shell immediately
+          git rebase upstream/main
+          REBASE_STATUS=$?
+
+          # Auto-resolve any conflicts that arise, commit by commit.
+          # Each loop iteration advances the rebase by one commit (--continue or --skip),
+          # so 200 gives headroom for a branch with up to ~200 conflicting commits.
+          MAX_ITER=200
+          ITER=0
+          while [ "$REBASE_STATUS" -ne 0 ] && [ "$ITER" -lt "$MAX_ITER" ]; do
+            ITER=$((ITER + 1))
+
+            # Verify we are actually inside a rebase operation
+            if [ ! -d .git/rebase-merge ] && [ ! -d .git/rebase-apply ]; then
+              echo "::error::Rebase failed with no rebase state present. Unexpected error."
+              exit 1
+            fi
+
+            # Collect files still showing as unmerged
+            CONFLICTED=$(git diff --name-only --diff-filter=U)
+
+            if [ -n "$CONFLICTED" ]; then
+              # Accept the local (rebased-commit / "theirs") version for every conflicting file.
+              # Rebase terminology: --theirs = the incoming local commit being replayed;
+              #                     --ours   = the upstream base already applied.
+              # Using --theirs therefore preserves the fork's local changes over upstream.
+              # Iterate line-by-line so filenames with spaces are handled correctly.
+              while IFS= read -r conflicted_file; do
+                git checkout --theirs -- "$conflicted_file"
+              done <<< "$CONFLICTED"
+              git add -A
+              git rebase --continue
+              REBASE_STATUS=$?
+            else
+              # No unmerged files but the rebase is still paused (e.g. empty commit).
+              # Skip the now-empty commit and move on.
+              git rebase --skip
+              REBASE_STATUS=$?
+            fi
+          done
+
+          if [ "$ITER" -ge "$MAX_ITER" ]; then
+            git rebase --abort
+            echo "::error::Conflict resolution exceeded $MAX_ITER iterations — aborting rebase."
+            exit 1
+          fi
+
+          git push origin sync-branch --force-with-lease=sync-branch

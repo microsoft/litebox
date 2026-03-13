@@ -1,0 +1,40 @@
+# Cargo configuration for faster builds and better development experience
+#
+# This configuration provides optional optimizations that can significantly
+# speed up compilation and linking times for local development.
+
+# =============================================================================
+# FAST LINKER CONFIGURATION (OPTIONAL BUT RECOMMENDED)
+# =============================================================================
+# Using a faster linker can reduce link times by 50-70% on large projects.
+# Uncomment ONE of the options below based on what you have installed:
+
+# Option 1: mold - Fastest linker for Linux (HIGHLY RECOMMENDED)
+# Install: sudo apt install mold  or  cargo install --locked mold
+# Typical speedup: 3-5x faster than GNU ld
+# [target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# Option 2: lld - Fast cross-platform linker from LLVM
+# Install: sudo apt install lld
+# Typical speedup: 2-3x faster than GNU ld
+# [target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# Option 3: System default linker (currently active)
+# No configuration needed - this is what you're using now
+
+# =============================================================================
+# CARGO ALIASES FOR COMMON TASKS
+# =============================================================================
+[alias]
+# Quick workspace check (excludes packages requiring special toolchains)
+check-fast = "check --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp"
+
+# Build only default workspace members (faster than full workspace)
+build-default = "build"
+
+# Run tests with nextest if available (much faster than cargo test)
+test-fast = "nextest run"

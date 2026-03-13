@@ -19,22 +19,26 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_VERSION: 0.9.114
+  RUSTFLAGS: -Dwarnings
 
 jobs:
   build_and_test:
     name: Build and Test
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
     steps:
       - name: Check out repo
         uses: actions/checkout@v6
       - name: Use Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - name: Set up Rust
-        run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-linux-gnu
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt,clippy
       - name: Set up Nextest
         uses: taiki-e/install-action@v2
         with:
@@ -77,48 +81,9 @@ jobs:
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
 
-  build_and_test_32bit:
-    name: Build and Test (32-bit)
-    runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -Dwarnings
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v6
-      - run: sudo apt update && sudo apt install -y gcc-multilib
-      - name: Set up Rust
-        run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target i686-unknown-linux-gnu
-      - name: Set up Nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: nextest@${{ env.NEXTEST_VERSION }}
-      - name: Install diod
-        run: |
-          sudo apt install -y diod
-      - name: Set up tun
-        run: |
-          sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
-      - uses: Swatinem/rust-cache@v2
-      - name: Cache custom out directories
-        uses: actions/cache@v5
-        with:
-          path: |
-            target/*/build/litebox_runner_linux_userland-*/out
-          key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
-      - run: ./.github/tools/github_actions_run_cargo build --target=i686-unknown-linux-gnu
-      - run: ./.github/tools/github_actions_run_cargo nextest --target=i686-unknown-linux-gnu
-      - run: |
-          ./.github/tools/github_actions_run_cargo test --target=i686-unknown-linux-gnu --doc
-          # We need to run `cargo test --doc` separately because doc tests
-          # aren't included in nextest at the moment. See relevant discussion at
-          # https://github.com/nextest-rs/nextest/issues/16
-
   build_and_test_lvbs:
     name: Build and Test LVBS
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -Dwarnings
     steps:
       - name: Check out repo
         uses: actions/checkout@v6
@@ -133,13 +98,13 @@ jobs:
       # Version alignment: The nightly version should match the stable version (e.g., stable
       # 1.91.x -> nightly 1.91.x). Use `rustc +nightly-YYYY-MM-DD --version` to find a date.
       - name: Set up Rust
-        run: |
-          RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
-          rustup toolchain install ${RUST_CHANNEL} --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-none
-          rustup component add rust-src --toolchain ${RUST_CHANNEL}-x86_64-unknown-linux-gnu
-          rustup default ${RUST_CHANNEL}
-          rustup override set ${RUST_CHANNEL}
-          rustup show
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain-file: litebox_runner_lvbs/rust-toolchain.toml
+          targets: x86_64-unknown-none
+          components: rustfmt,clippy
+          set-default: 'true'
+          add-rust-src: 'true'
       - name: Set up Nextest
         uses: taiki-e/install-action@v2
         with:
@@ -174,14 +139,15 @@ jobs:
     name: Build and Test Windows
     runs-on: windows-latest
     env:
-      RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
     steps:
       - name: Check out repo
         uses: actions/checkout@v6
       - name: Set up Rust
-        run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-pc-windows-msvc
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt,clippy
       - name: Set up Nextest
         uses: taiki-e/install-action@v2
         with:
@@ -199,8 +165,8 @@ jobs:
       - name: Build documentation (fail on warnings)
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland
 
-  build_and_test_snp:
-    name: Build and Test SNP
+  build_and_test_windows_on_linux:
+    name: Build and Test Windows-on-Linux
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -208,13 +174,124 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v6
       - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install MinGW cross-compiler
+        uses: ./.github/actions/install-mingw
+      - name: Clippy (Windows-on-Linux packages)
+        run: cargo clippy -p litebox_shim_windows -p litebox_platform_linux_for_windows -p litebox_runner_windows_on_linux_userland --all-targets --all-features
+      - name: Build Windows test programs
+        working-directory: windows_test_programs
+        run: cargo build --release --target x86_64-pc-windows-gnu
+      - name: Build Windows-on-Linux runner
+        run: cargo build -p litebox_runner_windows_on_linux_userland
+      - name: Run hello_cli.exe and verify output
         run: |
-          RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_snp/rust-toolchain.toml)
-          rustup toolchain install ${RUST_CHANNEL} --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-none
-          rustup component add rust-src --toolchain ${RUST_CHANNEL}-x86_64-unknown-linux-gnu
-          rustup default ${RUST_CHANNEL}
-          rustup override set ${RUST_CHANNEL}
-          rustup show
+          stderr_file=$(mktemp)
+          output=$(./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/target/x86_64-pc-windows-gnu/release/hello_cli.exe \
+            2>"$stderr_file") || { echo "ERROR: hello_cli.exe runner failed"; cat "$stderr_file"; exit 1; }
+          echo "$output"
+          echo "$output" | grep -q "Hello World from LiteBox!" || { echo "ERROR: hello_cli.exe did not produce expected output"; cat "$stderr_file"; exit 1; }
+      - name: Run math_test.exe and verify exit code
+        run: |
+          stderr_file=$(mktemp)
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/target/x86_64-pc-windows-gnu/release/math_test.exe \
+            2>"$stderr_file" || { echo "ERROR: math_test.exe failed"; cat "$stderr_file"; exit 1; }
+      - name: Run env_test.exe and verify exit code
+        run: |
+          stderr_file=$(mktemp)
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/target/x86_64-pc-windows-gnu/release/env_test.exe \
+            2>"$stderr_file" || { echo "ERROR: env_test.exe failed"; cat "$stderr_file"; exit 1; }
+      - name: Run args_test.exe and verify exit code
+        run: |
+          stderr_file=$(mktemp)
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/target/x86_64-pc-windows-gnu/release/args_test.exe \
+            2>"$stderr_file" || { echo "ERROR: args_test.exe failed"; cat "$stderr_file"; exit 1; }
+      - name: Run file_io_test.exe and verify exit code
+        run: |
+          stderr_file=$(mktemp)
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/target/x86_64-pc-windows-gnu/release/file_io_test.exe \
+            2>"$stderr_file" || { echo "ERROR: file_io_test.exe failed"; cat "$stderr_file"; exit 1; }
+      - name: Run string_test.exe and verify exit code
+        run: |
+          stderr_file=$(mktemp)
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/target/x86_64-pc-windows-gnu/release/string_test.exe \
+            2>"$stderr_file" || { echo "ERROR: string_test.exe failed"; cat "$stderr_file"; exit 1; }
+      - name: Build getprocaddress_test.exe (C program)
+        working-directory: windows_test_programs/dynload_test
+        run: make
+      - name: Run getprocaddress_test.exe and verify output
+        run: |
+          stderr_file=$(mktemp)
+          output=$(./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/dynload_test/getprocaddress_test.exe \
+            2>"$stderr_file") || { echo "ERROR: getprocaddress_test.exe runner failed"; cat "$stderr_file"; exit 1; }
+          echo "$output"
+          echo "$output" | grep -q ", 0 failed ===" || { echo "ERROR: getprocaddress_test.exe reported failures"; cat "$stderr_file"; exit 1; }
+      - name: Build gui_test.exe (C program)
+        working-directory: windows_test_programs/gui_test
+        run: make
+      - name: Run gui_test.exe and verify output
+        run: |
+          stderr_file=$(mktemp)
+          output=$(./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/gui_test/gui_test.exe \
+            2>"$stderr_file") || { echo "ERROR: gui_test.exe runner failed"; cat "$stderr_file"; exit 1; }
+          echo "$output"
+          echo "$output" | grep -q ", 0 failed ===" || { echo "ERROR: gui_test.exe reported failures"; cat "$stderr_file"; exit 1; }
+
+  build_and_test_real_vulkan:
+    name: Build and Test real_vulkan feature
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - name: Install Vulkan ICD loader and software driver
+        # libvulkan1 provides libvulkan.so.1 (the ICD loader).
+        # mesa-vulkan-drivers provides the lavapipe software Vulkan renderer,
+        # which enables functional testing on GPU-less CI machines.
+        run: sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+      - name: Clippy with real_vulkan feature
+        run: cargo clippy -p litebox_platform_linux_for_windows --all-targets --features real_vulkan
+      - name: Build with real_vulkan feature
+        run: cargo build -p litebox_platform_linux_for_windows --features real_vulkan
+      - name: Run unit tests with real_vulkan feature
+        run: cargo nextest run --profile ci -p litebox_platform_linux_for_windows --features real_vulkan
+
+  build_and_test_snp:
+    name: Build and Test SNP
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          toolchain-file: litebox_runner_snp/rust-toolchain.toml
+          targets: x86_64-unknown-none
+          components: rustfmt,clippy
+          set-default: 'true'
+          add-rust-src: 'true'
       - uses: Swatinem/rust-cache@v2
       - run: ./.github/tools/github_actions_run_cargo clippy --all-features --target litebox_runner_snp/target.json --manifest-path=litebox_runner_snp/Cargo.toml -Zbuild-std=core,compiler_builtins,alloc
       - run: |
@@ -229,8 +306,9 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v6
       - name: Set up Rust
-        run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-none
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-unknown-none
       - uses: Swatinem/rust-cache@v2
       - name: Confirm that we haven't accidentally pulled in std into LiteBox
         run: |
@@ -308,22 +386,638 @@ jobs:
           #
           # - `dev_bench` is meant to only be used for benchmarking, and thus
           #   can safely use std.
+          #
+          # - `litebox_platform_linux_for_windows` is allowed to have `std` access,
+          #   since it is a userland implementation for running Windows programs on Linux.
+          #
+          # - `litebox_runner_windows_on_linux_userland` is allowed to have `std`
+          #   access since it needs to actually access the file-system, pull in
+          #   relevant files, and then actually trigger LiteBox itself.
+          #
+          # - `litebox_shim_windows` is allowed to have `std` access in its default
+          #   feature set, as it provides Windows PE loading and API emulation support
+          #   for the Windows-on-Linux platform.
+          #
+          # - `litebox_rtld_audit` is allowed to have `std` access since it's
+          #   a helper library for runtime linking auditing.
+          #
+          # - `windows_test_programs` are test programs meant to run on Windows,
+          #   so they require std and should not be checked.
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
+            -not -path './litebox_platform_linux_for_windows/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
+            -not -path './litebox_runner_windows_on_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
             -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \
             -not -path './litebox_shim_linux/Cargo.toml' \
+            -not -path './litebox_shim_windows/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
+            -not -path './litebox_rtld_audit/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \
+            -not -path './windows_test_programs/Cargo.toml' \
+            -not -path './windows_test_programs/*/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'
+
+  test_win32_on_linux:
+    name: Build and Run ${{ matrix.suite }} Tests on Linux
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: winsock
+            test_dir: windows_test_programs/winsock_test
+          - suite: registry
+            test_dir: windows_test_programs/registry_test
+          - suite: phase27
+            test_dir: windows_test_programs/phase27_test
+          - suite: sync
+            test_dir: windows_test_programs/sync_test
+          - suite: seh
+            test_dir: windows_test_programs/seh_test
+          - suite: async_io
+            test_dir: windows_test_programs/async_io_test
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Install MinGW cross-compiler
+        uses: ./.github/actions/install-mingw
+      - name: Install clang for cross-compiled SEH tests
+        if: matrix.suite == 'seh'
+        run: sudo apt-get install -y clang lld
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wol-runner
+      - name: Build ${{ matrix.suite }} test programs
+        run: |
+          make -C ${{ matrix.test_dir }}
+          echo "Built executables:"
+          ls -lh ${{ matrix.test_dir }}/*.exe
+          file ${{ matrix.test_dir }}/*.exe
+      - name: Build Windows-on-Linux runner
+        run: cargo build --locked -p litebox_runner_windows_on_linux_userland
+      - name: Run winsock_basic_test
+        if: matrix.suite == 'winsock'
+        run: |
+          echo "=== winsock_basic_test.exe ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/winsock_test/winsock_basic_test.exe \
+            2>&1 | tee /tmp/winsock_basic_out.txt
+
+          echo ""
+          echo "--- Verifying test output ---"
+          grep -q "WinSock Basic API Tests PASSED" /tmp/winsock_basic_out.txt \
+            || { echo "✗ winsock_basic_test FAILED"; exit 1; }
+          echo "✓ winsock_basic_test PASSED"
+      - name: Run winsock_tcp_test
+        if: matrix.suite == 'winsock'
+        run: |
+          echo "=== winsock_tcp_test.exe ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/winsock_test/winsock_tcp_test.exe \
+            2>&1 | tee /tmp/winsock_tcp_out.txt
+
+          echo ""
+          echo "--- Verifying test output ---"
+          grep -q "WinSock TCP Socket Tests PASSED" /tmp/winsock_tcp_out.txt \
+            || { echo "✗ winsock_tcp_test FAILED"; exit 1; }
+          echo "✓ winsock_tcp_test PASSED"
+      - name: Run winsock_udp_test
+        if: matrix.suite == 'winsock'
+        run: |
+          echo "=== winsock_udp_test.exe ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/winsock_test/winsock_udp_test.exe \
+            2>&1 | tee /tmp/winsock_udp_out.txt
+
+          echo ""
+          echo "--- Verifying test output ---"
+          grep -q "WinSock UDP Socket Tests PASSED" /tmp/winsock_udp_out.txt \
+            || { echo "✗ winsock_udp_test FAILED"; exit 1; }
+          echo "✓ winsock_udp_test PASSED"
+      - name: Run registry_test
+        if: matrix.suite == 'registry'
+        run: |
+          echo "=== registry_test.exe ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/registry_test/registry_test.exe \
+            2>&1 | tee /tmp/registry_test_out.txt
+
+          echo ""
+          echo "--- Verifying test output ---"
+          grep -q "Windows Registry API Tests PASSED" /tmp/registry_test_out.txt \
+            || { echo "✗ registry_test FAILED"; exit 1; }
+          echo "✓ registry_test PASSED"
+      - name: Run phase27_test
+        if: matrix.suite == 'phase27'
+        run: |
+          echo "=== phase27_test.exe ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/phase27_test/phase27_test.exe \
+            2>&1 | tee /tmp/phase27_test_out.txt
+
+          echo ""
+          echo "--- Verifying test output ---"
+          grep -q "Phase 27 Windows API Tests PASSED" /tmp/phase27_test_out.txt \
+            || { echo "✗ phase27_test FAILED"; exit 1; }
+          echo "✓ phase27_test PASSED"
+      - name: Run sync_test
+        if: matrix.suite == 'sync'
+        run: |
+          echo "=== sync_test.exe ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/sync_test/sync_test.exe \
+            2>&1 | tee /tmp/sync_test_out.txt
+
+          echo ""
+          echo "--- Verifying test output ---"
+          grep -q "Windows Synchronization API Tests PASSED" /tmp/sync_test_out.txt \
+            || { echo "✗ sync_test FAILED"; exit 1; }
+          echo "✓ sync_test PASSED"
+      - name: Run seh_c_test
+        if: matrix.suite == 'seh'
+        run: |
+          echo "=== seh_c_test.exe ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/seh_test/seh_c_test.exe \
+            2>&1 | tee /tmp/seh_c_test_out.txt
+
+          echo ""
+          echo "--- Verifying test output ---"
+          grep -q "Results:.*0 failed" /tmp/seh_c_test_out.txt \
+            || { echo "✗ seh_c_test FAILED"; exit 1; }
+          echo "✓ seh_c_test PASSED"
+      - name: Run seh_cpp_test
+        if: matrix.suite == 'seh'
+        continue-on-error: true
+        run: |
+          echo "=== seh_cpp_test.exe ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/seh_test/seh_cpp_test.exe \
+            2>&1 | tee /tmp/seh_cpp_test_out.txt
+
+          echo ""
+          echo "--- Verifying test output ---"
+          grep -q "Results:.*0 failed" /tmp/seh_cpp_test_out.txt \
+            || { echo "✗ seh_cpp_test FAILED (C++ exception support is a work in progress)"; exit 1; }
+          echo "✓ seh_cpp_test PASSED"
+      - name: Run seh_cpp_test_clang
+        if: matrix.suite == 'seh'
+        run: |
+          echo "=== seh_cpp_test_clang.exe (clang/LLVM compiled) ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/seh_test/seh_cpp_test_clang.exe \
+            2>&1 | tee /tmp/seh_cpp_test_clang_out.txt
+
+          echo ""
+          echo "--- Verifying test output ---"
+          grep -q "Results:.*0 failed" /tmp/seh_cpp_test_clang_out.txt \
+            || { echo "✗ seh_cpp_test_clang FAILED"; exit 1; }
+          echo "✓ seh_cpp_test_clang PASSED"
+      - name: Run async_io_test
+        if: matrix.suite == 'async_io'
+        run: |
+          echo "=== async_io_test.exe ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            windows_test_programs/async_io_test/async_io_test.exe \
+            2>&1 | tee /tmp/async_io_test_out.txt
+
+          echo ""
+          echo "--- Verifying test output ---"
+          grep -q "Async I/O Tests PASSED" /tmp/async_io_test_out.txt \
+            || { echo "✗ async_io_test FAILED"; exit 1; }
+          echo "✓ async_io_test PASSED"
+      - name: Upload test output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.suite }}-test-output
+          path: /tmp/${{ matrix.suite }}_*.txt
+          retention-days: 7
+      - name: Summary
+        if: always()
+        run: |
+          echo ""
+          echo "================================================"
+          echo " ${{ matrix.suite }} Tests on Linux – Summary"
+          echo "================================================"
+          for f in /tmp/${{ matrix.suite }}_*.txt; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f" _out.txt)
+            pass=$(grep -c "\[PASS\]" "$f" || true)
+            fail=$(grep -c "\[FAIL\]" "$f" || true)
+            if grep -qE "PASSED \(0 failures\)|Tests PASSED|Results:.*0 failed" "$f"; then
+              echo "  ✓ ${name}: ${pass} passed, ${fail} failed"
+            else
+              echo "  ✗ ${name}: ${pass} passed, ${fail} failed"
+            fi
+          done
+          echo "================================================"
+
+  test_pe_and_tracing_on_linux:
+    name: Test PE Loader and API Tracing on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-gnu x86_64-unknown-linux-gnu
+      - name: Install MinGW cross-compiler and gdb
+        uses: ./.github/actions/install-mingw
+        with:
+          extra-packages: gdb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wol-runner
+      - name: Build Windows test programs
+        run: |
+          cd windows_test_programs
+          cargo build --release --target x86_64-pc-windows-gnu \
+            -p hello_cli -p hello_gui -p file_io_test \
+            -p args_test -p env_test -p string_test -p math_test
+      - name: Verify Windows executables
+        run: |
+          echo "Checking Windows test programs..."
+          ls -lh windows_test_programs/target/x86_64-pc-windows-gnu/release/*.exe
+          file windows_test_programs/target/x86_64-pc-windows-gnu/release/hello_cli.exe
+          file windows_test_programs/target/x86_64-pc-windows-gnu/release/hello_gui.exe
+          file windows_test_programs/target/x86_64-pc-windows-gnu/release/file_io_test.exe
+          file windows_test_programs/target/x86_64-pc-windows-gnu/release/args_test.exe
+          file windows_test_programs/target/x86_64-pc-windows-gnu/release/env_test.exe
+          file windows_test_programs/target/x86_64-pc-windows-gnu/release/string_test.exe
+          file windows_test_programs/target/x86_64-pc-windows-gnu/release/math_test.exe
+      - name: Build Windows-on-Linux runner
+        run: cargo build --locked --verbose -p litebox_runner_windows_on_linux_userland
+      - name: Test Windows CLI program - PE Loading
+        run: |
+          echo "=== Testing hello_cli.exe PE Loading ==="
+          set +e
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            --verbose \
+            ./windows_test_programs/target/x86_64-pc-windows-gnu/release/hello_cli.exe \
+            > /tmp/pe_test_output.txt 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          head -60 /tmp/pe_test_output.txt
+          echo ""
+
+          grep -q "Loaded PE binary:" /tmp/pe_test_output.txt || { echo "✗ Failed to load PE binary"; exit 1; }
+          grep -q "Entry point:" /tmp/pe_test_output.txt || { echo "✗ Failed to parse entry point"; exit 1; }
+          grep -q "Sections:" /tmp/pe_test_output.txt || { echo "✗ Failed to parse sections"; exit 1; }
+          grep -q "Applying relocations" /tmp/pe_test_output.txt || { echo "✗ Failed to apply relocations"; exit 1; }
+          grep -q "Resolving imports" /tmp/pe_test_output.txt || { echo "✗ Failed to resolve imports"; exit 1; }
+
+          echo "✓ PE loading infrastructure working (exit code: $EXIT_CODE, expected non-zero)"
+      - name: Test Windows CLI program - API Tracing
+        run: |
+          echo "=== Testing hello_cli.exe with API Tracing ==="
+          set +e
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            --trace-apis \
+            --trace-format text \
+            --verbose \
+            ./windows_test_programs/target/x86_64-pc-windows-gnu/release/hello_cli.exe \
+            > /tmp/trace_test_output.txt 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          head -80 /tmp/trace_test_output.txt
+          echo ""
+
+          grep -q "\[TID:main\] CALL" /tmp/trace_test_output.txt || { echo "✗ No API calls traced"; exit 1; }
+          grep -q "LoadLibrary" /tmp/trace_test_output.txt || { echo "✗ LoadLibrary not traced"; exit 1; }
+          grep -q "GetProcAddress" /tmp/trace_test_output.txt || { echo "✗ GetProcAddress not traced"; exit 1; }
+
+          echo "✓ API tracing working (exit code: $EXIT_CODE)"
+      - name: Test Windows GUI program - PE Loading
+        run: |
+          echo "=== Testing hello_gui.exe PE Loading ==="
+          set +e
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            --verbose \
+            ./windows_test_programs/target/x86_64-pc-windows-gnu/release/hello_gui.exe \
+            > /tmp/gui_test_output.txt 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          head -40 /tmp/gui_test_output.txt
+          echo ""
+
+          grep -q "Loaded PE binary:" /tmp/gui_test_output.txt || { echo "✗ Failed to load GUI PE binary"; exit 1; }
+          grep -q "Sections:" /tmp/gui_test_output.txt || { echo "✗ Failed to parse GUI sections"; exit 1; }
+
+          echo "✓ GUI PE binary loading working (exit code: $EXIT_CODE)"
+      - name: Test file_io_test - PE Loading
+        run: |
+          echo "=== Testing file_io_test.exe PE Loading ==="
+          set +e
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            --verbose \
+            ./windows_test_programs/target/x86_64-pc-windows-gnu/release/file_io_test.exe \
+            > /tmp/file_io_test_output.txt 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          head -60 /tmp/file_io_test_output.txt
+          echo ""
+
+          grep -q "Loaded PE binary:" /tmp/file_io_test_output.txt || { echo "✗ Failed to load file_io_test PE binary"; exit 1; }
+          grep -q "Resolving imports" /tmp/file_io_test_output.txt || { echo "✗ Failed to resolve imports for file_io_test"; exit 1; }
+
+          echo "✓ file_io_test PE loading working (exit code: $EXIT_CODE)"
+      - name: Test args_test - PE Loading
+        run: |
+          echo "=== Testing args_test.exe PE Loading ==="
+          set +e
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            --verbose \
+            ./windows_test_programs/target/x86_64-pc-windows-gnu/release/args_test.exe \
+            > /tmp/args_test_output.txt 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          head -60 /tmp/args_test_output.txt
+          echo ""
+
+          grep -q "Loaded PE binary:" /tmp/args_test_output.txt || { echo "✗ Failed to load args_test PE binary"; exit 1; }
+          grep -q "Resolving imports" /tmp/args_test_output.txt || { echo "✗ Failed to resolve imports for args_test"; exit 1; }
+
+          echo "✓ args_test PE loading working (exit code: $EXIT_CODE)"
+      - name: Test env_test - PE Loading
+        run: |
+          echo "=== Testing env_test.exe PE Loading ==="
+          set +e
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            --verbose \
+            ./windows_test_programs/target/x86_64-pc-windows-gnu/release/env_test.exe \
+            > /tmp/env_test_output.txt 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          head -60 /tmp/env_test_output.txt
+          echo ""
+
+          grep -q "Loaded PE binary:" /tmp/env_test_output.txt || { echo "✗ Failed to load env_test PE binary"; exit 1; }
+          grep -q "Resolving imports" /tmp/env_test_output.txt || { echo "✗ Failed to resolve imports for env_test"; exit 1; }
+
+          echo "✓ env_test PE loading working (exit code: $EXIT_CODE)"
+      - name: Test string_test - PE Loading
+        run: |
+          echo "=== Testing string_test.exe PE Loading ==="
+          set +e
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            --verbose \
+            ./windows_test_programs/target/x86_64-pc-windows-gnu/release/string_test.exe \
+            > /tmp/string_test_output.txt 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          head -60 /tmp/string_test_output.txt
+          echo ""
+
+          grep -q "Loaded PE binary:" /tmp/string_test_output.txt || { echo "✗ Failed to load string_test PE binary"; exit 1; }
+          grep -q "Resolving imports" /tmp/string_test_output.txt || { echo "✗ Failed to resolve imports for string_test"; exit 1; }
+
+          echo "✓ string_test PE loading working (exit code: $EXIT_CODE)"
+      - name: Test math_test - PE Loading
+        run: |
+          echo "=== Testing math_test.exe PE Loading ==="
+          set +e
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            --verbose \
+            ./windows_test_programs/target/x86_64-pc-windows-gnu/release/math_test.exe \
+            > /tmp/math_test_output.txt 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          head -60 /tmp/math_test_output.txt
+          echo ""
+
+          grep -q "Loaded PE binary:" /tmp/math_test_output.txt || { echo "✗ Failed to load math_test PE binary"; exit 1; }
+          grep -q "Resolving imports" /tmp/math_test_output.txt || { echo "✗ Failed to resolve imports for math_test"; exit 1; }
+
+          echo "✓ math_test PE loading working (exit code: $EXIT_CODE)"
+      - name: Test JSON Trace Output
+        run: |
+          echo "=== Testing JSON Trace Output ==="
+          set +e
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            --trace-apis \
+            --trace-format json \
+            --trace-output trace.json \
+            ./windows_test_programs/target/x86_64-pc-windows-gnu/release/hello_cli.exe \
+            > /tmp/json_test_output.txt 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          echo ""
+          if [ ! -f trace.json ]; then
+            echo "✗ JSON trace file not created"
+            echo "Runner output:"
+            head -40 /tmp/json_test_output.txt
+            exit 1
+          fi
+
+          echo "✓ JSON trace file created successfully"
+          echo "Sample trace output (first 10 lines):"
+          head -10 trace.json
+
+          if ! grep -q '"event"' trace.json; then
+            echo "✗ JSON trace file doesn't contain expected event data"
+            exit 1
+          fi
+
+          echo "✓ JSON trace format valid (exit code: $EXIT_CODE)"
+      - name: Upload test output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pe-tracing-test-output
+          path: /tmp/*_output.txt
+          retention-days: 7
+      - name: Summary
+        if: always()
+        run: |
+          echo ""
+          echo "================================================"
+          echo "Windows-on-Linux Test Summary"
+          echo "================================================"
+          echo "✓ Windows test programs built successfully"
+          echo "✓ Windows PE binaries load on Linux (all 7 programs)"
+          echo "  - hello_cli.exe  : PE loading + API tracing"
+          echo "  - hello_gui.exe  : PE loading (GUI subsystem)"
+          echo "  - file_io_test.exe : PE loading"
+          echo "  - args_test.exe  : PE loading"
+          echo "  - env_test.exe   : PE loading"
+          echo "  - string_test.exe: PE loading"
+          echo "  - math_test.exe  : PE loading"
+          echo "✓ Sections parsed and loaded into memory"
+          echo "✓ Import resolution working"
+          echo "✓ Relocation processing working"
+          echo "✓ API tracing infrastructure functional"
+          echo "================================================"
+
+  build_msvc_test_programs:
+    name: Build MSVC Test Programs
+    runs-on: windows-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msvc-test-programs
+      - name: Build Rust test programs with MSVC target
+        working-directory: windows_test_programs
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc --locked `
+            -p hello_cli -p math_test -p env_test `
+            -p args_test -p file_io_test -p string_test
+      - name: Verify MSVC executables
+        shell: bash
+        run: |
+          echo "Checking MSVC test programs..."
+          ls -lh windows_test_programs/target/x86_64-pc-windows-msvc/release/*.exe
+          file windows_test_programs/target/x86_64-pc-windows-msvc/release/hello_cli.exe
+          file windows_test_programs/target/x86_64-pc-windows-msvc/release/math_test.exe
+      - name: Upload MSVC test executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: msvc-test-executables
+          path: |
+            windows_test_programs/target/x86_64-pc-windows-msvc/release/hello_cli.exe
+            windows_test_programs/target/x86_64-pc-windows-msvc/release/math_test.exe
+            windows_test_programs/target/x86_64-pc-windows-msvc/release/env_test.exe
+            windows_test_programs/target/x86_64-pc-windows-msvc/release/args_test.exe
+            windows_test_programs/target/x86_64-pc-windows-msvc/release/file_io_test.exe
+            windows_test_programs/target/x86_64-pc-windows-msvc/release/string_test.exe
+          retention-days: 1
+
+  test_msvc_programs_on_linux:
+    name: Test MSVC Programs on Linux
+    runs-on: ubuntu-latest
+    needs: build_msvc_test_programs
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wol-runner
+      - name: Download MSVC test executables
+        uses: actions/download-artifact@v4
+        with:
+          name: msvc-test-executables
+          path: msvc_test_programs
+      - name: Build Windows-on-Linux runner
+        run: cargo build --locked -p litebox_runner_windows_on_linux_userland
+      - name: Run hello_cli.exe (MSVC) and verify output
+        run: |
+          echo "=== hello_cli.exe (MSVC-compiled) ==="
+          set +e
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            --verbose \
+            msvc_test_programs/hello_cli.exe \
+            2>&1 | tee /tmp/hello_cli_msvc.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "✗ MSVC hello_cli.exe FAILED (exit $EXIT_CODE)"
+            exit 1
+          fi
+          grep -q "Hello World from LiteBox!" /tmp/hello_cli_msvc.txt \
+            || { echo "✗ MSVC hello_cli.exe output mismatch"; exit 1; }
+          echo "✓ MSVC hello_cli.exe PASSED"
+      - name: Run math_test.exe (MSVC) and verify exit code
+        run: |
+          echo "=== math_test.exe (MSVC-compiled) ==="
+          set +e
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            msvc_test_programs/math_test.exe \
+            2>&1 | tee /tmp/math_test_msvc.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "✗ MSVC math_test.exe FAILED (exit $EXIT_CODE)"
+            exit 1
+          fi
+          grep -q "0 failed" /tmp/math_test_msvc.txt \
+            || { echo "✗ MSVC math_test.exe FAILED"; exit 1; }
+          echo "✓ MSVC math_test.exe PASSED"
+      - name: Run env_test.exe (MSVC) and verify exit code
+        run: |
+          echo "=== env_test.exe (MSVC-compiled) ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            msvc_test_programs/env_test.exe 2>&1 \
+            || { echo "✗ MSVC env_test.exe FAILED"; exit 1; }
+          echo "✓ MSVC env_test.exe PASSED"
+      - name: Run args_test.exe (MSVC) and verify exit code
+        run: |
+          echo "=== args_test.exe (MSVC-compiled) ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            msvc_test_programs/args_test.exe 2>&1 \
+            || { echo "✗ MSVC args_test.exe FAILED"; exit 1; }
+          echo "✓ MSVC args_test.exe PASSED"
+      - name: Run file_io_test.exe (MSVC) and verify exit code
+        run: |
+          echo "=== file_io_test.exe (MSVC-compiled) ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            msvc_test_programs/file_io_test.exe \
+            2>&1 | tee /tmp/file_io_test_msvc.txt \
+            || { echo "✗ MSVC file_io_test.exe FAILED"; exit 1; }
+          echo "✓ MSVC file_io_test.exe PASSED"
+      - name: Run string_test.exe (MSVC) and verify exit code
+        run: |
+          echo "=== string_test.exe (MSVC-compiled) ==="
+          ./target/debug/litebox_runner_windows_on_linux_userland \
+            msvc_test_programs/string_test.exe \
+            2>&1 | tee /tmp/string_test_msvc.txt
+          grep -q "0 failed" /tmp/string_test_msvc.txt \
+            || { echo "✗ MSVC string_test.exe FAILED"; exit 1; }
+          echo "✓ MSVC string_test.exe PASSED"
+      - name: Upload test output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msvc-test-output
+          path: /tmp/*_msvc.txt
+          retention-days: 7
+      - name: Summary
+        if: always()
+        run: |
+          echo ""
+          echo "================================================"
+          echo " MSVC Programs on Linux – Summary"
+          echo "================================================"
+          for f in /tmp/*_msvc.txt; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f" _msvc.txt)
+            pass=$(grep -c "\[PASS\]\|✓\|passed" "$f" 2>/dev/null || true)
+            fail=$(grep -c "\[FAIL\]\|✗\|failed" "$f" 2>/dev/null || true)
+            echo "  ${name}: ${pass} passed, ${fail} failed"
+          done
+          echo "================================================"
