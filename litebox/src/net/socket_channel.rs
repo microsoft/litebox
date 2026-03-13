@@ -406,7 +406,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
             SocketState::Closed => events |= Events::HUP | Events::OUT,
             SocketState::Error => events |= Events::ERR | Events::OUT,
             SocketState::Connected if self.is_writable() => events |= Events::OUT,
-            _ => {},
+            _ => {}
         }
 
         events
