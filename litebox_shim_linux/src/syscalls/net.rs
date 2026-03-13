@@ -2442,7 +2442,7 @@ mod tests {
                 sockfd,
                 SocketOptionName::Socket(SocketOption::KEEPALIVE),
                 optval_out,
-                core::mem::size_of::<u32>() as u32,
+                core::mem::size_of::<u32>().truncate(),
             )
             .expect("failed to get SO_KEEPALIVE");
         assert_eq!(len, core::mem::size_of::<u32>());
