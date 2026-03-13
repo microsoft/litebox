@@ -975,7 +975,7 @@ interrupt:
 pending_host_signals:
     .long 0
     .align 4
-.global wait_waker_addr
+.globl wait_waker_addr
 wait_waker_addr:
     .long 0
     "
