@@ -357,7 +357,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let shim = shim.clone();
         let shutdown_clone = shutdown.clone();
         let child = litebox_platform_linux_userland::spawn_host_thread(move || {
-            const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(5);
+            const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
+            const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(1);
             pin_thread_to_cpu(0);
 
             while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
@@ -369,8 +370,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         }
                     }
                 };
+                // TODO: We only wait for ingress packets on the TUN device and thus may block processing egress packets for up to `timeout`.
+                // Set a maximum timeout to ensure we don't wait too long. Alternatively, shim could notify us when there are egress packets to process,
+                // but that would require more invasive changes.
                 litebox_platform_multiplex::platform()
-                    .wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT)));
+                    .wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
             }
             // Final flush
             // TODO: keep running until all sockets are closed?
