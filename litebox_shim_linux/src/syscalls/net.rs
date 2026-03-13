@@ -323,6 +323,11 @@ impl<FS: ShimFS> GlobalState<FS> {
         optlen: usize,
     ) -> Result<(), Errno> {
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
+            // Collect any TCP option that needs to be applied via Network after
+            // releasing the descriptor table write lock, to avoid a deadlock:
+            // `with_socket_options_mut` holds a write lock on descriptors, while
+            // `Network::set_tcp_option` acquires a read lock on the same RwLock.
+            let mut deferred_tcp_option = None;
             self.with_socket_options_mut(fd, |opt| {
                 match (so, value) {
                     (SocketOption::RCVTIMEO, SocketOptionValue::Timeout(timeout)) => {
@@ -345,35 +350,35 @@ impl<FS: ShimFS> GlobalState<FS> {
                     }
                     (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                         let keep_alive = val != 0;
-                        if let Err(err) = self.net.lock().set_tcp_option(
-                            fd,
-                            if keep_alive {
-                                // default time interval is 2 hours
-                                litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                    core::time::Duration::from_secs(2 * 60 * 60),
-                                ))
-                            } else {
-                                litebox::net::TcpOptionData::KEEPALIVE(None)
-                            },
-                        ) {
-                            match err {
-                                litebox::net::errors::SetTcpOptionError::InvalidFd => {
-                                    return Err(Errno::EBADF);
-                                }
-                                litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                                    unimplemented!(
-                                        "SO_KEEPALIVE is not supported for non-TCP sockets"
-                                    )
-                                }
-                                _ => unimplemented!(),
-                            }
-                        }
+                        deferred_tcp_option = Some(if keep_alive {
+                            // default time interval is 2 hours
+                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                core::time::Duration::from_secs(2 * 60 * 60),
+                            ))
+                        } else {
+                            litebox::net::TcpOptionData::KEEPALIVE(None)
+                        });
                         opt.keep_alive = keep_alive;
                     }
                     _ => unreachable!(),
                 }
-                Ok(())
-            })
+                Ok::<(), Errno>(())
+            })?;
+            // Apply deferred TCP option after releasing the descriptor table write lock.
+            if let Some(tcp_data) = deferred_tcp_option
+                && let Err(err) = self.net.lock().set_tcp_option(fd, tcp_data)
+            {
+                match err {
+                    litebox::net::errors::SetTcpOptionError::InvalidFd => {
+                        return Err(Errno::EBADF);
+                    }
+                    litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
+                        unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
+                    }
+                    _ => unimplemented!(),
+                }
+            }
+            Ok(())
         }) {
             Err(Errno::ENOPROTOOPT) => {} // fallthrough to handle other options
             other => return other,
@@ -2418,6 +2423,30 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, Errno::EINVAL);
+
+        let val: u32 = 1;
+        let optval = ConstPtr::from_usize((&raw const val).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::KEEPALIVE),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("failed to set SO_KEEPALIVE");
+
+        // Verify SO_KEEPALIVE is enabled
+        let mut result: u32 = 0;
+        let optval_out = MutPtr::from_usize((&raw mut result).cast::<u8>() as usize);
+        let len = task
+            .do_getsockopt(
+                sockfd,
+                SocketOptionName::Socket(SocketOption::KEEPALIVE),
+                optval_out,
+                core::mem::size_of::<u32>().truncate(),
+            )
+            .expect("failed to get SO_KEEPALIVE");
+        assert_eq!(len, core::mem::size_of::<u32>());
+        assert_eq!(result, 1);
     }
 
     #[test]
