@@ -1192,9 +1192,9 @@ impl<FS: ShimFS> Task<FS> {
                         },
                         |_fd| todo!("net"),
                         |_fd| todo!("pipes"),
-                        |_fd| todo!("migrate before PR"),
-                        |_fd| todo!("migrate before PR"),
-                        |_fd| todo!("migrate before PR"),
+                        |_fd| Err(Errno::EBADF),
+                        |_fd| Err(Errno::EBADF),
+                        |_fd| Err(Errno::EBADF),
                     )
                     .flatten()
             }
@@ -1214,9 +1214,9 @@ impl<FS: ShimFS> Task<FS> {
                         },
                         |_fd| todo!("net"),
                         |_fd| todo!("pipes"),
-                        |_fd| todo!("migrate before PR"),
-                        |_fd| todo!("migrate before PR"),
-                        |_fd| todo!("migrate before PR"),
+                        |_fd| Err(Errno::EBADF),
+                        |_fd| Err(Errno::EBADF),
+                        |_fd| Err(Errno::EBADF),
                     )
                     .flatten()
             }
@@ -2110,9 +2110,9 @@ impl<FS: ShimFS> Task<FS> {
             },
             |_fd| todo!("net"),
             |_fd| todo!("pipes"),
-            |_fd| todo!("migrate before PR"),
-            |_fd| todo!("migrate before PR"),
-            |_fd| todo!("migrate before PR"),
+            |_fd| Err(Errno::EBADF),
+            |_fd| Err(Errno::EBADF),
+            |_fd| Err(Errno::EBADF),
         )?
     }
 }
