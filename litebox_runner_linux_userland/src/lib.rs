@@ -358,7 +358,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let shutdown_clone = shutdown.clone();
         let child = litebox_platform_linux_userland::spawn_host_thread(move || {
             const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
-            const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(100);
+            const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(5);
             pin_thread_to_cpu(0);
 
             while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
