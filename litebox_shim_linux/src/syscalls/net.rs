@@ -2423,6 +2423,30 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, Errno::EINVAL);
+
+        let val: u32 = 1;
+        let optval = ConstPtr::from_usize((&raw const val).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::KEEPALIVE),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("failed to set SO_KEEPALIVE");
+
+        // Verify SO_KEEPALIVE is enabled
+        let mut result: u32 = 0;
+        let optval_out = MutPtr::from_usize((&raw mut result).cast::<u8>() as usize);
+        let len = task
+            .do_getsockopt(
+                sockfd,
+                SocketOptionName::Socket(SocketOption::KEEPALIVE),
+                optval_out,
+                core::mem::size_of::<u32>() as u32,
+            )
+            .expect("failed to get SO_KEEPALIVE");
+        assert_eq!(len, core::mem::size_of::<u32>());
+        assert_eq!(result, 1);
     }
 
     #[test]
