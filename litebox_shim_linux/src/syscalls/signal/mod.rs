@@ -640,6 +640,13 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn queue_signals(&self, signal: litebox_common_linux::signal::Signal) {
+        if signal == litebox_common_linux::signal::Signal::SIGALRM {
+            // The platform timer fired; clear the stored deadline so that a
+            // subsequent `alarm()` call does not see a stale positive remaining
+            // time due to timer imprecision (the timer can fire slightly before
+            // the exact deadline).
+            self.process().alarm_timer.lock().deadline = None;
+        }
         self.send_shared_signal(signal, siginfo_kill(signal));
     }
 
