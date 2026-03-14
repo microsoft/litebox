@@ -698,6 +698,7 @@ pub enum IpOption {
 pub enum SocketOption {
     REUSEADDR = 2,
     TYPE = 3,
+    ERROR = 4,
     BROADCAST = 6,
     SNDBUF = 7,
     RCVBUF = 8,

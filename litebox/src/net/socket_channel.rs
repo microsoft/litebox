@@ -65,6 +65,57 @@ use crate::{
     platform::TimeProvider,
 };
 
+/// Generates common async socket error accessor methods for channel types
+/// that contain an `inner` field with a `socket_error: SocketAsyncErrorState`.
+macro_rules! impl_socket_async_error_accessors {
+    () => {
+        /// Set the async socket error.
+        pub(super) fn set_async_error(&self, error: super::errors::SocketAsyncError) {
+            self.inner.socket_error.set(error);
+        }
+
+        /// Clear the async socket error.
+        #[allow(dead_code)]
+        pub(super) fn clear_async_error(&self) {
+            let _ = self.inner.socket_error.get(true);
+        }
+
+        /// Read and optionally clear the async socket error.
+        fn get_async_error(&self, clear: bool) -> Option<super::errors::SocketAsyncError> {
+            self.inner.socket_error.get(clear)
+        }
+    };
+}
+
+/// Atomic storage for [`SocketAsyncError`]
+///
+/// [`SocketAsyncError`]: super::errors::SocketAsyncError
+struct SocketAsyncErrorState {
+    /// Socket error stored as raw u32; 0 means no error.
+    value: AtomicU32,
+}
+
+impl SocketAsyncErrorState {
+    fn new() -> Self {
+        Self {
+            value: AtomicU32::new(0),
+        }
+    }
+
+    fn set(&self, error: super::errors::SocketAsyncError) {
+        self.value.store(error as u32, Ordering::Release);
+    }
+
+    fn get(&self, clear: bool) -> Option<super::errors::SocketAsyncError> {
+        let raw = if clear {
+            self.value.swap(0, Ordering::AcqRel)
+        } else {
+            self.value.load(Ordering::Acquire)
+        };
+        super::errors::SocketAsyncError::from_u32(raw)
+    }
+}
+
 /// Socket state flags stored atomically
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -120,6 +171,28 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
                 channel.set_connected(state == SocketState::Connected);
             }
             NetworkProxy::Raw => {}
+        }
+    }
+
+    /// Set the async socket error.
+    pub(super) fn set_async_error(&self, error: super::errors::SocketAsyncError) {
+        match self {
+            NetworkProxy::Stream(channel) => {
+                channel.set_async_error(error);
+            }
+            NetworkProxy::Datagram(channel) => {
+                channel.set_async_error(error);
+            }
+            NetworkProxy::Raw => {}
+        }
+    }
+
+    /// Read and optionally clear the async socket error.
+    pub fn get_async_error(&self, clear: bool) -> Option<super::errors::SocketAsyncError> {
+        match self {
+            NetworkProxy::Stream(channel) => channel.get_async_error(clear),
+            NetworkProxy::Datagram(channel) => channel.get_async_error(clear),
+            NetworkProxy::Raw => None,
         }
     }
 
@@ -236,6 +309,9 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// Space available in TX buffer (for quick poll checks)
     tx_available: AtomicUsize,
 
+    /// Socket error.
+    socket_error: SocketAsyncErrorState,
+
     /// Event notification
     pollee: Pollee<Platform>,
 }
@@ -260,6 +336,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             write_shutdown: AtomicBool::new(false),
             rx_available: AtomicUsize::new(0),
             tx_available: AtomicUsize::new(tx_capacity),
+
+            socket_error: SocketAsyncErrorState::new(),
 
             pollee: Pollee::new(),
         }
@@ -584,6 +662,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     pub(super) fn notify_io_event(&self, events: Events) {
         self.inner.pollee.notify_observers(events);
     }
+
+    impl_socket_async_error_accessors!();
 }
 
 /// A datagram message for UDP-like sockets.
@@ -637,6 +717,9 @@ struct DatagramChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     /// For UDP, this indicates that a default destination has been set via connect().
     is_connected: AtomicBool,
 
+    /// Socket error.
+    socket_error: SocketAsyncErrorState,
+
     /// Event notification
     pollee: Pollee<Platform>,
 }
@@ -664,6 +747,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramChannelInner<Pl
 
             local_port: AtomicU16::new(0),
             is_connected: AtomicBool::new(false),
+
+            socket_error: SocketAsyncErrorState::new(),
 
             pollee: Pollee::new(),
         }
@@ -912,6 +997,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     fn set_connected(&self, connected: bool) {
         self.inner.is_connected.store(connected, Ordering::Release);
     }
+
+    impl_socket_async_error_accessors!();
 }
 
 #[cfg(test)]

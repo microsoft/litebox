@@ -45,6 +45,9 @@ pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
 /// Limits maximum number of packets in a buffer
 const MAX_PACKET_COUNT: usize = 32;
 
+/// TCP connection timeout.
+const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(75);
+
 /// The `Network` provides access to all networking related functionality provided by LiteBox.
 ///
 /// A LiteBox `Network` is parametric in the platform it runs on.
@@ -229,6 +232,8 @@ pub(crate) struct TcpSpecific {
     server_socket: Option<TcpServerSpecific>,
     /// Whether to immediately close the socket when closed (i.e., no graceful FIN handshake)
     immediate_close: AtomicBool,
+    /// Timestamp when `connect` was initiated
+    connect_initiated_at_us: Option<smoltcp::time::Instant>,
 }
 
 /// Socket-specific data for TCP server sockets
@@ -550,9 +555,10 @@ where
 
     /// Drain all socket channel buffers
     fn drain_all_socket_channel_buffers(&mut self) {
+        let now = self.now();
         let table = self.litebox.descriptor_table();
         for (_, entry) in table.iter::<Network<Platform>>() {
-            Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry);
+            Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry, now);
         }
     }
 
@@ -565,6 +571,7 @@ where
     fn drain_socket_channel_buffers(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         socket_handle: &SocketHandle<Platform>,
+        now: smoltcp::time::Instant,
     ) {
         let proxy = match &socket_handle.proxy {
             Some(proxy) => proxy.as_ref(),
@@ -594,12 +601,34 @@ where
 
                 if let tcp::State::Established = tcp_socket.state() {
                     proxy.set_state(socket_channel::SocketState::Connected);
+                    proxy.clear_async_error();
                 }
                 let tcp_specific = socket_handle.specific.tcp();
                 // Update socket state in the channel
                 // server socket that is listening also has closed state
                 if !tcp_socket.is_open() && tcp_specific.server_socket.is_none() {
-                    proxy.set_state(socket_channel::SocketState::Closed);
+                    // Determine error based on previous socket state
+                    match proxy.state() {
+                        socket_channel::SocketState::Connecting => {
+                            // Socket closed while connecting. Distinguish RST from timeout.
+                            let error = match tcp_specific.connect_initiated_at_us {
+                                Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
+                                    errors::SocketAsyncError::TimedOut
+                                }
+                                _ => errors::SocketAsyncError::ConnectionRefused,
+                            };
+                            proxy.set_async_error(error);
+                            proxy.set_state(socket_channel::SocketState::Error);
+                        }
+                        socket_channel::SocketState::Connected => {
+                            // Connection was reset by peer
+                            proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
+                            proxy.set_state(socket_channel::SocketState::Closed);
+                        }
+                        _ => {
+                            proxy.set_state(socket_channel::SocketState::Closed);
+                        }
+                    }
                 }
 
                 if let Some(server_socket) = tcp_specific.server_socket.as_ref()
@@ -755,6 +784,7 @@ where
                     local_port: None,
                     server_socket: None,
                     immediate_close: AtomicBool::new(false),
+                    connect_initiated_at_us: None,
                 }),
                 Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
                     remote_endpoint: None,
@@ -940,9 +970,7 @@ where
             .get_entry_mut(fd)
             .ok_or(ConnectError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if let Some(proxy) = &socket_handle.proxy {
-            proxy.set_state(socket_channel::SocketState::Connecting);
-        }
+        let now = self.now();
         let ret = match socket_handle.protocol() {
             Protocol::Tcp => {
                 let check_state = |state: tcp::State| -> Result<(), ConnectError> {
@@ -967,20 +995,23 @@ where
                     let local_endpoint: smoltcp::wire::IpListenEndpoint = local_port.port().into();
                     let addr: smoltcp::wire::IpEndpoint = (*addr).into();
                     match socket.connect(self.interface.context(), addr, local_endpoint) {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            socket.set_timeout(Some(TCP_CONNECT_TIMEOUT));
+                            let tcp_specific = socket_handle.tcp_mut();
+                            tcp_specific.connect_initiated_at_us = Some(now);
+                            let old_port = tcp_specific.local_port.replace(local_port);
+                            if old_port.is_some() {
+                                // Need to think about how to handle this situation
+                                unimplemented!()
+                            }
+                            check_state(socket.state())
+                        }
                         Err(tcp::ConnectError::InvalidState) => unreachable!(),
                         Err(tcp::ConnectError::Unaddressable) => {
                             self.local_port_allocator.deallocate(local_port);
-                            return Err(ConnectError::Unaddressable);
+                            Err(ConnectError::Unaddressable)
                         }
                     }
-                    let tcp_specific = socket_handle.tcp_mut();
-                    let old_port = tcp_specific.local_port.replace(local_port);
-                    if old_port.is_some() {
-                        // Need to think about how to handle this situation
-                        unimplemented!()
-                    }
-                    check_state(socket.state())
                 }
             }
             Protocol::Udp => {
@@ -1003,16 +1034,34 @@ where
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };
 
-        if ret.is_ok()
-            && let Some(proxy) = &socket_handle.proxy
-        {
-            proxy.set_state(socket_channel::SocketState::Connected);
+        let mut result = ret;
+        if let Some(proxy) = &socket_handle.proxy {
+            match ret {
+                Ok(()) => proxy.set_state(socket_channel::SocketState::Connected),
+                Err(ConnectError::InProgress) => {
+                    proxy.set_state(socket_channel::SocketState::Connecting);
+                }
+                Err(ConnectError::Unaddressable) => {
+                    proxy.set_async_error(errors::SocketAsyncError::ConnectionRefused);
+                }
+                Err(ConnectError::InvalidState) => {
+                    // Distinguish timeout from RST using elapsed time
+                    match socket_handle.tcp().connect_initiated_at_us {
+                        Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
+                            proxy.set_async_error(errors::SocketAsyncError::TimedOut);
+                            result = Err(ConnectError::TimedOut);
+                        }
+                        _ => proxy.set_async_error(errors::SocketAsyncError::ConnectionRefused),
+                    }
+                }
+                Err(_) => {}
+            }
         }
         drop(table_entry);
         drop(descriptor_table);
 
         self.automated_platform_interaction(PollDirection::Both);
-        ret
+        result
     }
 
     /// Get the local address and port a socket is bound to.
@@ -1316,6 +1365,7 @@ where
                         local_port,
                         server_socket: None,
                         immediate_close: AtomicBool::new(false),
+                        connect_initiated_at_us: None,
                     }),
                     proxy: None,
                 };

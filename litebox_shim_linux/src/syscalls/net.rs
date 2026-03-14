@@ -399,7 +399,9 @@ impl<FS: ShimFS> GlobalState<FS> {
                 // We use fixed buffer size for now
                 SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
                 // Socket does not support these options
-                SocketOption::TYPE | SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
+                SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
+                    return Err(Errno::ENOPROTOOPT);
+                }
             },
             SocketOptionName::TCP(to) => match to {
                 TcpOption::CONGESTION => {
@@ -548,6 +550,17 @@ impl<FS: ShimFS> GlobalState<FS> {
                 | SocketOption::KEEPALIVE
                 | SocketOption::BROADCAST => {
                     unreachable!()
+                }
+                SocketOption::ERROR => {
+                    // SO_ERROR is self-clearing: atomically read and reset to 0.
+                    let proxy = self.get_proxy(fd)?;
+                    match proxy.get_async_error(true) {
+                        Some(err) => {
+                            let errno: Errno = err.into();
+                            i32::from(errno).cast_unsigned()
+                        }
+                        None => 0,
+                    }
                 }
                 SocketOption::TYPE => self.get_socket_type(fd)? as u32,
                 SocketOption::RCVBUF | SocketOption::SNDBUF => {
@@ -1866,6 +1879,22 @@ mod tests {
             .expect("close socket failed");
     }
 
+    /// Helper to read SO_ERROR from a socket via getsockopt.
+    /// Returns the errno integer value (0 means no error).
+    fn get_so_error(task: &crate::Task<crate::DefaultFS>, sockfd: u32) -> u32 {
+        let mut optval: u32 = 0xDEAD;
+        let len = task
+            .do_getsockopt(
+                sockfd,
+                SocketOptionName::Socket(SocketOption::ERROR),
+                MutPtr::from_usize((&raw mut optval).cast::<u8>() as usize),
+                core::mem::size_of::<u32>().truncate(),
+            )
+            .expect("getsockopt SO_ERROR failed");
+        assert_eq!(len, core::mem::size_of::<u32>());
+        optval
+    }
+
     fn epoll_add(
         task: &crate::Task<crate::DefaultFS>,
         epfd: i32,
@@ -2151,6 +2180,12 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, litebox_common_linux::errno::Errno::ECONNREFUSED);
+
+        let so_err = get_so_error(&task, socket_fd2);
+        assert_eq!(so_err, i32::from(Errno::ECONNREFUSED).cast_unsigned());
+
+        // Second read should be cleared (self-clearing semantics)
+        assert_eq!(get_so_error(&task, socket_fd2), 0);
     }
 
     #[test]
@@ -2181,6 +2216,11 @@ mod tests {
         )));
         task.do_connect(client_fd, server_addr)
             .expect("failed to connect to server");
+        let so_error = get_so_error(&task, client_fd);
+        assert_eq!(
+            so_error, 0,
+            "SO_ERROR should be 0 after successful connect, got {so_error}"
+        );
 
         let buf = "Hello, world!";
         let n = task
@@ -2447,6 +2487,34 @@ mod tests {
             .expect("failed to get SO_KEEPALIVE");
         assert_eq!(len, core::mem::size_of::<u32>());
         assert_eq!(result, 1);
+    }
+
+    #[ignore = "timeout is 75s"]
+    #[test]
+    fn test_tun_tcp_so_error_network_unreachable() {
+        let task = init_platform(Some(TUN_DEVICE_NAME));
+        let sockfd = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .expect("failed to create socket");
+
+        // Connect to an off-subnet IP (TEST-NET, 192.0.2.1).
+        // smoltcp does not report errors when route table lookup fails. Instead, it just dicards the packets.
+        // Our current implementation returns `ETIMEDOUT` instead of `ENETUNREACH`.
+        let err = task
+            .do_connect(
+                sockfd,
+                SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+                    core::net::Ipv4Addr::from([192, 0, 2, 1]),
+                    SERVER_PORT,
+                ))),
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::ETIMEDOUT);
+
+        let so_err = get_so_error(&task, sockfd);
+        assert_eq!(so_err, i32::from(Errno::ETIMEDOUT).cast_unsigned());
+
+        close_socket(&task, sockfd);
     }
 
     #[test]
