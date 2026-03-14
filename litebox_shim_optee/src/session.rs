@@ -94,8 +94,8 @@
 
 use crate::{LoadedProgram, OpteeShim, SessionIdPool};
 use alloc::sync::Arc;
-use hashbrown::HashMap;
-use litebox_common_optee::{TaFlags, TeeUuid};
+use hashbrown::{HashMap, HashSet};
+use litebox_common_optee::{OpteeSmcReturnCode, TaFlags, TeeUuid};
 use spin::mutex::SpinMutex;
 
 /// Maximum number of concurrent TA instances to avoid out of memory situations.
@@ -315,6 +315,31 @@ impl Drop for SessionIdGuard {
     }
 }
 
+/// Result of [`SessionManager::with_creation_slot`].
+pub enum CreationReservation {
+    /// An existing single-instance TA was found (another core cached it
+    /// between our initial lookup and the reservation). Reuse this instance.
+    ExistingSingleInstance(Arc<SpinMutex<TaInstance>>),
+    /// The creation closure ran successfully inside the reserved slot.
+    SlotReserved,
+}
+
+/// State for coordinating concurrent instance creation.
+///
+/// Guarded by a single lock to provide atomic capacity checks and
+/// duplicate-UUID prevention.
+struct CreationState {
+    /// UUIDs of single-instance TAs currently being loaded. Prevents multiple cores
+    /// from simultaneously creating a new instance for the same single-instance
+    /// TA UUID (which would violate the single-instance invariant).
+    /// Multi-instance TAs are not tracked here. They can be created concurrently.
+    pending_uuids: HashSet<TeeUuid>,
+    /// Number of instances currently being created (not yet registered). This
+    /// covers both single-instance and multi-instance TAs.
+    /// Added to [`SessionManager::instance_count`] for accurate capacity checks.
+    pending_count: usize,
+}
+
 /// Session manager that coordinates session and instance lifecycle.
 ///
 /// This provides a unified interface for:
@@ -326,6 +351,10 @@ pub struct SessionManager {
     sessions: SessionMap,
     /// Cache of single-instance TAs by UUID.
     single_instance_cache: SingleInstanceCache,
+    /// Coordination state for concurrent instance creation.
+    creation_state: SpinMutex<CreationState>,
+    /// Cached TA flags by UUID, populated on first successful session registration.
+    known_flags: SpinMutex<HashMap<TeeUuid, TaFlags>>,
 }
 
 impl SessionManager {
@@ -334,6 +363,11 @@ impl SessionManager {
         Self {
             sessions: SessionMap::new(),
             single_instance_cache: SingleInstanceCache::new(),
+            creation_state: SpinMutex::new(CreationState {
+                pending_uuids: HashSet::new(),
+                pending_count: 0,
+            }),
+            known_flags: SpinMutex::new(HashMap::new()),
         }
     }
 
@@ -367,6 +401,14 @@ impl SessionManager {
         self.sessions.get_entry(session_id)
     }
 
+    /// Look up previously observed TA flags for a UUID.
+    ///
+    /// Returns `None` if this UUID has never been successfully loaded.
+    /// Callers should conservatively assume single-instance when `None`.
+    pub fn get_known_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
+        self.known_flags.lock().get(uuid).copied()
+    }
+
     /// Register a new session.
     pub fn register_session(
         &self,
@@ -375,6 +417,7 @@ impl SessionManager {
         ta_uuid: TeeUuid,
         ta_flags: TaFlags,
     ) {
+        self.known_flags.lock().entry(ta_uuid).or_insert(ta_flags);
         self.sessions
             .insert(session_id, instance, ta_uuid, ta_flags);
     }
@@ -417,6 +460,70 @@ impl SessionManager {
     /// Check if instance limit is reached.
     pub fn is_at_capacity(&self) -> bool {
         self.instance_count() >= MAX_TA_INSTANCES
+    }
+
+    /// Atomically reserve a creation slot and run `f` to create a new TA instance.
+    ///
+    /// Behavior depends on whether the TA is:
+    ///
+    /// - **Single-instance**: Re-checks the single-instance cache under the lock to
+    ///   close TOCTOU windows, and prevents duplicate concurrent creation of
+    ///   the same UUID via `pending_uuids`.
+    ///
+    /// - **Multi-instance**: Each session gets its own independent TA instance,
+    ///   matching OP-TEE OS behavior. Multiple cores may create instances of
+    ///   the same UUID concurrently.
+    pub fn with_creation_slot<F>(
+        &self,
+        uuid: &TeeUuid,
+        is_single_instance: bool,
+        f: F,
+    ) -> Result<CreationReservation, OpteeSmcReturnCode>
+    where
+        F: FnOnce() -> Result<(), OpteeSmcReturnCode>,
+    {
+        {
+            let mut state = self.creation_state.lock();
+
+            if is_single_instance {
+                // Re-check single-instance cache under the creation lock to close
+                // the TOCTOU window between the caller's get_single_instance() and here.
+                if let Some(existing) = self.single_instance_cache.get(uuid) {
+                    return Ok(CreationReservation::ExistingSingleInstance(existing));
+                }
+
+                // Another core is currently in the middle of creating an instance
+                // for this single-instance UUID. The instance isn't cached yet,
+                // so we cannot reuse it. Return EThreadLimit to have the
+                // normal-world driver wait and retry.
+                if state.pending_uuids.contains(uuid) {
+                    return Err(OpteeSmcReturnCode::EThreadLimit);
+                }
+            }
+
+            // Capacity check including in-flight creations.
+            let total = self.instance_count() + state.pending_count;
+            if total >= MAX_TA_INSTANCES {
+                return Err(OpteeSmcReturnCode::ENomem);
+            }
+
+            if is_single_instance {
+                state.pending_uuids.insert(*uuid);
+            }
+            state.pending_count += 1;
+        }
+
+        let result = f();
+
+        {
+            let mut state = self.creation_state.lock();
+            if is_single_instance {
+                state.pending_uuids.remove(uuid);
+            }
+            state.pending_count = state.pending_count.saturating_sub(1);
+        }
+
+        result.map(|()| CreationReservation::SlotReserved)
     }
 }
 
