@@ -334,7 +334,8 @@ struct CreationState {
     /// TA UUID (which would violate the single-instance invariant).
     /// Multi-instance TAs are not tracked here. They can be created concurrently.
     pending_uuids: HashSet<TeeUuid>,
-    /// Number of instances currently being created (not yet registered).
+    /// Number of instances currently being created (not yet registered). This
+    /// covers both single-instance and multi-instance TAs.
     /// Added to [`SessionManager::instance_count`] for accurate capacity checks.
     pending_count: usize,
 }
