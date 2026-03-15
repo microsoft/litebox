@@ -590,3 +590,50 @@ fn test_tun_and_runner_with_iperf3() {
     has_started.store(true, std::sync::atomic::Ordering::Relaxed);
     runner.run();
 }
+
+/// Test curl fetching from a host-side HTTP server through the TUN device.
+///
+/// A minimal HTTP server is started on the host bound to `0.0.0.0`. Once the
+/// runner creates the TUN device (`10.0.0.1` on the host side), curl inside
+/// the sandbox (`10.0.0.2`) reaches the server via `10.0.0.1`.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_tun_with_curl() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    const RESPONSE_BODY: &str = "#!/bin/bash\necho 'Hello from litebox!'\n";
+
+    // Bind to an OS-assigned port on all interfaces.
+    let listener = TcpListener::bind("0.0.0.0:0").expect("Failed to bind HTTP server");
+    let port = listener.local_addr().unwrap().port();
+
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("Failed to accept connection");
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).expect("Failed to read request");
+        let request = String::from_utf8_lossy(&buf[..n]);
+        println!("Received HTTP request:\n{request}");
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            RESPONSE_BODY.len(),
+            RESPONSE_BODY
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("Failed to send response");
+    });
+
+    let curl_path = run_which("curl");
+    let url = format!("http://10.0.0.1:{port}/something");
+    let output = Runner::new(Backend::Rewriter, &curl_path, "curl_rewriter")
+        .args(["-sS", &url])
+        .tun_device_name("tun99")
+        .output();
+
+    server_thread.join().expect("Server thread panicked");
+
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(output_str.contains(RESPONSE_BODY), "Unexpected curl output");
+}
