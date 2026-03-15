@@ -591,11 +591,6 @@ fn test_tun_and_runner_with_iperf3() {
     runner.run();
 }
 
-/// Test curl fetching from a host-side HTTP server through the TUN device.
-///
-/// A minimal HTTP server is started on the host bound to `0.0.0.0`. Once the
-/// runner creates the TUN device (`10.0.0.1` on the host side), curl inside
-/// the sandbox (`10.0.0.2`) reaches the server via `10.0.0.1`.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tun_with_curl() {
