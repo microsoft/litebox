@@ -1868,6 +1868,14 @@ mod tests {
     extern crate alloc;
     extern crate std;
 
+    // Compile-time layout check: UserMsgHdr must match Linux's struct user_msghdr.
+    #[cfg(target_pointer_width = "64")]
+    const _USER_MSG_HDR_SIZE_64: () =
+        assert!(core::mem::size_of::<litebox_common_linux::UserMsgHdr<crate::Platform>>() == 56);
+    #[cfg(target_pointer_width = "32")]
+    const _USER_MSG_HDR_SIZE_32: () =
+        assert!(core::mem::size_of::<litebox_common_linux::UserMsgHdr<crate::Platform>>() == 28);
+
     const TUN_IP_ADDR: [u8; 4] = [10, 0, 0, 2];
     const TUN_IP_ADDR_STR: &str = "10.0.0.2";
     const TUN_DEVICE_NAME: &str = "tun99";
@@ -2044,16 +2052,15 @@ mod tests {
                         iov_len: buf2.len(),
                     },
                 ];
-                let hdr = litebox_common_linux::UserMsgHdr {
-                    msg_name: ConstPtr::from_usize(0),
-                    msg_namelen: 0,
-                    #[cfg(target_pointer_width = "64")]
-                    _pad: 0,
-                    msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
-                    msg_iovlen: iovec.len(),
-                    msg_control: ConstPtr::from_usize(0),
-                    msg_controllen: 0,
-                    msg_flags: SendFlags::empty(),
+                let hdr = {
+                    use zerocopy::FromZeros as _;
+                    let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
+                    h.msg_name = ConstPtr::from_usize(0);
+                    h.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+                    h.msg_iovlen = iovec.len();
+                    h.msg_control = ConstPtr::from_usize(0);
+                    h.msg_flags = SendFlags::empty();
+                    h
                 };
                 assert_eq!(
                     task.do_sendmsg(client_fd, &hdr, SendFlags::empty())
