@@ -2050,6 +2050,19 @@ impl OpteeSmcArgs {
         }
     }
 
+    /// Get the shared memory reference and offset for the physical address of `OpteeMsgArgs`.
+    pub fn optee_regd_shm_ref_and_offset(&self) -> Result<(u64, usize), OpteeSmcReturnCode> {
+        // args[1]:args[2] contains the shared memory reference (pointer)
+        // and args[3] contains the offset within that shared memory.
+        if self.args[1] & 0xffff_ffff_0000_0000 == 0 && self.args[2] & 0xffff_ffff_0000_0000 == 0 {
+            let shm_ref = (self.args[1] << 32) | self.args[2];
+            let offset = self.args[3];
+            Ok((shm_ref as u64, offset))
+        } else {
+            Err(OpteeSmcReturnCode::EBadAddr)
+        }
+    }
+
     /// Set the return code of an OP-TEE SMC call
     pub fn set_return_code(&mut self, code: OpteeSmcReturnCode) {
         self.args[0] = code as usize;
@@ -2121,6 +2134,7 @@ pub enum OpteeSmcResult<'a> {
     CallWithArg {
         msg_args: Box<OpteeMsgArgs>,
         rpc_args: Option<Box<OpteeRpcArgs>>,
+        msg_args_phys_addr: u64,
     },
 }
 
