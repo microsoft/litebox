@@ -2001,6 +2001,15 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let oldfd_usize = usize::try_from(oldfd).or(Err(Errno::EBADF))?;
+        if !self
+            .files
+            .borrow()
+            .raw_descriptor_store
+            .read()
+            .is_alive(oldfd_usize)
+        {
+            return Err(Errno::EBADF);
+        }
         if let Some(newfd) = newfd {
             // dup2/dup3
             let Ok(newfd) = u32::try_from(newfd) else {

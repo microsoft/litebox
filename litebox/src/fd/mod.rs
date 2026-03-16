@@ -667,6 +667,15 @@ impl RawDescriptorStorage {
         Ok(ret)
     }
 
+    /// Check if there is a valid FD at the raw integer value `fd`.
+    ///
+    /// This function is entirely subsystem-irrelevant. If you want to check against a subsystem,
+    /// you might wish to use [`Self::fd_from_raw_integer`].
+    #[must_use]
+    pub fn is_alive(&self, fd: usize) -> bool {
+        self.stored_fds.get(fd).is_some_and(Option::is_some)
+    }
+
     /// Returns an iterator over raw integer indices that are currently alive (i.e., occupied).
     pub fn iter_alive(&self) -> impl Iterator<Item = usize> + '_ {
         self.stored_fds
