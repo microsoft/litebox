@@ -85,7 +85,10 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
             .raw_descriptor_store
             .read()
             .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
-            .map_err(|_| Errno::ENOTSOCK)?;
+            .map_err(|err| match err {
+                litebox::fd::ErrRawIntFd::NotFound => Errno::EBADF,
+                litebox::fd::ErrRawIntFd::InvalidSubsystem => Errno::ENOTSOCK,
+            })?;
         let handle = global
             .litebox
             .descriptor_table()
