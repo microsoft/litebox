@@ -2047,8 +2047,6 @@ mod tests {
                 let hdr = litebox_common_linux::UserMsgHdr {
                     msg_name: ConstPtr::from_usize(0),
                     msg_namelen: 0,
-                    #[cfg(target_pointer_width = "64")]
-                    _pad: 0,
                     msg_iov: ConstPtr::from_usize(iovec.as_ptr() as usize),
                     msg_iovlen: iovec.len(),
                     msg_control: ConstPtr::from_usize(0),

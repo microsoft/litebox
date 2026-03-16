@@ -1778,10 +1778,6 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     pub msg_name: Platform::RawConstPointer<u8>,
     /// size of socket address structure
     pub msg_namelen: u32,
-    #[cfg(target_pointer_width = "64")]
-    #[allow(clippy::pub_underscore_fields)]
-    #[doc(hidden)]
-    pub _pad: u32,
     /// ptr to an array of `iovec` structures
     pub msg_iov: Platform::RawConstPointer<IoVec<Platform::RawMutPointer<u8>>>,
     /// number of elements in msg_iov
@@ -1799,9 +1795,6 @@ impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platf
         Self {
             msg_name: self.msg_name,
             msg_namelen: self.msg_namelen,
-            #[cfg(target_pointer_width = "64")]
-            #[allow(clippy::used_underscore_binding)]
-            _pad: self._pad,
             msg_iov: self.msg_iov,
             msg_iovlen: self.msg_iovlen,
             msg_control: self.msg_control,
