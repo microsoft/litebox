@@ -1804,16 +1804,14 @@ impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platf
             msg_name: self.msg_name,
             msg_namelen: self.msg_namelen,
             #[cfg(target_pointer_width = "64")]
-            #[allow(clippy::used_underscore_binding)]
-            _pad: self._pad,
+            _pad: 0,
             msg_iov: self.msg_iov,
             msg_iovlen: self.msg_iovlen,
             msg_control: self.msg_control,
             msg_controllen: self.msg_controllen,
             msg_flags: self.msg_flags,
             #[cfg(target_pointer_width = "64")]
-            #[allow(clippy::used_underscore_binding)]
-            _pad2: self._pad2,
+            _pad2: 0,
         }
     }
 }
