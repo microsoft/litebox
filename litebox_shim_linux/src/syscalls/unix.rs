@@ -20,6 +20,7 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::WaitContext,
     },
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::{Mode, OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
@@ -34,6 +35,12 @@ use crate::{
     channel::{Channel, ReadEnd, WriteEnd},
     syscalls::net::{SocketOptionValue, SocketOptions},
 };
+
+pub(crate) struct UnixSocketSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>);
+impl<FS: ShimFS> FdEnabledSubsystem for UnixSocketSubsystem<FS> {
+    type Entry = UnixSocket<FS>;
+}
+impl<FS: ShimFS> FdEnabledSubsystemEntry for UnixSocket<FS> {}
 
 /// C-compatible structure for Unix socket addresses.
 const UNIX_PATH_MAX: usize = 108;

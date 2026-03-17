@@ -15,13 +15,20 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError, Waker},
     },
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
 use super::file::FilesState;
-use crate::{Descriptor, GlobalState, ShimFS, StrongFd};
+use crate::{GlobalState, ShimFS};
+
+pub(crate) struct EpollSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>);
+impl<FS: ShimFS> FdEnabledSubsystem for EpollSubsystem<FS> {
+    type Entry = EpollFile<FS>;
+}
+impl<FS: ShimFS> FdEnabledSubsystemEntry for EpollFile<FS> {}
 
 bitflags::bitflags! {
     /// Linux's epoll flags.
@@ -35,36 +42,46 @@ bitflags::bitflags! {
 }
 
 pub(crate) enum EpollDescriptor<FS: ShimFS> {
-    Eventfd(Arc<super::eventfd::EventFile<Platform>>),
-    Epoll(Arc<super::epoll::EpollFile<FS>>),
+    Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
+    Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<FS>>>),
     File(Arc<crate::FileFd<FS>>),
     Socket(Arc<super::net::SocketFd>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
-    Unix(Arc<crate::syscalls::unix::UnixSocket<FS>>),
+    Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
-    pub fn try_from(files: &FilesState<FS>, desc: &Descriptor<FS>) -> Result<Self, Errno> {
-        match desc {
-            Descriptor::LiteBoxRawFd(raw_fd) => match StrongFd::<FS>::from_raw(files, *raw_fd)? {
-                StrongFd::FileSystem(fd) => Ok(EpollDescriptor::File(fd)),
-                StrongFd::Network(fd) => Ok(EpollDescriptor::Socket(fd)),
-                StrongFd::Pipes(fd) => Ok(EpollDescriptor::Pipe(fd)),
-            },
-            Descriptor::Eventfd { file, .. } => Ok(EpollDescriptor::Eventfd(file.clone())),
-            Descriptor::Epoll { file, .. } => Ok(EpollDescriptor::Epoll(file.clone())),
-            Descriptor::Unix { file, .. } => Ok(EpollDescriptor::Unix(file.clone())),
+    pub fn try_from(files: &FilesState<FS>, raw_fd: usize) -> Result<Self, Errno> {
+        let rds = files.raw_descriptor_store.read();
+        if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+            return Ok(EpollDescriptor::File(fd));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer::<crate::Network<Platform>>(raw_fd) {
+            return Ok(EpollDescriptor::Socket(fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
+            return Ok(EpollDescriptor::Pipe(fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd) {
+            return Ok(EpollDescriptor::Eventfd(fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<FS>>(raw_fd) {
+            return Ok(EpollDescriptor::Epoll(fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd) {
+            return Ok(EpollDescriptor::Unix(fd));
+        }
+        Err(Errno::EBADF)
     }
 }
 
 enum DescriptorRef<FS: ShimFS> {
-    Eventfd(Weak<crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform>>),
-    Epoll(Weak<super::epoll::EpollFile<FS>>),
+    Eventfd(Weak<TypedFd<super::eventfd::EventfdSubsystem>>),
+    Epoll(Weak<TypedFd<super::epoll::EpollSubsystem<FS>>>),
     File(Weak<crate::FileFd<FS>>),
     Socket(Weak<super::net::SocketFd>),
     Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
-    Unix(Weak<crate::syscalls::unix::UnixSocket<FS>>),
+    Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
 }
 
 impl<FS: ShimFS> DescriptorRef<FS> {
@@ -106,12 +123,15 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             }
             iop.check_io_events() & (mask | Events::ALWAYS_POLLED)
         };
-        let io_pollable: &dyn IOPollable = match self {
-            EpollDescriptor::Eventfd(file) => file,
+        match self {
+            EpollDescriptor::Eventfd(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
             EpollDescriptor::Epoll(_file) => unimplemented!(),
             EpollDescriptor::File(_file) => {
                 // TODO: probably polling on stdio files, return dummy events for now
-                return Some(Events::OUT & mask);
+                Some(Events::OUT & mask)
             }
             EpollDescriptor::Socket(fd) => {
                 let proxy = match global.get_proxy(fd) {
@@ -121,14 +141,14 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                         return None;
                     }
                 };
-                return Some(poll(&proxy));
+                Some(poll(&proxy))
             }
-            EpollDescriptor::Pipe(fd) => {
-                return global.pipes.with_iopollable(fd, poll).ok();
+            EpollDescriptor::Pipe(fd) => global.pipes.with_iopollable(fd, poll).ok(),
+            EpollDescriptor::Unix(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
             }
-            EpollDescriptor::Unix(file) => file,
-        };
-        Some(poll(io_pollable))
+        }
     }
 }
 
@@ -507,12 +527,11 @@ impl PollSet {
         waker: Option<&Waker<Platform>>,
     ) -> bool {
         let mut is_ready = false;
-        let fds = files.file_descriptors.read();
         for entry in &mut self.entries {
             entry.revents = if entry.fd < 0 {
                 continue;
-            } else if let Some(file) = fds.get_fd(entry.fd.reinterpret_as_unsigned())
-                && let Ok(poll_descriptor) = EpollDescriptor::try_from(files, file)
+            } else if let Ok(poll_descriptor) =
+                EpollDescriptor::try_from(files, entry.fd.reinterpret_as_unsigned() as usize)
             {
                 let observer = if !is_ready && let Some(waker) = waker {
                     // TODO: a separate allocation is necessary here
@@ -598,7 +617,6 @@ mod test {
     use alloc::sync::Arc;
     use litebox::event::Events;
     use litebox::event::wait::WaitState;
-    use litebox::utils::ReinterpretUnsignedExt as _;
     use litebox_common_linux::{EfdFlags, EpollEvent};
     use litebox_platform_multiplex::platform;
 
@@ -617,15 +635,22 @@ mod test {
     #[test]
     fn test_epoll_with_eventfd() {
         let (task, epoll) = setup_epoll();
-        let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
-            0,
-            EfdFlags::CLOEXEC,
-        ));
+        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(raw_fd) = files.insert_raw_fd(typed) else {
+            unreachable!()
+        };
+        let descriptor = super::EpollDescriptor::try_from(&files, raw_fd).unwrap();
         epoll
             .add_interest(
                 &task.global,
                 10,
-                &super::EpollDescriptor::Eventfd(eventfd.clone()),
+                &descriptor,
                 EpollEvent {
                     events: Events::IN.bits(),
                     data: 0,
@@ -634,12 +659,23 @@ mod test {
             .unwrap();
 
         // spawn a thread to write to the eventfd
-        let copied_eventfd = eventfd.clone();
-        std::thread::spawn(move || {
-            copied_eventfd
-                .write(&WaitState::new(platform()).context(), 1)
-                .unwrap();
-        });
+        {
+            let global = task.global.clone();
+            let files = Arc::clone(&files);
+            std::thread::spawn(move || {
+                let typed = files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                    .unwrap();
+                let _ = global
+                    .litebox
+                    .descriptor_table()
+                    .with_entry(&typed, |entry| {
+                        entry.write(&WaitState::new(platform()).context(), 1)
+                    });
+            });
+        }
         epoll
             .wait(&task.global, &WaitState::new(platform()).context(), 1024)
             .unwrap();
@@ -694,24 +730,19 @@ mod test {
         let task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
-        let eventfd = Arc::new(crate::syscalls::eventfd::EventFile::new(
-            0,
-            EfdFlags::empty(),
-        ));
+        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::empty());
 
-        let fd = 10i32;
-        let descriptor = crate::Descriptor::Eventfd {
-            file: eventfd.clone(),
-            close_on_exec: core::sync::atomic::AtomicBool::new(false),
-        };
-
+        let typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
         let no_fds = FilesState::new(task.files.borrow().fs.clone());
-        let fds = FilesState::new(task.files.borrow().fs.clone());
-        let _ = fds.file_descriptors.write().insert_at(
-            &task,
-            descriptor,
-            fd.reinterpret_as_unsigned() as usize,
-        );
+        let fds = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(raw_fd) = fds.insert_raw_fd(typed) else {
+            unreachable!()
+        };
+        let fd = i32::try_from(raw_fd).unwrap();
         set.add_fd(fd, Events::IN);
 
         let revents = |set: &super::PollSet| {
@@ -724,14 +755,36 @@ mod test {
             .unwrap();
         assert_eq!(revents(&set), Events::NVAL);
 
-        eventfd
-            .write(&WaitState::new(platform()).context(), 1)
-            .unwrap();
+        {
+            let typed = fds
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                .unwrap();
+            task.global
+                .litebox
+                .descriptor_table()
+                .with_entry(&typed, |entry| {
+                    entry.write(&WaitState::new(platform()).context(), 1)
+                });
+        }
         set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
 
-        eventfd.read(&WaitState::new(platform()).context()).unwrap();
+        {
+            let typed = fds
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                .unwrap();
+            task.global
+                .litebox
+                .descriptor_table()
+                .with_entry(&typed, |entry| {
+                    entry.read(&WaitState::new(platform()).context())
+                });
+        }
         set.wait(
             &task.global,
             &WaitState::new(platform())
@@ -743,11 +796,21 @@ mod test {
         assert!(revents(&set).is_empty());
 
         // spawn a thread to write to the eventfd
-        let copied_eventfd = eventfd.clone();
+        let global = task.global.clone();
+        let fds_for_thread = Arc::clone(&fds);
         std::thread::spawn(move || {
-            copied_eventfd
-                .write(&WaitState::new(platform()).context(), 1)
+            let typed = fds_for_thread
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
                 .unwrap();
+            let handle = global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&typed)
+                .unwrap();
+            let _ =
+                handle.with_entry(|entry| entry.write(&WaitState::new(platform()).context(), 1));
         });
 
         set.wait(&task.global, &WaitState::new(platform()).context(), &fds)

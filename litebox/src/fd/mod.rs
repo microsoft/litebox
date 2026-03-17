@@ -37,7 +37,12 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
-    pub(crate) fn insert<Subsystem: FdEnabledSubsystem>(
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics impossible due to type invariants"
+    )]
+    #[must_use]
+    pub fn insert<Subsystem: FdEnabledSubsystem>(
         &mut self,
         entry: impl Into<Subsystem::Entry>,
     ) -> TypedFd<Subsystem> {
@@ -104,7 +109,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// have been cleared out).
     ///
     /// If the `fd` was already closed out, then (obviously) it does not return an entry.
-    pub(crate) fn remove<Subsystem: FdEnabledSubsystem>(
+    pub fn remove<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
@@ -285,7 +290,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Use the entry at `fd` as read-only.
     ///
     /// If the `fd` has been closed, then skips applying `f` and returns `None`.
-    pub(crate) fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics impossible due to type invariants"
+    )]
+    pub fn with_entry<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&Subsystem::Entry) -> R,
@@ -300,7 +309,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Use the entry at `fd` as mutably.
     ///
     /// If the `fd` has been closed, then skips applying `f` and returns `None`.
-    pub(crate) fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics impossible due to type invariants"
+    )]
+    pub fn with_entry_mut<Subsystem, F, R>(&self, fd: &TypedFd<Subsystem>, f: F) -> Option<R>
     where
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&mut Subsystem::Entry) -> R,
@@ -310,6 +323,20 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // somewhere.
         let mut entry = self.entries[fd.x.as_usize()?].as_ref().unwrap().write();
         Some(f(entry.as_subsystem_mut::<Subsystem>()))
+    }
+
+    /// Obtain a handle to the underlying entry for the `fd`.
+    ///
+    /// Similar to [`Self::with_entry`], except it does not require maintaining access to the table.
+    pub fn entry_handle<Subsystem: FdEnabledSubsystem>(
+        &self,
+        fd: &TypedFd<Subsystem>,
+    ) -> Option<EntryHandle<Platform, Subsystem>> {
+        // Since the typed FD should not have been created unless we had the correct subsystem in
+        // the first place, none of this should panic---if it does, someone has done a bad cast
+        // somewhere.
+        let entry = self.entries[fd.x.as_usize()?].as_ref()?;
+        Some(EntryHandle(Arc::clone(&entry.x), PhantomData))
     }
 
     /// Use the entry at `internal_fd` as mutably.
@@ -489,6 +516,24 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 }
 
+/// A handle to a descriptor entry (via [`Descriptors::entry_handle`]) that can be used without
+/// maintaining access to the descriptor table itself.
+pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
+    Arc<RwLock<Platform, DescriptorEntry>>,
+    PhantomData<Subsystem>,
+);
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
+    EntryHandle<Platform, Subsystem>
+{
+    pub fn with_entry<R>(&self, f: impl FnOnce(&Subsystem::Entry) -> R) -> R {
+        f(self.0.read().as_subsystem::<Subsystem>())
+    }
+
+    pub fn with_entry_mut<R>(&self, f: impl FnOnce(&mut Subsystem::Entry) -> R) -> R {
+        f(self.0.write().as_subsystem_mut::<Subsystem>())
+    }
+}
+
 /// Result of a [`Descriptors::close_and_duplicate_if_shared`] operation
 pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
     /// The FD was the last reference and has been closed, returning the entry
@@ -621,6 +666,23 @@ impl RawDescriptorStorage {
         drop(underlying);
         Ok(ret)
     }
+
+    /// Check if there is a valid FD at the raw integer value `fd`.
+    ///
+    /// This function is entirely subsystem-irrelevant. If you want to check against a subsystem,
+    /// you might wish to use [`Self::fd_from_raw_integer`].
+    #[must_use]
+    pub fn is_alive(&self, fd: usize) -> bool {
+        self.stored_fds.get(fd).is_some_and(Option::is_some)
+    }
+
+    /// Returns an iterator over raw integer indices that are currently alive (i.e., occupied).
+    pub fn iter_alive(&self) -> impl Iterator<Item = usize> + '_ {
+        self.stored_fds
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
+    }
 }
 
 macro_rules! multi_subsystem_generic {
@@ -693,14 +755,13 @@ impl RawDescriptorStorage {
     multi_subsystem_generic! {invoke_matching_subsystem_4, typed_fd_at_raw_4, f1 S1, f2 S2, f3 S3, f4 S4}
 }
 
-/// LiteBox subsystems that support having file descriptors.
+/// A LiteBox subsystem that support having file descriptors.
 pub trait FdEnabledSubsystem: Sized {
-    #[doc(hidden)]
+    /// The per-FD entry type stored in the descriptor table for this subsystem
     type Entry: FdEnabledSubsystemEntry + 'static;
 }
 
-/// Entries for a specific [`FdEnabledSubsystem`]
-#[doc(hidden)]
+/// A per-FD entry stored in the descriptor table for a specific [`FdEnabledSubsystem`]
 pub trait FdEnabledSubsystemEntry: Send + Sync + core::any::Any {}
 
 /// Possible errors from [`RawDescriptorStorage::fd_from_raw_integer`] and
@@ -881,7 +942,6 @@ macro_rules! enable_fds_for_subsystem {
         $entry:ty;
         $(-> $fd:ident $(<$($fd_param:ident),*>)?;)?
     ) => {
-        #[allow(unused, reason = "NOTE(jayb): remove this lint before merging the PR")]
         #[doc(hidden)]
         // This wrapper type exists just to make sure `$entry` itself is not public, but we can
         // still satisfy requirements for `FdEnabledSubsystem`.

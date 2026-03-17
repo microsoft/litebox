@@ -102,20 +102,20 @@ impl<FS: ShimFS> Task<FS> {
             return None;
         }
 
-        let Ok(fd) = u32::try_from(fd) else {
+        let Ok(fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return None;
         };
 
         let files = self.files.borrow();
-        let raw_fd = match files.file_descriptors.read().get_fd(fd)? {
-            crate::Descriptor::LiteBoxRawFd(raw_fd) => *raw_fd,
-            _ => return None,
-        };
+        let raw_fd = fd;
 
         let static_data = files
             .run_on_raw_fd(
                 raw_fd,
                 |typed_fd| files.fs.get_static_backing_data(typed_fd),
+                |_| None,
+                |_| None,
+                |_| None,
                 |_| None,
                 |_| None,
             )
