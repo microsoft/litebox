@@ -1778,6 +1778,10 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     pub msg_name: Platform::RawConstPointer<u8>,
     /// size of socket address structure
     pub msg_namelen: u32,
+    /// Explicit padding to match the 4-byte gap that Linux's naturally-aligned
+    /// `struct user_msghdr` has between `msg_namelen` and `msg_iov` on 64-bit.
+    #[cfg(target_pointer_width = "64")]
+    _pad: u32,
     /// ptr to an array of `iovec` structures
     pub msg_iov: Platform::RawConstPointer<IoVec<Platform::RawMutPointer<u8>>>,
     /// number of elements in msg_iov
@@ -1788,6 +1792,10 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     pub msg_controllen: usize,
     /// flags on received message
     pub msg_flags: SendFlags,
+    /// Explicit trailing padding to match the 4-byte gap after `msg_flags` in
+    /// Linux's naturally-aligned `struct user_msghdr` on 64-bit (total size 56).
+    #[cfg(target_pointer_width = "64")]
+    _pad2: u32,
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platform> {
@@ -1795,11 +1803,15 @@ impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platf
         Self {
             msg_name: self.msg_name,
             msg_namelen: self.msg_namelen,
+            #[cfg(target_pointer_width = "64")]
+            _pad: 0,
             msg_iov: self.msg_iov,
             msg_iovlen: self.msg_iovlen,
             msg_control: self.msg_control,
             msg_controllen: self.msg_controllen,
             msg_flags: self.msg_flags,
+            #[cfg(target_pointer_width = "64")]
+            _pad2: 0,
         }
     }
 }
