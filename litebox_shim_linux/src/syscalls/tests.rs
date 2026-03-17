@@ -71,8 +71,8 @@ fn test_fcntl() {
             .unwrap();
         assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFD).unwrap(), 0);
 
-        task.sys_fcntl(fd, FcntlArg::SETFL(OFlags::empty()))
-            .unwrap();
+        // OFlags::RDWR should be ignored
+        task.sys_fcntl(fd, FcntlArg::SETFL(OFlags::RDWR)).unwrap();
         assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFL).unwrap(), flags2.bits());
     };
 
