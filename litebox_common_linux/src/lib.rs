@@ -2732,6 +2732,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     flags: AtFlags::empty(),
                 }
             }
+            Sysno::rmdir => {
+                // rmdir is equivalent to unlinkat with dirfd AT_FDCWD and AT_REMOVEDIR
+                SyscallRequest::Unlinkat {
+                    dirfd: AT_FDCWD,
+                    pathname: ctx.sys_req_ptr(0),
+                    flags: AtFlags::AT_REMOVEDIR,
+                }
+            }
             Sysno::creat => {
                 // creat is equivalent to open with flags O_CREAT|O_WRONLY|O_TRUNC
                 SyscallRequest::Openat {
