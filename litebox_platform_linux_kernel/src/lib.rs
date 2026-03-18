@@ -85,6 +85,12 @@ impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, H
 
 impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
 
+impl<Host: HostInterface> litebox::platform::AddressSpaceProvider for LinuxKernel<Host> {
+    // All methods default to `Err(NotSupported)` — real implementation comes
+    // when kernel-mode multi-process (separate page tables) is added.
+    type AddressSpaceId = u32;
+}
+
 // TODO: implement pointer validation to ensure the pointers are in user space.
 type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,

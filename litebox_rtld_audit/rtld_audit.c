@@ -79,6 +79,25 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5,
   return rax;
 }
 
+/// Terminate the guest process because an unpatched shared library was loaded.
+/// This is only reachable under the rewriter backend (rtld_audit is not loaded
+/// otherwise), so any library without a trampoline is a fatal error.
+static void stop_guest_unpatched(const char *path) {
+  // Write to stderr (fd 2) since fd 1 may be captured/redirected.
+  if (syscall_entry) {
+    do_syscall(SYS_write, 2, (long)"[audit] FATAL: unpatched library: ", 34, 0, 0, 0);
+    if (path) {
+      long len = 0;
+      while (path[len]) len++;
+      do_syscall(SYS_write, 2, (long)path, len, 0, 0, 0);
+    }
+    do_syscall(SYS_write, 2, (long)"\n", 1, 0, 0, 0);
+    do_syscall(SYS_exit_group, 127, 0, 0, 0, 0, 0);
+  }
+  // If syscall_entry is not set, we can't make syscalls — trap instead.
+  __builtin_trap();
+}
+
 /* Re-implement some utility functions and re-define the structures to avoid
  * dependency on libc. */
 
@@ -201,11 +220,17 @@ int parse_object(const struct link_map *map) {
     }
   }
   max_addr = align_up(max_addr, 0x1000);
+
+  // The litebox loader maps the trampoline right after the last LOAD segment.
+  // The trampoline's first 8 bytes hold the syscall entry point. The loader
+  // guarantees that unpatched binaries are rejected before reaching this code,
+  // so the trampoline page should always be mapped here. As defense-in-depth,
+  // validate the value after reading.
   void *trampoline_addr = (void *)map->l_addr + max_addr;
-  // The trampoline code has the syscall entry point at offset 0.
   syscall_entry = (syscall_stub_t)read_u64(trampoline_addr);
-  if (syscall_entry == 0) {
-    syscall_print("[audit] syscall entry is null\n", 30);
+  if (syscall_entry == 0 || (uintptr_t)syscall_entry > MAX_USERSPACE_ADDR) {
+    syscall_print("[audit] invalid syscall entry point\n", 36);
+    syscall_entry = 0;
     return 1;
   }
   print_hex((uint64_t)syscall_entry);
@@ -254,33 +279,36 @@ unsigned int la_objopen(struct link_map *map,
     return 0; // ld.so is patched by libOS
   }
 
-  // Other shared libraries
+  // Other shared libraries — must be patched since rtld_audit only runs
+  // under the rewriter backend.
   syscall_print("[audit] la_objopen: path=", 25);
   syscall_print(path, 32);
   syscall_print("\n", 1);
 
   if (!syscall_entry) {
-    return 0;
+    // syscall_entry should have been set by the main binary or ld-linux.
+    // If not, something went wrong earlier — stop.
+    stop_guest_unpatched(path);
   }
 
   int fd = do_syscall(SYS_openat, AT_FDCWD, (long)path, 0, 0, 0, 0);
   if (fd < 0) {
     syscall_print("[audit] failed to open file\n", 28);
-    return 0;
+    stop_guest_unpatched(path);
   }
 
   struct FileStat st;
   if (do_syscall(SYS_fstat, fd, (long)&st, 0, 0, 0, 0) < 0) {
     syscall_print("[audit] fstat failed\n", 21);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
-    return 0;
+    stop_guest_unpatched(path);
   }
   long file_size = st.st_size;
 
   // File must be large enough to contain at least a trampoline header
   if (file_size < (long)sizeof(struct TrampolineHeader)) {
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
-    return 0;
+    stop_guest_unpatched(path);
   }
 
   // The trampoline header is at the end of the file (last 32 bytes for x86_64).
@@ -294,7 +322,7 @@ unsigned int la_objopen(struct link_map *map,
   if ((uintptr_t)header_page >= (uintptr_t)-4096) {
     syscall_print("[audit] mmap header page failed\n", 32);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
-    return 0;
+    stop_guest_unpatched(path);
   }
 
   // Read header from the mapped page
@@ -303,16 +331,13 @@ unsigned int la_objopen(struct link_map *map,
 
   // Check magic
   if (header->magic != TRAMPOLINE_MAGIC) {
-    // If the prefix matches but the version differs, fail explicitly.
     if (memcmp(header, "LITEBOX", 7) == 0) {
       syscall_print("[audit] invalid trampoline version\n", 36);
-      do_syscall(SYS_munmap, (long)header_page, 0x1000, 0, 0, 0, 0);
-      do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
-      return 0;
     }
-    // No trampoline found
+    // No valid trampoline — unpatched shared library.
     do_syscall(SYS_munmap, (long)header_page, 0x1000, 0, 0, 0, 0);
     do_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+    stop_guest_unpatched(path);
     return 0;
   }
 

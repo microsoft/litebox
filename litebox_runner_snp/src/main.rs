@@ -230,8 +230,14 @@ pub extern "C" fn sandbox_process_init(
     let fs = alloc::sync::Arc::new(default_fs);
 
     // Loading a program may trigger page faults, so we need to set SHIM before this.
-    let program = match shim.load_program(fs, platform.init_task(boot_params), &program, argv, envp)
-    {
+    let program = match shim.load_program(
+        fs,
+        platform.init_task(boot_params),
+        &program,
+        argv,
+        envp,
+        None,
+    ) {
         Ok(program) => program,
         Err(err) => {
             litebox::log_println!(platform, "failed to load program: {}", err);

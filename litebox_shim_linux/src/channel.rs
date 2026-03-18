@@ -20,13 +20,12 @@ macro_rules! common_functions_for_channel {
         }
 
         /// Shut this channel down.
-        #[expect(dead_code)]
-        fn shutdown(&self) {
+        pub(crate) fn shutdown(&self) {
             self.endpoint.shutdown();
         }
 
         /// Has the peer (i.e., other end) been shut down?
-        fn is_peer_shutdown(&self) -> bool {
+        pub(crate) fn is_peer_shutdown(&self) -> bool {
             if let Some(peer) = self.peer.upgrade() {
                 peer.is_shutdown()
             } else {
@@ -154,6 +153,26 @@ impl<T> WriteEnd<T> {
     }
 
     common_functions_for_channel!();
+}
+
+impl<T> Drop for WriteEnd<T> {
+    fn drop(&mut self) {
+        // Only notify when this is the last clone — the channel is truly closing.
+        if Arc::strong_count(&self.endpoint) == 1
+            && let Some(peer) = self.peer.upgrade()
+        {
+            peer.pollee
+                .notify_observers(Events::IN | Events::HUP | Events::RDHUP);
+        }
+    }
+}
+
+impl<T> Drop for ReadEnd<T> {
+    fn drop(&mut self) {
+        if let Some(peer) = self.peer.upgrade() {
+            peer.pollee.notify_observers(Events::HUP | Events::ERR);
+        }
+    }
 }
 
 pub(crate) struct Channel<T> {

@@ -1351,6 +1351,12 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     }
 }
 
+impl<Host: HostInterface> litebox::platform::AddressSpaceProvider for LinuxKernel<Host> {
+    // All methods default to `Err(NotSupported)` — real implementation comes
+    // when LVBS multi-process (separate page tables) is added.
+    type AddressSpaceId = u32;
+}
+
 #[cfg(feature = "optee_syscall")]
 /// Checks whether the given physical addresses are contiguous with respect to ALIGN.
 fn is_contiguous<const ALIGN: usize>(addrs: &[PhysPageAddr<ALIGN>]) -> bool {
@@ -1572,7 +1578,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
 /// The context must be valid user context.
 pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
 where
-    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
 {
     // Currently, `litebox_platform_lvbs` uses `swapgs` to efficiently switch between
     // kernel and user GS base values during kernel-user mode transitions.
@@ -1591,7 +1597,7 @@ where
 /// The context must be valid user context.
 pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
 where
-    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
 {
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
     run_thread_inner(shim, ctx, false);
@@ -1606,19 +1612,19 @@ where
 /// The context must be valid user context.
 pub unsafe fn reenter_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
 where
-    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
 {
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
     run_thread_inner(shim, ctx, true);
 }
 
 struct ThreadContext<'a> {
-    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
     ctx: &'a mut litebox_common_linux::PtRegs,
 }
 
 fn run_thread_inner(
-    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
     ctx: &mut litebox_common_linux::PtRegs,
     reenter: bool,
 ) {
@@ -2165,11 +2171,23 @@ impl ThreadContext<'_> {
     fn call_shim(
         &mut self,
         f: impl FnOnce(
-            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-            &mut litebox_common_linux::PtRegs,
+            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+            &mut litebox_common_linux::ExecutionContext,
         ) -> ContinueOperation,
     ) -> ContinueOperation {
-        f(self.shim, self.ctx)
+        // LVBS manages FP/SIMD state separately via per-CPU XSAVE areas.
+        // Wrap PtRegs in ExecutionContext for the shim interface; fp_regs
+        // is not used on this platform.
+        // Signal frames currently omit FP state on this platform because the
+        // per-CPU XSAVE area is not wired through `ExecutionContext::fp_regs`
+        // yet. Wire that state through if signal-frame FP accuracy is needed.
+        let mut exec_ctx = litebox_common_linux::ExecutionContext {
+            regs: self.ctx.clone(),
+            fp_regs: litebox_common_linux::FpRegs::default(),
+        };
+        let op = f(self.shim, &mut exec_ctx);
+        *self.ctx = exec_ctx.regs;
+        op
     }
 }
 

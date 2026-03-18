@@ -7,6 +7,7 @@
 //! trait is merely a collection of subtraits that could be composed independently from various
 //! other crates that implement them upon various types.
 
+pub mod address_space;
 pub mod common_providers;
 pub mod page_mgmt;
 pub mod trivial_providers;
@@ -18,6 +19,7 @@ use either::Either;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
+pub use address_space::AddressSpaceProvider;
 pub use page_mgmt::PageManagementProvider;
 
 #[macro_export]
@@ -43,10 +45,12 @@ macro_rules! log_println {
 pub trait Provider:
     RawMutexProvider
     + IPInterfaceProvider
+    + RawMessageProvider
     + TimeProvider
     + PunchthroughProvider
     + DebugLogProvider
     + RawPointerProvider
+    + AddressSpaceProvider
 {
 }
 
@@ -385,7 +389,11 @@ pub trait IPInterfaceProvider {
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
 #[derive(Error, Debug)]
 #[non_exhaustive]
-pub enum SendError {}
+pub enum SendError {
+    /// The underlying device returned an I/O error. The packet was not sent.
+    #[error("I/O error on send: errno {0}")]
+    Io(i32),
+}
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::receive_ip_packet`].
 #[derive(Error, Debug)]
@@ -393,6 +401,36 @@ pub enum SendError {}
 pub enum ReceiveError {
     #[error("Receive operation would block")]
     WouldBlock,
+    #[error("IPC protocol error: oversized frame")]
+    ProtocolError,
+    #[error("Channel closed (EOF)")]
+    Eof,
+}
+
+/// A raw byte-stream channel for direct message passing between the guest and
+/// the broker (bypassing the IP network stack).
+///
+/// When available, this provides a fast path for protocols like 9P that would
+/// otherwise pay the overhead of traversing two smoltcp stacks.
+///
+/// The default implementation returns [`ReceiveError::WouldBlock`] /
+/// [`SendError::Io`], indicating the channel is not available.  Platforms that
+/// support direct messaging override these methods.
+pub trait RawMessageProvider {
+    /// Send bytes to the broker over the raw channel.
+    ///
+    /// Returns `Ok(n)` with the number of bytes sent, or an error.
+    fn send_raw_message(&self, _data: &[u8]) -> Result<usize, SendError> {
+        Err(SendError::Io(0))
+    }
+
+    /// Receive bytes from the broker over the raw channel.
+    ///
+    /// Returns `Ok(n)` with the number of bytes read into `buf`, or
+    /// [`ReceiveError::WouldBlock`] if no data is available yet.
+    fn recv_raw_message(&self, _buf: &mut [u8]) -> Result<usize, ReceiveError> {
+        Err(ReceiveError::WouldBlock)
+    }
 }
 
 /// An interface to understanding time.
@@ -641,6 +679,110 @@ pub enum StdioStream {
     Stderr = 2,
 }
 
+/// A non-exhaustive list of errors from terminal operations on [`StdioProvider`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum StdioIoctlError {
+    /// The fd is not a terminal (ENOTTY).
+    #[error("not a terminal")]
+    NotATerminal,
+    /// The operation failed with an OS error code (errno on Linux, mapped
+    /// equivalent on other platforms).
+    #[error("ioctl failed: {0}")]
+    OsError(i32),
+}
+
+/// Platform-agnostic terminal attributes, mirroring the fields of Linux
+/// `struct termios`.
+///
+/// The guest always runs Linux binaries and speaks the Linux terminal ABI.
+/// Platform implementations fill this struct using their native APIs (e.g.,
+/// direct ioctl forwarding on Linux, `GetConsoleMode`/`SetConsoleMode` on
+/// Windows).
+#[derive(Debug, Clone)]
+pub struct TerminalAttributes {
+    /// Input mode flags.
+    pub c_iflag: u32,
+    /// Output mode flags.
+    pub c_oflag: u32,
+    /// Control mode flags.
+    pub c_cflag: u32,
+    /// Local mode flags.
+    pub c_lflag: u32,
+    /// Line discipline (typically `0` for `N_TTY`).
+    pub c_line: u8,
+    /// Control characters.
+    pub c_cc: [u8; 19],
+}
+
+// Terminal attribute flag constants.
+const TERMATTR_ECHO: u32 = 0x0008;
+const TERMATTR_ICRNL: u32 = 0x0100;
+const TERMATTR_OPOST: u32 = 0x0001;
+const TERMATTR_ONLCR: u32 = 0x0004;
+
+impl TerminalAttributes {
+    /// Default terminal attributes matching a freshly opened Linux PTY.
+    ///
+    /// These are realistic values that satisfy terminal detection in programs
+    /// such as Node.js Ink. **All-zero termios causes such programs to reject
+    /// the terminal silently.**
+    pub fn new_default() -> Self {
+        Self {
+            c_iflag: 0x6d02, // ICRNL | IXON | IXANY | IMAXBEL | IUTF8
+            c_oflag: 0x0005, // OPOST | ONLCR
+            c_cflag: 0x04bf, // CS8 | CREAD | CLOCAL | B38400
+            c_lflag: 0x8a3b, // ECHO | ECHOE | ECHOK | ISIG | ICANON | IEXTEN | ECHOCTL | ECHOKE
+            c_line: 0,       // N_TTY
+            c_cc: [
+                0x03, 0x1c, 0x7f, 0x15, 0x04, 0x00, 0x01, 0x00, 0x11, 0x13, 0x1a, 0xff, 0x12, 0x0f,
+                0x17, 0x16, 0xff, 0x00, 0x00,
+            ],
+        }
+    }
+
+    /// Returns `true` if the `ECHO` local flag is set.
+    pub fn echo_enabled(&self) -> bool {
+        self.c_lflag & TERMATTR_ECHO != 0
+    }
+
+    /// Returns `true` if the `ICRNL` input flag is set.
+    pub fn icrnl_enabled(&self) -> bool {
+        self.c_iflag & TERMATTR_ICRNL != 0
+    }
+
+    /// Returns `true` if output post-processing with newline translation
+    /// (`OPOST | ONLCR`) is enabled.
+    pub fn onlcr_enabled(&self) -> bool {
+        (self.c_oflag & TERMATTR_OPOST != 0) && (self.c_oflag & TERMATTR_ONLCR != 0)
+    }
+}
+
+/// Platform-agnostic terminal window size.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowSize {
+    /// Number of rows (height in characters).
+    pub rows: u16,
+    /// Number of columns (width in characters).
+    pub cols: u16,
+    /// Horizontal size in pixels (informational, often zero).
+    pub xpixel: u16,
+    /// Vertical size in pixels (informational, often zero).
+    pub ypixel: u16,
+}
+
+/// When to apply terminal attribute changes, corresponding to POSIX
+/// `tcsetattr()` actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetTermiosWhen {
+    /// Apply immediately (Linux `TCSETS`).
+    Now,
+    /// Drain output first, then apply (Linux `TCSETSW`).
+    AfterDrain,
+    /// Drain output first, flush pending input, then apply (Linux `TCSETSF`).
+    AfterDrainFlushInput,
+}
+
 /// A provider of standard input/output functionality.
 pub trait StdioProvider {
     /// Read from standard input. Returns number of bytes read.
@@ -651,6 +793,74 @@ pub trait StdioProvider {
 
     /// Check if a stream is connected to a TTY.
     fn is_a_tty(&self, stream: StdioStream) -> bool;
+
+    /// Get the terminal attributes for a stdio stream.
+    ///
+    /// On Linux, this forwards `TCGETS` to the host kernel. On Windows, this
+    /// returns stored attributes (initialized with realistic defaults).
+    ///
+    /// The default implementation returns [`StdioIoctlError::NotATerminal`].
+    fn get_terminal_attributes(
+        &self,
+        _stream: StdioStream,
+    ) -> Result<TerminalAttributes, StdioIoctlError> {
+        Err(StdioIoctlError::NotATerminal)
+    }
+
+    /// Set the terminal attributes for a stdio stream.
+    ///
+    /// On Linux, this forwards `TCSETS`/`TCSETSW`/`TCSETSF` to the host
+    /// kernel. On Windows, this stores the attributes and translates key flags
+    /// (e.g., `ECHO`, `ICANON`) to `SetConsoleMode` calls.
+    ///
+    /// The default implementation returns [`StdioIoctlError::NotATerminal`].
+    fn set_terminal_attributes(
+        &self,
+        _stream: StdioStream,
+        _attrs: &TerminalAttributes,
+        _when: SetTermiosWhen,
+    ) -> Result<(), StdioIoctlError> {
+        Err(StdioIoctlError::NotATerminal)
+    }
+
+    /// Get the terminal window size for a stdio stream.
+    ///
+    /// On Linux, this forwards `TIOCGWINSZ` to the host kernel. On Windows,
+    /// this queries `GetConsoleScreenBufferInfo` or returns a stored override.
+    ///
+    /// The default implementation returns [`StdioIoctlError::NotATerminal`].
+    fn get_window_size(&self, _stream: StdioStream) -> Result<WindowSize, StdioIoctlError> {
+        Err(StdioIoctlError::NotATerminal)
+    }
+
+    /// Set the terminal window size for a stdio stream.
+    ///
+    /// On Linux, this forwards `TIOCSWINSZ` to the host kernel. On other
+    /// platforms, this stores the size so that subsequent `get_window_size`
+    /// calls return the stored value (the actual console is not resized).
+    ///
+    /// The default implementation returns [`StdioIoctlError::NotATerminal`].
+    fn set_window_size(
+        &self,
+        _stream: StdioStream,
+        _size: &WindowSize,
+    ) -> Result<(), StdioIoctlError> {
+        Err(StdioIoctlError::NotATerminal)
+    }
+
+    /// Check if stdin has data available for reading without blocking.
+    ///
+    /// Returns `true` if a `read()` on stdin would return data immediately.
+    /// Used by epoll/poll to report stdin readability. The default returns
+    /// `false`.
+    fn poll_stdin_readable(&self) -> bool {
+        false
+    }
+
+    /// Cancel any pending `read_from_stdin()` call, causing it to return
+    /// [`StdioReadError::Closed`]. Used during process exit to unblock
+    /// threads waiting on stdin. The default is a no-op.
+    fn cancel_stdin(&self) {}
 }
 
 /// A provider for system information.

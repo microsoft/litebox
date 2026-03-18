@@ -55,7 +55,13 @@ impl<FS: crate::ShimFS> Task<FS> {
         );
         self.signals.set_signal_mask(mask);
 
-        Ok(restore_sigcontext(ctx, &lctx.sigcontext))
+        match restore_sigcontext(ctx, &lctx.sigcontext) {
+            Ok(rax) => Ok(rax),
+            Err(()) => {
+                self.signals.force_signal(Signal::SIGSEGV, false);
+                Err(Errno::EFAULT)
+            }
+        }
     }
 }
 
@@ -63,6 +69,11 @@ pub(super) fn uctx_addr(ctx: &PtRegs) -> usize {
     // Skip parameters.
     ctx.esp
         .wrapping_add(offset_of!(SignalFrameRt, ucontext) - offset_of!(SignalFrameRt, signal))
+}
+
+/// Return the restored EAX after rt_sigreturn so the caller's writeback is idempotent.
+pub(super) fn sigreturn_rax(ctx: &PtRegs) -> usize {
+    ctx.eax
 }
 
 pub(super) fn sp(ctx: &PtRegs) -> usize {
@@ -93,6 +104,7 @@ impl SignalState {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        _in_syscall: bool,
     ) -> Result<(), DeliverFault> {
         if !action.flags.contains(SaFlags::RESTORER) {
             // No restorer was provided. This is optional on x86, but if one is
@@ -186,7 +198,7 @@ impl SignalState {
 pub(super) fn restore_sigcontext(
     ctx: &mut PtRegs,
     sigctx: &litebox_common_linux::signal::x86::Sigcontext,
-) -> usize {
+) -> Result<usize, ()> {
     let litebox_common_linux::signal::x86::Sigcontext {
         gs,
         fs,
@@ -229,7 +241,7 @@ pub(super) fn restore_sigcontext(
     ctx.eip = eip as usize;
     ctx.eflags = eflags as usize;
 
-    // TODO: restore fpstate
+    // TODO: restore fpstate for x86
 
-    ctx.eax
+    Ok(ctx.eax)
 }

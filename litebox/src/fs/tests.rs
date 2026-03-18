@@ -2052,4 +2052,72 @@ mod layered_stdio {
             "File should not exist"
         );
     }
+
+    #[test]
+    fn layered_ptmx_opens_are_distinct() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let layered_fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            devices::FileSystem::new(&litebox),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        let first = layered_fs
+            .open("/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .expect("Failed to open first /dev/ptmx");
+        let second = layered_fs
+            .open("/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .expect("Failed to open second /dev/ptmx");
+
+        let first_status = layered_fs
+            .fd_file_status(&first)
+            .expect("Failed to stat first /dev/ptmx");
+        let second_status = layered_fs
+            .fd_file_status(&second)
+            .expect("Failed to stat second /dev/ptmx");
+
+        assert_ne!(
+            first_status.node_info.rdev, second_status.node_info.rdev,
+            "each /dev/ptmx open should allocate a fresh PTY master"
+        );
+
+        layered_fs
+            .close(&first)
+            .expect("Failed to close first /dev/ptmx");
+        layered_fs
+            .close(&second)
+            .expect("Failed to close second /dev/ptmx");
+    }
+
+    #[test]
+    fn layered_stderr_open_ignores_create_mode_bits() {
+        let platform = MockPlatform::new();
+        let litebox = LiteBox::new(platform);
+        let layered_fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            devices::FileSystem::new(&litebox),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        let fd = layered_fs
+            .open(
+                "/dev/stderr",
+                OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC | OFlags::LARGEFILE,
+                Mode::RWXU | Mode::RWXG | Mode::RWXO,
+            )
+            .expect("Failed to open /dev/stderr with shell-style redirection flags");
+
+        let data = b"stderr redirection still writes";
+        layered_fs
+            .write(&fd, data, None)
+            .expect("Failed to write redirected stderr");
+        layered_fs
+            .close(&fd)
+            .expect("Failed to close redirected stderr");
+
+        assert_eq!(litebox.x.platform.stderr_queue.read().unwrap().len(), 1);
+        assert_eq!(litebox.x.platform.stderr_queue.read().unwrap()[0], data);
+    }
 }

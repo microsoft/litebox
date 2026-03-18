@@ -37,6 +37,12 @@ extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *m
         let ucontext = &mut *(context.cast::<libc::ucontext_t>());
         ucontext.uc_mcontext.gregs[libc::REG_RCX as usize] = addr as i64;
 
+        // Store the syscall call-site address in R11 so that SA_RESTART
+        // can rewind to it. The rewriter trampoline does this via LEA;
+        // for the seccomp path we must do it here since the real `syscall`
+        // instruction puts RFLAGS in R11 instead.
+        ucontext.uc_mcontext.gregs[libc::REG_R11 as usize] = addr as i64;
+
         // TODO: hotpatch the syscall instruction to jump to the `sigsys_callback`
         // to avoid traps again.
         let rip = &mut ucontext.uc_mcontext.gregs[libc::REG_RIP as usize];

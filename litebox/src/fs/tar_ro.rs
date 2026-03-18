@@ -40,7 +40,7 @@ use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+        ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
     },
 };
 
@@ -452,6 +452,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         } else {
             Err(PathError::NoSuchFileOrDirectory)?
         }
+    }
+
+    fn rename(
+        &self,
+        _old: impl crate::path::Arg,
+        _new: impl crate::path::Arg,
+    ) -> Result<(), RenameError> {
+        Err(RenameError::ReadOnlyFileSystem)
     }
 
     fn mkdir(&self, _path: impl crate::path::Arg, _mode: Mode) -> Result<(), MkdirError> {

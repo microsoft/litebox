@@ -99,6 +99,16 @@ pub enum ListenError {
     NoAvailableFreeEphemeralPorts,
 }
 
+/// Possible errors from [`Network::shutdown`]
+#[non_exhaustive]
+#[derive(Error, Clone, Copy, Debug)]
+pub enum ShutdownError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
+    #[error("Socket is not connected")]
+    NotConnected,
+}
+
 /// Possible errors from [`Network::accept`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

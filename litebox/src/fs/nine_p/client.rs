@@ -71,6 +71,32 @@ pub(super) struct Client<Platform: RawSyncPrimitivesProvider, T: Read + Write> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
+    /// Allocate the next request tag, wrapping back to `1` before `NOTAG`.
+    ///
+    /// This client is synchronous and holds the transport lock until the
+    /// matching response is read, so there is never more than one request
+    /// in flight. That means tags only need to avoid `NOTAG`; they do not
+    /// need to be globally unique for the entire lifetime of the connection.
+    fn next_request_tag(&self) -> u16 {
+        let mut current = self.next_tag.load(Ordering::Relaxed);
+        loop {
+            let tag = match current {
+                0 | fcall::NOTAG => 1,
+                _ => current,
+            };
+            let next = if tag == fcall::NOTAG - 1 { 1 } else { tag + 1 };
+            match self.next_tag.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return tag,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     /// Create a new 9P client and perform version negotiation
     ///
     /// # Arguments
@@ -95,7 +121,10 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 }),
             },
         )
-        .map_err(|_| Error::Io)?;
+        .map_err(|e| match e {
+            transport::WriteError::Interrupted => Error::Interrupted,
+            transport::WriteError::Io => Error::Io,
+        })?;
 
         let response = transport::read_message(&mut transport, &mut rbuf)?;
 
@@ -133,15 +162,16 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     where
         F: FnOnce(Fcall<'_>) -> Result<R, Error>,
     {
-        let tag = self.next_tag.fetch_add(1, Ordering::Relaxed);
-        if tag == fcall::NOTAG {
-            todo!("tag wraparound");
-        }
+        let tag = self.next_request_tag();
 
         let mut write_state = self.write_state.lock();
         let ClientWriteState { transport, wbuf } = &mut *write_state;
-        transport::write_message(transport, wbuf, TaggedFcall { tag, fcall })
-            .map_err(|_| Error::Io)?;
+        transport::write_message(transport, wbuf, TaggedFcall { tag, fcall }).map_err(
+            |e| match e {
+                transport::WriteError::Interrupted => Error::Interrupted,
+                transport::WriteError::Io => Error::Io,
+            },
+        )?;
 
         let mut rbuf = self.rbuf.lock();
 
@@ -238,12 +268,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             f = new_f;
             // It means that the walk failed at the nwqid-th element
             if new_len < wnames.len() {
-                if wqids
-                    .last()
-                    .is_some_and(|e| e.typ == fcall::QidType::SYMLINK)
-                {
-                    todo!("symlink");
-                }
                 let _ = self.clunk(f);
                 return Err(Error::Remote(super::ENOENT));
             }
@@ -480,7 +504,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Rename a file
-    #[expect(dead_code)]
     pub(super) fn rename(
         &self,
         fid: fcall::Fid,
@@ -543,5 +566,115 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Use this when the fid has already been invalidated (e.g., after remove)
     pub(super) fn free_fid(&self, fid: fcall::Fid) {
         self.fids.free(fid);
+    }
+
+    /// Read the target of a symbolic link
+    pub(super) fn readlink(&self, fid: fcall::Fid) -> Result<alloc::vec::Vec<u8>, Error> {
+        self.fcall(
+            Fcall::Treadlink(fcall::Treadlink { fid }),
+            |response| match response {
+                Fcall::Rreadlink(r) => Ok(r.target.into_owned()),
+                Fcall::Rlerror(e) => Err(Error::from(e)),
+                _ => Err(Error::InvalidResponse),
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use std::io::{Cursor, Read as _};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use crate::platform::mock::MockPlatform;
+
+    use super::*;
+
+    struct MockTransport {
+        reads: Cursor<Vec<u8>>,
+        writes: Arc<StdMutex<Vec<Vec<u8>>>>,
+    }
+
+    impl MockTransport {
+        fn new(reads: Vec<u8>, writes: Arc<StdMutex<Vec<Vec<u8>>>>) -> Self {
+            Self {
+                reads: Cursor::new(reads),
+                writes,
+            }
+        }
+    }
+
+    impl Read for MockTransport {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
+            self.reads.read(buf).map_err(|_| transport::ReadError::Io)
+        }
+    }
+
+    impl Write for MockTransport {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
+            self.writes.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+    }
+
+    fn encode_message(msg: TaggedFcall<'_>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        transport::write_message(&mut buf, &mut Vec::new(), msg).expect("encode message");
+        buf
+    }
+
+    #[test]
+    fn request_tag_wraps_before_notag() {
+        let writes = Arc::new(StdMutex::new(Vec::new()));
+        let mut responses = Vec::new();
+        responses.extend(encode_message(TaggedFcall {
+            tag: fcall::NOTAG,
+            fcall: Fcall::Rversion(fcall::Rversion {
+                msize: 8192,
+                version: fcall::FcallStr::Borrowed(b"9P2000.L"),
+            }),
+        }));
+        responses.extend(encode_message(TaggedFcall {
+            tag: fcall::NOTAG - 1,
+            fcall: Fcall::Rclunk(fcall::Rclunk {}),
+        }));
+        responses.extend(encode_message(TaggedFcall {
+            tag: 1,
+            fcall: Fcall::Rclunk(fcall::Rclunk {}),
+        }));
+
+        let client =
+            Client::<MockPlatform, _>::new(MockTransport::new(responses, writes.clone()), 8192)
+                .expect("client should initialize");
+        client.next_tag.store(fcall::NOTAG - 1, Ordering::Relaxed);
+
+        client
+            .fcall(
+                Fcall::Tclunk(fcall::Tclunk { fid: 10 }),
+                |response| match response {
+                    Fcall::Rclunk(_) => Ok(()),
+                    _ => Err(Error::InvalidResponse),
+                },
+            )
+            .expect("first request should succeed");
+        client
+            .fcall(
+                Fcall::Tclunk(fcall::Tclunk { fid: 11 }),
+                |response| match response {
+                    Fcall::Rclunk(_) => Ok(()),
+                    _ => Err(Error::InvalidResponse),
+                },
+            )
+            .expect("second request should succeed");
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 3, "version + 2 requests should be written");
+
+        let first = TaggedFcall::decode(&writes[1]).expect("decode first request");
+        let second = TaggedFcall::decode(&writes[2]).expect("decode second request");
+        assert_eq!(first.tag, fcall::NOTAG - 1);
+        assert_eq!(second.tag, 1);
     }
 }

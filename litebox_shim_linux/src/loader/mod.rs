@@ -10,6 +10,9 @@ mod stack;
 
 pub(crate) const DEFAULT_STACK_SIZE: usize = 8 * 1024 * 1024; // 8 MB
 
-/// A default low address is used for the binary (which grows upwards) to avoid
-/// conflicts with the kernel's memory mappings (which grows downwards).
-pub(crate) const DEFAULT_LOW_ADDR: usize = 0x1000_0000;
+/// Offset from a partition's base at which PIE binaries are loaded.
+///
+/// This keeps the low portion of each partition unmapped, mirroring Linux's
+/// behaviour where addresses below `mmap_min_addr` are reserved for
+/// NULL-pointer dereference detection.
+pub(crate) const PIE_LOAD_OFFSET: usize = 0x1000_0000; // 256 MiB

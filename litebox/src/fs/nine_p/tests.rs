@@ -30,13 +30,15 @@ impl TcpTransport {
 
 impl transport::Read for TcpTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
-        self.stream.read(buf).map_err(|_| transport::ReadError)
+        self.stream.read(buf).map_err(|_| transport::ReadError::Io)
     }
 }
 
 impl transport::Write for TcpTransport {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
-        self.stream.write(buf).map_err(|_| transport::WriteError)
+        self.stream
+            .write(buf)
+            .map_err(|_| transport::WriteError::Io)
     }
 }
 
@@ -480,7 +482,7 @@ impl BrokenTransport {
 impl transport::Read for BrokenTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
         if self.broken.load(Ordering::SeqCst) {
-            return Err(transport::ReadError);
+            return Err(transport::ReadError::Io);
         }
         self.inner.read(buf)
     }
@@ -490,7 +492,7 @@ impl transport::Write for BrokenTransport {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
         if self.remaining_writes.load(Ordering::SeqCst) == 0 {
             self.broken.store(true, Ordering::SeqCst);
-            return Err(transport::WriteError);
+            return Err(transport::WriteError::Io);
         }
         self.remaining_writes.fetch_sub(1, Ordering::SeqCst);
         self.inner.write(buf)

@@ -72,13 +72,17 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
+        // Start PIE binaries at a fixed offset into the partition so that the
+        // low addresses remain unmapped (NULL-dereference guard region).
+        let hint = self.task.process_state.borrow().pm.addr_min() + super::PIE_LOAD_OFFSET;
+
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
         let mapping_ptr = self
             .task
             .sys_mmap(
-                super::DEFAULT_LOW_ADDR,
+                hint,
                 mapping_len,
                 litebox_common_linux::ProtFlags::PROT_NONE,
                 litebox_common_linux::MapFlags::MAP_ANONYMOUS
@@ -172,7 +176,7 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point())?;
+        let _ = parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point());
         Ok(Self { file, parsed })
     }
 }
@@ -185,7 +189,6 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
 
         // Parse the interpreter ELF file, if any.
         let interp = if let Some(interp_name) = main.parsed.interp(&mut &main.file)? {
-            // e.g., /lib64/ld-linux-x86-64.so.2
             Some(FileAndParsed::new(task, interp_name)?)
         } else {
             None
@@ -202,6 +205,17 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         mut aux: AuxVec,
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let global = &self.main.file.task.global;
+        let process_state = self.main.file.task.process_state.borrow();
+
+        // Reject ET_EXEC binaries whose fixed load addresses fall outside the
+        // process's VA partition (e.g., a child process in a higher slot).
+        if let Some(fixed_range) = self.main.parsed.fixed_load_range() {
+            let pm_min = process_state.pm.addr_min();
+            let pm_max = process_state.pm.addr_max();
+            if fixed_range.start < pm_min || fixed_range.end > pm_max {
+                return Err(ElfLoaderError::OutOfRange);
+            }
+        }
 
         // Load the main ELF file first so that it gets privileged addresses.
         let info = self
@@ -220,7 +234,13 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
             None
         };
 
-        global.pm.set_initial_brk(info.brk);
+        process_state.pm.set_initial_brk(info.brk);
+        process_state
+            .main_bss_start
+            .store(info.bss_start, core::sync::atomic::Ordering::Relaxed);
+        process_state
+            .main_bss_end
+            .store(info.bss_end, core::sync::atomic::Ordering::Relaxed);
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
         aux.insert(AuxKey::AT_PHDR, info.phdrs_addr);
         aux.insert(AuxKey::AT_PHENT, info.phent_size());
@@ -236,7 +256,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         let sp = unsafe {
             let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
-            global
+            process_state
                 .pm
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?
@@ -271,17 +291,25 @@ pub enum ElfLoaderError {
     InvalidStackAddr,
     #[error("failed to mmap")]
     MappingError(#[from] MappingError),
+    #[error("ET_EXEC load addresses outside process VA range")]
+    OutOfRange,
 }
 
 impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
     fn from(value: ElfLoaderError) -> Self {
         match value {
             ElfLoaderError::OpenError(e) => e,
-            ElfLoaderError::ParseError(e) => e.into(),
+            // Map parse errors to ENOENT rather than ENOEXEC. Returning
+            // ENOEXEC for non-ELF files (e.g. scripts) would cause glibc to
+            // retry execution via /bin/sh, which we don't support.
+            ElfLoaderError::ParseError(_) => litebox_common_linux::errno::Errno::ENOENT,
             ElfLoaderError::InvalidStackAddr | ElfLoaderError::MappingError(_) => {
                 litebox_common_linux::errno::Errno::ENOMEM
             }
             ElfLoaderError::LoadError(e) => e.into(),
+            // OutOfRange means the binary's load address doesn't fit in the
+            // current VA partition (e.g. non-PIE at 0x400000 in a child slot).
+            ElfLoaderError::OutOfRange => litebox_common_linux::errno::Errno::ENOMEM,
         }
     }
 }

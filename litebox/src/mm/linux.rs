@@ -300,29 +300,80 @@ impl VmArea {
 pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> {
     /// Memory backend that provides the actual memory.
     pub(super) platform: &'static Platform,
+    /// Initial program break address. `brk` may not shrink below this value.
+    pub(super) brk_base: usize,
     /// Current program break address.
     pub(super) brk: usize,
+    /// Page-aligned heap frontier that is actually backed or intentionally
+    /// reserved for contiguous `brk` growth.
+    pub(super) brk_frontier: usize,
     /// Virtual memory areas.
     vmas: RangeMap<usize, VmArea>,
+    /// Lower bound (inclusive) of the VA range this Vmem manages.
+    addr_min: usize,
+    /// Upper bound (exclusive) of the VA range this Vmem manages.
+    addr_max: usize,
 }
 
 impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
-    /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
-    pub(super) fn new(platform: &'static Platform) -> Self {
+    /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider)
+    /// and VA range.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is empty, not page-aligned, or exceeds the
+    /// platform's `TASK_ADDR_MIN..TASK_ADDR_MAX`.
+    pub(super) fn new(platform: &'static Platform, range: Range<usize>) -> Self {
+        assert!(
+            range.start < range.end,
+            "Vmem: range must be non-empty ({:#x}..{:#x})",
+            range.start,
+            range.end,
+        );
+        assert!(
+            range.start.is_multiple_of(ALIGN) && range.end.is_multiple_of(ALIGN),
+            "Vmem: range bounds must be aligned to {ALIGN} bytes ({:#x}..{:#x})",
+            range.start,
+            range.end,
+        );
+        assert!(
+            range.start >= Platform::TASK_ADDR_MIN,
+            "Vmem: range start {:#x} < TASK_ADDR_MIN {:#x}",
+            range.start,
+            Platform::TASK_ADDR_MIN,
+        );
+        assert!(
+            range.end <= Platform::TASK_ADDR_MAX,
+            "Vmem: range end {:#x} > TASK_ADDR_MAX {:#x}",
+            range.end,
+            Platform::TASK_ADDR_MAX,
+        );
         let mut vmem = Self {
             vmas: RangeMap::new(),
+            brk_base: 0,
             brk: 0,
+            brk_frontier: 0,
             platform,
+            addr_min: range.start,
+            addr_max: range.end,
         };
         for each in platform.reserved_pages() {
             assert!(
                 each.start % ALIGN == 0 && each.end % ALIGN == 0,
                 "Vmem: reserved range is not aligned to {ALIGN} bytes"
             );
+            // Clip reserved ranges to the configured process range. Entries
+            // entirely outside addr_min..addr_max are skipped; partially
+            // overlapping entries are clamped.
+            let clamped_start = each.start.max(vmem.addr_min);
+            let clamped_end = each.end.min(vmem.addr_max);
+            if clamped_start >= clamped_end {
+                continue;
+            }
             vmem.vmas.insert(
-                each.start..each.end,
+                clamped_start..clamped_end,
                 VmArea {
                     flags: VmFlags::empty(),
                     is_file_backed: false,
@@ -330,6 +381,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             );
         }
         vmem
+    }
+
+    /// Lower bound (inclusive) of the VA range managed by this Vmem.
+    pub(super) fn addr_min(&self) -> usize {
+        self.addr_min
+    }
+
+    /// Upper bound (exclusive) of the VA range managed by this Vmem.
+    pub(super) fn addr_max(&self) -> usize {
+        self.addr_max
     }
 
     /// Gets an iterator over all pairs of ([`Range<usize>`], [`VmArea`]),
@@ -453,10 +514,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let (start, end) = (suggested_range.start, suggested_range.end);
-        if start < Platform::TASK_ADDR_MIN {
+        if start < self.addr_min {
             return Err(AllocationError::BelowMinAddress);
         }
-        if end > Platform::TASK_ADDR_MAX {
+        if end > self.addr_max {
             return Err(AllocationError::AboveMaxAddress);
         }
         let platform_fixed_address_behavior = match fixed_address_behavior {
@@ -518,8 +579,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
         self.vmas.insert(new_start..new_end, vma);
-        debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
-        debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
+        debug_assert!(new_start >= self.addr_min);
+        debug_assert!(new_end <= self.addr_max);
         Ok(ret)
     }
 
@@ -890,34 +951,37 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         fixed_addr: bool,
     ) -> Option<usize> {
         let size = length.as_usize();
-        if size > Platform::TASK_ADDR_MAX {
+        let range_span = self.addr_max - self.addr_min;
+        if size > range_span {
             return None;
         }
         if let Some(suggested_address) = suggested_address {
-            if (Platform::TASK_ADDR_MAX - size) < suggested_address.0 {
-                return None;
+            let hint = suggested_address.0;
+            let hint_end = hint.saturating_add(size);
+            let in_range = hint >= self.addr_min && hint_end <= self.addr_max;
+
+            if fixed_addr {
+                // Fixed: always honour the hint; insert_mapping will reject
+                // out-of-range addresses with BelowMinAddress / AboveMaxAddress.
+                return Some(hint);
             }
-            if fixed_addr
-                || !self
-                    .vmas
-                    .overlaps(&(suggested_address.0..(suggested_address.0 + size)))
-            {
-                return Some(suggested_address.0);
+            // Non-fixed: use the hint only when it fits inside the range and
+            // doesn't overlap existing mappings. Otherwise fall through to the
+            // top-down search.
+            if in_range && !self.vmas.overlaps(&(hint..hint_end)) {
+                return Some(hint);
             }
         } else if fixed_addr {
             // MAP_FIXED with addr=0: return 0 so insert_mapping rejects it
-            // via the TASK_ADDR_MIN check (BelowMinAddress → EPERM).
+            // via the addr_min check (BelowMinAddress → EPERM).
             return Some(0);
         }
 
         // top down
         // 1. check [last_end, TASK_SIZE_MAX)
-        let (low_limit, high_limit) = (
-            Platform::TASK_ADDR_MIN,
-            Platform::TASK_ADDR_MAX - length.as_usize(),
-        );
-        debug_assert!(Platform::TASK_ADDR_MIN % ALIGN == 0);
-        debug_assert!(Platform::TASK_ADDR_MAX % ALIGN == 0);
+        let (low_limit, high_limit) = (self.addr_min, self.addr_max - length.as_usize());
+        debug_assert!(self.addr_min.is_multiple_of(ALIGN));
+        debug_assert!(self.addr_max.is_multiple_of(ALIGN));
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         if last_end <= high_limit {
             return Some(high_limit);

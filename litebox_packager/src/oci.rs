@@ -7,9 +7,8 @@
 //! extracts its filesystem layers into a temporary rootfs directory, then
 //! walks the rootfs to discover all ELF files for syscall rewriting.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -38,6 +37,9 @@ pub struct ExtractedImage {
     pub config: ImageConfig,
     /// Raw OCI image config JSON blob (the full config descriptor data).
     pub config_json: Vec<u8>,
+    /// Symlinks collected during layer extraction (used for cross-platform
+    /// resolution since OS symlinks may not work on all platforms).
+    pub symlinks: Vec<DeferredSymlink>,
 }
 
 /// Result of scanning an extracted rootfs for files to package.
@@ -96,6 +98,17 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     let image_data = rt.block_on(async {
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
+            // Always pull linux/amd64 images regardless of host platform.
+            platform_resolver: Some(Box::new(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry.platform.as_ref().is_some_and(|p| {
+                            p.os == "linux".into() && p.architecture == "amd64".into()
+                        })
+                    })
+                    .map(|e| e.digest.clone())
+            })),
             ..Default::default()
         };
         let client = Client::new(config);
@@ -134,6 +147,7 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     std::fs::create_dir_all(&rootfs_path).context("failed to create rootfs directory")?;
 
     // Extract layers in order (bottom layer first)
+    let mut symlinks: Vec<DeferredSymlink> = Vec::new();
     for (i, layer) in image_data.layers.iter().enumerate() {
         if verbose {
             eprintln!(
@@ -143,9 +157,16 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
                 layer.data.len()
             );
         }
-        extract_layer(&layer.data, &layer.media_type, &rootfs_path)
+        extract_layer(&layer.data, &layer.media_type, &rootfs_path, &mut symlinks)
             .with_context(|| format!("failed to extract layer {}", i + 1))?;
     }
+
+    // Materialize symlinks cross-platform: resolve chains through the in-memory
+    // map and copy target files (or create directories) instead of OS symlinks.
+    if verbose {
+        eprintln!("  Resolving {} symlinks...", symlinks.len());
+    }
+    materialize_symlinks(&symlinks, &rootfs_path, verbose)?;
 
     if verbose {
         eprintln!("  Rootfs extracted to {}", rootfs_path.display());
@@ -188,6 +209,7 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         rootfs_path,
         config,
         config_json,
+        symlinks,
     })
 }
 
@@ -280,16 +302,22 @@ fn shell_escape(s: &str) -> String {
 /// Extract a single OCI layer (tar or tar+gzip) into the rootfs directory.
 ///
 /// Handles OCI whiteout files (`.wh.*` prefixed entries) which indicate
-/// files deleted in upper layers.
-fn extract_layer(data: &[u8], media_type: &str, rootfs: &Path) -> anyhow::Result<()> {
+/// files deleted in upper layers. Symlinks are collected into `symlinks` for
+/// cross-platform resolution after all layers are extracted.
+fn extract_layer(
+    data: &[u8],
+    media_type: &str,
+    rootfs: &Path,
+    symlinks: &mut Vec<DeferredSymlink>,
+) -> anyhow::Result<()> {
     // Determine if the layer is gzipped
     let is_gzip = media_type.contains("gzip") || is_gzip_data(data);
 
     if is_gzip {
         let decoder = flate2::read::GzDecoder::new(data);
-        extract_tar(decoder, rootfs)
+        extract_tar(decoder, rootfs, symlinks)
     } else {
-        extract_tar(data, rootfs)
+        extract_tar(data, rootfs, symlinks)
     }
 }
 
@@ -306,11 +334,26 @@ struct DeferredHardLink {
     link_source: PathBuf,
 }
 
+/// Tracked symlink from a container image layer.
+pub struct DeferredSymlink {
+    /// Relative path inside the rootfs (e.g., `usr/lib64/ld-linux-x86-64.so.2`).
+    rel_path: PathBuf,
+    /// Symlink target as stored in the tar (Unix-style, may be relative or absolute).
+    link_target: PathBuf,
+}
+
 /// Extract a tar archive into the rootfs, handling OCI whiteout files.
 ///
-/// Hard links whose targets appear later in the archive are collected during
-/// the first pass and resolved after all regular entries have been extracted.
-fn extract_tar<R: Read>(reader: R, rootfs: &Path) -> anyhow::Result<()> {
+/// Symlinks are NOT created as OS symlinks. Instead they are tracked in
+/// `symlinks` so the caller can resolve them cross-platform after all layers
+/// are extracted. Hard links whose targets appear later in the archive are
+/// collected during the first pass and resolved after all regular entries
+/// have been extracted.
+fn extract_tar<R: Read>(
+    reader: R,
+    rootfs: &Path,
+    symlinks: &mut Vec<DeferredSymlink>,
+) -> anyhow::Result<()> {
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_unpack_xattrs(true);
@@ -364,11 +407,12 @@ fn extract_tar<R: Read>(reader: R, rootfs: &Path) -> anyhow::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
 
+        let entry_type = entry.header().entry_type();
+
         // Handle hard links: copy the link target instead of creating an OS
         // hard link. The tar crate's unpack() tries std::fs::hard_link which
         // can fail if the target hasn't been extracted yet (ordering issue),
         // and the litebox filesystem doesn't support hard links anyway.
-        let entry_type = entry.header().entry_type();
         if entry_type == tar::EntryType::Link {
             let link_name = entry
                 .link_name()?
@@ -393,7 +437,26 @@ fn extract_tar<R: Read>(reader: R, rootfs: &Path) -> anyhow::Result<()> {
             continue;
         }
 
-        // Normal file/directory/symlink: use the standard unpack
+        // Track symlinks in memory instead of creating OS symlinks.
+        // OS symlinks on Windows require special privileges and don't handle
+        // Unix-style relative paths reliably, so we resolve them ourselves
+        // after all layers are extracted.
+        if entry_type == tar::EntryType::Symlink {
+            let link_target = entry
+                .link_name()?
+                .context("symlink entry has no link name")?
+                .into_owned();
+            // A later layer may override this symlink, so remove any stale
+            // entry with the same rel_path.
+            symlinks.retain(|s| s.rel_path != path);
+            symlinks.push(DeferredSymlink {
+                rel_path: path.clone(),
+                link_target,
+            });
+            continue;
+        }
+
+        // Normal file/directory: use the standard unpack
         entry
             .unpack(&target)
             .with_context(|| format!("failed to unpack entry: {path_str}"))?;
@@ -426,20 +489,220 @@ fn extract_tar<R: Read>(reader: R, rootfs: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve a symlink target within the rootfs using the symlink map.
+///
+/// Handles both absolute targets (e.g., `/lib/x86_64-linux-gnu/ld.so`) and
+/// relative targets (e.g., `../lib/x86_64-linux-gnu/ld.so`). Follows symlink
+/// chains up to `max_depth` hops.
+fn resolve_symlink_in_rootfs(
+    rel_path: &Path,
+    rootfs: &Path,
+    symlink_map: &HashMap<PathBuf, PathBuf>,
+    max_depth: u32,
+) -> Option<PathBuf> {
+    if max_depth == 0 {
+        return None;
+    }
+
+    // Check if this rel_path is itself a symlink
+    if let Some(link_target) = symlink_map.get(rel_path) {
+        // Resolve the target to a new rel_path
+        let resolved_rel = if is_unix_absolute(link_target) {
+            strip_unix_root(link_target)
+        } else {
+            // Relative target: resolve from parent of the symlink
+            let parent = rel_path.parent().unwrap_or(Path::new(""));
+            normalize_path(&parent.join(link_target))
+        };
+        // Recurse to follow chains
+        return resolve_symlink_in_rootfs(&resolved_rel, rootfs, symlink_map, max_depth - 1);
+    }
+
+    // Not a symlink — check if any ancestor is a symlink (e.g., `lib64/foo` where
+    // `lib64` → `usr/lib64`).
+    let components: Vec<_> = rel_path.components().collect();
+    for i in 1..components.len() {
+        let prefix: PathBuf = components[..i].iter().collect();
+        if let Some(link_target) = symlink_map.get(&prefix) {
+            let resolved_prefix = if is_unix_absolute(link_target) {
+                strip_unix_root(link_target)
+            } else {
+                let parent = prefix.parent().unwrap_or(Path::new(""));
+                normalize_path(&parent.join(link_target))
+            };
+            let suffix: PathBuf = components[i..].iter().collect();
+            let new_rel = resolved_prefix.join(suffix);
+            return resolve_symlink_in_rootfs(&new_rel, rootfs, symlink_map, max_depth - 1);
+        }
+    }
+
+    let host_path = rootfs.join(rel_path);
+    if host_path.exists() {
+        Some(host_path)
+    } else {
+        None
+    }
+}
+
+/// Check if a path starts with `/` (Unix-style absolute).
+///
+/// On Windows, `Path::is_absolute()` requires a drive letter, so Unix-style
+/// paths like `/lib/foo` are not detected as absolute. This helper checks
+/// the raw string instead.
+fn is_unix_absolute(path: &Path) -> bool {
+    path.as_os_str()
+        .to_str()
+        .is_some_and(|s| s.starts_with('/'))
+        || path.is_absolute()
+}
+
+/// Strip the leading `/` from a Unix-style absolute path to make it
+/// rootfs-relative. Returns the path unchanged if it doesn't start with `/`.
+fn strip_unix_root(path: &Path) -> PathBuf {
+    if let Some(stripped) = path.as_os_str().to_str().and_then(|s| s.strip_prefix('/')) {
+        return PathBuf::from(stripped);
+    }
+    path.strip_prefix("/").unwrap_or(path).to_path_buf()
+}
+
+/// Normalize a path by resolving `.` and `..` components without touching the
+/// filesystem (no symlink resolution, no existence checks). Strips any root
+/// component so the result is always a relative path.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::CurDir | std::path::Component::RootDir => {}
+            c => result.push(c),
+        }
+    }
+    result.iter().collect()
+}
+
+/// Materialize all deferred symlinks by copying or creating directories.
+///
+/// This is called after all OCI layers have been extracted, so every real file
+/// should be on disk. Symlinks are resolved through the in-memory map (handling
+/// chains like `lib64` → `usr/lib64` → real dir) and then:
+/// - File symlinks: the target file is copied to the symlink location.
+/// - Directory symlinks: an empty directory is created (its contents will be
+///   expanded by `scan_rootfs`'s dir-symlink logic).
+fn materialize_symlinks(
+    symlinks: &[DeferredSymlink],
+    rootfs: &Path,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    // Build a map for O(1) lookup during resolution.
+    let symlink_map: HashMap<PathBuf, PathBuf> = symlinks
+        .iter()
+        .map(|s| (s.rel_path.clone(), s.link_target.clone()))
+        .collect();
+
+    for sym in symlinks {
+        let host_path = rootfs.join(&sym.rel_path);
+        if host_path.exists() {
+            // A later layer may have replaced the symlink with a real file.
+            continue;
+        }
+
+        if let Some(resolved) = resolve_symlink_in_rootfs(
+            &sym.rel_path,
+            rootfs,
+            &symlink_map,
+            32, // max chain depth
+        ) {
+            if let Some(parent) = host_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            if resolved.is_dir() {
+                // Directory symlink: create directory placeholder.
+                // scan_rootfs will discover this is a "dir symlink" and expand
+                // it through the symlink_map.
+                std::fs::create_dir_all(&host_path)?;
+                if verbose {
+                    eprintln!(
+                        "  [symlink→dir] {} -> {}",
+                        sym.rel_path.display(),
+                        sym.link_target.display()
+                    );
+                }
+            } else if resolved.is_file() {
+                std::fs::copy(&resolved, &host_path).with_context(|| {
+                    format!(
+                        "failed to materialize symlink {} -> {}",
+                        sym.rel_path.display(),
+                        resolved.display()
+                    )
+                })?;
+                if verbose {
+                    eprintln!(
+                        "  [symlink→file] {} -> {}",
+                        sym.rel_path.display(),
+                        sym.link_target.display()
+                    );
+                }
+            }
+        } else if verbose {
+            eprintln!(
+                "  [symlink-broken] {} -> {} (unresolvable)",
+                sym.rel_path.display(),
+                sym.link_target.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Scan an extracted rootfs directory and build a file map for packaging.
 ///
 /// Walks the rootfs directory tree and collects all regular files with their
-/// paths and permission bits. Symlinks are resolved within the rootfs context
-/// and flattened into regular file copies (the litebox tar RO filesystem does
-/// not support symlinks).
+/// paths and permission bits. After `materialize_symlinks` has been called,
+/// file symlinks are already materialized as regular file copies on disk.
 ///
-/// **Directory symlinks** (e.g., `/lib64` → `/usr/lib64`) are expanded: all
-/// files under the target directory are duplicated under the symlink's path
-/// prefix so that paths like `/lib64/ld-linux-x86-64.so.2` exist in the tar.
-pub fn scan_rootfs(rootfs: &Path, verbose: bool) -> anyhow::Result<RootfsFileMap> {
+/// `deferred_symlinks` provides the original symlink map from extraction so
+/// that **directory symlinks** (e.g., `lib64` → `usr/lib64`) can be expanded:
+/// all files under the target directory are duplicated under the symlink's
+/// path prefix so that paths like `lib64/ld-linux-x86-64.so.2` exist in the tar.
+pub fn scan_rootfs(
+    rootfs: &Path,
+    deferred_symlinks: &[DeferredSymlink],
+    verbose: bool,
+) -> anyhow::Result<RootfsFileMap> {
     let mut files = BTreeMap::new();
-    // Collect directory symlinks to expand after the initial walk.
+
+    // Build the symlink map for resolution.
+    let symlink_map: HashMap<PathBuf, PathBuf> = deferred_symlinks
+        .iter()
+        .map(|s| (s.rel_path.clone(), s.link_target.clone()))
+        .collect();
+
+    // Identify directory symlinks and their resolved targets on disk.
     let mut dir_symlinks: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for sym in deferred_symlinks {
+        let host_path = rootfs.join(&sym.rel_path);
+        if host_path.is_dir() {
+            // This dir symlink was materialized as an empty directory.
+            // Resolve the target to find the real directory to expand from.
+            if let Some(resolved) =
+                resolve_symlink_in_rootfs(&sym.rel_path, rootfs, &symlink_map, 32)
+                    .filter(|r| r.is_dir())
+            {
+                if verbose {
+                    eprintln!(
+                        "  [dir-symlink] {} -> {}",
+                        sym.rel_path.display(),
+                        sym.link_target.display()
+                    );
+                }
+                dir_symlinks.push((host_path, resolved));
+            }
+        }
+    }
 
     for entry in walkdir::WalkDir::new(rootfs)
         .follow_links(false)
@@ -454,10 +717,12 @@ pub fn scan_rootfs(rootfs: &Path, verbose: bool) -> anyhow::Result<RootfsFileMap
         }
 
         let tar_path = rel_path.to_string_lossy().to_string();
+        // Normalize path separators to Unix-style for the tar archive.
+        let tar_path = tar_path.replace('\\', "/");
 
         if entry.file_type().is_file() {
             let metadata = entry.metadata()?;
-            let mode = metadata.permissions().mode() & 0o7777;
+            let mode = super::file_mode(&metadata) & 0o7777;
             let is_executable = mode & 0o111 != 0;
 
             if verbose && is_executable {
@@ -474,28 +739,23 @@ pub fn scan_rootfs(rootfs: &Path, verbose: bool) -> anyhow::Result<RootfsFileMap
                 },
             );
         } else if entry.file_type().is_symlink() {
-            // Resolve symlink within rootfs and flatten to a regular file copy.
-            // Use the symlink's own path as the map key so that every symlink
-            // produces its own tar entry (multiple symlinks that resolve to the
-            // same target each get their own copy in the tar, matching the
-            // behaviour expected by the litebox filesystem which has no symlinks).
+            // On platforms that still have OS symlinks (Linux), resolve them.
             if let Some(resolved) = resolve_in_rootfs(entry.path(), rootfs, 16) {
                 if resolved.is_file() {
                     let metadata = std::fs::metadata(&resolved)?;
-                    let mode = metadata.permissions().mode() & 0o7777;
+                    let mode = super::file_mode(&metadata) & 0o7777;
                     let is_executable = mode & 0o111 != 0;
 
                     files.insert(
                         entry.path().to_path_buf(),
                         RootfsEntry {
                             tar_path,
-                            read_path: resolved,
+                            read_path: resolved.clone(),
                             is_executable,
                             mode,
                         },
                     );
                 } else if resolved.is_dir() {
-                    // Directory symlink: record for expansion below.
                     if verbose {
                         eprintln!("  [dir-symlink] {tar_path} -> {}", resolved.display());
                     }
@@ -552,6 +812,8 @@ pub fn scan_rootfs(rootfs: &Path, verbose: bool) -> anyhow::Result<RootfsFileMap
                 .strip_prefix(resolved_dir)
                 .unwrap_or(entry.path());
             let tar_path = symlink_rel.join(entry_rel).to_string_lossy().to_string();
+            // Normalize path separators to Unix-style for the tar archive.
+            let tar_path = tar_path.replace('\\', "/");
 
             // Use symlink_host_path-based key to avoid colliding with the
             // original entry under the resolved directory.
@@ -563,7 +825,7 @@ pub fn scan_rootfs(rootfs: &Path, verbose: bool) -> anyhow::Result<RootfsFileMap
             }
 
             let metadata = std::fs::metadata(&read_path)?;
-            let mode = metadata.permissions().mode() & 0o7777;
+            let mode = super::file_mode(&metadata) & 0o7777;
             let is_executable = mode & 0o111 != 0;
 
             if verbose {
@@ -607,9 +869,9 @@ fn resolve_in_rootfs(path: &Path, rootfs: &Path, max_depth: u32) -> Option<PathB
     }
 
     let link_target = std::fs::read_link(path).ok()?;
-    let resolved = if link_target.is_absolute() {
+    let resolved = if is_unix_absolute(&link_target) {
         // Absolute symlink: resolve within rootfs
-        rootfs.join(link_target.strip_prefix("/").unwrap_or(&link_target))
+        rootfs.join(strip_unix_root(&link_target))
     } else {
         // Relative symlink
         path.parent()?.join(&link_target)

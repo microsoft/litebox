@@ -8,7 +8,17 @@
 fn main() -> anyhow::Result<()> {
     use clap::Parser as _;
     use litebox_runner_linux_on_windows_userland::CliArgs;
-    litebox_runner_linux_on_windows_userland::run(CliArgs::parse())
+
+    let args = CliArgs::parse();
+
+    // Run on a thread with 8 MiB stack (matching Linux default).
+    // The Windows default main-thread stack is only 1 MiB, which is
+    // insufficient for the deeply-nested shim call chains.
+    let builder = std::thread::Builder::new().stack_size(8 * 1024 * 1024);
+    let handle = builder
+        .spawn(move || litebox_runner_linux_on_windows_userland::run(args))
+        .expect("failed to spawn main worker thread");
+    handle.join().unwrap()
 }
 
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]

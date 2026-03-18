@@ -34,16 +34,41 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
+    /// Lower bound (inclusive) of the VA range (cached for lock-free checks).
+    addr_min: usize,
+    /// Upper bound (exclusive) of the VA range (cached for lock-free checks).
+    addr_max: usize,
 }
 
 impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
-    /// Create a new `PageManager` instance.
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
-        Self { vmem }
+    /// Lower bound (inclusive) of the managed VA range.
+    pub fn addr_min(&self) -> usize {
+        self.addr_min
+    }
+
+    /// Upper bound (exclusive) of the managed VA range.
+    pub fn addr_max(&self) -> usize {
+        self.addr_max
+    }
+
+    /// Create a new `PageManager` instance for the given VA `range`.
+    ///
+    /// For a single-process setup (or the initial process), pass the full
+    /// platform range `Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX`.
+    /// For child processes, pass the sub-range obtained from
+    /// [`AddressSpaceProvider::address_space_range()`](crate::platform::AddressSpaceProvider::address_space_range).
+    pub fn new(litebox: &LiteBox<Platform>, range: Range<usize>) -> Self {
+        let addr_min = range.start;
+        let addr_max = range.end;
+        let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform, range));
+        Self {
+            vmem,
+            addr_min,
+            addr_max,
+        }
     }
 
     /// Create a mapping with the given flags.
@@ -289,7 +314,40 @@ where
     pub fn set_initial_brk(&self, brk: usize) {
         let mut vmem = self.vmem.write();
         assert_eq!(vmem.brk, 0, "initial brk is already set");
+        vmem.brk_base = brk;
         vmem.brk = brk;
+        vmem.brk_frontier = brk.next_multiple_of(linux::PAGE_SIZE);
+    }
+
+    /// Returns the current logical program break without modifying mappings.
+    pub fn current_brk(&self) -> usize {
+        self.vmem.read().brk
+    }
+
+    /// Returns the current page-aligned heap frontier that `brk` growth uses.
+    pub fn current_brk_frontier(&self) -> usize {
+        self.vmem.read().brk_frontier
+    }
+
+    /// Advance the program break and heap frontier to at least `min_brk`
+    /// without allocating new heap pages.
+    ///
+    /// This is used only when already-mapped non-heap pages, such as a
+    /// trampoline at the heap frontier, occupy space that future `brk` growth
+    /// must skip over.
+    pub fn ensure_brk_past(&self, min_brk: usize) {
+        let mut vmem = self.vmem.write();
+        if vmem.brk < min_brk {
+            vmem.brk = min_brk;
+        }
+        if vmem.brk_frontier < min_brk {
+            vmem.brk_frontier = min_brk;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_logical_brk_for_test(&self, brk: usize) {
+        self.vmem.write().brk = brk;
     }
 
     /// Set the program break to the given address.
@@ -319,10 +377,15 @@ where
             // Calling `brk` with 0 can be used to find the current location of the program break.
             return Ok(vmem.brk);
         }
+        if brk < vmem.brk_base {
+            // Linux keeps the current break unchanged when the request is
+            // below the permitted heap base.
+            return Ok(vmem.brk);
+        }
 
-        let old_brk = vmem.brk.next_multiple_of(linux::PAGE_SIZE);
+        let old_brk = vmem.brk_frontier;
         let new_brk = brk.next_multiple_of(linux::PAGE_SIZE);
-        if vmem.brk >= brk {
+        if new_brk < old_brk {
             // Shrink the memory region
             let brk = match unsafe {
                 vmem.remove_mapping(
@@ -331,6 +394,7 @@ where
             } {
                 Ok(()) => {
                     vmem.brk = brk;
+                    vmem.brk_frontier = new_brk;
                     brk
                 }
                 Err(_) => {
@@ -340,20 +404,23 @@ where
             return Ok(brk);
         }
 
-        if vmem.overlapping(old_brk..new_brk).next().is_some() {
-            return Err(MappingError::OutOfMemory);
-        }
-        if let Some(range) = PageRange::<ALIGN>::new(old_brk, new_brk) {
-            let (suggested_address, length) = range.start_and_length();
-            let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-            unsafe {
-                vmem.create_pages(
-                    Some(suggested_address),
-                    length,
-                    CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-                    perms,
-                )
-            }?;
+        if new_brk > old_brk {
+            if vmem.overlapping(old_brk..new_brk).next().is_some() {
+                return Err(MappingError::OutOfMemory);
+            }
+            if let Some(range) = PageRange::<ALIGN>::new(old_brk, new_brk) {
+                let (suggested_address, length) = range.start_and_length();
+                let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+                unsafe {
+                    vmem.create_pages(
+                        Some(suggested_address),
+                        length,
+                        CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                        perms,
+                    )
+                }?;
+            }
+            vmem.brk_frontier = new_brk;
         }
         vmem.brk = brk;
         Ok(brk)
@@ -381,7 +448,9 @@ where
 
         // reset brk
         let mut vmem = self.vmem.write();
+        vmem.brk_base = 0;
         vmem.brk = 0;
+        vmem.brk_frontier = 0;
 
         Ok(())
     }
@@ -672,7 +741,7 @@ where
         error_code: u64,
     ) -> Result<(), PageFaultError> {
         let fault_addr = fault_addr & !(ALIGN - 1);
-        if !(Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&fault_addr) {
+        if !(self.addr_min..self.addr_max).contains(&fault_addr) {
             return Err(PageFaultError::AccessError("Invalid address"));
         }
 
@@ -680,7 +749,7 @@ where
         // Find the range closest to the fault address
         let (start, vma) = {
             let (r, vma) = vmem
-                .overlapping(fault_addr..Platform::TASK_ADDR_MAX)
+                .overlapping(fault_addr..vmem.addr_max())
                 .next()
                 .ok_or(PageFaultError::AccessError("no mapping"))?;
             (r.start, *vma)
@@ -692,7 +761,7 @@ where
             }
 
             if !vmem
-                .overlapping(Platform::TASK_ADDR_MIN..fault_addr)
+                .overlapping(vmem.addr_min()..fault_addr)
                 .next_back()
                 .is_none_or(|(prev_range, prev_vma)| {
                     // Enforce gap between stack and other preceding non-stack mappings.

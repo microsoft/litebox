@@ -25,8 +25,13 @@ use thiserror::Error;
 
 /// A manager of all available futexes.
 ///
-/// Note: currently, this only supports "private" futexes, since it assumes only a single process.
-/// In the future, this may be expanded to support multi-process futexes.
+/// Supports both private and shared futexes. On userland platforms where all
+/// processes share a single flat virtual address space (with non-overlapping VA
+/// partitions), both private and shared futexes naturally work with
+/// `address_space_id = 0` because the same virtual address always refers to
+/// the same backing memory. On kernel platforms, the `address_space_id`
+/// discriminator prevents false aliasing between processes that might have
+/// overlapping virtual address ranges.
 pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
     /// Chaining hash table to map from futex address to waiter lists.
     table: alloc::boxed::Box<[LoanList<Platform, FutexEntry<Platform>>; HASH_TABLE_ENTRIES]>,
@@ -41,6 +46,10 @@ const HASH_TABLE_ENTRIES: usize = 256;
 
 struct FutexEntry<Platform: RawSyncPrimitivesProvider> {
     addr: usize,
+    /// Discriminator to prevent false aliasing across address spaces.
+    /// On userland (non-overlapping VA partitions) this is always 0.
+    /// On kernel platforms each process passes its AddressSpaceId as u64.
+    address_space_id: u64,
     waker: Waker<Platform>,
     bitset: u32,
     done: AtomicBool,
@@ -62,9 +71,16 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         }
     }
 
-    /// Returns the hash table bucket for the given futex address.
-    fn bucket(&self, addr: usize) -> &LoanList<Platform, FutexEntry<Platform>> {
-        let hash: usize = self.hash_builder.hash_one(addr).truncate();
+    /// Returns the hash table bucket for the given futex key.
+    fn bucket(
+        &self,
+        addr: usize,
+        address_space_id: u64,
+    ) -> &LoanList<Platform, FutexEntry<Platform>> {
+        let hash: usize = self
+            .hash_builder
+            .hash_one((addr, address_space_id))
+            .truncate();
         &self.table[hash % HASH_TABLE_ENTRIES]
     }
 
@@ -80,12 +96,18 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     /// If `bitset` is `Some`, then the waiter is only woken if the wake call's
     /// `bitset` has a non-zero intersection with the waiter's mask. Specifying
     /// `None` is equivalent to setting all bits in the mask.
+    ///
+    /// `address_space_id` is an opaque discriminator that distinguishes futexes
+    /// at the same virtual address in different address spaces. On userland
+    /// platforms (non-overlapping VA partitions) pass `0`. On kernel platforms
+    /// pass the process's `AddressSpaceId` converted to `u64`.
     pub fn wait(
         &self,
         cx: &WaitContext<'_, Platform>,
         futex_addr: Platform::RawMutPointer<u32>,
         expected_value: u32,
         bitset: Option<NonZeroU32>,
+        address_space_id: u64,
     ) -> Result<(), FutexError> {
         let bitset = bitset.unwrap_or(ALL_BITS).get();
         let addr = futex_addr.as_usize();
@@ -93,9 +115,10 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             return Err(FutexError::NotAligned);
         }
 
-        let bucket = self.bucket(addr);
+        let bucket = self.bucket(addr, address_space_id);
         let mut entry = pin!(LoanListEntry::new(FutexEntry {
             addr,
+            address_space_id,
             waker: cx.waker().clone(),
             bitset,
             done: AtomicBool::new(false),
@@ -131,12 +154,16 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     /// (subject to the `num_to_wake` limit). If `bitset` is `None`, then all
     /// waiters are eligible to be woken.
     ///
+    /// `address_space_id` must match the value passed to the corresponding
+    /// [`wait`](Self::wait) call.
+    ///
     /// Returns the number of waiters that were woken up.
     pub fn wake(
         &self,
         futex_addr: Platform::RawMutPointer<u32>,
         num_to_wake_up: NonZeroU32,
         bitset: Option<NonZeroU32>,
+        address_space_id: u64,
     ) -> Result<u32, FutexError> {
         let addr = futex_addr.as_usize();
         if !addr.is_multiple_of(align_of::<u32>()) {
@@ -144,10 +171,13 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         }
         let bitset = bitset.unwrap_or(ALL_BITS).get();
         let mut woken = 0;
-        let bucket = self.bucket(addr);
+        let bucket = self.bucket(addr, address_space_id);
         // Extract matching entries from the bucket until we've woken enough.
         let entries = bucket.extract_if(|entry| {
-            if entry.addr != addr || entry.bitset & bitset == 0 {
+            if entry.addr != addr
+                || entry.address_space_id != address_space_id
+                || entry.bitset & bitset == 0
+            {
                 return core::ops::ControlFlow::Continue(false);
             }
             woken += 1;
@@ -218,7 +248,7 @@ mod tests {
             barrier_clone.wait(); // Sync with main thread
 
             // Wait for value 0
-            futex_manager_clone.wait(&WaitState::new(platform).context(), futex_addr, 0, None)
+            futex_manager_clone.wait(&WaitState::new(platform).context(), futex_addr, 0, None, 0)
         });
 
         barrier.wait(); // Wait for waiter to be ready
@@ -231,7 +261,7 @@ mod tests {
                 futex_word.as_ptr() as usize,
             );
         let woken = futex_manager
-            .wake(futex_addr, NonZeroU32::new(1).unwrap(), None)
+            .wake(futex_addr, NonZeroU32::new(1).unwrap(), None, 0)
             .unwrap();
 
         // Wait for waiter thread to complete
@@ -270,6 +300,7 @@ mod tests {
                 futex_addr,
                 0,
                 None,
+                0,
             )
         });
 
@@ -283,7 +314,7 @@ mod tests {
                 futex_word.as_ptr() as usize,
             );
         let woken = futex_manager
-            .wake(futex_addr, NonZeroU32::new(1).unwrap(), None)
+            .wake(futex_addr, NonZeroU32::new(1).unwrap(), None, 0)
             .unwrap();
 
         // Wait for waiter thread to complete
@@ -324,6 +355,7 @@ mod tests {
                     futex_addr,
                     0,
                     None,
+                    0,
                 )
             });
             waiters.push(waiter);
@@ -339,7 +371,7 @@ mod tests {
                 futex_word.as_ptr() as usize,
             );
         let woken = futex_manager
-            .wake(futex_addr, NonZeroU32::new(u32::MAX).unwrap(), None)
+            .wake(futex_addr, NonZeroU32::new(u32::MAX).unwrap(), None, 0)
             .unwrap();
 
         // Wait for all waiter threads to complete

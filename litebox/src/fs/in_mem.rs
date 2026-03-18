@@ -4,6 +4,7 @@
 //! An in-memory file system, not backed by any physical device.
 
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
@@ -14,7 +15,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError,
+    WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
 
@@ -202,7 +204,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 if flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
                 }
-                entry
+                (entry, false)
             } else {
                 let Some((_, parent)) = parent else {
                     // Only `/` does not have a parent; any other scenario (e.g., missing ancestor)
@@ -233,7 +235,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 })));
                 let old = root.entries.insert(path, entry.clone());
                 assert!(old.is_none());
-                entry
+                (entry, true)
             }
         } else {
             let root = self.root.read();
@@ -241,10 +243,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             let Some(entry) = entry else {
                 return Err(PathError::NoSuchFileOrDirectory)?;
             };
-            entry
+            (entry, false)
         };
+        let (entry, just_created) = entry;
+        // On Linux, the creator of a file always gets the requested access mode
+        // regardless of the file's permission bits. Permission bits only restrict
+        // future opens.
         let read_allowed = if flags.contains(OFlags::RDONLY) || flags.contains(OFlags::RDWR) {
-            if !self.current_user.can_read(&entry.perms()) {
+            if !just_created && !self.current_user.can_read(&entry.perms()) {
                 return Err(OpenError::AccessNotAllowed);
             }
             true
@@ -252,7 +258,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             false
         };
         let write_allowed = if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
-            if !self.current_user.can_write(&entry.perms()) {
+            if !just_created && !self.current_user.can_write(&entry.perms()) {
                 return Err(OpenError::AccessNotAllowed);
             }
             true
@@ -563,6 +569,107 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(())
     }
 
+    fn rename(
+        &self,
+        old_path: impl crate::path::Arg,
+        new_path: impl crate::path::Arg,
+    ) -> Result<(), RenameError> {
+        let old_path = self.absolute_path(old_path)?;
+        let new_path = self.absolute_path(new_path)?;
+
+        if old_path == new_path {
+            return Ok(());
+        }
+
+        let mut root = self.root.write();
+
+        // Validate old path exists
+        let (old_parent, old_entry) = root.parent_and_entry(&old_path, self.current_user)?;
+        let Some((_, old_parent_dir)) = old_parent else {
+            // Cannot rename /
+            return Err(RenameError::NoWritePerms);
+        };
+        let Some(old_entry) = old_entry else {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        };
+        let old_is_dir = matches!(old_entry, Entry::Dir(_));
+
+        // Check write permission on old parent
+        if !self.current_user.can_write(&old_parent_dir.read().perms) {
+            return Err(RenameError::NoWritePerms);
+        }
+
+        // Validate new path parent exists
+        let (new_parent, new_entry) = root.parent_and_entry(&new_path, self.current_user)?;
+        let Some((_, new_parent_dir)) = new_parent else {
+            return Err(RenameError::NoWritePerms);
+        };
+
+        // Check write permission on new parent
+        if !self.current_user.can_write(&new_parent_dir.read().perms) {
+            return Err(RenameError::NoWritePerms);
+        }
+
+        // If new path exists, validate compatibility
+        if let Some(new_entry) = &new_entry {
+            let new_is_dir = matches!(new_entry, Entry::Dir(_));
+            if old_is_dir && !new_is_dir {
+                return Err(RenameError::NotADirectory);
+            }
+            if !old_is_dir && new_is_dir {
+                return Err(RenameError::IsADirectory);
+            }
+            if let Entry::Dir(d) = new_entry
+                && !d.read().children.is_empty()
+            {
+                return Err(RenameError::NotEmpty);
+            }
+        }
+
+        // Perform the rename: remove from old location, insert at new
+        let old_name = old_path.components().unwrap().last().unwrap().to_string();
+        let new_name = new_path.components().unwrap().last().unwrap().to_string();
+        let file_type = old_parent_dir.write().children.remove(&old_name).unwrap();
+
+        // Remove old entry from new parent's children if replacing
+        if new_entry.is_some() {
+            new_parent_dir.write().children.remove(&new_name);
+            root.entries.remove(&new_path);
+        }
+
+        // Insert into new parent
+        new_parent_dir.write().children.insert(new_name, file_type);
+
+        // Move entry in the entries map
+        let entry = root.entries.remove(&old_path).unwrap();
+        root.entries.insert(new_path.clone(), entry);
+
+        // If renaming a directory, update all descendant paths
+        if old_is_dir {
+            let mut prefix = old_path.clone();
+            prefix.push('/');
+            let to_move: Vec<(String, Entry<Platform>)> = root
+                .entries
+                .keys()
+                .filter(|k| k.starts_with(prefix.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|k| {
+                    let entry = root.entries.remove(&k).unwrap();
+                    let mut new_key = new_path.clone();
+                    new_key.push_str(&k[old_path.len()..]);
+                    (new_key, entry)
+                })
+                .collect();
+            for (new_key, entry) in to_move {
+                root.entries.insert(new_key, entry);
+            }
+        }
+
+        Ok(())
+    }
+
     fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
@@ -815,13 +922,21 @@ type ParentAndEntry<'a, D, E> = Result<(Option<(&'a str, D)>, Option<E>), PathEr
 
 impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
     fn new() -> Self {
+        // The root directory is owned by the default non-root user so that
+        // the guest process can create top-level directories. The runner
+        // uses `with_root_privileges` for any setup that needs elevated
+        // access. This mirrors a single-user sandbox where the guest owns
+        // the entire filesystem tree.
         Self {
             entries: [(
                 String::new(),
                 Entry::Dir(Arc::new(sync::RwLock::new(DirX {
                     perms: Permissions {
                         mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-                        userinfo: UserInfo { user: 0, group: 0 },
+                        userinfo: UserInfo {
+                            user: 1000,
+                            group: 1000,
+                        },
                     },
                     children: HashMap::default(),
                     unique_id: 0,
@@ -933,6 +1048,10 @@ impl UserInfo {
 
 impl Permissions {
     fn can_read_by(&self, current: UserInfo) -> bool {
+        // CAP_DAC_OVERRIDE: root bypasses all file permission checks.
+        if current.user == 0 {
+            return true;
+        }
         if self.userinfo.user == current.user {
             self.mode.contains(Mode::RUSR)
         } else if self.userinfo.group == current.group {
@@ -942,6 +1061,9 @@ impl Permissions {
         }
     }
     fn can_write_by(&self, current: UserInfo) -> bool {
+        if current.user == 0 {
+            return true;
+        }
         if self.userinfo.user == current.user {
             self.mode.contains(Mode::WUSR)
         } else if self.userinfo.group == current.group {
@@ -951,6 +1073,13 @@ impl Permissions {
         }
     }
     fn can_execute_by(&self, current: UserInfo) -> bool {
+        // CAP_DAC_OVERRIDE bypasses execute checks on directories but not
+        // regular files (where at least one execute bit must be set).
+        // For simplicity we grant full bypass — files in the sandbox are
+        // typically marked executable when they need to be.
+        if current.user == 0 {
+            return true;
+        }
         if self.userinfo.user == current.user {
             self.mode.contains(Mode::XUSR)
         } else if self.userinfo.group == current.group {

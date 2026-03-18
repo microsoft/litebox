@@ -6,7 +6,7 @@
 use core::{
     num::NonZeroUsize,
     sync::atomic::{
-        AtomicBool, AtomicU32,
+        AtomicBool, AtomicU32, AtomicUsize,
         Ordering::{self, Relaxed},
     },
 };
@@ -97,13 +97,42 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         fd: &PipeFd<Platform>,
         buf: &mut [u8],
     ) -> Result<usize, errors::ReadError> {
+        self.read_inner(cx, fd, buf, false)
+    }
+
+    /// Like [`read`](Self::read), but with vfork awareness.
+    ///
+    /// When `is_vfork_child` is true and a blocking read would deadlock
+    /// (the only remaining write-end FD belongs to the blocked parent),
+    /// returns `Ok(0)` (EOF) instead of blocking forever.
+    pub fn read_vfork_aware(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        fd: &PipeFd<Platform>,
+        buf: &mut [u8],
+        is_vfork_child: bool,
+    ) -> Result<usize, errors::ReadError> {
+        self.read_inner(cx, fd, buf, is_vfork_child)
+    }
+
+    fn read_inner(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        fd: &PipeFd<Platform>,
+        buf: &mut [u8],
+        is_vfork_child: bool,
+    ) -> Result<usize, errors::ReadError> {
         let dt = self.litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Arc::clone(p),
             PipeEnd::Sender(_) => return Err(errors::ReadError::NotForReading),
         };
         drop(dt);
-        p.read(cx, buf).map_err(From::from)
+        if is_vfork_child {
+            p.read_vfork_aware(cx, buf).map_err(From::from)
+        } else {
+            p.read(cx, buf).map_err(From::from)
+        }
     }
 
     /// Write the values in `buf` into the pipe, returning the number of elements written.
@@ -175,6 +204,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             PipeEnd::Sender(p) => Ok(f(p)),
         }
     }
+
+    /// Return the number of bytes available for reading on a pipe receiver.
+    /// Returns 0 for sender ends.
+    pub fn readable_bytes(&self, fd: &PipeFd<Platform>) -> Result<usize, errors::ClosedError> {
+        let dt = self.litebox.descriptor_table();
+        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => Ok(p.endpoint.rb.lock().occupied_len()),
+            PipeEnd::Sender(_) => Ok(0),
+        }
+    }
 }
 
 /// Whether a particular pipe end is the sender half or the receiver half
@@ -243,6 +282,8 @@ pub mod errors {
         WouldBlock,
         #[error("wait error")]
         WaitError(WaitError),
+        #[error("would deadlock: the only writer is the suspended vfork parent")]
+        Deadlock,
     }
 
     /// Possible errors from [`Pipes::write`]
@@ -338,6 +379,11 @@ struct WriteEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     status: AtomicU32,
     /// Slice length that is guaranteed to be an atomic write (i.e., non-interleaved).
     atomic_slice_guarantee_size: usize,
+    /// Number of open file descriptors referencing this write end.
+    /// Starts at 1 when created, incremented by fork, decremented by close.
+    /// When this reaches 0, the write end is shut down and the read peer
+    /// receives HUP — even if the Arc<WriteEnd> itself hasn't been dropped yet.
+    fd_ref_count: AtomicUsize,
 }
 
 /// Potential errors when writing or reading from a pipe
@@ -352,6 +398,8 @@ enum PipeError {
     WouldBlock,
     #[error("wait error")]
     WaitError(WaitError),
+    #[error("would deadlock: the only writer is the suspended vfork parent")]
+    Deadlock,
 }
 
 impl From<PipeError> for errors::ReadError {
@@ -363,6 +411,7 @@ impl From<PipeError> for errors::ReadError {
             }
             PipeError::WouldBlock => errors::ReadError::WouldBlock,
             PipeError::WaitError(e) => errors::ReadError::WaitError(e),
+            PipeError::Deadlock => errors::ReadError::Deadlock,
         }
     }
 }
@@ -373,6 +422,7 @@ impl From<PipeError> for errors::WriteError {
             PipeError::PeerShutdown => errors::WriteError::ReadEndClosed,
             PipeError::WouldBlock => errors::WriteError::WouldBlock,
             PipeError::WaitError(e) => errors::WriteError::WaitError(e),
+            PipeError::Deadlock => unreachable!("deadlock detection is read-side only"),
         }
     }
 }
@@ -394,6 +444,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
             peer: Weak::new(),
             status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
             atomic_slice_guarantee_size,
+            fd_ref_count: AtomicUsize::new(1),
         }
     }
 
@@ -561,6 +612,54 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T>
             .map_err(PipeError::from)
     }
 
+    /// Read with vfork deadlock avoidance.
+    ///
+    /// When the pipe buffer is empty and the only remaining write-end FD
+    /// belongs to a vfork-blocked parent, a normal blocking read would
+    /// deadlock (parent waits for child, child waits for pipe data that
+    /// only the parent could produce by closing its end). In this case,
+    /// return `Ok(0)` (EOF) instead of blocking.
+    fn read_vfork_aware(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [T],
+    ) -> Result<usize, PipeError>
+    where
+        T: Copy,
+    {
+        match self.try_read(buf) {
+            Ok(n) => return Ok(n),
+            Err(TryOpError::TryAgain) => {}
+            Err(e) => return Err(PipeError::from(e)),
+        }
+
+        // The pipe buffer is empty and the write-end is not shut down.
+        // fd_ref_count tracks the number of open FDs for the write-end
+        // (incremented on dup/fork, decremented on close). After the vfork
+        // child closes its write-end copy, if fd_ref_count == 1, the sole
+        // remaining writer is the blocked parent — a blocking read would
+        // deadlock. Return EDEADLK so the caller fails loudly instead of
+        // silently receiving a fake EOF.
+        if self
+            .peer
+            .upgrade()
+            .is_some_and(|p| p.fd_ref_count.load(Ordering::Acquire) <= 1)
+        {
+            return Err(PipeError::Deadlock);
+        }
+
+        // Standard blocking path.
+        self.endpoint
+            .pollee
+            .wait(
+                cx,
+                self.get_status().contains(OFlags::NONBLOCK),
+                Events::IN,
+                || self.try_read(buf),
+            )
+            .map_err(PipeError::from)
+    }
+
     common_functions_for_channel!();
 }
 
@@ -619,6 +718,44 @@ fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
 
     (producer, consumer)
 }
+
+// Manual implementation of FD subsystem integration for pipes.
+// We can't use the `enable_fds_for_subsystem!` macro here because we need
+// to override `on_dup()` and `on_close()` to properly track pipe writer
+// file descriptor counts across dup/fork.
+#[allow(unused, reason = "NOTE(jayb): remove this lint before merging the PR")]
+#[doc(hidden)]
+pub struct DescriptorEntry<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    entry: PipeEnd<Platform>,
+}
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> crate::fd::FdEnabledSubsystem
+    for Pipes<Platform>
+{
+    type Entry = DescriptorEntry<Platform>;
+}
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> crate::fd::FdEnabledSubsystemEntry
+    for DescriptorEntry<Platform>
+{
+    fn on_dup(&self) {
+        if let PipeEnd::Sender(w) = &self.entry {
+            w.fd_ref_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn on_close(&self) {
+        if let PipeEnd::Sender(w) = &self.entry {
+            w.fd_ref_count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> From<PipeEnd<Platform>>
+    for DescriptorEntry<Platform>
+{
+    fn from(entry: PipeEnd<Platform>) -> Self {
+        Self { entry }
+    }
+}
+pub type PipeFd<Platform> = crate::fd::TypedFd<Pipes<Platform>>;
 
 #[cfg(test)]
 mod tests {
@@ -720,12 +857,4 @@ mod tests {
             assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         });
     }
-}
-
-crate::fd::enable_fds_for_subsystem! {
-    @Platform: { RawSyncPrimitivesProvider + TimeProvider };
-    Pipes<Platform>;
-    @Platform: { RawSyncPrimitivesProvider + TimeProvider };
-    PipeEnd<Platform>;
-    -> PipeFd<Platform>;
 }

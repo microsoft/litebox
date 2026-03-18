@@ -52,7 +52,7 @@ pub struct OpteeShimEntrypoints {
 }
 
 impl litebox::shim::EnterShim for OpteeShimEntrypoints {
-    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ExecutionContext = litebox_common_linux::ExecutionContext;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         self.enter_shim(true, ctx, Task::handle_init_request)
@@ -142,7 +142,11 @@ impl OpteeShimBuilder {
     pub fn build(self) -> OpteeShim {
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(&self.litebox),
+            pm: PageManager::new(
+                &self.litebox,
+                <Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN
+                    ..<Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX,
+            ),
             _litebox: self.litebox,
             ta_uuid_map: TaUuidMap::new(),
         });

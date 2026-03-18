@@ -1,0 +1,11 @@
+[package]
+name = "wintun_create_adapter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }

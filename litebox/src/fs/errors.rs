@@ -27,6 +27,8 @@ pub enum OpenError {
     TruncateError(#[from] TruncateError),
     #[error("I/O error")]
     Io,
+    #[error("operation was interrupted")]
+    Interrupted,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -48,6 +50,10 @@ pub enum ReadError {
     NotForReading,
     #[error("I/O error")]
     Io,
+    #[error("operation would block")]
+    WouldBlock,
+    #[error("operation was interrupted")]
+    Interrupted,
 }
 
 /// Possible errors from [`FileSystem::write`]
@@ -62,6 +68,8 @@ pub enum WriteError {
     NotForWriting,
     #[error("I/O error")]
     Io,
+    #[error("operation was interrupted")]
+    Interrupted,
 }
 
 /// Possible errors from [`FileSystem::seek`]
@@ -183,6 +191,26 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::rename`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum RenameError {
+    #[error("a directory component in either path does not allow write permission")]
+    NoWritePerms,
+    #[error("old path is a directory but new path is not")]
+    IsADirectory,
+    #[error("new path is a directory but old path is not")]
+    NotADirectory,
+    #[error("new path is a non-empty directory")]
+    NotEmpty,
+    #[error("the filesystem does not support renaming")]
+    ReadOnlyFileSystem,
+    #[error("old and new are the same file")]
+    SameFile,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`FileSystem::read_dir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -203,6 +231,20 @@ pub enum FileStatusError {
     ClosedFd,
     #[error("I/O error")]
     Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::read_link`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ReadLinkError {
+    #[error("not a symbolic link")]
+    NotASymlink,
+    #[error("I/O error")]
+    Io,
+    #[error("operation not supported")]
+    NotSupported,
     #[error(transparent)]
     PathError(#[from] PathError),
 }

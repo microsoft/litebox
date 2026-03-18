@@ -76,8 +76,6 @@ where
     local_port_allocator: LocalPortAllocator,
     /// Whether outside interaction is automatic or manual
     platform_interaction: PlatformInteraction,
-    /// FDs that are queued for eventual closure
-    queued_for_closure: Vec<SocketFd<Platform>>,
     /// Sockets that are closing in the background
     closing_in_background: Vec<smoltcp::iface::SocketHandle>,
 }
@@ -121,7 +119,6 @@ where
             zero_time: litebox.x.platform.now(),
             local_port_allocator: LocalPortAllocator::new(),
             platform_interaction: PlatformInteraction::Automatic,
-            queued_for_closure: vec![],
             closing_in_background: vec![],
         }
     }
@@ -481,7 +478,6 @@ where
 
     /// (Internal-only API) Actually perform the queued interactions with the outside world.
     fn internal_perform_platform_interaction(&mut self) -> smoltcp::iface::PollResult {
-        self.attempt_to_close_queued();
         self.remove_dead_sockets();
         self.close_pending_sockets();
 
@@ -825,6 +821,44 @@ where
         true
     }
 
+    /// Shutdown part of a full-duplex connection.
+    ///
+    /// `read` controls whether the read side is shut down, and `write` controls
+    /// the write side. At least one must be true.
+    pub fn shutdown(
+        &mut self,
+        fd: &SocketFd<Platform>,
+        read: bool,
+        write: bool,
+    ) -> Result<(), errors::ShutdownError> {
+        let table = self.litebox.descriptor_table();
+        let table_entry = table
+            .get_entry(fd)
+            .ok_or(errors::ShutdownError::InvalidFd)?;
+        let socket_handle = &table_entry.entry;
+        let proxy = socket_handle
+            .proxy
+            .as_ref()
+            .ok_or(errors::ShutdownError::NotConnected)?;
+
+        if read {
+            proxy.shutdown_read();
+        }
+        if write {
+            proxy.shutdown_write();
+            // For TCP, initiate a graceful close (FIN) on the smoltcp socket.
+            if let Protocol::Tcp = socket_handle.protocol() {
+                let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                tcp_socket.close();
+            }
+        }
+
+        drop(table_entry);
+        drop(table);
+        self.automated_platform_interaction(PollDirection::Both);
+        Ok(())
+    }
+
     /// Close the socket at `fd`
     pub fn close(
         &mut self,
@@ -834,7 +868,7 @@ where
         let mut dt = self.litebox.descriptor_table_mut();
         // We close immediately if we can
         match dt
-            .close_and_duplicate_if_shared(fd, |entry| {
+            .close_and_remove(fd, |entry| {
                 match behavior {
                     CloseBehavior::Immediate => {
                         let socket_handle = &entry.entry;
@@ -869,11 +903,8 @@ where
                 drop(dt);
                 self.close_handle(socket_handle.entry);
             }
-            super::fd::CloseResult::Duplicated(dup_fd) => {
-                // It seems like there might be other duplicates around (e.g., due to `dup`), so we
-                // can't immediately close it out.
-                // We attempt to queue it for future closure and then just return.
-                self.queued_for_closure.push(dup_fd);
+            super::fd::CloseResult::Released => {
+                // Slot freed, other references (dup or fork) still hold the socket. Nothing to do.
             }
             super::fd::CloseResult::Deferred => {
                 let Some(()) = dt.with_entry_mut(fd, |entry| entry.entry.consider_closed = true)
@@ -884,25 +915,6 @@ where
             }
         }
         Ok(())
-    }
-
-    /// Attempt to close as many queued-to-close FDs as possible. Returns `true` iff any of them
-    /// were closed.
-    fn attempt_to_close_queued(&mut self) -> bool {
-        if self.queued_for_closure.is_empty() {
-            // fast path
-            return false;
-        }
-        let mut dt = self.litebox.descriptor_table_mut();
-        let entries = dt.drain_entries_full_covered_by(&mut self.queued_for_closure);
-        drop(dt);
-        if entries.is_empty() {
-            return false;
-        }
-        for entry in entries {
-            self.close_handle(entry.entry);
-        }
-        true
     }
 
     /// Close the `socket_handle`

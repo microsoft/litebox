@@ -320,7 +320,7 @@ impl<'a> DirEntryData<'a> {
     fn encode_to<W: transport::Write>(&self, w: &mut W) -> Result<(), transport::WriteError> {
         encode_le(
             w,
-            u32::try_from(self.size()).map_err(|_| transport::WriteError)?,
+            u32::try_from(self.size()).map_err(|_| transport::WriteError::Io)?,
         )?;
         for e in &self.data {
             e.encode_to(w)?;
@@ -680,7 +680,7 @@ Serializer! {
     /// Readlink request
     #[derive(Clone, Debug)]
     pub(super) struct Treadlink {
-        fid: u32,
+        pub(super) fid: u32,
     }
 }
 
@@ -688,7 +688,7 @@ Serializer! {
     /// Readlink response
     #[derive(Clone, Debug)]
     pub(super) struct Rreadlink<'a> {
-        target: FcallStr<'a>,
+        pub(super) target: FcallStr<'a>,
     }
 }
 
@@ -1168,7 +1168,7 @@ impl<'a> TaggedFcall<'a> {
         encode_fcall(buf, tag, fcall)?;
 
         // Write the size at the beginning
-        let size = u32::try_from(buf.len()).map_err(|_| transport::WriteError)?;
+        let size = u32::try_from(buf.len()).map_err(|_| transport::WriteError::Io)?;
         buf[0..4].copy_from_slice(&size.to_le_bytes());
 
         Ok(())
@@ -1233,7 +1233,7 @@ fn encode_str<W: transport::Write>(
 ) -> Result<(), transport::WriteError> {
     encode_le(
         w,
-        u16::try_from(v.len()).map_err(|_| transport::WriteError)?,
+        u16::try_from(v.len()).map_err(|_| transport::WriteError::Io)?,
     )?;
     w.write_all(v)
 }
@@ -1241,7 +1241,7 @@ fn encode_str<W: transport::Write>(
 fn encode_data_buf<W: transport::Write>(w: &mut W, v: &[u8]) -> Result<(), transport::WriteError> {
     encode_le(
         w,
-        u32::try_from(v.len()).map_err(|_| transport::WriteError)?,
+        u32::try_from(v.len()).map_err(|_| transport::WriteError::Io)?,
     )?;
     w.write_all(v)
 }
@@ -1252,7 +1252,7 @@ fn encode_vec_str<W: transport::Write>(
 ) -> Result<(), transport::WriteError> {
     encode_le(
         w,
-        u16::try_from(v.len()).map_err(|_| transport::WriteError)?,
+        u16::try_from(v.len()).map_err(|_| transport::WriteError::Io)?,
     )?;
     for s in v {
         encode_str(w, s)?;
@@ -1263,7 +1263,7 @@ fn encode_vec_str<W: transport::Write>(
 fn encode_vec_qid<W: transport::Write>(w: &mut W, v: &[Qid]) -> Result<(), transport::WriteError> {
     encode_le(
         w,
-        u16::try_from(v.len()).map_err(|_| transport::WriteError)?,
+        u16::try_from(v.len()).map_err(|_| transport::WriteError::Io)?,
     )?;
     for q in v {
         q.encode_to(w)?;

@@ -218,7 +218,11 @@ fn test_vmm_page_fault() {
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let platform = MockKernel::new(p4.start_address());
     let litebox = LiteBox::new(platform);
-    let vmm = PageManager::<_, PAGE_SIZE>::new(&litebox);
+    let vmm = PageManager::<_, PAGE_SIZE>::new(
+        &litebox,
+        <MockKernel as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN
+            ..<MockKernel as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX,
+    );
     unsafe {
         assert_eq!(
             vmm.create_writable_pages(

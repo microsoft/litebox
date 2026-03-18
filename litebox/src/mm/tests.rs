@@ -10,6 +10,7 @@ use crate::{
     mm::linux::{CreatePagesFlags, NonZeroAddress},
     platform::{
         PageManagementProvider, RawConstPointer,
+        mock::MockRawMutex,
         page_mgmt::MemoryRegionPermissions,
         trivial_providers::{TransparentConstPtr, TransparentMutPtr},
     },
@@ -23,9 +24,34 @@ use super::linux::{
 /// A dummy implementation of [`VmemBackend`] that does nothing.
 struct DummyVmemBackend;
 
+static DUMMY_VMEM_BACKEND: DummyVmemBackend = DummyVmemBackend;
+
 impl crate::platform::RawPointerProvider for DummyVmemBackend {
     type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
     type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
+}
+
+impl crate::platform::RawMutexProvider for DummyVmemBackend {
+    type RawMutex = MockRawMutex;
+}
+
+#[cfg(feature = "lock_tracing")]
+impl crate::platform::TimeProvider for DummyVmemBackend {
+    type Instant = crate::platform::mock::MockInstant;
+    type SystemTime = crate::platform::mock::MockSystemTime;
+
+    fn now(&self) -> Self::Instant {
+        crate::platform::mock::MockInstant { time: 0 }
+    }
+
+    fn current_time(&self) -> Self::SystemTime {
+        crate::platform::mock::MockSystemTime { time: 0 }
+    }
+}
+
+#[cfg(feature = "lock_tracing")]
+impl crate::platform::DebugLogProvider for DummyVmemBackend {
+    fn debug_log_print(&self, _msg: &str) {}
 }
 
 #[expect(unused_variables, reason = "dummy/mock backend")]
@@ -81,11 +107,22 @@ fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>
     vmm.iter().map(|v| v.0.start..v.0.end).collect()
 }
 
+fn make_page_manager() -> super::PageManager<DummyVmemBackend, PAGE_SIZE> {
+    let litebox = crate::LiteBox::new(&DUMMY_VMEM_BACKEND);
+    super::PageManager::new(
+        &litebox,
+        DummyVmemBackend::TASK_ADDR_MIN..DummyVmemBackend::TASK_ADDR_MAX,
+    )
+}
+
 #[test]
 fn test_vmm_mapping() {
     let start_addr: usize = 0x1_0000;
     let range = PageRange::new(start_addr, start_addr + 12 * PAGE_SIZE).unwrap();
-    let mut vmm = Vmem::new(&DummyVmemBackend);
+    let mut vmm = Vmem::new(
+        &DummyVmemBackend,
+        DummyVmemBackend::TASK_ADDR_MIN..DummyVmemBackend::TASK_ADDR_MAX,
+    );
 
     // []
     unsafe {
@@ -294,4 +331,44 @@ fn test_vmm_mapping() {
             DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
         ]
     );
+}
+
+#[test]
+fn brk_backfills_hole_after_logical_jump() {
+    let pm = make_page_manager();
+    pm.set_initial_brk(0x10_000);
+
+    unsafe {
+        assert_eq!(pm.brk(0x12_000).unwrap(), 0x12_000);
+    }
+    assert_eq!(pm.current_brk(), 0x12_000);
+    assert_eq!(pm.current_brk_frontier(), 0x12_000);
+
+    pm.force_logical_brk_for_test(0x20_000);
+    assert_eq!(pm.current_brk(), 0x20_000);
+    assert_eq!(pm.current_brk_frontier(), 0x12_000);
+
+    unsafe {
+        assert_eq!(pm.brk(0x14_000).unwrap(), 0x14_000);
+    }
+    assert_eq!(pm.current_brk(), 0x14_000);
+    assert_eq!(pm.current_brk_frontier(), 0x14_000);
+    assert!(
+        pm.mappings()
+            .iter()
+            .any(|(range, _)| *range == (0x10_000..0x14_000))
+    );
+}
+
+#[test]
+fn brk_rejects_requests_below_initial_brk() {
+    let pm = make_page_manager();
+    pm.set_initial_brk(0x10_000);
+
+    unsafe {
+        assert_eq!(pm.brk(0x0f_000).unwrap(), 0x10_000);
+    }
+    assert_eq!(pm.current_brk(), 0x10_000);
+    assert_eq!(pm.current_brk_frontier(), 0x10_000);
+    assert!(pm.mappings().is_empty());
 }

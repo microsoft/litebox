@@ -336,6 +336,68 @@ fn test_runner_with_ls() {
     }
 }
 
+/// End-to-end test for fork → exec → waitpid lifecycle.
+/// Compiled as dynamic (PIE) because child processes get a different VA
+/// partition and ET_EXEC binaries have hardcoded addresses in slot 0.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_fork_exec_waitpid() {
+    let unique_name = "fork_exec_wait_rewriter";
+    let target = common::compile(
+        "./tests/multiprocess/fork_exec_wait.c",
+        unique_name,
+        false, // dynamic (PIE)
+        false,
+    );
+    let output = Runner::new(Backend::Rewriter, &target, unique_name).output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("[OK]"),
+        "fork_exec_wait test failed:\n{output_str}",
+    );
+}
+
+/// End-to-end test for cross-process pipes: parent creates pipe, child
+/// writes through it after vfork+exec, parent reads after waitpid.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_pipe_cross_process() {
+    let unique_name = "pipe_cross_process_rewriter";
+    let target = common::compile(
+        "./tests/multiprocess/pipe_cross_process.c",
+        unique_name,
+        false, // dynamic (PIE)
+        false,
+    );
+    let output = Runner::new(Backend::Rewriter, &target, unique_name).output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("[OK]"),
+        "pipe_cross_process test failed:\n{output_str}",
+    );
+}
+
+/// Verify that pipe2(O_CLOEXEC) fds are properly closed in the child
+/// after vfork+exec (i.e., the FD_CLOEXEC metadata is preserved across
+/// fork-time fd duplication).
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_pipe_cloexec() {
+    let unique_name = "pipe_cloexec_rewriter";
+    let target = common::compile(
+        "./tests/multiprocess/pipe_cloexec.c",
+        unique_name,
+        false, // dynamic (PIE)
+        false,
+    );
+    let output = Runner::new(Backend::Rewriter, &target, unique_name).output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("[OK]"),
+        "pipe_cloexec test failed:\n{output_str}",
+    );
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn run_python(args: &[&str]) -> String {
     let output = std::process::Command::new("python3")
@@ -528,6 +590,101 @@ fn test_tun_with_tcp_socket() {
         .tun_device_name("tun99")
         .run();
     child.join().unwrap();
+}
+
+/// Stage an additional host binary (+ its dependencies, rewritten) into
+/// the guest filesystem tar directory. Used to make binaries like `cat`
+/// available for bash to exec.
+#[cfg(target_arch = "x86_64")]
+fn stage_host_binary(tar_dir: &Path, binary_name: &str, guest_path: &str) {
+    let host_path = run_which(binary_name);
+    let dir_path = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+
+    // Rewrite the binary itself.
+    let rewritten = dir_path.join(format!("{binary_name}.hooked"));
+    let success = common::rewrite_with_cache(&host_path, &rewritten, &[]);
+    assert!(success, "failed to rewrite {binary_name}");
+
+    // Copy rewritten binary to guest filesystem.
+    let dest = tar_dir.join(&guest_path[1..]); // strip leading '/'
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::copy(&rewritten, &dest).unwrap();
+
+    // Rewrite and stage any dependencies not already present.
+    let deps = common::find_dependencies(host_path.to_str().unwrap());
+    for dep in &deps {
+        let dep_path = Path::new(dep.as_str());
+        let dep_dest = tar_dir.join(&dep[1..]);
+        if dep_dest.exists() {
+            continue; // already staged by the main binary
+        }
+        if let Some(parent) = dep_dest.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let success = common::rewrite_with_cache(dep_path, &dep_dest, &[]);
+        assert!(success, "failed to rewrite dependency {dep}");
+    }
+}
+
+/// Run bash with a simple echo (builtin). Tests that bash can start and
+/// execute a command on LiteBox userland.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_bash_echo() {
+    let bash_path = run_which("bash");
+    let output = Runner::new(Backend::Rewriter, &bash_path, "bash_echo_rewriter")
+        .args(["--norc", "--noprofile", "-c", "echo hello-from-bash"])
+        .output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("hello-from-bash"),
+        "bash echo test failed:\n{output_str}",
+    );
+}
+
+/// Signal delivery and return must preserve the full AVX register state on
+/// x86_64, not just the legacy FXSAVE subset.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_avx_signal_state_preserved() {
+    if !std::arch::is_x86_feature_detected!("avx") {
+        eprintln!("Skipping AVX signal test: host CPU does not expose AVX");
+        return;
+    }
+
+    let target = common::compile("./tests/avx_signal.c", "avx_signal_static", true, false);
+    let output = Runner::new(Backend::Rewriter, &target, "avx_signal_state_rewriter").output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("AVX state preserved"),
+        "AVX signal preservation test failed:\n{output_str}",
+    );
+}
+
+/// Run bash piping echo (builtin) into /bin/cat (fork+exec). Tests the
+/// full multi-process stack: fork, exec, pipes, waitpid.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_bash_pipe_cat() {
+    let bash_path = run_which("bash");
+    let output = Runner::new(Backend::Rewriter, &bash_path, "bash_pipe_cat_rewriter")
+        .args([
+            "--norc",
+            "--noprofile",
+            "-c",
+            "echo hello-pipe-test | /bin/cat",
+        ])
+        .with_fs_path(|tar_dir| {
+            stage_host_binary(tar_dir, "cat", "/bin/cat");
+        })
+        .output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("hello-pipe-test"),
+        "bash pipe+cat test failed:\n{output_str}",
+    );
 }
 
 /// Test network performance with iperf3

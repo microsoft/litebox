@@ -13,7 +13,7 @@ use litebox::{
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
-    platform::{RawConstPointer, RawMutPointer},
+    platform::{RawConstPointer, RawMutPointer, StdioProvider as _},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
@@ -24,6 +24,16 @@ use litebox_platform_multiplex::Platform;
 
 use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Classification of a file descriptor for terminal ioctl routing.
+enum TerminalKind {
+    /// Host stdio device (major=5) — forward ioctls to host kernel.
+    HostStdio,
+    /// PTY slave device (major=136) — handle locally.
+    Pty,
+    /// Not a terminal device.
+    NotTerminal,
+}
 
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {
@@ -48,6 +58,20 @@ impl FsState {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
             cwd: litebox::sync::RwLock::new(String::from("/")),
+        }
+    }
+
+    /// Create a new `FsState` with a custom initial working directory.
+    ///
+    /// The `cwd` must be an absolute path. A trailing '/' is appended if missing.
+    pub fn with_cwd(mut cwd: String) -> Self {
+        assert!(cwd.starts_with('/'), "initial CWD must be absolute");
+        if !cwd.ends_with('/') {
+            cwd.push('/');
+        }
+        Self {
+            umask: (Mode::WGRP | Mode::WOTH).bits().into(),
+            cwd: litebox::sync::RwLock::new(cwd),
         }
     }
 
@@ -96,6 +120,27 @@ impl<FS: ShimFS> FilesState<FS> {
             return Err(alloc::sync::Arc::into_inner(orig).unwrap());
         }
         Ok(raw_fd)
+    }
+
+    /// Clone the FD table for `fork()`.
+    ///
+    /// Creates an independent FD table that shares the underlying file objects
+    /// (via `Arc`) with the parent. This matches POSIX fork semantics: the
+    /// child gets its own FD number space but file descriptions (offsets,
+    /// flags) are shared. Each raw fd is duplicated in the global descriptor
+    /// table so the child's `OwnedFd` instances are independent from the
+    /// parent's.
+    pub fn clone_for_fork(
+        &self,
+        global_dt: &mut litebox::fd::Descriptors<litebox_platform_multiplex::Platform>,
+    ) -> Self {
+        Self {
+            fs: self.fs.clone(),
+            raw_descriptor_store: litebox::sync::RwLock::new(
+                self.raw_descriptor_store.read().clone_for_fork(global_dt),
+            ),
+            max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
+        }
     }
 }
 
@@ -165,6 +210,42 @@ impl<FS: ShimFS> Task<FS> {
         self.fs.borrow().umask()
     }
 
+    fn pty_rdev_for_raw_fd(&self, files: &FilesState<FS>, raw_fd: usize) -> Option<usize> {
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let status = files.fs.fd_file_status(fd).ok()?;
+                    let rdev = status.node_info.rdev?.get();
+                    ((rdev >> 8) == 136).then_some(rdev)
+                },
+                |_fd| None,
+                |_fd| None,
+                |_fd| None,
+                |_fd| None,
+                |_fd| None,
+            )
+            .ok()
+            .flatten()
+    }
+
+    fn _pty_target_for_guest_fd(
+        &self,
+        files: &FilesState<FS>,
+        guest_fd: u32,
+    ) -> Option<(usize, usize)> {
+        let raw_fd = usize::try_from(guest_fd).ok()?;
+        if !files.raw_descriptor_store.read().is_alive(raw_fd) {
+            return None;
+        }
+        let rdev = self.pty_rdev_for_raw_fd(files, raw_fd)?;
+        Some((raw_fd, rdev))
+    }
+
+    fn trace_pty_open(&self, _path: &str, _guest_fd: u32, _raw_fd: usize, _rdev: Option<usize>) {}
+
+    fn maybe_trace_pty_dup(&self, _oldfd: u32, _newfd: u32) {}
+
     /// Resolve a path against the current working directory.
     fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
         let path_str = path.as_rust_str().map_err(|_| Errno::EINVAL)?;
@@ -196,14 +277,17 @@ impl<FS: ShimFS> Task<FS> {
             .files
             .borrow()
             .fs
-            .open(path, flags - OFlags::CLOEXEC, mode)?;
-        if flags.contains(OFlags::CLOEXEC) {
-            let None = self
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
-            else {
+            .open(&*path, flags - OFlags::CLOEXEC, mode)?;
+        {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            if flags.contains(OFlags::CLOEXEC) {
+                let None = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC) else {
+                    unreachable!()
+                };
+            }
+            // Store access mode + status flags so F_GETFL can return them.
+            let status = flags & OFlags::STATUS_FLAGS_MASK;
+            let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status)) else {
                 unreachable!()
             };
         }
@@ -212,7 +296,22 @@ impl<FS: ShimFS> Task<FS> {
             files.fs.close(&file).unwrap();
             Errno::EMFILE
         })?;
-        Ok(u32::try_from(raw_fd).unwrap())
+        let guest_fd = u32::try_from(raw_fd).unwrap();
+
+        // Record fd → path for ELF patch cache.
+        if let Ok(s) = path.to_str() {
+            self.process_state
+                .borrow()
+                .fd_paths
+                .lock()
+                .insert(guest_fd.cast_signed(), alloc::string::String::from(s));
+            if s == "/dev/ptmx" || s.starts_with("/dev/pts/") {
+                let rdev = self.pty_rdev_for_raw_fd(&files, raw_fd);
+                self.trace_pty_open(s, guest_fd, raw_fd, rdev);
+            }
+        }
+
+        Ok(guest_fd)
     }
 
     /// Handle syscall `openat`
@@ -284,6 +383,34 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    pub(crate) fn sys_renameat2(
+        &self,
+        olddirfd: i32,
+        oldpath: impl path::Arg,
+        newdirfd: i32,
+        newpath: impl path::Arg,
+        flags: u32,
+    ) -> Result<(), Errno> {
+        if flags != 0 {
+            // RENAME_NOREPLACE, RENAME_EXCHANGE, RENAME_WHITEOUT not yet supported
+            return Err(Errno::EINVAL);
+        }
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let old = FsPath::new(olddirfd, oldpath, get_cwd)?;
+        let new = FsPath::new(newdirfd, newpath, get_cwd)?;
+        let FsPath::Absolute { path: old_path } = old else {
+            return Err(Errno::EINVAL);
+        };
+        let FsPath::Absolute { path: new_path } = new else {
+            return Err(Errno::EINVAL);
+        };
+        self.files
+            .borrow()
+            .fs
+            .rename(old_path, new_path)
+            .map_err(Errno::from)
+    }
+
     /// Handle syscall `read`
     ///
     /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.
@@ -300,10 +427,44 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
-                    files
+                    // First attempt.
+                    let result = files
                         .fs
                         .read(fd, &mut buf.borrow_mut(), offset)
-                        .map_err(Errno::from)
+                        .map_err(Errno::from);
+                    // If the read returned EAGAIN (no data), check whether
+                    // this fd is a pollable device that wants blocking reads
+                    // (e.g. PTY slave). Non-blocking pollables (PTY master)
+                    // return EAGAIN immediately for epoll-driven callers.
+                    if let Err(Errno::EAGAIN) = result
+                        && let Some(pollable) = files.fs.get_io_pollable(fd)
+                        && pollable.should_block_read()
+                    {
+                        loop {
+                            // vfork parking needs blocked host-side loops
+                            // to break out so prepare_to_run_guest() can
+                            // park the thread.
+                            if self.is_exiting() || self.is_suspended() {
+                                return Err(Errno::EINTR);
+                            }
+                            let events = pollable.check_io_events();
+                            if events.contains(Events::HUP) {
+                                return Ok(0); // EOF — master closed
+                            }
+                            if events.contains(Events::IN) {
+                                match files.fs.read(fd, &mut buf.borrow_mut(), offset) {
+                                    Ok(n) => return Ok(n),
+                                    Err(litebox::fs::errors::ReadError::WouldBlock) => {
+                                        core::hint::spin_loop();
+                                        continue;
+                                    }
+                                    Err(e) => return Err(Errno::from(e)),
+                                }
+                            }
+                            core::hint::spin_loop();
+                        }
+                    }
+                    result
                 },
                 |fd| {
                     self.global.receive(
@@ -315,9 +476,15 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 },
                 |fd| {
+                    let is_vfork_child = self.fork_context.borrow().is_some();
                     self.global
                         .pipes
-                        .read(&self.wait_cx(), fd, &mut buf.borrow_mut())
+                        .read_vfork_aware(
+                            &self.wait_cx(),
+                            fd,
+                            &mut buf.borrow_mut(),
+                            is_vfork_child,
+                        )
                         .map_err(Errno::from)
                 },
                 |fd| {
@@ -417,7 +584,8 @@ impl<FS: ShimFS> Task<FS> {
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
+            // TODO: send SIGPIPE to the current task.
+            // For now, just return EPIPE — most programs check the return value.
         }
         res
     }
@@ -536,6 +704,13 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `close`
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
+        // Finalize any in-progress ELF patching for this fd (mprotect
+        // trampoline RW→RX) before closing the descriptor.
+        self.finalize_elf_patch(fd);
+
+        // Remove fd → path mapping.
+        self.process_state.borrow().fd_paths.lock().remove(&fd);
+
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
@@ -589,6 +764,7 @@ impl<FS: ShimFS> Task<FS> {
                     |_fd| todo!("unix"),
                 )
                 .flatten()?;
+            self.park_if_deferred();
             iov.iov_base
                 .copy_from_slice(0, &kernel_buffer[..size])
                 .ok_or(Errno::EFAULT)?;
@@ -668,7 +844,7 @@ impl<FS: ShimFS> Task<FS> {
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
+            // TODO: send SIGPIPE to the current task.
         }
         res
     }
@@ -680,7 +856,7 @@ impl<FS: ShimFS> Task<FS> {
         mode: litebox_common_linux::AccessFlags,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path(pathname)?;
-        let status = self.files.borrow().fs.file_status(pathname)?;
+        let status = self.files.borrow().fs.file_status(&*pathname)?;
         if mode == litebox_common_linux::AccessFlags::F_OK {
             return Ok(());
         }
@@ -721,8 +897,20 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
-        // TODO: we do not support symbolic links other than stdio yet.
-        Err(Errno::ENOENT)
+        // Try the filesystem for symlink resolution
+        let result = self.files.borrow().fs.read_link(fullpath);
+        match result {
+            Ok(target) => Ok(target),
+            Err(e) => {
+                use litebox::fs::errors::ReadLinkError;
+                match e {
+                    ReadLinkError::PathError(_) => Err(Errno::ENOENT),
+                    // Not a symlink, or FS doesn't support symlinks.
+                    // 9P also returns Io when readlink is called on a non-symlink.
+                    _ => Err(Errno::EINVAL),
+                }
+            }
+        }
     }
 
     /// Handle syscall `readlink`
@@ -1367,34 +1555,230 @@ impl<FS: ShimFS> Task<FS> {
         Ok(raw_fd.try_into().unwrap())
     }
 
-    fn stdio_ioctl(
+    /// Forward a terminal ioctl to the host via the platform's semantic
+    /// terminal methods.
+    ///
+    /// Maps the fd's device type to the corresponding host stdio stream and
+    /// calls `get_terminal_attributes`, `set_terminal_attributes`,
+    /// `get_window_size`, or `set_window_size` as appropriate.
+    fn host_stdio_ioctl(
         &self,
+        fs: &FS,
+        fd: &TypedFd<FS>,
         arg: &IoctlArg<litebox_platform_multiplex::Platform>,
     ) -> Result<u32, Errno> {
+        use litebox::platform::{SetTermiosWhen, StdioIoctlError, StdioStream};
+
+        /// Map a `StdioIoctlError` to an `Errno`.
+        fn ioctl_err_to_errno(e: StdioIoctlError) -> Errno {
+            match e {
+                StdioIoctlError::NotATerminal => Errno::ENOTTY,
+                _ => Errno::EIO,
+            }
+        }
+
+        // Determine which host stream this fd corresponds to.
+        let status = fs.fd_file_status(fd).map_err(|_| Errno::EBADF)?;
+        // Each stdio device has a distinct ino (stdin=9, stdout=10, stderr=11, tty=12).
+        let preferred = match status.node_info.ino {
+            9 | 12 => StdioStream::Stdin,
+            10 => StdioStream::Stdout,
+            _ => StdioStream::Stderr,
+        };
+
+        // Try the preferred stream first, then fall back to any stream that is
+        // actually a terminal on the host. This handles the common case where
+        // the runner's stderr (or stdout) is redirected to a log file but the
+        // guest still expects all stdio fds to behave as terminal devices.
+        let stream = if self.global.platform.is_a_tty(preferred) {
+            preferred
+        } else {
+            [StdioStream::Stdin, StdioStream::Stdout, StdioStream::Stderr]
+                .into_iter()
+                .find(|s| self.global.platform.is_a_tty(*s))
+                .ok_or(Errno::ENOTTY)?
+        };
+
         match arg {
-            IoctlArg::TCGETS(termios) => {
-                termios
+            IoctlArg::TCGETS(termios_ptr) => {
+                let attrs = self
+                    .global
+                    .platform
+                    .get_terminal_attributes(stream)
+                    .map_err(ioctl_err_to_errno)?;
+                termios_ptr
                     .write_at_offset(
                         0,
                         litebox_common_linux::Termios {
-                            c_iflag: 0,
-                            c_oflag: 0,
-                            c_cflag: 0,
-                            c_lflag: 0,
-                            c_line: 0,
-                            c_cc: [0; 19],
+                            c_iflag: attrs.c_iflag,
+                            c_oflag: attrs.c_oflag,
+                            c_cflag: attrs.c_cflag,
+                            c_lflag: attrs.c_lflag,
+                            c_line: attrs.c_line,
+                            c_cc: attrs.c_cc,
                         },
                     )
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
+            IoctlArg::TCSETS(termios_ptr) => {
+                let t: litebox_common_linux::Termios =
+                    termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let attrs = litebox::platform::TerminalAttributes {
+                    c_iflag: t.c_iflag,
+                    c_oflag: t.c_oflag,
+                    c_cflag: t.c_cflag,
+                    c_lflag: t.c_lflag,
+                    c_line: t.c_line,
+                    c_cc: t.c_cc,
+                };
+                self.global
+                    .platform
+                    .set_terminal_attributes(stream, &attrs, SetTermiosWhen::Now)
+                    .map_err(ioctl_err_to_errno)?;
+                Ok(0)
+            }
+            IoctlArg::TCSETSW(termios_ptr) => {
+                let t: litebox_common_linux::Termios =
+                    termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let attrs = litebox::platform::TerminalAttributes {
+                    c_iflag: t.c_iflag,
+                    c_oflag: t.c_oflag,
+                    c_cflag: t.c_cflag,
+                    c_lflag: t.c_lflag,
+                    c_line: t.c_line,
+                    c_cc: t.c_cc,
+                };
+                self.global
+                    .platform
+                    .set_terminal_attributes(stream, &attrs, SetTermiosWhen::AfterDrain)
+                    .map_err(ioctl_err_to_errno)?;
+                Ok(0)
+            }
+            IoctlArg::TCSETSF(termios_ptr) => {
+                let t: litebox_common_linux::Termios =
+                    termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let attrs = litebox::platform::TerminalAttributes {
+                    c_iflag: t.c_iflag,
+                    c_oflag: t.c_oflag,
+                    c_cflag: t.c_cflag,
+                    c_lflag: t.c_lflag,
+                    c_line: t.c_line,
+                    c_cc: t.c_cc,
+                };
+                self.global
+                    .platform
+                    .set_terminal_attributes(stream, &attrs, SetTermiosWhen::AfterDrainFlushInput)
+                    .map_err(ioctl_err_to_errno)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCGWINSZ(ws_ptr) => {
+                let size = self
+                    .global
+                    .platform
+                    .get_window_size(stream)
+                    .map_err(ioctl_err_to_errno)?;
+                ws_ptr
+                    .write_at_offset(
+                        0,
+                        litebox_common_linux::Winsize {
+                            row: size.rows,
+                            col: size.cols,
+                            xpixel: size.xpixel,
+                            ypixel: size.ypixel,
+                        },
+                    )
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSWINSZ(ws_ptr) => {
+                let ws: litebox_common_linux::Winsize =
+                    ws_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let size = litebox::platform::WindowSize {
+                    rows: ws.row,
+                    cols: ws.col,
+                    xpixel: ws.xpixel,
+                    ypixel: ws.ypixel,
+                };
+                self.global
+                    .platform
+                    .set_window_size(stream, &size)
+                    .map_err(ioctl_err_to_errno)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCGPGRP(pgrp) => {
+                // Return the calling process's PID as the foreground process group.
+                pgrp.write_at_offset(0, self.sys_getpid())
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            // These are no-ops for stdio: TIOCSCTTY (already controlling terminal),
+            // TIOCNOTTY (detach), TIOCSPGRP (set foreground pgrp), TIOCSPTLK (unlock PTY).
+            IoctlArg::TIOCSCTTY
+            | IoctlArg::TIOCNOTTY
+            | IoctlArg::TIOCSPGRP(_)
+            | IoctlArg::TIOCSPTLK(_) => Ok(0),
+            _ => Err(Errno::ENOTTY),
+        }
+    }
+
+    /// Handle terminal ioctls for PTY slave devices (major=136).
+    fn pty_ioctl(
+        &self,
+        fs: &FS,
+        fd: &TypedFd<FS>,
+        arg: &IoctlArg<litebox_platform_multiplex::Platform>,
+    ) -> Result<u32, Errno> {
+        match arg {
+            IoctlArg::TCGETS(termios) => {
+                // Return stored terminal attributes for this PTY.
+                let stored = fs.get_pty_termios(fd).ok_or(Errno::ENOTTY)?;
+                termios
+                    .write_at_offset(
+                        0,
+                        litebox_common_linux::Termios {
+                            c_iflag: stored.c_iflag,
+                            c_oflag: stored.c_oflag,
+                            c_cflag: stored.c_cflag,
+                            c_lflag: stored.c_lflag,
+                            c_line: stored.c_line,
+                            c_cc: stored.c_cc,
+                        },
+                    )
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TCSETS(termios_ptr)
+            | IoctlArg::TCSETSW(termios_ptr)
+            | IoctlArg::TCSETSF(termios_ptr) => {
+                // Store the terminal attributes so future TCGETS and line
+                // discipline behaviour reflect what the application configured.
+                let t: litebox_common_linux::Termios =
+                    termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let stored = litebox::platform::TerminalAttributes {
+                    c_iflag: t.c_iflag,
+                    c_oflag: t.c_oflag,
+                    c_cflag: t.c_cflag,
+                    c_lflag: t.c_lflag,
+                    c_line: t.c_line,
+                    c_cc: t.c_cc,
+                };
+                if !fs.set_pty_termios(fd, stored) {
+                    return Err(Errno::ENOTTY);
+                }
+                Ok(0)
+            }
+            IoctlArg::TIOCSWINSZ(_)
+            | IoctlArg::TIOCSPTLK(_)
+            | IoctlArg::TIOCSCTTY
+            | IoctlArg::TIOCNOTTY
+            | IoctlArg::TIOCSPGRP(_) => Ok(0),
             IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset(
                     0,
                     litebox_common_linux::Winsize {
-                        row: 20,
-                        col: 20,
+                        row: 40,
+                        col: 120,
                         xpixel: 0,
                         ypixel: 0,
                     },
@@ -1402,18 +1786,41 @@ impl<FS: ShimFS> Task<FS> {
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
-            _ => todo!(),
+            IoctlArg::TIOCGPTN(ptn) => {
+                let status = fs.fd_file_status(fd).map_err(|_| Errno::EBADF)?;
+                let rdev = status.node_info.rdev.ok_or(Errno::ENOTTY)?;
+                let major = rdev.get() >> 8;
+                if major != 136 {
+                    return Err(Errno::ENOTTY);
+                }
+                let minor = u32::try_from(rdev.get() & 0xFF).expect("minor fits in u32");
+                ptn.write_at_offset(0, minor).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCGPGRP(pgrp) => {
+                pgrp.write_at_offset(0, self.sys_getpid())
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            _ => Err(Errno::ENOTTY),
         }
     }
 
-    fn is_stdio(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
+    /// Classify a file descriptor as a host stdio device, PTY device, or neither.
+    fn classify_terminal(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<TerminalKind, Errno> {
         match fs.fd_file_status(fd) {
             Ok(status) => {
-                // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
+                if status.file_type != litebox::fs::FileType::CharacterDevice {
+                    return Ok(TerminalKind::NotTerminal);
+                }
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
-                Ok((136..=143).contains(&major)
-                    && status.file_type == litebox::fs::FileType::CharacterDevice)
+                match major {
+                    // major 5: /dev/tty, /dev/console, /dev/ptmx — host stdio
+                    5 => Ok(TerminalKind::HostStdio),
+                    // major 136-143: Unix98 PTY slaves (/dev/pts/*)
+                    136..=143 => Ok(TerminalKind::Pty),
+                    _ => Ok(TerminalKind::NotTerminal),
+                }
             }
             Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
             Err(_) => unimplemented!(),
@@ -1432,19 +1839,62 @@ impl<FS: ShimFS> Task<FS> {
 
         let files = self.files.borrow();
         match arg {
+            IoctlArg::FIONREAD(out) => {
+                // Return the number of bytes available to read.
+                files
+                    .run_on_raw_fd(
+                        desc,
+                        |_file_fd| {
+                            // File/device fds: ENOTTY (not a supported operation).
+                            Err(Errno::ENOTTY)
+                        },
+                        |socket_fd| {
+                            let proxy = self.global.get_proxy(socket_fd)?;
+                            let n = proxy.pending_rx_bytes();
+                            let n = i32::try_from(n).unwrap_or(i32::MAX);
+                            out.write_at_offset(0, n).ok_or(Errno::EFAULT)?;
+                            Ok(0u32)
+                        },
+                        |pipe_fd| {
+                            // Pipes: return actual buffered byte count.
+                            let n = self
+                                .global
+                                .pipes
+                                .readable_bytes(pipe_fd)
+                                .map_err(|_| Errno::EBADF)?;
+                            let n = i32::try_from(n).unwrap_or(i32::MAX);
+                            out.write_at_offset(0, n).ok_or(Errno::EFAULT)?;
+                            Ok(0u32)
+                        },
+                        |_fd| Err(Errno::ENOTTY),
+                        |_fd| Err(Errno::ENOTTY),
+                        |_fd| Err(Errno::ENOTTY),
+                    )
+                    .flatten()
+            }
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
                 self.files
                     .borrow()
                     .run_on_raw_fd(
                         desc,
-                        |_file_fd| {
-                            // TODO: stdio NONBLOCK?
-                            #[cfg(debug_assertions)]
-                            litebox::log_println!(
-                                self.global.platform,
-                                "Attempted to set non-blocking on raw fd; currently unimplemented"
-                            );
+                        |file_fd| {
+                            if let Err(e) = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .with_metadata_mut(file_fd, |crate::StdioStatusFlags(flags)| {
+                                    flags.set(OFlags::NONBLOCK, val != 0);
+                                })
+                            {
+                                match e {
+                                    MetadataError::ClosedFd => return Err(Errno::EBADF),
+                                    MetadataError::NoSuchMetadata => {
+                                        // Non-stdio file FD; non-blocking is irrelevant for
+                                        // in-memory files, so silently succeed.
+                                    }
+                                }
+                            }
                             Ok(())
                         },
                         |socket_fd| {
@@ -1522,8 +1972,22 @@ impl<FS: ShimFS> Task<FS> {
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
                 },
-                |_fd| todo!("net"),
-                |_fd| todo!("pipes"),
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
                 |fd| {
                     let _old = self
                         .global
@@ -1549,17 +2013,102 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 },
             )?,
-            IoctlArg::TCGETS(..)
-            | IoctlArg::TCSETS(..)
-            | IoctlArg::TIOCGPTN(..)
-            | IoctlArg::TIOCGWINSZ(..) => files.run_on_raw_fd(
+            IoctlArg::FIONCLEX => files.run_on_raw_fd(
                 desc,
                 |fd| {
-                    if self.is_stdio(&files.fs, fd)? {
-                        self.stdio_ioctl(&arg)
-                    } else {
-                        Err(Errno::ENOTTY)
-                    }
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+            )?,
+            IoctlArg::TIOCGPTPEER(open_flags) => {
+                // TIOCGPTPEER: open the slave side of a PTY master, returning a new fd.
+                // The argument contains O_RDWR|O_NOCTTY or similar open flags.
+                let pty_idx = files.run_on_raw_fd(
+                    desc,
+                    |file_fd| {
+                        // Check the fd is a PTY master (major 136).
+                        let status = files.fs.fd_file_status(file_fd).map_err(|_| Errno::EBADF)?;
+                        let rdev = status.node_info.rdev.ok_or(Errno::ENOTTY)?;
+                        let major = rdev.get() >> 8;
+                        if major != 136 {
+                            return Err(Errno::ENOTTY);
+                        }
+                        Ok(rdev.get() & 0xFF)
+                    },
+                    |_| Err(Errno::ENOTTY),
+                    |_| Err(Errno::ENOTTY),
+                    |_| Err(Errno::ENOTTY),
+                    |_| Err(Errno::ENOTTY),
+                    |_| Err(Errno::ENOTTY),
+                )??;
+                // Drop borrows before opening (which needs write access).
+                drop(files);
+                // Open the slave via the normal open path.
+                let slave_path = alloc::format!("/dev/pts/{pty_idx}");
+                let oflags = OFlags::from_bits_truncate(u32::try_from(open_flags).unwrap_or(0));
+                self.sys_open(slave_path.as_str(), oflags, Mode::empty())
+            }
+            IoctlArg::TCGETS(..)
+            | IoctlArg::TCSETS(..)
+            | IoctlArg::TCSETSW(..)
+            | IoctlArg::TCSETSF(..)
+            | IoctlArg::TIOCGPTN(..)
+            | IoctlArg::TIOCSPTLK(..)
+            | IoctlArg::TIOCSCTTY
+            | IoctlArg::TIOCNOTTY
+            | IoctlArg::TIOCGPGRP(..)
+            | IoctlArg::TIOCSPGRP(..)
+            | IoctlArg::TIOCGWINSZ(..)
+            | IoctlArg::TIOCSWINSZ(..) => files.run_on_raw_fd(
+                desc,
+                |term_fd| match self.classify_terminal(&files.fs, term_fd)? {
+                    TerminalKind::HostStdio => self.host_stdio_ioctl(&files.fs, term_fd, &arg),
+                    TerminalKind::Pty => self.pty_ioctl(&files.fs, term_fd, &arg),
+                    TerminalKind::NotTerminal => Err(Errno::ENOTTY),
                 },
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
@@ -1568,9 +2117,10 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| Err(Errno::ENOTTY),
             )?,
             _ => {
-                #[cfg(debug_assertions)]
-                litebox::log_println!(self.global.platform, "\n\n\n{:?}\n\n\n", arg);
-                todo!()
+                // Return ENOTTY for unsupported ioctls rather than panicking.
+                // Complex programs (e.g., bash) probe terminal capabilities and
+                // handle ENOTTY gracefully.
+                Err(Errno::ENOTTY)
             }
         }
     }
@@ -1639,7 +2189,9 @@ impl<FS: ShimFS> Task<FS> {
             .descriptor_table()
             .entry_handle(&epoll_fd)
             .ok_or(Errno::EBADF)?;
-        handle.with_entry(|entry| entry.epoll_ctl(&self.global, op, fd, &file_descriptor, event))
+        handle.with_entry(|entry| {
+            entry.epoll_ctl(&self.global, &*files.fs, op, fd, &file_descriptor, event)
+        })
     }
 
     /// Handle syscall `epoll_pwait`
@@ -1652,16 +2204,35 @@ impl<FS: ShimFS> Task<FS> {
         sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
         _sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if sigmask.is_some() {
-            todo!("sigmask not supported");
-        }
+        // Save the current signal mask and apply the caller's mask for the
+        // duration of the wait.  This is the core semantics of epoll_pwait:
+        // atomically { set sigmask; wait; restore sigmask }.
+        //
+        // The mask restore is DEFERRED via `set_restore_mask` so that
+        // `process_signals()` (called by `prepare_to_run_guest`) can deliver
+        // newly-unblocked signals (e.g. SIGCHLD) before re-blocking them.
+        let saved_mask = if let Some(mask_ptr) = sigmask {
+            let new_mask = mask_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let old = self.signals.get_blocked();
+            self.signals.set_blocked(new_mask);
+            Some(old)
+        } else {
+            None
+        };
+
         let Ok(epfd) = u32::try_from(epfd) else {
+            if let Some(old) = saved_mask {
+                self.signals.set_blocked(old);
+            }
             return Err(Errno::EBADF);
         };
         let maxevents = maxevents as usize;
         if maxevents == 0
             || maxevents > i32::MAX as usize / size_of::<litebox_common_linux::EpollEvent>()
         {
+            if let Some(old) = saved_mask {
+                self.signals.set_blocked(old);
+            }
             return Err(Errno::EINVAL);
         }
         let timeout = if timeout >= 0 {
@@ -1673,25 +2244,36 @@ impl<FS: ShimFS> Task<FS> {
         let handle = {
             let files = self.files.borrow();
             {
-                let raw_fd = usize::try_from(epfd).or(Err(Errno::EBADF))?;
+                let Ok(raw_fd) = usize::try_from(epfd) else {
+                    if let Some(old) = saved_mask {
+                        self.signals.set_blocked(old);
+                    }
+                    return Err(Errno::EBADF);
+                };
                 let Ok(fd) =
                     files
                         .raw_descriptor_store
                         .read()
                         .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<FS>>(raw_fd)
                 else {
+                    if let Some(old) = saved_mask {
+                        self.signals.set_blocked(old);
+                    }
                     return Err(Errno::EBADF);
                 };
-                self.global
-                    .litebox
-                    .descriptor_table()
-                    .entry_handle(&fd)
-                    .ok_or(Errno::EBADF)?
+                let Some(h) = self.global.litebox.descriptor_table().entry_handle(&fd) else {
+                    if let Some(old) = saved_mask {
+                        self.signals.set_blocked(old);
+                    }
+                    return Err(Errno::EBADF);
+                };
+                h
             }
         };
-        handle.with_entry(|epoll_file| {
+        let result = handle.with_entry(|epoll_file| {
             match epoll_file.wait(
                 &self.global,
+                &*self.files.borrow().fs,
                 &self.wait_cx().with_timeout(timeout),
                 maxevents,
             ) {
@@ -1706,7 +2288,16 @@ impl<FS: ShimFS> Task<FS> {
                 Err(WaitError::TimedOut) => Ok(0),
                 Err(WaitError::Interrupted) => Err(Errno::EINTR),
             }
-        })
+        });
+
+        // Defer mask restore to process_signals() so that signals unblocked
+        // by the caller's mask (like SIGCHLD) are delivered before the
+        // original mask is reinstated.
+        if let Some(old) = saved_mask {
+            self.signals.set_restore_mask(old);
+        }
+
+        result
     }
 
     /// Handle syscall `ppoll`.
@@ -1718,19 +2309,35 @@ impl<FS: ShimFS> Task<FS> {
         sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if sigmask.is_some() {
+        // Save and apply the caller's signal mask for the duration of the wait,
+        // matching ppoll(2) semantics.
+        let saved_mask = if let Some(mask_ptr) = sigmask {
             if sigsetsize != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
-                // Expected via ppoll(2) manpage
-                unimplemented!()
+                return Err(Errno::EINVAL);
             }
-            unimplemented!("no sigmask support yet");
-        }
+            let new_mask = mask_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let old = self.signals.get_blocked();
+            self.signals.set_blocked(new_mask);
+            Some(old)
+        } else {
+            None
+        };
         let timeout = timeout.read()?;
-        let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
+        let nfds_signed = isize::try_from(nfds).map_err(|_| {
+            if let Some(old) = saved_mask {
+                self.signals.set_blocked(old);
+            }
+            Errno::EINVAL
+        })?;
 
         let mut set = super::epoll::PollSet::with_capacity(nfds);
         for i in 0..nfds_signed {
-            let fd = fds.read_at_offset(i).ok_or(Errno::EFAULT)?;
+            let fd = fds.read_at_offset(i).ok_or_else(|| {
+                if let Some(old) = saved_mask {
+                    self.signals.set_blocked(old);
+                }
+                Errno::EFAULT
+            })?;
 
             let events = litebox::event::Events::from_bits_truncate(
                 fd.events.reinterpret_as_unsigned().into(),
@@ -1745,6 +2352,10 @@ impl<FS: ShimFS> Task<FS> {
         ) {
             Ok(()) => {}
             Err(WaitError::Interrupted) => {
+                // Defer mask restore for process_signals.
+                if let Some(old) = saved_mask {
+                    self.signals.set_restore_mask(old);
+                }
                 // TODO: update the remaining time.
                 return Err(Errno::EINTR);
             }
@@ -1752,6 +2363,11 @@ impl<FS: ShimFS> Task<FS> {
                 // A timeout occurred. Scan one last time.
                 set.scan(&self.global, &self.files.borrow());
             }
+        }
+
+        // Defer mask restore for process_signals.
+        if let Some(old) = saved_mask {
+            self.signals.set_restore_mask(old);
         }
 
         // Write just the revents back.
@@ -1858,9 +2474,30 @@ impl<FS: ShimFS> Task<FS> {
         timeout: TimeParam<Platform>,
         sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
     ) -> Result<usize, Errno> {
-        if sigsetpack.is_some() {
-            unimplemented!("no sigsetpack support yet");
-        }
+        // Save the current signal mask and apply the caller's mask for the
+        // duration of the wait (same semantics as epoll_pwait / ppoll).
+        //
+        // pselect6 passes a pointer to {sigset_t *ss, size_t ss_len} where
+        // ss is itself a pointer to the actual signal mask.
+        let saved_mask = if let Some(pack_ptr) = sigsetpack {
+            let pack: litebox_common_linux::SigSetPack =
+                pack_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if pack.size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
+                return Err(Errno::EINVAL);
+            }
+            // pack.sigset is actually a pointer to the sigset (the u64 holds
+            // the guest address). Dereference it to read the actual mask.
+            let sigset_ptr = crate::ConstPtr::<litebox_common_linux::signal::SigSet>::from_usize(
+                pack.sigset.as_u64().truncate(),
+            );
+            let new_mask = sigset_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let old = self.signals.get_blocked();
+            self.signals.set_blocked(new_mask);
+            Some(old)
+        } else {
+            None
+        };
+
         let timeout = timeout.read()?;
         if nfds >= i32::MAX as u32
             || nfds as usize
@@ -1869,6 +2506,9 @@ impl<FS: ShimFS> Task<FS> {
                     .limits
                     .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
         {
+            if let Some(old) = saved_mask {
+                self.signals.set_blocked(old);
+            }
             return Err(Errno::EINVAL);
         }
         let len = (nfds as usize).div_ceil(core::mem::size_of::<usize>() * 8);
@@ -1891,7 +2531,15 @@ impl<FS: ShimFS> Task<FS> {
             kwritefds.as_mut(),
             kexceptfds.as_mut(),
             timeout,
-        )?;
+        );
+
+        // Defer mask restore so signals unblocked by the caller's mask are
+        // delivered before the original mask is reinstated.
+        if let Some(old) = saved_mask {
+            self.signals.set_restore_mask(old);
+        }
+
+        let count = count?;
 
         if let Some(fds) = kreadfds {
             readfds
@@ -2002,15 +2650,66 @@ impl<FS: ShimFS> Task<FS> {
                 return Err(Errno::EBADF);
             };
             if oldfd == newfd {
-                // Different from dup3, if oldfd is a valid file descriptor, and newfd has the same value
-                // as oldfd, then dup2() does nothing.
-                return if flags.is_some() {
-                    // dup3
-                    Err(Errno::EINVAL)
-                } else {
-                    // dup2
-                    Ok(oldfd)
-                };
+                if flags.is_some() {
+                    // dup3(fd, fd) always returns EINVAL per POSIX.
+                    return Err(Errno::EINVAL);
+                }
+                // dup2(fd, fd): verify fd is valid, then clear CLOEXEC.
+                //
+                // POSIX says dup2(fd, fd) "does nothing", but libuv relies on
+                // inherited stdio fds surviving exec even though the parent
+                // sets CLOEXEC. Clearing CLOEXEC here matches the intent of
+                // the dup2 caller (set up this fd for the child) and prevents
+                // close-on-exec from closing stdio fds after exec.
+                let files = self.files.borrow();
+                files
+                    .run_on_raw_fd(
+                        oldfd_usize,
+                        |fd| {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        },
+                        |fd| {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        },
+                        |fd| {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        },
+                        |fd| {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        },
+                        |fd| {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        },
+                        |fd| {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        },
+                    )
+                    .flatten()?;
+                return Ok(oldfd);
             }
             // Close whatever is at newfd before duping into it
             let newfd_usize = usize::try_from(newfd).or(Err(Errno::EBADF))?;
@@ -2020,11 +2719,14 @@ impl<FS: ShimFS> Task<FS> {
                 flags.unwrap_or(OFlags::empty()),
                 Some(newfd_usize),
             )?;
+            self.maybe_trace_pty_dup(oldfd, newfd);
             Ok(newfd)
         } else {
             // dup
             let new_file = self.do_dup(oldfd_usize, flags.unwrap_or(OFlags::empty()))?;
-            Ok(u32::try_from(new_file).unwrap())
+            let newfd = u32::try_from(new_file).unwrap();
+            self.maybe_trace_pty_dup(oldfd, newfd);
+            Ok(newfd)
         }
     }
 }
@@ -2062,6 +2764,12 @@ impl<FS: ShimFS> Task<FS> {
                 let mut entries = files.fs.read_dir(file)?;
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
 
+                // Buffer all dirent64 entries into a kernel-side Vec<u8> before
+                // writing to guest memory. This allows us to insert a single
+                // park checkpoint (for deferred vfork parking) before the guest
+                // write, rather than scattering them across every entry.
+                let mut kernel_buf = alloc::vec::Vec::<u8>::with_capacity(count.min(4096));
+
                 for entry in entries.iter().skip(dir_off) {
                     // include null terminator and make it aligned
                     let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
@@ -2077,25 +2785,47 @@ impl<FS: ShimFS> Task<FS> {
                         typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
                         __name: [0; 0],
                     };
-                    let hdr_ptr = crate::MutPtr::from_usize(dirp.as_usize() + nbytes);
-                    hdr_ptr.write_at_offset(0, dirent64).ok_or(Errno::EFAULT)?;
-                    let name_ptr = crate::MutPtr::from_usize(
-                        hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME,
-                    );
-                    name_ptr
-                        .write_slice_at_offset(0, entry.name.as_bytes())
-                        .ok_or(Errno::EFAULT)?;
-                    // set the null terminator and padding
-                    let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
-                    name_ptr
-                        .write_slice_at_offset(
-                            isize::try_from(entry.name.len()).unwrap(),
-                            &vec![0; zeros_len],
+
+                    // Append the dirent64 header as raw bytes.
+                    let hdr_bytes: &[u8] = unsafe {
+                        // SAFETY: LinuxDirent64 is repr(C) and all bit patterns
+                        // from the initialized fields are valid. We read
+                        // exactly `size_of::<LinuxDirent64>()` bytes from a
+                        // properly aligned struct.
+                        core::slice::from_raw_parts(
+                            (&raw const dirent64).cast::<u8>(),
+                            core::mem::size_of::<litebox_common_linux::LinuxDirent64>(),
                         )
-                        .ok_or(Errno::EFAULT)?;
+                    };
+                    kernel_buf.extend_from_slice(hdr_bytes);
+                    // Pad to DIRENT_STRUCT_BYTES_WITHOUT_NAME (covers the
+                    // __name[0] flexible array member offset).
+                    let hdr_size = core::mem::size_of::<litebox_common_linux::LinuxDirent64>();
+                    if hdr_size < DIRENT_STRUCT_BYTES_WITHOUT_NAME {
+                        kernel_buf.extend(core::iter::repeat_n(
+                            0u8,
+                            DIRENT_STRUCT_BYTES_WITHOUT_NAME - hdr_size,
+                        ));
+                    }
+                    // Append the name.
+                    kernel_buf.extend_from_slice(entry.name.as_bytes());
+                    // Null terminator + padding.
+                    let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
+                    kernel_buf.extend(core::iter::repeat_n(0u8, zeros_len));
+
                     nbytes += len;
                     dir_off += 1;
                 }
+
+                // Park checkpoint: block for deferred vfork before guest write.
+                self.park_if_deferred();
+
+                // Single bulk write to guest memory.
+                if nbytes > 0 {
+                    dirp.copy_from_slice(0, &kernel_buf[..nbytes])
+                        .ok_or(Errno::EFAULT)?;
+                }
+
                 let _old = self
                     .global
                     .litebox

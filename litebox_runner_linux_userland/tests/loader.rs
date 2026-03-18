@@ -93,12 +93,19 @@ impl TestLauncher {
         let fs = std::sync::Arc::new(self.fs);
         let shim = self.shim_builder.build();
         let program = shim
-            .load_program(fs, self.platform.init_task(), executable_path, argv, envp)
+            .load_program(
+                fs,
+                self.platform.init_task(),
+                executable_path,
+                argv,
+                envp,
+                None,
+            )
             .unwrap();
         unsafe {
             litebox_platform_linux_userland::run_thread(
                 program.entrypoints,
-                &mut litebox_common_linux::PtRegs::default(),
+                &mut litebox_common_linux::ExecutionContext::default(),
             );
         }
         assert_eq!(

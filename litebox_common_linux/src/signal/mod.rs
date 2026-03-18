@@ -317,6 +317,9 @@ pub const SI_TKILL: i32 = -6;
 pub const SI_DETHREAD: i32 = -7;
 pub const SI_ASYNCNL: i32 = -60;
 
+pub const SEGV_MAPERR: i32 = 1;
+pub const SEGV_ACCERR: i32 = 2;
+
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
 pub struct Ucontext {

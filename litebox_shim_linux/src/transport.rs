@@ -5,6 +5,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use litebox::fs::nine_p::transport;
 use litebox::net::socket_channel::NetworkProxy;
@@ -12,7 +13,7 @@ use litebox::net::{ReceiveFlags, SendFlags};
 use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
 use crate::syscalls::net::SocketFd;
-use crate::{GlobalState, Platform, ShimFS};
+use crate::{GlobalState, Platform, ShimFS, VforkParking};
 
 /// Handles socket cleanup on drop without exposing the `FS` generic.
 ///
@@ -51,6 +52,13 @@ impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
 pub struct ShimTransport {
     drop_guard: Box<dyn DropGuard>,
     proxy: Arc<NetworkProxy<Platform>>,
+    interrupt: Arc<core::sync::atomic::AtomicBool>,
+    vfork_parking: Arc<VforkParking>,
+    /// Tracks whether this transport has already "lied" (incremented
+    /// `parked_count` without blocking) during the current spin session.
+    /// Prevents double-counting when `read_exact` calls `read()` multiple
+    /// times for partial reads within a single 9P fcall.
+    has_lied: core::sync::atomic::AtomicBool,
 }
 
 impl ShimTransport {
@@ -65,6 +73,8 @@ impl ShimTransport {
     pub(crate) fn connect<FS: ShimFS>(
         global: Arc<GlobalState<FS>>,
         addr: core::net::SocketAddr,
+        interrupt: Arc<core::sync::atomic::AtomicBool>,
+        vfork_parking: Arc<VforkParking>,
     ) -> Result<Self, Errno> {
         // 1. Create the raw socket.
         let sockfd = global
@@ -91,7 +101,13 @@ impl ShimTransport {
 
         let drop_guard = Box::new(SocketDropGuard { global, sockfd });
 
-        Ok(Self { drop_guard, proxy })
+        Ok(Self {
+            drop_guard,
+            proxy,
+            interrupt,
+            vfork_parking,
+            has_lied: core::sync::atomic::AtomicBool::new(false),
+        })
     }
 }
 
@@ -101,16 +117,82 @@ impl Drop for ShimTransport {
     }
 }
 
+impl ShimTransport {
+    /// Attempt a deferred park: if vfork parking is requested, announce that
+    /// we have "parked" (increment `parked_count`) but keep spinning. The
+    /// actual block happens later at a park checkpoint in `do_syscall`,
+    /// before any guest memory write.
+    ///
+    /// This avoids releasing the 9P `write_state` mutex mid-operation, which
+    /// would corrupt the protocol stream and cause deadlocks.
+    fn try_deferred_park(&self) {
+        use litebox::platform::RawMutex as _;
+
+        // Already lied in this fcall session — don't double-count.
+        if self.has_lied.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Check if vfork parking is actually requested for this process.
+        let park_val = self
+            .vfork_parking
+            .park
+            .underlying_atomic()
+            .load(Ordering::Acquire);
+        if park_val == 0 {
+            return;
+        }
+
+        // The Lie: announce parked, but keep running.
+        self.has_lied.store(true, Ordering::Relaxed);
+        self.vfork_parking
+            .deferred_lie_count
+            .fetch_add(1, Ordering::Release);
+        self.vfork_parking
+            .parked_count
+            .underlying_atomic()
+            .fetch_add(1, Ordering::Release);
+        self.vfork_parking.parked_count.wake_all();
+    }
+}
+
 impl transport::Read for ShimTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
+        // If the vfork that triggered our lie is over, reset for next time.
+        if self.has_lied.load(Ordering::Relaxed) {
+            use litebox::platform::RawMutex as _;
+            let park_val = self
+                .vfork_parking
+                .park
+                .underlying_atomic()
+                .load(Ordering::Acquire);
+            if park_val == 0 {
+                self.has_lied.store(false, Ordering::Relaxed);
+            }
+        }
+
         loop {
+            // If a vfork interrupt is pending, perform a deferred park (lie)
+            // instead of blocking — we must not release the write_state mutex.
+            // After the lie, fall through to try_read so the 9P operation can
+            // complete and the write_state mutex can be released. Without this,
+            // threads waiting on the mutex can never contribute to parked_count,
+            // causing park_other_threads() to deadlock.
+            if self.interrupt.load(Ordering::Acquire) {
+                self.try_deferred_park();
+            }
             match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
                 Ok(0) => {
                     // No data yet — spin until something arrives.
                     core::hint::spin_loop();
                 }
                 Ok(n) => return Ok(n),
-                Err(_) => return Err(transport::ReadError),
+                Err(e) => {
+                    use litebox::platform::DebugLogProvider as _;
+                    let msg = alloc::format!("9P transport: read IO error: {e:?}\n");
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                    return Err(transport::ReadError::Io);
+                }
             }
         }
     }
@@ -118,14 +200,169 @@ impl transport::Read for ShimTransport {
 
 impl transport::Write for ShimTransport {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
+        // Same has_lied reset as Read — if the vfork is over, clear the flag
+        // so we can lie again on the next vfork.
+        if self.has_lied.load(Ordering::Relaxed) {
+            use litebox::platform::RawMutex as _;
+            let park_val = self
+                .vfork_parking
+                .park
+                .underlying_atomic()
+                .load(Ordering::Acquire);
+            if park_val == 0 {
+                self.has_lied.store(false, Ordering::Relaxed);
+            }
+        }
+
         loop {
+            // Same deferred park logic as read — lie, then fall through to
+            // try_write so the 9P request can finish sending.
+            if self.interrupt.load(Ordering::Acquire) {
+                self.try_deferred_park();
+            }
             match self.proxy.try_write(buf, SendFlags::empty(), None) {
                 Ok(n) => return Ok(n),
                 Err(litebox::net::errors::SendError::BufferFull) => {
                     // TX ring full — spin until space opens up.
                     core::hint::spin_loop();
                 }
-                Err(_) => return Err(transport::WriteError),
+                Err(e) => {
+                    // SocketInInvalidState is a terminal condition (TCP
+                    // connection closed). Log once at debug level only to
+                    // avoid spamming stderr during process shutdown.
+                    if !matches!(e, litebox::net::errors::SendError::SocketInInvalidState) {
+                        use litebox::platform::DebugLogProvider as _;
+                        let msg = alloc::format!("9P transport: write IO error: {e:?}\n");
+                        litebox_platform_multiplex::platform().debug_log_print(&msg);
+                    }
+                    return Err(transport::WriteError::Io);
+                }
+            }
+        }
+    }
+}
+
+/// A direct byte-stream transport backed by the platform's [`RawMessageProvider`].
+///
+/// Unlike [`ShimTransport`] (which routes through smoltcp TCP), this sends and
+/// receives raw bytes over a dedicated channel to the broker — typically a
+/// blocking Unix socket. This eliminates double-smoltcp overhead for
+/// request-response protocols like 9P.
+///
+/// The implementation checks the interrupt / vfork-parking flags between each
+/// poll cycle (the platform returns [`WouldBlock`] after a short timeout) so
+/// that `park_other_threads()` can still stop this thread.
+pub struct ShimMessageChannel {
+    interrupt: Arc<core::sync::atomic::AtomicBool>,
+    vfork_parking: Arc<VforkParking>,
+    has_lied: core::sync::atomic::AtomicBool,
+}
+
+impl ShimMessageChannel {
+    /// Create a new direct message channel.
+    ///
+    /// The actual fd is owned by the platform (`RawMessageProvider`); this type
+    /// only holds the interrupt / vfork handles needed for cooperative parking.
+    pub(crate) fn new(
+        interrupt: Arc<core::sync::atomic::AtomicBool>,
+        vfork_parking: Arc<VforkParking>,
+    ) -> Self {
+        Self {
+            interrupt,
+            vfork_parking,
+            has_lied: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Same deferred park logic as [`ShimTransport::try_deferred_park`].
+    fn try_deferred_park(&self) {
+        use litebox::platform::RawMutex as _;
+
+        if self.has_lied.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let park_val = self
+            .vfork_parking
+            .park
+            .underlying_atomic()
+            .load(Ordering::Acquire);
+        if park_val == 0 {
+            return;
+        }
+
+        self.has_lied.store(true, Ordering::Relaxed);
+        self.vfork_parking
+            .deferred_lie_count
+            .fetch_add(1, Ordering::Release);
+        self.vfork_parking
+            .parked_count
+            .underlying_atomic()
+            .fetch_add(1, Ordering::Release);
+        self.vfork_parking.parked_count.wake_all();
+    }
+
+    /// Reset the lie flag when the vfork that triggered it is over.
+    fn maybe_reset_lie(&self) {
+        if self.has_lied.load(Ordering::Relaxed) {
+            use litebox::platform::RawMutex as _;
+            let park_val = self
+                .vfork_parking
+                .park
+                .underlying_atomic()
+                .load(Ordering::Acquire);
+            if park_val == 0 {
+                self.has_lied.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl transport::Read for ShimMessageChannel {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
+        self.maybe_reset_lie();
+        loop {
+            if self.interrupt.load(Ordering::Acquire) {
+                self.try_deferred_park();
+            }
+            match litebox::platform::RawMessageProvider::recv_raw_message(
+                litebox_platform_multiplex::platform(),
+                buf,
+            ) {
+                Ok(0) => return Err(transport::ReadError::Io),
+                Ok(n) => return Ok(n),
+                Err(litebox::platform::ReceiveError::WouldBlock) => {
+                    // Platform returned after its internal timeout (~1ms).
+                    // Loop to check interrupt flags and retry.
+                    core::hint::spin_loop();
+                }
+                Err(litebox::platform::ReceiveError::Eof) => {
+                    return Err(transport::ReadError::Io);
+                }
+                Err(_) => return Err(transport::ReadError::Io),
+            }
+        }
+    }
+}
+
+impl transport::Write for ShimMessageChannel {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
+        self.maybe_reset_lie();
+        loop {
+            if self.interrupt.load(Ordering::Acquire) {
+                self.try_deferred_park();
+            }
+            match litebox::platform::RawMessageProvider::send_raw_message(
+                litebox_platform_multiplex::platform(),
+                buf,
+            ) {
+                Ok(n) => return Ok(n),
+                Err(litebox::platform::SendError::Io(11 /* EAGAIN/EWOULDBLOCK */)) => {
+                    // Platform returned after its internal timeout (~1ms).
+                    // Loop to check interrupt/vfork flags and retry.
+                    core::hint::spin_loop();
+                }
+                Err(_) => return Err(transport::WriteError::Io),
             }
         }
     }
@@ -262,8 +499,13 @@ mod tests {
         server: &DiodServer,
     ) -> nine_p::FileSystem<crate::Platform, ShimTransport> {
         let addr = socket_addr([10, 0, 0, 1], server.port);
-        let transport = ShimTransport::connect(task.global.clone(), addr)
-            .expect("failed to connect to 9P server via shim network");
+        let transport = ShimTransport::connect(
+            task.global.clone(),
+            addr,
+            task.global.transport_interrupt.clone(),
+            task.process_state.borrow().vfork_parking.clone(),
+        )
+        .expect("failed to connect to 9P server via shim network");
 
         let aname = server.export_path().to_str().unwrap();
         let username = std::env::var("USER")

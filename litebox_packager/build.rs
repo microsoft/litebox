@@ -11,31 +11,57 @@ fn main() {
         return;
     }
 
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let mut make_cmd = std::process::Command::new("make");
-    make_cmd
-        .current_dir(RTLD_AUDIT_DIR)
-        .env("OUT_DIR", &out_dir)
-        .env("ARCH", &target_arch);
-    // Always build without DEBUG for the packager -- packaged binaries are
-    // release artifacts.
-    make_cmd.env_remove("DEBUG");
-    // Force rebuild in case a stale artifact exists from a different config.
-    let _ = std::fs::remove_file(out_dir.join("litebox_rtld_audit.so"));
 
-    let output = make_cmd
-        .output()
-        .expect("Failed to execute make for rtld_audit");
-    assert!(
-        output.status.success(),
-        "failed to build rtld_audit.so via make:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert!(
-        out_dir.join("litebox_rtld_audit.so").exists(),
-        "Build failed to create litebox_rtld_audit.so"
-    );
+    if target_os == "linux" {
+        // Build litebox_rtld_audit.so from source using make.
+        let mut make_cmd = std::process::Command::new("make");
+        make_cmd
+            .current_dir(RTLD_AUDIT_DIR)
+            .env("OUT_DIR", &out_dir)
+            .env("ARCH", &target_arch);
+        // Always build without DEBUG for the packager -- packaged binaries are
+        // release artifacts.
+        make_cmd.env_remove("DEBUG");
+        // Force rebuild in case a stale artifact exists from a different config.
+        let _ = std::fs::remove_file(out_dir.join("litebox_rtld_audit.so"));
+
+        let output = make_cmd
+            .output()
+            .expect("Failed to execute make for rtld_audit");
+        assert!(
+            output.status.success(),
+            "failed to build rtld_audit.so via make:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            out_dir.join("litebox_rtld_audit.so").exists(),
+            "Build failed to create litebox_rtld_audit.so"
+        );
+    } else {
+        // On non-Linux, check for a pre-built litebox_rtld_audit.so.
+        // The OCI packager needs this file embedded via include_bytes!.
+        // If not present, create a placeholder — the packager will still
+        // work but the rtld audit library won't be functional.
+        let so_path = out_dir.join("litebox_rtld_audit.so");
+        if !so_path.exists() {
+            // Try to copy from the repository's pre-built artifacts.
+            let prebuilt = PathBuf::from(RTLD_AUDIT_DIR).join("litebox_rtld_audit.so");
+            if prebuilt.exists() {
+                std::fs::copy(&prebuilt, &so_path).expect("failed to copy pre-built rtld_audit.so");
+            } else {
+                // Create an empty placeholder so include_bytes! doesn't fail.
+                // The runner will need a properly built .so at runtime.
+                eprintln!(
+                    "cargo:warning=litebox_rtld_audit.so not found; \
+                     creating empty placeholder. Build on Linux first to get a real .so."
+                );
+                std::fs::write(&so_path, b"").expect("failed to create placeholder .so");
+            }
+        }
+    }
 
     println!("cargo:rerun-if-changed={RTLD_AUDIT_DIR}/rtld_audit.c");
     println!("cargo:rerun-if-changed={RTLD_AUDIT_DIR}/Makefile");

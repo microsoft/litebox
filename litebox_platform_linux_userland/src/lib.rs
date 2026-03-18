@@ -8,8 +8,10 @@
 #![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 use std::unimplemented;
@@ -110,12 +112,31 @@ macro_rules! saved_tls {
     };
 }
 
+/// The network transport backend for the platform.
+///
+/// Determines how IP packets are sent/received between the runner and the
+/// outside world (TUN device or IPC pipe to a broker).
+pub enum NetworkTransport {
+    /// Traditional TUN device — requires root/admin to set up.
+    Tun(std::os::fd::OwnedFd),
+    /// IPC pipe to a network broker — no privileges needed.
+    /// The fd is one end of a Unix `socketpair()`.
+    Ipc(std::os::fd::OwnedFd),
+}
+
 /// The userland Linux platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
 pub struct LinuxUserland {
-    tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
+    network_transport: std::sync::RwLock<Option<NetworkTransport>>,
+    /// Set when the IPC network transport encounters a fatal protocol error.
+    /// Once set, `receive_ip_packet` and `wait_on_network` short-circuit to
+    /// prevent busy-looping on the unreadable fd.
+    ipc_dead: std::sync::atomic::AtomicBool,
+    /// Optional dedicated fd for direct (non-IP) message passing to the broker.
+    /// Used for 9P in IPC mode to bypass the smoltcp network stack.
+    raw_message_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
     #[cfg(feature = "systrap_backend")]
     seccomp_interception_enabled: std::sync::atomic::AtomicBool,
     /// Reserved pages that are not available for guest programs to use.
@@ -125,6 +146,15 @@ pub struct LinuxUserland {
     /// CoW-eligible memory regions. Maps start address of the static slice, to the info needed to
     /// re-mmap the file.
     cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, CowRegionInfo>>,
+    /// VA partition allocator for multi-process support (x86_64 only).
+    #[cfg(target_arch = "x86_64")]
+    partitions: std::sync::Mutex<PartitionState>,
+    /// When set, pending `read_from_stdin()` calls return EOF instead of blocking.
+    stdin_cancelled: std::sync::atomic::AtomicBool,
+    /// Synthetic terminal replies injected by the platform emulation layer.
+    stdin_injected: Mutex<VecDeque<u8>>,
+    /// Pending terminal escape-sequence fragments split across stdout/stderr writes.
+    terminal_osc_pending: Mutex<TerminalOscPending>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -140,6 +170,201 @@ struct CowRegionInfo {
     file_path: PathBuf,
     /// Length of the backing file.
     file_length: usize,
+}
+
+#[derive(Default)]
+struct TerminalOscPending {
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum OscTerminator {
+    Bell,
+    StringTerminator,
+}
+
+struct TerminalWriteFilterResult {
+    passthrough: Vec<u8>,
+    injected_stdin: Vec<u8>,
+}
+
+fn terminal_colors_are_dark() -> bool {
+    let Ok(colorfgbg) = std::env::var("COLORFGBG") else {
+        return true;
+    };
+
+    let Some(bg_component) = colorfgbg.rsplit(';').next() else {
+        return true;
+    };
+    let Ok(bg) = bg_component.parse::<u8>() else {
+        return true;
+    };
+
+    matches!(bg, 0..=6 | 8)
+}
+
+fn ansi_palette_entry(index: u8, dark_background: bool) -> &'static [u8] {
+    const DARK_PALETTE: [&[u8]; 16] = [
+        b"rgb:0000/0000/0000",
+        b"rgb:cdcd/0000/0000",
+        b"rgb:0000/cdcd/0000",
+        b"rgb:cdcd/cdcd/0000",
+        b"rgb:0000/0000/eeee",
+        b"rgb:cdcd/0000/cdcd",
+        b"rgb:0000/cdcd/cdcd",
+        b"rgb:e5e5/e5e5/e5e5",
+        b"rgb:7f7f/7f7f/7f7f",
+        b"rgb:ffff/0000/0000",
+        b"rgb:0000/ffff/0000",
+        b"rgb:ffff/ffff/0000",
+        b"rgb:5c5c/5c5c/ffff",
+        b"rgb:ffff/0000/ffff",
+        b"rgb:0000/ffff/ffff",
+        b"rgb:ffff/ffff/ffff",
+    ];
+    const LIGHT_PALETTE: [&[u8]; 16] = [
+        b"rgb:0000/0000/0000",
+        b"rgb:cdcd/3131/3131",
+        b"rgb:0000/8b8b/0000",
+        b"rgb:b8b8/8686/0b0b",
+        b"rgb:0000/0000/9f9f",
+        b"rgb:8b8b/0000/8b8b",
+        b"rgb:0000/8b8b/8b8b",
+        b"rgb:d3d3/d3d3/d3d3",
+        b"rgb:7f7f/7f7f/7f7f",
+        b"rgb:ffff/0000/0000",
+        b"rgb:0000/9f9f/0000",
+        b"rgb:b8b8/8686/0b0b",
+        b"rgb:0000/0000/ffff",
+        b"rgb:ffff/0000/ffff",
+        b"rgb:0000/9f9f/9f9f",
+        b"rgb:ffff/ffff/ffff",
+    ];
+
+    let palette = if dark_background {
+        &DARK_PALETTE
+    } else {
+        &LIGHT_PALETTE
+    };
+    palette[usize::from(index)]
+}
+
+fn build_terminal_osc_reply(body: &[u8], terminator: OscTerminator) -> Option<Vec<u8>> {
+    let dark_background = terminal_colors_are_dark();
+    let (reply_code, rgb) = match body {
+        b"10;?" if dark_background => (b"10".as_slice(), b"rgb:ffff/ffff/ffff".as_slice()),
+        b"10;?" => (b"10".as_slice(), b"rgb:0000/0000/0000".as_slice()),
+        b"11;?" if dark_background => (b"11".as_slice(), b"rgb:0000/0000/0000".as_slice()),
+        b"11;?" => (b"11".as_slice(), b"rgb:ffff/ffff/ffff".as_slice()),
+        _ if body.starts_with(b"4;") && body.ends_with(b";?") => {
+            let idx = core::str::from_utf8(&body[2..body.len() - 2])
+                .ok()?
+                .parse::<u8>()
+                .ok()?;
+            if idx >= 16 {
+                return None;
+            }
+            (
+                body[..body.len() - 2].as_ref(),
+                ansi_palette_entry(idx, dark_background),
+            )
+        }
+        _ => return None,
+    };
+
+    let mut reply = Vec::with_capacity(2 + reply_code.len() + 1 + rgb.len() + 2);
+    reply.extend_from_slice(b"\x1b]");
+    reply.extend_from_slice(reply_code);
+    reply.push(b';');
+    reply.extend_from_slice(rgb);
+    match terminator {
+        OscTerminator::Bell => reply.push(0x07),
+        OscTerminator::StringTerminator => reply.extend_from_slice(b"\x1b\\"),
+    }
+    Some(reply)
+}
+
+fn filter_terminal_osc_queries(
+    pending: &mut Vec<u8>,
+    incoming: &[u8],
+) -> TerminalWriteFilterResult {
+    pending.extend_from_slice(incoming);
+
+    let mut passthrough = Vec::with_capacity(pending.len());
+    let mut injected_stdin = Vec::new();
+    let mut i = 0;
+
+    while i < pending.len() {
+        if pending[i] != 0x1b {
+            let next_escape = pending[i..]
+                .iter()
+                .position(|&b| b == 0x1b)
+                .map_or(pending.len(), |offset| i + offset);
+            passthrough.extend_from_slice(&pending[i..next_escape]);
+            i = next_escape;
+            continue;
+        }
+
+        if i + 1 >= pending.len() {
+            break;
+        }
+
+        if pending[i + 1] != b']' {
+            passthrough.push(pending[i]);
+            i += 1;
+            continue;
+        }
+
+        let mut terminator = None;
+        let mut j = i + 2;
+        while j < pending.len() {
+            match pending[j] {
+                0x07 => {
+                    terminator = Some((j, OscTerminator::Bell));
+                    break;
+                }
+                0x1b => {
+                    if j + 1 >= pending.len() {
+                        break;
+                    }
+                    if pending[j + 1] == b'\\' {
+                        terminator = Some((j, OscTerminator::StringTerminator));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+
+        let Some((body_end, terminator_kind)) = terminator else {
+            break;
+        };
+
+        let sequence_end = body_end
+            + match terminator_kind {
+                OscTerminator::Bell => 1,
+                OscTerminator::StringTerminator => 2,
+            };
+        let body = &pending[i + 2..body_end];
+
+        if let Some(reply) = build_terminal_osc_reply(body, terminator_kind) {
+            injected_stdin.extend_from_slice(&reply);
+        } else {
+            passthrough.extend_from_slice(&pending[i..sequence_end]);
+        }
+
+        i = sequence_end;
+    }
+
+    if i > 0 {
+        pending.drain(..i);
+    }
+
+    TerminalWriteFilterResult {
+        passthrough,
+        injected_stdin,
+    }
 }
 
 const IF_NAMESIZE: usize = 16;
@@ -187,6 +412,195 @@ pub union Ifru {
     // pub ifru_data: *mut i8,
 }
 
+/// VA partition management for multi-process support on x86_64.
+///
+/// The total userland VA range is divided into fixed-size, non-overlapping
+/// partitions. Each process gets one partition. A simple bitvec tracks which
+/// slots are in use.
+#[cfg(target_arch = "x86_64")]
+mod va_partitions {
+    /// Size of each VA partition (1 TiB).
+    pub const PARTITION_SIZE: usize = 1 << 40;
+
+    /// The lowest usable guest address (matches `TASK_ADDR_MIN`).
+    pub const VA_MIN: usize = 0x1_0000;
+
+    /// One past the highest usable guest address (matches `TASK_ADDR_MAX`).
+    pub const VA_MAX: usize = 0x7FFF_FFFF_F000;
+
+    /// Total number of partition slots that fit in the VA range.
+    ///
+    /// Slot `i` covers `i * PARTITION_SIZE .. (i + 1) * PARTITION_SIZE`,
+    /// clipped to `VA_MIN..VA_MAX`.
+    pub const NUM_SLOTS: usize = VA_MAX / PARTITION_SIZE; // 127 on x86_64
+}
+
+/// Mutable state for the VA partition allocator.
+#[cfg(target_arch = "x86_64")]
+struct PartitionState {
+    /// Bit `i` is `true` if slot `i` is allocated.
+    allocated: [bool; va_partitions::NUM_SLOTS],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl PartitionState {
+    fn new() -> Self {
+        Self {
+            allocated: [false; va_partitions::NUM_SLOTS],
+        }
+    }
+
+    /// Claim the next free slot. Returns the slot index or `None` if full.
+    #[allow(clippy::cast_possible_truncation)]
+    fn allocate(&mut self) -> Option<u32> {
+        for (i, slot) in self.allocated.iter_mut().enumerate() {
+            if !*slot {
+                *slot = true;
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
+    /// Release a previously allocated slot.
+    ///
+    /// Returns `false` if the slot is out of range or not currently allocated.
+    fn deallocate(&mut self, slot: u32) -> bool {
+        let idx = slot as usize;
+        if idx >= va_partitions::NUM_SLOTS {
+            return false;
+        }
+        if !self.allocated[idx] {
+            return false;
+        }
+        self.allocated[idx] = false;
+        true
+    }
+
+    /// Returns `true` if the given slot is currently allocated.
+    fn is_allocated(&self, slot: u32) -> bool {
+        let idx = slot as usize;
+        idx < va_partitions::NUM_SLOTS && self.allocated[idx]
+    }
+
+    /// Return the VA range for the given slot, clipped to `VA_MIN..VA_MAX`.
+    fn range_of(slot: u32) -> core::ops::Range<usize> {
+        let base = (slot as usize) * va_partitions::PARTITION_SIZE;
+        let start = base.max(va_partitions::VA_MIN);
+        let end = (base + va_partitions::PARTITION_SIZE).min(va_partitions::VA_MAX);
+        start..end
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod partition_tests {
+    use super::*;
+
+    #[test]
+    fn slot_0_range_starts_at_va_min() {
+        let range = PartitionState::range_of(0);
+        assert_eq!(range.start, va_partitions::VA_MIN);
+        assert_eq!(range.end, va_partitions::PARTITION_SIZE);
+    }
+
+    #[test]
+    fn slot_1_range() {
+        let range = PartitionState::range_of(1);
+        assert_eq!(range.start, va_partitions::PARTITION_SIZE);
+        assert_eq!(range.end, 2 * va_partitions::PARTITION_SIZE);
+    }
+
+    #[test]
+    fn last_slot_clipped_to_va_max() {
+        #[allow(clippy::cast_possible_truncation)]
+        let last = (va_partitions::NUM_SLOTS - 1) as u32;
+        let range = PartitionState::range_of(last);
+        assert!(range.end <= va_partitions::VA_MAX);
+        assert!(range.start < range.end);
+    }
+
+    #[test]
+    fn allocate_returns_sequential_slots() {
+        let mut state = PartitionState::new();
+        assert_eq!(state.allocate(), Some(0));
+        assert_eq!(state.allocate(), Some(1));
+        assert_eq!(state.allocate(), Some(2));
+    }
+
+    #[test]
+    fn deallocate_reuses_slot() {
+        let mut state = PartitionState::new();
+        let s0 = state.allocate().unwrap();
+        let s1 = state.allocate().unwrap();
+        assert!(state.deallocate(s0));
+        // Next allocate should reuse slot 0
+        assert_eq!(state.allocate(), Some(s0));
+        assert!(state.deallocate(s1));
+    }
+
+    #[test]
+    fn deallocate_rejects_invalid() {
+        let mut state = PartitionState::new();
+        // Unallocated slot
+        assert!(!state.deallocate(0));
+        // Out-of-bounds slot
+        #[allow(clippy::cast_possible_truncation)]
+        let out_of_bounds = va_partitions::NUM_SLOTS as u32;
+        assert!(!state.deallocate(out_of_bounds));
+
+        let s0 = state.allocate().unwrap();
+        assert!(state.deallocate(s0));
+        // Double-free
+        assert!(!state.deallocate(s0));
+    }
+
+    #[test]
+    fn is_allocated_tracks_state() {
+        let mut state = PartitionState::new();
+        assert!(!state.is_allocated(0));
+        let s0 = state.allocate().unwrap();
+        assert!(state.is_allocated(s0));
+        assert!(state.deallocate(s0));
+        assert!(!state.is_allocated(s0));
+        // Out of bounds
+        #[allow(clippy::cast_possible_truncation)]
+        let num_slots = va_partitions::NUM_SLOTS as u32;
+        assert!(!state.is_allocated(num_slots));
+    }
+
+    #[test]
+    fn exhaust_all_slots() {
+        let mut state = PartitionState::new();
+        for _ in 0..va_partitions::NUM_SLOTS {
+            assert!(state.allocate().is_some());
+        }
+        assert_eq!(state.allocate(), None);
+    }
+
+    #[test]
+    fn partitions_do_not_overlap() {
+        #[allow(clippy::cast_possible_truncation)]
+        let num_slots = va_partitions::NUM_SLOTS as u32;
+        for i in 0..(num_slots - 1) {
+            let a = PartitionState::range_of(i);
+            let b = PartitionState::range_of(i + 1);
+            assert!(a.end <= b.start, "slot {i} and {} overlap", i + 1);
+        }
+    }
+
+    #[test]
+    fn partition_ranges_are_page_aligned() {
+        const PAGE_SIZE: usize = 4096;
+        #[allow(clippy::cast_possible_truncation)]
+        let num_slots = va_partitions::NUM_SLOTS as u32;
+        for i in 0..num_slots {
+            let range = PartitionState::range_of(i);
+            assert_eq!(range.start % PAGE_SIZE, 0, "slot {i} start not aligned");
+            assert_eq!(range.end % PAGE_SIZE, 0, "slot {i} end not aligned");
+        }
+    }
+}
+
 impl LinuxUserland {
     /// Create a new userland-Linux platform for use in `LiteBox`.
     ///
@@ -197,69 +611,162 @@ impl LinuxUserland {
     ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
-        register_exception_handlers();
+        let transport = tun_device_name.map(|tun_device_name| {
+            let tun_path = b"/dev/net/tun\0";
+            let tun_fd = unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::open,
+                    tun_path.as_ptr() as usize,
+                    (litebox::fs::OFlags::RDWR
+                        | litebox::fs::OFlags::CLOEXEC
+                        | litebox::fs::OFlags::NONBLOCK)
+                        .bits() as usize,
+                    litebox::fs::Mode::empty().bits() as usize,
+                )
+            }
+            .expect("failed to open tun device");
 
-        let tun_socket_fd = tun_device_name
-            .map(|tun_device_name| {
-                let tun_path = b"/dev/net/tun\0";
-                let tun_fd = unsafe {
-                    syscalls::syscall3(
-                        syscalls::Sysno::open,
-                        tun_path.as_ptr() as usize,
-                        (litebox::fs::OFlags::RDWR
-                            | litebox::fs::OFlags::CLOEXEC
-                            | litebox::fs::OFlags::NONBLOCK)
-                            .bits() as usize,
-                        litebox::fs::Mode::empty().bits() as usize,
-                    )
-                }
-                .expect("failed to open tun device");
-
-                let tunsetiff = |fd: usize, ifreq: *const Ifreq| {
-                    let cmd =
-                        litebox_common_linux::iow!(b'T', 202, size_of::<::core::ffi::c_int>());
-                    unsafe {
-                        syscalls::syscall3(syscalls::Sysno::ioctl, fd, cmd as usize, ifreq as usize)
-                    }
-                    .expect("failed to set TUN interface flags");
-                };
-                let ifreq = Ifreq {
-                    ifr_name: {
-                        let mut name = [0i8; 16];
-                        assert!(tun_device_name.len() < 16); // Note: strictly-less-than 16, to ensure it fits
-                        for (i, b) in tun_device_name.char_indices() {
-                            let b = b as u32;
-                            assert!(b < 128);
-                            name[i] = i8::try_from(b).unwrap();
-                        }
-                        name
-                    },
-                    ifr_ifru: Ifru {
-                        // IFF_NO_PI: no tun header
-                        // IFF_TUN: create tun (i.e., IP)
-                        ifru_flags: i16::try_from(IFF_TUN | IFF_NO_PI).unwrap(),
-                    },
-                };
-                tunsetiff(tun_fd, &raw const ifreq);
-
-                // By taking ownership, we are letting the drop handler automatically run `libc::close`
-                // when necessary.
+            let tunsetiff = |fd: usize, ifreq: *const Ifreq| {
+                let cmd = litebox_common_linux::iow!(b'T', 202, size_of::<::core::ffi::c_int>());
                 unsafe {
-                    std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().truncate())
+                    syscalls::syscall3(syscalls::Sysno::ioctl, fd, cmd as usize, ifreq as usize)
                 }
-            })
-            .into();
+                .expect("failed to set TUN interface flags");
+            };
+            let ifreq = Ifreq {
+                ifr_name: {
+                    let mut name = [0i8; 16];
+                    assert!(tun_device_name.len() < 16); // Note: strictly-less-than 16, to ensure it fits
+                    for (i, b) in tun_device_name.char_indices() {
+                        let b = b as u32;
+                        assert!(b < 128);
+                        name[i] = i8::try_from(b).unwrap();
+                    }
+                    name
+                },
+                ifr_ifru: Ifru {
+                    // IFF_NO_PI: no tun header
+                    // IFF_TUN: create tun (i.e., IP)
+                    ifru_flags: i16::try_from(IFF_TUN | IFF_NO_PI).unwrap(),
+                },
+            };
+            tunsetiff(tun_fd, &raw const ifreq);
+
+            // By taking ownership, we are letting the drop handler automatically run `libc::close`
+            // when necessary.
+            let fd = unsafe {
+                std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().truncate())
+            };
+            NetworkTransport::Tun(fd)
+        });
+        Self::with_network(transport)
+    }
+
+    /// Create the platform with a specific network transport (TUN, IPC, or none).
+    ///
+    /// This is the general-purpose constructor. `new()` is a convenience wrapper
+    /// that opens a TUN device by name.
+    pub fn with_network(transport: Option<NetworkTransport>) -> &'static Self {
+        register_exception_handlers();
 
         let (reserved_pages, vdso_address) = Self::read_maps_and_vdso();
         let platform = Self {
-            tun_socket_fd,
+            network_transport: transport.into(),
+            ipc_dead: std::sync::atomic::AtomicBool::new(false),
+            raw_message_fd: std::sync::RwLock::new(None),
             #[cfg(feature = "systrap_backend")]
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages,
             vdso_address,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            #[cfg(target_arch = "x86_64")]
+            partitions: std::sync::Mutex::new(PartitionState::new()),
+            stdin_cancelled: std::sync::atomic::AtomicBool::new(false),
+            stdin_injected: Mutex::new(VecDeque::new()),
+            terminal_osc_pending: Mutex::new(TerminalOscPending::default()),
         };
         Box::leak(Box::new(platform))
+    }
+
+    /// Set the raw message fd for direct (non-IP) message passing to the broker.
+    /// The fd should be a blocking Unix stream socket connected to the broker's
+    /// 9P service.
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned.
+    pub fn set_raw_message_fd(&self, fd: std::os::fd::OwnedFd) {
+        *self.raw_message_fd.write().unwrap() = Some(fd);
+    }
+
+    /// Cancel any pending `read_from_stdin()` call, causing it to return EOF.
+    /// Called when the guest process is exiting to unblock threads waiting on stdin.
+    pub fn cancel_stdin(&self) {
+        self.stdin_cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn drain_injected_stdin(&self, buf: &mut [u8]) -> Option<usize> {
+        let mut injected = self.stdin_injected.lock().unwrap();
+        if injected.is_empty() {
+            return None;
+        }
+
+        let len = buf.len().min(injected.len());
+        for slot in &mut buf[..len] {
+            *slot = injected.pop_front().unwrap();
+        }
+        Some(len)
+    }
+
+    fn inject_stdin_reply(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.stdin_injected
+            .lock()
+            .unwrap()
+            .extend(bytes.iter().copied());
+    }
+
+    fn filter_terminal_write(&self, buf: &[u8]) -> TerminalWriteFilterResult {
+        let mut pending = self.terminal_osc_pending.lock().unwrap();
+        filter_terminal_osc_queries(&mut pending.bytes, buf)
+    }
+
+    #[allow(clippy::unused_self)] // matches trait signature convention
+    fn write_host_stream(
+        &self,
+        stream: litebox::platform::StdioOutStream,
+        buf: &[u8],
+    ) -> Result<usize, litebox::platform::StdioWriteError> {
+        let fd = usize::try_from(match stream {
+            litebox::platform::StdioOutStream::Stdout => litebox_common_linux::STDOUT_FILENO,
+            litebox::platform::StdioOutStream::Stderr => litebox_common_linux::STDERR_FILENO,
+        })
+        .unwrap();
+
+        let mut written = 0;
+        while written < buf.len() {
+            let n = unsafe {
+                syscalls::syscall4(
+                    syscalls::Sysno::write,
+                    fd,
+                    buf[written..].as_ptr() as usize,
+                    buf.len() - written,
+                    syscall_intercept::SYSCALL_ARG_MAGIC,
+                )
+            }
+            .map_err(|err| match err {
+                syscalls::Errno::EPIPE => litebox::platform::StdioWriteError::Closed,
+                _ => panic!("unhandled error {err}"),
+            })?;
+
+            if n == 0 {
+                return Err(litebox::platform::StdioWriteError::Closed);
+            }
+            written += n;
+        }
+        Ok(written)
     }
 
     /// Register a CoW-eligible memory region backed by a file.
@@ -418,32 +925,176 @@ impl LinuxUserland {
         }
     }
 
-    /// Wait until there is data available on the TUN device.
+    /// Wait until there is data available on the network transport (TUN or IPC).
     ///
     /// # Panics
     ///
-    /// Panics if the TUN device is not initialized.
+    /// Panics if no network transport is configured.
     pub fn wait_on_tun(&self, timeout: Option<Duration>) {
-        let tun_fd = self.tun_socket_fd.read().unwrap();
+        self.wait_on_network(timeout);
+    }
+
+    /// Wait until there is data available on the network transport (TUN or IPC).
+    ///
+    /// # Panics
+    ///
+    /// Panics if no network transport is configured.
+    pub fn wait_on_network(&self, timeout: Option<Duration>) {
+        // If IPC transport is dead (protocol error or broker EOF), don't poll
+        // the fd — it would return instantly causing a busy-loop.
+        if self.ipc_dead.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(t) = timeout {
+                std::thread::sleep(t);
+            } else {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            return;
+        }
+
+        let transport = self.network_transport.read().unwrap();
+        let is_ipc = matches!(transport.as_ref(), Some(NetworkTransport::Ipc(_)));
+        let fd = match transport.as_ref().expect("no network transport configured") {
+            NetworkTransport::Tun(fd) | NetworkTransport::Ipc(fd) => fd.as_raw_fd(),
+        };
         let mut pfd = libc::pollfd {
-            fd: tun_fd.as_ref().unwrap().as_raw_fd(),
+            fd,
             events: libc::POLLIN,
             revents: 0,
         };
+        // Use ppoll for sub-millisecond precision. The runner's network worker
+        // uses a 100µs default timeout; poll() truncates that to 0ms (busy-spin).
+        let ts = timeout.map(|t| libc::timespec {
+            #[allow(clippy::cast_possible_wrap)]
+            tv_sec: t.as_secs() as libc::time_t,
+            tv_nsec: libc::c_long::from(t.subsec_nanos()),
+        });
         let _ = unsafe {
-            libc::poll(
+            libc::ppoll(
                 &raw mut pfd,
                 1,
-                timeout.map_or(-1, |t| {
-                    let ms = t.as_millis();
-                    i32::try_from(ms).unwrap_or(i32::MAX)
-                }),
+                ts.as_ref()
+                    .map_or(std::ptr::null(), std::ptr::from_ref::<libc::timespec>),
+                std::ptr::null(),
             )
         };
+
+        // For IPC transport, detect broker closure via POLLHUP/POLLERR.
+        // These are always reported regardless of the events mask.
+        if is_ipc && (pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0) {
+            self.ipc_dead
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Returns `true` if a network transport is configured (either TUN or IPC).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned.
+    pub fn has_network(&self) -> bool {
+        self.network_transport.read().unwrap().is_some()
     }
 }
 
 impl litebox::platform::Provider for LinuxUserland {}
+
+impl litebox::platform::RawMessageProvider for LinuxUserland {
+    fn send_raw_message(&self, data: &[u8]) -> Result<usize, litebox::platform::SendError> {
+        let guard = self.raw_message_fd.read().unwrap();
+        let fd = guard
+            .as_ref()
+            .ok_or(litebox::platform::SendError::Io(libc::ENODEV))?;
+        let raw_fd = std::os::fd::AsRawFd::as_raw_fd(fd);
+
+        // Poll with 1ms timeout so callers can check interrupt/vfork flags
+        // between attempts without blocking indefinitely in the kernel.
+        let mut pfd = libc::pollfd {
+            fd: raw_fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let poll_ret = unsafe { libc::poll(&raw mut pfd, 1, 1) };
+        if poll_ret <= 0 {
+            return Err(litebox::platform::SendError::Io(libc::EAGAIN));
+        }
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return Err(litebox::platform::SendError::Io(libc::EPIPE));
+        }
+
+        let ret = unsafe {
+            libc::send(
+                raw_fd,
+                data.as_ptr().cast::<libc::c_void>(),
+                data.len(),
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+            )
+        };
+        match ret.cmp(&0) {
+            std::cmp::Ordering::Greater =>
+            {
+                #[allow(clippy::cast_sign_loss)]
+                Ok(ret as usize)
+            }
+            std::cmp::Ordering::Equal => Err(litebox::platform::SendError::Io(libc::EPIPE)),
+            std::cmp::Ordering::Less => {
+                let errno = unsafe { *libc::__errno_location() };
+                Err(litebox::platform::SendError::Io(errno))
+            }
+        }
+    }
+
+    fn recv_raw_message(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::ReceiveError> {
+        let guard = self.raw_message_fd.read().unwrap();
+        let fd = guard
+            .as_ref()
+            .ok_or(litebox::platform::ReceiveError::WouldBlock)?;
+        let raw_fd = std::os::fd::AsRawFd::as_raw_fd(fd);
+
+        // Use poll with 1ms timeout so callers can check interrupt/vfork flags
+        // between attempts without blocking indefinitely.
+        let mut pfd = libc::pollfd {
+            fd: raw_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&raw mut pfd, 1, 1) };
+        if ret <= 0 {
+            return Err(litebox::platform::ReceiveError::WouldBlock);
+        }
+        // HUP with no POLLIN means peer closed and no remaining data.
+        if pfd.revents & libc::POLLIN == 0 && pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return Err(litebox::platform::ReceiveError::Eof);
+        }
+
+        let ret = unsafe {
+            libc::recv(
+                raw_fd,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        match ret.cmp(&0) {
+            std::cmp::Ordering::Greater =>
+            {
+                #[allow(clippy::cast_sign_loss)]
+                Ok(ret as usize)
+            }
+            std::cmp::Ordering::Equal => {
+                // EOF — peer closed.
+                Err(litebox::platform::ReceiveError::Eof)
+            }
+            std::cmp::Ordering::Less => {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                    Err(litebox::platform::ReceiveError::WouldBlock)
+                } else {
+                    Err(litebox::platform::ReceiveError::Eof)
+                }
+            }
+        }
+    }
+}
 
 impl litebox::platform::SignalProvider for LinuxUserland {
     type Signal = litebox_common_linux::signal::Signal;
@@ -472,17 +1123,84 @@ fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
     litebox_common_linux::signal::SigSet::from_u64(u64::from(lo))
 }
 
+impl litebox::platform::AddressSpaceProvider for LinuxUserland {
+    /// Slot index into the VA partition table.
+    type AddressSpaceId = u32;
+
+    // Lazy CoW: mark pages read-only at fork time and snapshot on first
+    // write fault. More memory-efficient than eager for processes with many
+    // writable pages since only actually-modified pages are copied.
+    const EAGER_COW_FOR_VFORK: bool = false;
+
+    #[cfg(target_arch = "x86_64")]
+    fn create_address_space(
+        &self,
+    ) -> Result<Self::AddressSpaceId, litebox::platform::address_space::AddressSpaceError> {
+        self.partitions
+            .lock()
+            .unwrap()
+            .allocate()
+            .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn destroy_address_space(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        if !self.partitions.lock().unwrap().deallocate(id) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn fork_address_space(
+        &self,
+        parent: Self::AddressSpaceId,
+    ) -> Result<
+        litebox::platform::address_space::ForkedAddressSpace<Self::AddressSpaceId>,
+        litebox::platform::address_space::AddressSpaceError,
+    > {
+        if !self.partitions.lock().unwrap().is_allocated(parent) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        let child = self.create_address_space()?;
+        Ok(litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(child))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn activate_address_space(
+        &self,
+        _id: Self::AddressSpaceId,
+    ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        // No-op on userland — all processes share the host address space.
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn address_space_range(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<core::ops::Range<usize>, litebox::platform::address_space::AddressSpaceError> {
+        if !self.partitions.lock().unwrap().is_allocated(id) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        Ok(PartitionState::range_of(id))
+    }
+}
+
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates or returns.
 ///
 /// # Safety
 /// The context must be valid guest context.
-pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
+pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::ExecutionContext)
 where
-    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
 {
-    run_thread_inner(&shim, ctx, false);
+    run_thread_inner(&shim, ctx, 0);
 }
 
 /// Run a guest thread using a reference to the shim.
@@ -492,11 +1210,11 @@ where
 ///
 /// # Safety
 /// The context must be valid guest context.
-pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
+pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::ExecutionContext)
 where
-    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
 {
-    run_thread_inner(shim, ctx, false);
+    run_thread_inner(shim, ctx, 0);
 }
 
 /// Re-enter a guest thread using a reference to the shim.
@@ -506,30 +1224,83 @@ where
 ///
 /// # Safety
 /// The context must be valid guest context.
-pub unsafe fn reenter_thread<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
+pub unsafe fn reenter_thread<T>(shim: &T, ctx: &mut litebox_common_linux::ExecutionContext)
 where
-    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
 {
-    run_thread_inner(shim, ctx, true);
+    run_thread_inner(shim, ctx, RUN_THREAD_REENTER | RUN_THREAD_SKIP_FP_INIT);
 }
 
 struct ThreadContext<'a> {
-    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &'a mut litebox_common_linux::PtRegs,
+    shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+    ctx: &'a mut litebox_common_linux::ExecutionContext,
 }
 
+/// Flags for `run_thread_arch`.
+const RUN_THREAD_REENTER: u8 = 1 << 0; // bit 0: call reenter_handler instead of init_handler
+const RUN_THREAD_SKIP_FP_INIT: u8 = 1 << 1; // bit 1: skip initial FP save (preserve cloned FP state)
+
 fn run_thread_inner(
-    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &mut litebox_common_linux::PtRegs,
-    reenter: bool,
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+    ctx: &mut litebox_common_linux::ExecutionContext,
+    flags: u8,
 ) {
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     ThreadHandle::run_with_handle(|| {
+        #[cfg(target_arch = "x86_64")]
+        init_guest_xsave_support();
         with_signal_alt_stack(|| unsafe {
-            run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
+            run_thread_arch(&mut thread_ctx, ctx_ptr, flags);
         });
     });
+}
+
+#[cfg(target_arch = "x86_64")]
+// Deliberately cap the guest-visible xstate set at x87/SSE/AVX for now.
+// This keeps the save area layout fixed at 832 bytes and avoids advertising
+// wider states (for example AVX-512) until the rest of the stack supports
+// them end-to-end.
+const GUEST_XSAVE_MASK: u64 = 0x7; // x87 | SSE | AVX
+
+#[cfg(target_arch = "x86_64")]
+fn detect_guest_xsave_mask() -> u64 {
+    use core::arch::x86_64::{__cpuid, _xgetbv};
+
+    // CPUID.01H:ECX.XSAVE[bit 26] and OSXSAVE[bit 27] gate XSAVE/XGETBV.
+    let leaf1 = __cpuid(1);
+    let has_xsave = (leaf1.ecx & (1 << 26)) != 0;
+    let has_osxsave = (leaf1.ecx & (1 << 27)) != 0;
+    if !(has_xsave && has_osxsave) {
+        return 0;
+    }
+
+    // SAFETY: CPUID.01H reported both XSAVE and OSXSAVE, which means XGETBV
+    // is supported and XCR0 is readable from userspace on this host.
+    let xcr0 = unsafe { _xgetbv(0) };
+    let mask = xcr0 & GUEST_XSAVE_MASK;
+    // We need at least the legacy x87/SSE state to use xsave/xrstor.
+    if (mask & 0x3) == 0x3 { mask } else { 0 }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn init_guest_xsave_support() {
+    let mask = detect_guest_xsave_mask();
+    let enabled = u8::from(mask != 0);
+    #[allow(clippy::cast_possible_truncation)]
+    let mask_lo = mask as u32;
+    let mask_hi = (mask >> 32) as u32;
+    unsafe {
+        core::arch::asm! {
+            "mov BYTE PTR fs:guest_xsave_enabled@tpoff, {enabled}",
+            "mov DWORD PTR fs:guest_xsave_mask_lo@tpoff, {mask_lo:e}",
+            "mov DWORD PTR fs:guest_xsave_mask_hi@tpoff, {mask_hi:e}",
+            enabled = in(reg_byte) enabled,
+            mask_lo = in(reg) mask_lo,
+            mask_hi = in(reg) mask_hi,
+            options(nostack, preserves_flags)
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -537,6 +1308,8 @@ core::arch::global_asm!(
     "
     .section .tbss
     .align 8
+saved_r11:
+    .quad 0
 scratch:
     .quad 0
 host_sp:
@@ -561,6 +1334,20 @@ pending_host_signals:
 .globl wait_waker_addr
 wait_waker_addr:
     .quad 0
+guest_xsave_enabled:
+    .byte 0
+    .align 4
+guest_xsave_mask_lo:
+    .long 0
+guest_xsave_mask_hi:
+    .long 0
+
+    // NOTE: switching from .tbss to .tdata for initialized constants.
+    .section .tdata
+    .align 4
+.globl default_mxcsr
+default_mxcsr:
+    .long 0x1F80
     "
 );
 
@@ -602,8 +1389,8 @@ fn get_guest_fsbase() -> usize {
 #[unsafe(naked)]
 unsafe extern "C-unwind" fn run_thread_arch(
     thread_ctx: &mut ThreadContext,
-    ctx: *mut litebox_common_linux::PtRegs,
-    reenter: u8,
+    ctx: *mut litebox_common_linux::ExecutionContext,
+    flags: u8, // bit 0: use reenter_handler; bit 1: skip fxsave (preserve cloned FP)
 ) {
     core::arch::naked_asm!(
     "
@@ -622,7 +1409,7 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // Save host rsp and rbp and guest context top in TLS.
     mov fs:host_sp@tpoff, rsp
     mov fs:host_bp@tpoff, rbp
-    lea r8, [rsi + {GUEST_CONTEXT_SIZE}]
+    lea r8, [rsi + {PTREGS_SIZE}]
     mov fs:guest_context_top@tpoff, r8
 
     // Save host fs base in gs base. This will stay set for the lifetime
@@ -630,8 +1417,30 @@ unsafe extern "C-unwind" fn run_thread_arch(
     rdfsbase r8
     wrgsbase r8
 
-    // Call init_handler or reenter_handler based on reenter flag (in dl).
-    test dl, dl
+    // Initialize guest FP state for initial threads.
+    // Bit 1 of flags (dl) controls the initial FP save: if set, skip it to
+    // preserve cloned parent FP state (child threads). If clear, seed
+    // ctx.fp_regs with host FP state so the first restore gets a sane MXCSR.
+    // The mxcsr_mask at offset 28 in the FXSAVE area is read by the shim's
+    // restore_sigcontext from ctx.fp_regs directly — no TLS copy needed.
+    test dl, 2
+    jnz .Lskip_fp_seed
+    cmp BYTE PTR fs:guest_xsave_enabled@tpoff, 0
+    je .Lseed_fp_save_fx
+    push rax
+    push rdx
+    mov eax, DWORD PTR fs:guest_xsave_mask_lo@tpoff
+    mov edx, DWORD PTR fs:guest_xsave_mask_hi@tpoff
+    xsave64 [rsi + {FP_REGS_OFFSET}]
+    pop rdx
+    pop rax
+    jmp .Lskip_fp_seed
+.Lseed_fp_save_fx:
+    fxsave64 [rsi + {FP_REGS_OFFSET}]
+.Lskip_fp_seed:
+
+    // Call init_handler or reenter_handler based on bit 0 of flags (dl).
+    test dl, 1
     jnz 1f
     call {init_handler}
     jmp .Ldone
@@ -651,17 +1460,42 @@ syscall_callback:
     // expectations of `interrupt_signal_handler`.
     mov      BYTE PTR gs:in_guest@tpoff, 0
 
-    // Restore host fs base.
+    // Save guest R11 (syscall call-site address from rewriter trampoline)
+    // before it is clobbered by the fsbase/gsbase save sequence below.
+    mov      gs:saved_r11@tpoff, r11
+
+    // Save guest fsbase, then get host TLS base.
     rdfsbase r11
     mov      gs:guest_fsbase@tpoff, r11
     rdgsbase r11
+
+    // Save guest FP/SIMD state into ctx.fp_regs and sanitize MXCSR before any
+    // Rust code runs. guest_context_top points to top of PtRegs in ctx;
+    // fp_regs starts at a known offset past PtRegs.
+    mov      r11, gs:guest_context_top@tpoff
+    cmp BYTE PTR gs:guest_xsave_enabled@tpoff, 0
+    je .Lsyscall_fp_save_fx
+    push rax
+    push rdx
+    mov eax, DWORD PTR gs:guest_xsave_mask_lo@tpoff
+    mov edx, DWORD PTR gs:guest_xsave_mask_hi@tpoff
+    xsave64 [r11 + {FP_REGS_OFFSET} - {PTREGS_SIZE}]
+    pop rdx
+    pop rax
+    jmp .Lsyscall_fp_saved
+.Lsyscall_fp_save_fx:
+    fxsave64 [r11 + {FP_REGS_OFFSET} - {PTREGS_SIZE}]
+.Lsyscall_fp_saved:
+    rdgsbase r11
+    ldmxcsr  [r11 + default_mxcsr@tpoff]
+
+    // Restore host fs base.
     wrfsbase r11
 
     // Switch to the top of the guest context.
     mov     r11, rsp
     mov     rsp, fs:guest_context_top@tpoff
 
-    // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
     push    0x2b       // pt_regs->ss = __USER_DS
     push    r11        // pt_regs->sp
@@ -678,7 +1512,7 @@ syscall_callback:
     push    r8          // pt_regs->r8
     push    r9          // pt_regs->r9
     push    r10         // pt_regs->r10
-    push    [rsp + 88]  // pt_regs->r11 = rflags
+    push    QWORD PTR gs:saved_r11@tpoff // pt_regs->r11 (syscall call-site from rewriter)
     push    rbx         // pt_regs->bx
     push    rbp         // pt_regs->bp
     push    r12         // pt_regs->r12
@@ -702,6 +1536,26 @@ exception_callback:
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
 
+    // Save guest FP/SIMD state into ctx.fp_regs and sanitize MXCSR. The host
+    // kernel's sigreturn restored the CPU's FP state from the host signal frame
+    // before reaching here, so the CPU FP state is the guest's original state.
+    mov      r11, fs:guest_context_top@tpoff
+    cmp BYTE PTR fs:guest_xsave_enabled@tpoff, 0
+    je .Lexception_fp_save_fx
+    push rax
+    push rdx
+    mov eax, DWORD PTR fs:guest_xsave_mask_lo@tpoff
+    mov edx, DWORD PTR fs:guest_xsave_mask_hi@tpoff
+    xsave64 [r11 + {FP_REGS_OFFSET} - {PTREGS_SIZE}]
+    pop rdx
+    pop rax
+    jmp .Lexception_fp_saved
+.Lexception_fp_save_fx:
+    fxsave64 [r11 + {FP_REGS_OFFSET} - {PTREGS_SIZE}]
+.Lexception_fp_saved:
+    rdfsbase r11
+    ldmxcsr  [r11 + default_mxcsr@tpoff]
+
     mov rdi, [rsp] // pass thread_ctx
     call {exception_handler}
     jmp .Ldone
@@ -710,6 +1564,25 @@ interrupt_callback:
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
+
+    // Save guest FP/SIMD state into ctx.fp_regs and sanitize MXCSR.
+    // Same rationale as exception_callback above.
+    mov      r11, fs:guest_context_top@tpoff
+    cmp BYTE PTR fs:guest_xsave_enabled@tpoff, 0
+    je .Linterrupt_fp_save_fx
+    push rax
+    push rdx
+    mov eax, DWORD PTR fs:guest_xsave_mask_lo@tpoff
+    mov edx, DWORD PTR fs:guest_xsave_mask_hi@tpoff
+    xsave64 [r11 + {FP_REGS_OFFSET} - {PTREGS_SIZE}]
+    pop rdx
+    pop rax
+    jmp .Linterrupt_fp_saved
+.Linterrupt_fp_save_fx:
+    fxsave64 [r11 + {FP_REGS_OFFSET} - {PTREGS_SIZE}]
+.Linterrupt_fp_saved:
+    rdfsbase r11
+    ldmxcsr  [r11 + default_mxcsr@tpoff]
 
     mov rdi, [rsp] // pass thread_ctx
     call {interrupt_handler}
@@ -727,7 +1600,8 @@ interrupt_callback:
     ret
     .cfi_endproc
 ",
-    GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+    PTREGS_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+    FP_REGS_OFFSET = const core::mem::offset_of!(litebox_common_linux::ExecutionContext, fp_regs),
     init_handler = sym init_handler,
     reenter_handler = sym reenter_handler,
     syscall_handler = sym syscall_handler,
@@ -750,8 +1624,8 @@ interrupt_callback:
 #[unsafe(naked)]
 unsafe extern "fastcall-unwind" fn run_thread_arch(
     thread_ctx: &mut ThreadContext,
-    ctx: *mut litebox_common_linux::PtRegs,
-    reenter: u8,
+    ctx: *mut litebox_common_linux::ExecutionContext,
+    flags: u8, // bit 0: use reenter_handler; bit 1: skip fxsave (x86_64 only)
 ) {
     core::arch::naked_asm!(
     "
@@ -768,18 +1642,18 @@ unsafe extern "fastcall-unwind" fn run_thread_arch(
     // Save host esp and ebp and guest context top in TLS
     mov gs:host_sp@ntpoff, esp
     mov gs:host_bp@ntpoff, ebp
-    lea edi, [edx + {GUEST_CONTEXT_SIZE}]
+    lea edi, [edx + {PTREGS_SIZE}]
     mov gs:guest_context_top@ntpoff, edi
 
     // Save host gs in fs
     mov ax, gs
     mov fs, ax
 
-    // Call init_handler or reenter_handler based on reenter flag (on stack at [ebp+8])
+    // Call init_handler or reenter_handler based on bit 0 of flags (on stack at [ebp+8])
     sub esp, 12 // align
     push ecx
-    mov al, [ebp + 8]  // reenter is 3rd arg, first stack arg for fastcall
-    test al, al
+    mov al, [ebp + 8]  // flags is 3rd arg, first stack arg for fastcall
+    test al, 1
     jnz 1f
     call {init_handler}
     jmp .Ldone
@@ -881,7 +1755,7 @@ interrupt_callback:
     ret 4  // pop the reenter argument (fastcall callee cleanup)
     .cfi_endproc
 ",
-    GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+    PTREGS_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
     init_handler = sym init_handler,
     reenter_handler = sym reenter_handler,
     syscall_handler_fast = sym syscall_handler_fast,
@@ -907,8 +1781,20 @@ unsafe extern "fastcall-unwind" fn syscall_handler_fast(thread_ctx: &mut ThreadC
 /// destructors.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContext) -> ! {
     core::arch::naked_asm!(
+        // Restore guest FP/SIMD state from ctx.fp_regs BEFORE setting in_guest=1.
+        // If an interrupt arrives here, handler sees in_guest=0 and IP outside
+        // [switch_to_guest_start, switch_to_guest_end) → host mode (Case 2).
+        "cmp BYTE PTR fs:guest_xsave_enabled@tpoff, 0",
+        "je 2f",
+        "mov eax, DWORD PTR fs:guest_xsave_mask_lo@tpoff",
+        "mov edx, DWORD PTR fs:guest_xsave_mask_hi@tpoff",
+        "xrstor64 [rdi + {FP_REGS_OFFSET}]",
+        "jmp 3f",
+        "2:",
+        "fxrstor64 [rdi + {FP_REGS_OFFSET}]",
+        "3:",
         "switch_to_guest_start:",
         // Set `in_guest` now, then check if there is a pending interrupt. If
         // so, jump to the interrupt handler.
@@ -947,6 +1833,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "pop rsp",
         "jmp gs:scratch@tpoff", // jump to the guest
         "switch_to_guest_end:",
+        FP_REGS_OFFSET = const core::mem::offset_of!(litebox_common_linux::ExecutionContext, fp_regs),
     );
 }
 
@@ -983,7 +1870,7 @@ wait_waker_addr:
 
 #[cfg(target_arch = "x86")]
 #[unsafe(naked)]
-unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContext) -> ! {
     core::arch::naked_asm!(
         "switch_to_guest_start:",
         // Set `in_guest` now, then check if there is a pending interrupt. If
@@ -1059,17 +1946,14 @@ where
 
 fn thread_start(
     init_thread: Box<
-        dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+        dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::ExecutionContext>,
     >,
-    mut ctx: litebox_common_linux::PtRegs,
+    mut ctx: litebox_common_linux::ExecutionContext,
 ) {
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
-    run_thread_inner(shim.as_ref(), &mut ctx, false);
-    // TODO: have syscall_callback return if we need to terminate the process.
-    // We should return this value to the caller so load_program can return it
-    // to the user.
+    run_thread_inner(shim.as_ref(), &mut ctx, RUN_THREAD_SKIP_FP_INIT);
 }
 
 // A handle to a platform thread.
@@ -1121,15 +2005,15 @@ impl ThreadHandle {
 }
 
 impl litebox::platform::ThreadProvider for LinuxUserland {
-    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ExecutionContext = litebox_common_linux::ExecutionContext;
     type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
 
     unsafe fn spawn_thread(
         &self,
-        ctx: &litebox_common_linux::PtRegs,
+        ctx: &litebox_common_linux::ExecutionContext,
         init_thread: Box<
-            dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
+            dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::ExecutionContext>,
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
@@ -1348,28 +2232,79 @@ impl litebox::platform::RawMutex for RawMutex {
 
 impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        let tun_fd = self.tun_socket_fd.read().unwrap();
-        let Some(tun_socket_fd) = tun_fd.as_ref() else {
-            unimplemented!("networking without tun is unimplemented")
-        };
-        match unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::write,
-                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
-                packet.as_ptr() as usize,
-                packet.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
-        } {
-            Ok(n) => {
-                if n != packet.len() {
-                    unimplemented!("unexpected size {n}")
+        let transport = self.network_transport.read().unwrap();
+        let transport = transport
+            .as_ref()
+            .expect("send_ip_packet called without network transport");
+
+        match transport {
+            NetworkTransport::Tun(fd) => {
+                match unsafe {
+                    syscalls::syscall4(
+                        syscalls::Sysno::write,
+                        usize::try_from(fd.as_raw_fd()).unwrap(),
+                        packet.as_ptr() as usize,
+                        packet.len(),
+                        // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                        syscall_intercept::SYSCALL_ARG_MAGIC,
+                    )
+                } {
+                    Ok(n) => {
+                        if n != packet.len() {
+                            unimplemented!("unexpected size {n}")
+                        }
+                        Ok(())
+                    }
+                    Err(errno) => Err(litebox::platform::SendError::Io(errno.into_raw())),
+                }
+            }
+            NetworkTransport::Ipc(fd) => {
+                // IPC framing: 4-byte LE length prefix + packet.
+                // Must handle partial writes to prevent stream misalignment.
+                let mut frame = Vec::with_capacity(4 + packet.len());
+                #[allow(clippy::cast_possible_truncation)]
+                frame.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+                frame.extend_from_slice(packet);
+
+                let mut sent = 0usize;
+                while sent < frame.len() {
+                    let ret = unsafe {
+                        libc::send(
+                            fd.as_raw_fd(),
+                            frame[sent..].as_ptr().cast::<libc::c_void>(),
+                            frame.len() - sent,
+                            libc::MSG_NOSIGNAL,
+                        )
+                    };
+                    match ret.cmp(&0) {
+                        std::cmp::Ordering::Greater => {
+                            #[allow(clippy::cast_sign_loss)]
+                            {
+                                sent += ret as usize;
+                            }
+                        }
+                        std::cmp::Ordering::Equal => {
+                            return Err(litebox::platform::SendError::Io(libc::EPIPE));
+                        }
+                        std::cmp::Ordering::Less => {
+                            let errno = unsafe { *libc::__errno_location() };
+                            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                                // Socket buffer full — wait briefly for space.
+                                let mut pfd = libc::pollfd {
+                                    fd: fd.as_raw_fd(),
+                                    events: libc::POLLOUT,
+                                    revents: 0,
+                                };
+                                unsafe {
+                                    libc::poll(&raw mut pfd, 1, 10);
+                                }
+                                continue;
+                            }
+                            return Err(litebox::platform::SendError::Io(errno));
+                        }
+                    }
                 }
                 Ok(())
-            }
-            Err(errno) => {
-                unimplemented!("unexpected error {errno}")
             }
         }
     }
@@ -1378,27 +2313,139 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        let tun_fd = self.tun_socket_fd.read().unwrap();
-        let Some(tun_socket_fd) = tun_fd.as_ref() else {
-            unimplemented!("networking without tun is unimplemented")
-        };
-        unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::read,
-                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
-                packet.as_mut_ptr() as usize,
-                packet.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
-        }
-        .map_err(|errno| match errno {
-            #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
-            syscalls::Errno::EWOULDBLOCK | syscalls::Errno::EAGAIN => {
-                litebox::platform::ReceiveError::WouldBlock
+        let transport = self.network_transport.read().unwrap();
+        let transport = transport
+            .as_ref()
+            .expect("receive_ip_packet called without network transport");
+
+        match transport {
+            NetworkTransport::Tun(fd) => {
+                unsafe {
+                    syscalls::syscall4(
+                        syscalls::Sysno::read,
+                        usize::try_from(fd.as_raw_fd()).unwrap(),
+                        packet.as_mut_ptr() as usize,
+                        packet.len(),
+                        // Unused by the syscall but would be checked by Seccomp filter if enabled.
+                        syscall_intercept::SYSCALL_ARG_MAGIC,
+                    )
+                }
+                .map_err(|errno| match errno {
+                    #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
+                    syscalls::Errno::EWOULDBLOCK | syscalls::Errno::EAGAIN => {
+                        litebox::platform::ReceiveError::WouldBlock
+                    }
+                    _ => unimplemented!("unexpected error {errno}"),
+                })
             }
-            _ => unimplemented!("unexpected error {errno}"),
-        })
+            NetworkTransport::Ipc(fd) => {
+                // If a prior call detected a fatal protocol error, short-circuit
+                // to prevent busy-looping on the corrupt fd.
+                if self.ipc_dead.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+
+                // IPC framing: peek at length prefix, then verify full frame
+                // is available before consuming anything. This prevents stream
+                // desynchronization on partial reads.
+                let mut len_buf = [0u8; 4];
+                let ret = unsafe {
+                    libc::recv(
+                        fd.as_raw_fd(),
+                        len_buf.as_mut_ptr().cast::<libc::c_void>(),
+                        4,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
+                };
+                if ret == 0 {
+                    // EOF — broker closed the IPC socket. Mark transport dead
+                    // to prevent busy-looping on the hung-up fd.
+                    self.ipc_dead
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+                if ret < 4 {
+                    // Either partial prefix (< 4 bytes available) or
+                    // EAGAIN/EWOULDBLOCK — not enough data yet.
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+                let pkt_len = u32::from_le_bytes(len_buf) as usize;
+
+                // Handle shutdown frame (len=0) — broker is closing.
+                if pkt_len == 0 {
+                    // Consume the 4-byte prefix.
+                    let mut discard = [0u8; 4];
+                    unsafe {
+                        libc::recv(
+                            fd.as_raw_fd(),
+                            discard.as_mut_ptr().cast::<libc::c_void>(),
+                            4,
+                            libc::MSG_DONTWAIT,
+                        );
+                    }
+                    self.ipc_dead
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+
+                if pkt_len > packet.len() {
+                    // Protocol violation: sender must respect the negotiated MTU.
+                    // Cannot safely drain without risking desync on partial arrival.
+                    // Mark transport as dead to prevent busy-looping.
+                    self.ipc_dead
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+
+                // Peek the full frame (4 + pkt_len) to confirm availability.
+                let frame_len = 4 + pkt_len;
+                let mut peek_buf = vec![0u8; frame_len];
+                let ret = unsafe {
+                    libc::recv(
+                        fd.as_raw_fd(),
+                        peek_buf.as_mut_ptr().cast::<libc::c_void>(),
+                        frame_len,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
+                };
+                #[allow(clippy::cast_sign_loss)]
+                if ret < 0 || (ret as usize) < frame_len {
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+
+                // Full frame confirmed. Consume the 4-byte length prefix.
+                let mut len_consume = [0u8; 4];
+                unsafe {
+                    libc::recv(
+                        fd.as_raw_fd(),
+                        len_consume.as_mut_ptr().cast::<libc::c_void>(),
+                        4,
+                        libc::MSG_DONTWAIT,
+                    );
+                }
+
+                // Read the packet body.
+                let mut read = 0;
+                while read < pkt_len {
+                    let ret = unsafe {
+                        libc::recv(
+                            fd.as_raw_fd(),
+                            packet[read..].as_mut_ptr().cast::<libc::c_void>(),
+                            pkt_len - read,
+                            libc::MSG_DONTWAIT,
+                        )
+                    };
+                    if ret <= 0 {
+                        return Err(litebox::platform::ReceiveError::WouldBlock);
+                    }
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        read += ret as usize;
+                    }
+                }
+                Ok(pkt_len)
+            }
+        }
     }
 }
 
@@ -1906,22 +2953,111 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     }
 }
 
+/// Map a `StdioStream` to a host file descriptor number.
+fn stdio_stream_to_fd(stream: litebox::platform::StdioStream) -> libc::c_int {
+    use litebox::platform::StdioStream;
+    match stream {
+        StdioStream::Stdin => 0,
+        StdioStream::Stdout => 1,
+        StdioStream::Stderr => 2,
+    }
+}
+
+/// Check the return value of a `libc::syscall(SYS_ioctl, ...)` call and map
+/// errors to `StdioIoctlError`.
+fn check_ioctl_result(ret: libc::c_long) -> Result<(), litebox::platform::StdioIoctlError> {
+    use litebox::platform::StdioIoctlError;
+    if ret < 0 {
+        let err = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::ENOTTY);
+        if err == libc::ENOTTY {
+            Err(StdioIoctlError::NotATerminal)
+        } else {
+            Err(StdioIoctlError::OsError(err))
+        }
+    } else {
+        Ok(())
+    }
+}
+
 impl litebox::platform::StdioProvider for LinuxUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::read,
-                usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
-                buf.as_ptr() as usize,
-                buf.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
+        if let Some(len) = self.drain_injected_stdin(buf) {
+            return Ok(len);
         }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioReadError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
+
+        // Use poll() with a timeout instead of a blocking read, so we can
+        // check the cancel flag periodically. This allows the process to exit
+        // cleanly when exit_group or SIGINT is received while a thread is
+        // blocking on stdin.
+        loop {
+            if self
+                .stdin_cancelled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if let Some(len) = self.drain_injected_stdin(buf) {
+                return Ok(len);
+            }
+
+            let mut pfd = libc::pollfd {
+                fd: litebox_common_linux::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll with a valid pollfd struct and 500ms timeout.
+            let ret = unsafe { libc::poll(core::ptr::from_mut(&mut pfd), 1, 500) };
+
+            if self
+                .stdin_cancelled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if let Some(len) = self.drain_injected_stdin(buf) {
+                return Ok(len);
+            }
+
+            if ret < 0 {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno == libc::EINTR {
+                    continue;
+                }
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if ret == 0 {
+                // Timeout — no data, loop to check cancel flag.
+                continue;
+            }
+
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 && pfd.revents & libc::POLLIN == 0
+            {
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if pfd.revents & libc::POLLIN != 0 {
+                let result = unsafe {
+                    syscalls::syscall4(
+                        syscalls::Sysno::read,
+                        usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
+                        buf.as_ptr() as usize,
+                        buf.len(),
+                        syscall_intercept::SYSCALL_ARG_MAGIC,
+                    )
+                };
+                return result.map_err(|err| match err {
+                    syscalls::Errno::EPIPE | syscalls::Errno::EIO => {
+                        litebox::platform::StdioReadError::Closed
+                    }
+                    _ => panic!("unhandled error {err}"),
+                });
+            }
+        }
     }
 
     fn write_to(
@@ -1929,28 +3065,17 @@ impl litebox::platform::StdioProvider for LinuxUserland {
         stream: litebox::platform::StdioOutStream,
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::write,
-                usize::try_from(match stream {
-                    litebox::platform::StdioOutStream::Stdout => {
-                        litebox_common_linux::STDOUT_FILENO
-                    }
-                    litebox::platform::StdioOutStream::Stderr => {
-                        litebox_common_linux::STDERR_FILENO
-                    }
-                })
-                .unwrap(),
-                buf.as_ptr() as usize,
-                buf.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
+        let filtered = self.filter_terminal_write(buf);
+        if !filtered.injected_stdin.is_empty() {
+            self.inject_stdin_reply(&filtered.injected_stdin);
+            if filtered.passthrough.is_empty() {
+                return Ok(buf.len());
+            }
+            self.write_host_stream(stream, &filtered.passthrough)?;
+            return Ok(buf.len());
         }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioWriteError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
+
+        self.write_host_stream(stream, buf)
     }
 
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
@@ -1961,6 +3086,146 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             StdioStream::Stdout => std::io::stdout().is_terminal(),
             StdioStream::Stderr => std::io::stderr().is_terminal(),
         }
+    }
+
+    fn get_terminal_attributes(
+        &self,
+        stream: litebox::platform::StdioStream,
+    ) -> Result<litebox::platform::TerminalAttributes, litebox::platform::StdioIoctlError> {
+        let host_fd = stdio_stream_to_fd(stream);
+        let mut termios = litebox_common_linux::Termios {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: 0,
+            c_line: 0,
+            c_cc: [0; 19],
+        };
+        // SAFETY: TCGETS fills a Termios struct via the host kernel ioctl.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                host_fd,
+                libc::c_ulong::from(litebox_common_linux::TCGETS),
+                core::ptr::from_mut(&mut termios) as libc::c_ulong,
+            )
+        };
+        check_ioctl_result(ret)?;
+        Ok(litebox::platform::TerminalAttributes {
+            c_iflag: termios.c_iflag,
+            c_oflag: termios.c_oflag,
+            c_cflag: termios.c_cflag,
+            c_lflag: termios.c_lflag,
+            c_line: termios.c_line,
+            c_cc: termios.c_cc,
+        })
+    }
+
+    fn set_terminal_attributes(
+        &self,
+        stream: litebox::platform::StdioStream,
+        attrs: &litebox::platform::TerminalAttributes,
+        when: litebox::platform::SetTermiosWhen,
+    ) -> Result<(), litebox::platform::StdioIoctlError> {
+        use litebox::platform::SetTermiosWhen;
+        let host_fd = stdio_stream_to_fd(stream);
+        let request = match when {
+            SetTermiosWhen::Now => litebox_common_linux::TCSETS,
+            SetTermiosWhen::AfterDrain => litebox_common_linux::TCSETSW,
+            SetTermiosWhen::AfterDrainFlushInput => litebox_common_linux::TCSETSF,
+        };
+        let termios = litebox_common_linux::Termios {
+            c_iflag: attrs.c_iflag,
+            c_oflag: attrs.c_oflag,
+            c_cflag: attrs.c_cflag,
+            c_lflag: attrs.c_lflag,
+            c_line: attrs.c_line,
+            c_cc: attrs.c_cc,
+        };
+        // SAFETY: TCSETS/W/F sets terminal attributes via the host kernel ioctl.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                host_fd,
+                libc::c_ulong::from(request),
+                core::ptr::from_ref(&termios) as libc::c_ulong,
+            )
+        };
+        check_ioctl_result(ret)?;
+        Ok(())
+    }
+
+    fn get_window_size(
+        &self,
+        stream: litebox::platform::StdioStream,
+    ) -> Result<litebox::platform::WindowSize, litebox::platform::StdioIoctlError> {
+        let host_fd = stdio_stream_to_fd(stream);
+        let mut ws = litebox_common_linux::Winsize {
+            row: 0,
+            col: 0,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        // SAFETY: TIOCGWINSZ fills a Winsize struct via the host kernel ioctl.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                host_fd,
+                libc::c_ulong::from(litebox_common_linux::TIOCGWINSZ),
+                core::ptr::from_mut(&mut ws) as libc::c_ulong,
+            )
+        };
+        check_ioctl_result(ret)?;
+        Ok(litebox::platform::WindowSize {
+            rows: ws.row,
+            cols: ws.col,
+            xpixel: ws.xpixel,
+            ypixel: ws.ypixel,
+        })
+    }
+
+    fn set_window_size(
+        &self,
+        stream: litebox::platform::StdioStream,
+        size: &litebox::platform::WindowSize,
+    ) -> Result<(), litebox::platform::StdioIoctlError> {
+        let host_fd = stdio_stream_to_fd(stream);
+        let ws = litebox_common_linux::Winsize {
+            row: size.rows,
+            col: size.cols,
+            xpixel: size.xpixel,
+            ypixel: size.ypixel,
+        };
+        // SAFETY: TIOCSWINSZ sets the window size via the host kernel ioctl.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                host_fd,
+                libc::c_ulong::from(litebox_common_linux::TIOCSWINSZ),
+                core::ptr::from_ref(&ws) as libc::c_ulong,
+            )
+        };
+        check_ioctl_result(ret)?;
+        Ok(())
+    }
+
+    fn poll_stdin_readable(&self) -> bool {
+        if self.stdin_injected.lock().unwrap().front().is_some() {
+            return true;
+        }
+
+        let mut pfd = libc::pollfd {
+            fd: 0, // stdin
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll with timeout=0 is a non-blocking check.
+        let ret = unsafe { libc::poll(core::ptr::from_mut(&mut pfd), 1, 0) };
+        ret > 0 && (pfd.revents & libc::POLLIN) != 0
+    }
+
+    fn cancel_stdin(&self) {
+        self.cancel_stdin();
     }
 }
 
@@ -2024,8 +3289,8 @@ impl ThreadContext<'_> {
     fn call_shim(
         &mut self,
         f: impl FnOnce(
-            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-            &mut litebox_common_linux::PtRegs,
+            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::ExecutionContext>,
+            &mut litebox_common_linux::ExecutionContext,
         ) -> ContinueOperation,
     ) {
         // Clear the interrupt flag before calling the shim, since we've handled it
@@ -2780,7 +4045,7 @@ mod tests {
 
     use litebox::platform::RawMutex;
 
-    use crate::LinuxUserland;
+    use crate::{LinuxUserland, filter_terminal_osc_queries};
     use litebox::platform::PageManagementProvider;
 
     extern crate std;
@@ -2816,5 +4081,69 @@ mod tests {
             assert!(page.end > page.start);
             prev = page.end;
         }
+    }
+
+    #[test]
+    fn osc_color_query_is_intercepted() {
+        let mut pending = Vec::new();
+        let result = filter_terminal_osc_queries(&mut pending, b"\x1b]11;?\x07");
+
+        assert!(result.passthrough.is_empty());
+        assert!(pending.is_empty());
+        assert!(result.injected_stdin.starts_with(b"\x1b]11;rgb:"));
+        assert!(result.injected_stdin.ends_with(b"\x07"));
+    }
+
+    #[test]
+    fn osc_color_query_survives_split_writes() {
+        let mut pending = Vec::new();
+
+        let first = filter_terminal_osc_queries(&mut pending, b"\x1b]10;");
+        assert!(first.passthrough.is_empty());
+        assert!(first.injected_stdin.is_empty());
+        assert_eq!(pending, b"\x1b]10;");
+
+        let second = filter_terminal_osc_queries(&mut pending, b"?\x1b\\");
+        assert!(second.passthrough.is_empty());
+        assert!(pending.is_empty());
+        assert!(second.injected_stdin.starts_with(b"\x1b]10;rgb:"));
+        assert!(second.injected_stdin.ends_with(b"\x1b\\"));
+    }
+
+    #[test]
+    fn osc_palette_query_is_intercepted() {
+        let mut pending = Vec::new();
+        let result = filter_terminal_osc_queries(&mut pending, b"\x1b]4;7;?\x1b\\");
+
+        assert!(result.passthrough.is_empty());
+        assert!(pending.is_empty());
+        assert!(result.injected_stdin.starts_with(b"\x1b]4;7;rgb:"));
+        assert!(result.injected_stdin.ends_with(b"\x1b\\"));
+    }
+
+    #[test]
+    fn osc_palette_query_survives_split_writes() {
+        let mut pending = Vec::new();
+
+        let first = filter_terminal_osc_queries(&mut pending, b"\x1b]4;15;");
+        assert!(first.passthrough.is_empty());
+        assert!(first.injected_stdin.is_empty());
+        assert_eq!(pending, b"\x1b]4;15;");
+
+        let second = filter_terminal_osc_queries(&mut pending, b"?\x1b\\");
+        assert!(second.passthrough.is_empty());
+        assert!(pending.is_empty());
+        assert!(second.injected_stdin.starts_with(b"\x1b]4;15;rgb:"));
+        assert!(second.injected_stdin.ends_with(b"\x1b\\"));
+    }
+
+    #[test]
+    fn non_color_osc_sequence_passthrough() {
+        let mut pending = Vec::new();
+        let result = filter_terminal_osc_queries(&mut pending, b"\x1b]0;title\x07");
+
+        assert_eq!(result.passthrough, b"\x1b]0;title\x07");
+        assert!(result.injected_stdin.is_empty());
+        assert!(pending.is_empty());
     }
 }

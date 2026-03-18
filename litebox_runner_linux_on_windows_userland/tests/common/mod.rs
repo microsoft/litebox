@@ -20,7 +20,7 @@ impl TestLauncher {
         initial_dirs: &[&str],
         initial_files: &[&str],
     ) -> Self {
-        let platform = Platform::new();
+        let platform = Platform::new(None);
         litebox_platform_multiplex::set_platform(platform);
         let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
         let litebox = shim_builder.litebox();
@@ -84,12 +84,19 @@ impl TestLauncher {
         let envp = vec![CString::new("PATH=/bin").unwrap()];
         let shim = self.shim_builder.build();
         let program = shim
-            .load_program(fs, self.platform.init_task(), executable_path, argv, envp)
+            .load_program(
+                fs,
+                self.platform.init_task(),
+                executable_path,
+                argv,
+                envp,
+                None,
+            )
             .unwrap();
         unsafe {
             litebox_platform_windows_userland::run_thread(
                 program.entrypoints,
-                &mut litebox_common_linux::PtRegs::default(),
+                &mut litebox_common_linux::ExecutionContext::default(),
             );
         }
         assert_eq!(program.process.wait(), 0);

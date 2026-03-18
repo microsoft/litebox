@@ -59,6 +59,14 @@ impl MockPlatform {
 
 impl Provider for MockPlatform {}
 
+impl RawMessageProvider for MockPlatform {}
+
+impl AddressSpaceProvider for MockPlatform {
+    // All methods default to `Err(NotSupported)`, which is correct for the
+    // mock platform (single-process only).
+    type AddressSpaceId = u32;
+}
+
 pub(crate) struct MockRawMutex {
     inner: AtomicU32,
     internal_state: std::sync::RwLock<MockRawMutexInternalState>,
@@ -210,7 +218,7 @@ impl IPInterfaceProvider for MockPlatform {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct MockInstant {
-    time: u64,
+    pub(crate) time: u64,
 }
 
 impl Instant for MockInstant {
@@ -230,7 +238,7 @@ impl Instant for MockInstant {
 }
 
 pub(crate) struct MockSystemTime {
-    time: u64,
+    pub(crate) time: u64,
 }
 
 impl SystemTime for MockSystemTime {

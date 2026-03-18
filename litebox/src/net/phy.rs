@@ -51,7 +51,12 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
                     buffer: &mut self.send_buffer,
                 },
             )),
-            Err(platform::ReceiveError::WouldBlock) => None,
+            Err(platform::ReceiveError::WouldBlock | platform::ReceiveError::Eof) => None,
+            Err(platform::ReceiveError::ProtocolError) => {
+                // IPC stream is unrecoverably desynchronized.
+                // Treat as permanent no-data — networking is dead.
+                None
+            }
         }
     }
 
@@ -95,9 +100,8 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<
     {
         let packet = &mut self.buffer[..len];
         let res = f(packet);
-        self.platform
-            .send_ip_packet(packet)
-            .expect("Sending IP packet failed");
+        // Drop the packet silently on send error — network protocols handle loss via retries.
+        let _ = self.platform.send_ip_packet(packet);
         res
     }
 }

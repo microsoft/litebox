@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 
 use crate::{
     fd::Descriptors,
+    process::ProcessRegistry,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -68,6 +69,17 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             x: Arc::new(LiteBoxX {
                 platform,
                 descriptors: RwLock::new(Descriptors::new_from_litebox_creation()),
+                process_registry: {
+                    let registry = ProcessRegistry::new();
+                    // Create the init process (PID 1) as the root of the process
+                    // tree. This mirrors Linux kernel behaviour where PID 1 is
+                    // created during boot before any user code runs.
+                    // exit_signal is 0 because init has no parent to signal.
+                    registry
+                        .create_process(None, 0)
+                        .expect("init process creation must succeed");
+                    registry
+                },
             }),
         }
     }
@@ -102,10 +114,20 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         self.x.descriptors.write()
     }
+
+    /// Access the process registry.
+    ///
+    /// The registry is initialized with the init process (PID 1) at
+    /// [`LiteBox::new()`] time. Use it to create child processes, record
+    /// exits, and wait for children.
+    pub fn process_registry(&self) -> &ProcessRegistry<Platform> {
+        &self.x.process_registry
+    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
 pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
+    pub(crate) process_registry: ProcessRegistry<Platform>,
 }

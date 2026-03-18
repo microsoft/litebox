@@ -54,6 +54,9 @@ pub enum Error {
     #[error("I/O error")]
     Io,
 
+    #[error("Operation interrupted")]
+    Interrupted,
+
     #[error("Invalid response from server")]
     InvalidResponse,
 
@@ -77,6 +80,7 @@ impl From<Error> for OpenError {
                 ENAMETOOLONG => OpenError::PathError(PathError::InvalidPathname),
                 _ => OpenError::Io,
             },
+            Error::Interrupted => OpenError::Interrupted,
             Error::Io | Error::InvalidResponse => OpenError::Io,
         }
     }
@@ -85,6 +89,7 @@ impl From<Error> for OpenError {
 impl From<Error> for ReadError {
     fn from(e: Error) -> Self {
         match e {
+            Error::Interrupted => ReadError::Interrupted,
             Error::Remote(errno) => match errno {
                 ENOENT | EISDIR => ReadError::NotAFile,
                 EPERM | EACCES => ReadError::NotForReading,
@@ -98,6 +103,7 @@ impl From<Error> for ReadError {
 impl From<Error> for WriteError {
     fn from(e: Error) -> Self {
         match e {
+            Error::Interrupted => WriteError::Interrupted,
             Error::Remote(errno) => match errno {
                 ENOENT | EISDIR => WriteError::NotAFile,
                 EPERM | EACCES => WriteError::NotForWriting,
@@ -120,7 +126,7 @@ impl From<Error> for MkdirError {
                 ENAMETOOLONG => MkdirError::PathError(PathError::InvalidPathname),
                 _ => MkdirError::Io,
             },
-            Error::Io | Error::InvalidResponse => MkdirError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => MkdirError::Io,
         }
     }
 }
@@ -132,7 +138,9 @@ impl From<Error> for ReadDirError {
                 ENOENT | ENOTDIR => ReadDirError::NotADirectory,
                 _ => ReadDirError::Io,
             },
-            Error::Io | Error::InvalidResponse | Error::InvalidPathname => ReadDirError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname | Error::Interrupted => {
+                ReadDirError::Io
+            }
         }
     }
 }
@@ -149,7 +157,7 @@ impl From<Error> for UnlinkError {
                 ENAMETOOLONG => UnlinkError::PathError(PathError::InvalidPathname),
                 _ => UnlinkError::Io,
             },
-            Error::Io | Error::InvalidResponse => UnlinkError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => UnlinkError::Io,
         }
     }
 }
@@ -166,7 +174,7 @@ impl From<Error> for RmdirError {
                 ENOTEMPTY => RmdirError::NotEmpty,
                 _ => RmdirError::Io,
             },
-            Error::Io | Error::InvalidResponse => RmdirError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => RmdirError::Io,
         }
     }
 }
@@ -187,7 +195,7 @@ impl From<Error> for FileStatusError {
                 }),
                 _ => FileStatusError::Io,
             },
-            Error::Io | Error::InvalidResponse => FileStatusError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => FileStatusError::Io,
         }
     }
 }
@@ -201,7 +209,9 @@ impl From<Error> for SeekError {
                 ESPIPE => SeekError::NonSeekable,
                 _ => SeekError::Io,
             },
-            _ => SeekError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname | Error::Interrupted => {
+                SeekError::Io
+            }
         }
     }
 }
@@ -215,7 +225,9 @@ impl From<Error> for TruncateError {
                 EPERM | EACCES => TruncateError::NotForWriting,
                 _ => TruncateError::Io,
             },
-            Error::Io | Error::InvalidResponse | Error::InvalidPathname => TruncateError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname | Error::Interrupted => {
+                TruncateError::Io
+            }
         }
     }
 }
@@ -230,7 +242,7 @@ impl From<Error> for ChmodError {
                 EPERM | EACCES => ChmodError::NotTheOwner,
                 _ => ChmodError::Io,
             },
-            Error::Io | Error::InvalidResponse => ChmodError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => ChmodError::Io,
         }
     }
 }
@@ -245,7 +257,7 @@ impl From<Error> for ChownError {
                 EPERM | EACCES => ChownError::NotTheOwner,
                 _ => ChownError::Io,
             },
-            Error::Io | Error::InvalidResponse => ChownError::Io,
+            Error::Io | Error::InvalidResponse | Error::Interrupted => ChownError::Io,
         }
     }
 }
@@ -348,8 +360,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             // Clone the root fid
             self.client.clone_fid(self.root.1)
         } else {
-            let (_, fid) = self.client.walk(self.root.1, &components)?;
-            Ok(fid)
+            self.client
+                .walk(self.root.1, &components)
+                .map(|(_, fid)| fid)
         }
     }
 
@@ -559,8 +572,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             | OFlags::CREAT
             | OFlags::NOCTTY
             | OFlags::EXCL
+            | OFlags::TRUNC
+            | OFlags::APPEND
             | OFlags::DIRECTORY
-            | OFlags::LARGEFILE;
+            | OFlags::NOFOLLOW
+            | OFlags::LARGEFILE
+            | OFlags::SYNC
+            | OFlags::DSYNC
+            | OFlags::DIRECT
+            | OFlags::NOATIME;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }
@@ -800,6 +820,60 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .map_err(UnlinkError::from)
     }
 
+    fn rename(
+        &self,
+        old: impl crate::path::Arg,
+        new: impl crate::path::Arg,
+    ) -> Result<(), super::errors::RenameError> {
+        let old_path = self
+            .absolute_path(old)
+            .map_err(|_| super::errors::RenameError::ReadOnlyFileSystem)?;
+        let new_path = self
+            .absolute_path(new)
+            .map_err(|_| super::errors::RenameError::ReadOnlyFileSystem)?;
+
+        // Walk to the source file
+        let src_fid = self
+            .walk_to(&old_path)
+            .map_err(|_| super::errors::RenameError::ReadOnlyFileSystem)?;
+
+        // Walk to the destination parent directory
+        let new_components: Vec<&str> = new_path
+            .normalized_components()
+            .map_err(|_| {
+                let _ = self.client.clunk(src_fid);
+                super::errors::RenameError::ReadOnlyFileSystem
+            })?
+            .collect();
+
+        if new_components.is_empty() {
+            let _ = self.client.clunk(src_fid);
+            return Err(super::errors::RenameError::ReadOnlyFileSystem);
+        }
+
+        let new_name = *new_components.last().unwrap();
+        let parent_components = &new_components[..new_components.len() - 1];
+        let dst_dir_fid = if parent_components.is_empty() {
+            if let Ok(f) = self.client.clone_fid(self.root.1) {
+                f
+            } else {
+                let _ = self.client.clunk(src_fid);
+                return Err(super::errors::RenameError::ReadOnlyFileSystem);
+            }
+        } else if let Ok((_, f)) = self.client.walk(self.root.1, parent_components) {
+            f
+        } else {
+            let _ = self.client.clunk(src_fid);
+            return Err(super::errors::RenameError::ReadOnlyFileSystem);
+        };
+
+        let result = self.client.rename(src_fid, dst_dir_fid, new_name);
+        let _ = self.client.clunk(src_fid);
+        let _ = self.client.clunk(dst_dir_fid);
+
+        result.map_err(|_| super::errors::RenameError::ReadOnlyFileSystem)
+    }
+
     fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
 
@@ -890,6 +964,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let attr = self.client.getattr(fid, fcall::GetattrMask::ALL)?;
 
         Ok(Self::rgetattr_to_file_status(&attr)?)
+    }
+
+    fn read_link(
+        &self,
+        path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        let abs = self
+            .absolute_path(path)
+            .map_err(super::errors::ReadLinkError::PathError)?;
+        let fid = self
+            .walk_to(&abs)
+            .map_err(|_| super::errors::ReadLinkError::Io)?;
+        let target = self.client.readlink(fid);
+        let _ = self.client.clunk(fid);
+        let target = target.map_err(|_| super::errors::ReadLinkError::Io)?;
+        alloc::string::String::from_utf8(target).map_err(|_| super::errors::ReadLinkError::Io)
     }
 }
 
