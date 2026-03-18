@@ -19,10 +19,11 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read as _, Seek, SeekFrom};
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
+
+use super::fs_compat::{self, FileExt, MetadataExt, OpenOptionsExt};
 
 use tracing::{debug, trace, warn};
 
@@ -954,7 +955,7 @@ impl Server {
             if self.policy.check(Action::Chmod, Some(&resolved)) == Decision::Deny {
                 return error_response(libc::EPERM as u32);
             }
-            let perms = fs::Permissions::from_mode(req.stat.mode);
+            let perms = fs_compat::permissions_from_mode(req.stat.mode);
             if let Err(e) = fs::set_permissions(&resolved, perms) {
                 return io_error_response(e);
             }
@@ -1037,11 +1038,11 @@ impl Server {
             });
 
             let typ = if qid.typ.contains(fcall::QidType::DIR) {
-                libc::DT_DIR
+                fs_compat::DT_DIR
             } else if qid.typ.contains(fcall::QidType::SYMLINK) {
-                libc::DT_LNK
+                fs_compat::DT_LNK
             } else {
-                libc::DT_REG
+                fs_compat::DT_REG
             };
 
             let entry = fcall::DirEntry {
@@ -1097,7 +1098,7 @@ impl Server {
 
         // Apply permissions
         if mode != 0 {
-            let perms = fs::Permissions::from_mode(mode);
+            let perms = fs_compat::permissions_from_mode(mode);
             let _ = fs::set_permissions(&target, perms);
         }
 

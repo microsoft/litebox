@@ -988,7 +988,11 @@ fn save_guest_context(
         // YMM halves on the next xrstor64, not stale data from a previous
         // fast-path xsave.
         core::ptr::write_bytes(
-            guest_context.fp_regs.data.as_mut_ptr().add(XSAVE_HEADER_OFFSET),
+            guest_context
+                .fp_regs
+                .data
+                .as_mut_ptr()
+                .add(XSAVE_HEADER_OFFSET),
             0,
             litebox_common_linux::FP_STATE_SIZE - XSAVE_HEADER_OFFSET,
         );
@@ -996,8 +1000,11 @@ fn save_guest_context(
         // legacy FP/SSE state from the FXSAVE area we just copied above.
         // Without these bits, xrstor64 would re-initialize x87/SSE instead
         // of loading the saved values.
-        let xstate_bv =
-            guest_context.fp_regs.data.as_mut_ptr().add(XSAVE_HEADER_OFFSET) as *mut u64;
+        let xstate_bv = guest_context
+            .fp_regs
+            .data
+            .as_mut_ptr()
+            .add(XSAVE_HEADER_OFFSET) as *mut u64;
         *xstate_bv = 0x3; // x87 (bit 0) | SSE (bit 1)
     }
 
@@ -1049,12 +1056,19 @@ fn extract_avx_from_context(
         // Copy the 256-byte AVX upper halves into FpRegs at offset 576.
         core::ptr::copy_nonoverlapping(
             avx_ptr as *const u8,
-            guest_context.fp_regs.data.as_mut_ptr().add(XSAVE_AVX_OFFSET),
+            guest_context
+                .fp_regs
+                .data
+                .as_mut_ptr()
+                .add(XSAVE_AVX_OFFSET),
             XSTATE_AVX_SIZE,
         );
         // Mark AVX as present in the XSAVE header's xstate_bv field.
-        let xstate_bv =
-            guest_context.fp_regs.data.as_mut_ptr().add(XSAVE_HEADER_OFFSET) as *mut u64;
+        let xstate_bv = guest_context
+            .fp_regs
+            .data
+            .as_mut_ptr()
+            .add(XSAVE_HEADER_OFFSET) as *mut u64;
         *xstate_bv |= 1u64 << XSTATE_AVX;
     }
 }
@@ -1082,7 +1096,14 @@ fn get_extended_thread_context(
 
     // Query required buffer size for extended context.
     let mut ctx_len: u32 = 0;
-    unsafe { InitializeContext(core::ptr::null_mut(), flags, core::ptr::null_mut(), &mut ctx_len) };
+    unsafe {
+        InitializeContext(
+            core::ptr::null_mut(),
+            flags,
+            core::ptr::null_mut(),
+            &mut ctx_len,
+        )
+    };
 
     if ctx_len == 0 {
         // XSTATE not supported; fall back to plain context.

@@ -18,10 +18,12 @@
 mod device;
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::io::OwnedFd;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket};
 use std::time::{Duration, Instant};
+
+use crate::sock_compat::{
+    self, AsRawSock, IpcListener, IpcStream, POLLERR, POLLHUP, POLLIN, POLLOUT, PollFd, RawSock,
+};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -70,8 +72,8 @@ struct PendingConnect {
     /// Full 4-tuple so parallel connections to the same server are distinguished.
     flow_key: TcpFlowKey,
     dest: SocketAddr,
-    /// Raw fd of the connecting socket.
-    fd: std::os::fd::OwnedFd,
+    /// Connecting stream.
+    stream: IpcStream,
     /// When the connect was initiated (for timeout).
     started: Instant,
 }
@@ -79,8 +81,8 @@ struct PendingConnect {
 /// A newly accepted connection waiting for its 4-byte handshake magic.
 /// Drained opportunistically each event-loop iteration with zero blocking.
 struct PendingHandshake {
-    stream: Option<std::os::unix::net::UnixStream>,
-    raw_fd: i32,
+    stream: Option<IpcStream>,
+    raw_socket: RawSock,
     magic: [u8; 4],
     got: usize,
     deadline: Instant,
@@ -91,6 +93,11 @@ const HANDSHAKE_ACCEPT_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Timeout for non-blocking host TCP connect.
 const HOST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Extract the raw socket descriptor from any std socket type.
+fn raw_socket<T: AsRawSock>(socket: &T) -> RawSock {
+    socket.as_raw_sock()
+}
 
 /// Key for a UDP flow: (src_ip, src_port, dst_ip, dst_port).
 type UdpFlowKey = ([u8; 4], u16, [u8; 4], u16);
@@ -120,13 +127,13 @@ struct UdpFlow {
 /// The handler runs in a separate thread. The returned `JoinHandle` is kept
 /// so the proxy can detect service exit.
 pub type ServiceSpawner =
-    Box<dyn Fn(std::os::unix::net::UnixStream) -> std::thread::JoinHandle<()> + Send + Sync>;
+    Box<dyn Fn(std::net::TcpStream) -> std::thread::JoinHandle<()> + Send + Sync>;
 
 /// Registry of broker-internal services keyed by TCP port.
 ///
 /// When a guest connects to `BROKER_IP:<port>`, the proxy looks up this
 /// registry. If a service is registered, the connection is handled
-/// in-process via a Unix socketpair instead of opening a host TCP socket.
+/// in-process via a loopback TCP pair instead of opening a host TCP socket.
 pub struct LocalServiceRegistry {
     services: HashMap<u16, ServiceSpawner>,
 }
@@ -145,7 +152,7 @@ impl LocalServiceRegistry {
     }
 
     /// Register a service on the given port. The `spawner` is called with one
-    /// end of a `socketpair()`; the other end is relayed to the smoltcp TCP
+    /// end of a loopback TCP pair; the other end is relayed to the smoltcp TCP
     /// socket.
     pub fn register(&mut self, port: u16, spawner: ServiceSpawner) {
         self.services.insert(port, spawner);
@@ -157,12 +164,12 @@ impl LocalServiceRegistry {
 }
 
 /// State for a TCP bridge to a broker-internal (local) service.
-/// Analogous to `TcpBridge` but the "host side" is a Unix socketpair fd
+/// Analogous to `TcpBridge` but the "host side" is a loopback TCP stream
 /// connected to an in-process service thread.
 struct LocalBridge {
     smoltcp_handle: SocketHandle,
-    /// Our end of the socketpair — the service thread owns the other end.
-    stream: std::os::unix::net::UnixStream,
+    /// Our end of the loopback pair — the service thread owns the other end.
+    stream: std::net::TcpStream,
     dest_port: u16,
     host_eof: bool,
     _thread: std::thread::JoinHandle<()>,
@@ -170,7 +177,7 @@ struct LocalBridge {
 
 /// Run the network proxy event loop.
 ///
-/// `ipc_fd` is one end of a Unix domain socket connected to the runner.
+/// `ipc_fd` is one end of an IPC stream connected to the runner.
 /// This function takes ownership and runs until the IPC connection closes.
 ///
 /// If `magic_prefix` is `Some`, the caller (e.g. [`accept_ipc_client`]) has
@@ -180,7 +187,7 @@ struct LocalBridge {
 /// If `local_services` is provided, connections to `BROKER_IP:<port>` are
 /// handled in-process by the registered service instead of proxied to the host.
 ///
-/// If `accept_listener` is provided, the event loop also accepts new Unix
+/// If `accept_listener` is provided, the event loop also accepts new IPC
 /// connections on it.  A connection sending `LB9P` magic is dispatched to the
 /// first registered local service (port 5640 / 9P) as a direct byte-stream
 /// channel, bypassing smoltcp entirely.
@@ -188,10 +195,10 @@ struct LocalBridge {
 /// If `handshake_done` is true, the caller (e.g. [`accept_ipc_client`]) has
 /// already completed the full LBNP handshake on the fd.
 pub fn run(
-    ipc_fd: OwnedFd,
+    ipc_fd: IpcStream,
     handshake_done: bool,
     local_services: Option<LocalServiceRegistry>,
-    accept_listener: Option<&std::os::unix::net::UnixListener>,
+    accept_listener: Option<&IpcListener>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let local_services = local_services.unwrap_or_default();
     info!("network proxy starting");
@@ -203,12 +210,7 @@ pub fn run(
 
     // Set non-blocking after handshake so send_ipc_frame() doesn't stall
     // the event loop when the socket buffer fills.
-    unsafe {
-        let flags = libc::fcntl(ipc_fd.as_raw_fd(), libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(ipc_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-    }
+    ipc_fd.set_nonblocking(true).ok();
 
     let mut device = IpcDevice::new(ipc_fd);
     let config = Config::new(HardwareAddress::Ip);
@@ -320,12 +322,12 @@ pub fn run(
                         suppress_from_smoltcp = true;
                     } else {
                         match start_nonblocking_connect(&dest) {
-                            Ok(fd) => {
+                            Ok(stream) => {
                                 debug!("SYN {src_ip:?}:{src_port} → {dest}, async host connect");
                                 pending_connects.push(PendingConnect {
                                     flow_key,
                                     dest,
-                                    fd,
+                                    stream,
                                     started: Instant::now(),
                                 });
                                 // Immediately try to resolve (handles localhost /
@@ -476,15 +478,13 @@ pub fn run(
         // Step 8: Check for IPC EOF via POLLHUP (always, not just when idle).
         // Also check when state tables are empty to catch clean shutdown.
         {
-            let mut probe_pfd = libc::pollfd {
-                fd: device.fd(),
+            let mut probe_pfd = PollFd {
+                fd: device.raw_socket(),
                 events: 0, // Only check for POLLHUP/POLLERR (always reported).
                 revents: 0,
             };
-            unsafe {
-                libc::poll(&raw mut probe_pfd, 1, 0);
-            }
-            if probe_pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            sock_compat::poll_fds(std::slice::from_mut(&mut probe_pfd), 0);
+            if probe_pfd.revents & (POLLHUP | POLLERR) != 0 {
                 info!("IPC connection closed (POLLHUP), shutting down");
                 break;
             }
@@ -493,19 +493,24 @@ pub fn run(
         // Step 8b: Accept new connections on the listener (non-blocking) and
         // queue them for handshake.  The handshake bytes are drained below with
         // zero blocking so a stray/slow client cannot stall the proxy loop.
-        if let Some(Ok((stream, _))) = accept_listener.map(|l| l.accept()) {
-            let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
-            unsafe {
-                let flags = libc::fcntl(raw_fd, libc::F_GETFL);
-                libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if let Some(listener) = accept_listener {
+            match listener.accept() {
+                Ok(Some(stream)) => {
+                    stream.set_nonblocking(true).ok();
+                    let raw_socket = stream.raw();
+                    pending_handshakes.push(PendingHandshake {
+                        stream: Some(stream),
+                        raw_socket,
+                        magic: [0u8; 4],
+                        got: 0,
+                        deadline: Instant::now() + HANDSHAKE_ACCEPT_TIMEOUT,
+                    });
+                }
+                Ok(None) => {} // Would-block, nothing to accept.
+                Err(e) => {
+                    warn!("listener accept error: {e}");
+                }
             }
-            pending_handshakes.push(PendingHandshake {
-                stream: Some(stream),
-                raw_fd,
-                magic: [0u8; 4],
-                got: 0,
-                deadline: Instant::now() + HANDSHAKE_ACCEPT_TIMEOUT,
-            });
         }
 
         // Drain pending handshakes: one non-blocking recv attempt per entry.
@@ -517,14 +522,7 @@ pub fn run(
                 );
                 return false;
             }
-            let n = unsafe {
-                libc::recv(
-                    ph.raw_fd,
-                    ph.magic[ph.got..].as_mut_ptr().cast(),
-                    4 - ph.got,
-                    libc::MSG_DONTWAIT,
-                )
-            };
+            let n = sock_compat::recv_nb(ph.raw_socket, &mut ph.magic[ph.got..], 0);
             if n > 0 {
                 #[allow(clippy::cast_sign_loss)]
                 {
@@ -533,8 +531,13 @@ pub fn run(
             } else if n == 0 {
                 debug!("accepted connection closed during handshake, dropping");
                 return false;
+            } else {
+                let err = sock_compat::last_socket_error();
+                if !sock_compat::is_would_block(err) {
+                    debug!("accepted connection handshake read failed: {err}");
+                    return false;
+                }
             }
-            // n < 0 with EAGAIN is normal — try again next iteration.
 
             if ph.got < 4 {
                 return true; // keep in queue
@@ -542,13 +545,9 @@ pub fn run(
 
             // Got all 4 bytes — check magic.
             if &ph.magic == b"LB9P" {
-                // Restore blocking mode for the 9P service.
-                unsafe {
-                    let flags = libc::fcntl(ph.raw_fd, libc::F_GETFL);
-                    libc::fcntl(ph.raw_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-                }
                 if let Some(spawner) = local_services.get(5640) {
                     if let Some(stream) = ph.stream.take() {
+                        let stream = sock_compat::into_blocking_tcp_stream(stream);
                         spawner(stream);
                         info!("direct 9P channel connected");
                     }
@@ -571,65 +570,55 @@ pub fn run(
         let wait = Duration::from_micros(100);
 
         // Build poll set: IPC fd + listener + pending connects + host TCP + local bridges + host UDP.
-        let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(
+        let mut pfds: Vec<PollFd> = Vec::with_capacity(
             2 + pending_connects.len() + tcp_bridges.len() + local_bridges.len() + udp_flows.len(),
         );
-        pfds.push(libc::pollfd {
-            fd: device.fd(),
-            events: libc::POLLIN,
+        pfds.push(PollFd {
+            fd: device.raw_socket(),
+            events: POLLIN,
             revents: 0,
         });
         if let Some(listener) = accept_listener {
-            pfds.push(libc::pollfd {
-                fd: std::os::fd::AsRawFd::as_raw_fd(listener),
-                events: libc::POLLIN,
+            pfds.push(PollFd {
+                fd: listener.raw(),
+                events: POLLIN,
                 revents: 0,
             });
         }
         for pc in pending_connects.iter() {
-            pfds.push(libc::pollfd {
-                fd: pc.fd.as_raw_fd(),
-                events: libc::POLLOUT, // Wake when connect completes.
+            pfds.push(PollFd {
+                fd: pc.stream.raw(),
+                events: POLLOUT, // Wake when connect completes.
                 revents: 0,
             });
         }
         for bridge in tcp_bridges.iter() {
             if !bridge.host_eof {
-                pfds.push(libc::pollfd {
-                    fd: bridge.host_stream.as_raw_fd(),
-                    events: libc::POLLIN,
+                pfds.push(PollFd {
+                    fd: raw_socket(&bridge.host_stream),
+                    events: POLLIN,
                     revents: 0,
                 });
             }
         }
         for bridge in local_bridges.iter() {
             if !bridge.host_eof {
-                pfds.push(libc::pollfd {
-                    fd: bridge.stream.as_raw_fd(),
-                    events: libc::POLLIN,
+                pfds.push(PollFd {
+                    fd: raw_socket(&bridge.stream),
+                    events: POLLIN,
                     revents: 0,
                 });
             }
         }
         for flow in udp_flows.values() {
-            pfds.push(libc::pollfd {
-                fd: flow.host_socket.as_raw_fd(),
-                events: libc::POLLIN,
+            pfds.push(PollFd {
+                fd: raw_socket(&flow.host_socket),
+                events: POLLIN,
                 revents: 0,
             });
         }
 
-        // Use ppoll for sub-millisecond precision (poll only has ms granularity).
-        let ts = libc::timespec {
-            tv_sec: wait.as_secs() as libc::time_t,
-            #[allow(clippy::cast_possible_wrap)]
-            tv_nsec: wait.subsec_nanos() as libc::c_long,
-        };
-        #[allow(clippy::cast_possible_truncation)]
-        let nfds = pfds.len() as libc::nfds_t;
-        unsafe {
-            libc::ppoll(pfds.as_mut_ptr(), nfds, &raw const ts, std::ptr::null());
-        }
+        sock_compat::poll_fds_timeout(&mut pfds, wait);
     }
 
     device.send_shutdown();
@@ -644,13 +633,13 @@ pub fn run(
 /// Connections that are slow, send wrong magic/version/MTU, or close early
 /// are dropped so a stray local client cannot monopolize the listener.
 ///
-/// Returns the accepted fd (already set non-blocking) once a valid LBNP
+/// Returns the accepted stream (already set non-blocking) once a valid LBNP
 /// handshake is complete, or an error if no valid client arrives within
 /// `overall_timeout`.  Pass `None` to wait indefinitely.
 pub fn accept_ipc_client(
-    listener: &std::os::unix::net::UnixListener,
+    listener: &IpcListener,
     overall_timeout: Option<Duration>,
-) -> Result<OwnedFd, Box<dyn std::error::Error>> {
+) -> Result<IpcStream, Box<dyn std::error::Error>> {
     let deadline = overall_timeout.map(|d| Instant::now() + d);
     let per_client_timeout = Duration::from_secs(2);
 
@@ -661,22 +650,18 @@ pub fn accept_ipc_client(
 
         // Non-blocking accept.
         let stream = match listener.accept() {
-            Ok((s, _)) => s,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            Ok(Some(stream)) => stream,
+            Ok(None) => {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
             Err(e) => {
-                warn!("accept error: {e}");
-                continue;
+                return Err(format!("listener accept error: {e}").into());
             }
         };
 
-        let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
-        unsafe {
-            let flags = libc::fcntl(raw_fd, libc::F_GETFL);
-            libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
+        stream.set_nonblocking(true).ok();
+        let raw_socket = stream.raw();
 
         // Read full 8-byte handshake: magic(4) + version(2) + MTU(2).
         let client_deadline = Instant::now() + per_client_timeout;
@@ -689,24 +674,20 @@ pub fn accept_ipc_client(
             let remaining_ms = client_deadline
                 .saturating_duration_since(Instant::now())
                 .as_millis();
-            let mut rpfd = libc::pollfd {
-                fd: raw_fd,
-                events: libc::POLLIN,
+            let mut rpfd = PollFd {
+                fd: raw_socket,
+                events: POLLIN,
                 revents: 0,
             };
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let ret = unsafe { libc::poll(&raw mut rpfd, 1, remaining_ms.min(100) as i32) };
+            let ret = sock_compat::poll_fds(
+                std::slice::from_mut(&mut rpfd),
+                remaining_ms.min(100) as i32,
+            );
             if ret <= 0 {
                 continue;
             }
-            let n = unsafe {
-                libc::recv(
-                    raw_fd,
-                    buf[got..].as_mut_ptr().cast(),
-                    8 - got,
-                    libc::MSG_DONTWAIT,
-                )
-            };
+            let n = sock_compat::recv_nb(raw_socket, &mut buf[got..], 0);
             if n > 0 {
                 #[allow(clippy::cast_sign_loss)]
                 {
@@ -717,8 +698,12 @@ pub fn accept_ipc_client(
                 }
             } else if n == 0 {
                 break false; // peer closed
+            } else {
+                let err = sock_compat::last_socket_error();
+                if !sock_compat::is_would_block(err) {
+                    break false;
+                }
             }
-            // EAGAIN — loop
         };
 
         if !ok || got < 8 {
@@ -756,14 +741,7 @@ pub fn accept_ipc_client(
             if Instant::now() >= send_deadline {
                 break false;
             }
-            let n = unsafe {
-                libc::send(
-                    raw_fd,
-                    response[sent..].as_ptr().cast(),
-                    8 - sent,
-                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                )
-            };
+            let n = sock_compat::send_nb(raw_socket, &response[sent..], 0);
             if n > 0 {
                 #[allow(clippy::cast_sign_loss)]
                 {
@@ -775,16 +753,14 @@ pub fn accept_ipc_client(
             } else if n == 0 {
                 break false;
             } else {
-                let errno = unsafe { *libc::__errno_location() };
-                if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-                    let mut wpfd = libc::pollfd {
-                        fd: raw_fd,
-                        events: libc::POLLOUT,
+                let err = sock_compat::last_socket_error();
+                if sock_compat::is_would_block(err) {
+                    let mut wpfd = PollFd {
+                        fd: raw_socket,
+                        events: POLLOUT,
                         revents: 0,
                     };
-                    unsafe {
-                        libc::poll(&raw mut wpfd, 1, 100);
-                    }
+                    sock_compat::poll_fds(std::slice::from_mut(&mut wpfd), 100);
                     continue;
                 }
                 break false;
@@ -800,11 +776,7 @@ pub fn accept_ipc_client(
             version,
             mtu, "accepted valid LBNP client, handshake complete"
         );
-        use std::os::unix::io::IntoRawFd;
-        let fd = stream.into_raw_fd();
-        // Safety: fd was just extracted from a valid stream.
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        return Ok(owned);
+        return Ok(stream);
     }
 }
 
@@ -813,32 +785,25 @@ pub fn accept_ipc_client(
 /// Reads all 8 bytes (magic + version + MTU), validates, and sends the
 /// response.  Used only by the `--network-proxy-fd` path where the runner
 /// passes the fd directly.
-fn perform_handshake(fd: &OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
+fn perform_handshake(fd: &IpcStream) -> Result<(), Box<dyn std::error::Error>> {
     // Wait for handshake with 10s timeout.
-    let mut pfd = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
+    let mut pfd = PollFd {
+        fd: fd.raw(),
+        events: POLLIN,
         revents: 0,
     };
-    let ret = unsafe { libc::poll(&raw mut pfd, 1, 10_000) };
+    let ret = sock_compat::poll_fds(std::slice::from_mut(&mut pfd), 10_000);
     if ret <= 0 {
         return Err("IPC handshake timeout".into());
     }
 
     // Read handshake: magic (4) + version (2) + MTU (2) = 8 bytes.
-    // Handles EAGAIN/short reads on non-blocking sockets.
+    // Handles would-block/short reads on non-blocking sockets.
     let mut buf = [0u8; 8];
     let mut read = 0;
     let deadline = Instant::now() + Duration::from_secs(10);
     while read < 8 {
-        let ret = unsafe {
-            libc::recv(
-                fd.as_raw_fd(),
-                buf[read..].as_mut_ptr().cast::<libc::c_void>(),
-                8 - read,
-                libc::MSG_DONTWAIT,
-            )
-        };
+        let ret = sock_compat::recv_nb(fd.raw(), &mut buf[read..], 0);
         if ret > 0 {
             #[allow(clippy::cast_sign_loss)]
             {
@@ -847,22 +812,20 @@ fn perform_handshake(fd: &OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
         } else if ret == 0 {
             return Err("IPC handshake: peer closed".into());
         } else {
-            let errno = unsafe { *libc::__errno_location() };
-            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            let err = sock_compat::last_socket_error();
+            if sock_compat::is_would_block(err) {
                 if Instant::now() > deadline {
                     return Err("IPC handshake read timeout".into());
                 }
-                let mut rpfd = libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: libc::POLLIN,
+                let mut rpfd = PollFd {
+                    fd: fd.raw(),
+                    events: POLLIN,
                     revents: 0,
                 };
-                unsafe {
-                    libc::poll(&raw mut rpfd, 1, 100);
-                }
+                sock_compat::poll_fds(std::slice::from_mut(&mut rpfd), 100);
                 continue;
             }
-            return Err(format!("IPC handshake read failed: errno {errno}").into());
+            return Err(format!("IPC handshake read failed: errno {err}").into());
         }
     }
 
@@ -894,7 +857,7 @@ fn perform_handshake(fd: &OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Send handshake response (retry on EAGAIN).
+    // Send handshake response (retry on would-block).
     #[allow(clippy::cast_possible_truncation)]
     let response_mtu = DEVICE_MTU as u16;
     let mut response = [0u8; 8];
@@ -904,14 +867,7 @@ fn perform_handshake(fd: &OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut sent = 0usize;
     while sent < 8 {
-        let ret = unsafe {
-            libc::send(
-                fd.as_raw_fd(),
-                response[sent..].as_ptr().cast::<libc::c_void>(),
-                8 - sent,
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-            )
-        };
+        let ret = sock_compat::send_nb(fd.raw(), &response[sent..], 0);
         if ret > 0 {
             #[allow(clippy::cast_sign_loss)]
             {
@@ -920,19 +876,17 @@ fn perform_handshake(fd: &OwnedFd) -> Result<(), Box<dyn std::error::Error>> {
         } else if ret == 0 {
             return Err("IPC handshake response: peer closed".into());
         } else {
-            let errno = unsafe { *libc::__errno_location() };
-            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-                let mut wpfd = libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: libc::POLLOUT,
+            let err = sock_compat::last_socket_error();
+            if sock_compat::is_would_block(err) {
+                let mut wpfd = PollFd {
+                    fd: fd.raw(),
+                    events: POLLOUT,
                     revents: 0,
                 };
-                unsafe {
-                    libc::poll(&raw mut wpfd, 1, 100);
-                }
+                sock_compat::poll_fds(std::slice::from_mut(&mut wpfd), 100);
                 continue;
             }
-            return Err(format!("IPC handshake response send failed: errno {errno}").into());
+            return Err(format!("IPC handshake response send failed: errno {err}").into());
         }
     }
 
@@ -993,46 +947,13 @@ fn ensure_listen_socket(
     }
 }
 
-/// Initiate a non-blocking TCP connect. Returns the OwnedFd.
-fn start_nonblocking_connect(dest: &SocketAddr) -> Result<std::os::fd::OwnedFd, std::io::Error> {
-    use std::os::fd::FromRawFd;
+/// Initiate a non-blocking TCP connect. Returns the IPC stream.
+fn start_nonblocking_connect(dest: &SocketAddr) -> Result<IpcStream, std::io::Error> {
+    sock_compat::start_nonblocking_connect(dest)
+}
 
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-
-    let SocketAddr::V4(addr) = dest else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "IPv6 not supported",
-        ));
-    };
-
-    let sa = libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: addr.port().to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: u32::from_ne_bytes(addr.ip().octets()),
-        },
-        sin_zero: [0; 8],
-    };
-
-    let ret = unsafe {
-        libc::connect(
-            fd.as_raw_fd(),
-            (&raw const sa).cast::<libc::sockaddr>(),
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        let errno = unsafe { *libc::__errno_location() };
-        if errno != libc::EINPROGRESS {
-            return Err(std::io::Error::from_raw_os_error(errno));
-        }
-    }
-    Ok(fd)
+fn check_connect(ipc: &IpcStream) -> Option<Result<(), std::io::Error>> {
+    sock_compat::check_connect(ipc)
 }
 
 /// Check pending host connects for completion.
@@ -1055,45 +976,17 @@ fn resolve_pending_connects(
             continue;
         }
 
-        // Check if writable (connect complete) via zero-timeout poll.
-        let mut pfd = libc::pollfd {
-            fd: pc.fd.as_raw_fd(),
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        unsafe {
-            libc::poll(&raw mut pfd, 1, 0);
-        }
-        if pfd.revents & libc::POLLOUT == 0 {
-            continue;
-        }
-
-        // Check SO_ERROR.
-        let mut err: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let ret = unsafe {
-            libc::getsockopt(
-                pc.fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                (&raw mut err).cast::<libc::c_void>(),
-                &raw mut len,
-            )
-        };
-        if ret < 0 || err != 0 {
-            if err != 0 {
-                warn!(
-                    "host TCP connect to {} failed: {}",
-                    pc.dest,
-                    std::io::Error::from_raw_os_error(err)
-                );
+        match check_connect(&pc.stream) {
+            Some(Ok(())) => {
+                info!("host TCP connected to {}", pc.dest);
+                successes.push(i);
             }
-            failures.push(i);
-            continue;
+            Some(Err(e)) => {
+                warn!("host TCP connect to {} failed: {e}", pc.dest);
+                failures.push(i);
+            }
+            None => continue,
         }
-
-        info!("host TCP connected to {}", pc.dest);
-        successes.push(i);
     }
 
     // Remove in reverse index order (swap_remove safe).
@@ -1106,12 +999,11 @@ fn resolve_pending_connects(
     for (i, is_success) in all {
         let pc = pending.swap_remove(i);
         if is_success {
-            let stream = unsafe {
-                std::net::TcpStream::from_raw_fd(std::os::fd::IntoRawFd::into_raw_fd(pc.fd))
-            };
+            let stream = sock_compat::into_blocking_tcp_stream(pc.stream);
+            stream.set_nonblocking(true).ok();
             ready_host_streams.insert(pc.flow_key, (stream, Instant::now()));
         }
-        // Failures: fd drops and closes.
+        // Failures: stream drops and closes.
     }
 }
 
@@ -1119,7 +1011,7 @@ fn resolve_pending_connects(
 /// Matches by the full 4-tuple via smoltcp's `remote_endpoint()`.
 ///
 /// For connections to `BROKER_IP`, spawns the registered local service via a
-/// Unix socketpair. For external connections, matches against
+/// loopback TCP pair. For external connections, matches against
 /// `ready_host_streams`.
 fn promote_established(
     sockets: &mut SocketSet<'_>,
@@ -1158,24 +1050,48 @@ fn promote_established(
     }
 
     for (handle, dest_ip, dest_port) in newly_established {
-        // Local service: spawn handler via socketpair.
+        // Local service: spawn handler via a loopback TCP pair.
         if dest_ip == BROKER_IPV4 {
             if let Some(spawner) = local_services.get(dest_port) {
-                match std::os::unix::net::UnixStream::pair() {
-                    Ok((proxy_end, service_end)) => {
-                        proxy_end.set_nonblocking(true).ok();
-                        let thread = spawner(service_end);
-                        info!("local service spawned on port {dest_port}");
-                        local_bridges.push(LocalBridge {
-                            smoltcp_handle: handle,
-                            stream: proxy_end,
-                            dest_port,
-                            host_eof: false,
-                            _thread: thread,
-                        });
-                    }
+                match TcpListener::bind("127.0.0.1:0") {
+                    Ok(listener) => match listener.local_addr() {
+                        Ok(addr) => match std::net::TcpStream::connect(addr) {
+                            Ok(proxy_end) => match listener.accept() {
+                                Ok((service_end, _)) => {
+                                    proxy_end.set_nonblocking(true).ok();
+                                    let thread = spawner(service_end);
+                                    info!("local service spawned on port {dest_port}");
+                                    local_bridges.push(LocalBridge {
+                                        smoltcp_handle: handle,
+                                        stream: proxy_end,
+                                        dest_port,
+                                        host_eof: false,
+                                        _thread: thread,
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!("failed to accept loopback service connection: {e}");
+                                    let socket: &mut tcp::Socket = sockets.get_mut(handle);
+                                    socket.abort();
+                                    sockets.remove(handle);
+                                }
+                            },
+                            Err(e) => {
+                                warn!("failed to connect loopback service stream: {e}");
+                                let socket: &mut tcp::Socket = sockets.get_mut(handle);
+                                socket.abort();
+                                sockets.remove(handle);
+                            }
+                        },
+                        Err(e) => {
+                            warn!("failed to resolve loopback service listener address: {e}");
+                            let socket: &mut tcp::Socket = sockets.get_mut(handle);
+                            socket.abort();
+                            sockets.remove(handle);
+                        }
+                    },
                     Err(e) => {
-                        warn!("failed to create socketpair for local service: {e}");
+                        warn!("failed to create loopback service listener: {e}");
                         let socket: &mut tcp::Socket = sockets.get_mut(handle);
                         socket.abort();
                         sockets.remove(handle);
@@ -1349,15 +1265,15 @@ fn relay_tcp(sockets: &mut SocketSet<'_>, bridges: &mut Vec<TcpBridge>) {
     }
 }
 
-/// Relay data between smoltcp TCP sockets and local service Unix streams.
-/// Same pattern as `relay_tcp` but uses `UnixStream` instead of `TcpStream`.
+/// Relay data between smoltcp TCP sockets and local service TCP streams.
+/// Same pattern as `relay_tcp` but uses the loopback service stream.
 fn relay_local(sockets: &mut SocketSet<'_>, bridges: &mut Vec<LocalBridge>) {
     let mut to_remove: Vec<usize> = Vec::new();
 
     for (i, bridge) in bridges.iter_mut().enumerate() {
         let socket: &mut tcp::Socket = sockets.get_mut(bridge.smoltcp_handle);
 
-        // Guest → Service: peek from smoltcp, write to Unix stream.
+        // Guest → Service: peek from smoltcp, write to the service stream.
         if socket.can_recv() {
             let mut buf = [0u8; 8192];
             match socket.peek_slice(&mut buf) {
@@ -1383,7 +1299,7 @@ fn relay_local(sockets: &mut SocketSet<'_>, bridges: &mut Vec<LocalBridge>) {
             }
         }
 
-        // Service → Guest: read from Unix stream, send to smoltcp.
+        // Service → Guest: read from the service stream, send to smoltcp.
         if socket.can_send() && !bridge.host_eof {
             let free = socket.send_capacity() - socket.send_queue();
             if free > 0 {

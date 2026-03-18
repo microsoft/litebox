@@ -10,8 +10,7 @@
 //!
 //! Frame format on the wire: `[u32 LE length][IP packet]`.
 
-use std::os::fd::AsRawFd;
-use std::os::unix::io::OwnedFd;
+use crate::sock_compat::{self, IpcStream, MSG_PEEK, POLLOUT, PollFd, RawSock};
 
 use smoltcp::phy;
 use tracing::error;
@@ -21,7 +20,7 @@ pub const DEVICE_MTU: usize = 1600;
 
 /// smoltcp device with a staging buffer for SYN-peek dispatch.
 pub struct IpcDevice {
-    fd: OwnedFd,
+    fd: IpcStream,
     /// Staging buffer for received packets.
     pub(super) rx_buf: [u8; DEVICE_MTU],
     /// Length of valid data in `rx_buf`, or `None` if no packet is staged.
@@ -32,7 +31,7 @@ pub struct IpcDevice {
 }
 
 impl IpcDevice {
-    pub fn new(fd: OwnedFd) -> Self {
+    pub fn new(fd: IpcStream) -> Self {
         Self {
             fd,
             rx_buf: [0u8; DEVICE_MTU],
@@ -41,9 +40,9 @@ impl IpcDevice {
         }
     }
 
-    /// Returns the raw file descriptor for use with poll/epoll.
-    pub fn fd(&self) -> i32 {
-        self.fd.as_raw_fd()
+    /// Returns the raw socket descriptor for use with poll.
+    pub fn raw_socket(&self) -> RawSock {
+        self.fd.raw()
     }
 
     /// Try to receive one framed IP packet from the IPC pipe into the staging
@@ -57,7 +56,7 @@ impl IpcDevice {
             return Ok(Some(&self.rx_buf[..len]));
         }
 
-        match recv_framed(self.fd.as_raw_fd(), &mut self.rx_buf) {
+        match recv_framed(self.fd.raw(), &mut self.rx_buf) {
             Ok(len) => {
                 self.rx_len = Some(len);
                 Ok(Some(&self.rx_buf[..len]))
@@ -75,17 +74,10 @@ impl IpcDevice {
 ///
 /// Returns `Ok(len)` on success, `Err(false)` for would-block/no-data,
 /// or `Err(true)` for a fatal protocol error (oversized frame).
-fn recv_framed(fd: i32, buf: &mut [u8; DEVICE_MTU]) -> Result<usize, bool> {
+fn recv_framed(fd: RawSock, buf: &mut [u8; DEVICE_MTU]) -> Result<usize, bool> {
     // Peek at the 4-byte length prefix.
     let mut len_buf = [0u8; 4];
-    let ret = unsafe {
-        libc::recv(
-            fd,
-            len_buf.as_mut_ptr().cast::<libc::c_void>(),
-            4,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
+    let ret = sock_compat::recv_nb(fd, &mut len_buf, MSG_PEEK);
     if ret < 4 {
         return Err(false);
     }
@@ -106,14 +98,7 @@ fn recv_framed(fd: i32, buf: &mut [u8; DEVICE_MTU]) -> Result<usize, bool> {
     // This prevents consuming the prefix when the body hasn't arrived yet.
     let frame_len = 4 + pkt_len;
     let mut peek_buf = vec![0u8; frame_len];
-    let ret = unsafe {
-        libc::recv(
-            fd,
-            peek_buf.as_mut_ptr().cast::<libc::c_void>(),
-            frame_len,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
+    let ret = sock_compat::recv_nb(fd, &mut peek_buf, MSG_PEEK);
     #[allow(clippy::cast_sign_loss)]
     if ret < 0 || (ret as usize) < frame_len {
         // Full frame not yet available — leave it for next iteration.
@@ -126,14 +111,7 @@ fn recv_framed(fd: i32, buf: &mut [u8; DEVICE_MTU]) -> Result<usize, bool> {
     // Read the packet body (guaranteed to succeed since we peeked it).
     let mut read = 0;
     while read < pkt_len {
-        let ret = unsafe {
-            libc::recv(
-                fd,
-                buf[read..].as_mut_ptr().cast::<libc::c_void>(),
-                pkt_len - read,
-                libc::MSG_DONTWAIT,
-            )
-        };
+        let ret = sock_compat::recv_nb(fd, &mut buf[read..pkt_len], 0);
         if ret <= 0 {
             // Shouldn't happen since we peeked successfully, but handle gracefully.
             return Err(false);
@@ -152,21 +130,14 @@ impl IpcDevice {
     /// Assembles the frame into a contiguous buffer and retries partial writes
     /// to prevent stream misalignment on non-blocking sockets.
     pub fn send_framed(&self, packet: &[u8]) -> bool {
-        send_ipc_frame(self.fd.as_raw_fd(), packet)
+        send_ipc_frame(self.fd.raw(), packet)
     }
 
     /// Send a shutdown frame (length=0) to signal the runner that IPC is closing.
     /// Errors are ignored — the runner may already be gone.
     pub fn send_shutdown(&self) {
         let frame = 0u32.to_le_bytes();
-        unsafe {
-            libc::send(
-                self.fd.as_raw_fd(),
-                frame.as_ptr().cast::<libc::c_void>(),
-                4,
-                libc::MSG_NOSIGNAL,
-            );
-        }
+        let _ = sock_compat::send_nb(self.fd.raw(), &frame, 0);
     }
 }
 
@@ -174,7 +145,7 @@ impl IpcDevice {
 ///
 /// Returns `true` if the entire frame was sent. On a non-blocking socket,
 /// retries with a short poll if the kernel buffer is temporarily full.
-pub fn send_ipc_frame(fd: i32, packet: &[u8]) -> bool {
+pub fn send_ipc_frame(fd: RawSock, packet: &[u8]) -> bool {
     let mut frame = Vec::with_capacity(4 + packet.len());
     #[allow(clippy::cast_possible_truncation)]
     frame.extend_from_slice(&(packet.len() as u32).to_le_bytes());
@@ -182,14 +153,7 @@ pub fn send_ipc_frame(fd: i32, packet: &[u8]) -> bool {
 
     let mut sent = 0usize;
     while sent < frame.len() {
-        let ret = unsafe {
-            libc::send(
-                fd,
-                frame[sent..].as_ptr().cast::<libc::c_void>(),
-                frame.len() - sent,
-                libc::MSG_NOSIGNAL,
-            )
-        };
+        let ret = sock_compat::send_nb(fd, &frame[sent..], 0);
         if ret > 0 {
             #[allow(clippy::cast_sign_loss)]
             {
@@ -198,17 +162,15 @@ pub fn send_ipc_frame(fd: i32, packet: &[u8]) -> bool {
         } else if ret == 0 {
             return false; // Peer closed.
         } else {
-            let errno = unsafe { *libc::__errno_location() };
-            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            let err = sock_compat::last_socket_error();
+            if sock_compat::is_would_block(err) {
                 // Socket buffer full — wait briefly for space.
-                let mut pfd = libc::pollfd {
+                let mut pfd = PollFd {
                     fd,
-                    events: libc::POLLOUT,
+                    events: POLLOUT,
                     revents: 0,
                 };
-                unsafe {
-                    libc::poll(&raw mut pfd, 1, 10);
-                }
+                sock_compat::poll_fds(std::slice::from_mut(&mut pfd), 10);
                 continue;
             }
             return false; // Unrecoverable error.
@@ -218,19 +180,12 @@ pub fn send_ipc_frame(fd: i32, packet: &[u8]) -> bool {
 }
 
 /// Consume exactly `n` bytes from the socket (non-blocking).
-fn consume_exact(fd: i32, n: usize) {
+fn consume_exact(fd: RawSock, n: usize) {
     let mut buf = [0u8; 16];
     let mut consumed = 0;
     while consumed < n {
         let chunk = (n - consumed).min(buf.len());
-        let ret = unsafe {
-            libc::recv(
-                fd,
-                buf.as_mut_ptr().cast::<libc::c_void>(),
-                chunk,
-                libc::MSG_DONTWAIT,
-            )
-        };
+        let ret = sock_compat::recv_nb(fd, &mut buf[..chunk], 0);
         if ret <= 0 {
             break;
         }
@@ -258,7 +213,7 @@ impl phy::Device for IpcDevice {
                 buffer: &self.rx_buf[..size],
             },
             TxToken {
-                fd: self.fd.as_raw_fd(),
+                fd: self.fd.raw(),
                 tx_buf: &mut self.tx_buf,
             },
         ))
@@ -266,7 +221,7 @@ impl phy::Device for IpcDevice {
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         Some(TxToken {
-            fd: self.fd.as_raw_fd(),
+            fd: self.fd.raw(),
             tx_buf: &mut self.tx_buf,
         })
     }
@@ -295,7 +250,7 @@ impl phy::RxToken for RxToken<'_> {
 
 /// Transmit token that writes the packet back through IPC framing.
 pub struct TxToken<'a> {
-    fd: i32,
+    fd: RawSock,
     tx_buf: &'a mut [u8],
 }
 

@@ -8,7 +8,6 @@
 //! TCP/UDP over an IPC pipe using smoltcp.
 
 use std::net::SocketAddr;
-use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,6 +15,11 @@ use clap::Parser;
 use tracing::info;
 
 use litebox_broker::policy::{AllowAllPolicy, ReadOnlyPolicy, ReadOnlyWithWritablePaths};
+use litebox_broker::sock_compat::IpcListener;
+#[cfg(unix)]
+use litebox_broker::sock_compat::IpcStream;
+#[cfg(unix)]
+use std::os::unix::io::FromRawFd;
 
 /// Litebox Broker — policy-enforced file access and network proxy for sandboxed processes.
 #[derive(Parser, Debug)]
@@ -42,13 +46,14 @@ struct Cli {
     writable_paths: Vec<PathBuf>,
 
     /// Run as a network proxy. The value is a file descriptor number for the
-    /// IPC socketpair end passed from the runner.
+    /// IPC socketpair end passed from the runner (Unix only).
     #[arg(long)]
     network_proxy_fd: Option<i32>,
 
-    /// Path to listen on for network proxy IPC connections (Unix domain socket).
+    /// Listen address for network proxy IPC connections.
+    /// On Unix: path to a Unix domain socket. On Windows: TCP address (e.g., 127.0.0.1:9999).
     #[arg(long, conflicts_with = "network_proxy_fd")]
-    network_proxy_listen: Option<PathBuf>,
+    network_proxy_listen: Option<String>,
 }
 
 fn build_policy(cli: &Cli) -> Arc<dyn litebox_broker::policy::Policy> {
@@ -106,35 +111,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    // Network proxy mode (fd passed from runner).
+    // Network proxy mode (fd passed from runner — Unix only).
+    #[cfg(unix)]
     if let Some(fd_num) = cli.network_proxy_fd {
         info!(fd = fd_num, "starting network proxy mode (fd)");
         // Safety: the fd was passed to us by the runner process via fork+exec.
         // We take ownership of it.
         let fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd_num) };
+        let ipc = IpcStream::from_owned_fd(fd);
         let registry = build_local_services(&cli);
-        return litebox_broker::net_proxy::run(fd, false, registry, None);
+        return litebox_broker::net_proxy::run(ipc, false, registry, None);
+    }
+    #[cfg(not(unix))]
+    if cli.network_proxy_fd.is_some() {
+        return Err("--network-proxy-fd is only supported on Unix".into());
     }
 
-    // Network proxy mode (listen on Unix socket).
-    if let Some(ref listen_path) = cli.network_proxy_listen {
-        info!(path = %listen_path.display(), "starting network proxy mode (listen)");
-        // Remove stale socket from a previous run, if any.
-        if listen_path.exists() {
-            std::fs::remove_file(listen_path)?;
-        }
-        let listener = std::os::unix::net::UnixListener::bind(listen_path)?;
-        // Set non-blocking so the event loop can poll for 9P channel connections
-        // without blocking.
-        listener.set_nonblocking(true)?;
-        info!(path = %listen_path.display(), "network proxy listening");
+    // Network proxy mode (listen for IPC connections).
+    if let Some(ref listen_addr) = cli.network_proxy_listen {
+        info!(addr = %listen_addr, "starting network proxy mode (listen)");
+
+        #[cfg(unix)]
+        let listener = IpcListener::bind_unix(std::path::Path::new(listen_addr))?;
+        #[cfg(windows)]
+        let listener = IpcListener::bind_tcp(listen_addr)?;
+
+        info!(addr = %listen_addr, "network proxy listening");
 
         // Accept connections, validating the LBNP handshake before entering the
         // proxy event loop.  Stray/slow clients are rejected quickly so they
         // cannot block the real runner from connecting.
         loop {
-            let owned_fd = match litebox_broker::net_proxy::accept_ipc_client(&listener, None) {
-                Ok(fd) => fd,
+            let ipc = match litebox_broker::net_proxy::accept_ipc_client(&listener, None) {
+                Ok(s) => s,
                 Err(e) => {
                     tracing::error!("accept_ipc_client error: {e}");
                     continue;
@@ -142,9 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             info!("network proxy client connected");
             let registry = build_local_services(&cli);
-            if let Err(e) =
-                litebox_broker::net_proxy::run(owned_fd, true, registry, Some(&listener))
-            {
+            if let Err(e) = litebox_broker::net_proxy::run(ipc, true, registry, Some(&listener)) {
                 tracing::error!("network proxy error: {e}");
             }
             info!("network proxy client disconnected");

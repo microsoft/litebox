@@ -8,6 +8,7 @@
 //! implementation in `litebox/src/fs/nine_p/`.
 
 pub mod fcall;
+pub mod fs_compat;
 pub mod server;
 pub mod transport;
 
