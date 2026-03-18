@@ -394,6 +394,9 @@ impl<FS: ShimFS> Task<FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|file| {
+                        if buf.len() < size_of::<u64>() {
+                            return Err(Errno::EINVAL);
+                        }
                         let value: u64 = u64::from_le_bytes(
                             buf[..size_of::<u64>()]
                                 .try_into()
