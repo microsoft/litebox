@@ -29,8 +29,9 @@ use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
     Foundation::GetLastError,
     System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-        EXCEPTION_POINTERS, EXCEPTION_RECORD,
+        AddVectoredExceptionHandler, CONTEXT_XSTATE_AMD64, EXCEPTION_CONTINUE_EXECUTION,
+        EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, EXCEPTION_RECORD, GetXStateFeaturesMask,
+        InitializeContext, LocateXStateFeature, SetXStateFeaturesMask,
     },
     System::Memory::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
@@ -883,7 +884,7 @@ unsafe extern "system" fn vectored_exception_handler_inner(
         &mut *(tls.guest_context_top.get().wrapping_sub(1)
             as *mut litebox_common_linux::ExecutionContext)
     };
-    save_guest_context(exec_ctx, context);
+    save_guest_context(exec_ctx, context, context as *const _);
 
     // If it looks like fs base was cleared, then go through the interrupt path
     // instead of the exception path to restore the fs base and try again.
@@ -918,9 +919,17 @@ unsafe extern "system" fn vectored_exception_handler_inner(
     EXCEPTION_CONTINUE_EXECUTION
 }
 
+/// Save guest general-purpose registers and FP state from a Windows CONTEXT.
+///
+/// `context` is used for register values and the 512-byte FXSAVE area.
+/// `xstate_ctx_ptr` is the original CONTEXT pointer within its allocation
+/// (may be the same as `context`, or point into an extended context buffer).
+/// It is used by `LocateXStateFeature` to find AVX upper halves. Pass
+/// `core::ptr::null()` to skip XSTATE extraction.
 fn save_guest_context(
     guest_context: &mut litebox_common_linux::ExecutionContext,
     context: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    xstate_ctx_ptr: *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
 ) {
     let litebox_common_linux::PtRegs {
         r15,
@@ -966,15 +975,177 @@ fn save_guest_context(
     *rsp = context.Rsp.truncate();
 
     // Save FP/SIMD state from the CONTEXT's FXSAVE area into FpRegs.
-    // The Windows CONTEXT.FltSave (XSAVE_FORMAT) is layout-compatible with the
-    // 512-byte FXSAVE image stored in FpRegs.data.
+    // The Windows CONTEXT.FltSave (XSAVE_FORMAT) is 512 bytes, matching
+    // the first 512 bytes of our FpRegs buffer.
     unsafe {
         core::ptr::copy_nonoverlapping(
             &raw const context.Anonymous.FltSave as *const u8,
             guest_context.fp_regs.data.as_mut_ptr(),
-            core::mem::size_of::<litebox_common_linux::FpRegs>(),
+            512,
         );
+        // Clear the XSAVE header and AVX upper halves (bytes 512-831) so
+        // that any failure to extract XSTATE below results in zeroed upper
+        // YMM halves on the next xrstor64, not stale data from a previous
+        // fast-path xsave.
+        core::ptr::write_bytes(
+            guest_context.fp_regs.data.as_mut_ptr().add(XSAVE_HEADER_OFFSET),
+            0,
+            litebox_common_linux::FP_STATE_SIZE - XSAVE_HEADER_OFFSET,
+        );
+        // Set xstate_bv bits 0-1 (x87 | SSE) so that xrstor64 restores the
+        // legacy FP/SSE state from the FXSAVE area we just copied above.
+        // Without these bits, xrstor64 would re-initialize x87/SSE instead
+        // of loading the saved values.
+        let xstate_bv =
+            guest_context.fp_regs.data.as_mut_ptr().add(XSAVE_HEADER_OFFSET) as *mut u64;
+        *xstate_bv = 0x3; // x87 (bit 0) | SSE (bit 1)
     }
+
+    // Try to extract AVX upper halves from the CONTEXT's XSTATE area.
+    // On modern Windows, exception CONTEXTs and extended GetThreadContext
+    // CONTEXTs contain XSTATE data accessible via LocateXStateFeature.
+    // On success this overwrites the zeroed region above with real data.
+    if !xstate_ctx_ptr.is_null() {
+        extract_avx_from_context(guest_context, xstate_ctx_ptr);
+    }
+}
+
+/// XSTATE feature ID for AVX (YMM upper halves).
+const XSTATE_AVX: u32 = 2;
+
+/// Size of AVX upper halves: 16 YMM registers × 16 bytes (upper 128 bits each).
+const XSTATE_AVX_SIZE: usize = 256;
+
+/// Offset within the XSAVE area where AVX upper halves are stored.
+/// Layout: [0..512) FXSAVE, [512..576) XSAVE header, [576..832) AVX upper halves.
+const XSAVE_AVX_OFFSET: usize = 576;
+
+/// XSAVE header offset within the XSAVE area.
+const XSAVE_HEADER_OFFSET: usize = 512;
+
+/// Extract AVX upper halves from a CONTEXT's XSTATE area into FpRegs.
+/// `ctx_ptr` must point to the original CONTEXT within its allocation (not a
+/// stack copy), because `LocateXStateFeature` navigates relative to it.
+///
+/// The caller must zero the XSAVE header + AVX region before calling this
+/// so that any early-return path leaves clean zeroed state, not stale data.
+fn extract_avx_from_context(
+    guest_context: &mut litebox_common_linux::ExecutionContext,
+    ctx_ptr: *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) {
+    unsafe {
+        let mut feature_mask: u64 = 0;
+        if GetXStateFeaturesMask(ctx_ptr, &mut feature_mask) == 0 {
+            return; // CONTEXT has no XSTATE data; buffer already zeroed
+        }
+        if feature_mask & (1u64 << XSTATE_AVX) == 0 {
+            return; // AVX not present; buffer already zeroed
+        }
+        let mut length: u32 = 0;
+        let avx_ptr = LocateXStateFeature(ctx_ptr, XSTATE_AVX, &mut length);
+        if avx_ptr.is_null() || (length as usize) < XSTATE_AVX_SIZE {
+            return; // Can't locate AVX data; buffer already zeroed
+        }
+        // Copy the 256-byte AVX upper halves into FpRegs at offset 576.
+        core::ptr::copy_nonoverlapping(
+            avx_ptr as *const u8,
+            guest_context.fp_regs.data.as_mut_ptr().add(XSAVE_AVX_OFFSET),
+            XSTATE_AVX_SIZE,
+        );
+        // Mark AVX as present in the XSAVE header's xstate_bv field.
+        let xstate_bv =
+            guest_context.fp_regs.data.as_mut_ptr().add(XSAVE_HEADER_OFFSET) as *mut u64;
+        *xstate_bv |= 1u64 << XSTATE_AVX;
+    }
+}
+
+/// Allocate an extended context buffer with XSTATE support, call
+/// `GetThreadContext` on the given thread handle, and return a CONTEXT copy,
+/// the original in-buffer pointer (for XSTATE extraction), and the buffer.
+///
+/// The returned `xstate_ptr` should be passed to `save_guest_context` for
+/// AVX extraction via `LocateXStateFeature`. The `_buf` must be kept alive
+/// as long as `xstate_ptr` is used.
+fn get_extended_thread_context(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> (
+    windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    Option<Vec<u8>>,
+) {
+    use windows_sys::Win32::System::Diagnostics::Debug as Dbg;
+
+    let flags = Dbg::CONTEXT_CONTROL_AMD64
+        | Dbg::CONTEXT_INTEGER_AMD64
+        | Dbg::CONTEXT_FLOATING_POINT_AMD64
+        | CONTEXT_XSTATE_AMD64;
+
+    // Query required buffer size for extended context.
+    let mut ctx_len: u32 = 0;
+    unsafe { InitializeContext(core::ptr::null_mut(), flags, core::ptr::null_mut(), &mut ctx_len) };
+
+    if ctx_len == 0 {
+        // XSTATE not supported; fall back to plain context.
+        return get_plain_thread_context(handle);
+    }
+
+    // Allocate buffer. InitializeContext handles alignment internally by
+    // returning an aligned context pointer within the buffer.
+    let mut buf = vec![0u8; ctx_len as usize];
+
+    let mut ctx_ptr: *mut Dbg::CONTEXT = core::ptr::null_mut();
+    let r = unsafe {
+        InitializeContext(
+            buf.as_mut_ptr() as *mut _,
+            flags,
+            &mut ctx_ptr,
+            &mut ctx_len,
+        )
+    };
+    if r == 0 || ctx_ptr.is_null() {
+        return get_plain_thread_context(handle);
+    }
+
+    // Request AVX state capture.
+    unsafe {
+        SetXStateFeaturesMask(ctx_ptr, 1u64 << XSTATE_AVX);
+    }
+
+    // Capture the thread's register state.
+    let r = unsafe { Dbg::GetThreadContext(handle, ctx_ptr) };
+    if r == 0 {
+        // If extended GetThreadContext fails, try plain.
+        return get_plain_thread_context(handle);
+    }
+
+    let context = unsafe { *ctx_ptr };
+    (context, ctx_ptr as *const _, Some(buf))
+}
+
+/// Fall back to a plain (non-extended) CONTEXT for GetThreadContext.
+fn get_plain_thread_context(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> (
+    windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    Option<Vec<u8>>,
+) {
+    use windows_sys::Win32::System::Diagnostics::Debug as Dbg;
+    let mut context = Dbg::CONTEXT {
+        ContextFlags: Dbg::CONTEXT_CONTROL_AMD64
+            | Dbg::CONTEXT_INTEGER_AMD64
+            | Dbg::CONTEXT_FLOATING_POINT_AMD64,
+        ..Default::default()
+    };
+    let r = unsafe { Dbg::GetThreadContext(handle, &raw mut context) };
+    assert_ne!(
+        r,
+        0,
+        "GetThreadContext failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // Plain CONTEXT has no XSTATE, so xstate_ptr is null.
+    (context, core::ptr::null(), None)
 }
 
 impl WindowsUserland {
@@ -1380,7 +1551,7 @@ struct TlsState {
     guest_context_top: Cell<*mut litebox_common_linux::PtRegs>,
     scratch: Cell<usize>,
     /// Second scratch slot used by the syscall callback to preserve the
-    /// syscall number (rax) across fxsave64 which clobbers rax.
+    /// syscall number (rax) across fxsave64/xsave64 which clobbers rax.
     scratch2: Cell<usize>,
     is_in_guest: Cell<bool>,
     interrupt: Cell<bool>,
@@ -1394,6 +1565,12 @@ struct TlsState {
     /// Pointer to the `Waker` currently being waited on, or null if not
     /// waiting.
     waiting_waker: std::sync::atomic::AtomicPtr<litebox::event::wait::Waker<WindowsUserland>>,
+    /// Non-zero if XSAVE is supported and should be used instead of FXSAVE.
+    xsave_enabled: Cell<u8>,
+    /// Low 32 bits of the XSAVE feature mask (x87=bit0, SSE=bit1, AVX=bit2).
+    xsave_mask_lo: Cell<u32>,
+    /// High 32 bits of the XSAVE feature mask (always 0 for now).
+    xsave_mask_hi: Cell<u32>,
 }
 
 impl TlsState {
@@ -1401,7 +1578,9 @@ impl TlsState {
     ///
     /// Copies `THREAD_GS_BASE` into the struct so the switch_to_guest asm
     /// can read it without going through the Windows thread_local! API.
+    /// Detects XSAVE support via CPUID for conditional FP save/restore.
     fn new() -> Self {
+        let (enabled, mask_lo, mask_hi) = detect_xsave_support();
         Self {
             host_sp: Cell::new(core::ptr::null_mut()),
             host_bp: Cell::new(core::ptr::null_mut()),
@@ -1414,8 +1593,37 @@ impl TlsState {
             continue_context: Box::default(),
             pending_host_signals: AtomicU32::new(0),
             waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            xsave_enabled: Cell::new(enabled),
+            xsave_mask_lo: Cell::new(mask_lo),
+            xsave_mask_hi: Cell::new(mask_hi),
         }
     }
+}
+
+/// x87 | SSE | AVX — the state components we save/restore for the guest.
+const GUEST_XSAVE_MASK: u64 = 0x7;
+
+/// Detect XSAVE support and return (enabled, mask_lo, mask_hi).
+fn detect_xsave_support() -> (u8, u32, u32) {
+    use core::arch::x86_64::{__cpuid, _xgetbv};
+
+    // CPUID.01H:ECX.XSAVE[bit 26] and OSXSAVE[bit 27] gate XSAVE/XGETBV.
+    // CPUID is always safe on x86_64.
+    let leaf1 = __cpuid(1);
+    let has_xsave = (leaf1.ecx & (1 << 26)) != 0;
+    let has_osxsave = (leaf1.ecx & (1 << 27)) != 0;
+    if !(has_xsave && has_osxsave) {
+        return (0, 0, 0);
+    }
+
+    // SAFETY: CPUID confirmed XSAVE and OSXSAVE — XGETBV(0) is valid.
+    let xcr0 = unsafe { _xgetbv(0) };
+    let mask = xcr0 & GUEST_XSAVE_MASK;
+    // We need at least x87+SSE (bits 0,1) to use xsave/xrstor.
+    if (mask & 0x3) != 0x3 {
+        return (0, 0, 0);
+    }
+    (1, mask as u32, (mask >> 32) as u32)
 }
 
 /// Stores `tls` in the current thread's Windows TLS slot.
@@ -1542,10 +1750,25 @@ syscall_callback:
 
     // Save guest FP/SIMD state. fp_regs is at GUEST_CONTEXT_TOP + FP_REGS_PAD
     // (padding between end of PtRegs and start of 64-byte-aligned FpRegs).
-    // Preserve rax (syscall number) in scratch2 because fxsave setup clobbers it.
+    // Preserve rax (syscall number) in scratch2 because xsave/fxsave uses eax:edx.
     mov     QWORD PTR [r11 + {SCRATCH2}], rax
     lea     rax, [rsp + {FP_REGS_PAD}]
+    cmp     BYTE PTR [r11 + {XSAVE_ENABLED}], 0
+    je      .Lsyscall_fp_save_fxsave
+    // xsave64 path: need eax:edx = mask, memory operand = buffer address.
+    // Stash guest rcx and rdx in PtRegs slots (will be overwritten by pushes).
+    mov     QWORD PTR [rsp], rcx              // temp stash at PtRegs[r15] slot
+    mov     QWORD PTR [rsp + 8], rdx          // temp stash at PtRegs[r14] slot
+    mov     rcx, rax                           // rcx = buffer ptr
+    mov     eax, DWORD PTR [r11 + {XSAVE_MASK_LO}]
+    mov     edx, DWORD PTR [r11 + {XSAVE_MASK_HI}]
+    xsave64 [rcx]
+    mov     rcx, QWORD PTR [rsp]              // restore guest rcx
+    mov     rdx, QWORD PTR [rsp + 8]          // restore guest rdx
+    jmp     .Lsyscall_fp_save_done
+.Lsyscall_fp_save_fxsave:
     fxsave64 [rax]
+.Lsyscall_fp_save_done:
     // Sanitize MXCSR for host Rust code (guest may have set denormals-are-zero
     // or flush-to-zero bits that could cause unexpected behavior in host math).
     ldmxcsr DWORD PTR [rip + DEFAULT_MXCSR]
@@ -1642,6 +1865,9 @@ DEFAULT_MXCSR:
     SCRATCH = const core::mem::offset_of!(TlsState, scratch),
     SCRATCH2 = const core::mem::offset_of!(TlsState, scratch2),
     IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
+    XSAVE_ENABLED = const core::mem::offset_of!(TlsState, xsave_enabled),
+    XSAVE_MASK_LO = const core::mem::offset_of!(TlsState, xsave_mask_lo),
+    XSAVE_MASK_HI = const core::mem::offset_of!(TlsState, xsave_mask_hi),
     // Padding between end of PtRegs and start of FpRegs in ExecutionContext.
     // FpRegs is align(64); PtRegs is 168 bytes; next 64-byte boundary is 192.
     FP_REGS_PAD = const {
@@ -1667,13 +1893,24 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
         core::arch::naked_asm!(
             // Restore guest FP/SIMD state before touching any guest registers.
             // rcx = ptr to ExecutionContext; fp_regs is at offset FP_REGS_OFFSET.
+            // First check xsave_enabled in TlsState (GS still points to host TEB).
+            "mov     r11d, DWORD PTR [rip + {TLS_INDEX}]",
+            "mov     r11, QWORD PTR gs:[r11 * 8 + 5248]", // TEB_TLS_SLOTS → TlsState*
+            "cmp     BYTE PTR [r11 + {XSAVE_ENABLED}], 0",
+            "je      .Lguest_fp_restore_fxrstor",
+            // xrstor64 path: need eax:edx = mask.
+            "mov     eax, DWORD PTR [r11 + {XSAVE_MASK_LO}]",
+            "mov     edx, DWORD PTR [r11 + {XSAVE_MASK_HI}]",
+            "xrstor64 [rcx + {FP_REGS_OFFSET}]",
+            "jmp     .Lguest_fp_restore_done",
+            ".Lguest_fp_restore_fxrstor:",
             "fxrstor64 [rcx + {FP_REGS_OFFSET}]",
+            ".Lguest_fp_restore_done:",
             // Restore guest GS base (if set) from the TlsState. GS still
             // points to the host TEB here, so we can read the TLS slot.
-            // This must happen AFTER fxrstor (so any fxrstor fault sees
-            // host GS) and BEFORE we start restoring guest registers.
-            "mov     r11d, DWORD PTR [rip + {TLS_INDEX}]",
-            "mov     r11, QWORD PTR gs:[r11 * 8 + 5248]", // TEB_TLS_SLOTS
+            // This must happen AFTER FP restore (so any fault sees host GS)
+            // and BEFORE we start restoring guest registers.
+            // Re-read TlsState (r11 was loaded above but may have been used).
             "mov     r11, QWORD PTR [r11 + {GUEST_GS_BASE}]",
             "test    r11, r11",
             "jz      2f",
@@ -1707,6 +1944,9 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
             FP_REGS_OFFSET = const core::mem::offset_of!(litebox_common_linux::ExecutionContext, fp_regs),
             TLS_INDEX = sym TLS_INDEX,
             GUEST_GS_BASE = const core::mem::offset_of!(TlsState, guest_gs_base),
+            XSAVE_ENABLED = const core::mem::offset_of!(TlsState, xsave_enabled),
+            XSAVE_MASK_LO = const core::mem::offset_of!(TlsState, xsave_mask_lo),
+            XSAVE_MASK_HI = const core::mem::offset_of!(TlsState, xsave_mask_hi),
         );
     }
 
@@ -1753,12 +1993,13 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
                 ..CONTEXT::default()
             });
             // Copy guest FP state into the CONTEXT's FXSAVE area (FltSave).
-            // FltSave is a XSAVE_FORMAT struct which is layout-compatible with
-            // the 512-byte FXSAVE image in FpRegs.
+            // FltSave is an XSAVE_FORMAT struct (512 bytes), layout-compatible
+            // with the first 512 bytes of our FpRegs (which may be 832 bytes
+            // when using XSAVE). Only copy the 512-byte FXSAVE portion.
             core::ptr::copy_nonoverlapping(
                 ctx.fp_regs.data.as_ptr(),
                 &raw mut (*win_ctx).Anonymous.FltSave as *mut u8,
-                core::mem::size_of::<litebox_common_linux::FpRegs>(),
+                512,
             );
         }
         // Ensure the context is written before we set `is_in_guest` so that
@@ -1770,6 +2011,22 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
         // the round-trip, so the guest resumes with GS = guest TEB.
         let guest_gs = tls.guest_gs_base.get();
         unsafe {
+            // When XSAVE is enabled, pre-load the full FP/SIMD state (including
+            // AVX upper halves) via xrstor64 before NtContinue. NtContinue will
+            // restore x87/SSE from CONTEXT.FltSave, but the AVX upper halves
+            // (not represented in CONTEXT) will persist from our xrstor.
+            if tls.xsave_enabled.get() != 0 {
+                let mask_lo = tls.xsave_mask_lo.get();
+                let mask_hi = tls.xsave_mask_hi.get();
+                let fp_ptr = ctx.fp_regs.data.as_ptr();
+                core::arch::asm!(
+                    "xrstor64 [{buf}]",
+                    buf = in(reg) fp_ptr,
+                    in("eax") mask_lo,
+                    in("edx") mask_hi,
+                    options(nostack),
+                );
+            }
             if guest_gs != 0 {
                 core::arch::asm!(
                     "wrgsbase {gs}",
@@ -2185,25 +2442,10 @@ impl ThreadHandle {
         //    this path will check the interrupt flag.
         // 4. In the guest. Save the guest context and jump to the interrupt callback.
 
-        // Get the current register context (including FP state for save).
-        let mut context = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT {
-            ContextFlags: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
-                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64
-                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_FLOATING_POINT_AMD64,
-            ..Default::default()
-        };
-        let r = unsafe {
-            windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(
-                inner.handle.as_raw_handle(),
-                &raw mut context,
-            )
-        };
-        assert_ne!(
-            r,
-            0,
-            "GetThreadContext failed: {}",
-            std::io::Error::last_os_error()
-        );
+        // Get the current register context (including FP + XSTATE for save).
+        // Use an extended context to capture AVX upper halves.
+        let (mut context, xstate_ptr, _ctx_buf) =
+            get_extended_thread_context(inner.handle.as_raw_handle());
 
         let run_interrupt_callback = if (switch_to_guest_start as *const () as usize
             ..switch_to_guest_end as *const () as usize)
@@ -2228,9 +2470,13 @@ impl ThreadHandle {
             false
         } else {
             // Case 4: save the guest context and jump to interrupt callback.
+            // The extended context includes XSTATE (AVX upper halves) when
+            // supported, so save_guest_context + extract_avx_from_context
+            // captures the full FP/SIMD state.
             save_guest_context(
                 unsafe { &mut *(guest_context as *mut litebox_common_linux::ExecutionContext) },
                 &context,
+                xstate_ptr,
             );
             true
         };

@@ -7,9 +7,9 @@
 //! NtSetInformationFile. For Phase 2, file operations pass through to the
 //! host OS. A proper sandboxed VFS will be added in later phases.
 
-use alloc::rc::Rc;
 use alloc::string::String;
-use core::cell::Cell;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use litebox_common_windows::nt_types::{
     FileBasicInformation, FilePositionInformation, FileStandardInformation, IoStatusBlock,
@@ -634,7 +634,7 @@ pub(crate) fn nt_create_file(
     let handle = handles.insert(NtObject::File {
         path: nt_path,
         host_handle,
-        position: Rc::new(Cell::new(0)),
+        position: Arc::new(AtomicU64::new(0)),
     });
 
     unsafe {
@@ -729,7 +729,7 @@ pub(crate) fn nt_read_file(
                 if offset >= 0 {
                     let new_pos = host::set_file_position(*host_handle, offset, 0); // FILE_BEGIN
                     if new_pos >= 0 {
-                        position.set(new_pos as u64);
+                        position.store(new_pos as u64, Relaxed);
                     }
                 }
             }
@@ -737,7 +737,7 @@ pub(crate) fn nt_read_file(
             let (ok, bytes_read) = host::read_file(*host_handle, buffer_ptr as *mut u8, length);
 
             if ok {
-                position.set(position.get() + bytes_read as u64);
+                position.store(position.load(Relaxed) + bytes_read as u64, Relaxed);
                 if io_status_ptr != 0 {
                     let iosb = IoStatusBlock {
                         status: NtStatus::STATUS_SUCCESS.0,
@@ -845,7 +845,7 @@ pub(crate) fn nt_write_file(
                 host::write_file(*host_handle, buffer_ptr as *const u8, length);
 
             if ok {
-                position.set(position.get() + bytes_written as u64);
+                position.store(position.load(Relaxed) + bytes_written as u64, Relaxed);
                 if io_status_ptr != 0 {
                     let iosb = IoStatusBlock {
                         status: NtStatus::STATUS_SUCCESS.0,
@@ -958,7 +958,7 @@ pub(crate) fn nt_query_information_file(
                     return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
                 }
                 let info = FilePositionInformation {
-                    current_byte_offset: position.get() as i64,
+                    current_byte_offset: position.load(Relaxed) as i64,
                 };
                 unsafe {
                     core::ptr::write(info_ptr as *mut FilePositionInformation, info);
@@ -1076,7 +1076,7 @@ pub(crate) fn nt_set_information_file(
                 let info = unsafe { core::ptr::read(info_ptr as *const FilePositionInformation) };
                 let new_pos = host::set_file_position(*host_handle, info.current_byte_offset, 0);
                 if new_pos >= 0 {
-                    position.set(new_pos as u64);
+                    position.store(new_pos as u64, Relaxed);
                     write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, size);
                     NtStatus::STATUS_SUCCESS
                 } else {

@@ -14,7 +14,9 @@ pub(crate) mod file;
 pub(crate) mod heap;
 pub(crate) mod k32_handlers;
 pub(crate) mod memory;
+pub(crate) mod sync;
 pub(crate) mod sysinfo;
+pub(crate) mod thread;
 
 /// Helper to read NT syscall arguments from the execution context.
 pub(crate) struct NtSyscallArgs {

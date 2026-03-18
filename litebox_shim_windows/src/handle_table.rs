@@ -6,12 +6,15 @@
 //! Maps Windows HANDLEs (opaque `usize` values) to typed kernel objects.
 //! Handles are allocated as small integers starting from 4 (Windows skips 0,
 //! and uses multiples of 4 for compatibility with tagged pointers).
+//!
+//! The handle table is not internally synchronized. The shim wraps it in a
+//! `Mutex` for multi-threaded access (Phase 3+).
 
 use alloc::collections::BTreeMap;
-use alloc::rc::Rc;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::Cell;
+use std::sync::{Condvar, Mutex};
 
 /// The first allocatable handle value. Windows handles start at 4.
 const FIRST_HANDLE: u32 = 4;
@@ -19,9 +22,9 @@ const FIRST_HANDLE: u32 = 4;
 const HANDLE_STEP: u32 = 4;
 
 /// Shared file position. Duplicated handles share the same host file object
-/// and therefore the same file pointer; this `Rc<Cell<u64>>` ensures both
-/// handles see the same cached position.
-pub type SharedFilePosition = Rc<Cell<u64>>;
+/// and therefore the same file pointer; this `Arc<AtomicU64>` ensures both
+/// handles see the same cached position (thread-safe for Phase 3+).
+pub type SharedFilePosition = Arc<core::sync::atomic::AtomicU64>;
 
 /// An NT kernel object.
 #[derive(Debug)]
@@ -66,6 +69,170 @@ pub enum NtObject {
         /// Description for debugging.
         kind: String,
     },
+    /// An NT event object (NtCreateEvent).
+    Event(Arc<EventObject>),
+    /// An NT semaphore object (NtCreateSemaphore).
+    Semaphore(Arc<SemaphoreObject>),
+    /// An NT keyed event object (NtCreateKeyedEvent).
+    KeyedEvent(Arc<KeyedEventObject>),
+    /// An NT thread object (NtCreateThreadEx).
+    Thread(Arc<ThreadObject>),
+}
+
+/// Internal state for an NT event object.
+///
+/// Events have two modes:
+/// - **Manual-reset**: stays signaled until explicitly reset. NtSetEvent wakes
+///   all waiters.
+/// - **Auto-reset**: automatically resets after waking one waiter.
+#[derive(Debug)]
+pub struct EventObject {
+    /// Mutex-protected signaled state.
+    pub state: Mutex<bool>,
+    /// Condvar for waiters to block on.
+    pub condvar: Condvar,
+    /// True = manual-reset, false = auto-reset.
+    pub manual_reset: bool,
+}
+
+impl EventObject {
+    /// Create a new event.
+    pub fn new(manual_reset: bool, initial_state: bool) -> Self {
+        Self {
+            state: Mutex::new(initial_state),
+            condvar: Condvar::new(),
+            manual_reset,
+        }
+    }
+}
+
+/// Internal state for an NT thread object.
+///
+/// Tracks thread exit status and provides a condvar for WaitForSingleObject
+/// on thread handles.
+#[derive(Debug)]
+pub struct ThreadObject {
+    /// Thread exit code, set when the thread terminates.
+    /// None = still running, Some(code) = exited.
+    pub exit_status: Mutex<Option<i32>>,
+    /// Condvar signaled when the thread exits.
+    pub condvar: Condvar,
+    /// Pseudo thread ID for GetCurrentThreadId / OwningThread in CRITICAL_SECTION.
+    pub thread_id: u32,
+}
+
+impl ThreadObject {
+    /// Create a new thread object (initially running).
+    pub fn new(thread_id: u32) -> Self {
+        Self {
+            exit_status: Mutex::new(None),
+            condvar: Condvar::new(),
+            thread_id,
+        }
+    }
+
+    /// Mark the thread as exited with the given exit code.
+    pub fn set_exited(&self, code: i32) {
+        *self.exit_status.lock().unwrap() = Some(code);
+        self.condvar.notify_all();
+    }
+
+    /// Returns true if the thread has exited.
+    pub fn has_exited(&self) -> bool {
+        self.exit_status.lock().unwrap().is_some()
+    }
+}
+
+/// Internal state for an NT semaphore object.
+#[derive(Debug)]
+pub struct SemaphoreObject {
+    /// Mutex-protected current count.
+    pub state: Mutex<i32>,
+    /// Condvar for waiters to block on.
+    pub condvar: Condvar,
+    /// Maximum count.
+    pub max_count: i32,
+}
+
+impl SemaphoreObject {
+    /// Create a new semaphore.
+    pub fn new(initial_count: i32, max_count: i32) -> Self {
+        Self {
+            state: Mutex::new(initial_count),
+            condvar: Condvar::new(),
+            max_count,
+        }
+    }
+}
+
+/// Internal state for an NT keyed event object.
+///
+/// Keyed events are a low-level futex-like primitive used internally by
+/// SRW locks and condition variables. Each wait/release pair is matched 1:1:
+/// one NtReleaseKeyedEvent wakes exactly one NtWaitForKeyedEvent on the same
+/// key, and vice versa.
+#[derive(Debug)]
+pub struct KeyedEventObject {
+    /// Per-key queue state with per-caller release tokens for 1:1 matching.
+    pub state: Mutex<BTreeMap<usize, KeyedWaiterQueue>>,
+    /// Condvar shared by all waiters/releasers on this keyed event object.
+    pub condvar: Condvar,
+    /// Monotonic counter for unique release token IDs.
+    next_release_id: Mutex<u64>,
+}
+
+/// Per-key queue state inside a keyed event.
+///
+/// Uses a VecDeque of per-releaser tokens so that each blocked releaser
+/// knows exactly when *its* release has been consumed by a waiter.
+#[derive(Debug, Default)]
+pub struct KeyedWaiterQueue {
+    /// Number of threads currently blocked in NtWaitForKeyedEvent on this key.
+    pub waiters: u32,
+    /// FIFO queue of pending release tokens. Each releaser that posts before
+    /// a waiter exists pushes a token and blocks until `consumed` is set.
+    /// Waiters pop from the front to pair 1:1 with releasers in FIFO order.
+    pub pending_releases: alloc::collections::VecDeque<ReleaseToken>,
+    /// Number of releases that have been matched to a waiter but the waiter
+    /// hasn't consumed yet (used when a releaser finds a blocked waiter and
+    /// returns immediately — the waiter side decrements this).
+    pub ready: u32,
+}
+
+/// A per-releaser token in the pending release queue.
+#[derive(Debug)]
+pub struct ReleaseToken {
+    /// Unique ID for this release, used by the releaser to detect when
+    /// *its specific* release has been consumed.
+    pub id: u64,
+    /// Set to true by the waiter that consumes this release.
+    pub consumed: bool,
+}
+
+impl KeyedWaiterQueue {
+    /// Returns true if the queue is empty and can be removed.
+    pub fn is_empty(&self) -> bool {
+        self.waiters == 0 && self.pending_releases.is_empty() && self.ready == 0
+    }
+}
+
+impl KeyedEventObject {
+    /// Create a new keyed event.
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(BTreeMap::new()),
+            condvar: Condvar::new(),
+            next_release_id: Mutex::new(0),
+        }
+    }
+
+    /// Allocate a unique release token ID.
+    pub fn alloc_release_id(&self) -> u64 {
+        let mut id = self.next_release_id.lock().unwrap();
+        let val = *id;
+        *id = val.wrapping_add(1);
+        val
+    }
 }
 
 /// A cached directory/search entry.
@@ -151,7 +318,7 @@ impl HandleTable {
 
     /// Duplicate a handle, creating a new handle table entry pointing to
     /// the same underlying object. For File objects, a new host handle is
-    /// obtained via DuplicateHandle and the position `Rc` is cloned so both
+    /// obtained via DuplicateHandle and the position `Arc` is cloned so both
     /// handles share the same file pointer state. Returns the new handle,
     /// or `None` if the source handle doesn't exist or duplication fails.
     pub fn duplicate(&mut self, source: u32) -> Option<u32> {
@@ -173,7 +340,7 @@ impl HandleTable {
                 NtObject::File {
                     path: path.clone(),
                     host_handle: new_host,
-                    position: Rc::clone(position),
+                    position: Arc::clone(position),
                 }
             }
             NtObject::Directory { path, .. } => NtObject::Directory {
@@ -186,6 +353,10 @@ impl HandleTable {
                 next_index: 0,
             },
             NtObject::Stub { kind } => NtObject::Stub { kind: kind.clone() },
+            NtObject::Event(e) => NtObject::Event(Arc::clone(e)),
+            NtObject::Semaphore(s) => NtObject::Semaphore(Arc::clone(s)),
+            NtObject::KeyedEvent(k) => NtObject::KeyedEvent(Arc::clone(k)),
+            NtObject::Thread(t) => NtObject::Thread(Arc::clone(t)),
         };
         Some(self.insert(new_obj))
     }

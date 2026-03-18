@@ -40,6 +40,9 @@ pub fn build_kernel32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64
     bytes
 }
 
+/// Default preferred base for advapi32.dll stub.
+pub const ADVAPI32_IMAGE_BASE: u64 = 0x0000_7FFE_0002_0000;
+
 /// Generate the ntdll.dll stub bytes with the default base (for tests).
 pub fn build_ntdll() -> Vec<u8> {
     let exports = ntdll_exports();
@@ -50,6 +53,14 @@ pub fn build_ntdll() -> Vec<u8> {
 pub fn build_kernel32() -> Vec<u8> {
     let exports = kernel32_exports();
     build_stub_dll("kernel32.dll", &exports, KERNEL32_IMAGE_BASE)
+}
+
+/// Generate the advapi32.dll stub bytes with a specific load base and callback.
+pub fn build_advapi32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+    let exports = advapi32_exports();
+    let mut bytes = build_stub_dll("advapi32.dll", &exports, image_base);
+    patch_text_header(&mut bytes, syscall_entry, gs_table_ptr);
+    bytes
 }
 
 /// Write the callback pointer and GS table pointer into the raw DLL bytes
@@ -134,11 +145,54 @@ fn ntdll_exports() -> Vec<StubExport> {
             "NtQueryInformationProcess",
             NtSyscallNumber::NtQueryInformationProcess as u32,
         ),
-        // Phase 3: Threading
+        // Phase 3: Threading & sync
         StubExport::syscall_stub("NtDelayExecution", NtSyscallNumber::NtDelayExecution as u32),
         StubExport::syscall_stub(
             "NtSetInformationThread",
             NtSyscallNumber::NtSetInformationThread as u32,
+        ),
+        StubExport::syscall_stub("NtCreateThreadEx", NtSyscallNumber::NtCreateThreadEx as u32),
+        StubExport::syscall_stub(
+            "NtTerminateThread",
+            NtSyscallNumber::NtTerminateThread as u32,
+        ),
+        StubExport::syscall_stub("NtOpenKey", NtSyscallNumber::NtOpenKey as u32),
+        StubExport::syscall_stub("NtQueryValueKey", NtSyscallNumber::NtQueryValueKey as u32),
+        StubExport::syscall_stub("NtCreateEvent", NtSyscallNumber::NtCreateEvent as u32),
+        StubExport::syscall_stub("NtSetEvent", NtSyscallNumber::NtSetEvent as u32),
+        StubExport::syscall_stub("NtResetEvent", NtSyscallNumber::NtResetEvent as u32),
+        StubExport::syscall_stub("NtClearEvent", NtSyscallNumber::NtClearEvent as u32),
+        StubExport::syscall_stub(
+            "NtWaitForSingleObject",
+            NtSyscallNumber::NtWaitForSingleObject as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtWaitForMultipleObjects",
+            NtSyscallNumber::NtWaitForMultipleObjects as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtCreateSemaphore",
+            NtSyscallNumber::NtCreateSemaphore as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtReleaseSemaphore",
+            NtSyscallNumber::NtReleaseSemaphore as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtCreateKeyedEvent",
+            NtSyscallNumber::NtCreateKeyedEvent as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtWaitForKeyedEvent",
+            NtSyscallNumber::NtWaitForKeyedEvent as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtReleaseKeyedEvent",
+            NtSyscallNumber::NtReleaseKeyedEvent as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtDuplicateObject",
+            NtSyscallNumber::NtDuplicateObject as u32,
         ),
         // Rtl* user-mode functions.
         StubExport::return_status("RtlNtStatusToDosError", 0),
@@ -172,7 +226,7 @@ fn kernel32_exports() -> Vec<StubExport> {
         StubExport::set_last_error(),
         // --- Process & Thread identity ---
         StubExport::return_status("GetCurrentProcessId", 1),
-        StubExport::return_status("GetCurrentThreadId", 1),
+        StubExport::syscall_stub("GetCurrentThreadId", K32_GET_CURRENT_THREAD_ID),
         // GetCurrentProcess returns the pseudo-handle -1 (0xFFFFFFFF).
         StubExport::return_status("GetCurrentProcess", -1),
         // GetCurrentThread returns the pseudo-handle -2 (0xFFFFFFFE).
@@ -196,12 +250,17 @@ fn kernel32_exports() -> Vec<StubExport> {
         StubExport::syscall_stub("QueryPerformanceCounter", K32_QUERY_PERF_COUNTER),
         StubExport::syscall_stub("QueryPerformanceFrequency", K32_QUERY_PERF_FREQUENCY),
         // --- Synchronization stubs (single-threaded for Phase 2) ---
-        StubExport::return_status("InitializeCriticalSection", 0),
-        StubExport::return_status("InitializeCriticalSectionEx", 1), // TRUE
-        StubExport::return_status("InitializeCriticalSectionAndSpinCount", 1),
-        StubExport::return_status("EnterCriticalSection", 0),
-        StubExport::return_status("LeaveCriticalSection", 0),
-        StubExport::return_status("DeleteCriticalSection", 0),
+        // --- Synchronization (Phase 3B: real critical sections) ---
+        StubExport::syscall_stub("InitializeCriticalSection", K32_INIT_CRITICAL_SECTION),
+        StubExport::syscall_stub("InitializeCriticalSectionEx", K32_INIT_CRITICAL_SECTION_EX),
+        StubExport::syscall_stub(
+            "InitializeCriticalSectionAndSpinCount",
+            K32_INIT_CRITICAL_SECTION_AND_SPIN_COUNT,
+        ),
+        StubExport::syscall_stub("EnterCriticalSection", K32_ENTER_CRITICAL_SECTION),
+        StubExport::syscall_stub("TryEnterCriticalSection", K32_TRY_ENTER_CRITICAL_SECTION),
+        StubExport::syscall_stub("LeaveCriticalSection", K32_LEAVE_CRITICAL_SECTION),
+        StubExport::syscall_stub("DeleteCriticalSection", K32_DELETE_CRITICAL_SECTION),
         StubExport::return_status("InitializeSListHead", 0),
         // --- TLS (Phase 2: simple stubs; Phase 3: real impl) ---
         StubExport::syscall_stub("TlsAlloc", K32_TLS_ALLOC),
@@ -279,11 +338,11 @@ fn kernel32_exports() -> Vec<StubExport> {
         StubExport::syscall_stub("GetTempPathW", K32_GET_TEMP_PATH_W),
         StubExport::syscall_stub("GetCurrentDirectoryW", K32_GET_CURRENT_DIRECTORY_W),
         StubExport::syscall_stub("SetCurrentDirectoryW", K32_SET_CURRENT_DIRECTORY_W),
-        // --- Waits (stub for Phase 2, real impl in Phase 3) ---
-        StubExport::return_status("WaitForSingleObject", 0), // WAIT_OBJECT_0
-        StubExport::return_status("WaitForSingleObjectEx", 0),
-        StubExport::return_status("Sleep", 0),
-        StubExport::return_status("SleepEx", 0),
+        // --- Waits ---
+        StubExport::syscall_stub("WaitForSingleObject", K32_WAIT_FOR_SINGLE_OBJECT),
+        StubExport::syscall_stub("WaitForSingleObjectEx", K32_WAIT_FOR_SINGLE_OBJECT_EX),
+        StubExport::syscall_stub("Sleep", K32_SLEEP),
+        StubExport::syscall_stub("SleepEx", K32_SLEEP_EX),
         // --- Handle duplication ---
         StubExport::syscall_stub("DuplicateHandle", K32_DUPLICATE_HANDLE),
         // --- SetFileInformationByHandle ---
@@ -298,12 +357,40 @@ fn kernel32_exports() -> Vec<StubExport> {
         StubExport::syscall_stub("FindFirstFileExW", K32_FIND_FIRST_FILE_EX_W),
         StubExport::syscall_stub("FindNextFileW", K32_FIND_NEXT_FILE_W),
         StubExport::syscall_stub("FindClose", K32_FIND_CLOSE),
+        // --- Registry (api-ms-win-core-registry-l1-1 maps here) ---
+        StubExport::syscall_stub("RegOpenKeyExW", K32_REG_OPEN_KEY_EX_W),
+        StubExport::syscall_stub("RegQueryValueExW", K32_REG_QUERY_VALUE_EX_W),
+        StubExport::syscall_stub("RegCloseKey", K32_REG_CLOSE_KEY),
+        StubExport::syscall_stub("RegOpenKeyExA", K32_REG_OPEN_KEY_EX_W),
+        StubExport::syscall_stub("RegQueryValueExA", K32_REG_QUERY_VALUE_EX_W),
         // --- SEH / unwinding (kernel32 re-exports from ntdll) ---
         StubExport::syscall_stub("RtlCaptureContext", K32_RTL_CAPTURE_CONTEXT),
         StubExport::syscall_stub("RtlLookupFunctionEntry", K32_RTL_LOOKUP_FUNCTION_ENTRY),
         StubExport::syscall_stub("RtlVirtualUnwind", K32_RTL_VIRTUAL_UNWIND),
         StubExport::syscall_stub("RtlUnwindEx", K32_RTL_UNWIND_EX),
         StubExport::syscall_stub("RtlPcToFileHeader", K32_RTL_PC_TO_FILE_HEADER),
+    ]
+}
+
+/// advapi32.dll exports — registry and security stubs.
+///
+/// Node.js / UCRT may import directly from advapi32. The registry functions
+/// use the same K32 pseudo-syscall numbers as kernel32 (since the API-set
+/// mapper routes `api-ms-win-core-registry-l1-1` to kernel32).
+fn advapi32_exports() -> Vec<StubExport> {
+    vec![
+        // --- Registry ---
+        StubExport::syscall_stub("RegOpenKeyExW", K32_REG_OPEN_KEY_EX_W),
+        StubExport::syscall_stub("RegQueryValueExW", K32_REG_QUERY_VALUE_EX_W),
+        StubExport::syscall_stub("RegCloseKey", K32_REG_CLOSE_KEY),
+        // --- Security stubs ---
+        // OpenProcessToken: returns FALSE, LastError = ERROR_NO_TOKEN (1008).
+        StubExport::return_status_with_last_error("OpenProcessToken", 0, 1008),
+        // GetTokenInformation: returns FALSE, LastError = ERROR_NO_TOKEN (1008).
+        StubExport::return_status_with_last_error("GetTokenInformation", 0, 1008),
+        // RegOpenKeyExA (ANSI variant): same handler.
+        StubExport::syscall_stub("RegOpenKeyExA", K32_REG_OPEN_KEY_EX_W),
+        StubExport::syscall_stub("RegQueryValueExA", K32_REG_QUERY_VALUE_EX_W),
     ]
 }
 
@@ -402,6 +489,25 @@ pub const K32_RTL_UNWIND_EX: u32 = 0x10F3;
 pub const K32_RTL_PC_TO_FILE_HEADER: u32 = 0x10F4;
 pub const K32_RAISE_EXCEPTION: u32 = 0x10F5;
 pub const K32_UNHANDLED_EXCEPTION_FILTER: u32 = 0x10F6;
+// Phase 3B: Sleep
+pub const K32_SLEEP: u32 = 0x1100;
+pub const K32_SLEEP_EX: u32 = 0x1101;
+// Phase 3B: Critical sections
+pub const K32_INIT_CRITICAL_SECTION: u32 = 0x1110;
+pub const K32_INIT_CRITICAL_SECTION_EX: u32 = 0x1111;
+pub const K32_INIT_CRITICAL_SECTION_AND_SPIN_COUNT: u32 = 0x1112;
+pub const K32_ENTER_CRITICAL_SECTION: u32 = 0x1113;
+pub const K32_LEAVE_CRITICAL_SECTION: u32 = 0x1114;
+pub const K32_DELETE_CRITICAL_SECTION: u32 = 0x1115;
+pub const K32_TRY_ENTER_CRITICAL_SECTION: u32 = 0x1116;
+// Phase 3B: Wait APIs
+pub const K32_WAIT_FOR_SINGLE_OBJECT: u32 = 0x1120;
+pub const K32_WAIT_FOR_SINGLE_OBJECT_EX: u32 = 0x1121;
+pub const K32_GET_CURRENT_THREAD_ID: u32 = 0x1130;
+
+pub const K32_REG_OPEN_KEY_EX_W: u32 = 0x1140;
+pub const K32_REG_QUERY_VALUE_EX_W: u32 = 0x1141;
+pub const K32_REG_CLOSE_KEY: u32 = 0x1142;
 
 #[cfg(test)]
 mod tests {

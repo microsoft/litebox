@@ -58,6 +58,7 @@ const GUEST_STACK_SIZE: usize = 0x0010_0000;
 /// 1 TiB partition, leaving plenty of space.
 const NTDLL_LOAD_BASE: usize = 0xF0_0000_0000;
 const KERNEL32_LOAD_BASE: usize = 0xF0_0001_0000;
+const ADVAPI32_LOAD_BASE: usize = 0xF0_0002_0000;
 
 /// PEB/TEB region base — placed just below the stub DLLs.
 const PEB_TEB_BASE: usize = 0xEF_FFFF_0000;
@@ -109,7 +110,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     // Create the process state that will be shared with the shim.
     // The runner uses pm via process_state.pm for all mapping operations.
-    let process_state = litebox_shim_windows::NtProcessState::new(pm);
+    let process_state = alloc::sync::Arc::new(litebox_shim_windows::NtProcessState::new(pm));
 
     // Build and map stub DLLs.
     // Use the actual load base so preferred == actual → no rebase → .text stays RX.
@@ -119,11 +120,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         stub_dlls::build_ntdll_for(NTDLL_LOAD_BASE as u64, syscall_entry, gs_table_ptr);
     let kernel32_bytes =
         stub_dlls::build_kernel32_for(KERNEL32_LOAD_BASE as u64, syscall_entry, gs_table_ptr);
+    let advapi32_bytes =
+        stub_dlls::build_advapi32_for(ADVAPI32_LOAD_BASE as u64, syscall_entry, gs_table_ptr);
 
     let ntdll_parsed = PeParsedFile::parse(&ntdll_bytes)
         .map_err(|e| anyhow!("Failed to parse ntdll stub: {e}"))?;
     let kernel32_parsed = PeParsedFile::parse(&kernel32_bytes)
         .map_err(|e| anyhow!("Failed to parse kernel32 stub: {e}"))?;
+    let advapi32_parsed = PeParsedFile::parse(&advapi32_bytes)
+        .map_err(|e| anyhow!("Failed to parse advapi32 stub: {e}"))?;
 
     let mut mapper = PageManagerMapper {
         pm: &process_state.pm,
@@ -140,10 +145,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     )
     .map_err(|e| anyhow!("Failed to load kernel32 stub: {e}"))?;
 
+    let advapi32_info = load_pe(
+        &advapi32_parsed,
+        &advapi32_bytes,
+        ADVAPI32_LOAD_BASE,
+        &mut mapper,
+    )
+    .map_err(|e| anyhow!("Failed to load advapi32 stub: {e}"))?;
+
     if cfg!(debug_assertions) {
         eprintln!(
-            "ntdll loaded at 0x{:X}, kernel32 at 0x{:X}",
-            ntdll_info.image_base, kernel32_info.image_base
+            "ntdll loaded at 0x{:X}, kernel32 at 0x{:X}, advapi32 at 0x{:X}",
+            ntdll_info.image_base, kernel32_info.image_base, advapi32_info.image_base
         );
     }
 
@@ -190,6 +203,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             base_address: kernel32_info.image_base,
             pe_data: &kernel32_bytes,
             parsed: &kernel32_parsed,
+        },
+        LoadedModule {
+            name: "advapi32.dll",
+            base_address: advapi32_info.image_base,
+            pe_data: &advapi32_bytes,
+            parsed: &advapi32_parsed,
         },
     ];
 
@@ -238,7 +257,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     // Synthesize PEB/TEB.
-    let mut shim = litebox_shim_windows::NtShimEntrypoints::new(&process_state);
+    let mut shim =
+        litebox_shim_windows::NtShimEntrypoints::new(alloc::sync::Arc::clone(&process_state));
     let (stdin_h, stdout_h, stderr_h) = shim.stdio_handles();
 
     let peb_teb_layout = PebTebLayout::at_base(PEB_TEB_BASE);
@@ -330,6 +350,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 path: String::from("C:\\Windows\\System32\\kernel32.dll"),
                 base_address: KERNEL32_LOAD_BASE,
                 image_size: kernel32_info.image_size,
+            },
+            litebox_shim_windows::ModuleBase {
+                name: String::from("advapi32.dll"),
+                path: String::from("C:\\Windows\\System32\\advapi32.dll"),
+                base_address: ADVAPI32_LOAD_BASE,
+                image_size: advapi32_info.image_size,
             },
         ],
         guest_va_start,

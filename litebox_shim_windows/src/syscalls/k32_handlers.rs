@@ -7,6 +7,8 @@
 //! number range. They forward to the appropriate NT handlers or provide
 //! direct implementations.
 
+use core::sync::atomic::Ordering::Relaxed;
+
 use litebox::mm::PageManager;
 use litebox::mm::linux::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::RawConstPointer as _;
@@ -839,7 +841,7 @@ pub(crate) fn k32_get_environment_strings_w(
     ctx: &mut super::super::ExecutionContext,
     env_vars: &alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
     ps: &super::super::NtProcessState,
-    pool: &core::cell::RefCell<alloc::vec::Vec<(usize, usize, bool)>>,
+    pool: &std::sync::Mutex<alloc::vec::Vec<(usize, usize, bool)>>,
 ) -> NtStatus {
     use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
     use litebox::platform::RawConstPointer as _;
@@ -858,7 +860,7 @@ pub(crate) fn k32_get_environment_strings_w(
     let aligned_size = (byte_len + 4095) & !4095;
 
     // Search the pool for a free block large enough to reuse.
-    let mut pool_ref = pool.borrow_mut();
+    let mut pool_ref = pool.lock().unwrap();
     if let Some(idx) = pool_ref
         .iter()
         .position(|(_, sz, in_use)| !in_use && byte_len <= *sz)
@@ -890,7 +892,7 @@ pub(crate) fn k32_get_environment_strings_w(
                         byte_len,
                     );
                 }
-                pool.borrow_mut().push((va, aligned_size, true)); // in-use
+                pool.lock().unwrap().push((va, aligned_size, true)); // in-use
                 ctx.regs.rax = va;
             }
             Err(_) => {
@@ -910,13 +912,13 @@ pub(crate) fn k32_get_environment_strings_w(
 pub(crate) fn k32_free_environment_strings_w(
     ctx: &mut super::super::ExecutionContext,
     _ps: &super::super::NtProcessState,
-    pool: &core::cell::RefCell<alloc::vec::Vec<(usize, usize, bool)>>,
+    pool: &std::sync::Mutex<alloc::vec::Vec<(usize, usize, bool)>>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let block_va = args.arg0;
 
     if block_va != 0 {
-        let mut pool_ref = pool.borrow_mut();
+        let mut pool_ref = pool.lock().unwrap();
         if let Some(entry) = pool_ref.iter_mut().find(|(va, _, _)| *va == block_va) {
             entry.2 = false; // mark as free
         }
@@ -1689,7 +1691,7 @@ pub(crate) fn k32_create_file_w(
     let nt_handle = handles.insert(crate::handle_table::NtObject::File {
         path: resolved,
         host_handle,
-        position: alloc::rc::Rc::new(core::cell::Cell::new(0)),
+        position: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
     });
 
     ctx.regs.rax = nt_handle as usize;
@@ -1717,7 +1719,7 @@ pub(crate) fn k32_read_file(
             let (ok, read) =
                 super::file::host::read_file(*host_handle, buffer as *mut u8, bytes_to_read);
             if ok {
-                position.set(position.get() + read as u64);
+                position.store(position.load(Relaxed) + read as u64, Relaxed);
                 if bytes_read_ptr != 0 {
                     unsafe { core::ptr::write(bytes_read_ptr as *mut u32, read) }
                 }
@@ -1786,7 +1788,7 @@ pub(crate) fn k32_write_file(
             let (ok, written) =
                 super::file::host::write_file(*host_handle, buffer as *const u8, bytes_to_write);
             if ok {
-                position.set(position.get() + written as u64);
+                position.store(position.load(Relaxed) + written as u64, Relaxed);
                 if bytes_written_ptr != 0 {
                     unsafe { core::ptr::write(bytes_written_ptr as *mut u32, written) }
                 }
@@ -1891,7 +1893,7 @@ pub(crate) fn k32_set_file_pointer_ex(
         }) => {
             let new_pos = super::file::host::set_file_position(*host_handle, distance, move_method);
             if new_pos >= 0 {
-                position.set(new_pos as u64);
+                position.store(new_pos as u64, Relaxed);
                 if new_pos_ptr != 0 {
                     unsafe { core::ptr::write(new_pos_ptr as *mut i64, new_pos) }
                 }
@@ -3433,5 +3435,291 @@ pub(crate) fn k32_unhandled_exception_filter(ctx: &mut super::super::ExecutionCo
 
     // EXCEPTION_CONTINUE_SEARCH = 0
     ctx.regs.rax = 0;
+    NtStatus::STATUS_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3B: Sleep / SleepEx
+// ---------------------------------------------------------------------------
+
+/// Sleep(DWORD dwMilliseconds)
+///
+/// Suspends the current thread for the specified number of milliseconds.
+pub(crate) fn k32_sleep(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let ms = args.arg0 as u32;
+
+    if ms == 0 {
+        std::thread::yield_now();
+    } else if ms == 0xFFFF_FFFF {
+        // INFINITE — sleep forever (shouldn't happen in practice).
+        loop {
+            std::thread::sleep(core::time::Duration::from_secs(86400));
+        }
+    } else {
+        std::thread::sleep(core::time::Duration::from_millis(ms as u64));
+    }
+
+    NtStatus::STATUS_SUCCESS
+}
+
+/// SleepEx(DWORD dwMilliseconds, BOOL bAlertable)
+///
+/// Same as Sleep but with alertable wait. We ignore the alertable flag.
+pub(crate) fn k32_sleep_ex(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+    // SleepEx returns 0 if the sleep completed, WAIT_IO_COMPLETION (0xC0) if
+    // an APC was dispatched. We never dispatch APCs, so always return 0.
+    k32_sleep(ctx);
+    ctx.regs.rax = 0;
+    NtStatus::STATUS_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3B: Critical Sections
+// ---------------------------------------------------------------------------
+//
+// Windows CRITICAL_SECTION layout (40 bytes on x64):
+//   +0x00  PRTL_CRITICAL_SECTION_DEBUG DebugInfo
+//   +0x08  LONG LockCount
+//   +0x0C  LONG RecursionCount
+//   +0x10  HANDLE OwningThread
+//   +0x18  HANDLE LockSemaphore
+//   +0x20  ULONG_PTR SpinCount
+//
+// We use OwningThread as a simple thread ID. In single-threaded mode this
+// always matches. For multi-threaded, we use a shim-side thread ID.
+// LockSemaphore is unused (we don't need a real event for contention yet).
+//
+// LockCount semantics:
+//   -1 = unlocked (available)
+//   0  = locked, no waiters
+//   >0 = locked, LockCount waiters
+
+const CS_DEBUG_INFO: usize = 0x00;
+const CS_LOCK_COUNT: usize = 0x08;
+const CS_RECURSION_COUNT: usize = 0x0C;
+const CS_OWNING_THREAD: usize = 0x10;
+const CS_LOCK_SEMAPHORE: usize = 0x18;
+const CS_SPIN_COUNT: usize = 0x20;
+
+/// InitializeCriticalSection(LPCRITICAL_SECTION lpCriticalSection)
+pub(crate) fn k32_init_critical_section(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let cs = args.arg0;
+    if cs == 0 {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+    init_cs(cs, 0);
+    NtStatus::STATUS_SUCCESS
+}
+
+/// InitializeCriticalSectionEx(LPCRITICAL_SECTION, DWORD SpinCount, DWORD Flags)
+pub(crate) fn k32_init_critical_section_ex(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let cs = args.arg0;
+    let spin_count = args.arg1 as u32;
+    // arg2 = flags (CRITICAL_SECTION_NO_DEBUG_INFO etc, ignored)
+    if cs == 0 {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+    init_cs(cs, spin_count as usize);
+    ctx.regs.rax = 1; // TRUE
+    NtStatus::STATUS_SUCCESS
+}
+
+/// InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION, DWORD SpinCount)
+pub(crate) fn k32_init_critical_section_and_spin_count(
+    ctx: &mut super::super::ExecutionContext,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let cs = args.arg0;
+    let spin_count = args.arg1 as u32;
+    if cs == 0 {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+    init_cs(cs, spin_count as usize);
+    ctx.regs.rax = 1; // TRUE
+    NtStatus::STATUS_SUCCESS
+}
+
+fn init_cs(cs: usize, spin_count: usize) {
+    unsafe {
+        core::ptr::write((cs + CS_DEBUG_INFO) as *mut usize, 0);
+        core::ptr::write((cs + CS_LOCK_COUNT) as *mut i32, -1); // unlocked
+        core::ptr::write((cs + CS_RECURSION_COUNT) as *mut i32, 0);
+        core::ptr::write((cs + CS_OWNING_THREAD) as *mut usize, 0);
+        core::ptr::write((cs + CS_LOCK_SEMAPHORE) as *mut usize, 0);
+        core::ptr::write((cs + CS_SPIN_COUNT) as *mut usize, spin_count);
+    }
+}
+
+/// EnterCriticalSection(LPCRITICAL_SECTION lpCriticalSection)
+///
+/// Acquires the critical section using atomic CAS on LockCount.
+/// Supports recursion by the owning thread. Spins then yields on contention.
+pub(crate) fn k32_enter_critical_section(
+    ctx: &mut super::super::ExecutionContext,
+    thread_id: u32,
+) -> NtStatus {
+    use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let cs = args.arg0;
+    if cs == 0 {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+
+    let tid = thread_id as usize;
+
+    unsafe {
+        // Safety: CS_LOCK_COUNT (offset 0x08) and CS_OWNING_THREAD (offset 0x10)
+        // are 8-byte aligned within the CRITICAL_SECTION struct, satisfying
+        // AtomicI32 (4-byte) and AtomicUsize (8-byte) alignment requirements.
+        let lock_count = &*((cs + CS_LOCK_COUNT) as *const AtomicI32);
+        let owner = &*((cs + CS_OWNING_THREAD) as *const AtomicUsize);
+
+        if owner.load(Ordering::Acquire) == tid {
+            // Recursive acquisition — bump the recursion count.
+            let rec = core::ptr::read((cs + CS_RECURSION_COUNT) as *const i32);
+            core::ptr::write((cs + CS_RECURSION_COUNT) as *mut i32, rec + 1);
+            lock_count.fetch_add(1, Ordering::Relaxed);
+            return NtStatus::STATUS_SUCCESS;
+        }
+
+        let spin_count = core::ptr::read((cs + CS_SPIN_COUNT) as *const usize);
+
+        // Spin phase — try CAS on each iteration.
+        for _ in 0..spin_count {
+            if lock_count
+                .compare_exchange_weak(-1, 0, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                core::ptr::write((cs + CS_RECURSION_COUNT) as *mut i32, 1);
+                owner.store(tid, Ordering::Release);
+                return NtStatus::STATUS_SUCCESS;
+            }
+            core::hint::spin_loop();
+        }
+
+        // Block phase — CAS retry with yield.
+        loop {
+            match lock_count.compare_exchange_weak(-1, 0, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => {
+                    core::ptr::write((cs + CS_RECURSION_COUNT) as *mut i32, 1);
+                    owner.store(tid, Ordering::Release);
+                    return NtStatus::STATUS_SUCCESS;
+                }
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+    }
+}
+
+/// TryEnterCriticalSection(LPCRITICAL_SECTION) -> BOOL
+///
+/// Attempts to acquire without blocking using atomic CAS. Returns TRUE (1) if
+/// acquired.
+pub(crate) fn k32_try_enter_critical_section(
+    ctx: &mut super::super::ExecutionContext,
+    thread_id: u32,
+) -> NtStatus {
+    use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let cs = args.arg0;
+    if cs == 0 {
+        ctx.regs.rax = 0;
+        return NtStatus::STATUS_SUCCESS;
+    }
+
+    let tid = thread_id as usize;
+
+    unsafe {
+        let lock_count = &*((cs + CS_LOCK_COUNT) as *const AtomicI32);
+        let owner = &*((cs + CS_OWNING_THREAD) as *const AtomicUsize);
+
+        if owner.load(Ordering::Acquire) == tid {
+            // Recursive — always succeeds.
+            let rec = core::ptr::read((cs + CS_RECURSION_COUNT) as *const i32);
+            core::ptr::write((cs + CS_RECURSION_COUNT) as *mut i32, rec + 1);
+            lock_count.fetch_add(1, Ordering::Relaxed);
+            ctx.regs.rax = 1; // TRUE
+            return NtStatus::STATUS_SUCCESS;
+        }
+
+        if lock_count
+            .compare_exchange(-1, 0, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            core::ptr::write((cs + CS_RECURSION_COUNT) as *mut i32, 1);
+            owner.store(tid, Ordering::Release);
+            ctx.regs.rax = 1; // TRUE
+        } else {
+            ctx.regs.rax = 0; // FALSE
+        }
+    }
+
+    NtStatus::STATUS_SUCCESS
+}
+
+/// LeaveCriticalSection(LPCRITICAL_SECTION lpCriticalSection)
+///
+/// Releases the critical section. Validates that the caller owns the lock
+/// to prevent cross-thread corruption.
+pub(crate) fn k32_leave_critical_section(
+    ctx: &mut super::super::ExecutionContext,
+    thread_id: u32,
+) -> NtStatus {
+    use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let cs = args.arg0;
+    if cs == 0 {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+
+    let tid = thread_id as usize;
+
+    unsafe {
+        let lock_count = &*((cs + CS_LOCK_COUNT) as *const AtomicI32);
+        let owner = &*((cs + CS_OWNING_THREAD) as *const AtomicUsize);
+
+        // Verify the caller owns this CS.
+        if owner.load(Ordering::Acquire) != tid {
+            return NtStatus::STATUS_SUCCESS;
+        }
+
+        let rec = core::ptr::read((cs + CS_RECURSION_COUNT) as *const i32);
+        if rec > 1 {
+            // Still recursively held — decrement.
+            core::ptr::write((cs + CS_RECURSION_COUNT) as *mut i32, rec - 1);
+            lock_count.fetch_sub(1, Ordering::Relaxed);
+        } else {
+            // Final release — clear ownership then unlock with atomic store.
+            core::ptr::write((cs + CS_RECURSION_COUNT) as *mut i32, 0);
+            owner.store(0, Ordering::Release);
+            lock_count.store(-1, Ordering::Release);
+        }
+    }
+
+    NtStatus::STATUS_SUCCESS
+}
+
+/// DeleteCriticalSection(LPCRITICAL_SECTION lpCriticalSection)
+pub(crate) fn k32_delete_critical_section(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+    use core::sync::atomic::{AtomicI32, Ordering};
+
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let cs = args.arg0;
+    if cs == 0 {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+
+    unsafe {
+        core::ptr::write_bytes(cs as *mut u8, 0, 0x28);
+        let lock_count = &*((cs + CS_LOCK_COUNT) as *const AtomicI32);
+        lock_count.store(-1, Ordering::Release);
+    }
+
     NtStatus::STATUS_SUCCESS
 }

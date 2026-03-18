@@ -98,6 +98,10 @@ pub enum NtSyscallNumber {
     NtDuplicateObject = 0x0039,
     NtQueryObject = 0x003A,
     NtDelayExecution = 0x003B,
+    NtCreateKeyedEvent = 0x003C,
+    NtWaitForKeyedEvent = 0x003D,
+    NtReleaseKeyedEvent = 0x003E,
+    NtClearEvent = 0x003F,
 
     // Phase 4: Networking & IOCP
     NtDeviceIoControlFile = 0x0040,
@@ -154,6 +158,10 @@ impl NtSyscallNumber {
             0x0039 => Some(Self::NtDuplicateObject),
             0x003A => Some(Self::NtQueryObject),
             0x003B => Some(Self::NtDelayExecution),
+            0x003C => Some(Self::NtCreateKeyedEvent),
+            0x003D => Some(Self::NtWaitForKeyedEvent),
+            0x003E => Some(Self::NtReleaseKeyedEvent),
+            0x003F => Some(Self::NtClearEvent),
 
             0x0040 => Some(Self::NtDeviceIoControlFile),
             0x0041 => Some(Self::NtCreateIoCompletion),

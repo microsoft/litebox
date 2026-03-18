@@ -65,6 +65,7 @@ impl NtStatus {
     pub const STATUS_NOT_A_DIRECTORY: Self = Self(0xC000_0103u32 as i32);
     pub const STATUS_NO_MORE_FILES: Self = Self(0x8000_0006u32 as i32);
     pub const STATUS_TIMEOUT: Self = Self(0x0000_0102);
+    pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: Self = Self(0xC000_004Bu32 as i32);
 
     // ---- Exception status codes (used as exit codes on unhandled exceptions) ----
 

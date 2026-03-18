@@ -310,17 +310,9 @@ pub(crate) fn nt_delay_execution(ctx: &mut super::super::ExecutionContext) -> Nt
     };
 
     if sleep_us > 0 {
-        // Use platform hint_spin_loop as a crude sleep for very short delays,
-        // or the real sleep path. For now, a simple busy-wait for short sleeps
-        // and yield for zero-length delays.
-        // TODO: Use a proper platform sleep primitive in Phase 3.
-        let sleep_ns = sleep_us * 1000;
-        let start = perf_counter_now();
-        while (perf_counter_now() - start) < sleep_ns {
-            core::hint::spin_loop();
-        }
+        std::thread::sleep(core::time::Duration::from_micros(sleep_us));
     } else {
-        core::hint::spin_loop();
+        std::thread::yield_now();
     }
 
     NtStatus::STATUS_SUCCESS

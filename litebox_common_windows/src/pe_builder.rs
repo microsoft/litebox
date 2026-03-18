@@ -143,6 +143,29 @@ impl StubExport {
             vec![0x65, 0x89, 0x0C, 0x25, 0x68, 0x00, 0x00, 0x00, 0xC3],
         )
     }
+
+    /// Return a fixed value in EAX and set TEB.LastErrorValue to a specific
+    /// error code. Useful for stubs that return FALSE and need a meaningful
+    /// GetLastError() value for the caller's fallback logic.
+    ///
+    /// Generated code:
+    /// ```text
+    /// mov dword gs:[0x68], <error>   ; set LastError
+    /// mov eax, <retval>              ; return value
+    /// ret
+    /// ```
+    pub fn return_status_with_last_error(name: &str, retval: i32, last_error: u32) -> Self {
+        let mut code = Vec::with_capacity(18);
+        // mov dword ptr gs:[0x68], imm32
+        code.extend_from_slice(&[0x65, 0xC7, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00]);
+        code.extend_from_slice(&last_error.to_le_bytes());
+        // mov eax, imm32
+        code.push(0xB8);
+        code.extend_from_slice(&(retval as u32).to_le_bytes());
+        // ret
+        code.push(0xC3);
+        Self::raw(name, code)
+    }
 }
 
 /// Alignment helpers.
