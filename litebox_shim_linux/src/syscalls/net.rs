@@ -1427,7 +1427,24 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 Ok(total_sent)
             },
-            |_file| Err(Errno::ENOTSOCK),
+            |file| {
+                let unix_addr = sock_addr
+                    .clone()
+                    .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
+                    .transpose()?;
+                let mut total_sent = 0;
+                for iov in &iovs {
+                    if iov.iov_len == 0 {
+                        continue;
+                    }
+                    let buf = iov
+                        .iov_base
+                        .to_owned_slice(iov.iov_len)
+                        .ok_or(Errno::EFAULT)?;
+                    total_sent += file.sendto(self, &buf, flags, unix_addr.clone())?;
+                }
+                Ok(total_sent)
+            },
         )
     }
 
