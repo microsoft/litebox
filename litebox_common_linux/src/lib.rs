@@ -1674,7 +1674,7 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     /// number of bytes of ancillary data
     pub msg_controllen: usize,
     /// flags on received message
-    pub msg_flags: SendFlags,
+    pub msg_flags: ReceiveFlags,
     /// Explicit trailing padding to match the 4-byte gap after `msg_flags` in
     /// Linux's naturally-aligned `struct user_msghdr` on 64-bit (total size 56).
     #[cfg(target_pointer_width = "64")]
@@ -1910,6 +1910,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         flags: ReceiveFlags,
         addr: Option<Platform::RawMutPointer<u8>>,
         addrlen: Platform::RawMutPointer<u32>,
+    },
+    Recvmsg {
+        sockfd: i32,
+        msg: Platform::RawMutPointer<UserMsgHdr<Platform>>,
+        flags: ReceiveFlags,
     },
     Bind {
         sockfd: i32,
@@ -2352,6 +2357,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::sendto => sys_req!(Sendto { sockfd, buf:*, len, flags, addr:*, addrlen }),
             Sysno::sendmsg => sys_req!(Sendmsg { sockfd, msg:*, flags }),
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
+            Sysno::recvmsg => sys_req!(Recvmsg { sockfd, msg:*, flags }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
             Sysno::setsockopt => sys_req!(Setsockopt {

@@ -1533,6 +1533,97 @@ impl<FS: ShimFS> Task<FS> {
         Ok(size)
     }
 
+    /// Handle syscall `recvmsg`
+    pub(crate) fn sys_recvmsg(
+        &self,
+        fd: i32,
+        msg_ptr: MutPtr<litebox_common_linux::UserMsgHdr<Platform>>,
+        flags: ReceiveFlags,
+    ) -> Result<usize, Errno> {
+        const MAX_LEN: usize = 4096;
+
+        let Ok(sockfd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let msg =
+            ConstPtr::<litebox_common_linux::UserMsgHdr<Platform>>::from_usize(msg_ptr.as_usize())
+                .read_at_offset(0)
+                .ok_or(Errno::EFAULT)?;
+
+        // Copy fields out of the packed struct to avoid unaligned references.
+        let msg_name = msg.msg_name;
+        let msg_iov = msg.msg_iov;
+        let msg_iovlen = msg.msg_iovlen;
+        let msg_controllen = msg.msg_controllen;
+
+        if msg_controllen != 0 {
+            unimplemented!("ancillary data is not supported");
+        }
+        if msg_iovlen == 0 || msg_iovlen > 1024 {
+            return Err(Errno::EINVAL);
+        }
+
+        let iovs = msg_iov.to_owned_slice(msg_iovlen).ok_or(Errno::EFAULT)?;
+
+        // Receive into the first non-empty iov buffer.
+        let want_source = msg_name.as_usize() != 0;
+        let mut source_addr = None;
+        let mut total_received = 0usize;
+        let mut ret_flags = ReceiveFlags::empty();
+
+        for iov in &iovs {
+            if iov.iov_len == 0 {
+                continue;
+            }
+            let recv_len = iov.iov_len.min(MAX_LEN);
+            let mut buffer = [0u8; MAX_LEN];
+            let recv_buf = &mut buffer[..recv_len];
+            let size = self.do_recvfrom(
+                sockfd,
+                recv_buf,
+                flags,
+                if want_source && source_addr.is_none() {
+                    Some(&mut source_addr)
+                } else {
+                    None
+                },
+            )?;
+            let copy_len = size.min(iov.iov_len);
+            iov.iov_base
+                .copy_from_slice(0, &recv_buf[..copy_len.min(recv_len)])
+                .ok_or(Errno::EFAULT)?;
+            total_received += size;
+            // Set MSG_TRUNC if the received datagram was larger than the buffer.
+            if size > iov.iov_len {
+                ret_flags |= ReceiveFlags::TRUNC;
+            }
+            // Unlike sendmsg which sends all iovecs, recvmsg fills until one
+            // recv returns — a single datagram/message is received.
+            break;
+        }
+
+        // Write back source address if requested.
+        if let Some(src_addr) = source_addr {
+            let addr_ptr = MutPtr::<u8>::from_usize(msg_name.as_usize());
+            let addrlen_ptr = MutPtr::<u32>::from_usize(
+                msg_ptr.as_usize()
+                    + core::mem::offset_of!(
+                        litebox_common_linux::UserMsgHdr<Platform>,
+                        msg_namelen
+                    ),
+            );
+            write_sockaddr_to_user(src_addr, addr_ptr, addrlen_ptr)?;
+        }
+
+        // Write back msg_flags with any status flags (e.g. MSG_TRUNC).
+        let flags_offset =
+            core::mem::offset_of!(litebox_common_linux::UserMsgHdr<Platform>, msg_flags);
+        let flags_ptr = MutPtr::<ReceiveFlags>::from_usize(msg_ptr.as_usize() + flags_offset);
+        let _ = flags_ptr.write_at_offset(0, ret_flags);
+
+        Ok(total_received)
+    }
+
     pub(crate) fn sys_setsockopt(
         &self,
         sockfd: i32,
