@@ -207,6 +207,35 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         Err(errors::ReadLinkError::NotSupported)
     }
 
+    /// Create a symbolic link.
+    ///
+    /// Creates a symlink at `linkpath` pointing to `target`. The default
+    /// implementation returns
+    /// [`SymlinkError::NotSupported`](errors::SymlinkError::NotSupported),
+    /// since most in-memory filesystems don't support symlinks.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn symlink(
+        &self,
+        target: impl path::Arg,
+        linkpath: impl path::Arg,
+    ) -> Result<(), errors::SymlinkError> {
+        Err(errors::SymlinkError::NotSupported)
+    }
+
+    /// Create a hard link.
+    ///
+    /// Creates a new directory entry `newpath` that refers to the same inode
+    /// as `oldpath`. The default implementation returns
+    /// [`LinkError::NotSupported`](errors::LinkError::NotSupported).
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn link(
+        &self,
+        oldpath: impl path::Arg,
+        newpath: impl path::Arg,
+    ) -> Result<(), errors::LinkError> {
+        Err(errors::LinkError::NotSupported)
+    }
+
     // -- fd-relative (`*_at`) methods --
     //
     // These resolve a relative path starting from a directory file descriptor.
@@ -249,6 +278,14 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         new_dirfd: &TypedFd<Self>,
         new_rel: impl path::Arg,
     ) -> Result<(), RenameError>;
+
+    /// Create a directory relative to a directory fd.
+    fn mkdir_at(
+        &self,
+        dirfd: &TypedFd<Self>,
+        rel_path: impl path::Arg,
+        mode: Mode,
+    ) -> Result<(), MkdirError>;
 
     /// Get the path associated with an open file descriptor, if available.
     ///

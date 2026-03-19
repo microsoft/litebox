@@ -269,6 +269,44 @@ pub enum ReadLinkError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::symlink`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SymlinkError {
+    #[error("pathname already exists")]
+    AlreadyExists,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("I/O error")]
+    Io,
+    #[error("operation not supported")]
+    NotSupported,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::link`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum LinkError {
+    #[error("pathname already exists")]
+    AlreadyExists,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("cross-device link not permitted")]
+    CrossDevice,
+    #[error("I/O error")]
+    Io,
+    #[error("operation not supported")]
+    NotSupported,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {

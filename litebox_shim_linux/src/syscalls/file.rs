@@ -18,7 +18,8 @@ use litebox::{
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    IoWriteVec, IoctlArg, STATX_BASIC_STATS, StatfsBuf, StatxBuf, StatxTimestamp, TMPFS_MAGIC,
+    TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -882,6 +883,158 @@ impl<FS: ShimFS> Task<FS> {
             .map_err(Errno::from)
     }
 
+    pub fn sys_mkdirat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: u32,
+    ) -> Result<(), Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let mode = Mode::from_bits_retain(mode) & !self.get_umask();
+        match fs_path {
+            FsPath::Absolute { path } => self
+                .files
+                .borrow()
+                .fs
+                .mkdir(path, mode)
+                .map_err(Errno::from),
+            FsPath::Cwd => self
+                .files
+                .borrow()
+                .fs
+                .mkdir(get_cwd(), mode)
+                .map_err(Errno::from),
+            FsPath::Fd(_fd) => Err(Errno::EEXIST),
+            FsPath::FdRelative { fd, path } => {
+                let Ok(raw_fd) = usize::try_from(fd) else {
+                    return Err(Errno::EBADF);
+                };
+                let files = self.files.borrow();
+                files.run_on_raw_fd(
+                    raw_fd,
+                    |dirfd| files.fs.mkdir_at(dirfd, path, mode).map_err(Errno::from),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                )?
+            }
+        }
+    }
+
+    /// Handle `symlinkat` — create a symbolic link.
+    pub fn sys_symlinkat(
+        &self,
+        target: impl path::Arg,
+        newdirfd: i32,
+        linkpath: impl path::Arg,
+    ) -> Result<(), Errno> {
+        let target_str = target.as_rust_str().map_err(|_| Errno::EINVAL)?.to_string();
+
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(newdirfd, linkpath, get_cwd)?;
+        match fs_path {
+            FsPath::Absolute { path } => self
+                .files
+                .borrow()
+                .fs
+                .symlink(target_str, path)
+                .map_err(Errno::from),
+            FsPath::Cwd => self
+                .files
+                .borrow()
+                .fs
+                .symlink(target_str, get_cwd())
+                .map_err(Errno::from),
+            FsPath::Fd(_) => Err(Errno::EEXIST),
+            FsPath::FdRelative { fd, path } => {
+                let Ok(raw_fd) = usize::try_from(fd) else {
+                    return Err(Errno::EBADF);
+                };
+                let files = self.files.borrow();
+                let dir_path = files.run_on_raw_fd(
+                    raw_fd,
+                    |dirfd| files.fs.fd_path(dirfd).ok_or(Errno::EBADF),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                )??;
+                let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
+                let abs = if rel.starts_with('/') {
+                    rel.to_string()
+                } else if dir_path.ends_with('/') {
+                    alloc::format!("{dir_path}{rel}")
+                } else {
+                    alloc::format!("{dir_path}/{rel}")
+                };
+                files.fs.symlink(target_str, abs).map_err(Errno::from)
+            }
+        }
+    }
+
+    /// Handle `linkat` — create a hard link.
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    pub fn sys_linkat(
+        &self,
+        olddirfd: i32,
+        oldpath: impl path::Arg,
+        newdirfd: i32,
+        newpath: impl path::Arg,
+        _flags: AtFlags,
+    ) -> Result<(), Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let old_fs = FsPath::new(olddirfd, oldpath, &get_cwd)?;
+        let new_fs = FsPath::new(newdirfd, newpath, &get_cwd)?;
+
+        let old_abs = self.resolve_fs_path_to_string(old_fs, &get_cwd)?;
+        let new_abs = self.resolve_fs_path_to_string(new_fs, &get_cwd)?;
+        self.files
+            .borrow()
+            .fs
+            .link(old_abs, new_abs)
+            .map_err(Errno::from)
+    }
+
+    /// Helper to resolve an `FsPath` to an absolute path string.
+    fn resolve_fs_path_to_string(
+        &self,
+        fs_path: FsPath,
+        get_cwd: &impl Fn() -> String,
+    ) -> Result<String, Errno> {
+        match fs_path {
+            FsPath::Absolute { path } => path.into_string().map_err(|_| Errno::EINVAL),
+            FsPath::Cwd => Ok(get_cwd()),
+            FsPath::Fd(_) => Err(Errno::EINVAL),
+            FsPath::FdRelative { fd, path } => {
+                let Ok(raw_fd) = usize::try_from(fd) else {
+                    return Err(Errno::EBADF);
+                };
+                let files = self.files.borrow();
+                let dir_path = files.run_on_raw_fd(
+                    raw_fd,
+                    |dirfd| files.fs.fd_path(dirfd).ok_or(Errno::EBADF),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                )??;
+                let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
+                Ok(if rel.starts_with('/') {
+                    rel.to_string()
+                } else if dir_path.ends_with('/') {
+                    alloc::format!("{dir_path}{rel}")
+                } else {
+                    alloc::format!("{dir_path}/{rel}")
+                })
+            }
+        }
+    }
+
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
@@ -1561,6 +1714,156 @@ impl<FS: ShimFS> Task<FS> {
             }
         };
         Ok(fstat)
+    }
+
+    /// Handle `statx` — modern replacement for `stat`/`fstatat`.
+    ///
+    /// Delegates to the same resolution logic as `newfstatat`, then
+    /// converts `FileStat` into the `statx` buffer layout.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::unnecessary_cast
+    )]
+    pub fn sys_statx(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: AtFlags,
+        _mask: u32,
+    ) -> Result<StatxBuf, Errno> {
+        // statx shares the same AT_* flags as newfstatat.
+        let stat = self.sys_newfstatat(dirfd, pathname, flags)?;
+        Ok(StatxBuf {
+            stx_mask: STATX_BASIC_STATS,
+            stx_blksize: stat.st_blksize as u32,
+            stx_attributes: 0,
+            stx_nlink: stat.st_nlink as u32,
+            stx_uid: stat.st_uid,
+            stx_gid: stat.st_gid,
+            stx_mode: stat.st_mode as u16,
+            __spare0: [0],
+            stx_ino: stat.st_ino,
+            stx_size: stat.st_size as u64,
+            stx_blocks: stat.st_blocks as u64,
+            stx_attributes_mask: 0,
+            stx_atime: StatxTimestamp {
+                tv_sec: stat.st_atime,
+                tv_nsec: stat.st_atime_nsec as u32,
+                __reserved: 0,
+            },
+            stx_btime: StatxTimestamp::default(),
+            stx_ctime: StatxTimestamp {
+                tv_sec: stat.st_ctime,
+                tv_nsec: stat.st_ctime_nsec as u32,
+                __reserved: 0,
+            },
+            stx_mtime: StatxTimestamp {
+                tv_sec: stat.st_mtime,
+                tv_nsec: stat.st_mtime_nsec as u32,
+                __reserved: 0,
+            },
+            stx_rdev_major: (stat.st_rdev >> 8) as u32,
+            stx_rdev_minor: (stat.st_rdev & 0xff) as u32,
+            stx_dev_major: (stat.st_dev >> 8) as u32,
+            stx_dev_minor: (stat.st_dev & 0xff) as u32,
+            stx_mnt_id: 0,
+            stx_dio_mem_align: 0,
+            stx_dio_opt_align: 0,
+            __spare3: [0; 12],
+        })
+    }
+
+    /// Handle `statfs` — return synthetic tmpfs-like filesystem stats.
+    pub fn sys_statfs(&self, pathname: impl path::Arg) -> Result<StatfsBuf, Errno> {
+        // Verify the path exists.
+        let path = self.resolve_path(pathname)?;
+        self.files
+            .borrow()
+            .fs
+            .file_status(path)
+            .map_err(Errno::from)?;
+        Ok(Self::synthetic_statfs())
+    }
+
+    /// Handle `fstatfs` — return synthetic tmpfs-like filesystem stats.
+    pub fn sys_fstatfs(&self, fd: i32) -> Result<StatfsBuf, Errno> {
+        let Ok(raw_fd) = usize::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        // Verify the fd is valid by attempting to stat it.
+        descriptor_stat(raw_fd, self)?;
+        Ok(Self::synthetic_statfs())
+    }
+
+    fn synthetic_statfs() -> StatfsBuf {
+        StatfsBuf {
+            f_type: TMPFS_MAGIC,
+            f_bsize: 4096,
+            f_blocks: 1024 * 1024,
+            f_bfree: 1024 * 1024,
+            f_bavail: 1024 * 1024,
+            f_files: 1024 * 1024,
+            f_ffree: 1024 * 1024,
+            f_fsid: [0, 0],
+            f_namelen: 255,
+            f_frsize: 4096,
+            f_flags: 0,
+            __spare: [0; 4],
+        }
+    }
+
+    /// Handle `fchmodat` — change file mode relative to directory fd.
+    pub fn sys_fchmodat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: u32,
+    ) -> Result<(), Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let mode = litebox::fs::Mode::from_bits_truncate(mode);
+        match fs_path {
+            FsPath::Absolute { path } => self
+                .files
+                .borrow()
+                .fs
+                .chmod(path, mode)
+                .map_err(Errno::from),
+            FsPath::Cwd => self
+                .files
+                .borrow()
+                .fs
+                .chmod(get_cwd(), mode)
+                .map_err(Errno::from),
+            FsPath::Fd(_fd) => Err(Errno::EINVAL),
+            FsPath::FdRelative { fd, path } => {
+                let Ok(raw_fd) = usize::try_from(fd) else {
+                    return Err(Errno::EBADF);
+                };
+                let files = self.files.borrow();
+                let dir_path = files.run_on_raw_fd(
+                    raw_fd,
+                    |dirfd| files.fs.fd_path(dirfd).ok_or(Errno::EBADF),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                )??;
+                let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
+                let abs = if rel.is_empty() || rel == "." {
+                    dir_path
+                } else if rel.starts_with('/') {
+                    rel.to_string()
+                } else if dir_path.ends_with('/') {
+                    alloc::format!("{dir_path}{rel}")
+                } else {
+                    alloc::format!("{dir_path}/{rel}")
+                };
+                files.fs.chmod(abs, mode).map_err(Errno::from)
+            }
+        }
     }
 
     pub(crate) fn sys_fcntl(

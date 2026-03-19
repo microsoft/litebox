@@ -1208,6 +1208,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     fn fd_path(&self, fd: &FileFd<Platform, T>) -> Option<alloc::string::String> {
         self.descriptor_path(fd)
     }
+
+    fn mkdir_at(
+        &self,
+        dirfd: &FileFd<Platform, T>,
+        rel_path: impl crate::path::Arg,
+        mode: super::Mode,
+    ) -> Result<(), MkdirError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::NotADirectory => {
+                MkdirError::PathError(PathError::ComponentNotADirectory)
+            }
+            super::DirFdError::ClosedFd | super::DirFdError::Io => MkdirError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| MkdirError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(MkdirError::PathError)?;
+        self.mkdir(abs, mode)
+    }
 }
 #[derive(Debug)]
 struct Descriptor {

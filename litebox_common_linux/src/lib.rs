@@ -386,6 +386,77 @@ impl From<FileStat> for FileStat64 {
     }
 }
 
+/// Linux `statx_timestamp` struct
+#[repr(C)]
+#[derive(Clone, Default, Debug, zerocopy::FromBytes, zerocopy::IntoBytes)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    #[doc(hidden)]
+    #[allow(clippy::pub_underscore_fields)]
+    pub __reserved: i32,
+}
+
+/// Linux `statx` result buffer
+#[repr(C)]
+#[derive(Clone, Default, Debug, zerocopy::FromBytes, zerocopy::IntoBytes)]
+pub struct StatxBuf {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    #[doc(hidden)]
+    #[allow(clippy::pub_underscore_fields)]
+    pub __spare0: [u16; 1],
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: StatxTimestamp,
+    pub stx_btime: StatxTimestamp,
+    pub stx_ctime: StatxTimestamp,
+    pub stx_mtime: StatxTimestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_opt_align: u32,
+    #[doc(hidden)]
+    #[allow(clippy::pub_underscore_fields)]
+    pub __spare3: [u64; 12],
+}
+
+/// STATX_BASIC_STATS — the set of fields that stat() populates.
+pub const STATX_BASIC_STATS: u32 = 0x07ff;
+
+/// Linux `statfs` result buffer (x86_64 layout)
+#[repr(C)]
+#[derive(Clone, Default, Debug, zerocopy::FromBytes, zerocopy::IntoBytes)]
+pub struct StatfsBuf {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: i64,
+    pub f_bfree: i64,
+    pub f_bavail: i64,
+    pub f_files: i64,
+    pub f_ffree: i64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+    #[doc(hidden)]
+    #[allow(clippy::pub_underscore_fields)]
+    pub __spare: [i64; 4],
+}
+
+/// TMPFS_MAGIC — `f_type` for tmpfs filesystems.
+pub const TMPFS_MAGIC: i64 = 0x0102_1994;
+
 /// Linux's `iovec` struct for `writev`
 #[derive(FromBytes, IntoBytes)]
 #[repr(C, packed)]
@@ -1969,6 +2040,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pathname: Platform::RawConstPointer<i8>,
         mode: u32,
     },
+    Mkdirat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        mode: u32,
+    },
     Chdir {
         pathname: Platform::RawConstPointer<i8>,
     },
@@ -2256,6 +2332,18 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         newpath: Platform::RawConstPointer<i8>,
         flags: u32,
     },
+    Symlinkat {
+        target: Platform::RawConstPointer<i8>,
+        newdirfd: i32,
+        linkpath: Platform::RawConstPointer<i8>,
+    },
+    Linkat {
+        olddirfd: i32,
+        oldpath: Platform::RawConstPointer<i8>,
+        newdirfd: i32,
+        newpath: Platform::RawConstPointer<i8>,
+        flags: AtFlags,
+    },
     Fchmod {
         fd: i32,
         mode: u32,
@@ -2291,10 +2379,55 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawMutPointer<FileStat64>,
         flags: AtFlags,
     },
+    Statx {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        flags: AtFlags,
+        mask: u32,
+        buf: Platform::RawMutPointer<StatxBuf>,
+    },
+    Statfs {
+        pathname: Platform::RawConstPointer<i8>,
+        buf: Platform::RawMutPointer<StatfsBuf>,
+    },
+    Fstatfs {
+        fd: i32,
+        buf: Platform::RawMutPointer<StatfsBuf>,
+    },
+    /// No-op: file access pattern hint (safe to ignore in sandbox).
+    Fadvise64 {
+        fd: i32,
+        offset: i64,
+        len: i64,
+        advice: i32,
+    },
+    /// Copy a range of data from one file to another.
+    CopyFileRange {
+        fd_in: i32,
+        off_in: Platform::RawMutPointer<i64>,
+        fd_out: i32,
+        off_out: Platform::RawMutPointer<i64>,
+        len: usize,
+        flags: u32,
+    },
     Eventfd2 {
         initval: u32,
         flags: EfdFlags,
     },
+    /// No-op: file locking (single-process sandbox).
+    Flock {
+        fd: i32,
+        operation: i32,
+    },
+    /// No-op: space preallocation (in-memory FS).
+    Fallocate {
+        fd: i32,
+        mode: i32,
+        offset: i64,
+        len: i64,
+    },
+    /// No-op: list extended attributes (returns empty list).
+    ListXattr,
     Pipe2 {
         pipefd: Platform::RawMutPointer<u32>,
         flags: litebox::fs::OFlags,
@@ -2542,6 +2675,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::fstat => sys_req!(Fstat { fd, buf:* }),
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
             Sysno::mkdir => sys_req!(Mkdir { pathname:*, mode }),
+            Sysno::mkdirat => sys_req!(Mkdirat { dirfd, pathname:*, mode }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
             Sysno::fchdir => sys_req!(Fchdir { fd }),
             #[cfg(target_arch = "x86_64")]
@@ -2929,6 +3063,22 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 newpath: ctx.sys_req_ptr(3),
                 flags: 0,
             },
+            Sysno::symlinkat => sys_req!(Symlinkat { target:*, newdirfd, linkpath:* }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::symlink => SyscallRequest::Symlinkat {
+                target: ctx.sys_req_ptr(0),
+                newdirfd: AT_FDCWD,
+                linkpath: ctx.sys_req_ptr(1),
+            },
+            Sysno::linkat => sys_req!(Linkat { olddirfd, oldpath:*, newdirfd, newpath:*, flags }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::link => SyscallRequest::Linkat {
+                olddirfd: AT_FDCWD,
+                oldpath: ctx.sys_req_ptr(0),
+                newdirfd: AT_FDCWD,
+                newpath: ctx.sys_req_ptr(1),
+                flags: AtFlags::empty(),
+            },
             #[cfg(target_arch = "x86_64")]
             Sysno::rename => SyscallRequest::Renameat2 {
                 olddirfd: AT_FDCWD,
@@ -3083,8 +3233,54 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 return Ok(SyscallRequest::Utimensat);
             }
             // Noisy unsupported syscalls.
-            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::statx => sys_req!(Statx { dirfd, pathname:*, flags, mask, buf:* }),
+            Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
+            Sysno::fstatfs => sys_req!(Fstatfs { fd, buf:* }),
+            Sysno::fadvise64 => sys_req!(Fadvise64 {
+                fd,
+                offset,
+                len,
+                advice
+            }),
+            Sysno::copy_file_range => sys_req!(CopyFileRange {
+                fd_in,
+                off_in:*,
+                fd_out,
+                off_out:*,
+                len,
+                flags
+            }),
+            Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
+            }
+            // Single-process sandbox: file locking is a no-op.
+            Sysno::flock => {
+                return Ok(SyscallRequest::Flock {
+                    fd: ctx.sys_req_arg(0),
+                    operation: ctx.sys_req_arg(1),
+                });
+            }
+            // Space preallocation: no-op for in-memory FS.
+            Sysno::fallocate => {
+                return Ok(SyscallRequest::Fallocate {
+                    fd: ctx.sys_req_arg(0),
+                    mode: ctx.sys_req_arg(1),
+                    offset: ctx.sys_req_arg(2),
+                    len: ctx.sys_req_arg(3),
+                });
+            }
+            // Extended attributes: not supported, return appropriate errors.
+            Sysno::getxattr | Sysno::lgetxattr | Sysno::fgetxattr => {
+                return Err(errno::Errno::ENODATA);
+            }
+            Sysno::setxattr | Sysno::lsetxattr | Sysno::fsetxattr => {
+                return Err(errno::Errno::EOPNOTSUPP);
+            }
+            Sysno::listxattr | Sysno::llistxattr | Sysno::flistxattr => {
+                return Ok(SyscallRequest::ListXattr);
+            }
+            Sysno::removexattr | Sysno::lremovexattr | Sysno::fremovexattr => {
+                return Err(errno::Errno::EOPNOTSUPP);
             }
             sysno => {
                 log_unsupported(format_args!("unsupported syscall {sysno:?}"));

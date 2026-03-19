@@ -936,6 +936,15 @@ impl<
         // Devices don't track paths.
         None
     }
+
+    fn mkdir_at(
+        &self,
+        _dirfd: &FileFd<Platform>,
+        _rel_path: impl Arg,
+        _mode: Mode,
+    ) -> Result<(), MkdirError> {
+        Err(MkdirError::Io)
+    }
 }
 
 // Manual implementation of FD subsystem integration for devices.

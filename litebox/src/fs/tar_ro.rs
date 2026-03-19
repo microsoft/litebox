@@ -758,6 +758,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn fd_path(&self, fd: &FileFd<Platform>) -> Option<alloc::string::String> {
         self.descriptor_path(fd)
     }
+
+    fn mkdir_at(
+        &self,
+        _dirfd: &FileFd<Platform>,
+        _rel_path: impl crate::path::Arg,
+        _mode: Mode,
+    ) -> Result<(), MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
 }
 
 const DEFAULT_DIR_MODE: Mode =

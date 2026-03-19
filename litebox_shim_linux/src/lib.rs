@@ -1343,6 +1343,13 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Mkdir { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_mkdir(path, mode))),
+            SyscallRequest::Mkdirat {
+                dirfd,
+                pathname,
+                mode,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_mkdirat(dirfd, path, mode))
+            }),
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
@@ -1670,6 +1677,26 @@ impl<FS: ShimFS> Task<FS> {
                 let new = newpath.to_cstring().ok_or(Errno::EFAULT)?;
                 syscall!(sys_renameat2(olddirfd, old, newdirfd, new, flags))
             }
+            SyscallRequest::Symlinkat {
+                target,
+                newdirfd,
+                linkpath,
+            } => {
+                let target = target.to_cstring().ok_or(Errno::EFAULT)?;
+                let linkpath = linkpath.to_cstring().ok_or(Errno::EFAULT)?;
+                syscall!(sys_symlinkat(target, newdirfd, linkpath))
+            }
+            SyscallRequest::Linkat {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            } => {
+                let old = oldpath.to_cstring().ok_or(Errno::EFAULT)?;
+                let new = newpath.to_cstring().ok_or(Errno::EFAULT)?;
+                syscall!(sys_linkat(olddirfd, old, newdirfd, new, flags))
+            }
             SyscallRequest::Fchmod { fd: _, mode: _ }
             | SyscallRequest::Fchown
             | SyscallRequest::Fchownat => {
@@ -1682,17 +1709,32 @@ impl<FS: ShimFS> Task<FS> {
                 // No-op for in-memory FS; data is always "persisted" and timestamps are ignored.
                 Ok(0)
             }
+            SyscallRequest::Fadvise64 { .. } => {
+                // No-op: file access advice is optional and safe to ignore.
+                Ok(0)
+            }
+            SyscallRequest::CopyFileRange { .. } => {
+                // Not implemented; programs fall back to read+write.
+                Err(Errno::EOPNOTSUPP)
+            }
+            SyscallRequest::Flock { .. } => {
+                // No-op: single-process sandbox has no contention.
+                Ok(0)
+            }
+            SyscallRequest::Fallocate { .. } => {
+                // No-op: in-memory FS doesn't need preallocation.
+                Ok(0)
+            }
+            SyscallRequest::ListXattr => {
+                // No extended attributes; return empty list (size 0).
+                Ok(0)
+            }
             SyscallRequest::Fchmodat {
-                dirfd: _,
+                dirfd,
                 pathname,
                 mode,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                self.files
-                    .borrow()
-                    .fs
-                    .chmod(path, litebox::fs::Mode::from_bits_truncate(mode))
-                    .map_err(Errno::from)?;
-                Ok(0)
+                syscall!(sys_fchmodat(dirfd, path, mode))
             }),
             SyscallRequest::Stat { pathname, buf } => {
                 pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
@@ -1748,6 +1790,29 @@ impl<FS: ShimFS> Task<FS> {
                         .map(|()| 0)
                 })
             }),
+            SyscallRequest::Statx {
+                dirfd,
+                pathname,
+                flags,
+                mask,
+                buf,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                self.sys_statx(dirfd, path, flags, mask).and_then(|statx| {
+                    self.park_if_deferred();
+                    buf.write_at_offset(0, statx)
+                        .ok_or(Errno::EFAULT)
+                        .map(|()| 0)
+                })
+            }),
+            SyscallRequest::Statfs { pathname, buf } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    self.sys_statfs(path)
+                        .and_then(|s| buf.write_at_offset(0, s).ok_or(Errno::EFAULT).map(|()| 0))
+                })
+            }
+            SyscallRequest::Fstatfs { fd, buf } => self
+                .sys_fstatfs(fd)
+                .and_then(|s| buf.write_at_offset(0, s).ok_or(Errno::EFAULT).map(|()| 0)),
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }

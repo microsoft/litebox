@@ -269,6 +269,35 @@ impl From<litebox::fs::errors::MkdirError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::SymlinkError> for Errno {
+    fn from(value: litebox::fs::errors::SymlinkError) -> Self {
+        match value {
+            litebox::fs::errors::SymlinkError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::SymlinkError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::SymlinkError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::SymlinkError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::SymlinkError::Io => Errno::EIO,
+            litebox::fs::errors::SymlinkError::NotSupported => Errno::EOPNOTSUPP,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::LinkError> for Errno {
+    fn from(value: litebox::fs::errors::LinkError) -> Self {
+        match value {
+            litebox::fs::errors::LinkError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::LinkError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::LinkError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::LinkError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::LinkError::CrossDevice => Errno::EXDEV,
+            litebox::fs::errors::LinkError::Io => Errno::EIO,
+            litebox::fs::errors::LinkError::NotSupported => Errno::EOPNOTSUPP,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
     fn from(value: litebox::platform::page_mgmt::AllocationError) -> Self {
         match value {
