@@ -935,8 +935,8 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Validate that an fd is a regular file opened with the required access
-    /// mode. Returns `EISDIR` for directories, `EBADF` for missing fds or
-    /// wrong access mode, and `EINVAL` for non-file fds (pipes, sockets, …).
+    /// mode. Returns `EISDIR` for directories, `EBADF` for missing/O_PATH fds
+    /// or wrong access mode, and `EINVAL` for non-regular-file fds.
     ///
     /// `need_read` / `need_write` indicate the required permissions.
     pub fn validate_regular_file_fd(
@@ -952,10 +952,12 @@ impl<FS: ShimFS> Task<FS> {
         files.run_on_raw_fd(
             raw_fd,
             |typed_fd| {
-                // Check file type — directories are not valid for copy_file_range.
+                // Check file type — only regular files are valid.
                 let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
-                if matches!(status.file_type, litebox::fs::FileType::Directory) {
-                    return Err(Errno::EISDIR);
+                match status.file_type {
+                    litebox::fs::FileType::RegularFile => {}
+                    litebox::fs::FileType::Directory => return Err(Errno::EISDIR),
+                    _ => return Err(Errno::EINVAL),
                 }
                 // Check access mode via stored open flags.
                 let open_flags = self
@@ -964,12 +966,15 @@ impl<FS: ShimFS> Task<FS> {
                     .descriptor_table()
                     .with_metadata(typed_fd, |crate::StdioStatusFlags(flags)| *flags)
                     .unwrap_or(OFlags::empty());
+                // O_PATH fds are not usable for I/O.
+                if open_flags.contains(OFlags::PATH) {
+                    return Err(Errno::EBADF);
+                }
                 let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
                 if need_read && access == OFlags::WRONLY {
                     return Err(Errno::EBADF);
                 }
                 if need_write && access == OFlags::empty() {
-                    // O_RDONLY (0) — not writable.
                     return Err(Errno::EBADF);
                 }
                 Ok(())
