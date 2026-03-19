@@ -934,6 +934,25 @@ impl<FS: ShimFS> Task<FS> {
         Ok(())
     }
 
+    /// Validate that an fd is open *and* refers to a regular FS file/directory
+    /// (not a pipe, socket, eventfd, or epoll). Returns `EBADF` for closed fds
+    /// and `EINVAL` for non-file fds.
+    pub fn validate_fs_fd(&self, fd: i32) -> Result<(), Errno> {
+        let Ok(raw_fd) = usize::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        files.run_on_raw_fd(
+            raw_fd,
+            |_| Ok(()),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+            |_| Err(Errno::EINVAL),
+        )?
+    }
+
     /// Validate that a path resolves to an existing file (follows symlinks).
     pub fn validate_path(&self, pathname: impl path::Arg) -> Result<(), Errno> {
         let path = self.resolve_path(pathname)?;

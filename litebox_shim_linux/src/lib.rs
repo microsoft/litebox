@@ -1719,11 +1719,16 @@ impl<FS: ShimFS> Task<FS> {
                 off_in,
                 fd_out,
                 off_out,
+                flags,
                 ..
             } => {
-                // Not implemented; validate fds and offset pointers first.
-                self.validate_fd(fd_in)?;
-                self.validate_fd(fd_out)?;
+                // Linux rejects nonzero flags and non-regular-file fds before
+                // reaching the filesystem, so we must do the same.
+                if flags != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                self.validate_fs_fd(fd_in)?;
+                self.validate_fs_fd(fd_out)?;
                 // Validate non-null offset pointers are readable.
                 if off_in.as_usize() != 0 {
                     off_in.read_at_offset(0).ok_or(Errno::EFAULT)?;
@@ -1758,8 +1763,13 @@ impl<FS: ShimFS> Task<FS> {
                 name,
                 value,
                 size,
+                flags,
                 follow_symlinks,
             } => {
+                // XATTR_CREATE=1, XATTR_REPLACE=2; any other bits → EINVAL.
+                if flags & !0x3 != 0 {
+                    return Err(Errno::EINVAL);
+                }
                 let path = pathname.to_cstring().ok_or(Errno::EFAULT)?;
                 self.validate_path_follow(path, follow_symlinks)?;
                 name.to_cstring().ok_or(Errno::EFAULT)?;
@@ -1786,7 +1796,11 @@ impl<FS: ShimFS> Task<FS> {
                 name,
                 value,
                 size,
+                flags,
             } => {
+                if flags & !0x3 != 0 {
+                    return Err(Errno::EINVAL);
+                }
                 self.validate_fd(fd)?;
                 name.to_cstring().ok_or(Errno::EFAULT)?;
                 if size > 0 {

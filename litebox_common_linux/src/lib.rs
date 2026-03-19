@@ -2432,12 +2432,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         name: Platform::RawConstPointer<i8>,
         follow_symlinks: bool,
     },
-    /// Xattr on a path: set → EOPNOTSUPP after validating path + name + value.
+    /// Xattr on a path: set → EOPNOTSUPP after validating path + name + value + flags.
     XattrSetPath {
         pathname: Platform::RawConstPointer<i8>,
         name: Platform::RawConstPointer<i8>,
         value: Platform::RawConstPointer<u8>,
         size: usize,
+        flags: i32,
         follow_symlinks: bool,
     },
     /// Xattr on a path: list → 0 after validating path.
@@ -2450,12 +2451,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         name: Platform::RawConstPointer<i8>,
     },
-    /// Xattr on an fd: set → EOPNOTSUPP after validating fd + name + value.
+    /// Xattr on an fd: set → EOPNOTSUPP after validating fd + name + value + flags.
     XattrSetFd {
         fd: i32,
         name: Platform::RawConstPointer<i8>,
         value: Platform::RawConstPointer<u8>,
         size: usize,
+        flags: i32,
     },
     /// Xattr on an fd: list → 0 after validating fd.
     XattrListFd {
@@ -3331,6 +3333,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     name: ctx.sys_req_ptr(1),
                     value: ctx.sys_req_ptr(2),
                     size: ctx.sys_req_arg(3),
+                    flags: ctx.sys_req_arg(4),
                     follow_symlinks: true,
                 });
             }
@@ -3340,6 +3343,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     name: ctx.sys_req_ptr(1),
                     value: ctx.sys_req_ptr(2),
                     size: ctx.sys_req_arg(3),
+                    flags: ctx.sys_req_arg(4),
                     follow_symlinks: false,
                 });
             }
@@ -3349,6 +3353,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     name: ctx.sys_req_ptr(1),
                     value: ctx.sys_req_ptr(2),
                     size: ctx.sys_req_arg(3),
+                    flags: ctx.sys_req_arg(4),
                 });
             }
             Sysno::listxattr => {
