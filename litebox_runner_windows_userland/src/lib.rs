@@ -30,6 +30,7 @@ extern crate alloc;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
 use litebox::platform::{AddressSpaceProvider, RawConstPointer, RawMutPointer, SystemInfoProvider};
@@ -72,6 +73,11 @@ pub struct CliArgs {
     /// Run the built-in hello world test instead of a file.
     #[arg(long = "test-hello")]
     pub test_hello: bool,
+    /// Connect to a network broker via TCP loopback at the given address
+    /// (e.g., "127.0.0.1:9000"). The broker must be listening and speaking
+    /// the litebox IPC network protocol (LBNP handshake).
+    #[arg(long = "network-broker", value_name = "ADDR")]
+    pub network_broker: Option<String>,
 }
 
 /// Run a Windows PE program with LiteBox.
@@ -94,7 +100,25 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // Initialize platform.
     let platform = Platform::new(None);
     litebox_platform_multiplex::set_platform(platform);
+
+    // If a network broker address was provided, connect and attach the IPC
+    // stream to the platform before creating the smoltcp Network (which reads
+    // from the platform's IPInterfaceProvider).
+    if let Some(ref broker_addr) = cli_args.network_broker {
+        let stream = connect_to_broker_ipc(broker_addr)?;
+        platform.set_ipc_stream(stream);
+    }
+
     let litebox = litebox::LiteBox::new(platform);
+
+    // Create the smoltcp network stack if any network transport is configured.
+    let net = if platform.has_network() {
+        let mut n = litebox::net::Network::new(&litebox);
+        n.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        Some(Arc::new(std::sync::Mutex::new(n)))
+    } else {
+        None
+    };
 
     // Allocate guest address space.
     let as_id = platform
@@ -363,6 +387,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         exe_path: exe_full_path,
     });
 
+    // Start the network worker thread if networking is configured.
+    let shutdown = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let network_thread = start_network_worker(&net, &shutdown);
+
     // Run the guest.
     // Tell the platform to set GS = guest TEB before entering guest code.
     litebox_platform_windows_userland::WindowsUserland::set_guest_gs_base(
@@ -372,6 +400,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     unsafe {
         litebox_platform_windows_userland::run_thread_ref(&shim, &mut ctx);
     }
+
+    // Signal network worker to stop and wait for it.
+    shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
+    // Also mark the IPC transport dead so any in-progress send loop exits.
+    if platform.has_network() {
+        platform.poison_ipc();
+    }
+    if let Some(handle) = network_thread {
+        let _ = handle.join();
+    }
+
     let exit_code = shim.exit_code();
     std::process::exit(exit_code)
 }
@@ -586,4 +625,130 @@ fn apply_iat_patches(_pm: &litebox::mm::PageManager<Platform, PAGE_SIZE>, patche
             VirtualProtect(ptr as *mut u8, 8, old_protect, &mut dummy);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Broker IPC helpers
+// ---------------------------------------------------------------------------
+
+/// IPC handshake constants (must match `litebox_broker` protocol).
+const HANDSHAKE_MAGIC: &[u8; 4] = b"LBNP";
+const HANDSHAKE_VERSION: u16 = 1;
+const HANDSHAKE_MTU: u16 = 1600;
+
+/// Connect to the network broker via TCP loopback and perform the LBNP
+/// handshake. Returns a **non-blocking** `TcpStream` ready for the
+/// platform's `IPInterfaceProvider` to use.
+fn connect_to_broker_ipc(addr: &str) -> Result<std::net::TcpStream> {
+    use std::io::{Read, Write};
+
+    let sock_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow!("Invalid broker address '{addr}': {e}"))?;
+
+    // Security: only allow loopback addresses for the IPC control plane.
+    let ip = sock_addr.ip();
+    if !ip.is_loopback() {
+        anyhow::bail!(
+            "Broker address '{addr}' is not a loopback address. \
+             Only 127.0.0.1 or [::1] are allowed for security."
+        );
+    }
+
+    // Blocking connect — we don't have anything else to do yet.
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_secs(5))
+            .map_err(|e| anyhow!("Failed to connect to broker at {addr}: {e}"))?;
+
+    stream.set_nodelay(true).ok(); // reduce latency for small IPC frames
+
+    // --- Send handshake: magic (4) + version (2) + MTU (2) = 8 bytes ---
+    let mut msg = [0u8; 8];
+    msg[0..4].copy_from_slice(HANDSHAKE_MAGIC);
+    msg[4..6].copy_from_slice(&HANDSHAKE_VERSION.to_le_bytes());
+    msg[6..8].copy_from_slice(&HANDSHAKE_MTU.to_le_bytes());
+    stream
+        .write_all(&msg)
+        .map_err(|e| anyhow!("IPC handshake send failed: {e}"))?;
+
+    // --- Read response (8 bytes, with timeout) ---
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
+    let mut resp = [0u8; 8];
+    stream
+        .read_exact(&mut resp)
+        .map_err(|e| anyhow!("IPC handshake response failed: {e}"))?;
+
+    // Validate response.
+    if &resp[0..4] != HANDSHAKE_MAGIC {
+        anyhow::bail!("IPC handshake: bad magic in response");
+    }
+    let version = u16::from_le_bytes([resp[4], resp[5]]);
+    if version != HANDSHAKE_VERSION {
+        anyhow::bail!(
+            "IPC handshake: version mismatch (got {version}, expected {HANDSHAKE_VERSION})"
+        );
+    }
+    let mtu = u16::from_le_bytes([resp[6], resp[7]]);
+    if mtu != HANDSHAKE_MTU {
+        anyhow::bail!("IPC handshake: MTU mismatch (broker sent {mtu}, we expect {HANDSHAKE_MTU})");
+    }
+    if cfg!(debug_assertions) {
+        eprintln!("IPC handshake complete: broker MTU={mtu}");
+    }
+
+    // Switch to non-blocking for the platform's poll-based I/O loop.
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| anyhow!("Failed to set non-blocking on IPC stream: {e}"))?;
+    stream.set_read_timeout(None).ok();
+
+    Ok(stream)
+}
+
+/// Start the network worker thread if a network stack is configured.
+///
+/// The thread repeatedly calls `perform_platform_interaction()` on the smoltcp
+/// `Network`, then waits on the platform transport until data arrives or a
+/// timeout fires. This mirrors the Linux runner's network worker pattern.
+fn start_network_worker(
+    net: &Option<Arc<std::sync::Mutex<litebox::net::Network<Platform>>>>,
+    shutdown: &Arc<core::sync::atomic::AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let net = net.as_ref()?.clone();
+    let shutdown = shutdown.clone();
+
+    let handle = std::thread::Builder::new()
+        .name("network-worker".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
+
+            while !shutdown.load(core::sync::atomic::Ordering::Relaxed) {
+                let timeout = loop {
+                    match net.lock().unwrap().perform_platform_interaction() {
+                        litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
+                        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
+                            break timeout;
+                        }
+                    }
+                };
+                let wait = match timeout {
+                    Some(t) if t < DEFAULT_TIMEOUT => t,
+                    _ => DEFAULT_TIMEOUT,
+                };
+                litebox_platform_multiplex::platform().wait_on_network(Some(wait));
+            }
+            // Drain remaining network interactions before exiting.
+            while net
+                .lock()
+                .unwrap()
+                .perform_platform_interaction()
+                .call_again_immediately()
+            {}
+        })
+        .expect("failed to spawn network worker thread");
+
+    Some(handle)
 }

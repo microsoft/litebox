@@ -257,10 +257,24 @@ pub struct PollFd {
     pub revents: i16,
 }
 
+// POSIX and WinSock use different bitmask values for poll events.
+#[cfg(unix)]
 pub const POLLIN: i16 = 0x0001;
+#[cfg(unix)]
 pub const POLLOUT: i16 = 0x0004;
+#[cfg(unix)]
 pub const POLLERR: i16 = 0x0008;
+#[cfg(unix)]
 pub const POLLHUP: i16 = 0x0010;
+
+#[cfg(windows)]
+pub const POLLIN: i16 = 0x0300; // POLLRDNORM | POLLRDBAND
+#[cfg(windows)]
+pub const POLLOUT: i16 = 0x0010; // POLLWRNORM
+#[cfg(windows)]
+pub const POLLERR: i16 = 0x0001;
+#[cfg(windows)]
+pub const POLLHUP: i16 = 0x0002;
 
 /// Poll a set of sockets for readiness.
 ///
@@ -566,7 +580,12 @@ pub fn into_blocking_tcp_stream(ipc: IpcStream) -> TcpStream {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
-#[allow(non_camel_case_types, non_snake_case, dead_code, clippy::upper_case_acronyms)]
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    dead_code,
+    clippy::upper_case_acronyms
+)]
 mod win {
     use std::sync::Once;
 

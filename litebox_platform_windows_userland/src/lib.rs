@@ -466,6 +466,11 @@ pub struct WindowsUserland {
     stdin_cancelled: core::sync::atomic::AtomicBool,
     /// WinTUN session for IP packet I/O (None when networking is disabled).
     tun_session: Option<wintun_ffi::WinTunSession>,
+    /// IPC TCP stream to a network broker (None when IPC networking is disabled).
+    /// Uses the same framing protocol as the Linux platform: `[u32 LE len][IP packet]`.
+    ipc_stream: std::sync::OnceLock<Mutex<std::net::TcpStream>>,
+    /// Set when the IPC transport encounters a fatal protocol error or EOF.
+    ipc_dead: core::sync::atomic::AtomicBool,
     /// Host-owned guest GS → host GS lookup table for NT-mode guests.
     /// The table is Box-allocated so its address is stable for the
     /// lifetime of the platform (trampoline code holds a raw pointer).
@@ -1245,6 +1250,8 @@ impl WindowsUserland {
             console_terminal: Mutex::new(ConsoleTerminalState::default()),
             stdin_cancelled: core::sync::atomic::AtomicBool::new(false),
             tun_session,
+            ipc_stream: std::sync::OnceLock::new(),
+            ipc_dead: core::sync::atomic::AtomicBool::new(false),
             guest_gs_table: Box::new(GuestGsTable::new()),
         };
 
@@ -1279,6 +1286,30 @@ impl WindowsUserland {
         );
 
         leaked
+    }
+
+    /// Attach an IPC TCP stream to the broker for networking.
+    ///
+    /// The stream must already be connected and in non-blocking mode.
+    /// Called after `new()` but before the network worker thread starts.
+    /// Panics if called more than once.
+    pub fn set_ipc_stream(&self, stream: std::net::TcpStream) {
+        self.ipc_stream
+            .set(Mutex::new(stream))
+            .expect("set_ipc_stream called more than once");
+    }
+
+    /// Whether any network transport (TUN or IPC) is configured.
+    pub fn has_network(&self) -> bool {
+        self.tun_session.is_some() || self.ipc_stream.get().is_some()
+    }
+
+    /// Mark the IPC transport as dead, causing any in-progress send/receive
+    /// to return immediately. Used during shutdown to unblock the network
+    /// worker thread.
+    pub fn poison_ipc(&self) {
+        self.ipc_dead
+            .store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
     fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
@@ -1363,6 +1394,78 @@ impl WindowsUserland {
         // Safety: read_wait_event() returns a valid HANDLE from WintunGetReadWaitEvent.
         unsafe {
             Win32_Threading::WaitForSingleObject(session.read_wait_event(), ms);
+        }
+    }
+
+    /// Wait for data on the network transport (TUN or IPC), or until
+    /// `timeout` expires.
+    pub fn wait_on_network(&self, timeout: Option<Duration>) {
+        // TUN path — delegate to existing wait_on_tun.
+        if self.tun_session.is_some() {
+            return self.wait_on_tun(timeout);
+        }
+
+        // IPC path — poll the TCP socket for POLLIN.
+        if let Some(stream_lock) = self.ipc_stream.get() {
+            if self.ipc_dead.load(core::sync::atomic::Ordering::Relaxed) {
+                if let Some(t) = timeout {
+                    std::thread::sleep(t);
+                }
+                return;
+            }
+
+            let raw_socket = {
+                use std::os::windows::io::AsRawSocket;
+                stream_lock.lock().unwrap().as_raw_socket() as usize
+            };
+
+            #[repr(C)]
+            struct WsaPollFd {
+                fd: usize,
+                events: i16,
+                revents: i16,
+            }
+            #[link(name = "ws2_32")]
+            unsafe extern "system" {
+                fn WSAPoll(fds: *mut WsaPollFd, nfds: u32, timeout: i32) -> i32;
+            }
+            let timeout_ms = match timeout {
+                Some(t) => {
+                    let ms = t.as_millis();
+                    if ms == 0 && !t.is_zero() {
+                        1
+                    } else {
+                        ms as i32
+                    }
+                }
+                None => -1,
+            };
+            // WinSock WSAPoll bitmask values (different from POSIX!):
+            //   POLLRDNORM = 0x0100, POLLIN = 0x0300, POLLOUT/POLLWRNORM = 0x0010
+            //   POLLERR = 0x0001, POLLHUP = 0x0002, POLLNVAL = 0x0004
+            const WS_POLLIN: i16 = 0x0300;
+            const WS_POLLERR: i16 = 0x0001;
+            const WS_POLLHUP: i16 = 0x0002;
+            let mut pfd = WsaPollFd {
+                fd: raw_socket,
+                events: WS_POLLIN,
+                revents: 0,
+            };
+            unsafe {
+                WSAPoll(&mut pfd, 1, timeout_ms);
+            }
+            // If the socket reported error or hangup, mark the transport dead
+            // so the worker transitions to the sleep path.
+            if pfd.revents & (WS_POLLERR | WS_POLLHUP) != 0 {
+                self.ipc_dead
+                    .store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+
+        // No transport — sleep.
+        if let Some(t) = timeout {
+            std::thread::sleep(t);
         }
     }
 }
@@ -2694,26 +2797,180 @@ impl litebox::platform::RawMutex for RawMutex {
 
 impl litebox::platform::IPInterfaceProvider for WindowsUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        let session = self
-            .tun_session
-            .as_ref()
-            .expect("send_ip_packet called without TUN device configured");
-        session
-            .send(packet)
-            .map_err(|errno| litebox::platform::SendError::Io(errno))
+        // TUN path.
+        if let Some(session) = &self.tun_session {
+            return session
+                .send(packet)
+                .map_err(|errno| litebox::platform::SendError::Io(errno));
+        }
+
+        // IPC path: write [u32 LE len][packet] as a single frame.
+        if let Some(stream_lock) = self.ipc_stream.get() {
+            use std::io::Write;
+            let mut stream = stream_lock.lock().unwrap();
+            let mut frame = alloc::vec::Vec::with_capacity(4 + packet.len());
+            #[allow(clippy::cast_possible_truncation)]
+            frame.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+            frame.extend_from_slice(packet);
+
+            let mut sent = 0usize;
+            while sent < frame.len() {
+                // Check if the transport was killed (by broker crash or runner shutdown).
+                if self.ipc_dead.load(core::sync::atomic::Ordering::Relaxed) {
+                    return Err(litebox::platform::SendError::Io(-1));
+                }
+                match stream.write(&frame[sent..]) {
+                    Ok(0) => {
+                        self.ipc_dead
+                            .store(true, core::sync::atomic::Ordering::Relaxed);
+                        return Err(litebox::platform::SendError::Io(-1));
+                    }
+                    Ok(n) => sent += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Wait for the socket to become writable (up to 10ms)
+                        // instead of busy-spinning. Drop the lock while waiting
+                        // so receive_ip_packet can make progress.
+                        use std::os::windows::io::AsRawSocket;
+                        let raw = stream.as_raw_socket() as usize;
+                        drop(stream);
+                        #[repr(C)]
+                        struct WsaPollFd {
+                            fd: usize,
+                            events: i16,
+                            revents: i16,
+                        }
+                        #[link(name = "ws2_32")]
+                        unsafe extern "system" {
+                            fn WSAPoll(fds: *mut WsaPollFd, nfds: u32, timeout: i32) -> i32;
+                        }
+                        // WinSock WSAPoll bitmask values (different from POSIX!):
+                        //   POLLOUT/POLLWRNORM = 0x0010
+                        //   POLLERR = 0x0001, POLLHUP = 0x0002
+                        const WS_POLLOUT: i16 = 0x0010;
+                        const WS_POLLERR: i16 = 0x0001;
+                        const WS_POLLHUP: i16 = 0x0002;
+                        let mut pfd = WsaPollFd {
+                            fd: raw,
+                            events: WS_POLLOUT,
+                            revents: 0,
+                        };
+                        unsafe {
+                            WSAPoll(&mut pfd, 1, 10);
+                        }
+                        // Check for error/hangup on the socket.
+                        if pfd.revents & (WS_POLLERR | WS_POLLHUP) != 0 {
+                            self.ipc_dead
+                                .store(true, core::sync::atomic::Ordering::Relaxed);
+                            return Err(litebox::platform::SendError::Io(-1));
+                        }
+                        stream = stream_lock.lock().unwrap();
+                    }
+                    Err(_) => {
+                        self.ipc_dead
+                            .store(true, core::sync::atomic::Ordering::Relaxed);
+                        return Err(litebox::platform::SendError::Io(-1));
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        panic!("send_ip_packet called without network transport configured");
     }
 
     fn receive_ip_packet(
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        let session = self
-            .tun_session
-            .as_ref()
-            .expect("receive_ip_packet called without TUN device configured");
-        session
-            .try_receive(packet)
-            .map_err(|_| litebox::platform::ReceiveError::WouldBlock)
+        // TUN path.
+        if let Some(session) = &self.tun_session {
+            return session
+                .try_receive(packet)
+                .map_err(|_| litebox::platform::ReceiveError::WouldBlock);
+        }
+
+        // IPC path: peek-validate-consume framing protocol.
+        if let Some(stream_lock) = self.ipc_stream.get() {
+            if self.ipc_dead.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(litebox::platform::ReceiveError::WouldBlock);
+            }
+
+            let mut stream = stream_lock.lock().unwrap();
+
+            // Step 1: Peek at the 4-byte length prefix.
+            let mut len_buf = [0u8; 4];
+            match stream.peek(&mut len_buf) {
+                Ok(n) if n < 4 => {
+                    if n == 0 {
+                        // EOF — broker closed the connection.
+                        self.ipc_dead
+                            .store(true, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+                Err(_) => {
+                    self.ipc_dead
+                        .store(true, core::sync::atomic::Ordering::Relaxed);
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+                Ok(_) => {}
+            }
+
+            let pkt_len = u32::from_le_bytes(len_buf) as usize;
+
+            // Shutdown frame (len=0).
+            if pkt_len == 0 {
+                use std::io::Read;
+                let mut discard = [0u8; 4];
+                let _ = stream.read(&mut discard);
+                self.ipc_dead
+                    .store(true, core::sync::atomic::Ordering::Relaxed);
+                return Err(litebox::platform::ReceiveError::Eof);
+            }
+
+            if pkt_len > packet.len() {
+                self.ipc_dead
+                    .store(true, core::sync::atomic::Ordering::Relaxed);
+                return Err(litebox::platform::ReceiveError::ProtocolError);
+            }
+
+            // Step 2: Peek full frame to verify it's all available.
+            let frame_len = 4 + pkt_len;
+            let mut peek_buf = alloc::vec![0u8; frame_len];
+            match stream.peek(&mut peek_buf) {
+                Ok(n) if n < frame_len => {
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+                Err(_) => {
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+                Ok(_) => {}
+            }
+
+            // Step 3: Consume the 4-byte prefix.
+            {
+                use std::io::Read;
+                let mut prefix = [0u8; 4];
+                let _ = stream.read_exact(&mut prefix);
+            }
+
+            // Step 4: Read the packet body.
+            {
+                use std::io::Read;
+                if stream.read_exact(&mut packet[..pkt_len]).is_err() {
+                    self.ipc_dead
+                        .store(true, core::sync::atomic::Ordering::Relaxed);
+                    return Err(litebox::platform::ReceiveError::WouldBlock);
+                }
+            }
+
+            return Ok(pkt_len);
+        }
+
+        panic!("receive_ip_packet called without network transport configured");
     }
 }
 
