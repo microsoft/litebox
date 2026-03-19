@@ -14,6 +14,7 @@ pub(crate) mod file;
 pub(crate) mod heap;
 pub(crate) mod k32_handlers;
 pub(crate) mod memory;
+pub(crate) mod net;
 pub(crate) mod sync;
 pub(crate) mod sysinfo;
 pub(crate) mod thread;
@@ -34,6 +35,25 @@ impl NtSyscallArgs {
             arg2: ctx.regs.r8,
             arg3: ctx.regs.r9,
         }
+    }
+
+    /// Read the 5th argument from the caller's stack frame.
+    ///
+    /// Windows x64 convention: `[rsp + 0x28]` (past return address + shadow
+    /// space). Only call this for syscalls that actually have 5+ arguments.
+    ///
+    /// # Safety
+    /// Guest stack must be valid and mapped.
+    pub unsafe fn arg4(ctx: &super::ExecutionContext) -> usize {
+        unsafe { *((ctx.regs.rsp + 0x28) as *const usize) }
+    }
+
+    /// Read the 6th argument from the caller's stack frame.
+    ///
+    /// # Safety
+    /// Guest stack must be valid and mapped.
+    pub unsafe fn arg5(ctx: &super::ExecutionContext) -> usize {
+        unsafe { *((ctx.regs.rsp + 0x30) as *const usize) }
     }
 }
 

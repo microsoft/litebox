@@ -84,6 +84,28 @@ impl NtProcessState {
     pub fn untrack_alloc(&self, base: usize) -> Option<usize> {
         self.alloc_tracker.lock().unwrap().remove(&base)
     }
+
+    /// Allocate a small RW region in guest VA. Returns the guest VA of the
+    /// allocated block, or 0 on failure. The allocation is page-aligned and
+    /// at least `size` bytes.
+    pub fn alloc_rw_bytes(&self, size: usize) -> usize {
+        use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
+        use litebox::platform::RawConstPointer as _;
+        let aligned = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let nz_size = match NonZeroPageSize::<PAGE_SIZE>::new(aligned) {
+            Some(s) => s,
+            None => return 0,
+        };
+        // Safety: create_writable_pages places the pages in guest VA.
+        let result = unsafe {
+            self.pm
+                .create_writable_pages(None, nz_size, CreatePagesFlags::empty(), |_| Ok(0))
+        };
+        match result {
+            Ok(ptr) => ptr.as_usize(),
+            Err(_) => 0,
+        }
+    }
 }
 
 /// On debug builds, logs that an unimplemented syscall was attempted.
@@ -172,6 +194,15 @@ pub(crate) struct NtSharedState {
     pub current_directory: Mutex<alloc::string::String>,
     /// Next thread ID for NtCreateThreadEx.
     pub next_thread_id: Mutex<u32>,
+    /// Optional smoltcp network stack for WinSock syscalls.
+    /// Set by the runner after creating the Network instance.
+    pub net:
+        std::sync::OnceLock<alloc::sync::Arc<std::sync::Mutex<litebox::net::Network<Platform>>>>,
+    /// Socket storage: maps socket IDs → owned `SocketFd` handles.
+    /// Socket IDs are also stored in the handle table as `NtObject::Socket { sock_id }`.
+    pub sockets: Mutex<alloc::collections::BTreeMap<u32, litebox::net::SocketFd<Platform>>>,
+    /// Next socket ID to allocate.
+    pub next_socket_id: Mutex<u32>,
 }
 
 /// State set by the runner to configure the initial thread.
@@ -235,6 +266,9 @@ impl NtShimEntrypoints {
             env_block_pool: Mutex::new(alloc::vec::Vec::new()),
             current_directory: Mutex::new(alloc::string::String::from("C:\\")),
             next_thread_id: Mutex::new(2), // TID 1 is the main thread
+            net: std::sync::OnceLock::new(),
+            sockets: Mutex::new(alloc::collections::BTreeMap::new()),
+            next_socket_id: Mutex::new(1),
         });
         Self {
             exit_code: AtomicI32::new(0),
@@ -338,6 +372,18 @@ impl NtShimEntrypoints {
             self.shared.stdout_handle,
             self.shared.stderr_handle,
         )
+    }
+
+    /// Attach the smoltcp network stack for WinSock syscall dispatch.
+    /// Must be called before running the guest if networking is needed.
+    pub fn set_network(
+        &self,
+        net: alloc::sync::Arc<std::sync::Mutex<litebox::net::Network<Platform>>>,
+    ) {
+        self.shared
+            .net
+            .set(net)
+            .unwrap_or_else(|_| panic!("set_network called more than once"));
     }
 
     /// Dispatch an NT syscall or kernel32 syscall.
@@ -1025,6 +1071,12 @@ impl NtShimEntrypoints {
                 // RegCloseKey — always succeeds (nothing to close).
                 ctx.regs.rax = 0; // ERROR_SUCCESS
                 return (NtStatus::STATUS_SUCCESS, false);
+            }
+
+            // --- WinSock (ws2_32) syscalls ---
+            nr if nr >= stub_dlls::WS2_STARTUP => {
+                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
+                return syscalls::net::dispatch_ws2_syscall(&self.shared, nr, ctx, teb_va);
             }
 
             _ => {}

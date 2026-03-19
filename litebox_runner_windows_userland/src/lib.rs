@@ -410,6 +410,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         exe_path: exe_full_path,
     });
 
+    // Attach the network stack to the shim for WinSock syscall dispatch.
+    if let Some(ref net_arc) = net {
+        shim.set_network(alloc::sync::Arc::clone(net_arc));
+    }
+
     // Start the network worker thread if networking is configured.
     let shutdown = Arc::new(core::sync::atomic::AtomicBool::new(false));
     let network_thread = start_network_worker(&net, &shutdown);

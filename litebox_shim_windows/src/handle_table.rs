@@ -77,6 +77,12 @@ pub enum NtObject {
     KeyedEvent(Arc<KeyedEventObject>),
     /// An NT thread object (NtCreateThreadEx).
     Thread(Arc<ThreadObject>),
+    /// A WinSock socket. The actual `SocketFd` is stored in
+    /// `NtSharedState::sockets`; this variant just records the key.
+    Socket {
+        /// Key into `NtSharedState::sockets`.
+        sock_id: u32,
+    },
 }
 
 /// Internal state for an NT event object.
@@ -357,6 +363,7 @@ impl HandleTable {
             NtObject::Semaphore(s) => NtObject::Semaphore(Arc::clone(s)),
             NtObject::KeyedEvent(k) => NtObject::KeyedEvent(Arc::clone(k)),
             NtObject::Thread(t) => NtObject::Thread(Arc::clone(t)),
+            NtObject::Socket { sock_id } => NtObject::Socket { sock_id: *sock_id },
         };
         Some(self.insert(new_obj))
     }
