@@ -4,8 +4,9 @@
 //! Windows userland PE runner for LiteBox.
 //!
 //! Loads a PE executable into a LiteBox address space using the NT shim,
-//! generates stub DLLs (ntdll.dll, kernel32.dll), resolves imports,
-//! synthesizes PEB/TEB, and runs the guest until it terminates.
+//! generates stub DLLs (ntdll.dll, kernel32.dll, advapi32.dll, ws2_32.dll),
+//! resolves imports, synthesizes PEB/TEB, and runs the guest until it
+//! terminates.
 //!
 //! ## Usage
 //!
@@ -13,9 +14,8 @@
 //! litebox_runner_windows_userland --pe-file hello.exe
 //! ```
 //!
-//! For Phase 1, only static PE executables that import from ntdll.dll and
-//! kernel32.dll are supported. The guest uses `syscall` to communicate with
-//! the NT shim.
+//! For Phase 1, static PE executables that import from the built-in stub DLLs
+//! are supported. The guest uses `syscall` to communicate with the NT shim.
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 #![allow(
@@ -60,6 +60,7 @@ const GUEST_STACK_SIZE: usize = 0x0010_0000;
 const NTDLL_LOAD_BASE: usize = 0xF0_0000_0000;
 const KERNEL32_LOAD_BASE: usize = 0xF0_0001_0000;
 const ADVAPI32_LOAD_BASE: usize = 0xF0_0002_0000;
+const WS2_32_LOAD_BASE: usize = 0xF0_0003_0000;
 
 /// PEB/TEB region base — placed just below the stub DLLs.
 const PEB_TEB_BASE: usize = 0xEF_FFFF_0000;
@@ -146,6 +147,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         stub_dlls::build_kernel32_for(KERNEL32_LOAD_BASE as u64, syscall_entry, gs_table_ptr);
     let advapi32_bytes =
         stub_dlls::build_advapi32_for(ADVAPI32_LOAD_BASE as u64, syscall_entry, gs_table_ptr);
+    let ws2_32_bytes =
+        stub_dlls::build_ws2_32_for(WS2_32_LOAD_BASE as u64, syscall_entry, gs_table_ptr);
 
     let ntdll_parsed = PeParsedFile::parse(&ntdll_bytes)
         .map_err(|e| anyhow!("Failed to parse ntdll stub: {e}"))?;
@@ -153,6 +156,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .map_err(|e| anyhow!("Failed to parse kernel32 stub: {e}"))?;
     let advapi32_parsed = PeParsedFile::parse(&advapi32_bytes)
         .map_err(|e| anyhow!("Failed to parse advapi32 stub: {e}"))?;
+    let ws2_32_parsed = PeParsedFile::parse(&ws2_32_bytes)
+        .map_err(|e| anyhow!("Failed to parse ws2_32 stub: {e}"))?;
 
     let mut mapper = PageManagerMapper {
         pm: &process_state.pm,
@@ -177,10 +182,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     )
     .map_err(|e| anyhow!("Failed to load advapi32 stub: {e}"))?;
 
+    let ws2_32_info = load_pe(&ws2_32_parsed, &ws2_32_bytes, WS2_32_LOAD_BASE, &mut mapper)
+        .map_err(|e| anyhow!("Failed to load ws2_32 stub: {e}"))?;
+
     if cfg!(debug_assertions) {
         eprintln!(
-            "ntdll loaded at 0x{:X}, kernel32 at 0x{:X}, advapi32 at 0x{:X}",
-            ntdll_info.image_base, kernel32_info.image_base, advapi32_info.image_base
+            "ntdll loaded at 0x{:X}, kernel32 at 0x{:X}, advapi32 at 0x{:X}, ws2_32 at 0x{:X}",
+            ntdll_info.image_base,
+            kernel32_info.image_base,
+            advapi32_info.image_base,
+            ws2_32_info.image_base
         );
     }
 
@@ -233,6 +244,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             base_address: advapi32_info.image_base,
             pe_data: &advapi32_bytes,
             parsed: &advapi32_parsed,
+        },
+        LoadedModule {
+            name: "ws2_32.dll",
+            base_address: ws2_32_info.image_base,
+            pe_data: &ws2_32_bytes,
+            parsed: &ws2_32_parsed,
         },
     ];
 
@@ -380,6 +397,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 path: String::from("C:\\Windows\\System32\\advapi32.dll"),
                 base_address: ADVAPI32_LOAD_BASE,
                 image_size: advapi32_info.image_size,
+            },
+            litebox_shim_windows::ModuleBase {
+                name: String::from("ws2_32.dll"),
+                path: String::from("C:\\Windows\\System32\\ws2_32.dll"),
+                base_address: WS2_32_LOAD_BASE,
+                image_size: ws2_32_info.image_size,
             },
         ],
         guest_va_start,

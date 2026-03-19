@@ -3,10 +3,11 @@
 
 //! Stub DLL catalog.
 //!
-//! Generates ntdll.dll and kernel32.dll stubs with the correct export lists
-//! for the NT shim. Each export is a tiny syscall stub or a user-mode function
-//! that the shim intercepts.
+//! Generates ntdll.dll, kernel32.dll, advapi32.dll, and ws2_32.dll stubs
+//! with the correct export lists for the NT shim. Each export is a tiny
+//! syscall stub or a user-mode function that the shim intercepts.
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -17,6 +18,12 @@ use crate::pe_builder::{CALLBACK_PTR_RVA, GS_TABLE_PTR_RVA, StubExport, build_st
 /// Each DLL gets a distinct base to avoid collisions.
 pub const NTDLL_IMAGE_BASE: u64 = 0x0000_7FFE_0000_0000;
 pub const KERNEL32_IMAGE_BASE: u64 = 0x0000_7FFE_0001_0000;
+
+/// Default preferred base for advapi32.dll stub.
+pub const ADVAPI32_IMAGE_BASE: u64 = 0x0000_7FFE_0002_0000;
+
+/// Default preferred base for ws2_32.dll stub.
+pub const WS2_32_IMAGE_BASE: u64 = 0x0000_7FFE_0003_0000;
 
 /// Generate the ntdll.dll stub bytes with a specific load base and callback.
 ///
@@ -40,8 +47,21 @@ pub fn build_kernel32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64
     bytes
 }
 
-/// Default preferred base for advapi32.dll stub.
-pub const ADVAPI32_IMAGE_BASE: u64 = 0x0000_7FFE_0002_0000;
+/// Generate the advapi32.dll stub bytes with a specific load base and callback.
+pub fn build_advapi32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+    let exports = advapi32_exports();
+    let mut bytes = build_stub_dll("advapi32.dll", &exports, image_base);
+    patch_text_header(&mut bytes, syscall_entry, gs_table_ptr);
+    bytes
+}
+
+/// Generate the ws2_32.dll stub bytes with a specific load base and callback.
+pub fn build_ws2_32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+    let exports = ws2_32_exports();
+    let mut bytes = build_stub_dll("ws2_32.dll", &exports, image_base);
+    patch_text_header(&mut bytes, syscall_entry, gs_table_ptr);
+    bytes
+}
 
 /// Generate the ntdll.dll stub bytes with the default base (for tests).
 pub fn build_ntdll() -> Vec<u8> {
@@ -55,12 +75,10 @@ pub fn build_kernel32() -> Vec<u8> {
     build_stub_dll("kernel32.dll", &exports, KERNEL32_IMAGE_BASE)
 }
 
-/// Generate the advapi32.dll stub bytes with a specific load base and callback.
-pub fn build_advapi32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
-    let exports = advapi32_exports();
-    let mut bytes = build_stub_dll("advapi32.dll", &exports, image_base);
-    patch_text_header(&mut bytes, syscall_entry, gs_table_ptr);
-    bytes
+/// Generate the ws2_32.dll stub bytes with the default base (for tests).
+pub fn build_ws2_32() -> Vec<u8> {
+    let exports = ws2_32_exports();
+    build_stub_dll("ws2_32.dll", &exports, WS2_32_IMAGE_BASE)
 }
 
 /// Write the callback pointer and GS table pointer into the raw DLL bytes
@@ -394,6 +412,52 @@ fn advapi32_exports() -> Vec<StubExport> {
     ]
 }
 
+/// ws2_32.dll exports — WinSock trampolines and byte-order helpers.
+fn ws2_32_exports() -> Vec<StubExport> {
+    let mut wsa_get_last_error = StubExport::get_last_error();
+    wsa_get_last_error.name = String::from("WSAGetLastError");
+
+    let mut wsa_set_last_error = StubExport::set_last_error();
+    wsa_set_last_error.name = String::from("WSASetLastError");
+
+    vec![
+        StubExport::syscall_stub("WSAStartup", WS2_STARTUP),
+        StubExport::syscall_stub("WSACleanup", WS2_CLEANUP),
+        StubExport::syscall_stub("socket", WS2_SOCKET),
+        StubExport::syscall_stub("closesocket", WS2_CLOSESOCKET),
+        StubExport::syscall_stub("connect", WS2_CONNECT),
+        StubExport::syscall_stub("bind", WS2_BIND),
+        StubExport::syscall_stub("listen", WS2_LISTEN),
+        StubExport::syscall_stub("accept", WS2_ACCEPT),
+        StubExport::syscall_stub("send", WS2_SEND),
+        StubExport::syscall_stub("recv", WS2_RECV),
+        StubExport::syscall_stub("sendto", WS2_SENDTO),
+        StubExport::syscall_stub("recvfrom", WS2_RECVFROM),
+        StubExport::syscall_stub("shutdown", WS2_SHUTDOWN),
+        StubExport::syscall_stub("setsockopt", WS2_SETSOCKOPT),
+        StubExport::syscall_stub("getsockopt", WS2_GETSOCKOPT),
+        StubExport::syscall_stub("ioctlsocket", WS2_IOCTLSOCKET),
+        StubExport::syscall_stub("select", WS2_SELECT),
+        StubExport::syscall_stub("getsockname", WS2_GETSOCKNAME),
+        StubExport::syscall_stub("getpeername", WS2_GETPEERNAME),
+        StubExport::syscall_stub("getaddrinfo", WS2_GETADDRINFO),
+        StubExport::syscall_stub("freeaddrinfo", WS2_FREEADDRINFO),
+        wsa_get_last_error,
+        wsa_set_last_error,
+        StubExport::raw(
+            "htons",
+            vec![0x66, 0x8B, 0xC1, 0x86, 0xE0, 0x0F, 0xB7, 0xC0, 0xC3],
+        ),
+        StubExport::raw("htonl", vec![0x8B, 0xC1, 0x0F, 0xC8, 0xC3]),
+        StubExport::raw(
+            "ntohs",
+            vec![0x66, 0x8B, 0xC1, 0x86, 0xE0, 0x0F, 0xB7, 0xC0, 0xC3],
+        ),
+        StubExport::raw("ntohl", vec![0x8B, 0xC1, 0x0F, 0xC8, 0xC3]),
+        StubExport::syscall_stub("inet_pton", WS2_INET_PTON),
+    ]
+}
+
 // Reserved syscall numbers for kernel32 functions (0x1000+ range).
 pub const K32_GET_STD_HANDLE: u32 = 0x1001;
 pub const K32_WRITE_CONSOLE_W: u32 = 0x1002;
@@ -509,6 +573,34 @@ pub const K32_REG_OPEN_KEY_EX_W: u32 = 0x1140;
 pub const K32_REG_QUERY_VALUE_EX_W: u32 = 0x1141;
 pub const K32_REG_CLOSE_KEY: u32 = 0x1142;
 
+// Phase 4: WinSock (ws2_32.dll)
+pub const WS2_STARTUP: u32 = 0x1200;
+pub const WS2_CLEANUP: u32 = 0x1201;
+pub const WS2_SOCKET: u32 = 0x1202;
+pub const WS2_CLOSESOCKET: u32 = 0x1203;
+pub const WS2_CONNECT: u32 = 0x1204;
+pub const WS2_BIND: u32 = 0x1205;
+pub const WS2_LISTEN: u32 = 0x1206;
+pub const WS2_ACCEPT: u32 = 0x1207;
+pub const WS2_SEND: u32 = 0x1208;
+pub const WS2_RECV: u32 = 0x1209;
+pub const WS2_SENDTO: u32 = 0x120A;
+pub const WS2_RECVFROM: u32 = 0x120B;
+pub const WS2_SHUTDOWN: u32 = 0x120C;
+pub const WS2_SETSOCKOPT: u32 = 0x120D;
+pub const WS2_GETSOCKOPT: u32 = 0x120E;
+pub const WS2_IOCTLSOCKET: u32 = 0x120F;
+pub const WS2_SELECT: u32 = 0x1210;
+pub const WS2_GETSOCKNAME: u32 = 0x1211;
+pub const WS2_GETPEERNAME: u32 = 0x1212;
+pub const WS2_GETADDRINFO: u32 = 0x1213;
+pub const WS2_FREEADDRINFO: u32 = 0x1214;
+pub const WS2_HTONS: u32 = 0x1215;
+pub const WS2_HTONL: u32 = 0x1216;
+pub const WS2_NTOHS: u32 = 0x1217;
+pub const WS2_NTOHL: u32 = 0x1218;
+pub const WS2_INET_PTON: u32 = 0x1219;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +640,22 @@ mod tests {
         assert!(names.contains(&"VirtualAlloc"));
         assert!(names.contains(&"EncodePointer"));
         assert!(names.contains(&"TlsAlloc"));
+    }
+
+    #[test]
+    fn ws2_32_stub_is_valid_pe() {
+        let bytes = build_ws2_32();
+        let parsed = PeParsedFile::parse(&bytes).expect("ws2_32 stub should be valid PE");
+        assert!(parsed.is_dll);
+        assert_eq!(parsed.image_base, WS2_32_IMAGE_BASE);
+
+        let exports = parsed.exports(&bytes);
+        let names: Vec<_> = exports.iter().filter_map(|e| e.name).collect();
+        assert!(names.contains(&"WSAStartup"));
+        assert!(names.contains(&"socket"));
+        assert!(names.contains(&"WSAGetLastError"));
+        assert!(names.contains(&"htons"));
+        assert!(names.contains(&"inet_pton"));
     }
 
     #[test]
