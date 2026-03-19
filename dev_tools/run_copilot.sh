@@ -52,7 +52,7 @@ fi
   --tun-device-name "$TUN_DEVICE" \
   --nine-p-broker "$BROKER_ADDR" \
   --cwd "$CWD" \
-  --env HOME=/tmp \
+  --env HOME=$HOME \
   --env COPILOT_DATA_DIR=/tmp/.copilot \
   --env COPILOT_RUN_APP=1 \
   --env SHELL=/bin/bash \

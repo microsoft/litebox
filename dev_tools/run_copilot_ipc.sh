@@ -100,7 +100,7 @@ trap cleanup EXIT
   --network-broker "$BROKER_SOCK" \
   --nine-p-broker "10.0.0.1:5640" \
   --cwd "$CWD" \
-  --env HOME=/tmp \
+  --env HOME=$HOME \
   --env COPILOT_DATA_DIR=/tmp/.copilot \
   --env COPILOT_RUN_APP=1 \
   --env SHELL=/bin/bash \

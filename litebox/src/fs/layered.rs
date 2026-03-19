@@ -35,9 +35,10 @@ pub enum LayeringSemantics {
     LowerLayerReadOnly,
     /// Lower layer's files are writable.
     ///
-    /// No new files can be made at the lower layer, but any existing files in the lower layer can
-    /// still be written to. If an upper level file exists with the same name as a lower layer file,
-    /// then it is shadowed, and only the upper layer file would be visible.
+    /// New files created with `O_CREAT` are placed directly on the lower layer so they persist
+    /// on the backing store (e.g., the host filesystem via 9P). Existing lower-layer files can
+    /// be written to directly. If an upper level file exists with the same name as a lower layer
+    /// file, then it is shadowed, and only the upper layer file would be visible.
     LowerLayerWritableFiles,
 }
 
@@ -99,6 +100,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// propagate the relevant error.
     fn ensure_lower_contains(&self, path: &str) -> Result<FileType, FileStatusError> {
         self.lower.file_status(path).map(|stat| stat.file_type)
+    }
+
+    /// Invalidate `root.entries` cache for a path and all its descendants.
+    /// Required after rename to prevent stale cached fds and tombstones
+    /// from shadowing the post-rename namespace.
+    fn invalidate_cache_tree(root: &mut RootDir<Upper, Lower>, path: &str) {
+        root.entries.remove(path);
+        let prefix = alloc::format!("{path}/");
+        let descendants: Vec<String> = root
+            .entries
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for k in descendants {
+            root.entries.remove(&k);
+        }
     }
 
     /// Returns whether a lower-layer fd is safe to share across multiple layered opens.
@@ -623,8 +641,8 @@ impl<
                     return Err(OpenError::AlreadyExists);
                 }
             } else {
-                // We must first attempt to open the file _without_ creating it, and only if that fails,
-                // do we fall-through and end up creating it (which will happen on the upper layer).
+                // We must first attempt to open the file _without_ creating it, and only if that
+                // fails, do we fall-through and end up creating it.
                 if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode) {
                     return Ok(fd);
                 }
@@ -672,6 +690,81 @@ impl<
                 // Another thread which also was attempting to create the same file (on top of a
                 // tombstoned file) won on the race to lock `self.root`, and thus it has already
                 // removed it for us. We don't need to remove it, and can proceed as normal.
+            }
+        }
+        // When LowerLayerWritableFiles and O_CREAT for a new file, try the
+        // lower layer first so the file persists on the host filesystem.
+        // Fall back to upper if lower can't create (e.g., parent dir only
+        // exists on upper).  Skip if we just removed a tombstone — the file
+        // still exists on lower and reopening it would resurrect a hidden entry.
+        // Also skip if the file already exists visibly — the non-O_CREAT open
+        // above (line 629) failed for a non-missing reason (e.g., not writable,
+        // wrong type), and creating on lower would shadow the upper entry.
+        if flags.contains(OFlags::CREAT)
+            && !tombstone_removal
+            && matches!(
+                self.layering_semantics,
+                LayeringSemantics::LowerLayerWritableFiles
+            )
+            && self.file_status(path.as_str()).is_err()
+        {
+            // Validate path through upper first. Only soft not-found errors
+            // (the path or an ancestor simply doesn't exist on upper) allow
+            // creation on lower. All other errors — ancestor is a non-dir,
+            // no search perms, I/O failures — must propagate.
+            match self.upper.file_status(path.as_str()) {
+                Ok(_)
+                | Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => {}
+                Err(FileStatusError::PathError(p)) => return Err(OpenError::PathError(p)),
+                Err(_) => return Err(OpenError::Io),
+            }
+            match self.lower.open(path.as_str(), flags, mode) {
+                Ok(lower_fd) => {
+                    // Mirror the shared-cache logic used by the normal lower
+                    // open path so that subsequent opens of the same
+                    // shareable file reuse this entry instead of creating a
+                    // conflicting standalone Arc.
+                    let entry = if self.lower_fd_is_shareable(&lower_fd) {
+                        let mut root = self.root.write();
+                        if let Some(existing) = root.entries.get(&path) {
+                            if matches!(existing.as_ref(), EntryX::Lower { fd } if self.lower_fd_is_shareable(fd))
+                            {
+                                let shared = Arc::clone(existing);
+                                drop(root);
+                                let _ = self.lower.close(&lower_fd);
+                                shared
+                            } else {
+                                drop(root);
+                                let _ = self.lower.close(&lower_fd);
+                                return Err(PathError::NoSuchFileOrDirectory)?;
+                            }
+                        } else {
+                            let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+                            root.entries.insert(path.clone(), Arc::clone(&entry));
+                            entry
+                        }
+                    } else {
+                        Arc::new(EntryX::Lower { fd: lower_fd })
+                    };
+                    return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                        path,
+                        flags,
+                        entry,
+                        position: 0.into(),
+                    }));
+                }
+                Err(
+                    OpenError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    )
+                    | OpenError::ReadOnlyFileSystem,
+                ) => {
+                    // Parent dir doesn't exist on lower, or lower is read-only
+                    // for this path — fall through to upper-layer creation.
+                }
+                Err(e) => return Err(e),
             }
         }
         // Otherwise, we first check the upper level, creating an entry if needed
@@ -848,14 +941,16 @@ impl<
                 self.upper.close(&fd)
             }
             EntryX::Lower { .. } => {
-                // Standalone lower-level descriptors (for example, character devices with per-open
-                // side effects) are not cached in `root`.
+                // Lower-level descriptors without a root entry are either standalone
+                // (e.g., character devices) or had their cache evicted (e.g., by rename).
+                // Close the fd if we are the sole remaining holder; otherwise another
+                // descriptor will handle it.
                 if !root_entries.contains_key(&path) {
-                    assert_eq!(Arc::strong_count(&entry), 1);
-                    let EntryX::Lower { fd } = Arc::into_inner(entry).unwrap() else {
-                        unreachable!()
-                    };
-                    return self.lower.close(&fd);
+                    match Arc::into_inner(entry) {
+                        Some(EntryX::Lower { fd }) => return self.lower.close(&fd),
+                        Some(_) => unreachable!(),
+                        None => return Ok(()),
+                    }
                 }
                 // Shared lower-level FDs have a corresponding entry in the root. Thus, we might
                 // need to possibly clean things up from the root.
@@ -892,10 +987,18 @@ impl<
                         }
                     }
                 }
-                // Pull out the root entry, and perform a quick sanity check, and drop it out
-                // entirely, which should lead us to become the sole owner.
+                // Pull out the root entry. If it is a different Arc (e.g., the
+                // cache was evicted by rename and a new open re-populated it),
+                // put it back and treat this fd as evicted.
                 let root_entry = root_entries.remove(&path).unwrap();
-                assert!(Arc::ptr_eq(&entry, &root_entry));
+                if !Arc::ptr_eq(&entry, &root_entry) {
+                    root_entries.insert(path, root_entry);
+                    match Arc::into_inner(entry) {
+                        Some(EntryX::Lower { fd }) => return self.lower.close(&fd),
+                        Some(_) => unreachable!(),
+                        None => return Ok(()),
+                    }
+                }
                 assert!(matches!(*root_entry, EntryX::Lower { .. }));
                 drop(root_entry);
                 // We are now assured that we can close out the underlying file; we are the only
@@ -1302,15 +1405,213 @@ impl<
         old_path: impl crate::path::Arg,
         new_path: impl crate::path::Arg,
     ) -> Result<(), RenameError> {
-        // Delegate rename to the upper (in-mem) layer. The layered FS currently
-        // only supports rename for files that reside entirely in the upper layer.
         let old = self.absolute_path(old_path)?;
         let new = self.absolute_path(new_path)?;
-        self.upper.rename(old.as_str(), new.as_str())
+
+        if old == new {
+            return Ok(());
+        }
+
+        // Block rename if the source is tombstoned (deleted from view).
+        // Also check if the destination is tombstoned — a tombstoned path
+        // is visibly absent in the layered namespace even though the lower
+        // entry still physically exists. This affects cross-layer EXDEV
+        // decisions: a tombstoned lower destination is not a live cross-
+        // layer target.
+        let new_is_tombstoned;
+        {
+            let root = self.root.read();
+            if let Some(entry) = root.entries.get(&old)
+                && matches!(entry.as_ref(), EntryX::Tombstone)
+            {
+                return Err(RenameError::PathError(PathError::NoSuchFileOrDirectory));
+            }
+            new_is_tombstoned = root
+                .entries
+                .get(&new)
+                .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone));
+        }
+
+        // When LowerLayerWritableFiles, try the lower layer first so renames
+        // of host-persisted files stay on the lower layer.
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            // Check upper status for both paths, propagating hard ancestor
+            // errors (ComponentNotADirectory, NoSearchPerms, etc.) that
+            // visible lookup would also reject.
+            let old_on_upper = match self.upper.file_status(&*old) {
+                Ok(_) => true,
+                Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => false,
+                Err(FileStatusError::PathError(p)) => return Err(RenameError::PathError(p)),
+                Err(_) => return Err(RenameError::Io),
+            };
+            let new_on_upper = match self.upper.file_status(&*new) {
+                Ok(_) => true,
+                Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => false,
+                Err(FileStatusError::PathError(p)) => return Err(RenameError::PathError(p)),
+                Err(_) => return Err(RenameError::Io),
+            };
+
+            if !old_on_upper {
+                // Source is not on upper — must be on lower.
+                // Verify source exists on lower, propagating hard errors.
+                match self.lower.file_status(&*old) {
+                    Ok(_) => {}
+                    Err(FileStatusError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    )) => {
+                        // Source not on lower either — upper.rename will
+                        // produce the appropriate ENOENT.
+                        return self.upper.rename(old.as_str(), new.as_str());
+                    }
+                    Err(FileStatusError::PathError(p)) => return Err(RenameError::PathError(p)),
+                    Err(_) => return Err(RenameError::Io),
+                }
+
+                if new_on_upper {
+                    // Cross-layer rename: source on lower, destination on
+                    // upper. Return EXDEV so callers fall back to
+                    // copy + delete (which every POSIX program already
+                    // handles for cross-mount renames).
+                    //
+                    // Why not attempt the rename directly?
+                    //
+                    // The lower backend (in-mem or 9P) can destroy a hidden
+                    // lower destination as part of rename, and there is no
+                    // way to atomically clean up the upper shadow in the
+                    // same operation. Any multi-step approach (park upper
+                    // dest, lower rename, cleanup parked entry) has failure
+                    // modes where rollback cannot fully restore hidden
+                    // state. See docs/litebox/design/layered-rename-codex.md
+                    // for a detailed analysis.
+                    //
+                    // TODO: Implement OverrideEntry::RedirectLower in the
+                    // layered namespace so cross-layer rename can be
+                    // expressed as a metadata transaction without immediate
+                    // lower mutation. Until then, EXDEV is the safe choice.
+                    return Err(RenameError::CrossDevice);
+                }
+
+                // No upper shadow on destination — pure lower rename.
+                // If the destination is tombstoned, the lower backend still
+                // has the hidden entry. Park it at a temp path so
+                // lower.rename doesn't validate type/emptiness against an
+                // invisible entry. If the rename fails, restore the hidden
+                // entry from temp so no hidden state is lost.
+                let tombstone_saved = if new_is_tombstoned && self.lower.file_status(&*new).is_ok()
+                {
+                    static TOMB_COUNTER: AtomicUsize = AtomicUsize::new(0);
+                    let parent_dir = {
+                        let p = new.rsplit_once('/').map_or("/", |(p, _)| p);
+                        if p.is_empty() { "/" } else { p }
+                    };
+                    let tmp = loop {
+                        let n = TOMB_COUNTER.fetch_add(1, SeqCst);
+                        let c = alloc::format!("{parent_dir}/.litebox_ts_{n:x}");
+                        if self.lower.file_status(&c).is_err() {
+                            break c;
+                        }
+                    };
+                    self.lower.rename(new.as_str(), &tmp).ok().map(|()| tmp)
+                } else {
+                    None
+                };
+
+                match self.lower.rename(old.as_str(), new.as_str()) {
+                    Ok(()) => {
+                        // Clean up the saved hidden entry (best-effort).
+                        if let Some(ref ts) = tombstone_saved
+                            && self.lower.unlink(ts.as_str()).is_err()
+                        {
+                            let _ = self.lower.rmdir(ts.as_str());
+                        }
+                        let mut root = self.root.write();
+                        Self::invalidate_cache_tree(&mut root, &old);
+                        Self::invalidate_cache_tree(&mut root, &new);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        // Restore the hidden lower entry on failure.
+                        if let Some(ref ts) = tombstone_saved {
+                            let _ = self.lower.rename(ts.as_str(), new.as_str());
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            // old_on_upper: visible source is on upper.
+            // Check if destination exists only on lower — that's also
+            // cross-layer and needs EXDEV for the same reasons. But skip
+            // the check if the destination is tombstoned (visibly absent).
+            if !new_on_upper && !new_is_tombstoned {
+                let new_on_lower = match self.lower.file_status(&*new) {
+                    Ok(_) => true,
+                    Err(FileStatusError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    )) => false,
+                    Err(FileStatusError::PathError(p)) => return Err(RenameError::PathError(p)),
+                    Err(_) => return Err(RenameError::Io),
+                };
+                if new_on_lower {
+                    // Cross-layer rename: source on upper, destination on
+                    // lower. The upper rename can't see or validate the
+                    // visible lower destination (type compatibility,
+                    // emptiness), and would leave stale lower cache entries.
+                    // Same rationale as the lower→upper EXDEV above.
+                    return Err(RenameError::CrossDevice);
+                }
+            }
+            // Both on upper (or new doesn't exist anywhere) — safe to
+            // delegate to upper.rename().
+        }
+
+        self.upper.rename(old.as_str(), new.as_str())?;
+        // Clear any tombstone or stale cache at the destination so the
+        // renamed entry is visible through layered lookup.
+        let mut root = self.root.write();
+        Self::invalidate_cache_tree(&mut root, &old);
+        Self::invalidate_cache_tree(&mut root, &new);
+        Ok(())
     }
 
     fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
+        // When LowerLayerWritableFiles, try lower layer first so directories
+        // persist on the host. Fall back to upper if lower can't create.
+        // But first, check upper for conflicts: if the path already exists,
+        // reject with AlreadyExists; if an ancestor is invalid (non-dir,
+        // no search perms), propagate that error instead of creating on lower.
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            match self.upper.file_status(path.as_str()) {
+                Ok(_) => return Err(MkdirError::AlreadyExists),
+                Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => {}
+                Err(FileStatusError::PathError(p)) => return Err(MkdirError::PathError(p)),
+                Err(_) => return Err(MkdirError::Io),
+            }
+            match self.lower.mkdir(path.as_str(), mode) {
+                Ok(()) => return Ok(()),
+                Err(
+                    MkdirError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    )
+                    | MkdirError::ReadOnlyFileSystem,
+                ) => {
+                    // Parent doesn't exist on lower — fall through to upper.
+                }
+                Err(e) => return Err(e),
+            }
+        }
         match self.upper.mkdir(path.as_str(), mode) {
             Ok(()) => {
                 // If we could successfully make the directory, we know that things are "sane" at
@@ -1427,18 +1728,12 @@ impl<
                     RmdirError::PathError(
                         PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                     ) => {
-                        // fallthrough
+                        // Dir doesn't exist on lower — fine, it only existed on upper.
                     }
-                    RmdirError::NotEmpty
-                    | RmdirError::NotADirectory
-                    | RmdirError::ReadOnlyFileSystem
-                    | RmdirError::PathError(
-                        PathError::ComponentNotADirectory | PathError::InvalidPathname,
-                    ) => unreachable!(),
-                    RmdirError::Busy
-                    | RmdirError::NoWritePerms
-                    | RmdirError::Io
-                    | RmdirError::PathError(PathError::NoSearchPerms { .. }) => return Err(e),
+                    // The lower rmdir can legitimately fail: the directory
+                    // may not be empty on lower (lower-only children), or
+                    // the lower path may not be a directory.
+                    _ => return Err(e),
                 }
             }
         }
@@ -1472,10 +1767,25 @@ impl<
                         let upper_names: HashSet<String> =
                             upper_entries.iter().map(|e| e.name.clone()).collect();
 
+                        let root = self.root.read();
                         for lower_entry in lower_entries {
-                            if !upper_names.contains(&lower_entry.name) {
-                                upper_entries.push(lower_entry);
+                            if upper_names.contains(&lower_entry.name) {
+                                continue;
                             }
+                            // Skip tombstoned entries — they are visibly deleted.
+                            let child_path = if path == "/" {
+                                alloc::format!("/{}", lower_entry.name)
+                            } else {
+                                alloc::format!("{}/{}", path, lower_entry.name)
+                            };
+                            if root
+                                .entries
+                                .get(&child_path)
+                                .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+                            {
+                                continue;
+                            }
+                            upper_entries.push(lower_entry);
                         }
                     }
                     let _ = self.lower.close(&lower_fd);
@@ -1484,8 +1794,21 @@ impl<
                 upper_entries
             }
             EntryX::Lower { fd } => {
-                // This is the easy case, nothing to deal with upper entries.
-                self.lower.read_dir(fd)?
+                // Lower-only directory: still need to filter tombstoned children.
+                let mut lower_entries = self.lower.read_dir(fd)?;
+                let root = self.root.read();
+                lower_entries.retain(|e| {
+                    let child_path = if path == "/" {
+                        alloc::format!("/{}", e.name)
+                    } else {
+                        alloc::format!("{}/{}", path, e.name)
+                    };
+                    !root
+                        .entries
+                        .get(&child_path)
+                        .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+                });
+                lower_entries
             }
             EntryX::Tombstone => unreachable!(),
         };

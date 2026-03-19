@@ -1882,6 +1882,240 @@ mod layered {
             Err(RmdirError::NotADirectory)
         ));
     }
+
+    /// Regression test: closing a stale fd after rename must not remove or
+    /// assert-fail on a fresh cache entry at the same path.
+    #[test]
+    fn close_stale_fd_after_rename_no_panic() {
+        use crate::fs::errors::RenameError;
+        use crate::fs::layered::LayeringSemantics;
+
+        let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            let fd = fs
+                .open("/a.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /a.txt");
+            fs.write(&fd, b"original", None).expect("write");
+            fs.close(&fd).expect("close");
+        });
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            // Pre-populate an upper-only file for cross-layer EXDEV test.
+            let fd = fs
+                .open("/upper.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /upper.txt");
+            fs.write(&fd, b"upper", None).expect("write");
+            fs.close(&fd).expect("close");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Open /a.txt — this caches a Lower entry in root.entries.
+        let fd_stale = fs
+            .open("/a.txt", OFlags::RDONLY, Mode::empty())
+            .expect("open /a.txt");
+
+        // Rename /a.txt → /b.txt on lower. This evicts the cache.
+        fs.rename("/a.txt", "/b.txt").expect("rename a→b");
+
+        // Create a new /a.txt. This inserts a fresh cache entry.
+        let fd_new = fs
+            .open("/a.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+            .expect("recreate /a.txt");
+        fs.write(&fd_new, b"replacement", None).expect("write");
+
+        // Close the stale fd. Must not panic or corrupt the new cache entry.
+        fs.close(&fd_stale).expect("close stale fd");
+
+        // The new fd and its cache entry must still work.
+        fs.close(&fd_new).expect("close new fd");
+
+        // Cross-layer rename (lower src → upper dest) returns EXDEV.
+        assert!(matches!(
+            fs.rename("/b.txt", "/upper.txt"),
+            Err(RenameError::CrossDevice)
+        ));
+
+        // Cross-layer rename (upper src → lower dest) also returns EXDEV.
+        assert!(matches!(
+            fs.rename("/upper.txt", "/b.txt"),
+            Err(RenameError::CrossDevice)
+        ));
+    }
+
+    /// Renaming into a tombstoned destination must not return EXDEV.
+    /// The tombstone hides the lower entry, so the dest is visibly absent.
+    #[test]
+    fn rename_into_tombstoned_dest_not_exdev() {
+        use crate::fs::layered::LayeringSemantics;
+
+        let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            let fd = fs
+                .open("/dst.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /dst.txt");
+            fs.close(&fd).expect("close");
+        });
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            let fd = fs
+                .open("/src.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /src.txt");
+            fs.write(&fd, b"hello", None).expect("write");
+            fs.close(&fd).expect("close");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // /dst.txt exists on lower. Delete it — installs tombstone.
+        fs.unlink("/dst.txt").expect("unlink tombstones /dst.txt");
+
+        // Rename upper /src.txt → /dst.txt. The dest is tombstoned
+        // (visibly absent), so this is NOT cross-layer and must succeed.
+        fs.rename("/src.txt", "/dst.txt")
+            .expect("rename into tombstoned dest must not be EXDEV");
+
+        // /dst.txt must be visible after the rename — tombstone must be cleared.
+        let stat = fs
+            .file_status("/dst.txt")
+            .expect("/dst.txt must be visible after rename");
+        assert_eq!(stat.file_type, FileType::RegularFile);
+
+        // The content from the original upper /src.txt must be readable.
+        let fd = fs
+            .open("/dst.txt", OFlags::RDONLY, Mode::empty())
+            .expect("open /dst.txt");
+        let mut buf = vec![0u8; 64];
+        let n = fs.read(&fd, &mut buf, None).expect("read");
+        assert_eq!(&buf[..n], b"hello");
+        fs.close(&fd).expect("close");
+
+        // /src.txt must no longer exist.
+        assert!(fs.file_status("/src.txt").is_err());
+    }
+
+    /// Lower-source rename into a tombstoned lower destination must not
+    /// fail with type-mismatch errors from the hidden lower entry.
+    #[test]
+    fn rename_lower_source_into_tombstoned_lower_dest() {
+        use crate::fs::layered::LayeringSemantics;
+
+        let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            // Create a file at /dst.txt on lower.
+            let fd = fs
+                .open("/dst.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /dst.txt");
+            fs.close(&fd).expect("close");
+            // Create a directory at /srcdir on lower.
+            fs.mkdir("/srcdir", all_rw).expect("mkdir /srcdir");
+        });
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Delete /dst.txt — installs tombstone. Lower still has the file.
+        fs.unlink("/dst.txt").expect("unlink /dst.txt");
+
+        // Rename lower dir /srcdir → /dst.txt. Without the tombstone fix,
+        // the lower backend would see the hidden file at /dst.txt and
+        // return NotADirectory. With the fix, the hidden entry is cleared
+        // first, so the rename succeeds.
+        fs.rename("/srcdir", "/dst.txt")
+            .expect("rename dir over tombstoned file must succeed");
+
+        // /dst.txt is now a directory.
+        let stat = fs.file_status("/dst.txt").expect("/dst.txt visible");
+        assert_eq!(stat.file_type, FileType::Directory);
+
+        // /srcdir is gone.
+        assert!(fs.file_status("/srcdir").is_err());
+    }
+
+    /// Tombstoned entries must not appear in read_dir() listings.
+    #[test]
+    fn read_dir_hides_tombstoned_entries() {
+        use crate::fs::layered::LayeringSemantics;
+
+        let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            let fd = fs
+                .open("/visible.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /visible.txt");
+            fs.close(&fd).expect("close");
+            let fd = fs
+                .open("/deleted.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /deleted.txt");
+            fs.close(&fd).expect("close");
+        });
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Unlink /deleted.txt — installs tombstone.
+        fs.unlink("/deleted.txt").expect("unlink");
+
+        // read_dir on root must show /visible.txt but NOT /deleted.txt.
+        let root_fd = fs
+            .open("/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+            .expect("open /");
+        let entries = fs.read_dir(&root_fd).expect("read_dir /");
+        fs.close(&root_fd).expect("close");
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"visible.txt"),
+            "visible.txt must appear: {names:?}"
+        );
+        assert!(
+            !names.contains(&"deleted.txt"),
+            "deleted.txt must be hidden: {names:?}"
+        );
+    }
 }
 
 mod stdio {

@@ -179,6 +179,7 @@ impl From<litebox::fs::errors::RenameError> for Errno {
             litebox::fs::errors::RenameError::NotEmpty => Errno::ENOTEMPTY,
             litebox::fs::errors::RenameError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::RenameError::SameFile => Errno::EINVAL,
+            litebox::fs::errors::RenameError::CrossDevice => Errno::EXDEV,
             litebox::fs::errors::RenameError::Io => Errno::EIO,
             litebox::fs::errors::RenameError::ClosedFd => Errno::EBADF,
             litebox::fs::errors::RenameError::PathError(path_error) => path_error.into(),

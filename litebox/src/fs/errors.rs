@@ -213,6 +213,8 @@ pub enum RenameError {
     NotEmpty,
     #[error("the filesystem does not support renaming")]
     ReadOnlyFileSystem,
+    #[error("old and new are on different filesystems")]
+    CrossDevice,
     #[error("old and new are the same file")]
     SameFile,
     #[error("I/O error")]
