@@ -1722,13 +1722,13 @@ impl<FS: ShimFS> Task<FS> {
                 flags,
                 ..
             } => {
-                // Linux rejects nonzero flags and non-regular-file fds before
-                // reaching the filesystem, so we must do the same.
+                // Linux rejects nonzero flags before any fd checks.
                 if flags != 0 {
                     return Err(Errno::EINVAL);
                 }
-                self.validate_fs_fd(fd_in)?;
-                self.validate_fs_fd(fd_out)?;
+                // Source must be a readable regular file; dest must be writable.
+                self.validate_regular_file_fd(fd_in, true, false)?;
+                self.validate_regular_file_fd(fd_out, false, true)?;
                 // Validate non-null offset pointers are readable.
                 if off_in.as_usize() != 0 {
                     off_in.read_at_offset(0).ok_or(Errno::EFAULT)?;

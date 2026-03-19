@@ -934,17 +934,46 @@ impl<FS: ShimFS> Task<FS> {
         Ok(())
     }
 
-    /// Validate that an fd is open *and* refers to a regular FS file/directory
-    /// (not a pipe, socket, eventfd, or epoll). Returns `EBADF` for closed fds
-    /// and `EINVAL` for non-file fds.
-    pub fn validate_fs_fd(&self, fd: i32) -> Result<(), Errno> {
+    /// Validate that an fd is a regular file opened with the required access
+    /// mode. Returns `EISDIR` for directories, `EBADF` for missing fds or
+    /// wrong access mode, and `EINVAL` for non-file fds (pipes, sockets, …).
+    ///
+    /// `need_read` / `need_write` indicate the required permissions.
+    pub fn validate_regular_file_fd(
+        &self,
+        fd: i32,
+        need_read: bool,
+        need_write: bool,
+    ) -> Result<(), Errno> {
         let Ok(raw_fd) = usize::try_from(fd) else {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
         files.run_on_raw_fd(
             raw_fd,
-            |_| Ok(()),
+            |typed_fd| {
+                // Check file type — directories are not valid for copy_file_range.
+                let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
+                if matches!(status.file_type, litebox::fs::FileType::Directory) {
+                    return Err(Errno::EISDIR);
+                }
+                // Check access mode via stored open flags.
+                let open_flags = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(typed_fd, |crate::StdioStatusFlags(flags)| *flags)
+                    .unwrap_or(OFlags::empty());
+                let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
+                if need_read && access == OFlags::WRONLY {
+                    return Err(Errno::EBADF);
+                }
+                if need_write && access == OFlags::empty() {
+                    // O_RDONLY (0) — not writable.
+                    return Err(Errno::EBADF);
+                }
+                Ok(())
+            },
             |_| Err(Errno::EINVAL),
             |_| Err(Errno::EINVAL),
             |_| Err(Errno::EINVAL),
