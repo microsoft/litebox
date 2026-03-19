@@ -1874,6 +1874,7 @@ pub struct UserMmsgHdr<Platform: litebox::platform::RawPointerProvider> {
     _pad: u32,
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl<Platform: litebox::platform::RawPointerProvider> core::fmt::Debug for UserMmsgHdr<Platform> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UserMmsgHdr")
@@ -1971,6 +1972,9 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Chdir {
         pathname: Platform::RawConstPointer<i8>,
     },
+    Fchdir {
+        fd: i32,
+    },
     Mmap {
         addr: usize,
         length: usize,
@@ -2059,6 +2063,17 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Access {
         pathname: Platform::RawConstPointer<i8>,
         mode: AccessFlags,
+    },
+    Faccessat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        mode: AccessFlags,
+    },
+    Faccessat2 {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        mode: AccessFlags,
+        flags: AtFlags,
     },
     Madvise {
         addr: Platform::RawMutPointer<u8>,
@@ -2528,6 +2543,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::lstat => sys_req!(Lstat { pathname:*, buf:* }),
             Sysno::mkdir => sys_req!(Mkdir { pathname:*, mode }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
+            Sysno::fchdir => sys_req!(Fchdir { fd }),
             #[cfg(target_arch = "x86_64")]
             Sysno::mmap => sys_req!(Mmap {
                 addr,
@@ -2629,6 +2645,8 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::readv => sys_req!(Readv { fd, iovec:*, iovcnt }),
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
             Sysno::access => sys_req!(Access { pathname:*, mode }),
+            Sysno::faccessat => sys_req!(Faccessat { dirfd, pathname:*, mode }),
+            Sysno::faccessat2 => sys_req!(Faccessat2 { dirfd, pathname:*, mode, flags }),
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),

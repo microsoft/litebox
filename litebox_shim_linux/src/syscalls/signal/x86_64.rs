@@ -679,6 +679,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn signal_fpstate_metadata_marks_extended_state() {
         let mut fp: SignalFpStateBuf = [0u8; SIGNAL_FPSTATE_SIZE];
         fp[..FPSTATE_SIZE].copy_from_slice(&litebox_common_linux::FpRegs::default().data);
@@ -886,6 +887,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn restore_sigcontext_accepts_valid_832_byte_xsave_frame() {
         let mut fp = [0u8; FPSTATE_SIZE];
         fp[0..2].copy_from_slice(&0x2468u16.to_le_bytes());

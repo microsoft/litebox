@@ -28,6 +28,21 @@ use errors::{
     ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 
+/// Error from resolving a directory file descriptor's path.
+///
+/// Used internally by `*_at` method implementations to distinguish a missing
+/// fd (the table has no entry) from a valid fd that doesn't point to a
+/// directory.
+#[derive(Debug)]
+pub(crate) enum DirFdError {
+    /// The fd is not present in the descriptor table.
+    ClosedFd,
+    /// The fd exists but refers to a non-directory (regular file, device, etc.).
+    NotADirectory,
+    /// An I/O error occurred while querying the underlying backend.
+    Io,
+}
+
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
 /// made public.
 mod private {
@@ -191,6 +206,55 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     ) -> Result<alloc::string::String, errors::ReadLinkError> {
         Err(errors::ReadLinkError::NotSupported)
     }
+
+    // -- fd-relative (`*_at`) methods --
+    //
+    // These resolve a relative path starting from a directory file descriptor.
+    // The path is stored in each FS Descriptor at open time; implementations
+    // join it with the relative component and delegate to path-based methods.
+
+    /// Open a file relative to a directory fd.
+    fn open_at(
+        &self,
+        dirfd: &TypedFd<Self>,
+        rel_path: impl path::Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<Self>, OpenError>;
+
+    /// Obtain the status of a file relative to a directory fd.
+    fn stat_at(
+        &self,
+        dirfd: &TypedFd<Self>,
+        rel_path: impl path::Arg,
+        follow_symlinks: bool,
+    ) -> Result<FileStatus, FileStatusError>;
+
+    /// Unlink a file relative to a directory fd.
+    fn unlink_at(&self, dirfd: &TypedFd<Self>, rel_path: impl path::Arg)
+    -> Result<(), UnlinkError>;
+
+    /// Read a symbolic link relative to a directory fd.
+    fn readlink_at(
+        &self,
+        dirfd: &TypedFd<Self>,
+        rel_path: impl path::Arg,
+    ) -> Result<alloc::string::String, errors::ReadLinkError>;
+
+    /// Rename a file, with source and destination relative to directory fds.
+    fn rename_at(
+        &self,
+        old_dirfd: &TypedFd<Self>,
+        old_rel: impl path::Arg,
+        new_dirfd: &TypedFd<Self>,
+        new_rel: impl path::Arg,
+    ) -> Result<(), RenameError>;
+
+    /// Get the path associated with an open file descriptor, if available.
+    ///
+    /// Returns the path that was used to open the file. Used by the ELF
+    /// patch cache and diagnostics.
+    fn fd_path(&self, fd: &TypedFd<Self>) -> Option<alloc::string::String>;
 }
 
 bitflags! {

@@ -885,6 +885,57 @@ impl<
             false
         }
     }
+
+    fn open_at(
+        &self,
+        _dirfd: &FileFd<Platform>,
+        _rel_path: impl crate::path::Arg,
+        _flags: super::OFlags,
+        _mode: super::Mode,
+    ) -> Result<FileFd<Platform>, super::errors::OpenError> {
+        // Device fds are not directories — fd-relative open is not meaningful.
+        Err(super::errors::OpenError::NotADirectory)
+    }
+
+    fn stat_at(
+        &self,
+        _dirfd: &FileFd<Platform>,
+        _rel_path: impl crate::path::Arg,
+        _follow_symlinks: bool,
+    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
+        Err(super::errors::FileStatusError::NotADirectory)
+    }
+
+    fn unlink_at(
+        &self,
+        _dirfd: &FileFd<Platform>,
+        _rel_path: impl crate::path::Arg,
+    ) -> Result<(), super::errors::UnlinkError> {
+        Err(super::errors::UnlinkError::NotADirectory)
+    }
+
+    fn readlink_at(
+        &self,
+        _dirfd: &FileFd<Platform>,
+        _rel_path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        Err(super::errors::ReadLinkError::NotADirectory)
+    }
+
+    fn rename_at(
+        &self,
+        _old_dirfd: &FileFd<Platform>,
+        _old_rel: impl crate::path::Arg,
+        _new_dirfd: &FileFd<Platform>,
+        _new_rel: impl crate::path::Arg,
+    ) -> Result<(), super::errors::RenameError> {
+        Err(super::errors::RenameError::NotADirectory)
+    }
+
+    fn fd_path(&self, _fd: &FileFd<Platform>) -> Option<alloc::string::String> {
+        // Devices don't track paths.
+        None
+    }
 }
 
 // Manual implementation of FD subsystem integration for devices.

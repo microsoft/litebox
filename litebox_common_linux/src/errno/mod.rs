@@ -133,6 +133,8 @@ impl From<litebox::fs::errors::OpenError> for Errno {
             litebox::fs::errors::OpenError::AlreadyExists => Errno::EEXIST,
             litebox::fs::errors::OpenError::Io => Errno::EIO,
             litebox::fs::errors::OpenError::Interrupted => Errno::EINTR,
+            litebox::fs::errors::OpenError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::OpenError::NotADirectory => Errno::ENOTDIR,
             _ => unimplemented!(),
         }
     }
@@ -145,6 +147,8 @@ impl From<litebox::fs::errors::UnlinkError> for Errno {
             litebox::fs::errors::UnlinkError::IsADirectory => Errno::EISDIR,
             litebox::fs::errors::UnlinkError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::UnlinkError::Io => Errno::EIO,
+            litebox::fs::errors::UnlinkError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::UnlinkError::NotADirectory => Errno::ENOTDIR,
             litebox::fs::errors::UnlinkError::PathError(path_error) => path_error.into(),
             _ => unimplemented!(),
         }
@@ -175,6 +179,8 @@ impl From<litebox::fs::errors::RenameError> for Errno {
             litebox::fs::errors::RenameError::NotEmpty => Errno::ENOTEMPTY,
             litebox::fs::errors::RenameError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::RenameError::SameFile => Errno::EINVAL,
+            litebox::fs::errors::RenameError::Io => Errno::EIO,
+            litebox::fs::errors::RenameError::ClosedFd => Errno::EBADF,
             litebox::fs::errors::RenameError::PathError(path_error) => path_error.into(),
             _ => unimplemented!(),
         }
@@ -370,6 +376,8 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
         match value {
             litebox::fs::errors::FileStatusError::PathError(path_error) => path_error.into(),
             litebox::fs::errors::FileStatusError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::FileStatusError::NotADirectory => Errno::ENOTDIR,
+            litebox::fs::errors::FileStatusError::SymlinkLoop => Errno::ELOOP,
             _ => Errno::EIO,
         }
     }

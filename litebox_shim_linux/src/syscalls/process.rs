@@ -1510,7 +1510,6 @@ impl<FS: ShimFS> Task<FS> {
                 thread_count: core::sync::atomic::AtomicI32::new(1),
                 active_cow: litebox::sync::Mutex::new(None),
                 elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-                fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                 main_bss_start: core::sync::atomic::AtomicUsize::new(0),
                 main_bss_end: core::sync::atomic::AtomicUsize::new(0),
                 vfork_parking: Arc::new(crate::VforkParking {
@@ -2658,7 +2657,6 @@ impl<FS: ShimFS> Task<FS> {
                 thread_count: core::sync::atomic::AtomicI32::new(1),
                 active_cow: litebox::sync::Mutex::new(None),
                 elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-                fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                 main_bss_start: core::sync::atomic::AtomicUsize::new(0),
                 main_bss_end: core::sync::atomic::AtomicUsize::new(0),
                 vfork_parking: Arc::new(crate::VforkParking {
@@ -2699,7 +2697,10 @@ impl<FS: ShimFS> Task<FS> {
         );
 
         match self.load_program(loader, argv_vec, envp_vec) {
-            Ok(()) => {}
+            Ok(()) => {
+                // Update /proc/self/exe to point to the new executable.
+                *self.fs.borrow().exe_path.write() = self.resolve_exe_path(path);
+            }
             Err(e) => {
                 if let Some(vd) = vfork_done.take() {
                     vd.signal();

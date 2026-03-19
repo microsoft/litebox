@@ -238,7 +238,6 @@ impl LinuxShimBuilder {
             thread_count: core::sync::atomic::AtomicI32::new(1),
             active_cow: litebox::sync::Mutex::new(None),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-            fd_paths: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             main_bss_start: core::sync::atomic::AtomicUsize::new(0),
             main_bss_end: core::sync::atomic::AtomicUsize::new(0),
             vfork_parking: Arc::new(VforkParking {
@@ -347,6 +346,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             argv,
             envp,
         )?;
+        *entrypoints.task.fs.borrow().exe_path.write() = entrypoints.task.resolve_exe_path(path);
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
             entrypoints,
@@ -1149,9 +1149,42 @@ impl<FS: ShimFS> Task<FS> {
         // (mirroring Linux's ERESTARTSYS).
         self.syscall_restartable.set(false);
 
+        #[cfg(feature = "trace_syscalls")]
+        {
+            #[cfg(target_arch = "x86_64")]
+            litebox::log_println!(
+                self.global.platform,
+                "[TRACE] syscall: pid={} nr={} rip={:#x} arg0={:#x} arg1={:#x} arg2={:#x}",
+                self.pid,
+                ctx.orig_rax,
+                ctx.rip,
+                ctx.syscall_arg(0),
+                ctx.syscall_arg(1),
+                ctx.syscall_arg(2),
+            );
+        }
+
         let return_value = match self.do_syscall(ctx) {
-            Ok(v) => v,
-            Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
+            Ok(v) => {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[TRACE] syscall done: pid={} ret=Ok({})",
+                    self.pid,
+                    v,
+                );
+                v
+            }
+            Err(err) => {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[TRACE] syscall done: pid={} ret=Err({})",
+                    self.pid,
+                    err.as_neg(),
+                );
+                (err.as_neg() as isize).reinterpret_as_unsigned()
+            }
         };
 
         #[cfg(target_arch = "x86")]
@@ -1313,6 +1346,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
+            SyscallRequest::Fchdir { fd } => syscall!(sys_fchdir(fd)),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
@@ -1380,6 +1414,26 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Access { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),
+            SyscallRequest::Faccessat {
+                dirfd,
+                pathname,
+                mode,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_faccessat(
+                    dirfd,
+                    path,
+                    mode,
+                    litebox_common_linux::AtFlags::empty()
+                ))
+            }),
+            SyscallRequest::Faccessat2 {
+                dirfd,
+                pathname,
+                mode,
+                flags,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_faccessat(dirfd, path, mode, flags))
+            }),
             SyscallRequest::Madvise {
                 addr,
                 length,
@@ -1892,11 +1946,6 @@ struct ProcessState {
     active_cow: litebox::sync::Mutex<Platform, Option<Arc<CowState>>>,
     /// Per-fd ELF patching state for the runtime syscall rewriter.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
-    /// Maps guest fd numbers to the file path used at open time. Populated by
-    /// `sys_open` / `sys_openat`, cleared by `sys_close`. Used by the ELF
-    /// patch cache to identify library paths.
-    fd_paths:
-        litebox::sync::Mutex<Platform, alloc::collections::BTreeMap<i32, alloc::string::String>>,
     /// Page-aligned start of the main binary's `.bss` region (zero-filled
     /// portion of the writable PT_LOAD segment). Set once during ELF loading.
     main_bss_start: core::sync::atomic::AtomicUsize,

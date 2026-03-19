@@ -63,6 +63,26 @@ fn align_down(addr: usize, align: usize) -> usize {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    /// Get the FS-level path for a raw fd, if it's a filesystem fd.
+    fn fd_path_for_raw(&self, fd: i32) -> Option<alloc::string::String> {
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return None;
+        };
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| files.fs.fd_path(typed_fd),
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()
+            .flatten()
+    }
+
     #[inline]
     fn do_mmap(
         &self,
@@ -221,7 +241,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Insert under lock (re-check for races).
         let ps = self.process_state.borrow();
-        let file_path = ps.fd_paths.lock().get(&fd).cloned();
+        let file_path = self.fd_path_for_raw(fd);
         let mut cache = ps.elf_patch_cache.lock();
         cache.entry(fd).or_insert(ElfPatchState {
             _base_addr: base_addr,
@@ -699,12 +719,7 @@ impl<FS: ShimFS> Task<FS> {
             #[cfg(debug_assertions)]
             {
                 let path = self
-                    .process_state
-                    .borrow()
-                    .fd_paths
-                    .lock()
-                    .get(&fd)
-                    .cloned()
+                    .fd_path_for_raw(fd)
                     .unwrap_or_else(|| alloc::format!("fd={fd}"));
                 litebox::log_println!(
                     self.global.platform,

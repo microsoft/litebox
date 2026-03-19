@@ -29,6 +29,10 @@ pub enum OpenError {
     Io,
     #[error("operation was interrupted")]
     Interrupted,
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("dirfd does not refer to a directory")]
+    NotADirectory,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -149,6 +153,10 @@ pub enum UnlinkError {
     ReadOnlyFileSystem,
     #[error("I/O error")]
     Io,
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("dirfd does not refer to a directory")]
+    NotADirectory,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -207,6 +215,10 @@ pub enum RenameError {
     ReadOnlyFileSystem,
     #[error("old and new are the same file")]
     SameFile,
+    #[error("I/O error")]
+    Io,
+    #[error("fd has been closed already")]
+    ClosedFd,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -229,8 +241,12 @@ pub enum ReadDirError {
 pub enum FileStatusError {
     #[error("fd has been closed already")]
     ClosedFd,
+    #[error("dirfd does not refer to a directory")]
+    NotADirectory,
     #[error("I/O error")]
     Io,
+    #[error("too many levels of symbolic links")]
+    SymlinkLoop,
     #[error(transparent)]
     PathError(#[from] PathError),
 }
@@ -245,6 +261,10 @@ pub enum ReadLinkError {
     Io,
     #[error("operation not supported")]
     NotSupported,
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("dirfd does not refer to a directory")]
+    NotADirectory,
     #[error(transparent)]
     PathError(#[from] PathError),
 }

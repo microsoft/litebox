@@ -42,6 +42,8 @@ pub(crate) struct FsState {
     ///
     /// Must end with a '/'.
     cwd: litebox::sync::RwLock<Platform, String>,
+    /// The path of the current executable (for `/proc/self/exe`).
+    pub(crate) exe_path: litebox::sync::RwLock<Platform, String>,
 }
 
 impl Clone for FsState {
@@ -49,6 +51,7 @@ impl Clone for FsState {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
             cwd: litebox::sync::RwLock::new(self.cwd.read().clone()),
+            exe_path: litebox::sync::RwLock::new(self.exe_path.read().clone()),
         }
     }
 }
@@ -58,6 +61,7 @@ impl FsState {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
             cwd: litebox::sync::RwLock::new(String::from("/")),
+            exe_path: litebox::sync::RwLock::new(String::new()),
         }
     }
 
@@ -72,6 +76,7 @@ impl FsState {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
             cwd: litebox::sync::RwLock::new(cwd),
+            exe_path: litebox::sync::RwLock::new(String::new()),
         }
     }
 
@@ -151,8 +156,8 @@ enum FsPath {
     Absolute { path: CString },
     /// Current working directory
     Cwd,
-    /// Path is relative to a file descriptor
-    #[expect(dead_code, reason = "currently unused, might want to use later")]
+    /// Path is relative to a file descriptor whose path is not known to
+    /// the shim. Will be passed through to the `FileSystem` `*_at` methods.
     FdRelative { fd: u32, path: CString },
     /// Fd
     Fd(u32),
@@ -165,10 +170,33 @@ impl FsPath {
     /// Create a new `FsPath` from a dirfd and path.
     ///
     /// CWD-relative paths are resolved immediately to absolute paths.
+    /// Empty paths return `ENOENT` unless `allow_empty` is true (for
+    /// syscalls that support `AT_EMPTY_PATH`).
     fn new(
         dirfd: i32,
         path: impl path::Arg,
         get_cwd: impl FnOnce() -> String,
+    ) -> Result<Self, Errno> {
+        Self::new_inner(dirfd, path, get_cwd, false)
+    }
+
+    /// Like [`new`](Self::new) but permits empty paths, producing
+    /// `FsPath::Fd` or `FsPath::Cwd`. Callers must only use this when
+    /// `AT_EMPTY_PATH` is set.
+    #[cfg(test)]
+    fn new_empty_ok(
+        dirfd: i32,
+        path: impl path::Arg,
+        get_cwd: impl FnOnce() -> String,
+    ) -> Result<Self, Errno> {
+        Self::new_inner(dirfd, path, get_cwd, true)
+    }
+
+    fn new_inner(
+        dirfd: i32,
+        path: impl path::Arg,
+        get_cwd: impl FnOnce() -> String,
+        allow_empty: bool,
     ) -> Result<Self, Errno> {
         let path_str = path.as_rust_str()?;
         if path_str.len() > PATH_MAX {
@@ -180,6 +208,9 @@ impl FsPath {
         } else if dirfd >= 0 {
             let dirfd = u32::try_from(dirfd).expect("dirfd >= 0");
             if path_str.is_empty() {
+                if !allow_empty {
+                    return Err(Errno::ENOENT);
+                }
                 FsPath::Fd(dirfd)
             } else {
                 let cpath = path.to_c_str()?.into_owned();
@@ -190,6 +221,9 @@ impl FsPath {
             }
         } else if dirfd == litebox_common_linux::AT_FDCWD {
             if path_str.is_empty() {
+                if !allow_empty {
+                    return Err(Errno::ENOENT);
+                }
                 FsPath::Cwd
             } else {
                 // Resolve CWD-relative path to absolute.
@@ -258,6 +292,94 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Resolve an executable path to a canonical absolute path for /proc/self/exe.
+    ///
+    /// Linux always reports /proc/self/exe as the fully resolved path:
+    /// relative paths are made absolute against CWD, `..`/`.` segments are
+    /// normalized, and symlinks in every component are followed (like
+    /// `realpath`).
+    pub(crate) fn resolve_exe_path(&self, path: &str) -> String {
+        let abs = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            let cwd = self.fs.borrow().cwd.read().clone();
+            alloc::format!("{cwd}{path}")
+        };
+        self.canonicalize_path(&abs).unwrap_or(abs)
+    }
+
+    /// Walk each component of an absolute path, resolving symlinks at every
+    /// level (like POSIX `realpath`). Returns `Err(ELOOP)` on symlink
+    /// cycles. When a symlink expands, its target components are spliced
+    /// into the work queue so intermediate symlinks are also resolved.
+    fn canonicalize_path(&self, path: &str) -> Result<String, Errno> {
+        let mut resolved = String::from("/");
+        let mut hops_remaining: usize = 40;
+
+        // Work queue of components still to process. Symlink expansions
+        // splice their target components to the front.
+        let mut remaining: alloc::vec::Vec<String> = path
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut idx = 0;
+
+        while idx < remaining.len() {
+            let component = remaining[idx].clone();
+            idx += 1;
+
+            match component.as_str() {
+                "" | "." => continue,
+                ".." => {
+                    if let Some(pos) = resolved[..resolved.len().saturating_sub(1)].rfind('/') {
+                        resolved.truncate(pos + 1);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            if !resolved.ends_with('/') {
+                resolved.push('/');
+            }
+            resolved.push_str(&component);
+
+            // If this prefix is a symlink, expand it: splice the target's
+            // components into the front of `remaining` and restart the
+            // outer loop so each new component is individually walked.
+            if let Ok(target) = self.do_readlink(&resolved) {
+                if hops_remaining == 0 {
+                    return Err(Errno::ELOOP);
+                }
+                hops_remaining -= 1;
+
+                if target.starts_with('/') {
+                    resolved = String::from("/");
+                } else {
+                    let parent_end = resolved.rfind('/').unwrap_or(0).max(1);
+                    resolved.truncate(parent_end);
+                }
+
+                let tail: alloc::vec::Vec<String> = remaining.drain(idx..).collect();
+                remaining.truncate(0);
+                remaining.extend(
+                    target
+                        .split('/')
+                        .filter(|c| !c.is_empty())
+                        .map(str::to_string),
+                );
+                remaining.extend(tail);
+                idx = 0;
+            }
+        }
+
+        if resolved.len() > 1 && resolved.ends_with('/') {
+            resolved.pop();
+        }
+        Ok(resolved)
+    }
+
     /// Handle syscall `umask`
     pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
         let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
@@ -298,17 +420,11 @@ impl<FS: ShimFS> Task<FS> {
         })?;
         let guest_fd = u32::try_from(raw_fd).unwrap();
 
-        // Record fd → path for ELF patch cache.
-        if let Ok(s) = path.to_str() {
-            self.process_state
-                .borrow()
-                .fd_paths
-                .lock()
-                .insert(guest_fd.cast_signed(), alloc::string::String::from(s));
-            if s == "/dev/ptmx" || s.starts_with("/dev/pts/") {
-                let rdev = self.pty_rdev_for_raw_fd(&files, raw_fd);
-                self.trace_pty_open(s, guest_fd, raw_fd, rdev);
-            }
+        if let Ok(s) = path.to_str()
+            && (s == "/dev/ptmx" || s.starts_with("/dev/pts/"))
+        {
+            let rdev = self.pty_rdev_for_raw_fd(&files, raw_fd);
+            self.trace_pty_open(s, guest_fd, raw_fd, rdev);
         }
 
         Ok(guest_fd)
@@ -331,9 +447,46 @@ impl<FS: ShimFS> Task<FS> {
                 log_unsupported!("openat with FsPath::Fd");
                 Err(Errno::EINVAL)
             }
-            FsPath::FdRelative { fd: _, path: _ } => {
-                log_unsupported!("openat with FsPath::FdRelative");
-                Err(Errno::EINVAL)
+            FsPath::FdRelative { fd, path } => {
+                let Ok(raw_fd) = usize::try_from(fd) else {
+                    return Err(Errno::EBADF);
+                };
+                let mode = mode & !self.get_umask();
+
+                let files = self.files.borrow();
+                let file = files.run_on_raw_fd(
+                    raw_fd,
+                    |dirfd| {
+                        files
+                            .fs
+                            .open_at(dirfd, path, flags - OFlags::CLOEXEC, mode)
+                            .map_err(Errno::from)
+                    },
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                )?;
+                let file = file?;
+                {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    if flags.contains(OFlags::CLOEXEC) {
+                        let None = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
+                        else {
+                            unreachable!()
+                        };
+                    }
+                    let status = flags & OFlags::STATUS_FLAGS_MASK;
+                    let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status)) else {
+                        unreachable!()
+                    };
+                }
+                let guest_raw = files.insert_raw_fd(file).map_err(|file| {
+                    files.fs.close(&file).unwrap();
+                    Errno::EMFILE
+                })?;
+                Ok(u32::try_from(guest_raw).unwrap())
             }
         }
     }
@@ -378,8 +531,49 @@ impl<FS: ShimFS> Task<FS> {
                     self.files.borrow().fs.unlink(path).map_err(Errno::from)
                 }
             }
-            FsPath::Cwd => Err(Errno::EINVAL),
-            FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
+            FsPath::Cwd | FsPath::Fd(_) => Err(Errno::EINVAL),
+            FsPath::FdRelative { fd, path } => {
+                let Ok(raw_fd) = usize::try_from(fd) else {
+                    return Err(Errno::EBADF);
+                };
+                let is_rmdir = flags.contains(AtFlags::AT_REMOVEDIR);
+
+                let files = self.files.borrow();
+                files.run_on_raw_fd(
+                    raw_fd,
+                    |dirfd| {
+                        if is_rmdir {
+                            // rmdir doesn't have an _at variant yet; resolve manually.
+                            // Verify dirfd refers to a directory.
+                            let status = files.fs.fd_file_status(dirfd).map_err(Errno::from)?;
+                            if !matches!(status.file_type, litebox::fs::FileType::Directory) {
+                                return Err(Errno::ENOTDIR);
+                            }
+                            let dir_path = files.fs.fd_path(dirfd).ok_or(Errno::EBADF)?;
+                            let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
+                            // Linux returns EINVAL for rmdir(".") or rmdir("").
+                            if rel.is_empty() || rel == "." {
+                                return Err(Errno::EINVAL);
+                            }
+                            let abs = if rel.starts_with('/') {
+                                rel.into()
+                            } else if dir_path.ends_with('/') {
+                                alloc::format!("{dir_path}{rel}")
+                            } else {
+                                alloc::format!("{dir_path}/{rel}")
+                            };
+                            files.fs.rmdir(abs).map_err(Errno::from)
+                        } else {
+                            files.fs.unlink_at(dirfd, path).map_err(Errno::from)
+                        }
+                    },
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                )?
+            }
         }
     }
 
@@ -398,12 +592,53 @@ impl<FS: ShimFS> Task<FS> {
         let get_cwd = || self.fs.borrow().cwd.read().clone();
         let old = FsPath::new(olddirfd, oldpath, get_cwd)?;
         let new = FsPath::new(newdirfd, newpath, get_cwd)?;
-        let FsPath::Absolute { path: old_path } = old else {
-            return Err(Errno::EINVAL);
+
+        // Resolve both paths to absolute strings, supporting FdRelative.
+        let resolve = |fspath: FsPath| -> Result<CString, Errno> {
+            match fspath {
+                FsPath::Absolute { path } => Ok(path),
+                FsPath::Cwd => CString::new(get_cwd()).map_err(|_| Errno::EINVAL),
+                FsPath::Fd(_) => Err(Errno::EINVAL),
+                FsPath::FdRelative { fd, path } => {
+                    let Ok(raw_fd) = usize::try_from(fd) else {
+                        return Err(Errno::EBADF);
+                    };
+
+                    let files = self.files.borrow();
+                    files.run_on_raw_fd(
+                        raw_fd,
+                        |dirfd| {
+                            // Verify dirfd refers to a directory.
+                            let status = files.fs.fd_file_status(dirfd).map_err(Errno::from)?;
+                            if !matches!(status.file_type, litebox::fs::FileType::Directory) {
+                                return Err(Errno::ENOTDIR);
+                            }
+                            let dir_path = files.fs.fd_path(dirfd).ok_or(Errno::EBADF)?;
+                            let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
+                            // Linux returns EBUSY for rename(".") or rename("").
+                            if rel.is_empty() || rel == "." {
+                                return Err(Errno::EBUSY);
+                            }
+                            let abs = if rel.starts_with('/') {
+                                rel.into()
+                            } else if dir_path.ends_with('/') {
+                                alloc::format!("{dir_path}{rel}")
+                            } else {
+                                alloc::format!("{dir_path}/{rel}")
+                            };
+                            CString::new(abs).map_err(|_| Errno::EINVAL)
+                        },
+                        |_| Err(Errno::ENOTDIR),
+                        |_| Err(Errno::ENOTDIR),
+                        |_| Err(Errno::ENOTDIR),
+                        |_| Err(Errno::ENOTDIR),
+                        |_| Err(Errno::ENOTDIR),
+                    )?
+                }
+            }
         };
-        let FsPath::Absolute { path: new_path } = new else {
-            return Err(Errno::EINVAL);
-        };
+        let old_path = resolve(old)?;
+        let new_path = resolve(new)?;
         self.files
             .borrow()
             .fs
@@ -708,9 +943,6 @@ impl<FS: ShimFS> Task<FS> {
         // trampoline RW→RX) before closing the descriptor.
         self.finalize_elf_patch(fd);
 
-        // Remove fd → path mapping.
-        self.process_state.borrow().fd_paths.lock().remove(&fd);
-
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
@@ -857,6 +1089,90 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path(pathname)?;
         let status = self.files.borrow().fs.file_status(&*pathname)?;
+        Self::check_access_mode(&status, mode)
+    }
+
+    /// Handle `faccessat` and `faccessat2` syscalls.
+    pub fn sys_faccessat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: litebox_common_linux::AccessFlags,
+        flags: litebox_common_linux::AtFlags,
+    ) -> Result<(), Errno> {
+        use litebox_common_linux::AtFlags;
+        let supported = AtFlags::AT_EACCESS | AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+        if flags.intersects(!supported) {
+            return Err(Errno::EINVAL);
+        }
+
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let allow_empty = flags.contains(AtFlags::AT_EMPTY_PATH);
+        let fs_path = FsPath::new_inner(dirfd, pathname, get_cwd, allow_empty)?;
+
+        let follow_symlinks = !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
+
+        let files = self.files.borrow();
+        let status = match fs_path {
+            FsPath::Absolute { path } => {
+                if follow_symlinks {
+                    let path_str = path.to_str().map_err(|_| Errno::EINVAL)?;
+                    let resolved = self.canonicalize_path(path_str)?;
+                    files.fs.file_status(&*resolved)?
+                } else {
+                    files.fs.file_status(&*path)?
+                }
+            }
+            FsPath::Cwd => files.fs.file_status(&*get_cwd())?,
+            FsPath::Fd(raw) => {
+                // AT_EMPTY_PATH: check the fd itself. For non-FS fds
+                // (network, pipes, etc.), the fd is valid so F_OK succeeds
+                // and we don't model fine-grained permissions.
+                let raw = usize::try_from(raw).map_err(|_| Errno::EBADF)?;
+                return files.run_on_raw_fd(
+                    raw,
+                    |fd| {
+                        let s = files.fs.fd_file_status(fd).map_err(Errno::from)?;
+                        Self::check_access_mode(&s, mode)
+                    },
+                    |_| Ok(()),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )?;
+            }
+            FsPath::FdRelative { fd, path } => {
+                // Use stat_at which handles follow_symlinks properly.
+                let raw = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+                return files.run_on_raw_fd(
+                    raw,
+                    |dirfd| {
+                        let s = files
+                            .fs
+                            .stat_at(dirfd, path, follow_symlinks)
+                            .map_err(Errno::from)?;
+                        Self::check_access_mode(&s, mode)
+                    },
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                )?;
+            }
+        };
+
+        // AT_EACCESS: use effective IDs instead of real IDs.
+        // We don't distinguish real vs effective, so this is a no-op.
+        Self::check_access_mode(&status, mode)
+    }
+
+    /// Check file access permissions against the given mode flags.
+    fn check_access_mode(
+        status: &litebox::fs::FileStatus,
+        mode: litebox_common_linux::AccessFlags,
+    ) -> Result<(), Errno> {
         if mode == litebox_common_linux::AccessFlags::F_OK {
             return Ok(());
         }
@@ -887,6 +1203,24 @@ impl<FS: ShimFS> Task<FS> {
     /// Note that this function only handles the following cases that we hardcoded:
     /// - `/proc/self/fd/<fd>`
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
+        if fullpath == "/proc/self/cwd" {
+            let cwd = self.fs.borrow().cwd.read().clone();
+            // Strip trailing slash (except for root "/") — Linux's
+            // readlink("/proc/self/cwd") never includes one.
+            let trimmed = cwd.trim_end_matches('/');
+            return Ok(if trimmed.is_empty() {
+                "/".into()
+            } else {
+                trimmed.into()
+            });
+        }
+        if fullpath == "/proc/self/exe" {
+            let exe = self.fs.borrow().exe_path.read().clone();
+            if exe.is_empty() {
+                return Err(Errno::ENOENT);
+            }
+            return Ok(exe);
+        }
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
             match fd {
@@ -935,7 +1269,32 @@ impl<FS: ShimFS> Task<FS> {
                 let cwd = self.fs.borrow().cwd.read().clone();
                 self.do_readlink(&cwd)
             }
-            FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
+            FsPath::Fd(_) => unimplemented!(),
+            FsPath::FdRelative { fd, path } => {
+                let Ok(raw_fd) = usize::try_from(fd) else {
+                    return Err(Errno::EBADF);
+                };
+
+                let files = self.files.borrow();
+                files.run_on_raw_fd(
+                    raw_fd,
+                    |dirfd| {
+                        files.fs.readlink_at(dirfd, path).map_err(|e| match e {
+                            litebox::fs::errors::ReadLinkError::NotASymlink
+                            | litebox::fs::errors::ReadLinkError::NotSupported => Errno::EINVAL,
+                            litebox::fs::errors::ReadLinkError::ClosedFd => Errno::EBADF,
+                            litebox::fs::errors::ReadLinkError::NotADirectory => Errno::ENOTDIR,
+                            litebox::fs::errors::ReadLinkError::PathError(pe) => Errno::from(pe),
+                            _ => Errno::EIO,
+                        })
+                    },
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                )?
+            }
         }?;
         let bytes = path.as_bytes();
         let min_len = core::cmp::min(buf.len(), bytes.len());
@@ -1118,8 +1477,7 @@ impl<FS: ShimFS> Task<FS> {
     fn do_stat(&self, pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, Errno> {
         let normalized_path = pathname.normalized()?;
         let path = if follow_symlink {
-            self.do_readlink(normalized_path.as_str())
-                .unwrap_or(normalized_path)
+            self.canonicalize_path(normalized_path.as_str())?
         } else {
             normalized_path
         };
@@ -1158,18 +1516,21 @@ impl<FS: ShimFS> Task<FS> {
         pathname: impl path::Arg,
         flags: AtFlags,
     ) -> Result<FileStat, Errno> {
-        let current_support_flags = AtFlags::AT_EMPTY_PATH;
-        if flags.contains(current_support_flags.complement()) {
-            todo!("unsupported flags");
+        let follow_symlinks = !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
+        let allow_empty = flags.contains(AtFlags::AT_EMPTY_PATH);
+        let supported_flags =
+            AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_NO_AUTOMOUNT;
+        let unsupported = flags & supported_flags.complement();
+        if !unsupported.is_empty() {
+            return Err(Errno::EINVAL);
         }
 
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new_inner(dirfd, pathname, get_cwd, allow_empty)?;
         let files = self.files.borrow();
         let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         let fstat: FileStat = match fs_path {
-            FsPath::Absolute { path } => {
-                self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
-            }
+            FsPath::Absolute { path } => self.do_stat(path, follow_symlinks)?,
             FsPath::Cwd => files.fs.file_status(get_cwd())?.into(),
             FsPath::Fd(fd) => {
                 let Ok(raw_fd) = usize::try_from(fd) else {
@@ -1177,7 +1538,27 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 descriptor_stat(raw_fd, self)?
             }
-            FsPath::FdRelative { .. } => todo!(),
+            FsPath::FdRelative { fd, path } => {
+                let Ok(raw_fd) = usize::try_from(fd) else {
+                    return Err(Errno::EBADF);
+                };
+
+                files.run_on_raw_fd(
+                    raw_fd,
+                    |dirfd| {
+                        files
+                            .fs
+                            .stat_at(dirfd, path, follow_symlinks)
+                            .map(FileStat::from)
+                            .map_err(Errno::from)
+                    },
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                )??
+            }
         };
         Ok(fstat)
     }
@@ -1455,6 +1836,40 @@ impl<FS: ShimFS> Task<FS> {
             new_cwd.push('/');
         }
 
+        *self.fs.borrow().cwd.write() = new_cwd;
+        Ok(())
+    }
+
+    /// Handle syscall `fchdir` — change working directory via an open directory fd.
+    pub fn sys_fchdir(&self, fd: i32) -> Result<(), Errno> {
+        use litebox::fs::FileType;
+
+        let raw = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+
+        // Get the path and verify it's a directory.
+        let dir_path = files.run_on_raw_fd(
+            raw,
+            |typed_fd| {
+                let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
+                if status.file_type != FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+                files.fs.fd_path(typed_fd).ok_or(Errno::EBADF)
+            },
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+        )??;
+
+        let mut new_cwd = dir_path;
+        if !new_cwd.ends_with('/') {
+            new_cwd.push('/');
+        }
+
+        drop(files);
         *self.fs.borrow().cwd.write() = new_cwd;
         Ok(())
     }
@@ -2868,15 +3283,26 @@ mod tests {
             matches!(fp, FsPath::Absolute { path } if path.to_str().unwrap() == "/home/foo/bar")
         );
 
-        // Empty path at AT_FDCWD → Cwd variant.
-        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "", || {
+        // Empty path at AT_FDCWD → ENOENT (no AT_EMPTY_PATH).
+        let err = FsPath::new(litebox_common_linux::AT_FDCWD, "", || {
+            panic!("get_cwd should not be called for empty path")
+        })
+        .unwrap_err();
+        assert_eq!(err, Errno::ENOENT);
+
+        // Positive fd + empty path → ENOENT (no AT_EMPTY_PATH).
+        let err = FsPath::new(5, "", || panic!("should not be called")).unwrap_err();
+        assert_eq!(err, Errno::ENOENT);
+
+        // Empty path at AT_FDCWD with new_empty_ok → Cwd variant.
+        let fp = FsPath::new_empty_ok(litebox_common_linux::AT_FDCWD, "", || {
             panic!("get_cwd should not be called for empty Cwd path")
         })
         .unwrap();
         assert!(matches!(fp, FsPath::Cwd));
 
-        // Positive fd + empty path → Fd variant.
-        let fp = FsPath::new(5, "", || panic!("should not be called")).unwrap();
+        // Positive fd + empty path with new_empty_ok → Fd variant.
+        let fp = FsPath::new_empty_ok(5, "", || panic!("should not be called")).unwrap();
         assert!(matches!(fp, FsPath::Fd(5)));
 
         // Invalid dirfd → EBADF.
@@ -2890,6 +3316,13 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err, Errno::ENAMETOOLONG);
+
+        // Positive fd + non-empty path → FdRelative variant.
+        let fp = FsPath::new(3, "child/file.txt", || {
+            panic!("get_cwd should not be called")
+        })
+        .unwrap();
+        assert!(matches!(fp, FsPath::FdRelative { fd: 3, .. }));
     }
 
     #[test]
@@ -2958,7 +3391,71 @@ mod tests {
         assert_eq!(cwd, "/rel_parent/");
     }
 
-    /// Verify every path-taking syscall resolves relative paths after `chdir`.
+    #[test]
+    fn fchdir_changes_cwd() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        task.sys_mkdir("/fchdir_test", 0o777).unwrap();
+
+        // Open the directory.
+        let dirfd = task
+            .sys_open(
+                "/fchdir_test",
+                litebox::fs::OFlags::RDONLY | litebox::fs::OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+
+        // fchdir to it.
+        task.sys_fchdir(i32::try_from(dirfd).unwrap()).unwrap();
+
+        let mut buf = [0u8; 256];
+        let len = task.sys_getcwd(&mut buf).unwrap();
+        let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
+        assert_eq!(cwd, "/fchdir_test/");
+
+        // fchdir on a regular file fd → ENOTDIR.
+        let filefd = task
+            .sys_open(
+                "/fchdir_test/file.txt",
+                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        assert_eq!(
+            task.sys_fchdir(i32::try_from(filefd).unwrap()).unwrap_err(),
+            Errno::ENOTDIR
+        );
+
+        // fchdir on a closed fd → EBADF.
+        task.sys_close(i32::try_from(dirfd).unwrap()).unwrap();
+        assert_eq!(
+            task.sys_fchdir(i32::try_from(dirfd).unwrap()).unwrap_err(),
+            Errno::EBADF
+        );
+
+        task.sys_close(i32::try_from(filefd).unwrap()).unwrap();
+    }
+
+    /// readlink("/proc/self/cwd") must return the CWD without a trailing slash.
+    #[test]
+    fn readlink_proc_self_cwd_no_trailing_slash() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Default CWD is "/" — readlink should return "/" (root is special).
+        let mut buf = [0u8; 256];
+        let len = task.sys_readlink("/proc/self/cwd", &mut buf).unwrap();
+        let link = core::str::from_utf8(&buf[..len]).unwrap();
+        assert_eq!(link, "/");
+
+        // chdir to a subdirectory.
+        task.sys_mkdir("/proc_cwd_test", 0o777).unwrap();
+        task.sys_chdir("/proc_cwd_test").unwrap();
+
+        let len = task.sys_readlink("/proc/self/cwd", &mut buf).unwrap();
+        let link = core::str::from_utf8(&buf[..len]).unwrap();
+        assert_eq!(link, "/proc_cwd_test", "must not have trailing slash");
+    }
     #[test]
     fn all_path_syscalls_respect_chdir() {
         use litebox_common_linux::{AccessFlags, AtFlags};
@@ -3034,5 +3531,248 @@ mod tests {
             task.sys_stat("/cwd_test/subdir").unwrap_err(),
             Errno::ENOENT
         );
+    }
+
+    /// Verify `*_at` syscalls work with a real directory fd (FdRelative dispatch).
+    #[test]
+    fn fd_relative_syscalls() {
+        use litebox_common_linux::AtFlags;
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Create /fdrel_test/ with a seed file.
+        task.sys_mkdir("/fdrel_test", 0o777).unwrap();
+        let seed_fd = task
+            .sys_open(
+                "/fdrel_test/seed.txt",
+                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        task.sys_close(i32::try_from(seed_fd).unwrap()).unwrap();
+
+        // Open the directory to get a real dirfd.
+        let dirfd = task
+            .sys_open(
+                "/fdrel_test",
+                litebox::fs::OFlags::RDONLY | litebox::fs::OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        let dirfd_i32 = i32::try_from(dirfd).unwrap();
+
+        // ── sys_newfstatat(dirfd, "seed.txt") ──
+        task.sys_newfstatat(dirfd_i32, "seed.txt", AtFlags::empty())
+            .unwrap();
+
+        // ── sys_openat(dirfd, "new.txt", O_CREAT|O_WRONLY) ──
+        let new_fd = task
+            .sys_openat(
+                dirfd_i32,
+                "new.txt",
+                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        task.sys_close(i32::try_from(new_fd).unwrap()).unwrap();
+
+        // Verify via absolute path that the file was created.
+        task.sys_stat("/fdrel_test/new.txt").unwrap();
+
+        // ── sys_unlinkat(dirfd, "new.txt") ──
+        task.sys_unlinkat(dirfd_i32, "new.txt", AtFlags::empty())
+            .unwrap();
+        assert_eq!(
+            task.sys_stat("/fdrel_test/new.txt").unwrap_err(),
+            Errno::ENOENT
+        );
+
+        // ── sys_newfstatat(dirfd, "nonexistent") → ENOENT ──
+        assert_eq!(
+            task.sys_newfstatat(dirfd_i32, "nonexistent", AtFlags::empty())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+
+        // Clean up: close dirfd.
+        task.sys_close(dirfd_i32).unwrap();
+
+        // ── After closing dirfd, FdRelative should fail with EBADF ──
+        assert_eq!(
+            task.sys_newfstatat(dirfd_i32, "seed.txt", AtFlags::empty())
+                .unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    /// Non-directory fds used as dirfd must return ENOTDIR, not act on the file.
+    #[test]
+    fn fd_relative_rejects_non_directory_dirfd() {
+        use litebox_common_linux::AtFlags;
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Create a regular file and open it.
+        let filefd = task
+            .sys_open(
+                "/notdir_test_file",
+                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let filefd_i32 = i32::try_from(filefd).unwrap();
+
+        // fstatat(filefd, ".", ...) must return ENOTDIR, not stat the file.
+        assert_eq!(
+            task.sys_newfstatat(filefd_i32, ".", AtFlags::empty())
+                .unwrap_err(),
+            Errno::ENOTDIR
+        );
+
+        // openat(filefd, "child", ...) must return ENOTDIR.
+        assert_eq!(
+            task.sys_openat(
+                filefd_i32,
+                "child",
+                litebox::fs::OFlags::RDONLY,
+                Mode::empty(),
+            )
+            .unwrap_err(),
+            Errno::ENOTDIR
+        );
+
+        // unlinkat(filefd, "child", 0) must return ENOTDIR.
+        assert_eq!(
+            task.sys_unlinkat(filefd_i32, "child", AtFlags::empty())
+                .unwrap_err(),
+            Errno::ENOTDIR
+        );
+
+        task.sys_close(filefd_i32).unwrap();
+    }
+
+    /// Verify `faccessat` works with AT_FDCWD, real dirfd, and invalid flags.
+    #[test]
+    fn faccessat_syscall() {
+        use litebox_common_linux::{AccessFlags, AtFlags};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Create /acc_test/ with a file inside.
+        task.sys_mkdir("/acc_test", 0o777).unwrap();
+        let fd = task
+            .sys_open(
+                "/acc_test/file.txt",
+                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR | Mode::XUSR,
+            )
+            .unwrap();
+        task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+
+        // ── faccessat(AT_FDCWD, absolute path, F_OK) ──
+        task.sys_faccessat(
+            litebox_common_linux::AT_FDCWD,
+            "/acc_test/file.txt",
+            AccessFlags::F_OK,
+            AtFlags::empty(),
+        )
+        .unwrap();
+
+        // ── faccessat(AT_FDCWD, relative path after chdir) ──
+        task.sys_chdir("/acc_test").unwrap();
+        task.sys_faccessat(
+            litebox_common_linux::AT_FDCWD,
+            "file.txt",
+            AccessFlags::R_OK | AccessFlags::W_OK,
+            AtFlags::empty(),
+        )
+        .unwrap();
+
+        // ── faccessat with real dirfd ──
+        let dirfd = task
+            .sys_open(
+                "/acc_test",
+                litebox::fs::OFlags::RDONLY | litebox::fs::OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        let dirfd_i32 = i32::try_from(dirfd).unwrap();
+
+        task.sys_faccessat(dirfd_i32, "file.txt", AccessFlags::F_OK, AtFlags::empty())
+            .unwrap();
+
+        task.sys_faccessat(
+            dirfd_i32,
+            "file.txt",
+            AccessFlags::R_OK | AccessFlags::X_OK,
+            AtFlags::empty(),
+        )
+        .unwrap();
+
+        // ── faccessat on nonexistent file → ENOENT ──
+        assert_eq!(
+            task.sys_faccessat(dirfd_i32, "nope.txt", AccessFlags::F_OK, AtFlags::empty())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+
+        // ── faccessat with unsupported flags → EINVAL ──
+        assert_eq!(
+            task.sys_faccessat(
+                litebox_common_linux::AT_FDCWD,
+                "/acc_test/file.txt",
+                AccessFlags::F_OK,
+                AtFlags::AT_NO_AUTOMOUNT,
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+
+        task.sys_close(dirfd_i32).unwrap();
+    }
+
+    /// rmdir(".", dirfd) must return EINVAL and rename(".", dirfd) must return EBUSY.
+    #[test]
+    fn dot_path_special_errors() {
+        use litebox_common_linux::AtFlags;
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        task.sys_mkdir("/dot_test", 0o777).unwrap();
+        task.sys_mkdir("/dot_test/sub", 0o777).unwrap();
+
+        let dirfd = task
+            .sys_open(
+                "/dot_test/sub",
+                litebox::fs::OFlags::RDONLY | litebox::fs::OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        let dirfd_i32 = i32::try_from(dirfd).unwrap();
+
+        // unlinkat(dirfd, ".", AT_REMOVEDIR) → EINVAL (kernel behavior)
+        assert_eq!(
+            task.sys_unlinkat(dirfd_i32, ".", AtFlags::AT_REMOVEDIR)
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+
+        // renameat2(dirfd, ".", AT_FDCWD, "/dot_test/other") → EBUSY
+        assert_eq!(
+            task.sys_renameat2(
+                dirfd_i32,
+                ".",
+                litebox_common_linux::AT_FDCWD,
+                "/dot_test/other",
+                0,
+            )
+            .unwrap_err(),
+            Errno::EBUSY
+        );
+
+        // The directory must still exist after the failed operations.
+        task.sys_stat("/dot_test/sub").unwrap();
+
+        task.sys_close(dirfd_i32).unwrap();
     }
 }

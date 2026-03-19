@@ -244,8 +244,10 @@ pub fn sys_madvise<
     match advice {
         crate::MadviseBehavior::Normal
         | crate::MadviseBehavior::DontFork
-        | crate::MadviseBehavior::DoFork => {
-            // No-op for now, as we don't support fork yet.
+        | crate::MadviseBehavior::DoFork
+        | crate::MadviseBehavior::WipeOnFork
+        | crate::MadviseBehavior::KeepOnFork => {
+            // Fork-related hints are no-ops for now.
             Ok(())
         }
         crate::MadviseBehavior::DontNeed => {

@@ -350,6 +350,117 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
     }
 
+    /// Get the stored path from any fd's Descriptor.
+    fn descriptor_path(&self, dirfd: &FileFd<Platform, T>) -> Option<alloc::string::String> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(dirfd)?;
+        Some(entry.entry.path.clone())
+    }
+
+    /// Get the stored path from a directory fd's Descriptor.
+    fn dir_fd_path(
+        &self,
+        dirfd: &FileFd<Platform, T>,
+    ) -> Result<alloc::string::String, super::DirFdError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table
+            .get_entry(dirfd)
+            .ok_or(super::DirFdError::ClosedFd)?;
+        if entry.entry.qid.typ.contains(fcall::QidType::DIR) {
+            Ok(entry.entry.path.clone())
+        } else {
+            Err(super::DirFdError::NotADirectory)
+        }
+    }
+
+    /// Resolve a relative path against a base directory path.
+    fn resolve_relative(base: &str, rel: &str) -> Result<alloc::string::String, PathError> {
+        if rel.is_empty() || rel == "." {
+            return Ok(base.into());
+        }
+        if rel.starts_with('/') {
+            return Ok(rel.normalized()?);
+        }
+        let combined = if base.ends_with('/') {
+            alloc::format!("{base}{rel}")
+        } else {
+            alloc::format!("{base}/{rel}")
+        };
+        Ok(combined.normalized()?)
+    }
+
+    /// Resolve symlinks in every component of `path` (like `realpath`).
+    ///
+    /// Walks each component, checking for symlinks at each prefix. When a
+    /// symlink is found, its target's components are spliced into the work
+    /// queue so nested symlinks within the target are also resolved.
+    /// Returns `SymlinkLoop` if more than `max_hops` symlinks are followed.
+    fn resolve_follow_symlinks(
+        &self,
+        path: alloc::string::String,
+        max_hops: usize,
+    ) -> Result<alloc::string::String, super::FileStatusError> {
+        let mut resolved = alloc::string::String::from("/");
+        let mut hops_remaining = max_hops;
+
+        let mut remaining: alloc::vec::Vec<alloc::string::String> = path
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(alloc::string::String::from)
+            .collect();
+        let mut idx = 0;
+
+        while idx < remaining.len() {
+            let component = remaining[idx].clone();
+            idx += 1;
+
+            match component.as_str() {
+                "" | "." => continue,
+                ".." => {
+                    if let Some(pos) = resolved[..resolved.len().saturating_sub(1)].rfind('/') {
+                        resolved.truncate(pos + 1);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            if !resolved.ends_with('/') {
+                resolved.push('/');
+            }
+            resolved.push_str(&component);
+
+            if let Ok(t) = <Self as super::FileSystem>::read_link(self, &*resolved) {
+                if hops_remaining == 0 {
+                    return Err(super::FileStatusError::SymlinkLoop);
+                }
+                hops_remaining -= 1;
+
+                if t.starts_with('/') {
+                    resolved = alloc::string::String::from("/");
+                } else {
+                    let parent_end = resolved.rfind('/').unwrap_or(0).max(1);
+                    resolved.truncate(parent_end);
+                }
+
+                let tail: alloc::vec::Vec<alloc::string::String> = remaining.drain(idx..).collect();
+                remaining.truncate(0);
+                remaining.extend(
+                    t.split('/')
+                        .filter(|c| !c.is_empty())
+                        .map(alloc::string::String::from),
+                );
+                remaining.extend(tail);
+                idx = 0;
+            }
+        }
+
+        if resolved.len() > 1 && resolved.ends_with('/') {
+            resolved.pop();
+        }
+        Ok(resolved)
+    }
+
     /// Walk to a path and return the fid
     fn walk_to(&self, path: &str) -> Result<fcall::Fid, Error> {
         let components: Vec<&str> = path
@@ -609,6 +720,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             fid: new_fid,
             offset: AtomicUsize::new(0),
             qid: new_qid,
+            path: path.clone(),
         };
 
         let fd = self.litebox.descriptor_table_mut().insert(descriptor);
@@ -981,9 +1093,122 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let target = target.map_err(|_| super::errors::ReadLinkError::Io)?;
         alloc::string::String::from_utf8(target).map_err(|_| super::errors::ReadLinkError::Io)
     }
-}
 
-/// Internal descriptor state for a 9P file descriptor
+    fn open_at(
+        &self,
+        dirfd: &FileFd<Platform, T>,
+        rel_path: impl crate::path::Arg,
+        flags: super::OFlags,
+        mode: super::Mode,
+    ) -> Result<FileFd<Platform, T>, super::errors::OpenError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::OpenError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::OpenError::NotADirectory,
+            super::DirFdError::Io => super::errors::OpenError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::errors::OpenError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(super::errors::OpenError::PathError)?;
+        self.open(abs, flags, mode)
+    }
+
+    fn stat_at(
+        &self,
+        dirfd: &FileFd<Platform, T>,
+        rel_path: impl crate::path::Arg,
+        follow_symlinks: bool,
+    ) -> Result<super::FileStatus, super::FileStatusError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::FileStatusError::ClosedFd,
+            super::DirFdError::NotADirectory => super::FileStatusError::NotADirectory,
+            super::DirFdError::Io => super::FileStatusError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::FileStatusError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(super::FileStatusError::PathError)?;
+        // When following symlinks, resolve the full chain (up to 40 hops).
+        // Relative targets are resolved against the symlink's parent
+        // directory, not the process CWD.
+        let resolved = if follow_symlinks {
+            self.resolve_follow_symlinks(abs, 40)?
+        } else {
+            abs
+        };
+        self.file_status(resolved)
+    }
+
+    fn unlink_at(
+        &self,
+        dirfd: &FileFd<Platform, T>,
+        rel_path: impl crate::path::Arg,
+    ) -> Result<(), super::errors::UnlinkError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::UnlinkError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::UnlinkError::NotADirectory,
+            super::DirFdError::Io => super::errors::UnlinkError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::errors::UnlinkError::PathError(e.into()))?;
+        let abs =
+            Self::resolve_relative(&dir, rel).map_err(super::errors::UnlinkError::PathError)?;
+        self.unlink(abs)
+    }
+
+    fn readlink_at(
+        &self,
+        dirfd: &FileFd<Platform, T>,
+        rel_path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::ReadLinkError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::ReadLinkError::NotADirectory,
+            super::DirFdError::Io => super::errors::ReadLinkError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::errors::ReadLinkError::PathError(e.into()))?;
+        let abs =
+            Self::resolve_relative(&dir, rel).map_err(super::errors::ReadLinkError::PathError)?;
+        self.read_link(abs)
+    }
+
+    fn rename_at(
+        &self,
+        old_dirfd: &FileFd<Platform, T>,
+        old_rel: impl crate::path::Arg,
+        new_dirfd: &FileFd<Platform, T>,
+        new_rel: impl crate::path::Arg,
+    ) -> Result<(), super::errors::RenameError> {
+        let old_dir = self.dir_fd_path(old_dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::RenameError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::RenameError::NotADirectory,
+            super::DirFdError::Io => super::errors::RenameError::Io,
+        })?;
+        let old_r = old_rel
+            .as_rust_str()
+            .map_err(|e| super::errors::RenameError::PathError(e.into()))?;
+        let old_abs = Self::resolve_relative(&old_dir, old_r)
+            .map_err(super::errors::RenameError::PathError)?;
+        let new_dir = self.dir_fd_path(new_dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::RenameError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::RenameError::NotADirectory,
+            super::DirFdError::Io => super::errors::RenameError::Io,
+        })?;
+        let new_r = new_rel
+            .as_rust_str()
+            .map_err(|e| super::errors::RenameError::PathError(e.into()))?;
+        let new_abs = Self::resolve_relative(&new_dir, new_r)
+            .map_err(super::errors::RenameError::PathError)?;
+        self.rename(old_abs, new_abs)
+    }
+
+    fn fd_path(&self, fd: &FileFd<Platform, T>) -> Option<alloc::string::String> {
+        self.descriptor_path(fd)
+    }
+}
 #[derive(Debug)]
 struct Descriptor {
     /// The 9P fid for this file
@@ -992,6 +1217,8 @@ struct Descriptor {
     offset: AtomicUsize,
     /// The qid of the file (contains type and unique ID)
     qid: fcall::Qid,
+    /// Path used to open this file
+    path: alloc::string::String,
 }
 
 crate::fd::enable_fds_for_subsystem! {

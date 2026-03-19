@@ -164,7 +164,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 Ok(FileType::RegularFile | FileType::CharacterDevice)
                 | Err(
                     FileStatusError::PathError(PathError::MissingComponent)
-                    | FileStatusError::ClosedFd,
+                    | FileStatusError::ClosedFd
+                    | FileStatusError::NotADirectory,
                 ) => unreachable!(),
                 Err(FileStatusError::PathError(PathError::ComponentNotADirectory)) => {
                     unimplemented!()
@@ -179,7 +180,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     assert_ne!(dir, path);
                     return Err(PathError::MissingComponent)?;
                 }
-                Err(FileStatusError::Io) => return Err(MkdirError::Io),
+                Err(FileStatusError::Io | FileStatusError::SymlinkLoop) => {
+                    return Err(MkdirError::Io);
+                }
             }
         }
         // The loop above should return at one of its return points
@@ -224,6 +227,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                | OpenError::ClosedFd
+                | OpenError::NotADirectory
                 | OpenError::TruncateError(_) => unreachable!(),
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
@@ -422,6 +427,134 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
     }
 
+    /// Get the stored path from any fd's Descriptor.
+    fn descriptor_path(&self, dirfd: &FileFd<Platform, Upper, Lower>) -> Option<String> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(dirfd)?;
+        Some(entry.entry.path.clone())
+    }
+
+    /// Get the stored path from a directory fd's Descriptor.
+    fn dir_fd_path(
+        &self,
+        dirfd: &FileFd<Platform, Upper, Lower>,
+    ) -> Result<String, super::DirFdError> {
+        // Clone the path and underlying entry in a single borrow scope so the
+        // descriptor_table borrow is released before we query the backend.
+        let (path, entry) = {
+            let descriptor_table = self.litebox.descriptor_table();
+            let desc = descriptor_table
+                .get_entry(dirfd)
+                .ok_or(super::DirFdError::ClosedFd)?;
+            (desc.entry.path.clone(), Arc::clone(&desc.entry.entry))
+        };
+        // Check the actual file type from the underlying backend rather than
+        // relying on OFlags::DIRECTORY, which the caller may not have set.
+        let file_type = match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.fd_file_status(fd),
+            EntryX::Lower { fd } => self.lower.fd_file_status(fd),
+            EntryX::Tombstone => return Err(super::DirFdError::ClosedFd),
+        }
+        .map_err(|e| match e {
+            FileStatusError::ClosedFd => super::DirFdError::ClosedFd,
+            _ => super::DirFdError::Io,
+        })?
+        .file_type;
+        if matches!(file_type, super::FileType::Directory) {
+            Ok(path)
+        } else {
+            Err(super::DirFdError::NotADirectory)
+        }
+    }
+
+    /// Resolve a relative path against a base directory path.
+    fn resolve_relative(base: &str, rel: &str) -> Result<String, PathError> {
+        if rel.is_empty() || rel == "." {
+            return Ok(base.into());
+        }
+        if rel.starts_with('/') {
+            return Ok(rel.normalized()?);
+        }
+        let combined = if base.ends_with('/') {
+            alloc::format!("{base}{rel}")
+        } else {
+            alloc::format!("{base}/{rel}")
+        };
+        Ok(combined.normalized()?)
+    }
+
+    /// Resolve symlinks in every component of `path` (like `realpath`).
+    ///
+    /// Walks each component, checking for symlinks at each prefix. When a
+    /// symlink is found, its target's components are spliced into the work
+    /// queue so nested symlinks within the target are also resolved.
+    /// Returns `SymlinkLoop` if more than `max_hops` symlinks are followed.
+    fn resolve_follow_symlinks(
+        &self,
+        path: String,
+        max_hops: usize,
+    ) -> Result<String, super::FileStatusError> {
+        let mut resolved = alloc::string::String::from("/");
+        let mut hops_remaining = max_hops;
+
+        let mut remaining: alloc::vec::Vec<alloc::string::String> = path
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(alloc::string::String::from)
+            .collect();
+        let mut idx = 0;
+
+        while idx < remaining.len() {
+            let component = remaining[idx].clone();
+            idx += 1;
+
+            match component.as_str() {
+                "" | "." => continue,
+                ".." => {
+                    if let Some(pos) = resolved[..resolved.len().saturating_sub(1)].rfind('/') {
+                        resolved.truncate(pos + 1);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            if !resolved.ends_with('/') {
+                resolved.push('/');
+            }
+            resolved.push_str(&component);
+
+            if let Ok(t) = <Self as super::FileSystem>::read_link(self, &*resolved) {
+                if hops_remaining == 0 {
+                    return Err(super::FileStatusError::SymlinkLoop);
+                }
+                hops_remaining -= 1;
+
+                if t.starts_with('/') {
+                    resolved = alloc::string::String::from("/");
+                } else {
+                    let parent_end = resolved.rfind('/').unwrap_or(0).max(1);
+                    resolved.truncate(parent_end);
+                }
+
+                let tail: alloc::vec::Vec<alloc::string::String> = remaining.drain(idx..).collect();
+                remaining.truncate(0);
+                remaining.extend(
+                    t.split('/')
+                        .filter(|c| !c.is_empty())
+                        .map(alloc::string::String::from),
+                );
+                remaining.extend(tail);
+                idx = 0;
+            }
+        }
+
+        if resolved.len() > 1 && resolved.ends_with('/') {
+            resolved.pop();
+        }
+        Ok(resolved)
+    }
+
     // Converts a `NodeInfo` from any of the layers into a layered `NodeInfo`
     fn get_layered_nodeinfo(&self, node_info: NodeInfo) -> NodeInfo {
         let mut node_info_lookup = self.node_info_lookup.write();
@@ -559,6 +692,8 @@ impl<
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                | OpenError::ClosedFd
+                | OpenError::NotADirectory
                 | OpenError::TruncateError(
                     TruncateError::IsDirectory
                     | TruncateError::NotForWriting
@@ -1041,9 +1176,9 @@ impl<
         }
         match self.ensure_lower_contains(&path) {
             Ok(_) => {}
-            Err(FileStatusError::Io) => return Err(ChmodError::Io),
+            Err(FileStatusError::Io | FileStatusError::SymlinkLoop) => return Err(ChmodError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChmodError::PathError(e)),
-            Err(FileStatusError::ClosedFd) => unreachable!(),
+            Err(FileStatusError::ClosedFd | FileStatusError::NotADirectory) => unreachable!(),
         }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
@@ -1086,9 +1221,9 @@ impl<
         }
         match self.ensure_lower_contains(&path) {
             Ok(_) => {}
-            Err(FileStatusError::Io) => return Err(ChownError::Io),
+            Err(FileStatusError::Io | FileStatusError::SymlinkLoop) => return Err(ChownError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChownError::PathError(e)),
-            Err(FileStatusError::ClosedFd) => unreachable!(),
+            Err(FileStatusError::ClosedFd | FileStatusError::NotADirectory) => unreachable!(),
         }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
@@ -1121,6 +1256,8 @@ impl<
                 | UnlinkError::Io
                 | UnlinkError::IsADirectory
                 | UnlinkError::ReadOnlyFileSystem
+                | UnlinkError::ClosedFd
+                | UnlinkError::NotADirectory
                 | UnlinkError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
@@ -1134,9 +1271,11 @@ impl<
                     // We must now check if the lower level contains the file; if it does not, we
                     // must exit with failure. Otherwise, we fallthrough to place the tombstone.
                     match self.ensure_lower_contains(&path).map_err(|e| match e {
-                        FileStatusError::Io => UnlinkError::Io,
+                        FileStatusError::Io | FileStatusError::SymlinkLoop => UnlinkError::Io,
                         FileStatusError::PathError(p) => UnlinkError::PathError(p),
-                        FileStatusError::ClosedFd => unreachable!(),
+                        FileStatusError::ClosedFd | FileStatusError::NotADirectory => {
+                            unreachable!()
+                        }
                     })? {
                         FileType::RegularFile => {
                             // fallthrough
@@ -1236,6 +1375,8 @@ impl<
                 }
                 OpenError::NoWritePerms
                 | OpenError::AlreadyExists
+                | OpenError::ClosedFd
+                | OpenError::NotADirectory
                 | OpenError::Interrupted
                 | OpenError::TruncateError(_) => {
                     unreachable!()
@@ -1414,13 +1555,13 @@ impl<
                     // None of these can be handled by lower level, just quit out early
                     return Err(e);
                 }
-                FileStatusError::Io => return Err(e),
+                FileStatusError::Io | FileStatusError::SymlinkLoop => return Err(e),
                 FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
                     // Handle-able by a lower level, fallthrough
                 }
-                FileStatusError::ClosedFd => unreachable!(),
+                FileStatusError::ClosedFd | FileStatusError::NotADirectory => unreachable!(),
             },
         }
         let FileStatus {
@@ -1553,6 +1694,118 @@ impl<
             ) => self.lower.read_link(path),
             Err(e) => Err(e),
         }
+    }
+
+    fn open_at(
+        &self,
+        dirfd: &FileFd<Platform, Upper, Lower>,
+        rel_path: impl crate::path::Arg,
+        flags: super::OFlags,
+        mode: super::Mode,
+    ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => OpenError::ClosedFd,
+            super::DirFdError::NotADirectory => OpenError::NotADirectory,
+            super::DirFdError::Io => OpenError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| OpenError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(OpenError::PathError)?;
+        self.open(abs, flags, mode)
+    }
+
+    fn stat_at(
+        &self,
+        dirfd: &FileFd<Platform, Upper, Lower>,
+        rel_path: impl crate::path::Arg,
+        follow_symlinks: bool,
+    ) -> Result<super::FileStatus, super::FileStatusError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::FileStatusError::ClosedFd,
+            super::DirFdError::NotADirectory => super::FileStatusError::NotADirectory,
+            super::DirFdError::Io => super::FileStatusError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::FileStatusError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(super::FileStatusError::PathError)?;
+        // When following symlinks, resolve the full chain (up to 40 hops).
+        // Relative targets are resolved against the symlink's parent
+        // directory, not the process CWD.
+        let resolved = if follow_symlinks {
+            self.resolve_follow_symlinks(abs, 40)?
+        } else {
+            abs
+        };
+        self.file_status(resolved)
+    }
+
+    fn unlink_at(
+        &self,
+        dirfd: &FileFd<Platform, Upper, Lower>,
+        rel_path: impl crate::path::Arg,
+    ) -> Result<(), UnlinkError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => UnlinkError::ClosedFd,
+            super::DirFdError::NotADirectory => UnlinkError::NotADirectory,
+            super::DirFdError::Io => UnlinkError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| UnlinkError::PathError(e.into()))?;
+        let abs = Self::resolve_relative(&dir, rel).map_err(UnlinkError::PathError)?;
+        self.unlink(abs)
+    }
+
+    fn readlink_at(
+        &self,
+        dirfd: &FileFd<Platform, Upper, Lower>,
+        rel_path: impl crate::path::Arg,
+    ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
+        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => super::errors::ReadLinkError::ClosedFd,
+            super::DirFdError::NotADirectory => super::errors::ReadLinkError::NotADirectory,
+            super::DirFdError::Io => super::errors::ReadLinkError::Io,
+        })?;
+        let rel = rel_path
+            .as_rust_str()
+            .map_err(|e| super::errors::ReadLinkError::PathError(e.into()))?;
+        let abs =
+            Self::resolve_relative(&dir, rel).map_err(super::errors::ReadLinkError::PathError)?;
+        self.read_link(abs)
+    }
+
+    fn rename_at(
+        &self,
+        old_dirfd: &FileFd<Platform, Upper, Lower>,
+        old_rel: impl crate::path::Arg,
+        new_dirfd: &FileFd<Platform, Upper, Lower>,
+        new_rel: impl crate::path::Arg,
+    ) -> Result<(), RenameError> {
+        let old_dir = self.dir_fd_path(old_dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => RenameError::ClosedFd,
+            super::DirFdError::NotADirectory => RenameError::NotADirectory,
+            super::DirFdError::Io => RenameError::Io,
+        })?;
+        let old_r = old_rel
+            .as_rust_str()
+            .map_err(|e| RenameError::PathError(e.into()))?;
+        let old_abs = Self::resolve_relative(&old_dir, old_r).map_err(RenameError::PathError)?;
+        let new_dir = self.dir_fd_path(new_dirfd).map_err(|e| match e {
+            super::DirFdError::ClosedFd => RenameError::ClosedFd,
+            super::DirFdError::NotADirectory => RenameError::NotADirectory,
+            super::DirFdError::Io => RenameError::Io,
+        })?;
+        let new_r = new_rel
+            .as_rust_str()
+            .map_err(|e| RenameError::PathError(e.into()))?;
+        let new_abs = Self::resolve_relative(&new_dir, new_r).map_err(RenameError::PathError)?;
+        self.rename(old_abs, new_abs)
+    }
+
+    fn fd_path(&self, fd: &FileFd<Platform, Upper, Lower>) -> Option<alloc::string::String> {
+        self.descriptor_path(fd)
     }
 }
 

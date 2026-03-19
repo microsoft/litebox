@@ -2121,3 +2121,276 @@ mod layered_stdio {
         assert_eq!(litebox.x.platform.stderr_queue.read().unwrap()[0], data);
     }
 }
+
+mod in_mem_at {
+    use crate::LiteBox;
+    use crate::fs::in_mem;
+    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::platform::mock::MockPlatform;
+    extern crate std;
+
+    /// Helper: set up a filesystem with /dir/ containing a file.
+    fn setup_with_dir_and_file() -> in_mem::FileSystem<MockPlatform> {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/dir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("mkdir /dir");
+            let fd = fs
+                .open("/dir/hello.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("create hello.txt");
+            fs.write(&fd, b"hello", None).expect("write");
+            fs.close(&fd).expect("close");
+        });
+        fs
+    }
+
+    #[test]
+    fn open_at_creates_file_relative_to_dirfd() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            let fd = fs
+                .open_at(
+                    &dirfd,
+                    "new.txt",
+                    OFlags::CREAT | OFlags::WRONLY,
+                    Mode::RWXU,
+                )
+                .expect("open_at create");
+            fs.write(&fd, b"world", None).expect("write");
+            fs.close(&fd).expect("close");
+            fs.close(&dirfd).expect("close dirfd");
+
+            // Verify via absolute path.
+            let fd = fs
+                .open("/dir/new.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open absolute");
+            let mut buf = [0u8; 5];
+            let n = fs.read(&fd, &mut buf, None).expect("read");
+            assert_eq!(n, 5);
+            assert_eq!(&buf, b"world");
+            fs.close(&fd).expect("close");
+        });
+    }
+
+    #[test]
+    fn open_at_reads_existing_file() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            let fd = fs
+                .open_at(&dirfd, "hello.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open_at read");
+            let mut buf = [0u8; 5];
+            let n = fs.read(&fd, &mut buf, None).expect("read");
+            assert_eq!(n, 5);
+            assert_eq!(&buf, b"hello");
+            fs.close(&fd).expect("close");
+            fs.close(&dirfd).expect("close dirfd");
+        });
+    }
+
+    #[test]
+    fn stat_at_returns_correct_metadata() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            let st = fs.stat_at(&dirfd, "hello.txt", true).expect("stat_at");
+            assert_eq!(st.size, 5);
+            assert_eq!(st.file_type, crate::fs::FileType::RegularFile);
+
+            // stat_at on the directory itself with "."
+            let st = fs.stat_at(&dirfd, ".", true).expect("stat_at dot");
+            assert_eq!(st.file_type, crate::fs::FileType::Directory);
+
+            fs.close(&dirfd).expect("close dirfd");
+        });
+    }
+
+    #[test]
+    fn stat_at_nonexistent_returns_error() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            let err = fs.stat_at(&dirfd, "does_not_exist", true);
+            assert!(err.is_err());
+            fs.close(&dirfd).expect("close dirfd");
+        });
+    }
+
+    #[test]
+    fn unlink_at_removes_file() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            fs.unlink_at(&dirfd, "hello.txt").expect("unlink_at");
+            fs.close(&dirfd).expect("close dirfd");
+
+            // Verify deleted via absolute path.
+            assert!(
+                fs.open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn rename_at_moves_file() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/dir2", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("mkdir /dir2");
+
+            let src_dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open src dirfd");
+            let dst_dirfd = fs
+                .open("/dir2", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dst dirfd");
+
+            fs.rename_at(&src_dirfd, "hello.txt", &dst_dirfd, "moved.txt")
+                .expect("rename_at");
+
+            fs.close(&src_dirfd).expect("close");
+            fs.close(&dst_dirfd).expect("close");
+
+            // Old path gone, new path exists.
+            assert!(
+                fs.open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                    .is_err()
+            );
+            let fd = fs
+                .open("/dir2/moved.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open moved");
+            let mut buf = [0u8; 5];
+            let n = fs.read(&fd, &mut buf, None).expect("read");
+            assert_eq!(n, 5);
+            assert_eq!(&buf, b"hello");
+            fs.close(&fd).expect("close");
+        });
+    }
+
+    #[test]
+    fn fd_path_returns_open_path() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+            assert_eq!(fs.fd_path(&dirfd).as_deref(), Some("/dir"));
+
+            let fd = fs
+                .open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open file");
+            assert_eq!(fs.fd_path(&fd).as_deref(), Some("/dir/hello.txt"));
+
+            fs.close(&fd).expect("close");
+            fs.close(&dirfd).expect("close dirfd");
+        });
+    }
+
+    #[test]
+    fn open_at_with_absolute_path_ignores_dirfd() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            let dirfd = fs
+                .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+                .expect("open dirfd");
+
+            // Absolute path overrides the dirfd entirely.
+            let fd = fs
+                .open_at(&dirfd, "/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open_at absolute");
+            let mut buf = [0u8; 5];
+            let n = fs.read(&fd, &mut buf, None).expect("read");
+            assert_eq!(n, 5);
+            assert_eq!(&buf, b"hello");
+            fs.close(&fd).expect("close");
+            fs.close(&dirfd).expect("close dirfd");
+        });
+    }
+
+    #[test]
+    fn open_at_with_dotdot_resolves_parent() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/dir/sub", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("mkdir sub");
+            let fd = fs
+                .open(
+                    "/dir/sub/in_sub.txt",
+                    OFlags::CREAT | OFlags::WRONLY,
+                    Mode::RWXU,
+                )
+                .expect("create in_sub");
+            fs.close(&fd).expect("close");
+
+            let sub_dirfd = fs
+                .open(
+                    "/dir/sub",
+                    OFlags::RDONLY | OFlags::DIRECTORY,
+                    Mode::empty(),
+                )
+                .expect("open sub dirfd");
+
+            // "../hello.txt" from /dir/sub should resolve to /dir/hello.txt
+            let fd = fs
+                .open_at(&sub_dirfd, "../hello.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open_at dotdot");
+            let mut buf = [0u8; 5];
+            let n = fs.read(&fd, &mut buf, None).expect("read");
+            assert_eq!(n, 5);
+            assert_eq!(&buf, b"hello");
+            fs.close(&fd).expect("close");
+            fs.close(&sub_dirfd).expect("close dirfd");
+        });
+    }
+
+    /// Non-directory fds must be rejected as dirfd with NotADirectory.
+    #[test]
+    fn non_directory_dirfd_returns_enotdir() {
+        let mut fs = setup_with_dir_and_file();
+        fs.with_root_privileges(|fs| {
+            // Open a regular file (not a directory).
+            let filefd = fs
+                .open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
+                .expect("open file");
+
+            // stat_at with a file fd must fail with NotADirectory.
+            assert!(matches!(
+                fs.stat_at(&filefd, ".", true),
+                Err(crate::fs::errors::FileStatusError::NotADirectory)
+            ));
+
+            // open_at with a file fd must fail with NotADirectory.
+            assert!(matches!(
+                fs.open_at(&filefd, "other.txt", OFlags::RDONLY, Mode::empty()),
+                Err(crate::fs::errors::OpenError::NotADirectory)
+            ));
+
+            // unlink_at with a file fd must fail with NotADirectory.
+            assert!(matches!(
+                fs.unlink_at(&filefd, "anything"),
+                Err(crate::fs::errors::UnlinkError::NotADirectory)
+            ));
+
+            fs.close(&filefd).expect("close filefd");
+        });
+    }
+}
