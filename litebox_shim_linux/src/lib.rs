@@ -1709,24 +1709,55 @@ impl<FS: ShimFS> Task<FS> {
                 // No-op for in-memory FS; data is always "persisted" and timestamps are ignored.
                 Ok(0)
             }
-            SyscallRequest::Fadvise64 { .. } => {
+            SyscallRequest::Fadvise64 { fd, .. } => {
                 // No-op: file access advice is optional and safe to ignore.
+                self.validate_fd(fd)?;
                 Ok(0)
             }
-            SyscallRequest::CopyFileRange { .. } => {
-                // Not implemented; programs fall back to read+write.
+            SyscallRequest::CopyFileRange { fd_in, fd_out, .. } => {
+                // Not implemented; validate fds first, then programs fall back to read+write.
+                self.validate_fd(fd_in)?;
+                self.validate_fd(fd_out)?;
                 Err(Errno::EOPNOTSUPP)
             }
-            SyscallRequest::Flock { .. } => {
+            SyscallRequest::Flock { fd, .. } => {
                 // No-op: single-process sandbox has no contention.
+                self.validate_fd(fd)?;
                 Ok(0)
             }
-            SyscallRequest::Fallocate { .. } => {
+            SyscallRequest::Fallocate { fd, .. } => {
                 // No-op: in-memory FS doesn't need preallocation.
+                self.validate_fd(fd)?;
                 Ok(0)
             }
-            SyscallRequest::ListXattr => {
-                // No extended attributes; return empty list (size 0).
+            SyscallRequest::XattrGetPath { pathname } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    self.validate_path(path)?;
+                    Err(Errno::ENODATA)
+                })
+            }
+            SyscallRequest::XattrSetPath { pathname } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    self.validate_path(path)?;
+                    Err(Errno::EOPNOTSUPP)
+                })
+            }
+            SyscallRequest::XattrListPath { pathname } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    self.validate_path(path)?;
+                    Ok(0)
+                })
+            }
+            SyscallRequest::XattrGetFd { fd } => {
+                self.validate_fd(fd)?;
+                Err(Errno::ENODATA)
+            }
+            SyscallRequest::XattrSetFd { fd } => {
+                self.validate_fd(fd)?;
+                Err(Errno::EOPNOTSUPP)
+            }
+            SyscallRequest::XattrListFd { fd } => {
+                self.validate_fd(fd)?;
                 Ok(0)
             }
             SyscallRequest::Fchmodat {

@@ -2426,8 +2426,30 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         offset: i64,
         len: i64,
     },
-    /// No-op: list extended attributes (returns empty list).
-    ListXattr,
+    /// Xattr on a path: get/remove → ENODATA after validating path.
+    XattrGetPath {
+        pathname: Platform::RawConstPointer<i8>,
+    },
+    /// Xattr on a path: set → EOPNOTSUPP after validating path.
+    XattrSetPath {
+        pathname: Platform::RawConstPointer<i8>,
+    },
+    /// Xattr on a path: list → 0 after validating path.
+    XattrListPath {
+        pathname: Platform::RawConstPointer<i8>,
+    },
+    /// Xattr on an fd: get/remove → ENODATA after validating fd.
+    XattrGetFd {
+        fd: i32,
+    },
+    /// Xattr on an fd: set → EOPNOTSUPP after validating fd.
+    XattrSetFd {
+        fd: i32,
+    },
+    /// Xattr on an fd: list → 0 after validating fd.
+    XattrListFd {
+        fd: i32,
+    },
     Pipe2 {
         pipefd: Platform::RawMutPointer<u32>,
         flags: litebox::fs::OFlags,
@@ -3269,18 +3291,47 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     len: ctx.sys_req_arg(3),
                 });
             }
-            // Extended attributes: not supported, return appropriate errors.
-            Sysno::getxattr | Sysno::lgetxattr | Sysno::fgetxattr => {
-                return Err(errno::Errno::ENODATA);
+            // Extended attributes: not supported. Parse and validate args
+            // before returning the appropriate stub error.
+            Sysno::getxattr | Sysno::lgetxattr => {
+                return Ok(SyscallRequest::XattrGetPath {
+                    pathname: ctx.sys_req_ptr(0),
+                });
             }
-            Sysno::setxattr | Sysno::lsetxattr | Sysno::fsetxattr => {
-                return Err(errno::Errno::EOPNOTSUPP);
+            Sysno::fgetxattr => {
+                return Ok(SyscallRequest::XattrGetFd {
+                    fd: ctx.sys_req_arg(0),
+                });
             }
-            Sysno::listxattr | Sysno::llistxattr | Sysno::flistxattr => {
-                return Ok(SyscallRequest::ListXattr);
+            Sysno::setxattr | Sysno::lsetxattr => {
+                return Ok(SyscallRequest::XattrSetPath {
+                    pathname: ctx.sys_req_ptr(0),
+                });
             }
-            Sysno::removexattr | Sysno::lremovexattr | Sysno::fremovexattr => {
-                return Err(errno::Errno::EOPNOTSUPP);
+            Sysno::fsetxattr => {
+                return Ok(SyscallRequest::XattrSetFd {
+                    fd: ctx.sys_req_arg(0),
+                });
+            }
+            Sysno::listxattr | Sysno::llistxattr => {
+                return Ok(SyscallRequest::XattrListPath {
+                    pathname: ctx.sys_req_ptr(0),
+                });
+            }
+            Sysno::flistxattr => {
+                return Ok(SyscallRequest::XattrListFd {
+                    fd: ctx.sys_req_arg(0),
+                });
+            }
+            Sysno::removexattr | Sysno::lremovexattr => {
+                return Ok(SyscallRequest::XattrGetPath {
+                    pathname: ctx.sys_req_ptr(0),
+                });
+            }
+            Sysno::fremovexattr => {
+                return Ok(SyscallRequest::XattrGetFd {
+                    fd: ctx.sys_req_arg(0),
+                });
             }
             sysno => {
                 log_unsupported(format_args!("unsupported syscall {sysno:?}"));

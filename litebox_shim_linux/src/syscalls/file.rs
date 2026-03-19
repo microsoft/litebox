@@ -924,6 +924,59 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Validate that an fd is open, returning `Ok(())` or `EBADF`.
+    pub fn validate_fd(&self, fd: i32) -> Result<(), Errno> {
+        let Ok(raw_fd) = usize::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        files.run_on_raw_fd(raw_fd, |_| (), |_| (), |_| (), |_| (), |_| (), |_| ())?;
+        Ok(())
+    }
+
+    /// Validate that a path resolves to an existing file.
+    pub fn validate_path(&self, pathname: impl path::Arg) -> Result<(), Errno> {
+        let path = self.resolve_path(pathname)?;
+        self.files
+            .borrow()
+            .fs
+            .file_status(path)
+            .map_err(Errno::from)?;
+        Ok(())
+    }
+
+    /// Resolve an `FsPath::FdRelative` to an absolute path, validating that
+    /// the dirfd refers to a directory (not a regular file).
+    fn resolve_dirfd_path(&self, fd: u32, rel_path: &CString) -> Result<String, Errno> {
+        let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+        files.run_on_raw_fd(
+            raw_fd,
+            |dirfd| {
+                let status = files.fs.fd_file_status(dirfd).map_err(Errno::from)?;
+                if !matches!(status.file_type, litebox::fs::FileType::Directory) {
+                    return Err(Errno::ENOTDIR);
+                }
+                let dir_path = files.fs.fd_path(dirfd).ok_or(Errno::EBADF)?;
+                let rel = rel_path.to_str().map_err(|_| Errno::EINVAL)?;
+                Ok(if rel.is_empty() || rel == "." {
+                    dir_path
+                } else if rel.starts_with('/') {
+                    rel.to_string()
+                } else if dir_path.ends_with('/') {
+                    alloc::format!("{dir_path}{rel}")
+                } else {
+                    alloc::format!("{dir_path}/{rel}")
+                })
+            },
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+        )?
+    }
+
     /// Handle `symlinkat` — create a symbolic link.
     pub fn sys_symlinkat(
         &self,
@@ -950,27 +1003,8 @@ impl<FS: ShimFS> Task<FS> {
                 .map_err(Errno::from),
             FsPath::Fd(_) => Err(Errno::EEXIST),
             FsPath::FdRelative { fd, path } => {
-                let Ok(raw_fd) = usize::try_from(fd) else {
-                    return Err(Errno::EBADF);
-                };
+                let abs = self.resolve_dirfd_path(fd, &path)?;
                 let files = self.files.borrow();
-                let dir_path = files.run_on_raw_fd(
-                    raw_fd,
-                    |dirfd| files.fs.fd_path(dirfd).ok_or(Errno::EBADF),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                )??;
-                let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
-                let abs = if rel.starts_with('/') {
-                    rel.to_string()
-                } else if dir_path.ends_with('/') {
-                    alloc::format!("{dir_path}{rel}")
-                } else {
-                    alloc::format!("{dir_path}/{rel}")
-                };
                 files.fs.symlink(target_str, abs).map_err(Errno::from)
             }
         }
@@ -1009,29 +1043,7 @@ impl<FS: ShimFS> Task<FS> {
             FsPath::Absolute { path } => path.into_string().map_err(|_| Errno::EINVAL),
             FsPath::Cwd => Ok(get_cwd()),
             FsPath::Fd(_) => Err(Errno::EINVAL),
-            FsPath::FdRelative { fd, path } => {
-                let Ok(raw_fd) = usize::try_from(fd) else {
-                    return Err(Errno::EBADF);
-                };
-                let files = self.files.borrow();
-                let dir_path = files.run_on_raw_fd(
-                    raw_fd,
-                    |dirfd| files.fs.fd_path(dirfd).ok_or(Errno::EBADF),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                )??;
-                let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
-                Ok(if rel.starts_with('/') {
-                    rel.to_string()
-                } else if dir_path.ends_with('/') {
-                    alloc::format!("{dir_path}{rel}")
-                } else {
-                    alloc::format!("{dir_path}/{rel}")
-                })
-            }
+            FsPath::FdRelative { fd, path } => self.resolve_dirfd_path(fd, &path),
         }
     }
 
@@ -1838,30 +1850,8 @@ impl<FS: ShimFS> Task<FS> {
                 .map_err(Errno::from),
             FsPath::Fd(_fd) => Err(Errno::EINVAL),
             FsPath::FdRelative { fd, path } => {
-                let Ok(raw_fd) = usize::try_from(fd) else {
-                    return Err(Errno::EBADF);
-                };
-                let files = self.files.borrow();
-                let dir_path = files.run_on_raw_fd(
-                    raw_fd,
-                    |dirfd| files.fs.fd_path(dirfd).ok_or(Errno::EBADF),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                )??;
-                let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
-                let abs = if rel.is_empty() || rel == "." {
-                    dir_path
-                } else if rel.starts_with('/') {
-                    rel.to_string()
-                } else if dir_path.ends_with('/') {
-                    alloc::format!("{dir_path}{rel}")
-                } else {
-                    alloc::format!("{dir_path}/{rel}")
-                };
-                files.fs.chmod(abs, mode).map_err(Errno::from)
+                let abs = self.resolve_dirfd_path(fd, &path)?;
+                self.files.borrow().fs.chmod(abs, mode).map_err(Errno::from)
             }
         }
     }
