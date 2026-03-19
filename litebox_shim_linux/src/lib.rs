@@ -1714,10 +1714,23 @@ impl<FS: ShimFS> Task<FS> {
                 self.validate_fd(fd)?;
                 Ok(0)
             }
-            SyscallRequest::CopyFileRange { fd_in, fd_out, .. } => {
-                // Not implemented; validate fds first, then programs fall back to read+write.
+            SyscallRequest::CopyFileRange {
+                fd_in,
+                off_in,
+                fd_out,
+                off_out,
+                ..
+            } => {
+                // Not implemented; validate fds and offset pointers first.
                 self.validate_fd(fd_in)?;
                 self.validate_fd(fd_out)?;
+                // Validate non-null offset pointers are readable.
+                if off_in.as_usize() != 0 {
+                    off_in.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                }
+                if off_out.as_usize() != 0 {
+                    off_out.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                }
                 Err(Errno::EOPNOTSUPP)
             }
             SyscallRequest::Flock { fd, .. } => {
@@ -1730,30 +1743,55 @@ impl<FS: ShimFS> Task<FS> {
                 self.validate_fd(fd)?;
                 Ok(0)
             }
-            SyscallRequest::XattrGetPath { pathname } => {
-                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                    self.validate_path(path)?;
-                    Err(Errno::ENODATA)
-                })
-            }
-            SyscallRequest::XattrSetPath { pathname } => {
-                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                    self.validate_path(path)?;
-                    Err(Errno::EOPNOTSUPP)
-                })
-            }
-            SyscallRequest::XattrListPath { pathname } => {
-                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                    self.validate_path(path)?;
-                    Ok(0)
-                })
-            }
-            SyscallRequest::XattrGetFd { fd } => {
-                self.validate_fd(fd)?;
+            SyscallRequest::XattrGetPath {
+                pathname,
+                name,
+                follow_symlinks,
+            } => {
+                let path = pathname.to_cstring().ok_or(Errno::EFAULT)?;
+                self.validate_path_follow(path, follow_symlinks)?;
+                name.to_cstring().ok_or(Errno::EFAULT)?;
                 Err(Errno::ENODATA)
             }
-            SyscallRequest::XattrSetFd { fd } => {
+            SyscallRequest::XattrSetPath {
+                pathname,
+                name,
+                value,
+                size,
+                follow_symlinks,
+            } => {
+                let path = pathname.to_cstring().ok_or(Errno::EFAULT)?;
+                self.validate_path_follow(path, follow_symlinks)?;
+                name.to_cstring().ok_or(Errno::EFAULT)?;
+                if size > 0 {
+                    value.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                }
+                Err(Errno::EOPNOTSUPP)
+            }
+            SyscallRequest::XattrListPath {
+                pathname,
+                follow_symlinks,
+            } => {
+                let path = pathname.to_cstring().ok_or(Errno::EFAULT)?;
+                self.validate_path_follow(path, follow_symlinks)?;
+                Ok(0)
+            }
+            SyscallRequest::XattrGetFd { fd, name } => {
                 self.validate_fd(fd)?;
+                name.to_cstring().ok_or(Errno::EFAULT)?;
+                Err(Errno::ENODATA)
+            }
+            SyscallRequest::XattrSetFd {
+                fd,
+                name,
+                value,
+                size,
+            } => {
+                self.validate_fd(fd)?;
+                name.to_cstring().ok_or(Errno::EFAULT)?;
+                if size > 0 {
+                    value.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                }
                 Err(Errno::EOPNOTSUPP)
             }
             SyscallRequest::XattrListFd { fd } => {

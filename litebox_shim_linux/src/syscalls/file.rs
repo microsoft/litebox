@@ -934,7 +934,7 @@ impl<FS: ShimFS> Task<FS> {
         Ok(())
     }
 
-    /// Validate that a path resolves to an existing file.
+    /// Validate that a path resolves to an existing file (follows symlinks).
     pub fn validate_path(&self, pathname: impl path::Arg) -> Result<(), Errno> {
         let path = self.resolve_path(pathname)?;
         self.files
@@ -943,6 +943,37 @@ impl<FS: ShimFS> Task<FS> {
             .file_status(path)
             .map_err(Errno::from)?;
         Ok(())
+    }
+
+    /// Validate that a path entry itself exists (does not follow symlinks).
+    /// A dangling symlink is considered valid.
+    pub fn validate_path_nofollow(&self, pathname: impl path::Arg) -> Result<(), Errno> {
+        let path = self.resolve_path(pathname)?;
+        let files = self.files.borrow();
+        // If the path resolves via follow (normal stat), it exists.
+        if files.fs.file_status(&path).is_ok() {
+            return Ok(());
+        }
+        // The follow-stat failed. Check if it's a symlink (possibly dangling).
+        if files.fs.read_link(&path).is_ok() {
+            return Ok(());
+        }
+        // Neither a resolvable path nor a symlink — report the original error.
+        files.fs.file_status(path).map_err(Errno::from)?;
+        Ok(())
+    }
+
+    /// Validate a path with symlink-follow control.
+    pub fn validate_path_follow(
+        &self,
+        pathname: impl path::Arg,
+        follow: bool,
+    ) -> Result<(), Errno> {
+        if follow {
+            self.validate_path(pathname)
+        } else {
+            self.validate_path_nofollow(pathname)
+        }
     }
 
     /// Resolve an `FsPath::FdRelative` to an absolute path, validating that

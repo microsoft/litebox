@@ -2426,25 +2426,36 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         offset: i64,
         len: i64,
     },
-    /// Xattr on a path: get/remove → ENODATA after validating path.
+    /// Xattr on a path: get/remove → ENODATA after validating path + name.
     XattrGetPath {
         pathname: Platform::RawConstPointer<i8>,
+        name: Platform::RawConstPointer<i8>,
+        follow_symlinks: bool,
     },
-    /// Xattr on a path: set → EOPNOTSUPP after validating path.
+    /// Xattr on a path: set → EOPNOTSUPP after validating path + name + value.
     XattrSetPath {
         pathname: Platform::RawConstPointer<i8>,
+        name: Platform::RawConstPointer<i8>,
+        value: Platform::RawConstPointer<u8>,
+        size: usize,
+        follow_symlinks: bool,
     },
     /// Xattr on a path: list → 0 after validating path.
     XattrListPath {
         pathname: Platform::RawConstPointer<i8>,
+        follow_symlinks: bool,
     },
-    /// Xattr on an fd: get/remove → ENODATA after validating fd.
+    /// Xattr on an fd: get/remove → ENODATA after validating fd + name.
     XattrGetFd {
         fd: i32,
+        name: Platform::RawConstPointer<i8>,
     },
-    /// Xattr on an fd: set → EOPNOTSUPP after validating fd.
+    /// Xattr on an fd: set → EOPNOTSUPP after validating fd + name + value.
     XattrSetFd {
         fd: i32,
+        name: Platform::RawConstPointer<i8>,
+        value: Platform::RawConstPointer<u8>,
+        size: usize,
     },
     /// Xattr on an fd: list → 0 after validating fd.
     XattrListFd {
@@ -3293,29 +3304,63 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }
             // Extended attributes: not supported. Parse and validate args
             // before returning the appropriate stub error.
-            Sysno::getxattr | Sysno::lgetxattr => {
+            // getxattr follows symlinks; lgetxattr does not.
+            Sysno::getxattr => {
                 return Ok(SyscallRequest::XattrGetPath {
                     pathname: ctx.sys_req_ptr(0),
+                    name: ctx.sys_req_ptr(1),
+                    follow_symlinks: true,
+                });
+            }
+            Sysno::lgetxattr => {
+                return Ok(SyscallRequest::XattrGetPath {
+                    pathname: ctx.sys_req_ptr(0),
+                    name: ctx.sys_req_ptr(1),
+                    follow_symlinks: false,
                 });
             }
             Sysno::fgetxattr => {
                 return Ok(SyscallRequest::XattrGetFd {
                     fd: ctx.sys_req_arg(0),
+                    name: ctx.sys_req_ptr(1),
                 });
             }
-            Sysno::setxattr | Sysno::lsetxattr => {
+            Sysno::setxattr => {
                 return Ok(SyscallRequest::XattrSetPath {
                     pathname: ctx.sys_req_ptr(0),
+                    name: ctx.sys_req_ptr(1),
+                    value: ctx.sys_req_ptr(2),
+                    size: ctx.sys_req_arg(3),
+                    follow_symlinks: true,
+                });
+            }
+            Sysno::lsetxattr => {
+                return Ok(SyscallRequest::XattrSetPath {
+                    pathname: ctx.sys_req_ptr(0),
+                    name: ctx.sys_req_ptr(1),
+                    value: ctx.sys_req_ptr(2),
+                    size: ctx.sys_req_arg(3),
+                    follow_symlinks: false,
                 });
             }
             Sysno::fsetxattr => {
                 return Ok(SyscallRequest::XattrSetFd {
                     fd: ctx.sys_req_arg(0),
+                    name: ctx.sys_req_ptr(1),
+                    value: ctx.sys_req_ptr(2),
+                    size: ctx.sys_req_arg(3),
                 });
             }
-            Sysno::listxattr | Sysno::llistxattr => {
+            Sysno::listxattr => {
                 return Ok(SyscallRequest::XattrListPath {
                     pathname: ctx.sys_req_ptr(0),
+                    follow_symlinks: true,
+                });
+            }
+            Sysno::llistxattr => {
+                return Ok(SyscallRequest::XattrListPath {
+                    pathname: ctx.sys_req_ptr(0),
+                    follow_symlinks: false,
                 });
             }
             Sysno::flistxattr => {
@@ -3323,14 +3368,24 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     fd: ctx.sys_req_arg(0),
                 });
             }
-            Sysno::removexattr | Sysno::lremovexattr => {
+            Sysno::removexattr => {
                 return Ok(SyscallRequest::XattrGetPath {
                     pathname: ctx.sys_req_ptr(0),
+                    name: ctx.sys_req_ptr(1),
+                    follow_symlinks: true,
+                });
+            }
+            Sysno::lremovexattr => {
+                return Ok(SyscallRequest::XattrGetPath {
+                    pathname: ctx.sys_req_ptr(0),
+                    name: ctx.sys_req_ptr(1),
+                    follow_symlinks: false,
                 });
             }
             Sysno::fremovexattr => {
                 return Ok(SyscallRequest::XattrGetFd {
                     fd: ctx.sys_req_arg(0),
+                    name: ctx.sys_req_ptr(1),
                 });
             }
             sysno => {
