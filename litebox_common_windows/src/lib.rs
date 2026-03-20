@@ -35,6 +35,7 @@ extern crate alloc;
 pub mod apiset;
 pub mod gs_table;
 pub mod nt_types;
+pub mod ntdll_rewriter;
 pub mod ntstatus;
 pub mod pe;
 pub mod pe_builder;
@@ -52,128 +53,343 @@ pub const NT_CURRENT_PROCESS: usize = usize::MAX; // (HANDLE)-1
 /// Pseudo-handle for the current thread.
 pub const NT_CURRENT_THREAD: usize = usize::MAX - 1; // (HANDLE)-2
 
-/// NT syscall numbers. Since we control both the stub DLLs and the shim
-/// dispatcher, we assign our own stable numbers rather than matching any
-/// specific Windows build.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum NtSyscallNumber {
-    // Phase 1: Minimal boot
-    NtWriteFile = 0x0001,
-    NtAllocateVirtualMemory = 0x0002,
-    NtFreeVirtualMemory = 0x0003,
-    NtProtectVirtualMemory = 0x0004,
-    NtQueryVirtualMemory = 0x0005,
-    NtClose = 0x0006,
-    NtTerminateProcess = 0x0007,
+/// NT syscall identifiers.
+///
+/// These are **logical names** for NT syscalls the shim can handle.
+/// They carry no fixed numeric value — the ntdll rewriter discovers the
+/// real Windows syscall number for each function at rewrite time and
+/// produces a mapping table (`NtSyscallMap`) that the shim uses for
+/// dispatch.  This design works across Windows builds where the raw
+/// numbers change.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum NtSyscallId {
+    NtWriteFile,
+    NtAllocateVirtualMemory,
+    NtAllocateVirtualMemoryEx,
+    NtFreeVirtualMemory,
+    NtProtectVirtualMemory,
+    NtQueryVirtualMemory,
+    NtClose,
+    NtTerminateProcess,
 
-    // Phase 2: File I/O & CRT init
-    NtCreateFile = 0x0010,
-    NtReadFile = 0x0011,
-    NtQueryInformationFile = 0x0012,
-    NtSetInformationFile = 0x0013,
-    NtQueryVolumeInformationFile = 0x0014,
-    NtQueryDirectoryFile = 0x0015,
-    NtDeleteFile = 0x0016,
-    NtQueryAttributesFile = 0x0017,
-    NtCreateSection = 0x0018,
-    NtMapViewOfSection = 0x0019,
-    NtUnmapViewOfSection = 0x001A,
-    NtQuerySystemInformation = 0x001B,
-    NtQueryPerformanceCounter = 0x001C,
-    NtQuerySystemTime = 0x001D,
-    NtSetInformationThread = 0x001E,
-    NtQueryInformationProcess = 0x001F,
+    NtCreateFile,
+    NtReadFile,
+    NtQueryInformationFile,
+    NtSetInformationFile,
+    NtQueryVolumeInformationFile,
+    NtQueryDirectoryFile,
+    NtDeleteFile,
+    NtQueryAttributesFile,
+    NtCreateSection,
+    NtMapViewOfSection,
+    NtUnmapViewOfSection,
+    NtQuerySystemInformation,
+    NtQuerySystemInformationEx,
+    NtQueryPerformanceCounter,
+    NtQuerySystemTime,
+    NtSetInformationThread,
+    NtQueryInformationProcess,
+    NtOpenFile,
 
-    // Phase 3: Threading & sync
-    NtCreateThreadEx = 0x0030,
-    NtTerminateThread = 0x0031,
-    NtWaitForSingleObject = 0x0032,
-    NtWaitForMultipleObjects = 0x0033,
-    NtCreateEvent = 0x0034,
-    NtSetEvent = 0x0035,
-    NtResetEvent = 0x0036,
-    NtCreateSemaphore = 0x0037,
-    NtReleaseSemaphore = 0x0038,
-    NtDuplicateObject = 0x0039,
-    NtQueryObject = 0x003A,
-    NtDelayExecution = 0x003B,
-    NtCreateKeyedEvent = 0x003C,
-    NtWaitForKeyedEvent = 0x003D,
-    NtReleaseKeyedEvent = 0x003E,
-    NtClearEvent = 0x003F,
+    NtCreateThreadEx,
+    NtTerminateThread,
+    NtWaitForSingleObject,
+    NtWaitForMultipleObjects,
+    NtCreateEvent,
+    NtSetEvent,
+    NtResetEvent,
+    NtCreateSemaphore,
+    NtReleaseSemaphore,
+    NtDuplicateObject,
+    NtQueryObject,
+    NtDelayExecution,
+    NtCreateKeyedEvent,
+    NtWaitForKeyedEvent,
+    NtReleaseKeyedEvent,
+    NtClearEvent,
 
-    // Phase 4: Networking & IOCP
-    NtDeviceIoControlFile = 0x0040,
-    NtCreateIoCompletion = 0x0041,
-    NtSetIoCompletion = 0x0042,
-    NtRemoveIoCompletion = 0x0043,
+    NtDeviceIoControlFile,
+    NtCreateIoCompletion,
+    NtSetIoCompletion,
+    NtRemoveIoCompletion,
 
-    // Phase 5: Process spawning
-    NtCreateUserProcess = 0x0050,
-    NtCreateNamedPipeFile = 0x0051,
-    NtOpenKey = 0x0052,
-    NtQueryValueKey = 0x0053,
+    NtContinue,
+    NtOpenSection,
+    NtQuerySection,
+    NtSetInformationProcess,
+    NtFlushBuffersFile,
+    NtCreateMutant,
+    NtOpenMutant,
+    NtQueryInformationThread,
+    NtOpenProcessToken,
+    NtOpenThreadToken,
+    NtQueryInformationToken,
+    NtRtlExitUserThread,
+
+    NtCreateUserProcess,
+    NtCreateNamedPipeFile,
+    NtOpenKey,
+    NtQueryValueKey,
+
+    NtTraceEvent,
+    NtManageHotPatch,
+    NtRaiseHardError,
+    NtQueryKey,
+    NtOpenKeyEx,
+    NtGetNlsSectionPtr,
+    NtInitializeNlsFiles,
+    NtCreateWaitCompletionPacket,
+    NtOpenDirectoryObject,
+    NtCreateWorkerFactory,
+    NtCreateTimer2,
+    NtRaiseException,
+    NtOpenEvent,
+    NtSetInformationWorkerFactory,
+    NtAssociateWaitCompletionPacket,
+    NtShutdownWorkerFactory,
+    NtCancelWaitCompletionPacket,
+    NtTraceControl,
+    NtSetWnfProcessNotificationEvent,
+    NtCreateSectionEx,
+    NtMapViewOfSectionEx,
+    NtSetDefaultHardErrorPort,
+    NtOpenSymbolicLinkObject,
+    NtQuerySymbolicLinkObject,
+    NtEnumerateKey,
+    NtEnumerateValueKey,
+    NtApphelpCacheControl,
+    NtSubscribeWnfStateChange,
+    NtUnsubscribeWnfStateChange,
 }
 
-impl NtSyscallNumber {
-    /// Try to convert a raw u32 syscall number to an `NtSyscallNumber`.
-    pub fn from_raw(nr: u32) -> Option<Self> {
-        // Use a match rather than transmute for safety.
-        match nr {
-            0x0001 => Some(Self::NtWriteFile),
-            0x0002 => Some(Self::NtAllocateVirtualMemory),
-            0x0003 => Some(Self::NtFreeVirtualMemory),
-            0x0004 => Some(Self::NtProtectVirtualMemory),
-            0x0005 => Some(Self::NtQueryVirtualMemory),
-            0x0006 => Some(Self::NtClose),
-            0x0007 => Some(Self::NtTerminateProcess),
+/// Mapping from real Windows syscall numbers to `NtSyscallId`.
+///
+/// Produced by the ntdll rewriter after scanning the export table.
+/// The shim receives this at init and uses it for dispatch.
+pub struct NtSyscallMap {
+    /// Sparse lookup: index = real Windows syscall number, value = Some(id).
+    /// Sized to hold the maximum real number seen during rewriting + 1.
+    table: alloc::vec::Vec<Option<NtSyscallId>>,
+}
 
-            0x0010 => Some(Self::NtCreateFile),
-            0x0011 => Some(Self::NtReadFile),
-            0x0012 => Some(Self::NtQueryInformationFile),
-            0x0013 => Some(Self::NtSetInformationFile),
-            0x0014 => Some(Self::NtQueryVolumeInformationFile),
-            0x0015 => Some(Self::NtQueryDirectoryFile),
-            0x0016 => Some(Self::NtDeleteFile),
-            0x0017 => Some(Self::NtQueryAttributesFile),
-            0x0018 => Some(Self::NtCreateSection),
-            0x0019 => Some(Self::NtMapViewOfSection),
-            0x001A => Some(Self::NtUnmapViewOfSection),
-            0x001B => Some(Self::NtQuerySystemInformation),
-            0x001C => Some(Self::NtQueryPerformanceCounter),
-            0x001D => Some(Self::NtQuerySystemTime),
-            0x001E => Some(Self::NtSetInformationThread),
-            0x001F => Some(Self::NtQueryInformationProcess),
-
-            0x0030 => Some(Self::NtCreateThreadEx),
-            0x0031 => Some(Self::NtTerminateThread),
-            0x0032 => Some(Self::NtWaitForSingleObject),
-            0x0033 => Some(Self::NtWaitForMultipleObjects),
-            0x0034 => Some(Self::NtCreateEvent),
-            0x0035 => Some(Self::NtSetEvent),
-            0x0036 => Some(Self::NtResetEvent),
-            0x0037 => Some(Self::NtCreateSemaphore),
-            0x0038 => Some(Self::NtReleaseSemaphore),
-            0x0039 => Some(Self::NtDuplicateObject),
-            0x003A => Some(Self::NtQueryObject),
-            0x003B => Some(Self::NtDelayExecution),
-            0x003C => Some(Self::NtCreateKeyedEvent),
-            0x003D => Some(Self::NtWaitForKeyedEvent),
-            0x003E => Some(Self::NtReleaseKeyedEvent),
-            0x003F => Some(Self::NtClearEvent),
-
-            0x0040 => Some(Self::NtDeviceIoControlFile),
-            0x0041 => Some(Self::NtCreateIoCompletion),
-            0x0042 => Some(Self::NtSetIoCompletion),
-            0x0043 => Some(Self::NtRemoveIoCompletion),
-
-            0x0050 => Some(Self::NtCreateUserProcess),
-            0x0051 => Some(Self::NtCreateNamedPipeFile),
-            0x0052 => Some(Self::NtOpenKey),
-            0x0053 => Some(Self::NtQueryValueKey),
-
-            _ => None,
+impl NtSyscallMap {
+    /// Build from a list of (real_nr, id) pairs.
+    pub fn from_pairs(pairs: &[(u32, NtSyscallId)]) -> Self {
+        let max_nr = pairs.iter().map(|(nr, _)| *nr).max().unwrap_or(0) as usize;
+        let mut table = alloc::vec![None; max_nr + 1];
+        for &(nr, id) in pairs {
+            table[nr as usize] = Some(id);
         }
+        Self { table }
     }
+
+    /// Look up a raw syscall number.
+    #[inline]
+    pub fn lookup(&self, raw_nr: u32) -> Option<NtSyscallId> {
+        self.table.get(raw_nr as usize).copied().flatten()
+    }
+
+    /// Build an identity map where syscall number == `NtSyscallId` discriminant.
+    ///
+    /// Used by the stub-DLL path where we control the syscall numbers.
+    pub fn identity() -> Self {
+        let all: &[NtSyscallId] = &[
+            NtSyscallId::NtWriteFile,
+            NtSyscallId::NtAllocateVirtualMemory,
+            NtSyscallId::NtAllocateVirtualMemoryEx,
+            NtSyscallId::NtFreeVirtualMemory,
+            NtSyscallId::NtProtectVirtualMemory,
+            NtSyscallId::NtQueryVirtualMemory,
+            NtSyscallId::NtClose,
+            NtSyscallId::NtTerminateProcess,
+            NtSyscallId::NtCreateFile,
+            NtSyscallId::NtReadFile,
+            NtSyscallId::NtQueryInformationFile,
+            NtSyscallId::NtSetInformationFile,
+            NtSyscallId::NtQueryVolumeInformationFile,
+            NtSyscallId::NtQueryDirectoryFile,
+            NtSyscallId::NtDeleteFile,
+            NtSyscallId::NtQueryAttributesFile,
+            NtSyscallId::NtCreateSection,
+            NtSyscallId::NtMapViewOfSection,
+            NtSyscallId::NtUnmapViewOfSection,
+            NtSyscallId::NtQuerySystemInformation,
+            NtSyscallId::NtQuerySystemInformationEx,
+            NtSyscallId::NtQueryPerformanceCounter,
+            NtSyscallId::NtQuerySystemTime,
+            NtSyscallId::NtSetInformationThread,
+            NtSyscallId::NtQueryInformationProcess,
+            NtSyscallId::NtOpenFile,
+            NtSyscallId::NtCreateThreadEx,
+            NtSyscallId::NtTerminateThread,
+            NtSyscallId::NtWaitForSingleObject,
+            NtSyscallId::NtWaitForMultipleObjects,
+            NtSyscallId::NtCreateEvent,
+            NtSyscallId::NtSetEvent,
+            NtSyscallId::NtResetEvent,
+            NtSyscallId::NtClearEvent,
+            NtSyscallId::NtCreateSemaphore,
+            NtSyscallId::NtReleaseSemaphore,
+            NtSyscallId::NtCreateKeyedEvent,
+            NtSyscallId::NtWaitForKeyedEvent,
+            NtSyscallId::NtReleaseKeyedEvent,
+            NtSyscallId::NtDuplicateObject,
+            NtSyscallId::NtQueryObject,
+            NtSyscallId::NtDelayExecution,
+            NtSyscallId::NtDeviceIoControlFile,
+            NtSyscallId::NtCreateIoCompletion,
+            NtSyscallId::NtSetIoCompletion,
+            NtSyscallId::NtRemoveIoCompletion,
+            NtSyscallId::NtContinue,
+            NtSyscallId::NtOpenSection,
+            NtSyscallId::NtQuerySection,
+            NtSyscallId::NtSetInformationProcess,
+            NtSyscallId::NtFlushBuffersFile,
+            NtSyscallId::NtCreateMutant,
+            NtSyscallId::NtOpenMutant,
+            NtSyscallId::NtQueryInformationThread,
+            NtSyscallId::NtOpenProcessToken,
+            NtSyscallId::NtOpenThreadToken,
+            NtSyscallId::NtQueryInformationToken,
+            NtSyscallId::NtRtlExitUserThread,
+            NtSyscallId::NtOpenKey,
+            NtSyscallId::NtQueryValueKey,
+            NtSyscallId::NtTraceEvent,
+            NtSyscallId::NtManageHotPatch,
+            NtSyscallId::NtRaiseHardError,
+            NtSyscallId::NtQueryKey,
+            NtSyscallId::NtOpenKeyEx,
+            NtSyscallId::NtGetNlsSectionPtr,
+            NtSyscallId::NtInitializeNlsFiles,
+            NtSyscallId::NtCreateWaitCompletionPacket,
+            NtSyscallId::NtOpenDirectoryObject,
+            NtSyscallId::NtCreateWorkerFactory,
+            NtSyscallId::NtCreateTimer2,
+            NtSyscallId::NtRaiseException,
+            NtSyscallId::NtOpenEvent,
+            NtSyscallId::NtSetInformationWorkerFactory,
+            NtSyscallId::NtAssociateWaitCompletionPacket,
+            NtSyscallId::NtShutdownWorkerFactory,
+            NtSyscallId::NtCancelWaitCompletionPacket,
+            NtSyscallId::NtTraceControl,
+            NtSyscallId::NtSetWnfProcessNotificationEvent,
+            NtSyscallId::NtCreateSectionEx,
+            NtSyscallId::NtMapViewOfSectionEx,
+            NtSyscallId::NtSetDefaultHardErrorPort,
+            NtSyscallId::NtOpenSymbolicLinkObject,
+            NtSyscallId::NtQuerySymbolicLinkObject,
+            NtSyscallId::NtEnumerateKey,
+            NtSyscallId::NtEnumerateValueKey,
+            NtSyscallId::NtApphelpCacheControl,
+            NtSyscallId::NtSubscribeWnfStateChange,
+            NtSyscallId::NtUnsubscribeWnfStateChange,
+        ];
+        let pairs: alloc::vec::Vec<(u32, NtSyscallId)> =
+            all.iter().map(|&id| (id as u32, id)).collect();
+        Self::from_pairs(&pairs)
+    }
+}
+
+/// Map an ntdll export name to its `NtSyscallId`.
+///
+/// This is the single source of truth for which NT function names the
+/// shim recognises.  The rewriter calls this for every exported stub it
+/// finds; matches get recorded in the `NtSyscallMap`.
+pub fn name_to_syscall_id(name: &str) -> Option<NtSyscallId> {
+    let id = match name {
+        "NtWriteFile" => NtSyscallId::NtWriteFile,
+        "NtAllocateVirtualMemory" => NtSyscallId::NtAllocateVirtualMemory,
+        "NtAllocateVirtualMemoryEx" => NtSyscallId::NtAllocateVirtualMemoryEx,
+        "NtFreeVirtualMemory" => NtSyscallId::NtFreeVirtualMemory,
+        "NtProtectVirtualMemory" => NtSyscallId::NtProtectVirtualMemory,
+        "NtQueryVirtualMemory" => NtSyscallId::NtQueryVirtualMemory,
+        "NtClose" => NtSyscallId::NtClose,
+        "NtTerminateProcess" => NtSyscallId::NtTerminateProcess,
+        "NtCreateFile" => NtSyscallId::NtCreateFile,
+        "NtReadFile" => NtSyscallId::NtReadFile,
+        "NtQueryInformationFile" => NtSyscallId::NtQueryInformationFile,
+        "NtSetInformationFile" => NtSyscallId::NtSetInformationFile,
+        "NtQueryVolumeInformationFile" => NtSyscallId::NtQueryVolumeInformationFile,
+        "NtQueryDirectoryFile" => NtSyscallId::NtQueryDirectoryFile,
+        "NtDeleteFile" => NtSyscallId::NtDeleteFile,
+        "NtQueryAttributesFile" => NtSyscallId::NtQueryAttributesFile,
+        "NtCreateSection" => NtSyscallId::NtCreateSection,
+        "NtMapViewOfSection" => NtSyscallId::NtMapViewOfSection,
+        "NtUnmapViewOfSection" => NtSyscallId::NtUnmapViewOfSection,
+        "NtQuerySystemInformation" => NtSyscallId::NtQuerySystemInformation,
+        "NtQuerySystemInformationEx" => NtSyscallId::NtQuerySystemInformationEx,
+        "NtQueryPerformanceCounter" => NtSyscallId::NtQueryPerformanceCounter,
+        "NtQuerySystemTime" => NtSyscallId::NtQuerySystemTime,
+        "NtSetInformationThread" => NtSyscallId::NtSetInformationThread,
+        "NtQueryInformationProcess" => NtSyscallId::NtQueryInformationProcess,
+        "NtOpenFile" => NtSyscallId::NtOpenFile,
+        "NtCreateThreadEx" => NtSyscallId::NtCreateThreadEx,
+        "NtTerminateThread" => NtSyscallId::NtTerminateThread,
+        "NtWaitForSingleObject" => NtSyscallId::NtWaitForSingleObject,
+        "NtWaitForMultipleObjects" => NtSyscallId::NtWaitForMultipleObjects,
+        "NtCreateEvent" => NtSyscallId::NtCreateEvent,
+        "NtSetEvent" => NtSyscallId::NtSetEvent,
+        "NtResetEvent" => NtSyscallId::NtResetEvent,
+        "NtCreateSemaphore" => NtSyscallId::NtCreateSemaphore,
+        "NtReleaseSemaphore" => NtSyscallId::NtReleaseSemaphore,
+        "NtDuplicateObject" => NtSyscallId::NtDuplicateObject,
+        "NtQueryObject" => NtSyscallId::NtQueryObject,
+        "NtDelayExecution" => NtSyscallId::NtDelayExecution,
+        "NtCreateKeyedEvent" => NtSyscallId::NtCreateKeyedEvent,
+        "NtWaitForKeyedEvent" => NtSyscallId::NtWaitForKeyedEvent,
+        "NtReleaseKeyedEvent" => NtSyscallId::NtReleaseKeyedEvent,
+        "NtClearEvent" => NtSyscallId::NtClearEvent,
+        "NtDeviceIoControlFile" => NtSyscallId::NtDeviceIoControlFile,
+        "NtCreateIoCompletion" => NtSyscallId::NtCreateIoCompletion,
+        "NtSetIoCompletion" => NtSyscallId::NtSetIoCompletion,
+        "NtRemoveIoCompletion" => NtSyscallId::NtRemoveIoCompletion,
+        "NtContinue" => NtSyscallId::NtContinue,
+        "NtOpenSection" => NtSyscallId::NtOpenSection,
+        "NtQuerySection" => NtSyscallId::NtQuerySection,
+        "NtSetInformationProcess" => NtSyscallId::NtSetInformationProcess,
+        "NtFlushBuffersFile" => NtSyscallId::NtFlushBuffersFile,
+        "NtCreateMutant" => NtSyscallId::NtCreateMutant,
+        "NtOpenMutant" => NtSyscallId::NtOpenMutant,
+        "NtQueryInformationThread" => NtSyscallId::NtQueryInformationThread,
+        "NtOpenProcessToken" => NtSyscallId::NtOpenProcessToken,
+        "NtOpenThreadToken" => NtSyscallId::NtOpenThreadToken,
+        "NtQueryInformationToken" => NtSyscallId::NtQueryInformationToken,
+        "RtlExitUserThread" => NtSyscallId::NtRtlExitUserThread,
+        "NtTraceEvent" => NtSyscallId::NtTraceEvent,
+        "NtManageHotPatch" => NtSyscallId::NtManageHotPatch,
+        "NtRaiseHardError" => NtSyscallId::NtRaiseHardError,
+        "NtQueryKey" => NtSyscallId::NtQueryKey,
+        "NtOpenKey" => NtSyscallId::NtOpenKey,
+        "NtOpenKeyEx" => NtSyscallId::NtOpenKeyEx,
+        "NtQueryValueKey" => NtSyscallId::NtQueryValueKey,
+        "NtCreateUserProcess" => NtSyscallId::NtCreateUserProcess,
+        "NtCreateNamedPipeFile" => NtSyscallId::NtCreateNamedPipeFile,
+        "NtGetNlsSectionPtr" => NtSyscallId::NtGetNlsSectionPtr,
+        "NtInitializeNlsFiles" => NtSyscallId::NtInitializeNlsFiles,
+        "NtCreateWaitCompletionPacket" => NtSyscallId::NtCreateWaitCompletionPacket,
+        "NtOpenDirectoryObject" => NtSyscallId::NtOpenDirectoryObject,
+        "NtCreateWorkerFactory" => NtSyscallId::NtCreateWorkerFactory,
+        "NtCreateTimer2" => NtSyscallId::NtCreateTimer2,
+        "NtRaiseException" => NtSyscallId::NtRaiseException,
+        "NtOpenEvent" => NtSyscallId::NtOpenEvent,
+        "NtSetInformationWorkerFactory" => NtSyscallId::NtSetInformationWorkerFactory,
+        "NtAssociateWaitCompletionPacket" => NtSyscallId::NtAssociateWaitCompletionPacket,
+        "NtShutdownWorkerFactory" => NtSyscallId::NtShutdownWorkerFactory,
+        "NtCancelWaitCompletionPacket" => NtSyscallId::NtCancelWaitCompletionPacket,
+        "NtTraceControl" => NtSyscallId::NtTraceControl,
+        "NtSetWnfProcessNotificationEvent" => NtSyscallId::NtSetWnfProcessNotificationEvent,
+        "NtCreateSectionEx" => NtSyscallId::NtCreateSectionEx,
+        "NtMapViewOfSectionEx" => NtSyscallId::NtMapViewOfSectionEx,
+        "NtSetDefaultHardErrorPort" => NtSyscallId::NtSetDefaultHardErrorPort,
+        "NtOpenSymbolicLinkObject" => NtSyscallId::NtOpenSymbolicLinkObject,
+        "NtQuerySymbolicLinkObject" => NtSyscallId::NtQuerySymbolicLinkObject,
+        "NtEnumerateKey" => NtSyscallId::NtEnumerateKey,
+        "NtEnumerateValueKey" => NtSyscallId::NtEnumerateValueKey,
+        "NtApphelpCacheControl" => NtSyscallId::NtApphelpCacheControl,
+        "NtSubscribeWnfStateChange" => NtSyscallId::NtSubscribeWnfStateChange,
+        "NtUnsubscribeWnfStateChange" => NtSyscallId::NtUnsubscribeWnfStateChange,
+        _ => return None,
+    };
+    Some(id)
 }

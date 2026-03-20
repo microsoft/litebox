@@ -12,6 +12,18 @@
 pub struct NtStatus(pub i32);
 
 impl NtStatus {
+    /// Construct an `NtStatus` from a raw 32-bit value.
+    #[inline]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw as i32)
+    }
+
+    /// Return the raw 32-bit value.
+    #[inline]
+    pub const fn raw(self) -> u32 {
+        self.0 as u32
+    }
+
     /// Returns true if this status represents success (bit 31 clear, bits 29-30 clear).
     #[inline]
     pub const fn is_success(self) -> bool {
@@ -33,6 +45,8 @@ impl NtStatus {
     // ---- Warning codes ----
 
     pub const STATUS_OBJECT_NAME_EXISTS: Self = Self(0x4000_0000);
+    /// The image was loaded at a different address than its preferred base.
+    pub const STATUS_IMAGE_NOT_AT_BASE: Self = Self(0x4000_0003);
 
     // ---- Error codes ----
 
@@ -49,6 +63,7 @@ impl NtStatus {
     pub const STATUS_CONFLICTING_ADDRESSES: Self = Self(0xC000_0018u32 as i32);
     pub const STATUS_MEMORY_NOT_ALLOCATED: Self = Self(0xC000_0019u32 as i32);
     pub const STATUS_UNABLE_TO_FREE_VM: Self = Self(0xC000_001Au32 as i32);
+    pub const STATUS_INVALID_ADDRESS: Self = Self(0xC000_0141u32 as i32);
     pub const STATUS_INVALID_PAGE_PROTECTION: Self = Self(0xC000_0045u32 as i32);
     pub const STATUS_OBJECT_NAME_INVALID: Self = Self(0xC000_0033u32 as i32);
     pub const STATUS_OBJECT_NAME_NOT_FOUND: Self = Self(0xC000_0034u32 as i32);
@@ -58,6 +73,8 @@ impl NtStatus {
     pub const STATUS_OBJECT_PATH_SYNTAX_BAD: Self = Self(0xC000_003Bu32 as i32);
     pub const STATUS_OBJECT_TYPE_MISMATCH: Self = Self(0xC000_0024u32 as i32);
     pub const STATUS_NOT_SUPPORTED: Self = Self(0xC000_00BBu32 as i32);
+    pub const STATUS_NOT_FOUND: Self = Self(0xC000_0225u32 as i32);
+    pub const STATUS_NO_MORE_ENTRIES: Self = Self(0x8000_001Au32 as i32);
     pub const STATUS_ILLEGAL_FUNCTION: Self = Self(0xC000_0061u32 as i32);
     pub const STATUS_BUFFER_TOO_SMALL: Self = Self(0xC000_0023u32 as i32);
     pub const STATUS_ACCESS_DENIED: Self = Self(0xC000_0022u32 as i32);
@@ -66,6 +83,12 @@ impl NtStatus {
     pub const STATUS_NO_MORE_FILES: Self = Self(0x8000_0006u32 as i32);
     pub const STATUS_TIMEOUT: Self = Self(0x0000_0102);
     pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: Self = Self(0xC000_004Bu32 as i32);
+    pub const STATUS_NO_TOKEN: Self = Self(0xC000_007Cu32 as i32);
+    pub const STATUS_PRIVILEGE_NOT_HELD: Self = Self(0xC000_0061u32 as i32);
+    pub const STATUS_INVALID_IMAGE_FORMAT: Self = Self(0xC000_007Bu32 as i32);
+    pub const STATUS_DLL_INIT_FAILED: Self = Self(0xC000_0142u32 as i32);
+    pub const STATUS_DLL_NOT_FOUND: Self = Self(0xC000_0135u32 as i32);
+    pub const STATUS_PROCEDURE_NOT_FOUND: Self = Self(0xC000_007Au32 as i32);
 
     // ---- Exception status codes (used as exit codes on unhandled exceptions) ----
 

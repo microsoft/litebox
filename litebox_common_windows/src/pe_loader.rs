@@ -112,7 +112,7 @@ fn page_align_up(value: usize) -> usize {
 
 /// Determine the permissions for a PE section from its characteristics.
 fn section_permissions(characteristics: u32) -> SectionPermissions {
-    use crate::pe::section_chars::*;
+    use crate::pe::section_chars::{IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE};
     let exec = characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
     let write = characteristics & IMAGE_SCN_MEM_WRITE != 0;
     // Executable sections are RX, writable sections are RW, otherwise RO.
@@ -140,12 +140,38 @@ pub fn load_pe(
     base_address: usize,
     mapper: &mut impl PeMemoryMapper,
 ) -> Result<PeLoadInfo, PeLoadError> {
+    load_pe_inner(parsed, pe_data, base_address, mapper, true)
+}
+
+/// Load a PE into memory, optionally skipping relocation processing.
+///
+/// When `apply_relocations` is false, the image is mapped with raw data
+/// (no fixups applied). The caller (e.g., ntdll's loader) is expected to
+/// handle relocations itself; the mapper returns `STATUS_IMAGE_NOT_AT_BASE`.
+pub fn load_pe_no_reloc(
+    parsed: &PeParsedFile,
+    pe_data: &[u8],
+    base_address: usize,
+    mapper: &mut impl PeMemoryMapper,
+) -> Result<PeLoadInfo, PeLoadError> {
+    load_pe_inner(parsed, pe_data, base_address, mapper, false)
+}
+
+fn load_pe_inner(
+    parsed: &PeParsedFile,
+    pe_data: &[u8],
+    base_address: usize,
+    mapper: &mut impl PeMemoryMapper,
+    apply_relocations: bool,
+) -> Result<PeLoadInfo, PeLoadError> {
     let preferred_base = parsed.image_base as usize;
     let needs_rebase = base_address != preferred_base;
     let image_size = parsed.size_of_image as usize;
 
-    // If rebase is needed, verify the image has a relocation directory.
+    // If rebase is needed and we're applying relocations, verify the image
+    // has a relocation directory.
     if needs_rebase
+        && apply_relocations
         && parsed
             .data_directory(IMAGE_DIRECTORY_ENTRY_BASERELOC)
             .is_none()
@@ -156,7 +182,7 @@ pub fn load_pe(
     // Pre-apply relocations to a mutable copy of the PE bytes so that
     // sections are mapped with their correct final permissions (RX stays RX).
     let relocated;
-    let effective_data = if needs_rebase {
+    let effective_data = if needs_rebase && apply_relocations {
         relocated = {
             let mut buf = alloc::vec::Vec::from(pe_data);
             apply_relocations_to_buffer(parsed, &mut buf, parsed.image_base, base_address as u64)?;
@@ -208,8 +234,7 @@ pub fn load_pe(
     // Collect import directory info.
     let (import_dir_rva, import_dir_size) = parsed
         .data_directory(IMAGE_DIRECTORY_ENTRY_IMPORT)
-        .map(|dd| (Some(dd.virtual_address), Some(dd.size)))
-        .unwrap_or((None, None));
+        .map_or((None, None), |dd| (Some(dd.virtual_address), Some(dd.size)));
 
     let tls_dir_rva = parsed
         .data_directory(IMAGE_DIRECTORY_ENTRY_TLS)
@@ -233,6 +258,10 @@ pub fn load_pe(
 /// This is the simpler variant used when you have a mutable copy of the
 /// entire image (e.g., for stub DLLs built in memory). Mutates `image`
 /// in place.
+///
+/// # Panics
+///
+/// Panics if relocation entries reference offsets beyond the image buffer.
 pub fn apply_relocations_to_buffer(
     parsed: &PeParsedFile,
     image: &mut [u8],
@@ -276,7 +305,7 @@ pub fn apply_relocations_to_buffer(
         while entry_offset + 2 <= entries_end {
             let entry = u16::from_le_bytes([image[entry_offset], image[entry_offset + 1]]);
             let reloc_type = entry >> 12;
-            let reloc_offset = (entry & 0x0FFF) as u32;
+            let reloc_offset = u32::from(entry & 0x0FFF);
 
             match reloc_type {
                 0 => {} // IMAGE_REL_BASED_ABSOLUTE — skip.
@@ -334,6 +363,37 @@ pub fn resolve_imports(
     target_base: usize,
     modules: &[LoadedModule<'_>],
 ) -> Result<Vec<IatPatch>, PeLoadError> {
+    resolve_imports_inner(target, target_data, target_base, modules, None)
+}
+
+/// Like `resolve_imports`, but unresolved imports are patched with
+/// `fallback_va` instead of returning an error.  The names of skipped
+/// imports are collected in the returned `Vec<String>`.
+pub fn resolve_imports_lenient(
+    target: &PeParsedFile,
+    target_data: &[u8],
+    target_base: usize,
+    modules: &[LoadedModule<'_>],
+    fallback_va: u64,
+) -> Result<(Vec<IatPatch>, Vec<alloc::string::String>), PeLoadError> {
+    let mut skipped = Vec::new();
+    let patches = resolve_imports_inner(
+        target,
+        target_data,
+        target_base,
+        modules,
+        Some((fallback_va, &mut skipped)),
+    )?;
+    Ok((patches, skipped))
+}
+
+fn resolve_imports_inner(
+    target: &PeParsedFile,
+    target_data: &[u8],
+    target_base: usize,
+    modules: &[LoadedModule<'_>],
+    mut fallback: Option<(u64, &mut Vec<alloc::string::String>)>,
+) -> Result<Vec<IatPatch>, PeLoadError> {
     let imports = target.imports(target_data);
     let mut patches = Vec::new();
 
@@ -341,18 +401,41 @@ pub fn resolve_imports(
         // Resolve API-set names to physical DLL names.
         let dll_name = crate::apiset::resolve_apiset(import.dll_name).unwrap_or(import.dll_name);
 
-        // Find the module that provides this DLL.
+        // Find the module that provides this DLL, but never resolve
+        // a module's imports against itself (self-imports create infinite
+        // JMP-to-self loops when an export thunk forwards through the IAT).
         let module = modules
             .iter()
-            .find(|m| m.name.eq_ignore_ascii_case(dll_name));
+            .find(|m| m.name.eq_ignore_ascii_case(dll_name) && m.base_address != target_base);
 
-        let module = match module {
-            Some(m) => m,
-            None => {
-                return Err(PeLoadError::UnresolvedModule(alloc::string::String::from(
-                    dll_name,
-                )));
+        let module = if let Some(m) = module {
+            m
+        } else {
+            if let Some((fb_va, ref mut skipped)) = fallback {
+                // Patch all imports from this unknown DLL with fallback.
+                let mut iat_rva = import.iat_rva;
+                for func in &import.functions {
+                    let desc = match func {
+                        crate::pe_parser::ImportEntry::Name(n) => {
+                            alloc::format!("{dll_name}!{n}")
+                        }
+                        crate::pe_parser::ImportEntry::Ordinal(o) => {
+                            alloc::format!("{dll_name}!ordinal#{o}")
+                        }
+                    };
+                    skipped.push(desc);
+                    let iat_va = target_base + iat_rva as usize;
+                    patches.push(IatPatch {
+                        iat_va,
+                        resolved_va: fb_va,
+                    });
+                    iat_rva += 8;
+                }
+                continue;
             }
+            return Err(PeLoadError::UnresolvedModule(alloc::string::String::from(
+                dll_name,
+            )));
         };
 
         let module_exports = module.parsed.exports(module.pe_data);
@@ -360,41 +443,44 @@ pub fn resolve_imports(
         // Patch each imported function.
         let mut iat_rva = import.iat_rva;
         for func in &import.functions {
-            let resolved_rva = match func {
-                crate::pe_parser::ImportEntry::Name(name) => module_exports.iter().find_map(|e| {
-                    if e.name == Some(name) {
-                        Some(e.rva)
-                    } else {
-                        None
-                    }
-                }),
+            let found_export = match func {
+                crate::pe_parser::ImportEntry::Name(name) => {
+                    module_exports.iter().find(|e| e.name == Some(name))
+                }
                 crate::pe_parser::ImportEntry::Ordinal(ord) => {
-                    module_exports.iter().find_map(|e| {
-                        if e.ordinal == u32::from(*ord) {
-                            Some(e.rva)
-                        } else {
-                            None
-                        }
-                    })
+                    module_exports.iter().find(|e| e.ordinal == u32::from(*ord))
                 }
             };
 
-            match resolved_rva {
-                Some(rva) => {
-                    let resolved_va = module.base_address + rva as usize;
+            // Resolve the export, following forwarder chains.
+            let resolved_va = if let Some(exp) = found_export {
+                resolve_export(exp, module, modules, target_base, 8)
+            } else {
+                None
+            };
+
+            if let Some(va) = resolved_va {
+                let iat_va = target_base + iat_rva as usize;
+                patches.push(IatPatch {
+                    iat_va,
+                    resolved_va: va as u64,
+                });
+            } else {
+                let func_desc = match func {
+                    crate::pe_parser::ImportEntry::Name(n) => alloc::string::String::from(*n),
+                    crate::pe_parser::ImportEntry::Ordinal(o) => {
+                        alloc::format!("ordinal #{o}")
+                    }
+                };
+
+                if let Some((fb_va, ref mut skipped)) = fallback {
+                    skipped.push(alloc::format!("{dll_name}!{func_desc}"));
                     let iat_va = target_base + iat_rva as usize;
                     patches.push(IatPatch {
                         iat_va,
-                        resolved_va: resolved_va as u64,
+                        resolved_va: fb_va,
                     });
-                }
-                None => {
-                    let func_desc = match func {
-                        crate::pe_parser::ImportEntry::Name(n) => alloc::string::String::from(*n),
-                        crate::pe_parser::ImportEntry::Ordinal(o) => {
-                            alloc::format!("ordinal #{o}")
-                        }
-                    };
+                } else {
                     return Err(PeLoadError::UnresolvedImport {
                         dll: alloc::string::String::from(dll_name),
                         function: func_desc,
@@ -416,6 +502,53 @@ pub struct IatPatch {
     pub iat_va: usize,
     /// Resolved absolute virtual address to write into the IAT slot.
     pub resolved_va: u64,
+}
+
+/// Resolve an export to a concrete virtual address, following forwarder chains.
+///
+/// If the export is a direct export, returns `module.base_address + rva`.
+/// If the export is a forwarder (e.g., `"NTDLL.RtlFoo"`), looks up the target
+/// in `modules` and recurses. `depth` limits recursion to prevent cycles.
+/// Returns `None` if the forwarder target cannot be found.
+fn resolve_export(
+    exp: &crate::pe_parser::PeExport<'_>,
+    module: &LoadedModule<'_>,
+    modules: &[LoadedModule<'_>],
+    target_base: usize,
+    depth: usize,
+) -> Option<usize> {
+    if depth == 0 {
+        return None;
+    }
+
+    match &exp.forwarder {
+        None => {
+            // Direct export — return the VA.
+            Some(module.base_address + exp.rva as usize)
+        }
+        Some(fwd) => {
+            // Forwarded export: resolve the target DLL + function.
+            let fwd_dll_full = alloc::format!("{}.dll", fwd.dll);
+            let fwd_dll_name =
+                crate::apiset::resolve_apiset(&fwd_dll_full).unwrap_or(&fwd_dll_full);
+
+            // Find the target module (excluding self to prevent cycles).
+            let target_module = modules.iter().find(|m| {
+                m.name.eq_ignore_ascii_case(fwd_dll_name) && m.base_address != target_base
+            })?;
+
+            let target_exports = target_module.parsed.exports(target_module.pe_data);
+            let target_exp = target_exports.iter().find(|e| {
+                if let Some(name) = e.name {
+                    name == fwd.function
+                } else {
+                    false
+                }
+            })?;
+
+            resolve_export(target_exp, target_module, modules, target_base, depth - 1)
+        }
+    }
 }
 
 #[cfg(test)]

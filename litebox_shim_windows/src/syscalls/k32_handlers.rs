@@ -48,19 +48,18 @@ pub(crate) fn set_guest_last_error(teb_va: usize, error_code: u32) {
 /// component (but never past the root).
 fn canonicalize_segments(path: &str) -> alloc::string::String {
     // Split off the drive/root prefix so we never pop past it.
-    let (prefix, rest) = if path.starts_with("\\??\\") {
+    let (prefix, rest) = if let Some(inner) = path.strip_prefix("\\??\\") {
         // NT object-manager prefix — detect inner path form to protect
         // the real root (e.g. \??\C:\ or \??\UNC\server\share\).
-        let inner = &path[4..];
         if inner.len() >= 3
             && inner.as_bytes()[1] == b':'
             && (inner.as_bytes()[2] == b'\\' || inner.as_bytes()[2] == b'/')
         {
             // \??\C:\... — root is \??\C:\.
             (&path[..7], &path[7..])
-        } else if inner.starts_with("UNC\\") {
+        } else if let Some(after_unc) = inner.strip_prefix("UNC\\") {
             // \??\UNC\server\share\... — keep through share component.
-            let after_unc = &inner[4..]; // "server\share\..."
+            // "server\share\..."
             if let Some(server_end) = after_unc.find('\\') {
                 let share_start = 4 + 4 + server_end + 1; // offset in path
                 if let Some(share_end) = path[share_start..].find('\\') {
@@ -81,9 +80,8 @@ fn canonicalize_segments(path: &str) -> alloc::string::String {
         && (path.as_bytes()[2] == b'\\' || path.as_bytes()[2] == b'/')
     {
         (&path[..3], &path[3..])
-    } else if path.starts_with("\\\\") {
+    } else if let Some(after_slashes) = path.strip_prefix("\\\\") {
         // UNC — keep "\\server\share\" as the fixed root (two components).
-        let after_slashes = &path[2..];
         if let Some(server_end) = after_slashes.find('\\') {
             let share_start = 2 + server_end + 1;
             if let Some(share_end) = path[share_start..].find('\\') {
@@ -101,7 +99,7 @@ fn canonicalize_segments(path: &str) -> alloc::string::String {
     };
 
     let mut components: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
-    for seg in rest.split(|c: char| c == '\\' || c == '/') {
+    for seg in rest.split(['\\', '/']) {
         match seg {
             "" | "." => {}
             ".." => {
@@ -151,7 +149,7 @@ pub(crate) fn resolve_relative_path(path: &str, cwd: &str) -> alloc::string::Str
         }
     }
     // Relative — prepend CWD.
-    canonicalize_segments(&alloc::format!("{}{}", cwd, path))
+    canonicalize_segments(&alloc::format!("{cwd}{path}"))
 }
 
 // ========================================================================
@@ -181,12 +179,9 @@ pub(crate) fn k32_virtual_alloc(
     }
 
     let aligned_size = (dw_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let nz_size = match NonZeroPageSize::new(aligned_size) {
-        Some(s) => s,
-        None => {
-            ctx.regs.rax = 0;
-            return NtStatus::STATUS_INVALID_PARAMETER;
-        }
+    let Some(nz_size) = NonZeroPageSize::new(aligned_size) else {
+        ctx.regs.rax = 0;
+        return NtStatus::STATUS_INVALID_PARAMETER;
     };
 
     let suggested = if lp_address != 0 {
@@ -848,7 +843,7 @@ pub(crate) fn k32_get_environment_strings_w(
 
     // Build the double-NUL terminated UTF-16 environment block.
     let mut block = alloc::vec::Vec::<u16>::new();
-    for (key, value) in env_vars.iter() {
+    for (key, value) in env_vars {
         block.extend(key.encode_utf16());
         block.push(b'=' as u16);
         block.extend(value.encode_utf16());
@@ -1163,16 +1158,16 @@ pub(crate) fn k32_multi_byte_to_wide_char(
                             | ((src[i + 1] as u32 & 0x3F) << 12)
                             | ((src[i + 2] as u32 & 0x3F) << 6)
                             | (src[i + 3] as u32 & 0x3F);
-                        if cp > 0x10FFFF || cp < 0x10000 {
-                            // Out of Unicode range or overlong 4-byte encoding.
-                            out.push(0xFFFD);
-                            i += 1;
-                        } else {
+                        if (0x10000..=0x10FFFF).contains(&cp) {
                             // Valid supplementary code point — encode as surrogate pair.
                             let cp = cp - 0x10000;
                             out.push((0xD800 + (cp >> 10)) as u16);
                             out.push((0xDC00 + (cp & 0x3FF)) as u16);
                             i += 4;
+                        } else {
+                            // Out of Unicode range or overlong 4-byte encoding.
+                            out.push(0xFFFD);
+                            i += 1;
                         }
                     } else {
                         out.push(0xFFFD);
@@ -1417,7 +1412,7 @@ fn classify_utf16(ch: u16) -> u16 {
             }
         }
         // CJK, Arabic, Cyrillic, etc. — mark as alpha+defined
-        0x0370..=0x03FF | 0x0400..=0x04FF | 0x0500..=0x052F => C1_ALPHA | C1_DEFINED,
+        0x0370..=0x052F => C1_ALPHA | C1_DEFINED,
         0x0600..=0x06FF | 0x0900..=0x097F => C1_ALPHA | C1_DEFINED,
         0x3000..=0x303F => C1_PUNCT | C1_DEFINED, // CJK punctuation
         0x3040..=0x30FF => C1_ALPHA | C1_DEFINED, // Hiragana/Katakana
@@ -1583,12 +1578,10 @@ pub(crate) fn k32_compare_string_w(ctx: &mut super::super::ExecutionContext) -> 
     }
 
     // Prefixes match — shorter string is less.
-    ctx.regs.rax = if len1 < len2 {
-        1 // CSTR_LESS_THAN
-    } else if len1 > len2 {
-        3 // CSTR_GREATER_THAN
-    } else {
-        2 // CSTR_EQUAL
+    ctx.regs.rax = match len1.cmp(&len2) {
+        core::cmp::Ordering::Less => 1,    // CSTR_LESS_THAN
+        core::cmp::Ordering::Equal => 2,   // CSTR_EQUAL
+        core::cmp::Ordering::Greater => 3, // CSTR_GREATER_THAN
     };
     NtStatus::STATUS_SUCCESS
 }
@@ -1698,111 +1691,151 @@ pub(crate) fn k32_create_file_w(
     NtStatus::STATUS_SUCCESS
 }
 
-/// ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped) -> BOOL
-pub(crate) fn k32_read_file(
+/// ReadFile for host file handles. Called after handle-table lock is dropped
+/// so that potentially blocking reads (UNC paths, pipes) don't stall the
+/// global handle table. Uses `fetch_add` for atomic position updates.
+pub(crate) fn k32_read_file_host(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut crate::handle_table::HandleTable,
+    host_handle: usize,
+    position: &alloc::sync::Arc<core::sync::atomic::AtomicU64>,
     teb_va: usize,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
-    let h_file = args.arg0 as u32;
     let buffer = args.arg1;
     let bytes_to_read = args.arg2 as u32;
     let bytes_read_ptr = args.arg3;
 
-    match handles.get(h_file) {
-        Some(crate::handle_table::NtObject::File {
-            host_handle,
-            position,
-            ..
-        }) => {
-            let (ok, read) =
-                super::file::host::read_file(*host_handle, buffer as *mut u8, bytes_to_read);
-            if ok {
-                position.store(position.load(Relaxed) + read as u64, Relaxed);
-                if bytes_read_ptr != 0 {
-                    unsafe { core::ptr::write(bytes_read_ptr as *mut u32, read) }
-                }
-                ctx.regs.rax = 1;
-            } else {
-                let err = super::file::host::get_last_error();
-                set_guest_last_error(teb_va, err);
-                ctx.regs.rax = 0;
-            }
+    // Reserve the byte range atomically before I/O so concurrent readers
+    // on duplicated handles get non-overlapping offsets.
+    let start = position.fetch_add(bytes_to_read as u64, Relaxed);
+    let (ok, read) =
+        super::file::host::read_file_at(host_handle, buffer as *mut u8, bytes_to_read, start);
+    if ok {
+        // Correct the over-advance if we read fewer bytes than reserved.
+        let over = bytes_to_read as u64 - read as u64;
+        if over > 0 {
+            position.fetch_sub(over, Relaxed);
         }
-        Some(crate::handle_table::NtObject::ConsoleInput) => {
-            let (ok, read) = super::file::host::read_stdin(buffer as *mut u8, bytes_to_read);
-            if ok {
-                if bytes_read_ptr != 0 {
-                    unsafe { core::ptr::write(bytes_read_ptr as *mut u32, read) }
-                }
-                ctx.regs.rax = 1;
-            } else {
-                let err = super::file::host::get_last_error();
-                set_guest_last_error(teb_va, err);
-                ctx.regs.rax = 0;
-            }
+        if bytes_read_ptr != 0 {
+            unsafe { core::ptr::write(bytes_read_ptr as *mut u32, read) }
         }
-        _ => {
-            set_guest_last_error(teb_va, 6); // ERROR_INVALID_HANDLE
-            ctx.regs.rax = 0;
-        }
+        ctx.regs.rax = 1;
+    } else {
+        // Undo entire reservation on failure.
+        position.fetch_sub(bytes_to_read as u64, Relaxed);
+        let err = super::file::host::get_last_error();
+        set_guest_last_error(teb_va, err);
+        ctx.regs.rax = 0;
     }
     NtStatus::STATUS_SUCCESS
 }
 
-/// WriteFile(hFile, lpBuffer, nBytesToWrite, lpBytesWritten, lpOverlapped) -> BOOL
-pub(crate) fn k32_write_file(
+/// ReadFile for ConsoleInput handles. Holds the pending mutex for the entire
+/// operation to serialize with ReadConsoleW. Called after handle-table lock is
+/// dropped.
+pub(crate) fn k32_read_file_console(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut crate::handle_table::HandleTable,
     teb_va: usize,
+    console_pending: &std::sync::Mutex<alloc::vec::Vec<u8>>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
-    let h_file = args.arg0 as u32;
+    let buffer = args.arg1;
+    let bytes_to_read = args.arg2 as u32;
+    let bytes_read_ptr = args.arg3;
+
+    // Hold pending mutex for the entire operation to serialize with
+    // ReadConsoleW on the same stdin stream.
+    let mut pending = console_pending.lock().unwrap();
+    let mut filled = 0u32;
+
+    // Drain any bytes stashed by ReadConsoleW first.
+    if !pending.is_empty() {
+        let drain = pending.len().min(bytes_to_read as usize);
+        unsafe {
+            core::ptr::copy_nonoverlapping(pending.as_ptr(), buffer as *mut u8, drain);
+        }
+        pending.drain(..drain);
+        filled = drain as u32;
+    }
+
+    if filled < bytes_to_read {
+        let remaining = bytes_to_read - filled;
+        let (ok, read) =
+            super::file::host::read_stdin((buffer + filled as usize) as *mut u8, remaining);
+        if ok {
+            filled += read;
+        } else if filled == 0 {
+            let err = super::file::host::get_last_error();
+            set_guest_last_error(teb_va, err);
+            if bytes_read_ptr != 0 {
+                unsafe { core::ptr::write(bytes_read_ptr as *mut u32, 0) }
+            }
+            ctx.regs.rax = 0;
+            return NtStatus::STATUS_SUCCESS;
+        }
+    }
+
+    if bytes_read_ptr != 0 {
+        unsafe { core::ptr::write(bytes_read_ptr as *mut u32, filled) }
+    }
+    ctx.regs.rax = 1;
+    NtStatus::STATUS_SUCCESS
+}
+
+/// WriteFile for console output handles. Non-blocking — prints to debug log.
+pub(crate) fn k32_write_file_console(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
     let buffer = args.arg1;
     let bytes_to_write = args.arg2 as u32;
     let bytes_written_ptr = args.arg3;
 
-    match handles.get(h_file) {
-        Some(crate::handle_table::NtObject::ConsoleOutput { .. }) => {
-            if buffer != 0 && bytes_to_write > 0 {
-                unsafe {
-                    let buf =
-                        core::slice::from_raw_parts(buffer as *const u8, bytes_to_write as usize);
-                    use litebox::platform::DebugLogProvider as _;
-                    if let Ok(s) = core::str::from_utf8(buf) {
-                        litebox_platform_multiplex::platform().debug_log_print(s);
-                    }
-                }
-            }
-            if bytes_written_ptr != 0 {
-                unsafe { core::ptr::write(bytes_written_ptr as *mut u32, bytes_to_write) }
-            }
-            ctx.regs.rax = 1;
-        }
-        Some(crate::handle_table::NtObject::File {
-            host_handle,
-            position,
-            ..
-        }) => {
-            let (ok, written) =
-                super::file::host::write_file(*host_handle, buffer as *const u8, bytes_to_write);
-            if ok {
-                position.store(position.load(Relaxed) + written as u64, Relaxed);
-                if bytes_written_ptr != 0 {
-                    unsafe { core::ptr::write(bytes_written_ptr as *mut u32, written) }
-                }
-                ctx.regs.rax = 1;
-            } else {
-                let err = super::file::host::get_last_error();
-                set_guest_last_error(teb_va, err);
-                ctx.regs.rax = 0;
+    if buffer != 0 && bytes_to_write > 0 {
+        unsafe {
+            let buf = core::slice::from_raw_parts(buffer as *const u8, bytes_to_write as usize);
+            use litebox::platform::DebugLogProvider as _;
+            if let Ok(s) = core::str::from_utf8(buf) {
+                litebox_platform_multiplex::platform().debug_log_print(s);
             }
         }
-        _ => {
-            set_guest_last_error(teb_va, 6); // ERROR_INVALID_HANDLE
-            ctx.regs.rax = 0;
+    }
+    if bytes_written_ptr != 0 {
+        unsafe { core::ptr::write(bytes_written_ptr as *mut u32, bytes_to_write) }
+    }
+    ctx.regs.rax = 1;
+    NtStatus::STATUS_SUCCESS
+}
+
+/// WriteFile for host file handles. Called after handle-table lock is dropped.
+pub(crate) fn k32_write_file_host(
+    ctx: &mut super::super::ExecutionContext,
+    host_handle: usize,
+    position: &alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+    teb_va: usize,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let buffer = args.arg1;
+    let bytes_to_write = args.arg2 as u32;
+    let bytes_written_ptr = args.arg3;
+
+    // Reserve the byte range atomically before I/O so concurrent writers
+    // on duplicated handles get non-overlapping offsets.
+    let start = position.fetch_add(bytes_to_write as u64, Relaxed);
+    let (ok, written) =
+        super::file::host::write_file_at(host_handle, buffer as *const u8, bytes_to_write, start);
+    if ok {
+        let over = bytes_to_write as u64 - written as u64;
+        if over > 0 {
+            position.fetch_sub(over, Relaxed);
         }
+        if bytes_written_ptr != 0 {
+            unsafe { core::ptr::write(bytes_written_ptr as *mut u32, written) }
+        }
+        ctx.regs.rax = 1;
+    } else {
+        position.fetch_sub(bytes_to_write as u64, Relaxed);
+        let err = super::file::host::get_last_error();
+        set_guest_last_error(teb_va, err);
+        ctx.regs.rax = 0;
     }
     NtStatus::STATUS_SUCCESS
 }
@@ -1835,10 +1868,14 @@ pub(crate) fn k32_get_file_type(
     let handle = args.arg0 as u32;
 
     ctx.regs.rax = match handles.get(handle) {
-        Some(crate::handle_table::NtObject::ConsoleInput)
-        | Some(crate::handle_table::NtObject::ConsoleOutput { .. }) => 2,
-        Some(crate::handle_table::NtObject::File { .. })
-        | Some(crate::handle_table::NtObject::Directory { .. }) => 1,
+        Some(
+            crate::handle_table::NtObject::ConsoleInput
+            | crate::handle_table::NtObject::ConsoleOutput { .. },
+        ) => 2,
+        Some(
+            crate::handle_table::NtObject::File { .. }
+            | crate::handle_table::NtObject::Directory { .. },
+        ) => 1,
         _ => 0,
     };
     NtStatus::STATUS_SUCCESS
@@ -1891,15 +1928,73 @@ pub(crate) fn k32_set_file_pointer_ex(
             position,
             ..
         }) => {
-            let new_pos = super::file::host::set_file_position(*host_handle, distance, move_method);
-            if new_pos >= 0 {
+            // Compute the new position from the cached value alone.
+            // FILE_BEGIN (0), FILE_CURRENT (1), and FILE_END (2).
+            // This avoids touching the host kernel file pointer, which is
+            // irrelevant since all I/O uses explicit-offset OVERLAPPED.
+            let new_pos: i64 = match move_method {
+                0 => distance,                                 // FILE_BEGIN
+                1 => position.load(Relaxed) as i64 + distance, // FILE_CURRENT
+                2 => {
+                    // FILE_END — need the actual file size.
+                    let size = super::file::host::get_file_size(*host_handle);
+                    if size < 0 {
+                        set_guest_last_error(teb_va, super::file::host::get_last_error());
+                        ctx.regs.rax = 0;
+                        return NtStatus::STATUS_SUCCESS;
+                    }
+                    size + distance
+                }
+                _ => {
+                    set_guest_last_error(teb_va, 87); // ERROR_INVALID_PARAMETER
+                    ctx.regs.rax = 0;
+                    return NtStatus::STATUS_SUCCESS;
+                }
+            };
+
+            if new_pos < 0 {
+                set_guest_last_error(teb_va, 131); // ERROR_NEGATIVE_SEEK
+                ctx.regs.rax = 0;
+            } else {
                 position.store(new_pos as u64, Relaxed);
                 if new_pos_ptr != 0 {
                     unsafe { core::ptr::write(new_pos_ptr as *mut i64, new_pos) }
                 }
                 ctx.regs.rax = 1;
+            }
+        }
+        _ => {
+            set_guest_last_error(teb_va, 6); // ERROR_INVALID_HANDLE
+            ctx.regs.rax = 0;
+        }
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
+/// SetEndOfFile(hFile) -> BOOL
+///
+/// Sets the end of file to the current file pointer position.
+pub(crate) fn k32_set_end_of_file(
+    ctx: &mut super::super::ExecutionContext,
+    handles: &mut crate::handle_table::HandleTable,
+    teb_va: usize,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let handle = args.arg0 as u32;
+
+    match handles.get(handle) {
+        Some(crate::handle_table::NtObject::File {
+            host_handle,
+            position,
+            ..
+        }) => {
+            let current_pos = position.load(Relaxed) as i64;
+            let result = super::file::host::set_end_of_file(*host_handle, current_pos);
+            if result {
+                ctx.regs.rax = 1; // TRUE
             } else {
-                set_guest_last_error(teb_va, 87); // ERROR_INVALID_PARAMETER
+                let err = super::file::host::get_last_error();
+                set_guest_last_error(teb_va, err);
                 ctx.regs.rax = 0;
             }
         }
@@ -1936,6 +2031,194 @@ pub(crate) fn k32_get_console_mode(ctx: &mut super::super::ExecutionContext) -> 
 pub(crate) fn k32_set_console_mode(ctx: &mut super::super::ExecutionContext) -> NtStatus {
     ctx.regs.rax = 1; // TRUE — accepted but ignored
     NtStatus::STATUS_SUCCESS
+}
+
+/// ReadConsoleW(hConsoleInput, lpBuffer, nNumberOfCharsToRead, lpNumberOfCharsRead, pInputControl)
+///
+/// Reads wide characters from the console input buffer.  On Windows host we
+/// use ReadFile on the real stdin to get bytes and convert to UTF-16.
+///
+/// The caller must validate the handle *before* calling this function (to
+/// avoid holding the handle-table mutex across a blocking stdin read).
+///
+/// A carry-over buffer (`pending`) preserves bytes read from host stdin that
+/// could not yet be returned to the guest (excess beyond `chars_to_read`, or
+/// incomplete trailing UTF-8 sequences).  The pending mutex is held for the
+/// entire operation to serialize concurrent stdin readers — this matches real
+/// Windows, where ReadConsoleW is internally serialized by the console
+/// subsystem.
+///
+/// **TOCTOU note:** the handle is validated before this function is called,
+/// but another thread could close it concurrently.  This mirrors real Windows
+/// behavior where an in-flight ReadConsole can race with CloseHandle; the
+/// read simply completes on the process-global stdin regardless.
+pub(crate) fn k32_read_console_w(
+    ctx: &mut super::super::ExecutionContext,
+    is_console_input: bool,
+    teb_va: usize,
+    pending: &std::sync::Mutex<alloc::vec::Vec<u8>>,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let buffer_ptr = args.arg1;
+    let chars_to_read = args.arg2 as u32;
+    let chars_read_ptr = args.arg3;
+
+    if !is_console_input {
+        set_guest_last_error(teb_va, 6); // ERROR_INVALID_HANDLE
+        ctx.regs.rax = 0;
+        return NtStatus::STATUS_SUCCESS;
+    }
+
+    if buffer_ptr == 0 || chars_to_read == 0 {
+        if chars_read_ptr != 0 {
+            unsafe { core::ptr::write(chars_read_ptr as *mut u32, 0) }
+        }
+        ctx.regs.rax = 1;
+        return NtStatus::STATUS_SUCCESS;
+    }
+
+    // Hold the pending mutex for the entire operation to prevent concurrent
+    // readers from both seeing an empty buffer, both reading stdin, and then
+    // one overwriting the other's leftover bytes.
+    let mut pending_guard = pending.lock().unwrap();
+    let mut buf = core::mem::take(&mut *pending_guard);
+
+    // If the carry-over buffer is empty, do an initial read from host stdin.
+    if buf.is_empty() {
+        let mut raw = alloc::vec![0u8; 4096];
+        let (ok, n) = super::file::host::read_stdin(raw.as_mut_ptr(), 4096);
+        if !ok || n == 0 {
+            if chars_read_ptr != 0 {
+                unsafe { core::ptr::write(chars_read_ptr as *mut u32, 0) }
+            }
+            if ok {
+                ctx.regs.rax = 1; // EOF
+            } else {
+                let err = super::file::host::get_last_error();
+                set_guest_last_error(teb_va, err);
+                ctx.regs.rax = 0;
+            }
+            return NtStatus::STATUS_SUCCESS;
+        }
+        raw.truncate(n as usize);
+        buf = raw;
+    }
+
+    // Try to decode complete characters from what we have.
+    let (consumed_bytes, write_count, wide) = utf8_prefix_to_utf16(&buf, chars_to_read as usize);
+
+    if write_count > 0 {
+        // We got at least one character — return it. Any remaining bytes
+        // (including a possible incomplete trailing sequence) go back into
+        // the carry-over buffer for the next call.
+        if consumed_bytes < buf.len() {
+            *pending_guard = buf[consumed_bytes..].to_vec();
+        }
+    } else {
+        // No complete characters could be decoded. The buffer must consist
+        // entirely of an incomplete UTF-8 sequence. Try one more read from
+        // stdin to complete it.
+        let mut raw = alloc::vec![0u8; 4096];
+        let (ok, n) = super::file::host::read_stdin(raw.as_mut_ptr(), 4096);
+        if ok && n > 0 {
+            buf.extend_from_slice(&raw[..n as usize]);
+        }
+
+        // Retry decode after appending new bytes.
+        let (consumed2, write_count2, wide2) = utf8_prefix_to_utf16(&buf, chars_to_read as usize);
+
+        if write_count2 > 0 {
+            if consumed2 < buf.len() {
+                *pending_guard = buf[consumed2..].to_vec();
+            }
+            let dest = buffer_ptr as *mut u16;
+            for (i, &ch) in wide2.iter().enumerate().take(write_count2) {
+                unsafe { core::ptr::write(dest.add(i), ch) }
+            }
+            if chars_read_ptr != 0 {
+                unsafe { core::ptr::write(chars_read_ptr as *mut u32, write_count2 as u32) }
+            }
+            ctx.regs.rax = 1;
+            return NtStatus::STATUS_SUCCESS;
+        }
+
+        // Still no complete chars — emit U+FFFD for each remaining byte
+        // so we make forward progress and never wedge.
+        let emit = buf.len().min(chars_to_read as usize);
+        let dest = buffer_ptr as *mut u16;
+        for i in 0..emit {
+            unsafe { core::ptr::write(dest.add(i), 0xFFFD) }
+        }
+        if emit < buf.len() {
+            *pending_guard = buf[emit..].to_vec();
+        }
+        if chars_read_ptr != 0 {
+            unsafe { core::ptr::write(chars_read_ptr as *mut u32, emit as u32) }
+        }
+        ctx.regs.rax = 1;
+        return NtStatus::STATUS_SUCCESS;
+    }
+
+    // Write UTF-16 code units to guest buffer.
+    let dest = buffer_ptr as *mut u16;
+    for (i, item) in wide.iter().enumerate().take(write_count) {
+        unsafe { core::ptr::write(dest.add(i), *item) }
+    }
+
+    if chars_read_ptr != 0 {
+        unsafe { core::ptr::write(chars_read_ptr as *mut u32, write_count as u32) }
+    }
+    ctx.regs.rax = 1; // TRUE
+    NtStatus::STATUS_SUCCESS
+}
+
+/// Decode the largest prefix of `bytes` that is valid UTF-8 and produces at
+/// most `max_chars` UTF-16 code units.
+///
+/// Returns `(bytes_consumed, utf16_count, utf16_data)`.
+fn utf8_prefix_to_utf16(bytes: &[u8], max_chars: usize) -> (usize, usize, alloc::vec::Vec<u16>) {
+    let mut wide = alloc::vec::Vec::with_capacity(max_chars);
+    let mut byte_pos = 0;
+
+    while byte_pos < bytes.len() && wide.len() < max_chars {
+        // Determine the length of the next UTF-8 codepoint.
+        let b = bytes[byte_pos];
+        let cp_len = if b < 0x80 {
+            1
+        } else if b < 0xE0 {
+            2
+        } else if b < 0xF0 {
+            3
+        } else {
+            4
+        };
+
+        // Check if the full sequence is available.
+        if byte_pos + cp_len > bytes.len() {
+            break; // incomplete sequence — leave for next call
+        }
+
+        // Decode the codepoint.
+        let slice = &bytes[byte_pos..byte_pos + cp_len];
+        if let Ok(s) = core::str::from_utf8(slice) {
+            // Check if encoding to UTF-16 would exceed the limit.
+            let u16_count = s.encode_utf16().count();
+            if wide.len() + u16_count > max_chars {
+                break; // would exceed caller's buffer — stop here
+            }
+            wide.extend(s.encode_utf16());
+            byte_pos += cp_len;
+        } else {
+            // Invalid UTF-8 byte — skip it as U+FFFD.
+            if wide.len() + 1 > max_chars {
+                break;
+            }
+            wide.push(0xFFFD);
+            byte_pos += 1;
+        }
+    }
+
+    (byte_pos, wide.len(), wide)
 }
 
 // ========================================================================
@@ -1999,7 +2282,7 @@ pub(crate) fn k32_get_proc_address(
         }
         core::str::from_utf8(&name)
             .ok()
-            .map(|s| alloc::string::String::from(s))
+            .map(alloc::string::String::from)
     } else {
         None // Ordinal import
     };
@@ -2025,7 +2308,7 @@ pub(crate) fn k32_get_proc_address(
     if let Some(ref name) = name_str {
         use litebox::platform::DebugLogProvider as _;
         litebox_platform_multiplex::platform()
-            .debug_log_print(&alloc::format!("[NT shim] GetProcAddress: {}\n", name));
+            .debug_log_print(&alloc::format!("[NT shim] GetProcAddress: {name}\n"));
     }
 
     set_guest_last_error(teb_va, 127); // ERROR_PROC_NOT_FOUND
@@ -2168,8 +2451,7 @@ pub(crate) fn k32_load_library_ex_w(
 
     use litebox::platform::DebugLogProvider as _;
     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-        "[NT shim] LoadLibraryExW: {:?} not found\n",
-        name
+        "[NT shim] LoadLibraryExW: {name:?} not found\n"
     ));
 
     set_guest_last_error(teb_va, 126); // ERROR_MOD_NOT_FOUND
@@ -3359,9 +3641,7 @@ pub(crate) fn k32_rtl_pc_to_file_header(
     let pc = args.arg0;
     let base_ptr = args.arg1;
 
-    let image_base = find_module_for_pc(pc, module_bases)
-        .map(|(base, _)| base as u64)
-        .unwrap_or(0);
+    let image_base = find_module_for_pc(pc, module_bases).map_or(0, |(base, _)| base as u64);
 
     if base_ptr != 0 {
         unsafe {

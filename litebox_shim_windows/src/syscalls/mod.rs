@@ -15,6 +15,7 @@ pub(crate) mod heap;
 pub(crate) mod k32_handlers;
 pub(crate) mod memory;
 pub(crate) mod net;
+pub(crate) mod section;
 pub(crate) mod sync;
 pub(crate) mod sysinfo;
 pub(crate) mod thread;

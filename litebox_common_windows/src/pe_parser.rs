@@ -366,6 +366,7 @@ impl PeParsedFile {
         // names (aliases), emit one PeExport per name so that a name-based
         // resolver can find all of them.
         let mut result = Vec::with_capacity(num_functions);
+        #[allow(clippy::needless_range_loop)] // eat_index is used for both arithmetic and indexing
         for eat_index in 0..num_functions {
             let func_off = match self
                 .rva_to_file_offset(export_dir.address_of_functions + (eat_index as u32) * 4)

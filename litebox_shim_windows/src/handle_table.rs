@@ -83,6 +83,37 @@ pub enum NtObject {
         /// Key into `NtSharedState::sockets`.
         sock_id: u32,
     },
+    /// An in-memory file (e.g., a DLL served from the tar archive).
+    MemoryFile {
+        /// Guest-visible NT path.
+        path: String,
+        /// File content bytes.
+        data: Arc<Vec<u8>>,
+        /// Current read position.
+        position: Arc<core::sync::atomic::AtomicU64>,
+    },
+    /// An NT section object (NtCreateSection).
+    Section {
+        /// The raw PE data (for SEC_IMAGE sections).
+        pe_data: Arc<Vec<u8>>,
+        /// Parsed PE metadata.
+        image_size: u32,
+        image_base: u64,
+        entry_point: u32,
+        section_alignment: u32,
+        is_dll: bool,
+    },
+    /// An anonymous data section (NtCreateSection without SEC_IMAGE).
+    DataSection {
+        /// Maximum size of the section (in bytes).
+        max_size: u64,
+    },
+    /// Current process handle (from duplicating pseudo-handle -1).
+    CurrentProcess,
+    /// Current thread handle (from duplicating pseudo-handle -2).
+    CurrentThread,
+    /// A registry key handle (dummy — returns NOT_FOUND on value queries).
+    RegistryKey,
 }
 
 /// Internal state for an NT event object.
@@ -309,10 +340,11 @@ impl HandleTable {
     pub fn close(&mut self, handle: u32) -> Option<NtObject> {
         let obj = self.objects.remove(&handle);
         // If this is a File with a host handle, close it.
-        if let Some(NtObject::File { host_handle, .. }) = &obj {
-            if *host_handle != 0 && *host_handle != usize::MAX {
-                close_host_handle(*host_handle);
-            }
+        if let Some(NtObject::File { host_handle, .. }) = &obj
+            && *host_handle != 0
+            && *host_handle != usize::MAX
+        {
+            close_host_handle(*host_handle);
         }
         obj
     }
@@ -364,6 +396,38 @@ impl HandleTable {
             NtObject::KeyedEvent(k) => NtObject::KeyedEvent(Arc::clone(k)),
             NtObject::Thread(t) => NtObject::Thread(Arc::clone(t)),
             NtObject::Socket { sock_id } => NtObject::Socket { sock_id: *sock_id },
+            NtObject::MemoryFile {
+                path,
+                data,
+                position,
+            } => NtObject::MemoryFile {
+                path: path.clone(),
+                data: Arc::clone(data),
+                position: Arc::new(core::sync::atomic::AtomicU64::new(
+                    position.load(core::sync::atomic::Ordering::Relaxed),
+                )),
+            },
+            NtObject::Section {
+                pe_data,
+                image_size,
+                image_base,
+                entry_point,
+                section_alignment,
+                is_dll,
+            } => NtObject::Section {
+                pe_data: Arc::clone(pe_data),
+                image_size: *image_size,
+                image_base: *image_base,
+                entry_point: *entry_point,
+                section_alignment: *section_alignment,
+                is_dll: *is_dll,
+            },
+            NtObject::DataSection { max_size } => NtObject::DataSection {
+                max_size: *max_size,
+            },
+            NtObject::CurrentProcess => NtObject::CurrentProcess,
+            NtObject::CurrentThread => NtObject::CurrentThread,
+            NtObject::RegistryKey => NtObject::RegistryKey,
         };
         Some(self.insert(new_obj))
     }

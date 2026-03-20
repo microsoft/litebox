@@ -548,11 +548,9 @@ pub(crate) fn nt_wait_for_multiple_objects(
         // Validate all handles upfront.
         {
             let handles = handles_mutex.lock().unwrap();
-            for &h in handle_array.iter() {
+            for &h in handle_array {
                 match handles.get(h) {
-                    Some(NtObject::Event(_))
-                    | Some(NtObject::Semaphore(_))
-                    | Some(NtObject::Thread(_)) => {}
+                    Some(NtObject::Event(_) | NtObject::Semaphore(_) | NtObject::Thread(_)) => {}
                     _ => return NtStatus::STATUS_INVALID_HANDLE,
                 }
             }
@@ -590,10 +588,10 @@ pub(crate) fn nt_wait_for_multiple_objects(
                 }
             } // handle table lock dropped
 
-            if let Some(dl) = deadline {
-                if std::time::Instant::now() >= dl {
-                    return NtStatus::STATUS_TIMEOUT;
-                }
+            if let Some(dl) = deadline
+                && std::time::Instant::now() >= dl
+            {
+                return NtStatus::STATUS_TIMEOUT;
             }
 
             // Yield before retrying.
@@ -611,7 +609,7 @@ pub(crate) fn nt_wait_for_multiple_objects(
         let waitables: alloc::vec::Vec<Waitable> = {
             let handles = handles_mutex.lock().unwrap();
             let mut v = alloc::vec::Vec::with_capacity(handle_array.len());
-            for &h in handle_array.iter() {
+            for &h in handle_array {
                 match handles.get(h) {
                     Some(NtObject::Event(e)) => v.push(Waitable::Event(Arc::clone(e))),
                     Some(NtObject::Semaphore(s)) => v.push(Waitable::Semaphore(Arc::clone(s))),
@@ -714,10 +712,10 @@ pub(crate) fn nt_wait_for_multiple_objects(
                 return NtStatus::STATUS_SUCCESS;
             }
 
-            if let Some(dl) = deadline {
-                if std::time::Instant::now() >= dl {
-                    return NtStatus::STATUS_TIMEOUT;
-                }
+            if let Some(dl) = deadline
+                && std::time::Instant::now() >= dl
+            {
+                return NtStatus::STATUS_TIMEOUT;
             }
 
             std::thread::sleep(Duration::from_millis(1));

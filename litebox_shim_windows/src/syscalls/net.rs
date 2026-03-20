@@ -179,9 +179,8 @@ fn ws2_socket(
     let af = args.arg0 as i32;
     let sock_type = args.arg1 as i32;
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => return wsa_fail(ctx, teb_va, WSANOTINITIALISED),
+    let Some(net_arc) = shared.net.get() else {
+        return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
     // AF_INET = 2, AF_INET6 = 23
@@ -232,9 +231,8 @@ fn ws2_closesocket(
     };
 
     // Remove from socket table — this also provides the SocketFd for close().
-    let socket_fd = match shared.sockets.lock().unwrap().remove(&sock_id) {
-        Some(fd) => fd,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(socket_fd) = shared.sockets.lock().unwrap().remove(&sock_id) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
     if let Some(net_arc) = shared.net.get() {
@@ -255,14 +253,12 @@ fn ws2_shutdown(
     let sock = args.arg0 as u32;
     let how = args.arg1 as i32;
 
-    let sock_id = match sock_id_for_handle(shared, sock) {
-        Some(id) => id,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(sock_id) = sock_id_for_handle(shared, sock) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => return wsa_fail(ctx, teb_va, WSANOTINITIALISED),
+    let Some(net_arc) = shared.net.get() else {
+        return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
     // SD_RECEIVE=0, SD_SEND=1, SD_BOTH=2
@@ -274,9 +270,8 @@ fn ws2_shutdown(
     };
 
     let sockets = shared.sockets.lock().unwrap();
-    let socket_fd = match sockets.get(&sock_id) {
-        Some(fd) => fd,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(socket_fd) = sockets.get(&sock_id) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
     let mut net = net_arc.lock().unwrap();
     match net.shutdown(socket_fd, read, write) {
@@ -364,19 +359,16 @@ fn ws2_connect(
     let addr_ptr = args.arg1;
     let addr_len = args.arg2 as i32;
 
-    let sock_id = match sock_id_for_handle(shared, sock) {
-        Some(id) => id,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(sock_id) = sock_id_for_handle(shared, sock) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
-    let addr = match parse_sockaddr(addr_ptr, addr_len) {
-        Some(a) => a,
-        None => return wsa_fail(ctx, teb_va, WSAEINVAL),
+    let Some(addr) = parse_sockaddr(addr_ptr, addr_len) else {
+        return wsa_fail(ctx, teb_va, WSAEINVAL);
     };
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => return wsa_fail(ctx, teb_va, WSANOTINITIALISED),
+    let Some(net_arc) = shared.net.get() else {
+        return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
     // Blocking connect: loop until connected or failed.
@@ -384,9 +376,8 @@ fn ws2_connect(
     loop {
         let result = {
             let sockets = shared.sockets.lock().unwrap();
-            let socket_fd = match sockets.get(&sock_id) {
-                Some(fd) => fd,
-                None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+            let Some(socket_fd) = sockets.get(&sock_id) else {
+                return wsa_fail(ctx, teb_va, WSAENOTSOCK);
             };
             let mut net = net_arc.lock().unwrap();
             net.connect(socket_fd, &addr, check_progress)
@@ -422,14 +413,12 @@ fn ws2_send(shared: &NtSharedState, ctx: &mut ExecutionContext, teb_va: usize) -
     let buf_ptr = args.arg1;
     let len = args.arg2 as usize;
 
-    let sock_id = match sock_id_for_handle(shared, sock) {
-        Some(id) => id,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(sock_id) = sock_id_for_handle(shared, sock) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => return wsa_fail(ctx, teb_va, WSANOTINITIALISED),
+    let Some(net_arc) = shared.net.get() else {
+        return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
     // Safety: guest memory is directly accessible.
@@ -439,9 +428,8 @@ fn ws2_send(shared: &NtSharedState, ctx: &mut ExecutionContext, teb_va: usize) -
     loop {
         let result = {
             let sockets = shared.sockets.lock().unwrap();
-            let socket_fd = match sockets.get(&sock_id) {
-                Some(fd) => fd,
-                None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+            let Some(socket_fd) = sockets.get(&sock_id) else {
+                return wsa_fail(ctx, teb_va, WSAENOTSOCK);
             };
             let mut net = net_arc.lock().unwrap();
             net.send(socket_fd, buf, litebox::net::SendFlags::empty(), None)
@@ -466,14 +454,12 @@ fn ws2_recv(shared: &NtSharedState, ctx: &mut ExecutionContext, teb_va: usize) -
     let buf_ptr = args.arg1;
     let len = args.arg2 as usize;
 
-    let sock_id = match sock_id_for_handle(shared, sock) {
-        Some(id) => id,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(sock_id) = sock_id_for_handle(shared, sock) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => return wsa_fail(ctx, teb_va, WSANOTINITIALISED),
+    let Some(net_arc) = shared.net.get() else {
+        return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
     // Safety: guest memory is directly accessible.
@@ -483,9 +469,8 @@ fn ws2_recv(shared: &NtSharedState, ctx: &mut ExecutionContext, teb_va: usize) -
     loop {
         let result = {
             let sockets = shared.sockets.lock().unwrap();
-            let socket_fd = match sockets.get(&sock_id) {
-                Some(fd) => fd,
-                None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+            let Some(socket_fd) = sockets.get(&sock_id) else {
+                return wsa_fail(ctx, teb_va, WSAENOTSOCK);
             };
             let mut net = net_arc.lock().unwrap();
             net.receive(socket_fd, buf, litebox::net::ReceiveFlags::empty(), None)
@@ -522,14 +507,12 @@ fn ws2_sendto(
     let to_ptr = unsafe { NtSyscallArgs::arg4(ctx) };
     let to_len = unsafe { NtSyscallArgs::arg5(ctx) } as i32;
 
-    let sock_id = match sock_id_for_handle(shared, sock) {
-        Some(id) => id,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(sock_id) = sock_id_for_handle(shared, sock) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => return wsa_fail(ctx, teb_va, WSANOTINITIALISED),
+    let Some(net_arc) = shared.net.get() else {
+        return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
     let dest = if to_ptr != 0 && to_len > 0 {
@@ -543,9 +526,8 @@ fn ws2_sendto(
     loop {
         let result = {
             let sockets = shared.sockets.lock().unwrap();
-            let socket_fd = match sockets.get(&sock_id) {
-                Some(fd) => fd,
-                None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+            let Some(socket_fd) = sockets.get(&sock_id) else {
+                return wsa_fail(ctx, teb_va, WSAENOTSOCK);
             };
             let mut net = net_arc.lock().unwrap();
             net.send(socket_fd, buf, litebox::net::SendFlags::empty(), dest)
@@ -574,14 +556,12 @@ fn ws2_recvfrom(
     let from_ptr = unsafe { NtSyscallArgs::arg4(ctx) };
     let fromlen_ptr = unsafe { NtSyscallArgs::arg5(ctx) };
 
-    let sock_id = match sock_id_for_handle(shared, sock) {
-        Some(id) => id,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(sock_id) = sock_id_for_handle(shared, sock) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => return wsa_fail(ctx, teb_va, WSANOTINITIALISED),
+    let Some(net_arc) = shared.net.get() else {
+        return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
     let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
@@ -595,9 +575,8 @@ fn ws2_recvfrom(
         };
         let result = {
             let sockets = shared.sockets.lock().unwrap();
-            let socket_fd = match sockets.get(&sock_id) {
-                Some(fd) => fd,
-                None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+            let Some(socket_fd) = sockets.get(&sock_id) else {
+                return wsa_fail(ctx, teb_va, WSAENOTSOCK);
             };
             let mut net = net_arc.lock().unwrap();
             net.receive(
@@ -609,10 +588,10 @@ fn ws2_recvfrom(
         };
         match result {
             Ok(n) if n > 0 => {
-                if from_ptr != 0 {
-                    if let Some(ref addr) = source {
-                        write_sockaddr(addr, from_ptr, fromlen_ptr);
-                    }
+                if from_ptr != 0
+                    && let Some(ref addr) = source
+                {
+                    write_sockaddr(addr, from_ptr, fromlen_ptr);
                 }
                 return wsa_ok(ctx, teb_va, n);
             }
@@ -638,25 +617,21 @@ fn ws2_bind(shared: &NtSharedState, ctx: &mut ExecutionContext, teb_va: usize) -
     let addr_ptr = args.arg1;
     let addr_len = args.arg2 as i32;
 
-    let sock_id = match sock_id_for_handle(shared, sock) {
-        Some(id) => id,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(sock_id) = sock_id_for_handle(shared, sock) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
-    let addr = match parse_sockaddr(addr_ptr, addr_len) {
-        Some(a) => a,
-        None => return wsa_fail(ctx, teb_va, WSAEINVAL),
+    let Some(addr) = parse_sockaddr(addr_ptr, addr_len) else {
+        return wsa_fail(ctx, teb_va, WSAEINVAL);
     };
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => return wsa_fail(ctx, teb_va, WSANOTINITIALISED),
+    let Some(net_arc) = shared.net.get() else {
+        return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
     let sockets = shared.sockets.lock().unwrap();
-    let socket_fd = match sockets.get(&sock_id) {
-        Some(fd) => fd,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(socket_fd) = sockets.get(&sock_id) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
     let mut net = net_arc.lock().unwrap();
     match net.bind(socket_fd, &addr) {
@@ -681,20 +656,17 @@ fn ws2_listen(
     let sock = args.arg0 as u32;
     let backlog = args.arg1 as u16;
 
-    let sock_id = match sock_id_for_handle(shared, sock) {
-        Some(id) => id,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(sock_id) = sock_id_for_handle(shared, sock) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => return wsa_fail(ctx, teb_va, WSANOTINITIALISED),
+    let Some(net_arc) = shared.net.get() else {
+        return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
     let sockets = shared.sockets.lock().unwrap();
-    let socket_fd = match sockets.get(&sock_id) {
-        Some(fd) => fd,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(socket_fd) = sockets.get(&sock_id) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
     let mut net = net_arc.lock().unwrap();
     match net.listen(socket_fd, backlog.max(1)) {
@@ -714,22 +686,16 @@ fn ws2_accept(
     let addr_ptr = args.arg1;
     let addrlen_ptr = args.arg2;
 
-    let sock_id = match sock_id_for_handle(shared, sock) {
-        Some(id) => id,
-        None => {
-            set_last_wsa_error(teb_va, WSAENOTSOCK);
-            ctx.regs.rax = INVALID_SOCKET;
-            return (NtStatus::STATUS_SUCCESS, false);
-        }
+    let Some(sock_id) = sock_id_for_handle(shared, sock) else {
+        set_last_wsa_error(teb_va, WSAENOTSOCK);
+        ctx.regs.rax = INVALID_SOCKET;
+        return (NtStatus::STATUS_SUCCESS, false);
     };
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => {
-            set_last_wsa_error(teb_va, WSANOTINITIALISED);
-            ctx.regs.rax = INVALID_SOCKET;
-            return (NtStatus::STATUS_SUCCESS, false);
-        }
+    let Some(net_arc) = shared.net.get() else {
+        set_last_wsa_error(teb_va, WSANOTINITIALISED);
+        ctx.regs.rax = INVALID_SOCKET;
+        return (NtStatus::STATUS_SUCCESS, false);
     };
 
     // Blocking accept.
@@ -745,13 +711,10 @@ fn ws2_accept(
         };
         let result = {
             let sockets = shared.sockets.lock().unwrap();
-            let socket_fd = match sockets.get(&sock_id) {
-                Some(fd) => fd,
-                None => {
-                    set_last_wsa_error(teb_va, WSAENOTSOCK);
-                    ctx.regs.rax = INVALID_SOCKET;
-                    return (NtStatus::STATUS_SUCCESS, false);
-                }
+            let Some(socket_fd) = sockets.get(&sock_id) else {
+                set_last_wsa_error(teb_va, WSAENOTSOCK);
+                ctx.regs.rax = INVALID_SOCKET;
+                return (NtStatus::STATUS_SUCCESS, false);
             };
             let mut net = net_arc.lock().unwrap();
             net.accept(socket_fd, peer_ref)
@@ -870,20 +833,17 @@ fn ws2_getsockname(
     let name_ptr = args.arg1;
     let namelen_ptr = args.arg2;
 
-    let sock_id = match sock_id_for_handle(shared, sock) {
-        Some(id) => id,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(sock_id) = sock_id_for_handle(shared, sock) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => return wsa_fail(ctx, teb_va, WSANOTINITIALISED),
+    let Some(net_arc) = shared.net.get() else {
+        return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
     let sockets = shared.sockets.lock().unwrap();
-    let socket_fd = match sockets.get(&sock_id) {
-        Some(fd) => fd,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(socket_fd) = sockets.get(&sock_id) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
     let net = net_arc.lock().unwrap();
     match net.get_local_addr(socket_fd) {
@@ -906,20 +866,17 @@ fn ws2_getpeername(
     let name_ptr = args.arg1;
     let namelen_ptr = args.arg2;
 
-    let sock_id = match sock_id_for_handle(shared, sock) {
-        Some(id) => id,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(sock_id) = sock_id_for_handle(shared, sock) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
-    let net_arc = match shared.net.get() {
-        Some(n) => n,
-        None => return wsa_fail(ctx, teb_va, WSANOTINITIALISED),
+    let Some(net_arc) = shared.net.get() else {
+        return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
     let sockets = shared.sockets.lock().unwrap();
-    let socket_fd = match sockets.get(&sock_id) {
-        Some(fd) => fd,
-        None => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
+    let Some(socket_fd) = sockets.get(&sock_id) else {
+        return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
     let net = net_arc.lock().unwrap();
     match net.get_remote_addr(socket_fd) {
@@ -971,7 +928,7 @@ fn ws2_getaddrinfo(
     let port: u16 = service
         .as_deref()
         .and_then(|s| {
-            s.parse::<u16>().ok().or_else(|| match s {
+            s.parse::<u16>().ok().or(match s {
                 "http" => Some(80),
                 "https" => Some(443),
                 "dns" => Some(53),
@@ -991,16 +948,13 @@ fn ws2_getaddrinfo(
         None
     });
 
-    let ip = match ip {
-        Some(ip) => ip,
-        None => {
-            if res_ptr != 0 {
-                unsafe { core::ptr::write(res_ptr as *mut usize, 0) };
-            }
-            set_last_wsa_error(teb_va, WSAHOST_NOT_FOUND);
-            ctx.regs.rax = WSAHOST_NOT_FOUND as usize; // EAI_NONAME
-            return (NtStatus::STATUS_SUCCESS, false);
+    let Some(ip) = ip else {
+        if res_ptr != 0 {
+            unsafe { core::ptr::write(res_ptr as *mut usize, 0) };
         }
+        set_last_wsa_error(teb_va, WSAHOST_NOT_FOUND);
+        ctx.regs.rax = WSAHOST_NOT_FOUND as usize; // EAI_NONAME
+        return (NtStatus::STATUS_SUCCESS, false);
     };
 
     // Allocate a minimal addrinfo + sockaddr_in in guest memory.

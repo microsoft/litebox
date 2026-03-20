@@ -206,7 +206,7 @@ pub fn build_stub_dll(dll_name: &str, exports: &[StubExport], image_base: u64) -
     let mut code_offsets: Vec<u32> = vec![0; exports.len()];
     for (i, export) in exports.iter().enumerate() {
         // Align each function to 16 bytes.
-        while text_data.len() % 16 != 0 {
+        while !text_data.len().is_multiple_of(16) {
             text_data.push(0xCC); // INT3 padding
         }
         let stub_offset = text_data.len() as u32;
@@ -307,14 +307,14 @@ pub fn build_stub_dll(dll_name: &str, exports: &[StubExport], image_base: u64) -
         }
     }
     // Final padding
-    while text_data.len() % 16 != 0 {
+    while !text_data.len().is_multiple_of(16) {
         text_data.push(0xCC);
     }
 
     // ---- Build .edata section content (export directory) ----
     let num_exports = exports.len() as u32;
     let text_section_rva: u32 = section_alignment;
-    let text_pages = (text_data.len() as u32 + section_alignment - 1) / section_alignment;
+    let text_pages = (text_data.len() as u32).div_ceil(section_alignment);
     let edata_section_rva: u32 = text_section_rva + text_pages * section_alignment;
 
     // Layout of .edata:
@@ -752,7 +752,7 @@ pub fn build_test_exe(
         let mut dll_iat_rvas = Vec::new();
         for (func_idx, _func) in dll.functions.iter().enumerate() {
             // ILT entry: RVA to hint/name (bit 63 clear = by name)
-            let hn_rva = hint_name_rvas[dll_idx][func_idx] as u64;
+            let hn_rva = u64::from(hint_name_rvas[dll_idx][func_idx]);
             let ilt_off = ilt_cursor as usize + func_idx * 8;
             idata_data[ilt_off..ilt_off + 8].copy_from_slice(&hn_rva.to_le_bytes());
 

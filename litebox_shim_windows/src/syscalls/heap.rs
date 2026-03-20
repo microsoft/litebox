@@ -170,12 +170,9 @@ fn do_heap_alloc(
     let total = size + HEADER_SIZE;
     let aligned = (total + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
-    let nz_size = match NonZeroPageSize::new(aligned) {
-        Some(s) => s,
-        None => {
-            ctx.regs.rax = 0;
-            return NtStatus::STATUS_NO_MEMORY;
-        }
+    let Some(nz_size) = NonZeroPageSize::new(aligned) else {
+        ctx.regs.rax = 0;
+        return NtStatus::STATUS_NO_MEMORY;
     };
 
     let zero_fill = flags & HEAP_ZERO_MEMORY != 0;

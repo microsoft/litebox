@@ -6,6 +6,25 @@
 // Restrict this crate to only work on Windows. For now, we are restricting this to only x86-64
 // Windows, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#![allow(
+    // Windows ABI entrypoints and packet interfaces require these integer widths.
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    // Raw pointer conversions are inherent to the userland platform glue.
+    clippy::borrow_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::ptr_as_ptr,
+    clippy::ptr_cast_constness,
+    clippy::ref_as_ptr,
+    // Some helpers define local items after probing platform state.
+    clippy::items_after_statements,
+    // Interop helpers intentionally use panic assertions and underscored fields.
+    clippy::missing_panics_doc,
+    clippy::unused_self,
+    clippy::used_underscore_binding,
+)]
 
 use core::cell::Cell;
 use core::panic;
@@ -653,7 +672,7 @@ impl GuestGsTable {
     /// trampoline scanner continues past the slot rather than stopping.
     fn remove(&self, guest_gs: u64) {
         let mut guard = self.entries.lock().unwrap();
-        for entry in guard.data.iter_mut() {
+        for entry in &mut guard.data {
             if entry.guest_gs == guest_gs {
                 // Write tombstone instead of zero so the scanner doesn't
                 // treat this as end-of-table.
@@ -713,7 +732,7 @@ impl GuestGsTable {
                 return None;
             }
         };
-        for i in 0..litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES + 1 {
+        for i in 0..=litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES {
             let entry = unsafe { &*entries.add(i) };
             let gs = unsafe { core::ptr::read_volatile(&entry.guest_gs) };
             if gs == 0 {
@@ -835,6 +854,25 @@ unsafe extern "system" fn vectored_exception_handler_inner(
         context = &mut *info.ContextRecord;
     }
 
+    #[cfg(debug_assertions)]
+    {
+        static VEH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = VEH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 20 {
+            eprintln!(
+                "[VEH] #{} code=0x{:08X} rip=0x{:X} addr=0x{:X}",
+                n,
+                exception_record.ExceptionCode as u32,
+                context.Rip,
+                if exception_record.NumberParameters >= 2 {
+                    exception_record.ExceptionInformation[1] as u64
+                } else {
+                    0
+                }
+            );
+        }
+    }
+
     let Some(tls) = get_tls_ptr() else {
         // TLS slot not initialized yet; cannot be in guest.
         return EXCEPTION_CONTINUE_SEARCH;
@@ -903,20 +941,19 @@ unsafe extern "system" fn vectored_exception_handler_inner(
     {
         set_context_to_interrupt_callback(tls, context);
     } else {
-        // Push the exception record onto the host stack.
+        // Store the exception record below host_sp for the exception handler.
         let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
         assert!(exception_record_ptr.is_aligned());
         unsafe { exception_record_ptr.write(*exception_record) };
 
-        // Re-align the stack pointer.
-        let rsp = exception_record_ptr as usize & !15;
-
         // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
         let _ = run_thread_arch as *const () as usize;
 
-        // Update the thread context to jump to the exception handler.
+        // Restore RSP to host_sp so that exception_callback can read
+        // thread_ctx from [rsp] (same layout as the syscall path).
+        // The exception record is below host_sp and passed via RDX.
         context.Rip = exception_callback as *const () as usize as u64;
-        context.Rsp = rsp as u64;
+        context.Rsp = tls.host_sp.get().addr() as u64;
         context.Rbp = tls.host_bp.get() as u64;
         context.Rdx = exception_record_ptr as u64;
     }
@@ -1501,12 +1538,15 @@ impl litebox::platform::AddressSpaceProvider for WindowsUserland {
     fn create_address_space(
         &self,
     ) -> Result<Self::AddressSpaceId, litebox::platform::address_space::AddressSpaceError> {
-        // The initial address space shares slot 0 with the host process.
-        // Host allocations (exe, DLLs, heap) are expected in this range,
-        // so skip the VirtualQuery cleanliness probe.
-        self.partitions
-            .lock()
-            .unwrap()
+        // Try to find a clean VA partition first (no host allocations).
+        // This avoids fragmentation conflicts when the guest does its own
+        // memory management (e.g., ntdll heap init, DLL loading).
+        let mut partitions = self.partitions.lock().unwrap();
+        if let Some(id) = partitions.allocate_probed(is_va_range_clean) {
+            return Ok(id);
+        }
+        // Fallback: use any available slot even if host-contaminated.
+        partitions
             .allocate()
             .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)
     }
@@ -2801,7 +2841,7 @@ impl litebox::platform::IPInterfaceProvider for WindowsUserland {
         if let Some(session) = &self.tun_session {
             return session
                 .send(packet)
-                .map_err(|errno| litebox::platform::SendError::Io(errno));
+                .map_err(litebox::platform::SendError::Io);
         }
 
         // IPC path: write [u32 LE len][packet] as a single frame.
@@ -3364,19 +3404,68 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         }
 
         debug_assert!(base_addr.is_null());
-        let ptr = reserve_and_commit(0..size, prot_flags(initial_permissions));
-        assert!(
-            !ptr.is_null(),
-            "VirtualAlloc2(RESERVE|COMMIT size=0x{:x}) failed: {}",
-            size,
-            std::io::Error::last_os_error()
-        );
 
-        // Prefetch the memory range if requested
-        if populate_pages_immediately {
-            do_prefetch_on_range(ptr as usize, size);
+        // VirtualAlloc2 with address requirements to keep allocations within
+        // the same partition as the original suggested range.  Without this,
+        // NULL-base allocations can land outside the page manager's addr_max.
+        let partition_end = {
+            // Round suggested_range.end up to the next partition boundary.
+            let end = suggested_range.end;
+            let ps = va_partitions::PARTITION_SIZE;
+            end.div_ceil(ps) * ps
+        };
+        #[repr(C)]
+        struct MemAddressRequirements {
+            lowest: *mut c_void,
+            highest: *mut c_void,
+            alignment: usize,
         }
-        Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
+        let mut addr_req = MemAddressRequirements {
+            lowest: va_partitions::VA_MIN as *mut c_void,
+            highest: (partition_end.saturating_sub(1)) as *mut c_void,
+            alignment: 0,
+        };
+        #[repr(C)]
+        struct MemExtendedParameter {
+            type_and_reserved: u64,
+            value: *mut c_void,
+        }
+        // Type = MemExtendedParameterAddressRequirements (1), shifted left by 32 bits per the API.
+        let mut ext_param = MemExtendedParameter {
+            type_and_reserved: 1_u64 << 32,
+            value: &mut addr_req as *mut MemAddressRequirements as *mut c_void,
+        };
+        let aligned_size = self.round_up_to_granu(size);
+        let ptr = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                core::ptr::null_mut(),
+                aligned_size,
+                Win32_Memory::MEM_RESERVE | Win32_Memory::MEM_COMMIT,
+                prot_flags(initial_permissions),
+                &mut ext_param as *mut MemExtendedParameter as *mut _,
+                1,
+            )
+        };
+        if ptr.is_null() {
+            // Fallback: try without address constraints.
+            let ptr = reserve_and_commit(0..size, prot_flags(initial_permissions));
+            assert!(
+                !ptr.is_null(),
+                "VirtualAlloc2(RESERVE|COMMIT size=0x{:x}) failed: {}",
+                size,
+                std::io::Error::last_os_error()
+            );
+            if populate_pages_immediately {
+                do_prefetch_on_range(ptr as usize, size);
+            }
+            Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
+        } else {
+            if populate_pages_immediately {
+                do_prefetch_on_range(ptr as usize, size);
+            }
+            Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
+        }
     }
 
     unsafe fn deallocate_pages(
@@ -4046,7 +4135,7 @@ fn is_page_committed(addr: usize) -> bool {
 /// `read_write_flag` is `ExceptionInformation[0]` from
 /// `EXCEPTION_ACCESS_VIOLATION`: 0 = read, 1 = write, 8 = DEP.
 fn synthesize_pf_error_code(is_present: bool, read_write_flag: usize) -> u32 {
-    (if is_present { 1 } else { 0 })
+    u32::from(is_present)
         | match read_write_flag {
             0 => 0,      // read fault
             8 => 1 << 4, // DEP (instruction fetch)

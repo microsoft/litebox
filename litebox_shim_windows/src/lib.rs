@@ -27,10 +27,30 @@
     // Cast warnings for syscall number extraction and status return
     // are inherent to the NT ABI (u32 syscall numbers, i32 NTSTATUS).
     clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
+    clippy::cast_lossless,
     clippy::unused_self,
+    // Raw guest-memory marshaling uses explicit pointer casts and alignment assumptions.
+    clippy::borrow_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::ptr_as_ptr,
     // Phase 2 adds many match arms; some have similar structure.
+    clippy::items_after_statements,
     clippy::match_same_arms,
+    clippy::single_match_else,
+    // These helpers intentionally use scratch bindings and doc-light internal APIs.
+    clippy::missing_panics_doc,
+    clippy::no_effect_underscore_binding,
+    clippy::used_underscore_binding,
+    clippy::unnecessary_cast,
+    // Some syscall helpers naturally use near-identical names for paired values.
+    clippy::similar_names,
+    clippy::format_push_string,
+    clippy::identity_op,
+    clippy::new_without_default,
+    clippy::too_many_arguments,
+    clippy::case_sensitive_file_extension_comparisons,
 )]
 
 extern crate alloc;
@@ -41,9 +61,9 @@ use std::sync::Mutex;
 
 use litebox::mm::PageManager;
 use litebox::shim::{ContinueOperation, ExceptionInfo};
-use litebox_common_windows::NtSyscallNumber;
 use litebox_common_windows::ntstatus::NtStatus;
 use litebox_common_windows::stub_dlls;
+use litebox_common_windows::{NtSyscallId, NtSyscallMap};
 use litebox_platform_multiplex::Platform;
 
 /// Pseudo-handle value for the current process (HANDLE)-1.
@@ -60,9 +80,13 @@ const PAGE_SIZE: usize = 4096;
 pub struct NtProcessState {
     /// Page manager for the guest address space.
     pub pm: PageManager<Platform, PAGE_SIZE>,
-    /// Tracks allocation base → aligned size for MEM_RELEASE.
+    /// Tracks allocation base ΓåÆ aligned size for MEM_RELEASE.
     /// MEM_RELEASE with size==0 must free the entire original allocation.
     alloc_tracker: Mutex<alloc::collections::BTreeMap<usize, usize>>,
+    /// Tracks SEC_IMAGE mappings (base ΓåÆ size) for NtQueryVirtualMemory.
+    /// Pages within these ranges should report `MEM_IMAGE` type instead of
+    /// `MEM_PRIVATE`, matching real NT kernel behavior.
+    image_mappings: Mutex<alloc::collections::BTreeMap<usize, usize>>,
 }
 
 impl NtProcessState {
@@ -71,10 +95,11 @@ impl NtProcessState {
         Self {
             pm,
             alloc_tracker: Mutex::new(alloc::collections::BTreeMap::new()),
+            image_mappings: Mutex::new(alloc::collections::BTreeMap::new()),
         }
     }
 
-    /// Record an allocation (base address → size in bytes).
+    /// Record an allocation (base address ΓåÆ size in bytes).
     pub fn track_alloc(&self, base: usize, size: usize) {
         self.alloc_tracker.lock().unwrap().insert(base, size);
     }
@@ -85,6 +110,17 @@ impl NtProcessState {
         self.alloc_tracker.lock().unwrap().remove(&base)
     }
 
+    /// Returns `true` if `addr` falls within any tracked allocation range.
+    pub fn is_tracked_alloc(&self, addr: usize) -> bool {
+        let tracker = self.alloc_tracker.lock().unwrap();
+        // Find the largest base Γëñ addr and check if addr < base + size.
+        if let Some((&base, &size)) = tracker.range(..=addr).next_back() {
+            addr < base + size
+        } else {
+            false
+        }
+    }
+
     /// Allocate a small RW region in guest VA. Returns the guest VA of the
     /// allocated block, or 0 on failure. The allocation is page-aligned and
     /// at least `size` bytes.
@@ -92,9 +128,8 @@ impl NtProcessState {
         use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
         use litebox::platform::RawConstPointer as _;
         let aligned = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let nz_size = match NonZeroPageSize::<PAGE_SIZE>::new(aligned) {
-            Some(s) => s,
-            None => return 0,
+        let Some(nz_size) = NonZeroPageSize::<PAGE_SIZE>::new(aligned) else {
+            return 0;
         };
         // Safety: create_writable_pages places the pages in guest VA.
         let result = unsafe {
@@ -104,6 +139,21 @@ impl NtProcessState {
         match result {
             Ok(ptr) => ptr.as_usize(),
             Err(_) => 0,
+        }
+    }
+
+    /// Record a SEC_IMAGE mapping (base ΓåÆ size) for NtQueryVirtualMemory.
+    pub fn track_image_mapping(&self, base: usize, size: usize) {
+        self.image_mappings.lock().unwrap().insert(base, size);
+    }
+
+    /// Returns `true` if `addr` falls within a SEC_IMAGE mapping.
+    pub fn is_image_mapping(&self, addr: usize) -> bool {
+        let mappings = self.image_mappings.lock().unwrap();
+        if let Some((&base, &size)) = mappings.range(..=addr).next_back() {
+            addr < base + size
+        } else {
+            false
         }
     }
 }
@@ -198,11 +248,24 @@ pub(crate) struct NtSharedState {
     /// Set by the runner after creating the Network instance.
     pub net:
         std::sync::OnceLock<alloc::sync::Arc<std::sync::Mutex<litebox::net::Network<Platform>>>>,
-    /// Socket storage: maps socket IDs → owned `SocketFd` handles.
+    /// Socket storage: maps socket IDs ΓåÆ owned `SocketFd` handles.
     /// Socket IDs are also stored in the handle table as `NtObject::Socket { sock_id }`.
     pub sockets: Mutex<alloc::collections::BTreeMap<u32, litebox::net::SocketFd<Platform>>>,
     /// Next socket ID to allocate.
     pub next_socket_id: Mutex<u32>,
+    /// Carry-over buffer for ReadConsoleW: bytes read from host stdin that
+    /// have not yet been returned to the guest.  Preserves excess and
+    /// incomplete UTF-8 tails across calls.
+    pub console_input_pending: Mutex<alloc::vec::Vec<u8>>,
+    /// DLL files from the tar archive, for serving via NtOpenFile during
+    /// ntdll-driven initialization. Keyed by lowercase filename.
+    pub dll_tar_files:
+        Mutex<Option<alloc::collections::BTreeMap<alloc::string::String, alloc::vec::Vec<u8>>>>,
+    /// Mapping from real Windows syscall numbers to `NtSyscallId`.
+    /// Populated by the ntdll rewriter; used for dispatch.
+    pub syscall_map: std::sync::OnceLock<NtSyscallMap>,
+    /// Syscall number ΓåÆ export name for unhandled stubs (debug logging).
+    pub unhandled_stubs: std::sync::OnceLock<alloc::vec::Vec<(u32, alloc::string::String)>>,
 }
 
 /// State set by the runner to configure the initial thread.
@@ -231,6 +294,12 @@ pub struct NtInitState {
     pub guest_va_end: usize,
     /// Full path of the main executable (for GetModuleFileNameW).
     pub exe_path: alloc::string::String,
+    /// For ntdll-driven init: RCX value (CONTEXT* pointer on guest stack).
+    /// When set, init() uses this as RCX instead of entry_point, allowing
+    /// the NtContinue slow path to restore all registers properly.
+    pub initial_rcx: Option<usize>,
+    /// For ntdll-driven init: RDX value (ntdll base address).
+    pub initial_rdx: Option<usize>,
 }
 
 /// A loaded module's name and base address for GetModuleHandleW.
@@ -269,6 +338,10 @@ impl NtShimEntrypoints {
             net: std::sync::OnceLock::new(),
             sockets: Mutex::new(alloc::collections::BTreeMap::new()),
             next_socket_id: Mutex::new(1),
+            console_input_pending: Mutex::new(alloc::vec::Vec::new()),
+            dll_tar_files: Mutex::new(None),
+            syscall_map: std::sync::OnceLock::new(),
+            unhandled_stubs: std::sync::OnceLock::new(),
         });
         Self {
             exit_code: AtomicI32::new(0),
@@ -279,6 +352,17 @@ impl NtShimEntrypoints {
             thread_id: 1, // Main thread is always TID 1
             shared,
         }
+    }
+
+    /// Install the syscall mapping table produced by the ntdll rewriter.
+    /// Must be called before entering the guest.
+    pub fn set_syscall_map(&self, map: NtSyscallMap) {
+        let _ = self.shared.syscall_map.set(map);
+    }
+
+    /// Install unhandled stub names for debug logging of unknown syscalls.
+    pub fn set_unhandled_stubs(&self, stubs: alloc::vec::Vec<(u32, alloc::string::String)>) {
+        let _ = self.shared.unhandled_stubs.set(stubs);
     }
 
     /// Create a new NT shim entrypoints for a child thread.
@@ -310,6 +394,8 @@ impl NtShimEntrypoints {
                 guest_va_start: parent_init.guest_va_start,
                 guest_va_end: parent_init.guest_va_end,
                 exe_path: parent_init.exe_path.clone(),
+                initial_rcx: None,
+                initial_rdx: None,
             }),
             child_thread_argument: Some(child_argument),
             fls_slots: Mutex::new([0usize; 128]),
@@ -386,6 +472,15 @@ impl NtShimEntrypoints {
             .unwrap_or_else(|_| panic!("set_network called more than once"));
     }
 
+    /// Provide DLL tar files so the shim can serve DLLs via NtOpenFile
+    /// during ntdll-driven initialization.
+    pub fn set_dll_tar_files(
+        &self,
+        files: alloc::collections::BTreeMap<alloc::string::String, alloc::vec::Vec<u8>>,
+    ) {
+        *self.shared.dll_tar_files.lock().unwrap() = Some(files);
+    }
+
     /// Dispatch an NT syscall or kernel32 syscall.
     ///
     /// Reads the syscall number from `orig_rax` (the platform's
@@ -395,9 +490,11 @@ impl NtShimEntrypoints {
     fn dispatch_syscall(&self, ctx: &mut ExecutionContext) -> (NtStatus, bool) {
         let nr = ctx.regs.orig_rax as u32;
 
-        // First try NT syscalls (0x0001–0x0FFF range).
-        if let Some(nt_nr) = NtSyscallNumber::from_raw(nr) {
-            return self.dispatch_nt_syscall(nt_nr, nr, ctx);
+        // First try NT syscalls via the rewriter-produced mapping.
+        if let Some(map) = self.shared.syscall_map.get()
+            && let Some(id) = map.lookup(nr)
+        {
+            return self.dispatch_nt_syscall(id, nr, ctx);
         }
 
         // Then try kernel32 syscalls (0x1000+ range).
@@ -446,7 +543,7 @@ impl NtShimEntrypoints {
                 return (NtStatus::STATUS_SUCCESS, false);
             }
             stub_dlls::K32_GET_COMMAND_LINE_A => {
-                // GetCommandLineA — return pointer to the ANSI command line
+                // GetCommandLineA ΓÇö return pointer to the ANSI command line
                 // buffer that was built alongside the UTF-16 version in the
                 // PEB/TEB region.
                 if let Some(state) = &self.init_state {
@@ -458,8 +555,8 @@ impl NtShimEntrypoints {
             }
             stub_dlls::K32_GET_MODULE_HANDLE_W => {
                 // GetModuleHandleW(lpModuleName).
-                // NULL → image base of the main executable.
-                // Non-null → case-insensitive lookup in loaded modules.
+                // NULL ΓåÆ image base of the main executable.
+                // Non-null ΓåÆ case-insensitive lookup in loaded modules.
                 let module_name_va = ctx.regs.r10; // arg0
                 if module_name_va == 0 {
                     if let Some(state) = &self.init_state {
@@ -493,7 +590,7 @@ impl NtShimEntrypoints {
                             log_unimplemented!("GetModuleHandleW({:?}) not found", name);
                         }
                     } else {
-                        // Unterminated or invalid pointer — return NULL.
+                        // Unterminated or invalid pointer ΓÇö return NULL.
                         log_unimplemented!(
                             "GetModuleHandleW: bad lpModuleName VA 0x{:X}",
                             module_name_va
@@ -742,20 +839,113 @@ impl NtShimEntrypoints {
             }
             stub_dlls::K32_READ_FILE => {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_read_file(
-                    ctx,
-                    &mut self.shared.handles.lock().unwrap(),
-                    teb_va,
-                );
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let h_file = args.arg0 as u32;
+
+                // Snapshot handle info under lock, then drop lock before I/O
+                // so that potentially blocking reads (UNC, pipes) don't stall
+                // the global handle table.  The close-after-validation race
+                // (another thread closing the handle mid-read) matches real
+                // Windows, where concurrent ReadFile + CloseHandle is UB.
+                // Position uses fetch_add (atomic RMW) so concurrent reads on
+                // duplicated handles don't lose increments.
+                enum ReadTarget {
+                    File {
+                        host_handle: usize,
+                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+                    },
+                    Console,
+                }
+                let target = {
+                    let handles = self.shared.handles.lock().unwrap();
+                    match handles.get(h_file) {
+                        Some(crate::handle_table::NtObject::File {
+                            host_handle,
+                            position,
+                            ..
+                        }) => ReadTarget::File {
+                            host_handle: *host_handle,
+                            position: position.clone(),
+                        },
+                        Some(crate::handle_table::NtObject::ConsoleInput) => ReadTarget::Console,
+                        _ => {
+                            syscalls::k32_handlers::set_guest_last_error(teb_va, 6);
+                            ctx.regs.rax = 0;
+                            return (NtStatus::STATUS_SUCCESS, false);
+                        }
+                    }
+                };
+                // Handle lock dropped.
+                let status = match target {
+                    ReadTarget::File {
+                        host_handle,
+                        position,
+                    } => syscalls::k32_handlers::k32_read_file_host(
+                        ctx,
+                        host_handle,
+                        &position,
+                        teb_va,
+                    ),
+                    ReadTarget::Console => syscalls::k32_handlers::k32_read_file_console(
+                        ctx,
+                        teb_va,
+                        &self.shared.console_input_pending,
+                    ),
+                };
                 return (status, false);
             }
             stub_dlls::K32_WRITE_FILE => {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_write_file(
-                    ctx,
-                    &mut self.shared.handles.lock().unwrap(),
-                    teb_va,
-                );
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let h_file = args.arg0 as u32;
+
+                // Snapshot handle info under lock, drop before I/O.
+                enum WriteTarget {
+                    Console {
+                        is_stderr: bool,
+                    },
+                    File {
+                        host_handle: usize,
+                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+                    },
+                }
+                let target = {
+                    let handles = self.shared.handles.lock().unwrap();
+                    match handles.get(h_file) {
+                        Some(crate::handle_table::NtObject::ConsoleOutput { is_stderr }) => {
+                            WriteTarget::Console {
+                                is_stderr: *is_stderr,
+                            }
+                        }
+                        Some(crate::handle_table::NtObject::File {
+                            host_handle,
+                            position,
+                            ..
+                        }) => WriteTarget::File {
+                            host_handle: *host_handle,
+                            position: position.clone(),
+                        },
+                        _ => {
+                            syscalls::k32_handlers::set_guest_last_error(teb_va, 6);
+                            ctx.regs.rax = 0;
+                            return (NtStatus::STATUS_SUCCESS, false);
+                        }
+                    }
+                };
+                let status = match target {
+                    WriteTarget::Console { is_stderr: _ } => {
+                        syscalls::k32_handlers::k32_write_file_console(ctx)
+                    }
+                    WriteTarget::File {
+                        host_handle,
+                        position,
+                    } => syscalls::k32_handlers::k32_write_file_host(
+                        ctx,
+                        host_handle,
+                        &position,
+                        teb_va,
+                    ),
+                };
                 return (status, false);
             }
             stub_dlls::K32_CLOSE_HANDLE => {
@@ -792,6 +982,15 @@ impl NtShimEntrypoints {
                 );
                 return (status, false);
             }
+            stub_dlls::K32_SET_END_OF_FILE => {
+                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
+                let status = syscalls::k32_handlers::k32_set_end_of_file(
+                    ctx,
+                    &mut self.shared.handles.lock().unwrap(),
+                    teb_va,
+                );
+                return (status, false);
+            }
 
             // --- Console mode ---
             stub_dlls::K32_GET_CONSOLE_MODE => {
@@ -800,6 +999,27 @@ impl NtShimEntrypoints {
             }
             stub_dlls::K32_SET_CONSOLE_MODE => {
                 let status = syscalls::k32_handlers::k32_set_console_mode(ctx);
+                return (status, false);
+            }
+            stub_dlls::K32_READ_CONSOLE_W => {
+                let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
+                let handle = ctx.regs.r10 as u32;
+                let is_console_input = matches!(
+                    self.shared.handles.lock().unwrap().get(handle),
+                    Some(crate::handle_table::NtObject::ConsoleInput)
+                );
+                let status = if is_console_input {
+                    syscalls::k32_handlers::k32_read_console_w(
+                        ctx,
+                        is_console_input,
+                        teb_va,
+                        &self.shared.console_input_pending,
+                    )
+                } else {
+                    syscalls::k32_handlers::set_guest_last_error(teb_va, 6);
+                    ctx.regs.rax = 0;
+                    NtStatus::STATUS_SUCCESS
+                };
                 return (status, false);
             }
 
@@ -940,8 +1160,7 @@ impl NtShimEntrypoints {
                 let mods = self
                     .init_state
                     .as_ref()
-                    .map(|s| s.module_bases.as_slice())
-                    .unwrap_or(&[]);
+                    .map_or(&[][..], |s| s.module_bases.as_slice());
                 let status = syscalls::k32_handlers::k32_rtl_lookup_function_entry(ctx, mods);
                 return (status, false);
             }
@@ -949,8 +1168,7 @@ impl NtShimEntrypoints {
                 let mods = self
                     .init_state
                     .as_ref()
-                    .map(|s| s.module_bases.as_slice())
-                    .unwrap_or(&[]);
+                    .map_or(&[][..], |s| s.module_bases.as_slice());
                 let status = syscalls::k32_handlers::k32_rtl_virtual_unwind(ctx, mods);
                 return (status, false);
             }
@@ -958,8 +1176,7 @@ impl NtShimEntrypoints {
                 let mods = self
                     .init_state
                     .as_ref()
-                    .map(|s| s.module_bases.as_slice())
-                    .unwrap_or(&[]);
+                    .map_or(&[][..], |s| s.module_bases.as_slice());
                 let status = syscalls::k32_handlers::k32_rtl_unwind_ex(ctx, mods);
                 return (status, false);
             }
@@ -967,8 +1184,7 @@ impl NtShimEntrypoints {
                 let mods = self
                     .init_state
                     .as_ref()
-                    .map(|s| s.module_bases.as_slice())
-                    .unwrap_or(&[]);
+                    .map_or(&[][..], |s| s.module_bases.as_slice());
                 let status = syscalls::k32_handlers::k32_rtl_pc_to_file_header(ctx, mods);
                 return (status, false);
             }
@@ -1058,7 +1274,7 @@ impl NtShimEntrypoints {
             }
             // --- Registry stubs ---
             stub_dlls::K32_REG_OPEN_KEY_EX_W => {
-                // RegOpenKeyExW / RegOpenKeyExA — always return ERROR_FILE_NOT_FOUND.
+                // RegOpenKeyExW / RegOpenKeyExA ΓÇö always return ERROR_FILE_NOT_FOUND.
                 // In a sandbox, no registry keys exist.
                 ctx.regs.rax = 2; // ERROR_FILE_NOT_FOUND
                 return (NtStatus::STATUS_SUCCESS, false);
@@ -1068,7 +1284,7 @@ impl NtShimEntrypoints {
                 return (NtStatus::STATUS_SUCCESS, false);
             }
             stub_dlls::K32_REG_CLOSE_KEY => {
-                // RegCloseKey — always succeeds (nothing to close).
+                // RegCloseKey ΓÇö always succeeds (nothing to close).
                 ctx.regs.rax = 0; // ERROR_SUCCESS
                 return (NtStatus::STATUS_SUCCESS, false);
             }
@@ -1082,19 +1298,82 @@ impl NtShimEntrypoints {
             _ => {}
         }
 
-        log_unimplemented!("unknown syscall nr=0x{:04X}", nr);
+        // Look up the name from unhandled_stubs if available.
+        let name = self.shared.unhandled_stubs.get().and_then(|stubs| {
+            stubs
+                .iter()
+                .find(|(n, _)| *n == nr)
+                .map(|(_, s)| s.as_str())
+        });
+        if let Some(name) = name {
+            log_unimplemented!("unknown syscall nr=0x{:04X} ({})", nr, name);
+        } else {
+            log_unimplemented!("unknown syscall nr=0x{:04X}", nr);
+        }
         (NtStatus::STATUS_NOT_IMPLEMENTED, false)
     }
 
     /// Dispatch an NT-specific syscall (from ntdll stubs).
+    ///
+    /// The rewriter trampoline pops the return address into RCX before
+    /// entering `syscall_callback`, so `ctx.regs.rsp` is 8 bytes higher
+    /// than in the stub-DLL path (where the return address stays on stack).
+    /// We temporarily subtract 8 from RSP so that all stack-arg offsets
+    /// (+0x28 = arg5, +0x30 = arg6, etc.) work identically to the stub path.
     fn dispatch_nt_syscall(
         &self,
-        nt_nr: NtSyscallNumber,
+        nt_nr: NtSyscallId,
         raw_nr: u32,
         ctx: &mut ExecutionContext,
     ) -> (NtStatus, bool) {
+        // Normalize RSP: the rewriter trampoline pops the return address,
+        // so RSP is 8 higher than it would be with a real `syscall` instruction
+        // or with the stub-DLL path.  Subtract 8 so stack arg offsets match.
+        ctx.regs.rsp = ctx.regs.rsp.wrapping_sub(8);
+
+        let result = self.dispatch_nt_syscall_inner(nt_nr, raw_nr, ctx);
+
+        #[cfg(debug_assertions)]
+        {
+            // Log return status for non-SUCCESS results to aid debugging.
+            let status = result.0;
+            if status != NtStatus::STATUS_SUCCESS {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "NT shim: {:?} returned 0x{:08X}\n",
+                    nt_nr,
+                    status.0 as u32,
+                ));
+            }
+        }
+
+        // Restore RSP so sysret resumes the guest correctly.
+        ctx.regs.rsp = ctx.regs.rsp.wrapping_add(8);
+
+        result
+    }
+
+    /// Inner dispatch after RSP normalization.
+    fn dispatch_nt_syscall_inner(
+        &self,
+        nt_nr: NtSyscallId,
+        raw_nr: u32,
+        ctx: &mut ExecutionContext,
+    ) -> (NtStatus, bool) {
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: {:?} (nr=0x{:04X}) r10=0x{:X} rdx=0x{:X} r8=0x{:X}\n",
+                nt_nr,
+                raw_nr,
+                ctx.regs.r10,
+                ctx.regs.rdx,
+                ctx.regs.r8,
+            ));
+        }
         match nt_nr {
-            NtSyscallNumber::NtTerminateProcess => {
+            NtSyscallId::NtTerminateProcess => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle = args.arg0;
                 let exit_status = args.arg1 as i32;
@@ -1111,100 +1390,233 @@ impl NtShimEntrypoints {
                     (NtStatus::STATUS_NOT_IMPLEMENTED, false)
                 }
             }
-            NtSyscallNumber::NtWriteFile => {
-                let status =
-                    syscalls::file::nt_write_file(ctx, &mut self.shared.handles.lock().unwrap());
+            NtSyscallId::NtWriteFile => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let file_handle = args.arg0 as u32;
+
+                // Snapshot handle info under lock, drop before I/O.
+                enum NtWriteTarget {
+                    Console {
+                        is_stderr: bool,
+                    },
+                    File {
+                        host_handle: usize,
+                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+                    },
+                    Invalid,
+                }
+                let target = {
+                    let handles = self.shared.handles.lock().unwrap();
+                    match handles.get(file_handle) {
+                        Some(crate::handle_table::NtObject::ConsoleOutput { is_stderr }) => {
+                            NtWriteTarget::Console {
+                                is_stderr: *is_stderr,
+                            }
+                        }
+                        Some(crate::handle_table::NtObject::File {
+                            host_handle,
+                            position,
+                            ..
+                        }) => NtWriteTarget::File {
+                            host_handle: *host_handle,
+                            position: position.clone(),
+                        },
+                        _ => NtWriteTarget::Invalid,
+                    }
+                };
+                let status = match target {
+                    NtWriteTarget::Console { is_stderr } => {
+                        syscalls::file::nt_write_file_console(ctx, is_stderr)
+                    }
+                    NtWriteTarget::File {
+                        host_handle,
+                        position,
+                    } => syscalls::file::nt_write_file_host(ctx, host_handle, &position),
+                    NtWriteTarget::Invalid => NtStatus::STATUS_INVALID_HANDLE,
+                };
                 (status, false)
             }
-            NtSyscallNumber::NtClose => {
+            NtSyscallId::NtClose => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let status =
                     syscalls::nt_close(&mut self.shared.handles.lock().unwrap(), args.arg0 as u32);
                 (status, false)
             }
             // Phase 2: File I/O
-            NtSyscallNumber::NtCreateFile => {
+            NtSyscallId::NtCreateFile => {
                 let status =
                     syscalls::file::nt_create_file(ctx, &mut self.shared.handles.lock().unwrap());
                 (status, false)
             }
-            NtSyscallNumber::NtReadFile => {
-                let status =
-                    syscalls::file::nt_read_file(ctx, &mut self.shared.handles.lock().unwrap());
-                (status, false)
-            }
-            NtSyscallNumber::NtQueryInformationFile => {
-                let status = syscalls::file::nt_query_information_file(
+            NtSyscallId::NtOpenFile => {
+                let status = syscalls::file::nt_open_file(
                     ctx,
-                    &self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock().unwrap(),
+                    &self.shared.dll_tar_files,
                 );
                 (status, false)
             }
-            NtSyscallNumber::NtSetInformationFile => {
+            NtSyscallId::NtReadFile => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let file_handle = args.arg0 as u32;
+
+                // Snapshot handle info under lock, drop before I/O.
+                enum NtReadTarget {
+                    File {
+                        host_handle: usize,
+                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+                    },
+                    MemoryFile {
+                        data: alloc::sync::Arc<alloc::vec::Vec<u8>>,
+                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+                    },
+                    Console,
+                    Invalid,
+                }
+                let target = {
+                    let handles = self.shared.handles.lock().unwrap();
+                    match handles.get(file_handle) {
+                        Some(crate::handle_table::NtObject::File {
+                            host_handle,
+                            position,
+                            ..
+                        }) => NtReadTarget::File {
+                            host_handle: *host_handle,
+                            position: position.clone(),
+                        },
+                        Some(crate::handle_table::NtObject::MemoryFile {
+                            data, position, ..
+                        }) => NtReadTarget::MemoryFile {
+                            data: data.clone(),
+                            position: position.clone(),
+                        },
+                        Some(crate::handle_table::NtObject::ConsoleInput) => NtReadTarget::Console,
+                        _ => NtReadTarget::Invalid,
+                    }
+                };
+                let status = match target {
+                    NtReadTarget::File {
+                        host_handle,
+                        position,
+                    } => syscalls::file::nt_read_file_host(ctx, host_handle, &position),
+                    NtReadTarget::MemoryFile { data, position } => {
+                        syscalls::file::nt_read_file_memory(ctx, &data, &position)
+                    }
+                    NtReadTarget::Console => syscalls::file::nt_read_file_console(ctx),
+                    NtReadTarget::Invalid => NtStatus::STATUS_INVALID_HANDLE,
+                };
+                (status, false)
+            }
+            NtSyscallId::NtQueryInformationFile => {
+                // Check if this is a MemoryFile (need special handling).
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let file_handle = args.arg0 as u32;
+                let mem_info = {
+                    let handles = self.shared.handles.lock().unwrap();
+                    match handles.get(file_handle) {
+                        Some(crate::handle_table::NtObject::MemoryFile {
+                            data, position, ..
+                        }) => Some((data.clone(), position.clone())),
+                        _ => None,
+                    }
+                };
+                let status = if let Some((data, position)) = mem_info {
+                    syscalls::file::nt_query_information_file_memory(
+                        ctx,
+                        data.len() as u64,
+                        &position,
+                    )
+                } else {
+                    syscalls::file::nt_query_information_file(
+                        ctx,
+                        &self.shared.handles.lock().unwrap(),
+                    )
+                };
+                (status, false)
+            }
+            NtSyscallId::NtSetInformationFile => {
                 let status = syscalls::file::nt_set_information_file(
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
                 );
                 (status, false)
             }
-            NtSyscallNumber::NtQueryAttributesFile => {
+            NtSyscallId::NtQueryAttributesFile => {
                 let status = syscalls::file::nt_query_attributes_file(ctx);
                 (status, false)
             }
             // Phase 2: Memory management
-            NtSyscallNumber::NtAllocateVirtualMemory => {
+            NtSyscallId::NtAllocateVirtualMemory => {
                 let status =
                     syscalls::memory::nt_allocate_virtual_memory(ctx, &self.shared.process_state);
                 (status, false)
             }
-            NtSyscallNumber::NtFreeVirtualMemory => {
+            NtSyscallId::NtAllocateVirtualMemoryEx => {
+                let status = syscalls::memory::nt_allocate_virtual_memory_ex(
+                    ctx,
+                    &self.shared.process_state,
+                );
+                (status, false)
+            }
+            NtSyscallId::NtFreeVirtualMemory => {
                 let status =
                     syscalls::memory::nt_free_virtual_memory(ctx, &self.shared.process_state);
                 (status, false)
             }
-            NtSyscallNumber::NtProtectVirtualMemory => {
+            NtSyscallId::NtProtectVirtualMemory => {
                 let status =
                     syscalls::memory::nt_protect_virtual_memory(ctx, &self.shared.process_state.pm);
                 (status, false)
             }
-            NtSyscallNumber::NtQueryVirtualMemory => {
-                let status =
-                    syscalls::memory::nt_query_virtual_memory(ctx, &self.shared.process_state.pm);
+            NtSyscallId::NtQueryVirtualMemory => {
+                let module_bases = self
+                    .init_state
+                    .as_ref()
+                    .map_or(&[][..], |s| s.module_bases.as_slice());
+                let status = syscalls::memory::nt_query_virtual_memory(
+                    ctx,
+                    &self.shared.process_state,
+                    module_bases,
+                );
                 (status, false)
             }
             // Phase 2: System information & time
-            NtSyscallNumber::NtQuerySystemInformation => {
+            NtSyscallId::NtQuerySystemInformation => {
                 let status = syscalls::sysinfo::nt_query_system_information(ctx);
                 (status, false)
             }
-            NtSyscallNumber::NtQueryPerformanceCounter => {
+            NtSyscallId::NtQuerySystemInformationEx => {
+                let status = syscalls::sysinfo::nt_query_system_information_ex(ctx);
+                (status, false)
+            }
+            NtSyscallId::NtQueryPerformanceCounter => {
                 let status = syscalls::sysinfo::nt_query_performance_counter(ctx);
                 (status, false)
             }
-            NtSyscallNumber::NtQuerySystemTime => {
+            NtSyscallId::NtQuerySystemTime => {
                 let status = syscalls::sysinfo::nt_query_system_time(ctx);
                 (status, false)
             }
-            NtSyscallNumber::NtQueryInformationProcess => {
+            NtSyscallId::NtQueryInformationProcess => {
                 let status =
                     syscalls::sysinfo::nt_query_information_process(ctx, self.init_state.as_ref());
                 (status, false)
             }
-            NtSyscallNumber::NtDelayExecution => {
+            NtSyscallId::NtDelayExecution => {
                 let status = syscalls::sysinfo::nt_delay_execution(ctx);
                 (status, false)
             }
-            NtSyscallNumber::NtSetInformationThread => {
+            NtSyscallId::NtSetInformationThread => {
                 // Commonly called for thread name, affinity, etc.
-                // Return success for now — most info classes are optional.
+                // Return success for now ΓÇö most info classes are optional.
                 (NtStatus::STATUS_SUCCESS, false)
             }
-            NtSyscallNumber::NtQueryVolumeInformationFile => {
+            NtSyscallId::NtQueryVolumeInformationFile => {
                 // Stub: return basic volume information.
                 let status = syscalls::file::nt_query_volume_information_file(ctx);
                 (status, false)
             }
-            NtSyscallNumber::NtQueryDirectoryFile => {
+            NtSyscallId::NtQueryDirectoryFile => {
                 let status = syscalls::file::nt_query_directory_file(
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
@@ -1212,14 +1624,14 @@ impl NtShimEntrypoints {
                 (status, false)
             }
             // Phase 3: Sync primitives
-            NtSyscallNumber::NtCreateKeyedEvent => {
+            NtSyscallId::NtCreateKeyedEvent => {
                 let status = syscalls::sync::nt_create_keyed_event(
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
                 );
                 (status, false)
             }
-            NtSyscallNumber::NtWaitForKeyedEvent => {
+            NtSyscallId::NtWaitForKeyedEvent => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let keyed = {
                     let handles = self.shared.handles.lock().unwrap();
@@ -1230,7 +1642,7 @@ impl NtShimEntrypoints {
                     None => (NtStatus::STATUS_INVALID_HANDLE, false),
                 }
             }
-            NtSyscallNumber::NtReleaseKeyedEvent => {
+            NtSyscallId::NtReleaseKeyedEvent => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let keyed = {
                     let handles = self.shared.handles.lock().unwrap();
@@ -1241,39 +1653,39 @@ impl NtShimEntrypoints {
                     None => (NtStatus::STATUS_INVALID_HANDLE, false),
                 }
             }
-            NtSyscallNumber::NtCreateEvent => {
+            NtSyscallId::NtCreateEvent => {
                 let status =
                     syscalls::sync::nt_create_event(ctx, &mut self.shared.handles.lock().unwrap());
                 (status, false)
             }
-            NtSyscallNumber::NtSetEvent => {
+            NtSyscallId::NtSetEvent => {
                 let status =
                     syscalls::sync::nt_set_event(ctx, &self.shared.handles.lock().unwrap());
                 (status, false)
             }
-            NtSyscallNumber::NtResetEvent => {
+            NtSyscallId::NtResetEvent => {
                 let status =
                     syscalls::sync::nt_reset_event(ctx, &self.shared.handles.lock().unwrap());
                 (status, false)
             }
-            NtSyscallNumber::NtClearEvent => {
+            NtSyscallId::NtClearEvent => {
                 let status =
                     syscalls::sync::nt_clear_event(ctx, &self.shared.handles.lock().unwrap());
                 (status, false)
             }
-            NtSyscallNumber::NtCreateSemaphore => {
+            NtSyscallId::NtCreateSemaphore => {
                 let status = syscalls::sync::nt_create_semaphore(
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
                 );
                 (status, false)
             }
-            NtSyscallNumber::NtReleaseSemaphore => {
+            NtSyscallId::NtReleaseSemaphore => {
                 let status =
                     syscalls::sync::nt_release_semaphore(ctx, &self.shared.handles.lock().unwrap());
                 (status, false)
             }
-            NtSyscallNumber::NtWaitForSingleObject => {
+            NtSyscallId::NtWaitForSingleObject => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let waitable = {
                     let handles = self.shared.handles.lock().unwrap();
@@ -1284,19 +1696,36 @@ impl NtShimEntrypoints {
                     None => (NtStatus::STATUS_INVALID_HANDLE, false),
                 }
             }
-            NtSyscallNumber::NtWaitForMultipleObjects => {
+            NtSyscallId::NtWaitForMultipleObjects => {
                 let status =
                     syscalls::sync::nt_wait_for_multiple_objects(ctx, &self.shared.handles);
                 (status, false)
             }
-            NtSyscallNumber::NtDuplicateObject => {
+            NtSyscallId::NtDuplicateObject => {
                 // NtDuplicateObject(SourceProcess, SourceHandle, TargetProcess,
                 //                   TargetHandle*, DesiredAccess, Attributes, Options)
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let source_handle = args.arg1 as u32;
                 let target_handle_va = args.arg3;
                 let mut handles = self.shared.handles.lock().unwrap();
-                if let Some(new_handle) = handles.duplicate(source_handle) {
+
+                // Handle pseudo-handles: -1 = current process, -2 = current thread.
+                let new_obj = if source_handle == 0xFFFFFFFF {
+                    Some(handle_table::NtObject::CurrentProcess)
+                } else if source_handle == 0xFFFFFFFE {
+                    Some(handle_table::NtObject::CurrentThread)
+                } else {
+                    None
+                };
+
+                let result = if let Some(obj) = new_obj {
+                    let h = handles.insert(obj);
+                    Some(h)
+                } else {
+                    handles.duplicate(source_handle)
+                };
+
+                if let Some(new_handle) = result {
                     if target_handle_va != 0 {
                         unsafe {
                             core::ptr::write(target_handle_va as *mut u32, new_handle);
@@ -1307,11 +1736,11 @@ impl NtShimEntrypoints {
                     (NtStatus::STATUS_INVALID_HANDLE, false)
                 }
             }
-            NtSyscallNumber::NtCreateThreadEx => {
+            NtSyscallId::NtCreateThreadEx => {
                 let status = syscalls::thread::nt_create_thread_ex(ctx, self);
                 (status, false)
             }
-            NtSyscallNumber::NtTerminateThread => {
+            NtSyscallId::NtTerminateThread => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle = args.arg0 as u32;
                 let exit_code = args.arg1 as i32;
@@ -1354,11 +1783,1415 @@ impl NtShimEntrypoints {
                 }
             }
             // --- Registry stubs (NT level) ---
-            NtSyscallNumber::NtOpenKey => {
-                // Always fail: no registry keys exist in the sandbox.
+            NtSyscallId::NtOpenKey | NtSyscallId::NtOpenKeyEx => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let key_handle_ptr = args.arg0; // PHANDLE
+                let _desired_access = args.arg1 as u32;
+                let obj_attrs_ptr = args.arg2; // POBJECT_ATTRIBUTES
+
+                // Read the key name from OBJECT_ATTRIBUTES.ObjectName
+                let key_name = if obj_attrs_ptr != 0 {
+                    // OBJECT_ATTRIBUTES layout (x64):
+                    //   +0x00: ULONG Length
+                    //   +0x08: HANDLE RootDirectory
+                    //   +0x10: PUNICODE_STRING ObjectName
+                    //   +0x18: ULONG Attributes
+                    //   +0x20: PVOID SecurityDescriptor
+                    //   +0x28: PVOID SecurityQualityOfService
+                    let name_ptr =
+                        unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x10) as *const u64) };
+                    if name_ptr != 0 {
+                        // UNICODE_STRING: Length (u16) + MaxLength (u16) + Buffer (ptr)
+                        let len =
+                            unsafe { core::ptr::read_unaligned(name_ptr as *const u16) } as usize;
+                        let buf =
+                            unsafe { core::ptr::read_unaligned((name_ptr + 8) as *const u64) };
+                        if buf != 0 && len > 0 {
+                            let wchars =
+                                unsafe { core::slice::from_raw_parts(buf as *const u16, len / 2) };
+                            alloc::string::String::from_utf16_lossy(wchars)
+                        } else {
+                            alloc::string::String::from("<empty>")
+                        }
+                    } else {
+                        alloc::string::String::from("<null>")
+                    }
+                } else {
+                    alloc::string::String::from("<no-attrs>")
+                };
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let msg = alloc::format!("NT shim: NtOpenKey(name={key_name:?})\n");
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                }
+
+                // For critical Session Manager keys, return a dummy handle
+                // so ntdll's init can proceed. NtQueryValueKey will return
+                // NOT_FOUND for individual values.
+                // Exclude "Segment Heap" ΓÇö we don't support segment heap,
+                // and returning NOT_FOUND here forces ntdll to use the
+                // traditional NT heap (RtlCreateHeap).
+                let key_lower = key_name.to_ascii_lowercase();
+                let is_critical_key = (key_lower.contains("session manager")
+                    || key_lower.contains("knowndlls")
+                    || key_lower.contains("nls")
+                    || key_lower.contains("muilanguages")
+                    || key_lower.contains("currentversion")
+                    || key_lower.contains("\\registry\\user\\")
+                    || key_lower.contains("control panel"))
+                    && !key_lower.contains("segment heap");
+                if is_critical_key {
+                    // Dump PEB NLS fields for debugging
+                    #[cfg(debug_assertions)]
+                    if key_lower.contains("control panel")
+                        && let Some(init) = self.init_state.as_ref()
+                    {
+                        let peb = init.peb_va;
+                        use litebox::platform::DebugLogProvider as _;
+                        let acp_id =
+                            unsafe { core::ptr::read_unaligned((peb + 0x34C) as *const u16) };
+                        let oemcp_id =
+                            unsafe { core::ptr::read_unaligned((peb + 0x34E) as *const u16) };
+                        let ansi_data =
+                            unsafe { core::ptr::read_unaligned((peb + 0x350) as *const u64) };
+                        let oem_data =
+                            unsafe { core::ptr::read_unaligned((peb + 0x358) as *const u64) };
+                        let case_data =
+                            unsafe { core::ptr::read_unaligned((peb + 0x360) as *const u64) };
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: PEB NLS fields:\n  \
+                                     ACP=0x{acp_id:X} OEMCP=0x{oemcp_id:X}\n  \
+                                     AnsiCodePageData=0x{ansi_data:X}\n  \
+                                     OemCodePageData=0x{oem_data:X}\n  \
+                                     UnicodeCaseTableData=0x{case_data:X}\n",
+                        ));
+                        // If AnsiCodePageData is set, dump first 16 bytes
+                        if ansi_data != 0 {
+                            let bytes: [u8; 16] =
+                                unsafe { core::ptr::read_unaligned(ansi_data as *const [u8; 16]) };
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "  AnsiCodePageData first 16 bytes: {bytes:02X?}\n"
+                                ),
+                            );
+                        }
+                    }
+                    // Create a dummy registry key handle.
+                    let handle_val = self
+                        .shared
+                        .handles
+                        .lock()
+                        .unwrap()
+                        .insert(handle_table::NtObject::RegistryKey);
+                    if key_handle_ptr != 0 {
+                        unsafe {
+                            core::ptr::write(key_handle_ptr as *mut u32, handle_val);
+                        }
+                    }
+                    (NtStatus::STATUS_SUCCESS, false)
+                } else {
+                    (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                }
+            }
+            NtSyscallId::NtEnumerateKey | NtSyscallId::NtEnumerateValueKey => {
+                // Our dummy registry keys have no subkeys or values.
+                // Return STATUS_NO_MORE_ENTRIES to stop enumeration loops.
+                (NtStatus::STATUS_NO_MORE_ENTRIES, false)
+            }
+            NtSyscallId::NtQueryValueKey => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let _key_handle = args.arg0 as u32;
+                let value_name_ptr = args.arg1; // PUNICODE_STRING
+                let info_class = args.arg2 as u32;
+                let info_ptr = args.arg3;
+                let info_length = unsafe { syscalls::NtSyscallArgs::arg4(ctx) } as u32;
+                let result_length_ptr = unsafe { syscalls::NtSyscallArgs::arg5(ctx) };
+
+                // Read the value name.
+                let value_name = if value_name_ptr != 0 {
+                    let len =
+                        unsafe { core::ptr::read_unaligned(value_name_ptr as *const u16) } as usize;
+                    let buf =
+                        unsafe { core::ptr::read_unaligned((value_name_ptr + 8) as *const u64) };
+                    if buf != 0 && len > 0 {
+                        let wchars =
+                            unsafe { core::slice::from_raw_parts(buf as *const u16, len / 2) };
+                        alloc::string::String::from_utf16_lossy(wchars)
+                    } else {
+                        alloc::string::String::new()
+                    }
+                } else {
+                    alloc::string::String::new()
+                };
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let msg = alloc::format!(
+                        "NT shim: NtQueryValueKey(name={value_name:?}, class={info_class})\n"
+                    );
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                }
+
+                // Return hardcoded values for critical NLS registry entries.
+                let name_lower = value_name.to_ascii_lowercase();
+                let reg_value: Option<&str> = match name_lower.as_str() {
+                    "acp" => Some("1252"),    // ANSI Code Page
+                    "oemcp" => Some("437"),   // OEM Code Page
+                    "maccp" => Some("10000"), // MAC Code Page
+                    _ => None,
+                };
+
+                if let Some(val_str) = reg_value {
+                    // Return as REG_SZ (type 1) in KeyValuePartialInformation.
+                    let val_wide: alloc::vec::Vec<u16> = val_str
+                        .encode_utf16()
+                        .chain(core::iter::once(0u16))
+                        .collect();
+                    let data_bytes = val_wide.len() * 2;
+                    // KEY_VALUE_PARTIAL_INFORMATION: TitleIndex(4) + Type(4) + DataLength(4) + Data
+                    let total_size = 12 + data_bytes;
+
+                    if result_length_ptr != 0 {
+                        unsafe {
+                            core::ptr::write(result_length_ptr as *mut u32, total_size as u32);
+                        }
+                    }
+
+                    if (info_length as usize) < total_size || info_ptr == 0 {
+                        (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                    } else if info_class == 2 {
+                        // KeyValuePartialInformation
+                        unsafe {
+                            let base = info_ptr as *mut u8;
+                            core::ptr::write(base.cast::<u32>(), 0); // TitleIndex
+                            core::ptr::write(base.add(4).cast::<u32>(), 1); // Type = REG_SZ
+                            core::ptr::write(base.add(8).cast::<u32>(), data_bytes as u32); // DataLength
+                            core::ptr::copy_nonoverlapping(
+                                val_wide.as_ptr() as *const u8,
+                                base.add(12),
+                                data_bytes,
+                            );
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
+                    } else {
+                        // Other info classes ΓÇö return NOT_IMPLEMENTED for now.
+                        (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                    }
+                } else {
+                    (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                }
+            }
+
+            // --- NtContinue: restore CONTEXT and resume ---
+            NtSyscallId::NtContinue => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let context_ptr = args.arg0; // RCX (saved in R10) = CONTEXT*
+                // Read the CONTEXT structure from guest memory and update
+                // the execution context registers so the platform resumes
+                // at the new RIP/RSP/etc.
+                // CONTEXT offsets (x64):
+                //   0x44 = EFlags, 0x78 = Rax, 0x80 = Rcx, 0x88 = Rdx,
+                //   0x90 = Rbx, 0x98 = Rsp, 0xA0 = Rbp, 0xA8 = Rsi,
+                //   0xB0 = Rdi, 0xB8 = R8, 0xC0 = R9, 0xC8 = R10,
+                //   0xD0 = R11, 0xD8 = R12, 0xE0 = R13, 0xE8 = R14,
+                //   0xF0 = R15, 0xF8 = Rip
+                unsafe {
+                    let p = context_ptr as *const u8;
+                    let r64 = |off: usize| {
+                        u64::from_le_bytes(
+                            core::slice::from_raw_parts(p.add(off), 8)
+                                .try_into()
+                                .unwrap(),
+                        ) as usize
+                    };
+                    let r32 = |off: usize| {
+                        u32::from_le_bytes(
+                            core::slice::from_raw_parts(p.add(off), 4)
+                                .try_into()
+                                .unwrap(),
+                        )
+                    };
+                    ctx.regs.rip = r64(0xF8);
+                    ctx.regs.rsp = r64(0x98);
+                    ctx.regs.rax = r64(0x78);
+                    ctx.regs.rcx = r64(0x80);
+                    ctx.regs.rdx = r64(0x88);
+                    ctx.regs.rbx = r64(0x90);
+                    ctx.regs.rbp = r64(0xA0);
+                    ctx.regs.rsi = r64(0xA8);
+                    ctx.regs.rdi = r64(0xB0);
+                    ctx.regs.r8 = r64(0xB8);
+                    ctx.regs.r9 = r64(0xC0);
+                    ctx.regs.r10 = r64(0xC8);
+                    ctx.regs.r11 = r64(0xD0);
+                    ctx.regs.r12 = r64(0xD8);
+                    ctx.regs.r13 = r64(0xE0);
+                    ctx.regs.r14 = r64(0xE8);
+                    ctx.regs.r15 = r64(0xF0);
+                    // Restore EFlags (offset 0x44 in CONTEXT).
+                    ctx.eflags = r32(0x44) as usize;
+                    // Restore FP/XSAVE state from CONTEXT.FltSave (offset 0x100,
+                    // 512-byte FXSAVE area). The platform's slow NtContinue path
+                    // copies ctx.fp_regs into the host CONTEXT, so we must
+                    // populate it here for the state to carry over.
+                    let flt_save_offset = 0x100;
+                    let fxsave_size = 512.min(ctx.fp_regs.data.len());
+                    core::ptr::copy_nonoverlapping(
+                        p.add(flt_save_offset),
+                        ctx.fp_regs.data.as_mut_ptr(),
+                        fxsave_size,
+                    );
+                }
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtContinue: new RIP=0x{:X}, RSP=0x{:X}, RCX=0x{:X}, RDX=0x{:X}\n",
+                        ctx.regs.rip,
+                        ctx.regs.rsp,
+                        ctx.regs.rcx,
+                        ctx.regs.rdx
+                    ));
+                }
+                // NtContinue does not return an NTSTATUS ΓÇö it switches context.
+                // We return STATUS_SUCCESS but the dispatch loop must NOT
+                // overwrite rax (it was already set from the CONTEXT).
+                // Leave rcx != rip so the platform uses the slow NtContinue
+                // path which correctly restores ALL registers from the context.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            // --- ntdll-driven init: section syscalls for DLL loading ---
+            NtSyscallId::NtCreateSection => {
+                let status = syscalls::section::nt_create_section(
+                    ctx,
+                    &mut self.shared.handles.lock().unwrap(),
+                );
+                (status, false)
+            }
+            NtSyscallId::NtMapViewOfSection => {
+                let status = syscalls::section::nt_map_view_of_section(
+                    ctx,
+                    &self.shared.handles.lock().unwrap(),
+                    &self.shared.process_state,
+                );
+                (status, false)
+            }
+            NtSyscallId::NtUnmapViewOfSection => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let _unmap_base = args.arg1 as usize;
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtUnmapViewOfSection base=0x{_unmap_base:X}\n",
+                    ));
+                }
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            // --- ntdll-driven init: stubs for syscalls hit during LdrpInitialize ---
+            NtSyscallId::NtOpenSection => {
+                // ntdll tries to open \KnownDlls\<name> as a cached section.
+                // We emulate this by looking up the DLL name in our tar archive
+                // and creating a Section handle directly, bypassing the
+                // NtOpenFile ΓåÆ NtCreateSection path.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle_out_ptr = args.arg0;
+                let _desired_access = args.arg1 as u32;
+                let obj_attrs_ptr = args.arg2;
+
+                // Extract the name from OBJECT_ATTRIBUTES.
+                let name = if obj_attrs_ptr != 0 {
+                    let name_ptr =
+                        unsafe { core::ptr::read((obj_attrs_ptr + 0x10) as *const usize) };
+                    if name_ptr != 0 {
+                        let len = unsafe { core::ptr::read(name_ptr as *const u16) as usize };
+                        let buf = unsafe { core::ptr::read((name_ptr + 8) as *const usize) };
+                        if buf != 0 && len > 0 {
+                            let chars = len / 2;
+                            let slice =
+                                unsafe { core::slice::from_raw_parts(buf as *const u16, chars) };
+                            alloc::string::String::from_utf16_lossy(slice)
+                        } else {
+                            alloc::string::String::new()
+                        }
+                    } else {
+                        alloc::string::String::new()
+                    }
+                } else {
+                    alloc::string::String::new()
+                };
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtOpenSection name=\"{name}\"\n"
+                    ));
+                }
+
+                // Extract the DLL filename from paths like
+                // "\KnownDlls\kernelbase.dll" or just "kernelbase.dll".
+                let dll_name = name.rsplit('\\').next().unwrap_or(&name).to_lowercase();
+
+                // Try to find this DLL in the tar archive.
+                let found = if dll_name.ends_with(".dll") {
+                    let tar_files = self.shared.dll_tar_files.lock().unwrap();
+                    if let Some(ref files) = *tar_files {
+                        files.get(&dll_name).cloned()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(pe_data) = found {
+                    // Parse PE and create a Section handle (like NtCreateSection).
+                    match litebox_common_windows::pe_parser::PeParsedFile::parse(&pe_data) {
+                        Ok(parsed) => {
+                            let handle = self.shared.handles.lock().unwrap().insert(
+                                crate::handle_table::NtObject::Section {
+                                    pe_data: alloc::sync::Arc::new(pe_data.clone()),
+                                    image_size: parsed.size_of_image,
+                                    image_base: parsed.image_base,
+                                    entry_point: parsed.entry_point,
+                                    section_alignment: parsed.section_alignment,
+                                    is_dll: parsed.is_dll,
+                                },
+                            );
+                            if handle_out_ptr != 0 {
+                                unsafe {
+                                    core::ptr::write(handle_out_ptr as *mut u32, handle);
+                                }
+                            }
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: NtOpenSection ΓåÆ created section for '{dll_name}' (handle=0x{handle:X})\n"
+                                    ),
+                                );
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                        Err(_) => {
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: NtOpenSection PE parse failed for '{dll_name}'\n"
+                                    ),
+                                );
+                            }
+                            (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                        }
+                    }
+                } else {
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform()
+                            .debug_log_print("NT shim: NtOpenSection returned 0xC0000034\n");
+                    }
+                    (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                }
+            }
+            NtSyscallId::NtQuerySection => {
+                let status =
+                    syscalls::section::nt_query_section(ctx, &self.shared.handles.lock().unwrap());
+                (status, false)
+            }
+            NtSyscallId::NtSetInformationProcess => {
+                let info_class = ctx.regs.rdx as u32;
+                match info_class {
+                    // ProcessMappingInformation (0x70 = 112): ntdll uses this
+                    // to register the MI_MAP_INFO region with the kernel. The
+                    // kernel then writes mapping entries during
+                    // NtMapViewOfSection(SEC_IMAGE). We don't implement this
+                    // kernel-side write, so reject the class to make ntdll
+                    // fall back to a path that doesn't rely on MI_MAP_INFO.
+                    0x70 => {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                "  NtSetInformationProcess(0x70): ΓåÆ STATUS_INVALID_INFO_CLASS (disable MI_MAP_INFO)\n",
+                            );
+                        }
+                        (NtStatus(0xC0000003_u32 as i32), false) // STATUS_INVALID_INFO_CLASS
+                    }
+                    _ => (NtStatus::STATUS_SUCCESS, false),
+                }
+            }
+            NtSyscallId::NtFlushBuffersFile => (NtStatus::STATUS_SUCCESS, false),
+            NtSyscallId::NtCreateMutant => {
+                log_unimplemented!("NtCreateMutant");
+                (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+            }
+            NtSyscallId::NtOpenMutant => (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false),
+            NtSyscallId::NtQueryInformationThread => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let _thread_handle = args.arg0; // -2 = NtCurrentThread
+                let info_class = args.arg1 as u32;
+                let info_ptr = args.arg2;
+                let info_len = args.arg3 as u32;
+                let return_len_ptr = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
+
+                match info_class {
+                    0 => {
+                        // ThreadBasicInformation (48 bytes):
+                        //   +0x00: NTSTATUS ExitStatus (4)
+                        //   +0x08: PVOID TebBaseAddress (8)
+                        //   +0x10: CLIENT_ID { UniqueProcess(8), UniqueThread(8) }
+                        //   +0x20: ULONG_PTR AffinityMask (8)
+                        //   +0x28: LONG Priority (4)
+                        //   +0x2C: LONG BasePriority (4)
+                        if info_len < 48 || info_ptr == 0 {
+                            (NtStatus::STATUS_INFO_LENGTH_MISMATCH, false)
+                        } else {
+                            let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
+                            unsafe {
+                                let p = info_ptr as *mut u8;
+                                core::ptr::write_bytes(p, 0, 48);
+                                // ExitStatus = STATUS_PENDING (0x103)
+                                core::ptr::write(p.add(0) as *mut u32, 0x103);
+                                // TebBaseAddress
+                                core::ptr::write(p.add(8) as *mut u64, teb_va as u64);
+                                // ClientId.UniqueProcess
+                                core::ptr::write(p.add(0x10) as *mut u64, 4);
+                                // ClientId.UniqueThread
+                                core::ptr::write(p.add(0x18) as *mut u64, 4);
+                                // AffinityMask
+                                core::ptr::write(p.add(0x20) as *mut u64, 1);
+                                // Priority = 8, BasePriority = 8
+                                core::ptr::write(p.add(0x28) as *mut i32, 8);
+                                core::ptr::write(p.add(0x2C) as *mut i32, 8);
+                            }
+                            if return_len_ptr != 0 {
+                                unsafe {
+                                    core::ptr::write(return_len_ptr as *mut u32, 48);
+                                }
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    }
+                    _ => {
+                        log_unimplemented!("NtQueryInformationThread class={}", info_class);
+                        (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                    }
+                }
+            }
+            NtSyscallId::NtOpenProcessToken | NtSyscallId::NtOpenThreadToken => {
+                // No token support in sandbox.
+                (NtStatus::STATUS_NO_TOKEN, false)
+            }
+            NtSyscallId::NtQueryInformationToken => {
+                // Pseudo-handles: -4 = CurrentProcessToken, -5 = CurrentThreadToken,
+                // -6 = CurrentThreadEffectiveToken.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let _token_handle = args.arg0; // pseudo-handle or real
+                let info_class = args.arg1 as u32;
+                let info_ptr = args.arg2;
+                let info_len = args.arg3 as u32;
+                let return_len_ptr = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
+
+                match info_class {
+                    1 => {
+                        // TokenUser: return a synthetic SID.
+                        // TOKEN_USER is { SID_AND_ATTRIBUTES { PSID, DWORD Attributes } }
+                        // We place the SID right after the TOKEN_USER header.
+                        // Minimal SID: S-1-5-21-0-0-0-1000 (generic user)
+                        //   Revision=1, SubAuthorityCount=5,
+                        //   IdentifierAuthority={0,0,0,0,0,5},
+                        //   SubAuthorities=[21, 0, 0, 0, 1000]
+                        let sid_size: u32 = 8 + 5 * 4; // 28 bytes
+                        let header_size: u32 = 16; // SID_AND_ATTRIBUTES on 64-bit
+                        let needed = header_size + sid_size;
+
+                        if return_len_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(return_len_ptr as *mut u32, needed);
+                            }
+                        }
+                        if info_len < needed {
+                            (NtStatus(0xC0000023_u32 as i32), false) // STATUS_BUFFER_TOO_SMALL
+                        } else if info_ptr == 0 {
+                            (NtStatus::STATUS_INVALID_PARAMETER, false)
+                        } else {
+                            let buf = info_ptr as *mut u8;
+                            unsafe {
+                                core::ptr::write_bytes(buf, 0, needed as usize);
+                                // PSID pointer ΓåÆ right after header
+                                let sid_va = info_ptr + header_size as usize;
+                                core::ptr::write(buf as *mut u64, sid_va as u64);
+                                // Attributes = 0 (already zeroed)
+                                // SID body
+                                let sid = sid_va as *mut u8;
+                                *sid = 1; // Revision
+                                *sid.add(1) = 5; // SubAuthorityCount
+                                // IdentifierAuthority = {0,0,0,0,0,5}
+                                *sid.add(7) = 5;
+                                // SubAuthority[0] = 21
+                                core::ptr::write((sid.add(8)) as *mut u32, 21);
+                                // SubAuthority[1..3] = 0 (already zeroed)
+                                // SubAuthority[4] = 1000
+                                core::ptr::write((sid.add(24)) as *mut u32, 1000);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    }
+                    25 => {
+                        // TokenElevation: DWORD = 0 (not elevated)
+                        let needed: u32 = 4;
+                        if return_len_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(return_len_ptr as *mut u32, needed);
+                            }
+                        }
+                        if info_len >= needed && info_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(info_ptr as *mut u32, 0);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        } else {
+                            (NtStatus(0xC0000023_u32 as i32), false)
+                        }
+                    }
+                    _ => {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "NT shim: NtQueryInformationToken class={info_class} unhandled\n"
+                                ),
+                            );
+                        }
+                        (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                    }
+                }
+            }
+            NtSyscallId::NtRtlExitUserThread => {
+                // Thread exit. For the main thread, treat as process exit.
+                if let Some(ref obj) = self.thread_obj {
+                    let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                    obj.set_exited(args.arg0 as i32);
+                    (NtStatus::STATUS_SUCCESS, true)
+                } else {
+                    // Main thread exiting.
+                    let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                    self.exit_code.store(args.arg0 as i32, Ordering::Release);
+                    (NtStatus::STATUS_SUCCESS, true)
+                }
+            }
+
+            // --- Phase 6: Additional ntdll init syscalls ---
+            NtSyscallId::NtTraceEvent => {
+                // ETW tracing ΓÇö no-op in sandbox.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+            NtSyscallId::NtManageHotPatch => {
+                // Hotpatching ΓÇö not supported in sandbox.
+                (NtStatus::STATUS_NOT_SUPPORTED, false)
+            }
+            NtSyscallId::NtRaiseHardError => {
+                // ntdll raises this when DLL init fails (e.g., STATUS_DLL_INIT_FAILED).
+                // Log the status and parameters, then terminate.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let status = args.arg0 as u32;
+                let num_params = args.arg1 as u32;
+                let params_ptr = args.arg3; // PULONG_PTR *Parameters
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtRaiseHardError: status=0x{status:08X} num_params={num_params}\n",
+                    ));
+                    if params_ptr != 0 && num_params > 0 {
+                        for i in 0..num_params.min(4) {
+                            let param = unsafe {
+                                core::ptr::read((params_ptr + (i as usize) * 8) as *const u64)
+                            };
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!("  param[{i}] = 0x{param:016X}\n"),
+                            );
+                        }
+                    }
+                    // Dump RSP, RIP, and all GPRs
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "  RSP=0x{:X} RIP=0x{:X} RBP=0x{:X}\n  \
+                         RAX=0x{:X} RBX=0x{:X} RCX=0x{:X} RDX=0x{:X}\n  \
+                         RSI=0x{:X} RDI=0x{:X} R8=0x{:X} R9=0x{:X}\n  \
+                         R10=0x{:X} R11=0x{:X} R12=0x{:X} R13=0x{:X}\n  \
+                         R14=0x{:X} R15=0x{:X}\n",
+                        ctx.regs.rsp,
+                        ctx.regs.rip,
+                        ctx.regs.rbp,
+                        ctx.regs.rax,
+                        ctx.regs.rbx,
+                        ctx.regs.rcx,
+                        ctx.regs.rdx,
+                        ctx.regs.rsi,
+                        ctx.regs.rdi,
+                        ctx.regs.r8,
+                        ctx.regs.r9,
+                        ctx.regs.r10,
+                        ctx.regs.r11,
+                        ctx.regs.r12,
+                        ctx.regs.r13,
+                        ctx.regs.r14,
+                        ctx.regs.r15,
+                    ));
+                    // Walk the stack to find return addresses (likely ntdll code)
+                    let (ntdll_base, ntdll_end) = self
+                        .init_state
+                        .as_ref()
+                        .and_then(|s| s.module_bases.iter().find(|m| m.name == "ntdll.dll"))
+                        .map_or((0, 0), |m| (m.base_address, m.base_address + m.image_size));
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "  ntdll range: 0x{ntdll_base:X}..0x{ntdll_end:X}\n",
+                    ));
+                    // Scan stack for all values (not just ntdll range)
+                    let rsp = ctx.regs.rsp as usize;
+                    litebox_platform_multiplex::platform().debug_log_print("  Full stack dump:\n");
+                    for off in (0..256).step_by(8) {
+                        let addr = rsp + off;
+                        if addr > 0 {
+                            let val = unsafe { core::ptr::read(addr as *const u64) };
+                            let annotation =
+                                if val as usize >= ntdll_base && (val as usize) < ntdll_end {
+                                    let rva = val as usize - ntdll_base;
+                                    alloc::format!(" (ntdll+0x{rva:X})")
+                                } else {
+                                    alloc::string::String::new()
+                                };
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "    [RSP+0x{off:X}] = 0x{val:016X}{annotation}\n",
+                                ),
+                            );
+                        }
+                    }
+                    // Read kernelbase progress marker if loaded
+                    if let Some(init) = self.init_state.as_ref() {
+                        for m in &init.module_bases {
+                            if m.name.to_ascii_lowercase().contains("kernelbase") {
+                                let marker_addr = m.base_address + 0x39C868;
+                                let marker =
+                                    unsafe { core::ptr::read_unaligned(marker_addr as *const u16) };
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  kernelbase progress: 0x{marker:X} (base=0x{:X})\n",
+                                        m.base_address
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                self.exit_code.store(status as i32, Ordering::Release);
+                (NtStatus::STATUS_SUCCESS, true)
+            }
+            NtSyscallId::NtQueryKey => {
+                // NtQueryKey(KeyHandle, KeyInformationClass, KeyInformation,
+                //            Length, ResultLength)
+                // Validate the handle, then return empty/minimal results.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let key_handle = args.arg0 as u32;
+                let info_class = args.arg1 as u32;
+                let _info_ptr = args.arg2;
+                let info_length = args.arg3 as u32;
+                let result_length_ptr =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+
+                let is_valid = self
+                    .shared
+                    .handles
+                    .lock()
+                    .unwrap()
+                    .get(key_handle)
+                    .is_some_and(|obj| matches!(obj, handle_table::NtObject::RegistryKey));
+                if !is_valid {
+                    (NtStatus::STATUS_INVALID_HANDLE, false)
+                } else {
+                    // Minimum fixed-header sizes per NT ABI:
+                    //   KeyBasicInformation:  LARGE_INTEGER + 2*ULONG = 16 bytes (+ Name)
+                    //   KeyNodeInformation:   LARGE_INTEGER + 4*ULONG = 24 bytes (+ Name)
+                    //   KeyFullInformation:   LARGE_INTEGER + 9*ULONG = 44 bytes (+ Class)
+                    let required: u32 = match info_class {
+                        0 => 16,                                              // KeyBasicInformation
+                        1 => 24,                                              // KeyNodeInformation
+                        2 => 44,                                              // KeyFullInformation
+                        _ => return (NtStatus::STATUS_INVALID_INFO_CLASS, false),
+                    };
+                    if result_length_ptr != 0 {
+                        unsafe {
+                            core::ptr::write(result_length_ptr as *mut u32, required);
+                        }
+                    }
+                    if info_length < required {
+                        (NtStatus(0xC0000023_u32 as i32), false) // STATUS_BUFFER_TOO_SMALL
+                    } else {
+                        // Zero-fill the output buffer
+                        if _info_ptr != 0 && info_length > 0 {
+                            unsafe {
+                                core::ptr::write_bytes(
+                                    _info_ptr as *mut u8,
+                                    0,
+                                    info_length as usize,
+                                );
+                            }
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                }
+            }
+
+            NtSyscallId::NtInitializeNlsFiles => {
+                // NtInitializeNlsFiles(OUT PVOID *BaseAddress, OUT PLCID DefaultLocaleId,
+                //                      OUT PLARGE_INTEGER DefaultCasingTableSize)
+                // Returns the combined NLS locale section built by the kernel.
+                // We call the host's real NtInitializeNlsFiles to get the correct
+                // section data, then copy it into guest VA.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let base_addr_out = args.arg0; // PVOID*
+                let locale_id_out = args.arg1; // PLCID
+                let casing_size_out = args.arg2; // PLARGE_INTEGER (can be NULL)
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let msg = alloc::format!(
+                        "NT shim: NtInitializeNlsFiles(base_out=0x{base_addr_out:X}, locale_out=0x{locale_id_out:X})\n"
+                    );
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                }
+
+                // Call the host's real NtInitializeNlsFiles via GetProcAddress.
+                type NtInitNlsFn =
+                    unsafe extern "system" fn(*mut *mut u8, *mut u32, *mut i64) -> i32;
+
+                let host_result: Result<(alloc::vec::Vec<u8>, u32, i64), NtStatus> = unsafe {
+                    // Get host ntdll's NtInitializeNlsFiles
+                    unsafe extern "system" {
+                        fn GetModuleHandleA(name: *const u8) -> *mut core::ffi::c_void;
+                        fn GetProcAddress(
+                            module: *mut core::ffi::c_void,
+                            name: *const u8,
+                        ) -> *mut core::ffi::c_void;
+                    }
+
+                    let ntdll_mod = GetModuleHandleA(c"ntdll.dll".as_ptr().cast::<u8>());
+                    if ntdll_mod.is_null() {
+                        Err(NtStatus::STATUS_DLL_NOT_FOUND)
+                    } else {
+                        let proc = GetProcAddress(
+                            ntdll_mod,
+                            c"NtInitializeNlsFiles".as_ptr().cast::<u8>(),
+                        );
+                        if proc.is_null() {
+                            Err(NtStatus::STATUS_PROCEDURE_NOT_FOUND)
+                        } else {
+                            let func: NtInitNlsFn = core::mem::transmute(proc);
+                            let mut host_base: *mut u8 = core::ptr::null_mut();
+                            let mut host_locale: u32 = 0;
+                            let mut host_casing: i64 = 0;
+                            let status = func(&mut host_base, &mut host_locale, &mut host_casing);
+                            if status != 0 || host_base.is_null() {
+                                Err(NtStatus::from_raw(status as u32))
+                            } else {
+                                // Query the section size via VirtualQuery
+                                let mut mbi = core::mem::zeroed::<MemoryBasicInformation>();
+                                let ret = VirtualQuery(
+                                    host_base as usize,
+                                    &mut mbi,
+                                    core::mem::size_of::<MemoryBasicInformation>(),
+                                );
+                                let section_size = if ret != 0 {
+                                    mbi.region_size
+                                } else {
+                                    // Fallback: common NLS section is ~0xD3000
+                                    0xD3000
+                                };
+                                let data = core::slice::from_raw_parts(host_base, section_size);
+                                Ok((data.to_vec(), host_locale, host_casing))
+                            }
+                        }
+                    }
+                };
+
+                match host_result {
+                    Ok((data, host_locale, host_casing)) => {
+                        use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
+                        use litebox::platform::RawConstPointer as _;
+
+                        let page_size = 4096usize;
+                        let alloc_size = (data.len() + page_size - 1) & !(page_size - 1);
+                        let nz_size =
+                            NonZeroPageSize::<4096>::new(alloc_size).expect("NLS alloc size");
+
+                        let result = unsafe {
+                            self.shared.process_state.pm.create_readable_pages(
+                                None,
+                                nz_size,
+                                CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                                |ptr| {
+                                    let dest = ptr.as_usize() as *mut u8;
+                                    core::ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
+                                    Ok(data.len())
+                                },
+                            )
+                        };
+
+                        match result {
+                            Ok(addr) => {
+                                let va = addr.as_usize();
+                                if base_addr_out != 0 {
+                                    unsafe {
+                                        core::ptr::write(base_addr_out as *mut u64, va as u64);
+                                    }
+                                }
+                                if locale_id_out != 0 {
+                                    unsafe {
+                                        core::ptr::write(locale_id_out as *mut u32, host_locale);
+                                    }
+                                }
+                                if casing_size_out != 0 {
+                                    unsafe {
+                                        core::ptr::write(casing_size_out as *mut i64, host_casing);
+                                    }
+                                }
+                                #[cfg(debug_assertions)]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    let msg = alloc::format!(
+                                        "NT shim: NLS InitializeNlsFiles mapped at 0x{:X} ({} bytes, locale=0x{:X})\n",
+                                        va,
+                                        data.len(),
+                                        host_locale
+                                    );
+                                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                                }
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                            Err(_) => (NtStatus::STATUS_NO_MEMORY, false),
+                        }
+                    }
+                    Err(status) => {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "NT shim: NtInitializeNlsFiles host call failed: 0x{:X}\n",
+                                    status.raw()
+                                ),
+                            );
+                        }
+                        (status, false)
+                    }
+                }
+            }
+
+            NtSyscallId::NtGetNlsSectionPtr => {
+                // NtGetNlsSectionPtr: load NLS data from host and map into guest.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let section_type = args.arg0 as u32;
+                let section_data = args.arg1 as u32;
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let msg = alloc::format!(
+                        "NT shim: NtGetNlsSectionPtr(type={section_type}, data=0x{section_data:X})\n"
+                    );
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                }
+
+                // Determine NLS filename based on type.
+                let nls_filename = match section_type {
+                    11 => alloc::format!("c_{section_data}.nls"),
+                    12 => alloc::string::String::from("normnfc.nls"),
+                    _ => alloc::string::String::from("l_intl.nls"),
+                };
+
+                let nls_path = alloc::format!("C:\\Windows\\System32\\{nls_filename}");
+                let nls_data = std::fs::read(&nls_path);
+
+                match nls_data {
+                    Ok(data) => {
+                        use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
+                        use litebox::platform::RawConstPointer as _;
+
+                        let page_size = 4096usize;
+                        let alloc_size = (data.len() + page_size - 1) & !(page_size - 1);
+                        let nz_size =
+                            NonZeroPageSize::<4096>::new(alloc_size).expect("NLS alloc size");
+
+                        let result = unsafe {
+                            self.shared.process_state.pm.create_readable_pages(
+                                None,
+                                nz_size,
+                                CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                                |ptr| {
+                                    // Copy NLS data into the mapped pages.
+                                    let dest = ptr.as_usize() as *mut u8;
+                                    core::ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
+                                    Ok(data.len())
+                                },
+                            )
+                        };
+
+                        match result {
+                            Ok(addr) => {
+                                let va = addr.as_usize();
+                                // Write SectionPointer (arg3) and SectionSize (arg4).
+                                let section_ptr_out = args.arg3;
+                                let section_size_out =
+                                    unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
+                                #[cfg(debug_assertions)]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!(
+                                            "NT shim: NLS {} at 0x{:X} ({} bytes) ptr_out=0x{:X} size_out=0x{:X}\n",
+                                            nls_filename, va, data.len(), section_ptr_out, section_size_out
+                                        ),
+                                    );
+                                }
+                                if section_ptr_out != 0 {
+                                    unsafe {
+                                        core::ptr::write(section_ptr_out as *mut u64, va as u64);
+                                    }
+                                }
+                                if section_size_out != 0 {
+                                    unsafe {
+                                        core::ptr::write(
+                                            section_size_out as *mut u32,
+                                            data.len() as u32,
+                                        );
+                                    }
+                                }
+                                #[cfg(debug_assertions)]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    let msg = alloc::format!(
+                                        "NT shim: NLS mapped {} at 0x{:X} ({} bytes)\n",
+                                        nls_filename,
+                                        va,
+                                        data.len()
+                                    );
+                                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                                }
+                                // Set PEB codepage/NLS data pointers ΓÇö the kernel
+                                // normally does this during process creation.
+                                if let Some(init) = self.init_state.as_ref() {
+                                    if section_type == 11 {
+                                        // Codepage data. Match codepage number to
+                                        // ACP (PEB+0x34C) or OEMCP (PEB+0x34E).
+                                        let acp = unsafe {
+                                            core::ptr::read_unaligned(
+                                                (init.peb_va + 0x34C) as *const u16,
+                                            )
+                                        };
+                                        let oemcp = unsafe {
+                                            core::ptr::read_unaligned(
+                                                (init.peb_va + 0x34E) as *const u16,
+                                            )
+                                        };
+                                        if section_data == acp as u32 {
+                                            // PEB+0x350 = AnsiCodePageData
+                                            unsafe {
+                                                core::ptr::write(
+                                                    (init.peb_va + 0x350) as *mut u64,
+                                                    va as u64,
+                                                );
+                                            }
+                                        }
+                                        if section_data == oemcp as u32 {
+                                            // PEB+0x358 = OemCodePageData
+                                            unsafe {
+                                                core::ptr::write(
+                                                    (init.peb_va + 0x358) as *mut u64,
+                                                    va as u64,
+                                                );
+                                            }
+                                        }
+                                    } else if section_type == 14 {
+                                        // Type 0xE (14): Unicode case table (l_intl.nls)
+                                        // PEB+0x360 = UnicodeCaseTableData
+                                        unsafe {
+                                            core::ptr::write(
+                                                (init.peb_va + 0x360) as *mut u64,
+                                                va as u64,
+                                            );
+                                        }
+                                    }
+                                }
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                            Err(_) => (NtStatus::STATUS_NO_MEMORY, false),
+                        }
+                    }
+                    Err(_) => {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            let msg = alloc::format!("NT shim: NLS file not found: {nls_path}\n");
+                            litebox_platform_multiplex::platform().debug_log_print(&msg);
+                        }
+                        (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                    }
+                }
+            }
+
+            NtSyscallId::NtCreateWaitCompletionPacket => {
+                // Thread pool wait completion packet ΓÇö allocate a dummy handle.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle_ptr = args.arg0; // PHANDLE
+                let mut handles = self.shared.handles.lock().unwrap();
+                let h = handles.insert(handle_table::NtObject::Stub {
+                    kind: alloc::string::String::from("WaitCompletionPacket"),
+                });
+                unsafe {
+                    *(handle_ptr as *mut u64) = h as u64;
+                }
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtCreateIoCompletion => {
+                // I/O completion port ΓÇö used by ntdll's thread pool (TpAllocPool).
+                // Allocate a dummy handle so the pool init doesn't fail.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle_ptr = args.arg0; // PHANDLE
+                let mut handles = self.shared.handles.lock().unwrap();
+                let h = handles.insert(handle_table::NtObject::Stub {
+                    kind: alloc::string::String::from("IoCompletion"),
+                });
+                unsafe {
+                    *(handle_ptr as *mut u64) = h as u64;
+                }
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtCreateWorkerFactory => {
+                // Worker factory ΓÇö ntdll's thread pool creates worker threads
+                // through this syscall. Allocate a dummy handle; the actual
+                // thread creation won't happen but the pool init will succeed.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle_ptr = args.arg0; // PHANDLE
+                let mut handles = self.shared.handles.lock().unwrap();
+                let h = handles.insert(handle_table::NtObject::Stub {
+                    kind: alloc::string::String::from("WorkerFactory"),
+                });
+                unsafe {
+                    *(handle_ptr as *mut u64) = h as u64;
+                }
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtCreateTimer2 => {
+                // Timer2 ΓÇö used by the thread pool for delayed work items.
+                // Allocate a dummy handle so pool init doesn't abort.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle_ptr = args.arg0; // PHANDLE
+                let mut handles = self.shared.handles.lock().unwrap();
+                let h = handles.insert(handle_table::NtObject::Stub {
+                    kind: alloc::string::String::from("Timer2"),
+                });
+                unsafe {
+                    *(handle_ptr as *mut u64) = h as u64;
+                }
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtOpenDirectoryObject => {
+                // ntdll opens \KnownDlls to check for pre-cached section
+                // objects. Return a fake handle so the loader proceeds to
+                // NtOpenSection per-DLL, where we return NOT_FOUND to force
+                // file-based loading.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle_ptr = args.arg0 as *mut u64;
+                let mut handles = self.shared.handles.lock().unwrap();
+                let h = handles.insert(handle_table::NtObject::Stub {
+                    kind: alloc::string::String::from("DirectoryObject"),
+                });
+                unsafe { core::ptr::write(handle_ptr, h as u64) };
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtRaiseException => {
+                // NtRaiseException(EXCEPTION_RECORD*, CONTEXT*, FirstChance)
+                //
+                // On real Windows the kernel dispatches this back to user mode
+                // via KiUserExceptionDispatcher. We replicate that: copy the
+                // EXCEPTION_RECORD and CONTEXT onto the guest stack in the
+                // layout KiUserExceptionDispatcher expects, then redirect RIP.
+                //
+                // Stack layout for KiUserExceptionDispatcher:
+                //   [RSP+0x000]: CONTEXT         (0x4D0 bytes)
+                //   [RSP+0x4F0]: EXCEPTION_RECORD (0x98 bytes)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let exc_record_ptr = args.arg0; // EXCEPTION_RECORD*
+                let context_ptr = args.arg1; // CONTEXT*
+
+                const CONTEXT_SIZE: usize = 0x4D0;
+                const EXCEPTION_RECORD_SIZE: usize = 0x98;
+                const EXCEPTION_RECORD_OFFSET: usize = 0x4F0;
+                // Total frame: EXCEPTION_RECORD_OFFSET + EXCEPTION_RECORD_SIZE,
+                // rounded up to 16-byte alignment.
+                const FRAME_SIZE: usize =
+                    (EXCEPTION_RECORD_OFFSET + EXCEPTION_RECORD_SIZE + 0xF) & !0xF;
+
+                // Find ntdll base to compute KiUserExceptionDispatcher address.
+                // RVA 0x165C10 is the export address in our ntdll build.
+                const KI_USER_EXCEPTION_DISPATCHER_RVA: usize = 0x165C10;
+                let ntdll_base = self
+                    .init_state
+                    .as_ref()
+                    .and_then(|s| s.module_bases.iter().find(|m| m.name == "ntdll.dll"))
+                    .map_or(0, |m| m.base_address);
+
+                if ntdll_base == 0 {
+                    // No ntdll loaded ΓÇö can't dispatch. Return error.
+                    (NtStatus::STATUS_UNSUCCESSFUL, false)
+                } else {
+                    let dispatcher_va = ntdll_base + KI_USER_EXCEPTION_DISPATCHER_RVA;
+
+                    // Allocate frame on guest stack.
+                    let new_rsp = (ctx.regs.rsp - FRAME_SIZE) & !0xF;
+
+                    // Copy CONTEXT and EXCEPTION_RECORD to guest stack.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            context_ptr as *const u8,
+                            new_rsp as *mut u8,
+                            CONTEXT_SIZE,
+                        );
+                        // Zero the gap between CONTEXT end and EXCEPTION_RECORD.
+                        core::ptr::write_bytes(
+                            (new_rsp + CONTEXT_SIZE) as *mut u8,
+                            0,
+                            EXCEPTION_RECORD_OFFSET - CONTEXT_SIZE,
+                        );
+                        core::ptr::copy_nonoverlapping(
+                            exc_record_ptr as *const u8,
+                            (new_rsp + EXCEPTION_RECORD_OFFSET) as *mut u8,
+                            EXCEPTION_RECORD_SIZE,
+                        );
+                    }
+
+                    // Redirect guest execution to KiUserExceptionDispatcher.
+                    ctx.regs.rsp = new_rsp;
+                    ctx.regs.rip = dispatcher_va;
+                    ctx.regs.rcx = dispatcher_va; // for sysret fast path
+
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        let exc_code = unsafe { *(exc_record_ptr as *const u32) };
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NtRaiseException: code=0x{exc_code:X} ΓåÆ KiUserExceptionDispatcher @ 0x{dispatcher_va:X}\n",
+                        ));
+                    }
+                    (NtStatus::STATUS_SUCCESS, false)
+                }
+            }
+
+            NtSyscallId::NtOpenEvent => {
+                // ntdll tries to open named events (e.g. CSR connection).
+                // Return NOT_FOUND ΓÇö we don't have CSRSS or named event objects.
                 (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
             }
-            NtSyscallNumber::NtQueryValueKey => (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false),
+
+            NtSyscallId::NtSetInformationWorkerFactory => {
+                // Configure thread pool (min/max threads, etc.). Stub as success.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtAssociateWaitCompletionPacket => {
+                // Associates a wait packet with a completion port. Stub as success.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtShutdownWorkerFactory => {
+                // Thread pool shutdown/cleanup. Stub as success.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtCancelWaitCompletionPacket => {
+                // Cancel a pending wait completion packet. Stub as success.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtTraceControl => {
+                // ETW trace control. Stub as success.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtSetWnfProcessNotificationEvent => {
+                // WNF (Windows Notification Facility) event. Stub as success.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtSubscribeWnfStateChange | NtSyscallId::NtUnsubscribeWnfStateChange => {
+                // WNF subscribe/unsubscribe. Stub as success.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtApphelpCacheControl => {
+                // Application compatibility database lookup. Not needed.
+                (NtStatus::STATUS_NOT_FOUND, false)
+            }
+
+            NtSyscallId::NtCreateSectionEx => {
+                // NtCreateSectionEx is the modern (Win10+) superset of
+                // NtCreateSection with an extra ExtendedParameters array.
+                // We ignore the extended params and delegate to the existing
+                // NtCreateSection handler which reads the first 7 arguments.
+                let status = syscalls::section::nt_create_section(
+                    ctx,
+                    &mut self.shared.handles.lock().unwrap(),
+                );
+                (status, false)
+            }
+
+            NtSyscallId::NtMapViewOfSectionEx => {
+                // NtMapViewOfSectionEx is the modern (Win10+) superset of
+                // NtMapViewOfSection with extra parameters. Delegate to
+                // existing handler which reads the standard 10 arguments.
+                let status = syscalls::section::nt_map_view_of_section(
+                    ctx,
+                    &self.shared.handles.lock().unwrap(),
+                    &self.shared.process_state,
+                );
+                (status, false)
+            }
+
+            NtSyscallId::NtSetDefaultHardErrorPort => {
+                // Registers the hard error port. Stub as success.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtOpenSymbolicLinkObject => {
+                // ntdll opens \KnownDlls\KnownDllPath to discover the system
+                // directory (C:\Windows\System32). Return a fake handle so
+                // NtQuerySymbolicLinkObject can return the path.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle_ptr = args.arg0 as *mut u64;
+                let mut handles = self.shared.handles.lock().unwrap();
+                let h = handles.insert(handle_table::NtObject::Stub {
+                    kind: alloc::string::String::from("SymbolicLink"),
+                });
+                unsafe { core::ptr::write(handle_ptr, h as u64) };
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtQuerySymbolicLinkObject => {
+                // Return the system directory path that the loader uses for
+                // DLL search. The UNICODE_STRING at arg1 receives the target.
+                //
+                // UNICODE_STRING layout: { u16 Length, u16 MaximumLength, *u16 Buffer }
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let _handle = args.arg0;
+                let ustr_ptr = args.arg1;
+
+                // The path ntdll expects for KnownDllPath.
+                let path: &[u16] = &[
+                    b'C' as u16,
+                    b':' as u16,
+                    b'\\' as u16,
+                    b'W' as u16,
+                    b'i' as u16,
+                    b'n' as u16,
+                    b'd' as u16,
+                    b'o' as u16,
+                    b'w' as u16,
+                    b's' as u16,
+                    b'\\' as u16,
+                    b'S' as u16,
+                    b'y' as u16,
+                    b's' as u16,
+                    b't' as u16,
+                    b'e' as u16,
+                    b'm' as u16,
+                    b'3' as u16,
+                    b'2' as u16,
+                ];
+                let byte_len = (path.len() * 2) as u16;
+
+                unsafe {
+                    // Read MaximumLength from UNICODE_STRING.
+                    let max_len = core::ptr::read_unaligned((ustr_ptr + 2) as *const u16);
+                    if max_len < byte_len {
+                        return (NtStatus::STATUS_BUFFER_TOO_SMALL, false);
+                    }
+                    // Write Length.
+                    core::ptr::write_unaligned(ustr_ptr as *mut u16, byte_len);
+                    // Copy path into Buffer.
+                    let buf_ptr =
+                        core::ptr::read_unaligned((ustr_ptr + 8) as *const usize) as *mut u16;
+                    core::ptr::copy_nonoverlapping(path.as_ptr(), buf_ptr, path.len());
+                }
+                // If caller provides a return-length pointer (arg2), write it.
+                let ret_len_ptr = args.arg2;
+                if ret_len_ptr != 0 {
+                    unsafe {
+                        core::ptr::write(ret_len_ptr as *mut u32, byte_len as u32);
+                    }
+                }
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtDeviceIoControlFile => {
+                // NtDeviceIoControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+                //   IoStatusBlock, IoControlCode, InputBuffer, InputLen, OutputBuffer, OutputLen)
+                // Args: r10=FileHandle, rdx=Event, r8=ApcRoutine, r9=ApcContext
+                //   [rsp+0x28]=IoStatusBlock, [rsp+0x30]=IoControlCode
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let file_handle = args.arg0 as u32;
+                let io_status_ptr =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+                let ioctl_code = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
+
+                let is_condrv = {
+                    let handles = self.shared.handles.lock().unwrap();
+                    handles.get(file_handle).is_some_and(|obj| {
+                        matches!(obj, handle_table::NtObject::Stub { kind } if kind == "ConDrv")
+                    })
+                };
+
+                if is_condrv {
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtDeviceIoControlFile ConDrv ioctl=0x{ioctl_code:X} ΓåÆ stub success\n"
+                        ));
+                    }
+                    if io_status_ptr != 0 {
+                        unsafe {
+                            core::ptr::write(io_status_ptr as *mut u64, 0); // Status
+                            core::ptr::write((io_status_ptr + 8) as *mut u64, 0); // Information
+                        }
+                    }
+                    (NtStatus::STATUS_SUCCESS, false)
+                } else {
+                    log_unimplemented!(
+                        "NtDeviceIoControlFile handle=0x{:X} ioctl=0x{:X}",
+                        file_handle,
+                        ioctl_code
+                    );
+                    (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                }
+            }
+
             other => {
                 log_unimplemented!("syscall {:?} (nr=0x{:04X})", other, raw_nr);
                 (NtStatus::STATUS_NOT_IMPLEMENTED, false)
@@ -1378,13 +3211,18 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
 
             if let Some(argument) = self.child_thread_argument {
                 // Child thread: RCX = argument (first Win64 parameter).
-                // Since RCX != RIP, the platform will use the NtContinue slow
-                // path which correctly restores all registers from CONTEXT.
                 ctx.regs.rcx = argument;
+            } else if let Some(rcx) = state.initial_rcx {
+                // ntdll-driven init: RCX = CONTEXT* on guest stack,
+                // RDX = ntdll base address. Since RCX != RIP, the platform
+                // uses the NtContinue slow path which restores all registers.
+                ctx.regs.rcx = rcx;
+                if let Some(rdx) = state.initial_rdx {
+                    ctx.regs.rdx = rdx;
+                }
             } else {
-                // Main thread: set rcx = rip so the platform uses the sysret
-                // fast path for initial entry. This is important because sysret
-                // restores guest GS base in naked asm.
+                // Stub-DLL path: set rcx = rip so the platform uses the sysret
+                // fast path for initial entry.
                 ctx.regs.rcx = state.entry_point;
             }
         }
@@ -1410,10 +3248,14 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         let (status, terminate) = self.dispatch_syscall(ctx);
 
         // Kernel32 functions in the 0x1000+ range return values in rax
-        // directly (the dispatch handler sets rax). NT syscalls in the
-        // 0x0000–0x0FFF range return NTSTATUS in rax.
+        // directly (the dispatch handler sets rax). NT syscalls return
+        // NTSTATUS in rax.
+        // Special case: NtContinue restores the full context including rax,
+        // so we must not overwrite it.
         let is_kernel32 = nr >= 0x1000;
-        if !is_kernel32 {
+        let is_context_switch = self.shared.syscall_map.get().and_then(|m| m.lookup(nr))
+            == Some(NtSyscallId::NtContinue);
+        if !is_kernel32 && !is_context_switch {
             ctx.regs.rax = status.0 as u32 as usize;
         }
 
@@ -1448,19 +3290,131 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             return ContinueOperation::Terminate;
         }
 
+        // Handle demand-commit page faults for reserved (inaccessible) pages.
+        //
+        // In the NT memory model, MEM_RESERVE creates inaccessible pages and
+        // MEM_COMMIT makes them accessible. When guest code (especially ntdll's
+        // heap) accesses a reserved page without an explicit MEM_COMMIT, we
+        // demand-commit it here by upgrading the faulting page to read-write.
+        if info.exception == litebox::shim::Exception::PAGE_FAULT {
+            let fault_addr = info.cr2 & !(PAGE_SIZE - 1);
+            if let (Some(addr), Some(page_size)) = (
+                litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(fault_addr),
+                litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(PAGE_SIZE),
+            ) && let Some(perms) = self
+                .shared
+                .process_state
+                .pm
+                .get_memory_permissions(addr, page_size)
+                && perms.is_empty()
+            {
+                // Page is in a valid VMA but has no permissions (reserved).
+                // Demand-commit: upgrade to read-write.
+                use litebox::platform::{RawConstPointer as _, RawPointerProvider};
+                let ptr =
+                    <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(fault_addr);
+                if unsafe {
+                    self.shared
+                        .process_state
+                        .pm
+                        .make_pages_writable(ptr, PAGE_SIZE)
+                }
+                .is_ok()
+                {
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: demand-commit page fault at 0x{:X} \
+                                         (rip=0x{:X}) ΓåÆ committed RW\n",
+                            fault_addr,
+                            ctx.regs.rip,
+                        ));
+                    }
+                    return ContinueOperation::Resume;
+                }
+            }
+        }
+
         let status = exception_to_ntstatus(info);
 
         #[cfg(debug_assertions)]
         {
             use litebox::platform::DebugLogProvider as _;
             let msg = alloc::format!(
-                "NT shim: EXCEPTION at rip=0x{:X} rsp=0x{:X} status=0x{:08X} info={:?}\n",
+                "NT shim: EXCEPTION at rip=0x{:X} rsp=0x{:X} status=0x{:08X}\n  \
+                 rax=0x{:X} rcx=0x{:X} rdx=0x{:X} rbx=0x{:X}\n  \
+                 rsi=0x{:X} rdi=0x{:X} rbp=0x{:X}\n  \
+                 r8=0x{:X} r9=0x{:X} r10=0x{:X} r11=0x{:X}\n  \
+                 r12=0x{:X} r13=0x{:X} r14=0x{:X} r15=0x{:X}\n  \
+                 info={:?}\n",
                 ctx.regs.rip,
                 ctx.regs.rsp,
                 status.0 as u32,
+                ctx.regs.rax,
+                ctx.regs.rcx,
+                ctx.regs.rdx,
+                ctx.regs.rbx,
+                ctx.regs.rsi,
+                ctx.regs.rdi,
+                ctx.regs.rbp,
+                ctx.regs.r8,
+                ctx.regs.r9,
+                ctx.regs.r10,
+                ctx.regs.r11,
+                ctx.regs.r12,
+                ctx.regs.r13,
+                ctx.regs.r14,
+                ctx.regs.r15,
                 info
             );
             litebox_platform_multiplex::platform().debug_log_print(&msg);
+
+            // Dump stack: 8 words below RSP and 48 words above (covers rsp+0x170)
+            let rsp = ctx.regs.rsp as u64;
+            let mut stack_dump = alloc::string::String::from("  stack (rsp-64..rsp+384):\n");
+            for offset in (-8i64..48).rev() {
+                let addr = (rsp as i64 + offset * 8) as u64;
+                let val = unsafe { core::ptr::read_unaligned(addr as *const u64) };
+                let marker = if offset == 0 { " <-- RSP" } else { "" };
+                stack_dump.push_str(&alloc::format!(
+                    "    [{addr:016X}] = 0x{val:016X}{marker}\n"
+                ));
+            }
+            litebox_platform_multiplex::platform().debug_log_print(&stack_dump);
+
+            // Dump instruction bytes at crash RIP
+            let rip = ctx.regs.rip as u64;
+            let mut insn_dump = alloc::format!("  code at rip=0x{rip:X}: ");
+            for i in 0u64..16 {
+                let byte = unsafe { core::ptr::read((rip + i) as *const u8) };
+                insn_dump.push_str(&alloc::format!("{byte:02X} "));
+            }
+            // Also show 8 bytes before rip for context
+            insn_dump.push_str(&alloc::format!("\n  code at rip-8=0x{:X}: ", rip - 8));
+            for i in 0u64..8 {
+                let byte = unsafe { core::ptr::read((rip - 8 + i) as *const u8) };
+                insn_dump.push_str(&alloc::format!("{byte:02X} "));
+            }
+            insn_dump.push('\n');
+            litebox_platform_multiplex::platform().debug_log_print(&insn_dump);
+
+            // Dump memory near R12 and R13 to understand initialized vs zero-filled regions.
+            for (label, base) in [("R12", ctx.regs.r12), ("R13", ctx.regs.r13)] {
+                if base != 0 {
+                    let mut mem = alloc::format!("  memory at {label}=0x{base:X}:\n");
+                    for off in (0usize..0xC0).step_by(8) {
+                        let addr = base as usize + off;
+                        let val = unsafe { core::ptr::read_unaligned(addr as *const u64) };
+                        if val != 0 {
+                            mem.push_str(&alloc::format!(
+                                "    [{label}+0x{off:03X}] = 0x{val:016X}\n"
+                            ));
+                        }
+                    }
+                    litebox_platform_multiplex::platform().debug_log_print(&mem);
+                }
+            }
         }
 
         self.exit_code.store(status.0, Ordering::Release);
@@ -1478,7 +3432,7 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
     }
 
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        // Note: Guest GS base is NOT restored here — interrupts are delivered
+        // Note: Guest GS base is NOT restored here ΓÇö interrupts are delivered
         // via the platform's VEH which runs with host GS (restored by the
         // kernel for exception delivery). The trampoline return path handles
         // guest GS restoration for the syscall path.
@@ -1506,7 +3460,7 @@ fn exception_to_ntstatus(info: &ExceptionInfo) -> NtStatus {
 const MAX_WIDE_STRING_CHARS: usize = 260;
 
 // ---------------------------------------------------------------------------
-// Minimal FFI for VirtualQuery — used to probe whether guest pages are
+// Minimal FFI for VirtualQuery ΓÇö used to probe whether guest pages are
 // committed before reading. We define the struct and extern inline to avoid
 // adding a windows-sys dependency to this no_std crate.
 // ---------------------------------------------------------------------------
@@ -1554,9 +3508,8 @@ fn is_memory_readable(va: usize, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    let end = match va.checked_add(len) {
-        Some(e) => e,
-        None => return false,
+    let Some(end) = va.checked_add(len) else {
+        return false;
     };
     let mut addr = va;
     while addr < end {
@@ -1597,8 +3550,8 @@ fn is_memory_readable(_va: usize, _len: usize) -> bool {
 /// incremental page probing.
 ///
 /// For each u16 we need to read, we ensure the containing page(s) are
-/// committed and readable via `VirtualQuery`. Probing is done lazily —
-/// only pages actually touched are checked — so a short string near the
+/// committed and readable via `VirtualQuery`. Probing is done lazily ΓÇö
+/// only pages actually touched are checked ΓÇö so a short string near the
 /// end of a committed region works correctly.
 ///
 /// Returns `None` if `va` is zero, outside the guest VA partition, the
@@ -1643,6 +3596,6 @@ fn read_wide_string_bounded(
         chars.push(wchar);
         ptr = read_end;
     }
-    // Unterminated string — treat as invalid rather than silently truncating.
+    // Unterminated string ΓÇö treat as invalid rather than silently truncating.
     None
 }

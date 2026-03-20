@@ -83,136 +83,203 @@ static API_SET_MAP: &[ApiSetEntry] = &[
         prefix: "api-ms-win-crt-utility-l1-1",
         target: "ucrtbase.dll",
     },
-    // Core
+    // Core — On modern Windows (10+), most api-ms-win-core-* API sets
+    // resolve to kernelbase.dll, which contains the real implementations.
+    // kernel32.dll is a thin re-export wrapper that imports FROM these
+    // same api-sets, so mapping them back to kernel32.dll creates
+    // circular import thunks.
     ApiSetEntry {
         prefix: "api-ms-win-core-console-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-console-l1-2",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-datetime-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-debug-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-errorhandling-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-file-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-file-l1-2",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-file-l2-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-handle-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-heap-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-heap-l2-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-interlocked-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-io-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-libraryloader-l1-2",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-localization-l1-2",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-memory-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-namedpipe-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-processenvironment-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
+    },
+    ApiSetEntry {
+        prefix: "api-ms-win-core-processenvironment-l1-2",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-processthreads-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-profile-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-realtime-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-registry-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
+    },
+    ApiSetEntry {
+        prefix: "api-ms-win-core-apiquery-l1-1",
+        target: "ntdll.dll",
+    },
+    ApiSetEntry {
+        prefix: "api-ms-win-core-delayload-l1-1",
+        target: "kernelbase.dll",
+    },
+    ApiSetEntry {
+        prefix: "api-ms-win-core-job-l1-1",
+        target: "kernelbase.dll",
+    },
+    ApiSetEntry {
+        prefix: "api-ms-win-core-largeinteger-l1-1",
+        target: "kernelbase.dll",
+    },
+    ApiSetEntry {
+        prefix: "api-ms-win-core-libraryloader-l2-1",
+        target: "kernelbase.dll",
+    },
+    ApiSetEntry {
+        prefix: "api-ms-win-core-namedpipe-l1-2",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-rtlsupport-l1-1",
         target: "ntdll.dll",
     },
     ApiSetEntry {
+        prefix: "api-ms-win-core-rtlsupport-l1-2",
+        target: "ntdll.dll",
+    },
+    ApiSetEntry {
         prefix: "api-ms-win-core-string-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-synch-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-synch-l1-2",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-sysinfo-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
+    },
+    ApiSetEntry {
+        prefix: "api-ms-win-core-sysinfo-l1-2",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-threadpool-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
+    },
+    ApiSetEntry {
+        prefix: "api-ms-win-core-threadpool-legacy-l1-1",
+        target: "kernelbase.dll",
+    },
+    ApiSetEntry {
+        prefix: "api-ms-win-core-threadpool-private-l1-1",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-timezone-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     ApiSetEntry {
         prefix: "api-ms-win-core-util-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
     // Security
     ApiSetEntry {
         prefix: "api-ms-win-security-base-l1-1",
         target: "advapi32.dll",
     },
+    ApiSetEntry {
+        prefix: "api-ms-win-security-base-l1-2",
+        target: "advapi32.dll",
+    },
+    // Eventing
+    ApiSetEntry {
+        prefix: "api-ms-win-eventing-provider-l1-1",
+        target: "kernelbase.dll",
+    },
+    // Fibers
+    ApiSetEntry {
+        prefix: "api-ms-win-core-fibers-l1-1",
+        target: "kernelbase.dll",
+    },
+    // Process snapshot
+    ApiSetEntry {
+        prefix: "api-ms-win-core-processsnapshot-l1-1",
+        target: "kernelbase.dll",
+    },
     // Sockets
     ApiSetEntry {
         prefix: "api-ms-win-core-comm-l1-1",
-        target: "kernel32.dll",
+        target: "kernelbase.dll",
     },
 ];
 
@@ -240,10 +307,10 @@ pub fn resolve_apiset(dll_name: &str) -> Option<&'static str> {
     // match has either nothing remaining, or a patch-version suffix of the
     // form "-<digits>".
     for entry in API_SET_MAP {
-        if let Some(rest) = lower.strip_prefix(entry.prefix) {
-            if rest.is_empty() || is_patch_version_suffix(rest) {
-                return Some(entry.target);
-            }
+        if let Some(rest) = lower.strip_prefix(entry.prefix)
+            && (rest.is_empty() || is_patch_version_suffix(rest))
+        {
+            return Some(entry.target);
         }
     }
 
@@ -295,7 +362,7 @@ mod tests {
         // With patch version -1
         assert_eq!(
             resolve_apiset("api-ms-win-core-file-l1-1-1.dll"),
-            Some("kernel32.dll")
+            Some("kernelbase.dll")
         );
         // Case-insensitive
         assert_eq!(

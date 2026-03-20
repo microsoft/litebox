@@ -129,10 +129,281 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             }
             NtStatus::STATUS_SUCCESS
         }
+        // SystemBasicInformation extended (0x3E = 62). Same as class 0 but with a
+        // 4-byte reserved field prepended, shifting all other fields by 4 bytes.
+        // The heap manager reads AllocationGranularity and MaximumUserModeAddress
+        // from this structure to compute the initial heap reservation size.
+        0x3E => {
+            const SBIE_SIZE: usize = 64;
+            if (info_length as usize) < SBIE_SIZE || info_ptr == 0 {
+                if return_length_ptr != 0 {
+                    unsafe {
+                        core::ptr::write(return_length_ptr as *mut u32, SBIE_SIZE as u32);
+                    }
+                }
+                return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            unsafe {
+                core::ptr::write_bytes(info_ptr as *mut u8, 0, SBIE_SIZE);
+                let base = info_ptr as *mut u8;
+                // offset 0: Reserved (ULONG) = 0
+                // offset 4: TimerResolution (ULONG)
+                core::ptr::write(base.add(4).cast::<u32>(), 156250);
+                // offset 8: PageSize (ULONG)
+                core::ptr::write(base.add(8).cast::<u32>(), 4096);
+                // offset 12: NumberOfPhysicalPages (ULONG) — ~4GB
+                core::ptr::write(base.add(12).cast::<u32>(), 1048576);
+                // offset 16: LowestPhysicalPageNumber (ULONG)
+                core::ptr::write(base.add(16).cast::<u32>(), 1);
+                // offset 20: HighestPhysicalPageNumber (ULONG)
+                core::ptr::write(base.add(20).cast::<u32>(), 1048576);
+                // offset 24: AllocationGranularity (ULONG)
+                core::ptr::write(base.add(24).cast::<u32>(), 65536);
+                // offset 32: MinimumUserModeAddress (ULONG_PTR)
+                core::ptr::write(base.add(32).cast::<u64>(), 0x10000);
+                // offset 40: MaximumUserModeAddress (ULONG_PTR)
+                core::ptr::write(base.add(40).cast::<u64>(), 0x7FFF_FFFE_FFFF);
+                // offset 48: ActiveProcessorsAffinityMask (KAFFINITY)
+                core::ptr::write(base.add(48).cast::<u64>(), 1);
+                // offset 56: NumberOfProcessors (CCHAR)
+                core::ptr::write(base.add(56), 1);
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, SBIE_SIZE as u32);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // SystemProcessorGroupInformation (0x37 = 55). Returns per-group
+        // processor info. Real kernel returns 24 bytes with processor mask
+        // at offset 8. We report 1 active processor.
+        0x37 => {
+            const SPG_SIZE: usize = 24;
+            if (info_length as usize) < SPG_SIZE || info_ptr == 0 {
+                if return_length_ptr != 0 {
+                    unsafe {
+                        core::ptr::write(return_length_ptr as *mut u32, SPG_SIZE as u32);
+                    }
+                }
+                return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            unsafe {
+                core::ptr::write_bytes(
+                    info_ptr as *mut u8,
+                    0,
+                    core::cmp::min(info_length as usize, 0x408),
+                );
+                let base = info_ptr as *mut u8;
+                // offset 8: processor mask (KAFFINITY) — 1 bit = 1 processor.
+                // Real kernel places mask here; ntdll reads it directly.
+                core::ptr::write(base.add(8).cast::<u64>(), 0x1);
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, SPG_SIZE as u32);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // SystemCodeIntegrityInformation (0xC0 = 192). ntdll checks CI flags.
+        0xC0 => {
+            const SCI_SIZE: usize = 32;
+            if (info_length as usize) < 8 || info_ptr == 0 {
+                if return_length_ptr != 0 {
+                    unsafe {
+                        core::ptr::write(return_length_ptr as *mut u32, SCI_SIZE as u32);
+                    }
+                }
+                return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let fill = core::cmp::min(info_length as usize, SCI_SIZE);
+            unsafe {
+                core::ptr::write_bytes(info_ptr as *mut u8, 0, fill);
+                let base = info_ptr as *mut u8;
+                // offset 0: Length (ULONG) = 8 (CI info header size)
+                core::ptr::write(base.cast::<u32>(), 0x7);
+                // offset 4: CodeIntegrityOptions (ULONG) = 0x40
+                core::ptr::write(base.add(4).cast::<u32>(), 0x40);
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, fill as u32);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // SystemHypervisorSharedPageInformation (0xC5 = 197). Returns a pointer to
+        // the hypervisor shared page used for fast time queries. We allocate a page
+        // in guest memory and return its address.
+        0xC5 => {
+            if (info_length as usize) < 8 || info_ptr == 0 {
+                return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            // Return 0 (no hypervisor shared page available). ntdll should
+            // fall back to syscall-based time queries.
+            unsafe {
+                core::ptr::write(info_ptr as *mut u64, 0);
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, 8);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
         _ => {
-            // Unknown info class — return not-implemented so the CRT can
-            // fall back.
-            NtStatus::STATUS_INVALID_INFO_CLASS
+            // Unknown info class — many classes are queried during ntdll init.
+            // Return zeroed data for reasonable buffer sizes to satisfy queries
+            // we don't need to implement precisely (NUMA info, security, etc.).
+            if info_ptr != 0 && info_length > 0 && info_length <= 0x10000 {
+                unsafe {
+                    core::ptr::write_bytes(info_ptr as *mut u8, 0, info_length as usize);
+                }
+                if return_length_ptr != 0 {
+                    unsafe {
+                        core::ptr::write(return_length_ptr as *mut u32, info_length);
+                    }
+                }
+                NtStatus::STATUS_SUCCESS
+            } else {
+                NtStatus::STATUS_INVALID_INFO_CLASS
+            }
+        }
+    }
+}
+
+/// NtQuerySystemInformationEx — extended system information query.
+///
+/// NT signature:
+/// ```text
+/// NTSTATUS NtQuerySystemInformationEx(
+///     SYSTEM_INFORMATION_CLASS SystemInformationClass, // r10
+///     PVOID InputBuffer,                               // rdx
+///     ULONG InputBufferLength,                         // r8
+///     PVOID SystemInformation,                         // r9
+///     ULONG SystemInformationLength,                   // [rsp+0x28]
+///     PULONG ReturnLength                              // [rsp+0x30]
+/// );
+/// ```
+///
+/// Called during ntdll init for NUMA/processor group and CPU set queries.
+/// For class 0x6B (SystemCpuSetInformation), the caller does a two-step query:
+/// first with output_len=0 to get the required size, then allocates and retries.
+pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let info_class = args.arg0 as u32;
+    let info_ptr = args.arg3;
+    let info_length = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const u32) };
+    let return_length_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
+
+    #[cfg(debug_assertions)]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "  NtQuerySystemInformationEx: class=0x{info_class:X} out=0x{info_ptr:X} outLen={info_length} retLenPtr=0x{return_length_ptr:X}\n"
+        ));
+    }
+
+    match info_class {
+        // SystemLogicalProcessorAndGroupInformation (0x6B = 107).
+        //
+        // ntdll's LdrpInitializeProcess calls this with InputBuffer containing
+        // a DWORD = 4 (RelationGroup) to discover the number of processor
+        // groups. The caller does a two-step query:
+        //   1. outBuf=NULL, outLen=0 → expect STATUS_INFO_LENGTH_MISMATCH + retLen
+        //   2. allocate, retry → expect STATUS_SUCCESS + filled buffer
+        //
+        // If the returned MaximumGroupCount is 0, ntdll returns
+        // STATUS_INTERNAL_ERROR and the process fails to start.
+        //
+        // We return a single SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
+        // (RelationGroup) with 1 active group containing 1 processor.
+        //
+        // Layout (80 bytes total):
+        //   +0x00  DWORD Relationship = 4 (RelationGroup)
+        //   +0x04  DWORD Size = 80
+        //   +0x08  WORD  MaximumGroupCount = 1
+        //   +0x0A  WORD  ActiveGroupCount = 1
+        //   +0x0C  BYTE  Reserved[20] = {0}
+        //   +0x20  PROCESSOR_GROUP_INFO[0]:
+        //     +0x20  BYTE  MaximumProcessorCount = 1
+        //     +0x21  BYTE  ActiveProcessorCount = 1
+        //     +0x22  BYTE  Reserved[38] = {0}
+        //     +0x48  KAFFINITY ActiveProcessorMask = 0x1
+        0x6B => {
+            const ENTRY_SIZE: u32 = 80;
+            if info_ptr == 0 || info_length < ENTRY_SIZE {
+                if return_length_ptr != 0 {
+                    unsafe {
+                        core::ptr::write(return_length_ptr as *mut u32, ENTRY_SIZE);
+                    }
+                }
+                return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+            }
+            unsafe {
+                let base = info_ptr as *mut u8;
+                core::ptr::write_bytes(base, 0, ENTRY_SIZE as usize);
+                // Relationship = RelationGroup (4)
+                core::ptr::write(base.cast::<u32>(), 4);
+                // Size
+                core::ptr::write(base.add(4).cast::<u32>(), ENTRY_SIZE);
+                // MaximumGroupCount
+                core::ptr::write(base.add(8).cast::<u16>(), 1);
+                // ActiveGroupCount
+                core::ptr::write(base.add(10).cast::<u16>(), 1);
+                // PROCESSOR_GROUP_INFO at offset 0x20:
+                // MaximumProcessorCount
+                core::ptr::write(base.add(0x20), 1);
+                // ActiveProcessorCount
+                core::ptr::write(base.add(0x21), 1);
+                // ActiveProcessorMask (KAFFINITY = u64 at offset 0x48)
+                core::ptr::write(base.add(0x48).cast::<u64>(), 0x1);
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, ENTRY_SIZE);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // SystemProcessorIdleCycleTimeInformation (0xD2) and
+        // SystemProcessorCycleTimeInformation (0xD3): ntdll's loader queries
+        // these during image mapping to determine processor topology. Return
+        // zeroed data (single processor, all idle) rather than INFO_NOT_FOUND,
+        // which would cause the loader to skip per-processor initialization
+        // of internal data structures.
+        0xD2 | 0xD3 => {
+            if info_ptr != 0 && info_length > 0 {
+                unsafe {
+                    core::ptr::write_bytes(info_ptr as *mut u8, 0, info_length as usize);
+                }
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, info_length);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // Default: unknown classes in NtQuerySystemInformationEx. The real
+        // kernel returns STATUS_INFO_NOT_FOUND (0xC0000004) for unknown or
+        // unsupported Ex classes. We must match this specific status code
+        // because ntdll checks for it explicitly during init.
+        _ => {
+            #[cfg(debug_assertions)]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "  NtQuerySystemInformationEx: unknown class 0x{info_class:X} → STATUS_INFO_NOT_FOUND\n"
+                ));
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, 0);
+                }
+            }
+            NtStatus(0xC0000004_u32 as i32) // STATUS_INFO_NOT_FOUND
         }
     }
 }
@@ -257,6 +528,78 @@ pub(crate) fn nt_query_information_process(
             }
             NtStatus::STATUS_SUCCESS
         }
+        // ProcessDebugPort (7) — no debugger attached.
+        7 => {
+            if info_ptr != 0 && info_length >= 8 {
+                unsafe {
+                    core::ptr::write(info_ptr as *mut u64, 0); // no debug port
+                }
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, 8);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // ProcessDebugFlags (0x1F = 31)
+        0x1F => {
+            if info_ptr != 0 && info_length >= 4 {
+                unsafe {
+                    // 1 = PROCESS_DEBUG_INHERIT (not being debugged)
+                    core::ptr::write(info_ptr as *mut u32, 1);
+                }
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, 4);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // ProcessCookie (0x24 = 36) — returns a random non-zero u32 cookie
+        36 => {
+            if info_ptr != 0 && info_length >= 4 {
+                unsafe {
+                    // Return a fixed non-zero cookie value (real kernel returns random)
+                    core::ptr::write(info_ptr as *mut u32, 0x5981937B_u32);
+                }
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, 4);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // ProcessHandleCount (0x14 = 20)
+        0x14 => {
+            if info_ptr != 0 && info_length >= 4 {
+                unsafe {
+                    core::ptr::write(info_ptr as *mut u32, 16); // fake handle count
+                }
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, 4);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // ProcessHandleCheckingMode (0x25 = 37) — return 0 (disabled)
+        37 => {
+            if info_ptr != 0 && info_length >= 4 {
+                unsafe {
+                    core::ptr::write(info_ptr as *mut u32, 0);
+                }
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, 4);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
         // ProcessImageInformation (44) — return success with zeroed data.
         44 => {
             if info_ptr != 0 && info_length >= 8 {
@@ -265,6 +608,20 @@ pub(crate) fn nt_query_information_process(
                         info_ptr as *mut u8,
                         0,
                         core::cmp::min(info_length as usize, 64),
+                    );
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // ProcessMitigationPolicy (0x34 = 52) or (0x3F = 63)
+        52 | 63 => {
+            // Return zeroed data (no mitigations enabled).
+            if info_ptr != 0 && info_length > 0 {
+                unsafe {
+                    core::ptr::write_bytes(
+                        info_ptr as *mut u8,
+                        0,
+                        core::cmp::min(info_length as usize, 128),
                     );
                 }
             }
@@ -296,17 +653,10 @@ pub(crate) fn nt_delay_execution(ctx: &mut super::super::ExecutionContext) -> Nt
     let delay_100ns = unsafe { core::ptr::read(delay_ptr as *const i64) };
 
     // Negative = relative time. Convert to microseconds for the platform sleep.
-    let sleep_us = if delay_100ns < 0 {
-        // Absolute value, convert 100ns -> us (divide by 10).
-        ((-delay_100ns) / 10) as u64
-    } else if delay_100ns == 0 {
-        // Zero means yield.
-        0
-    } else {
-        // Positive = absolute time. Sleep until then.
-        let now = windows_filetime_now();
-        let diff = delay_100ns - now;
-        if diff <= 0 { 0 } else { (diff / 10) as u64 }
+    let sleep_us = match delay_100ns.cmp(&0) {
+        core::cmp::Ordering::Less => delay_100ns.unsigned_abs() / 10,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 0,
     };
 
     if sleep_us > 0 {

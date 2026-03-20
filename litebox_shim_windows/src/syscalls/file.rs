@@ -139,6 +139,44 @@ pub(crate) mod host {
         (ok != 0, bytes_read)
     }
 
+    /// Read bytes from a host file handle at an explicit byte offset.
+    ///
+    /// Uses OVERLAPPED to specify the file position so that the host kernel's
+    /// implicit file pointer is never consulted. This makes the caller's
+    /// cached position the single source of truth.
+    pub fn read_file_at(handle: usize, buf: *mut u8, len: u32, offset: u64) -> (bool, u32) {
+        unsafe extern "system" {
+            fn ReadFile(
+                handle: usize,
+                buffer: *mut u8,
+                bytes_to_read: u32,
+                bytes_read: *mut u32,
+                overlapped: usize,
+            ) -> i32;
+        }
+
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset_low: u32,
+            offset_high: u32,
+            h_event: usize,
+        }
+
+        let mut ovl = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset_low: offset as u32,
+            offset_high: (offset >> 32) as u32,
+            h_event: 0,
+        };
+        let mut bytes_read: u32 = 0;
+        // Safety: overlapped pointer is valid for the duration of the call.
+        let ok = unsafe { ReadFile(handle, buf, len, &raw mut bytes_read, &raw mut ovl as usize) };
+        (ok != 0, bytes_read)
+    }
+
     /// Read bytes from the host's stdin handle.
     pub fn read_stdin(buf: *mut u8, len: u32) -> (bool, u32) {
         unsafe extern "system" {
@@ -178,56 +216,30 @@ pub(crate) mod host {
         (ok != 0, bytes_written)
     }
 
-    /// Read bytes from a host file handle at a specific offset.
-    pub fn read_file_at(handle: usize, buf: *mut u8, len: u32, offset: u64) -> (bool, u32) {
-        #[repr(C)]
-        struct Overlapped {
-            internal: usize,
-            internal_high: usize,
-            offset_low: u32,
-            offset_high: u32,
-            h_event: usize,
-        }
-        unsafe extern "system" {
-            fn ReadFile(
-                handle: usize,
-                buffer: *mut u8,
-                bytes_to_read: u32,
-                bytes_read: *mut u32,
-                overlapped: *mut Overlapped,
-            ) -> i32;
-        }
-        let mut ovl = Overlapped {
-            internal: 0,
-            internal_high: 0,
-            offset_low: offset as u32,
-            offset_high: (offset >> 32) as u32,
-            h_event: 0,
-        };
-        let mut bytes_read: u32 = 0;
-        let ok = unsafe { ReadFile(handle, buf, len, &raw mut bytes_read, &raw mut ovl) };
-        (ok != 0, bytes_read)
-    }
-
-    /// Write bytes to a host file handle at a specific offset.
+    /// Write bytes to a host file handle at an explicit byte offset.
+    ///
+    /// Uses OVERLAPPED to specify the file position so that the host kernel's
+    /// implicit file pointer is never consulted.
     pub fn write_file_at(handle: usize, buf: *const u8, len: u32, offset: u64) -> (bool, u32) {
-        #[repr(C)]
-        struct Overlapped {
-            internal: usize,
-            internal_high: usize,
-            offset_low: u32,
-            offset_high: u32,
-            h_event: usize,
-        }
         unsafe extern "system" {
             fn WriteFile(
                 handle: usize,
                 buffer: *const u8,
                 bytes_to_write: u32,
                 bytes_written: *mut u32,
-                overlapped: *mut Overlapped,
+                overlapped: usize,
             ) -> i32;
         }
+
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset_low: u32,
+            offset_high: u32,
+            h_event: usize,
+        }
+
         let mut ovl = Overlapped {
             internal: 0,
             internal_high: 0,
@@ -236,7 +248,16 @@ pub(crate) mod host {
             h_event: 0,
         };
         let mut bytes_written: u32 = 0;
-        let ok = unsafe { WriteFile(handle, buf, len, &raw mut bytes_written, &raw mut ovl) };
+        // Safety: overlapped pointer is valid for the duration of the call.
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                buf,
+                len,
+                &raw mut bytes_written,
+                &raw mut ovl as usize,
+            )
+        };
         (ok != 0, bytes_written)
     }
 
@@ -265,6 +286,26 @@ pub(crate) mod host {
         let mut new_pos: i64 = 0;
         let ok = unsafe { SetFilePointerEx(handle, offset, &raw mut new_pos, method) };
         if ok != 0 { new_pos } else { -1 }
+    }
+
+    /// Set end-of-file at the given position.
+    pub fn set_end_of_file(handle: usize, position: i64) -> bool {
+        unsafe extern "system" {
+            fn SetFilePointerEx(
+                handle: usize,
+                distance: i64,
+                new_pointer: *mut i64,
+                method: u32,
+            ) -> i32;
+            fn SetEndOfFile(handle: usize) -> i32;
+        }
+
+        // First seek to the position, then set EOF there.
+        let ok = unsafe { SetFilePointerEx(handle, position, core::ptr::null_mut(), 0) };
+        if ok == 0 {
+            return false;
+        }
+        unsafe { SetEndOfFile(handle) != 0 }
     }
 
     /// Get file attributes/times.
@@ -416,10 +457,16 @@ pub(crate) mod host {
     pub fn read_file(_handle: usize, _buf: *mut u8, _len: u32) -> (bool, u32) {
         (false, 0)
     }
+    pub fn read_file_at(_handle: usize, _buf: *mut u8, _len: u32, _offset: u64) -> (bool, u32) {
+        (false, 0)
+    }
     pub fn read_stdin(_buf: *mut u8, _len: u32) -> (bool, u32) {
         (false, 0)
     }
     pub fn write_file(_handle: usize, _buf: *const u8, _len: u32) -> (bool, u32) {
+        (false, 0)
+    }
+    pub fn write_file_at(_handle: usize, _buf: *const u8, _len: u32, _offset: u64) -> (bool, u32) {
         (false, 0)
     }
     pub fn get_file_size(_handle: usize) -> i64 {
@@ -427,6 +474,9 @@ pub(crate) mod host {
     }
     pub fn set_file_position(_handle: usize, _offset: i64, _method: u32) -> i64 {
         -1
+    }
+    pub fn set_end_of_file(_handle: usize, _position: i64) -> bool {
+        false
     }
     pub fn get_file_info(_handle: usize) -> Option<(u32, i64, i64, i64, i64)> {
         None
@@ -460,9 +510,9 @@ pub(crate) mod host {
 pub(crate) fn translate_nt_path(nt_path: &str) -> Option<String> {
     // Strip common NT prefixes.
     if let Some(rest) = nt_path.strip_prefix("\\??\\") {
-        if rest.starts_with("UNC\\") {
+        if let Some(stripped) = rest.strip_prefix("UNC\\") {
             // UNC path: \??\UNC\server\share → \\server\share
-            return Some(String::from("\\\\") + &rest[4..]);
+            return Some(String::from("\\\\") + stripped);
         }
         // Standard drive path: \??\C:\... → C:\...
         return Some(String::from(rest));
@@ -473,10 +523,10 @@ pub(crate) fn translate_nt_path(nt_path: &str) -> Option<String> {
     if let Some(rest) = nt_path.strip_prefix("\\SystemRoot\\") {
         return Some(String::from("C:\\Windows\\") + rest);
     }
-    if let Some(rest) = nt_path.strip_prefix("\\SystemRoot") {
-        if rest.is_empty() {
-            return Some(String::from("C:\\Windows"));
-        }
+    if let Some(rest) = nt_path.strip_prefix("\\SystemRoot")
+        && rest.is_empty()
+    {
+        return Some(String::from("C:\\Windows"));
     }
     // If it looks like a drive letter path already, pass through.
     if nt_path.len() >= 3 && nt_path.as_bytes()[1] == b':' {
@@ -548,29 +598,70 @@ pub(crate) fn nt_create_file(
     let obj_attr = unsafe { core::ptr::read(obj_attr_ptr as *const ObjectAttributes) };
 
     // Read the path from UNICODE_STRING.
-    let nt_path = match read_unicode_string_from_guest(obj_attr.object_name as usize) {
-        Some(p) => p,
-        None => return NtStatus::STATUS_OBJECT_NAME_INVALID,
+    let Some(nt_path) = read_unicode_string_from_guest(obj_attr.object_name as usize) else {
+        return NtStatus::STATUS_OBJECT_NAME_INVALID;
     };
+
+    // Handle device paths that don't go through the filesystem.
+    let nt_path_lower = nt_path.to_lowercase();
+    let is_condrv_path = nt_path_lower.contains("\\device\\condrv\\");
+    // Check if root directory handle is a ConDrv stub (relative open).
+    let is_condrv_relative = if obj_attr.root_directory != 0 && !is_condrv_path {
+        let root_h = obj_attr.root_directory as u32;
+        handles
+            .get(root_h)
+            .is_some_and(|obj| matches!(obj, NtObject::Stub { kind } if kind == "ConDrv"))
+    } else {
+        false
+    };
+    if is_condrv_path || is_condrv_relative {
+        // Console driver device — dispatch to proper handle type based on
+        // the path suffix: \\Input → ConsoleInput, \\Output → ConsoleOutput,
+        // everything else → generic ConDrv stub.
+        let path_lower = nt_path.to_lowercase();
+        let obj = if path_lower.ends_with("\\input") {
+            NtObject::ConsoleInput
+        } else if path_lower.ends_with("\\output") {
+            NtObject::ConsoleOutput { is_stderr: false }
+        } else {
+            NtObject::Stub {
+                kind: alloc::string::String::from("ConDrv"),
+            }
+        };
+        let h = handles.insert(obj);
+        if handle_out_ptr != 0 {
+            unsafe {
+                core::ptr::write(handle_out_ptr as *mut u64, u64::from(h));
+            }
+        }
+        if io_status_ptr != 0 {
+            unsafe {
+                core::ptr::write(io_status_ptr as *mut u64, 0); // Status = SUCCESS
+                core::ptr::write((io_status_ptr + 8) as *mut u64, 0); // Information = FILE_OPENED
+            }
+        }
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: NtCreateFile ConDrv stub handle=0x{h:X} path={nt_path:?}\n",
+            ));
+        }
+        return NtStatus::STATUS_SUCCESS;
+    }
 
     // Check for directory opens.
     let is_directory = create_options & file_options::FILE_DIRECTORY_FILE != 0;
 
     // Translate NT path to host path.
-    let host_path = match translate_nt_path(&nt_path) {
-        Some(p) => p,
-        None => {
-            #[cfg(debug_assertions)]
-            {
-                use litebox::platform::DebugLogProvider as _;
-                let msg = alloc::format!(
-                    "NT shim: NtCreateFile path not translatable: {:?}\n",
-                    nt_path
-                );
-                litebox_platform_multiplex::platform().debug_log_print(&msg);
-            }
-            return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
+    let Some(host_path) = translate_nt_path(&nt_path) else {
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            let msg = alloc::format!("NT shim: NtCreateFile path not translatable: {nt_path:?}\n");
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
         }
+        return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
     };
 
     if is_directory {
@@ -740,29 +831,14 @@ pub(crate) fn nt_create_file(
 // NtReadFile
 // ========================================================================
 
-/// NtReadFile — read data from a file handle.
+/// NtReadFile — read from a host file handle.
 ///
-/// NT signature:
-/// ```text
-/// NTSTATUS NtReadFile(
-///     HANDLE FileHandle,           // r10
-///     HANDLE Event,                // rdx
-///     PIO_APC_ROUTINE ApcRoutine,  // r8
-///     PVOID ApcContext,             // r9
-///     PIO_STATUS_BLOCK IoStatusBlock, // [rsp+0x28]
-///     PVOID Buffer,                // [rsp+0x30]
-///     ULONG Length,                // [rsp+0x38]
-///     PLARGE_INTEGER ByteOffset,   // [rsp+0x40]
-///     PULONG Key                   // [rsp+0x48]
-/// );
-/// ```
-pub(crate) fn nt_read_file(
+/// Called after handle-table lock is dropped. Takes extracted handle info.
+pub(crate) fn nt_read_file_host(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut HandleTable,
+    host_handle: usize,
+    position: &alloc::sync::Arc<AtomicU64>,
 ) -> NtStatus {
-    let args = NtSyscallArgs::from_ctx(ctx);
-    let file_handle = args.arg0 as u32;
-
     // Stack arguments.
     let io_status_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
     let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
@@ -773,75 +849,95 @@ pub(crate) fn nt_read_file(
         return NtStatus::STATUS_INVALID_PARAMETER;
     }
 
-    // Look up the handle.
-    let obj = match handles.get(file_handle) {
-        Some(obj) => obj,
-        None => return NtStatus::STATUS_INVALID_HANDLE,
+    // NT ByteOffset sentinels:
+    //   >= 0                      → positional I/O (pread), no position mutation
+    //   -2 (USE_FILE_POINTER_POS) → use & advance the shared current position
+    //   -1 and all others         → invalid for reads
+    //   NULL pointer              → use & advance the shared current position
+    const FILE_USE_FILE_POINTER_POSITION: i64 = -2;
+
+    let (read_pos, reserved) = if byte_offset_ptr != 0 {
+        let offset = unsafe { core::ptr::read(byte_offset_ptr as *const i64) };
+        if offset >= 0 {
+            // Positional read: don't mutate the shared position.
+            (offset as u64, 0u64)
+        } else if offset == FILE_USE_FILE_POINTER_POSITION {
+            let start = position.fetch_add(length as u64, Relaxed);
+            (start, length as u64)
+        } else {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        }
+    } else {
+        let start = position.fetch_add(length as u64, Relaxed);
+        (start, length as u64)
     };
 
-    match obj {
-        NtObject::File {
-            host_handle,
-            position,
-            ..
-        } => {
-            // If a byte offset is provided, seek first.
-            if byte_offset_ptr != 0 {
-                let offset = unsafe { core::ptr::read(byte_offset_ptr as *const i64) };
-                if offset >= 0 {
-                    let new_pos = host::set_file_position(*host_handle, offset, 0); // FILE_BEGIN
-                    if new_pos >= 0 {
-                        position.store(new_pos as u64, Relaxed);
-                    }
-                }
-            }
+    let (ok, bytes_read) = host::read_file_at(host_handle, buffer_ptr as *mut u8, length, read_pos);
 
-            let (ok, bytes_read) = host::read_file(*host_handle, buffer_ptr as *mut u8, length);
-
-            if ok {
-                position.store(position.load(Relaxed) + bytes_read as u64, Relaxed);
-                if io_status_ptr != 0 {
-                    let iosb = IoStatusBlock {
-                        status: NtStatus::STATUS_SUCCESS.0,
-                        _pad: 0,
-                        information: bytes_read as u64,
-                    };
-                    unsafe {
-                        core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-                    }
-                }
-                if bytes_read == 0 {
-                    NtStatus::STATUS_END_OF_FILE
-                } else {
-                    NtStatus::STATUS_SUCCESS
-                }
-            } else {
-                NtStatus::STATUS_ACCESS_DENIED
+    if ok {
+        if reserved > 0 {
+            let over = reserved - bytes_read as u64;
+            if over > 0 {
+                position.fetch_sub(over, Relaxed);
             }
         }
-        NtObject::ConsoleInput => {
-            let (ok, bytes_read) = host::read_stdin(buffer_ptr as *mut u8, length);
-            if ok {
-                if io_status_ptr != 0 {
-                    let iosb = IoStatusBlock {
-                        status: NtStatus::STATUS_SUCCESS.0,
-                        _pad: 0,
-                        information: bytes_read as u64,
-                    };
-                    unsafe {
-                        core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-                    }
-                }
-                if bytes_read == 0 {
-                    NtStatus::STATUS_END_OF_FILE
-                } else {
-                    NtStatus::STATUS_SUCCESS
-                }
-            } else {
-                NtStatus::STATUS_UNSUCCESSFUL
+        if io_status_ptr != 0 {
+            let iosb = IoStatusBlock {
+                status: NtStatus::STATUS_SUCCESS.0,
+                _pad: 0,
+                information: bytes_read as u64,
+            };
+            unsafe {
+                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
             }
         }
-        _ => NtStatus::STATUS_INVALID_HANDLE,
+        if bytes_read == 0 {
+            NtStatus::STATUS_END_OF_FILE
+        } else {
+            NtStatus::STATUS_SUCCESS
+        }
+    } else {
+        if reserved > 0 {
+            position.fetch_sub(reserved, Relaxed);
+        }
+        NtStatus::STATUS_ACCESS_DENIED
+    }
+}
+
+/// NtReadFile — read from ConsoleInput.
+///
+/// Called after handle-table lock is dropped.
+pub(crate) fn nt_read_file_console(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+    let io_status_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+    let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
+    let length = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
+
+    if buffer_ptr == 0 || length == 0 {
+        return NtStatus::STATUS_INVALID_PARAMETER;
+    }
+
+    // Read from the platform's StdioProvider (same path as Linux shim).
+    let buf = unsafe { core::slice::from_raw_parts_mut(buffer_ptr as *mut u8, length as usize) };
+    use litebox::platform::StdioProvider as _;
+    match litebox_platform_multiplex::platform().read_from_stdin(buf) {
+        Ok(bytes_read) => {
+            if io_status_ptr != 0 {
+                let iosb = IoStatusBlock {
+                    status: NtStatus::STATUS_SUCCESS.0,
+                    _pad: 0,
+                    information: bytes_read as u64,
+                };
+                unsafe {
+                    core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+                }
+            }
+            if bytes_read == 0 {
+                NtStatus::STATUS_END_OF_FILE
+            } else {
+                NtStatus::STATUS_SUCCESS
+            }
+        }
+        Err(_) => NtStatus::STATUS_END_OF_FILE,
     }
 }
 
@@ -849,81 +945,122 @@ pub(crate) fn nt_read_file(
 // NtWriteFile (enhanced for file handles)
 // ========================================================================
 
-/// NtWriteFile — write data to a file handle.
+/// NtWriteFile — write to ConsoleOutput via platform StdioProvider.
 ///
-/// Enhanced from Phase 1 to support real file handles in addition to console.
-pub(crate) fn nt_write_file(
+/// Called after handle-table lock is dropped.
+pub(crate) fn nt_write_file_console(
     ctx: &mut super::super::ExecutionContext,
-    handles: &mut HandleTable,
+    is_stderr: bool,
 ) -> NtStatus {
-    let args = NtSyscallArgs::from_ctx(ctx);
-    let file_handle = args.arg0 as u32;
-
-    // Stack arguments.
     let io_status_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
     let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
     let length = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
 
-    let obj = match handles.get(file_handle) {
-        Some(obj) => obj,
-        None => return NtStatus::STATUS_INVALID_HANDLE,
+    let mut bytes_written = 0u32;
+    if buffer_ptr != 0 && length > 0 {
+        let buf = unsafe { core::slice::from_raw_parts(buffer_ptr as *const u8, length as usize) };
+        let stream = if is_stderr {
+            litebox::platform::StdioOutStream::Stderr
+        } else {
+            litebox::platform::StdioOutStream::Stdout
+        };
+        use litebox::platform::StdioProvider as _;
+        match litebox_platform_multiplex::platform().write_to(stream, buf) {
+            Ok(n) => bytes_written = n as u32,
+            Err(_) => return NtStatus::STATUS_UNSUCCESSFUL,
+        }
+    }
+    if io_status_ptr != 0 {
+        let iosb = IoStatusBlock {
+            status: NtStatus::STATUS_SUCCESS.0,
+            _pad: 0,
+            information: bytes_written as u64,
+        };
+        unsafe {
+            core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+        }
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
+/// NtWriteFile — write to a host file handle.
+///
+/// Called after handle-table lock is dropped. Takes extracted handle info.
+/// Supports ByteOffset at [rsp+0x40].
+pub(crate) fn nt_write_file_host(
+    ctx: &mut super::super::ExecutionContext,
+    host_handle: usize,
+    position: &alloc::sync::Arc<AtomicU64>,
+) -> NtStatus {
+    let io_status_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+    let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
+    let length = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
+    let byte_offset_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x40) as *const usize) };
+
+    if buffer_ptr == 0 || length == 0 {
+        return NtStatus::STATUS_INVALID_PARAMETER;
+    }
+
+    // NT ByteOffset sentinels:
+    //   >= 0                        → positional I/O (pwrite), no position mutation
+    //   -2 (USE_FILE_POINTER_POS)   → use & advance the shared current position
+    //   -1 (WRITE_TO_END_OF_FILE)   → append at EOF
+    //   all others                  → invalid
+    //   NULL pointer                → use & advance the shared current position
+    const FILE_USE_FILE_POINTER_POSITION: i64 = -2;
+    const FILE_WRITE_TO_END_OF_FILE: i64 = -1;
+
+    let (write_pos, reserved) = if byte_offset_ptr != 0 {
+        let offset = unsafe { core::ptr::read(byte_offset_ptr as *const i64) };
+        if offset >= 0 {
+            // Positional write: don't mutate the shared position.
+            (offset as u64, 0u64)
+        } else if offset == FILE_USE_FILE_POINTER_POSITION {
+            let start = position.fetch_add(length as u64, Relaxed);
+            (start, length as u64)
+        } else if offset == FILE_WRITE_TO_END_OF_FILE {
+            // Append at EOF: query actual file size for the write offset.
+            // Don't mutate the shared position — the caller explicitly asked
+            // for EOF, not "advance current pointer."
+            let size = host::get_file_size(host_handle);
+            if size < 0 {
+                return NtStatus::STATUS_UNSUCCESSFUL;
+            }
+            (size as u64, 0u64)
+        } else {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        }
+    } else {
+        let start = position.fetch_add(length as u64, Relaxed);
+        (start, length as u64)
     };
 
-    match obj {
-        NtObject::ConsoleOutput { is_stderr } => {
-            // Write to platform debug log (stderr on userland).
-            if buffer_ptr != 0 && length > 0 {
-                unsafe {
-                    let buf = core::slice::from_raw_parts(buffer_ptr as *const u8, length as usize);
-                    use litebox::platform::DebugLogProvider as _;
-                    if let Ok(s) = core::str::from_utf8(buf) {
-                        litebox_platform_multiplex::platform().debug_log_print(s);
-                    }
-                }
-            }
-            if io_status_ptr != 0 {
-                let iosb = IoStatusBlock {
-                    status: NtStatus::STATUS_SUCCESS.0,
-                    _pad: 0,
-                    information: length as u64,
-                };
-                unsafe {
-                    core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-                }
-            }
-            let _ = is_stderr; // suppress unused warning
-            NtStatus::STATUS_SUCCESS
-        }
-        NtObject::File {
-            host_handle,
-            position,
-            ..
-        } => {
-            if buffer_ptr == 0 || length == 0 {
-                return NtStatus::STATUS_INVALID_PARAMETER;
-            }
+    let (ok, bytes_written) =
+        host::write_file_at(host_handle, buffer_ptr as *const u8, length, write_pos);
 
-            let (ok, bytes_written) =
-                host::write_file(*host_handle, buffer_ptr as *const u8, length);
-
-            if ok {
-                position.store(position.load(Relaxed) + bytes_written as u64, Relaxed);
-                if io_status_ptr != 0 {
-                    let iosb = IoStatusBlock {
-                        status: NtStatus::STATUS_SUCCESS.0,
-                        _pad: 0,
-                        information: bytes_written as u64,
-                    };
-                    unsafe {
-                        core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-                    }
-                }
-                NtStatus::STATUS_SUCCESS
-            } else {
-                NtStatus::STATUS_ACCESS_DENIED
+    if ok {
+        if reserved > 0 {
+            let over = reserved - bytes_written as u64;
+            if over > 0 {
+                position.fetch_sub(over, Relaxed);
             }
         }
-        _ => NtStatus::STATUS_INVALID_HANDLE,
+        if io_status_ptr != 0 {
+            let iosb = IoStatusBlock {
+                status: NtStatus::STATUS_SUCCESS.0,
+                _pad: 0,
+                information: bytes_written as u64,
+            };
+            unsafe {
+                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+            }
+        }
+        NtStatus::STATUS_SUCCESS
+    } else {
+        if reserved > 0 {
+            position.fetch_sub(reserved, Relaxed);
+        }
+        NtStatus::STATUS_ACCESS_DENIED
     }
 }
 
@@ -955,9 +1092,8 @@ pub(crate) fn nt_query_information_file(
 
     let info_class = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const u32) };
 
-    let obj = match handles.get(file_handle) {
-        Some(obj) => obj,
-        None => return NtStatus::STATUS_INVALID_HANDLE,
+    let Some(obj) = handles.get(file_handle) else {
+        return NtStatus::STATUS_INVALID_HANDLE;
     };
 
     match obj {
@@ -1118,9 +1254,8 @@ pub(crate) fn nt_set_information_file(
 
     let info_class = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const u32) };
 
-    let obj = match handles.get(file_handle) {
-        Some(obj) => obj,
-        None => return NtStatus::STATUS_INVALID_HANDLE,
+    let Some(obj) = handles.get(file_handle) else {
+        return NtStatus::STATUS_INVALID_HANDLE;
     };
 
     match obj {
@@ -1184,14 +1319,12 @@ pub(crate) fn nt_query_attributes_file(ctx: &mut super::super::ExecutionContext)
     }
 
     let obj_attr = unsafe { core::ptr::read(obj_attr_ptr as *const ObjectAttributes) };
-    let nt_path = match read_unicode_string_from_guest(obj_attr.object_name as usize) {
-        Some(p) => p,
-        None => return NtStatus::STATUS_OBJECT_NAME_INVALID,
+    let Some(nt_path) = read_unicode_string_from_guest(obj_attr.object_name as usize) else {
+        return NtStatus::STATUS_OBJECT_NAME_INVALID;
     };
 
-    let host_path = match translate_nt_path(&nt_path) {
-        Some(p) => p,
-        None => return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND,
+    let Some(host_path) = translate_nt_path(&nt_path) else {
+        return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
     };
 
     // Use GetFileAttributesW which works for both files and directories
@@ -1217,7 +1350,13 @@ pub(crate) fn nt_query_attributes_file(ctx: &mut super::super::ExecutionContext)
             0x01 | 0x02 | 0x04, // FILE_SHARE_READ | WRITE | DELETE
             open_flags,
         );
-        let info = if handle != host::INVALID_HANDLE {
+        let info = if handle == host::INVALID_HANDLE {
+            // Fallback: at least return the attributes from GetFileAttributesW.
+            FileBasicInformation {
+                file_attributes: attrs,
+                ..FileBasicInformation::default()
+            }
+        } else {
             let result = if let Some((a, ctime, atime, wtime, chtime)) = host::get_file_info(handle)
             {
                 FileBasicInformation {
@@ -1244,12 +1383,6 @@ pub(crate) fn nt_query_attributes_file(ctx: &mut super::super::ExecutionContext)
                 }
             }
             result
-        } else {
-            // Fallback: at least return the attributes from GetFileAttributesW.
-            FileBasicInformation {
-                file_attributes: attrs,
-                ..FileBasicInformation::default()
-            }
         };
         unsafe {
             core::ptr::write(info_ptr as *mut FileBasicInformation, info);
@@ -1415,12 +1548,9 @@ pub(crate) fn nt_query_directory_file(
     {
         // Restart scan or first call — (re)populate from host filesystem.
         if restart_scan || enum_entries.is_empty() {
-            let host_dir = match translate_nt_path(path) {
-                Some(p) => p,
-                None => {
-                    write_iosb(io_status_ptr, NtStatus::STATUS_OBJECT_PATH_NOT_FOUND, 0);
-                    return NtStatus::STATUS_OBJECT_PATH_NOT_FOUND;
-                }
+            let Some(host_dir) = translate_nt_path(path) else {
+                write_iosb(io_status_ptr, NtStatus::STATUS_OBJECT_PATH_NOT_FOUND, 0);
+                return NtStatus::STATUS_OBJECT_PATH_NOT_FOUND;
             };
 
             let filter = if filename_ptr != 0 {
@@ -1430,9 +1560,9 @@ pub(crate) fn nt_query_directory_file(
             };
 
             let search_pattern = if let Some(ref f) = filter {
-                alloc::format!("{}\\{}", host_dir, f)
+                alloc::format!("{host_dir}\\{f}")
             } else {
-                alloc::format!("{}\\*", host_dir)
+                alloc::format!("{host_dir}\\*")
             };
 
             let host_entries = host::find_files(&search_pattern);
@@ -1512,7 +1642,7 @@ pub(crate) fn nt_query_directory_file(
                     // by hashing the filename (FNV-1a).
                     let file_id = {
                         let mut h: u64 = 0xcbf29ce484222325;
-                        for w in name_u16.iter() {
+                        for w in &name_u16 {
                             let bytes = w.to_le_bytes();
                             for &b in &bytes {
                                 h ^= b as u64;
@@ -1577,5 +1707,341 @@ pub(crate) fn nt_query_directory_file(
     } else {
         write_iosb(io_status_ptr, NtStatus::STATUS_INVALID_HANDLE, 0);
         NtStatus::STATUS_INVALID_HANDLE
+    }
+}
+
+// ========================================================================
+// NtOpenFile
+// ========================================================================
+
+/// NtOpenFile — open an existing file.
+///
+/// NT signature:
+/// ```text
+/// NTSTATUS NtOpenFile(
+///     PHANDLE FileHandle,                 // r10 (out)
+///     ACCESS_MASK DesiredAccess,           // rdx
+///     POBJECT_ATTRIBUTES ObjectAttributes, // r8
+///     PIO_STATUS_BLOCK IoStatusBlock,      // r9
+///     ULONG ShareAccess,                  // [rsp+0x28]
+///     ULONG OpenOptions                   // [rsp+0x30]
+/// );
+/// ```
+///
+/// During ntdll-driven initialization, ntdll's loader calls NtOpenFile to
+/// open DLL files. We first check the tar archive (dll_tar_files) and
+/// return a `MemoryFile` handle if found; otherwise fall back to the host.
+pub(crate) fn nt_open_file(
+    ctx: &mut super::super::ExecutionContext,
+    handles: &mut HandleTable,
+    dll_tar_files: &std::sync::Mutex<
+        Option<alloc::collections::BTreeMap<alloc::string::String, alloc::vec::Vec<u8>>>,
+    >,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let handle_out_ptr = args.arg0;
+    let _desired_access = args.arg1 as u32;
+    let obj_attr_ptr = args.arg2;
+    let io_status_ptr = args.arg3;
+
+    // Stack arguments.
+    let share_access = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const u32) };
+    let open_options = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
+
+    if handle_out_ptr == 0 || obj_attr_ptr == 0 {
+        return NtStatus::STATUS_INVALID_PARAMETER;
+    }
+
+    // Read OBJECT_ATTRIBUTES from guest memory.
+    let obj_attr = unsafe { core::ptr::read(obj_attr_ptr as *const ObjectAttributes) };
+
+    // Read the path from UNICODE_STRING.
+    let Some(nt_path) = read_unicode_string_from_guest(obj_attr.object_name as usize) else {
+        return NtStatus::STATUS_OBJECT_NAME_INVALID;
+    };
+
+    #[cfg(debug_assertions)]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        let msg = alloc::format!("NT shim: NtOpenFile path={nt_path:?}\n");
+        litebox_platform_multiplex::platform().debug_log_print(&msg);
+    }
+
+    // Extract the filename (last path component) for tar lookup.
+    let filename = nt_path
+        .rsplit('\\')
+        .next()
+        .unwrap_or(&nt_path)
+        .to_ascii_lowercase();
+
+    // Check if the file is available in the DLL tar archive.
+    let tar_data = {
+        let tar_guard = dll_tar_files.lock().unwrap();
+        if let Some(ref files) = *tar_guard {
+            files.get(&filename).cloned()
+        } else {
+            None
+        }
+    };
+
+    if let Some(data) = tar_data {
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            let msg = alloc::format!(
+                "NT shim: NtOpenFile serving '{}' from tar ({} bytes)\n",
+                filename,
+                data.len()
+            );
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
+        }
+
+        let handle = handles.insert(NtObject::MemoryFile {
+            path: nt_path,
+            data: Arc::new(data),
+            position: Arc::new(AtomicU64::new(0)),
+        });
+        unsafe {
+            core::ptr::write(handle_out_ptr as *mut u32, handle);
+        }
+        if io_status_ptr != 0 {
+            let iosb = IoStatusBlock {
+                status: NtStatus::STATUS_SUCCESS.0,
+                _pad: 0,
+                information: 1, // FILE_OPENED
+            };
+            unsafe {
+                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+            }
+        }
+        return NtStatus::STATUS_SUCCESS;
+    }
+
+    // Not in tar — check if it's a directory open.
+    let is_directory = open_options & file_options::FILE_DIRECTORY_FILE != 0;
+
+    // Translate NT path to host path.
+    let Some(host_path) = translate_nt_path(&nt_path) else {
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            let msg = alloc::format!("NT shim: NtOpenFile path not translatable: {nt_path:?}\n");
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
+        }
+        return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
+    };
+
+    if is_directory {
+        let attrs = host::get_file_attributes(&host_path);
+        if attrs == host::INVALID_FILE_ATTRIBUTES || attrs & host::FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        let handle = handles.insert(NtObject::Directory {
+            path: nt_path,
+            enum_entries: alloc::vec::Vec::new(),
+            enum_index: 0,
+        });
+        unsafe {
+            core::ptr::write(handle_out_ptr as *mut u32, handle);
+        }
+        if io_status_ptr != 0 {
+            let iosb = IoStatusBlock {
+                status: NtStatus::STATUS_SUCCESS.0,
+                _pad: 0,
+                information: 1, // FILE_OPENED
+            };
+            unsafe {
+                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+            }
+        }
+        return NtStatus::STATUS_SUCCESS;
+    }
+
+    // Open as a regular file via host pass-through.
+    let host_handle = host::open_file(
+        &host_path,
+        true,  // read access
+        false, // no write
+        3,     // OPEN_EXISTING
+        share_access,
+        0x80, // FILE_ATTRIBUTE_NORMAL
+    );
+
+    if host_handle == host::INVALID_HANDLE {
+        let win_err = host::get_last_error();
+        return map_win32_error_to_ntstatus(win_err);
+    }
+
+    let handle = handles.insert(NtObject::File {
+        path: nt_path,
+        host_handle,
+        position: Arc::new(AtomicU64::new(0)),
+    });
+    unsafe {
+        core::ptr::write(handle_out_ptr as *mut u32, handle);
+    }
+    if io_status_ptr != 0 {
+        let iosb = IoStatusBlock {
+            status: NtStatus::STATUS_SUCCESS.0,
+            _pad: 0,
+            information: 1, // FILE_OPENED
+        };
+        unsafe {
+            core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+        }
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
+// ========================================================================
+// NtReadFile for MemoryFile handles
+// ========================================================================
+
+/// NtReadFile — read from an in-memory file (DLLs served from tar).
+pub(crate) fn nt_read_file_memory(
+    ctx: &mut super::super::ExecutionContext,
+    data: &[u8],
+    position: &Arc<AtomicU64>,
+) -> NtStatus {
+    // Stack arguments (same layout as NtReadFile for host files).
+    let io_status_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+    let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
+    let length = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
+    let byte_offset_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x40) as *const usize) };
+
+    if buffer_ptr == 0 || length == 0 {
+        return NtStatus::STATUS_INVALID_PARAMETER;
+    }
+
+    // Determine read offset.
+    let offset = if byte_offset_ptr != 0 {
+        let off = unsafe { core::ptr::read(byte_offset_ptr as *const i64) };
+        if off >= 0 {
+            off as u64
+        } else {
+            position.load(Relaxed)
+        }
+    } else {
+        position.load(Relaxed)
+    };
+
+    let file_len = data.len() as u64;
+    if offset >= file_len {
+        // At or past EOF.
+        if io_status_ptr != 0 {
+            let iosb = IoStatusBlock {
+                status: NtStatus::STATUS_END_OF_FILE.0,
+                _pad: 0,
+                information: 0,
+            };
+            unsafe {
+                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+            }
+        }
+        return NtStatus::STATUS_END_OF_FILE;
+    }
+
+    let avail = (file_len - offset) as usize;
+    let to_read = (length as usize).min(avail);
+
+    // Copy data to guest buffer.
+    let src = &data[offset as usize..offset as usize + to_read];
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), buffer_ptr as *mut u8, to_read);
+    }
+
+    // Update position.
+    position.store(offset + to_read as u64, Relaxed);
+
+    if io_status_ptr != 0 {
+        let iosb = IoStatusBlock {
+            status: NtStatus::STATUS_SUCCESS.0,
+            _pad: 0,
+            information: to_read as u64,
+        };
+        unsafe {
+            core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+        }
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
+/// NtQueryInformationFile for MemoryFile handles.
+pub(crate) fn nt_query_information_file_memory(
+    ctx: &mut super::super::ExecutionContext,
+    data_len: u64,
+    position: &Arc<AtomicU64>,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let io_status_ptr = args.arg1;
+
+    // Stack args for NtQueryInformationFile.
+    let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+    let buffer_len = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
+    let info_class = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
+
+    match info_class {
+        // FileStandardInformation (5)
+        5 => {
+            if buffer_len < core::mem::size_of::<FileStandardInformation>() as u32 {
+                return NtStatus::STATUS_BUFFER_TOO_SMALL;
+            }
+            let info = FileStandardInformation {
+                allocation_size: data_len as i64,
+                end_of_file: data_len as i64,
+                number_of_links: 1,
+                delete_pending: 0,
+                directory: 0,
+                _pad: [0; 2],
+            };
+            unsafe {
+                core::ptr::write(buffer_ptr as *mut FileStandardInformation, info);
+            }
+            if io_status_ptr != 0 {
+                let iosb = IoStatusBlock {
+                    status: NtStatus::STATUS_SUCCESS.0,
+                    _pad: 0,
+                    information: core::mem::size_of::<FileStandardInformation>() as u64,
+                };
+                unsafe {
+                    core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        // FilePositionInformation (14)
+        14 => {
+            if buffer_len < core::mem::size_of::<FilePositionInformation>() as u32 {
+                return NtStatus::STATUS_BUFFER_TOO_SMALL;
+            }
+            let info = FilePositionInformation {
+                current_byte_offset: position.load(Relaxed) as i64,
+            };
+            unsafe {
+                core::ptr::write(buffer_ptr as *mut FilePositionInformation, info);
+            }
+            if io_status_ptr != 0 {
+                let iosb = IoStatusBlock {
+                    status: NtStatus::STATUS_SUCCESS.0,
+                    _pad: 0,
+                    information: core::mem::size_of::<FilePositionInformation>() as u64,
+                };
+                unsafe {
+                    core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        other => {
+            #[cfg(debug_assertions)]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                let msg = alloc::format!(
+                    "NT shim: NtQueryInformationFile(MemoryFile) unhandled class {other}\n"
+                );
+                litebox_platform_multiplex::platform().debug_log_print(&msg);
+            }
+            NtStatus::STATUS_NOT_IMPLEMENTED
+        }
     }
 }

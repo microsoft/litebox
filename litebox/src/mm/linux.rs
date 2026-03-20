@@ -588,9 +588,17 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             })?;
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
+        // When the platform returns an address outside the managed VA range
+        // (e.g., VirtualAlloc chose a different location because the hinted
+        // address was occupied by the host), free the allocation and report
+        // out-of-memory instead of recording a VMA at an invalid address.
+        if new_start < self.addr_min || new_end > self.addr_max {
+            unsafe {
+                let _ = self.platform.deallocate_pages(new_start..new_end);
+            }
+            return Err(AllocationError::OutOfMemory);
+        }
         self.vmas.insert(new_start..new_end, vma);
-        debug_assert!(new_start >= self.addr_min);
-        debug_assert!(new_end <= self.addr_max);
         Ok(ret)
     }
 
