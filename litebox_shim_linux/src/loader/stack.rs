@@ -159,11 +159,14 @@ impl UserStack {
     }
 
     /// Initialize the stack for the new process.
+    ///
+    /// `exec_filename` is the pathname passed to execve, used for `AT_EXECFN`.
     pub(super) fn init(
         &mut self,
         argv: Vec<CString>,
         env: Vec<CString>,
         mut aux: BTreeMap<AuxKey, usize>,
+        exec_filename: Option<&CString>,
     ) -> Option<()> {
         // end markers
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
@@ -172,6 +175,29 @@ impl UserStack {
 
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;
+
+        // Push the AT_EXECFN string (exec pathname, not argv[0]).
+        if let Some(filename) = exec_filename {
+            self.push_cstring(filename)?;
+            aux.insert(AuxKey::AT_EXECFN, self.stack_top.as_usize() + self.pos);
+        }
+
+        // Push the AT_PLATFORM string identifying the CPU architecture.
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.push_bytes(b"x86_64\0")?;
+            aux.insert(AuxKey::AT_PLATFORM, self.stack_top.as_usize() + self.pos);
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            self.push_bytes(b"i686\0")?;
+            aux.insert(AuxKey::AT_PLATFORM, self.stack_top.as_usize() + self.pos);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.push_bytes(b"aarch64\0")?;
+            aux.insert(AuxKey::AT_PLATFORM, self.stack_top.as_usize() + self.pos);
+        }
 
         // TODO: generate a random value
         self.push_bytes(&[

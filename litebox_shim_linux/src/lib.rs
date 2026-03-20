@@ -341,10 +341,12 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 deferred_vfork_park: Cell::new(false),
             },
         };
+        let exec_filename = alloc::ffi::CString::new(path).ok();
         entrypoints.task.load_program(
             loader::elf::ElfLoader::new(&entrypoints.task, path)?,
             argv,
             envp,
+            exec_filename.as_ref(),
         )?;
         *entrypoints.task.fs.borrow().exe_path.write() = entrypoints.task.resolve_exe_path(path);
         let process = LinuxShimProcess(entrypoints.task.process().clone());

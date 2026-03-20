@@ -78,6 +78,15 @@ impl<FS: ShimFS> Task<FS> {
         aux.insert(AuxKey::AT_GID, user_info.gid as usize);
         aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
 
+        // AT_SECURE: not a setuid/setgid process.
+        aux.insert(AuxKey::AT_SECURE, 0);
+
+        // AT_CLKTCK: USER_HZ (100 on Linux).
+        aux.insert(AuxKey::AT_CLKTCK, 100);
+
+        // AT_FLAGS: always 0 on Linux.
+        aux.insert(AuxKey::AT_FLAGS, 0);
+
         if let Some(vdso_base) = self.global.platform.get_vdso_address() {
             aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
         }

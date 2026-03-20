@@ -11,7 +11,7 @@
 #   1. Build the runner:
 #        cargo build --release -p litebox_runner_linux_userland
 #   2. Create the tar (only needed once, or when copilot is updated):
-#        ./dev_tools/create_tar_for_copilot_cli.sh
+#        ./dev_tools/create_tar_for_copilot.sh
 #   3. Set up TUN networking:
 #        sudo ./dev_tools/setup_tun_nat.sh up
 #   4. Start the 9P file broker (in a separate terminal):
@@ -27,6 +27,7 @@ TAR="${COPILOT_TAR:-/tmp/copilot_ustar.tar}"
 TUN_DEVICE="${TUN_DEVICE:-tun99}"
 BROKER_ADDR="${BROKER_ADDR:-10.0.0.1:5640}"
 CWD="${SANDBOX_CWD:-$(pwd)}"
+SANDBOX_HOME="${SANDBOX_HOME:-$HOME}"
 
 # Find copilot binary (used as the in-tar program path)
 COPILOT_BIN="$(which copilot 2>/dev/null || true)"
@@ -43,7 +44,7 @@ fi
 
 if [ ! -f "$TAR" ]; then
     echo "Error: tar not found at $TAR" >&2
-    echo "Run: ./dev_tools/create_tar_for_copilot_cli.sh" >&2
+    echo "Run: ./dev_tools/create_tar_for_copilot.sh" >&2
     exit 1
 fi
 
@@ -52,8 +53,8 @@ fi
   --tun-device-name "$TUN_DEVICE" \
   --nine-p-broker "$BROKER_ADDR" \
   --cwd "$CWD" \
-  --env HOME=$HOME \
-  --env COPILOT_DATA_DIR=/tmp/.copilot \
+  --env HOME=$SANDBOX_HOME \
+  --env COPILOT_DATA_DIR=$SANDBOX_HOME/.copilot \
   --env COPILOT_RUN_APP=1 \
   --env SHELL=/bin/bash \
   --env "PATH=/tmp/litebox-bin:${PATH:-/usr/local/bin:/usr/bin:/bin}" \

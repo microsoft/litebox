@@ -1014,6 +1014,7 @@ impl<FS: ShimFS> Task<FS> {
                 | Signal::SIGBUS
                 | Signal::SIGFPE
                 | Signal::SIGILL
+                | Signal::SIGTRAP
         ));
 
         self.signals

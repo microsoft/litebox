@@ -1,11 +1,12 @@
 #!/bin/bash
 # Create a tar archive for running GitHub Copilot CLI inside the litebox sandbox.
 #
-# Usage: ./dev_tools/create_tar_for_copilot.sh [-o output.tar] [--ipc]
+# Usage: ./dev_tools/create_tar_for_copilot.sh [-o output.tar] [--ipc] [--home DIR]
 #
 # Options:
-#   -o FILE   Output tar path (default: /tmp/copilot_ustar.tar)
-#   --ipc     Use IPC network proxy (DNS via 8.8.8.8 instead of TUN gateway)
+#   -o FILE     Output tar path (default: /tmp/copilot_ustar.tar)
+#   --ipc       Use IPC network proxy (DNS via 8.8.8.8 instead of TUN gateway)
+#   --home DIR  Home directory path inside the sandbox (default: $HOME)
 #
 # Prerequisites:
 #   - Build the packager: cargo build --release -p litebox_packager
@@ -18,11 +19,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PACKAGER="$REPO_ROOT/target/release/litebox_packager"
 OUTPUT="/tmp/copilot_ustar.tar"
 USE_IPC=false
+SANDBOX_HOME="${SANDBOX_HOME:-$HOME}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -o)       OUTPUT="$2"; shift 2 ;;
         --ipc)    USE_IPC=true; shift ;;
+        --home)   SANDBOX_HOME="$2"; shift 2 ;;
         *)        echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -54,24 +57,32 @@ fi
 COPILOT_CONFIG_DIR="${COPILOT_DATA_DIR:-$HOME/.copilot}"
 
 # --- Locate or extract copilot JS package ---
-# The native copilot launcher extracts its JS bundle to a cache directory.
-# Respect the same env vars copilot uses: XDG_CACHE_HOME, then ~/.cache.
-USER_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/copilot"
+# The native copilot launcher extracts its JS bundle into ~/.copilot/pkg.
+# Also check the legacy XDG_CACHE_HOME location for older versions.
+COPILOT_DATA="${COPILOT_DATA_DIR:-$HOME/.copilot}"
+LEGACY_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/copilot"
 STAGING_DIR=""
 
-if [ -d "$USER_CACHE_DIR/pkg" ]; then
-    # Packages already extracted in the user's cache — use them directly.
-    COPILOT_CACHE_DIR="$USER_CACHE_DIR"
+if [ -d "$COPILOT_DATA/pkg" ]; then
+    COPILOT_CACHE_DIR="$COPILOT_DATA"
     echo "Using cached packages: $COPILOT_CACHE_DIR/pkg"
+elif [ -d "$LEGACY_CACHE_DIR/pkg" ]; then
+    COPILOT_CACHE_DIR="$LEGACY_CACHE_DIR"
+    echo "Using cached packages (legacy path): $COPILOT_CACHE_DIR/pkg"
 else
     # Run copilot --help with a temp HOME to trigger package extraction.
     STAGING_DIR="$(mktemp -d)"
     echo "Extracting copilot packages to staging dir..."
     HOME="$STAGING_DIR" "$COPILOT_BIN" --help >/dev/null 2>&1 || true
-    COPILOT_CACHE_DIR="$STAGING_DIR/.cache/copilot"
-    if [ ! -d "$COPILOT_CACHE_DIR/pkg" ]; then
+    # Check both possible extraction paths.
+    if [ -d "$STAGING_DIR/.copilot/pkg" ]; then
+        COPILOT_CACHE_DIR="$STAGING_DIR/.copilot"
+    elif [ -d "$STAGING_DIR/.cache/copilot/pkg" ]; then
+        COPILOT_CACHE_DIR="$STAGING_DIR/.cache/copilot"
+    else
         echo "Error: copilot package extraction failed" >&2
-        echo "Expected packages at $COPILOT_CACHE_DIR/pkg" >&2
+        echo "Checked: $STAGING_DIR/.copilot/pkg" >&2
+        echo "Checked: $STAGING_DIR/.cache/copilot/pkg" >&2
         rm -rf "$STAGING_DIR"
         exit 1
     fi
@@ -224,18 +235,23 @@ ARGS+=(--include "/etc/gai.conf:etc/gai.conf")
 # SSL CA certificates
 ARGS+=(--include "/etc/ssl/certs/ca-certificates.crt:etc/ssl/certs/ca-certificates.crt")
 
+# Home-relative paths: place config and cached packages under the real $HOME
+# so the sandbox can use HOME=$HOME without extra env overrides.
+TAR_HOME="${SANDBOX_HOME#/}"
+
 # GitHub CLI auth
-ARGS+=(--include "$GH_HOSTS:tmp/.config/gh/hosts.yml")
+ARGS+=(--include "$GH_HOSTS:$TAR_HOME/.config/gh/hosts.yml")
 
 # Copilot config (auth tokens, model preferences, trusted folders)
 if [ -f "$COPILOT_CONFIG_DIR/config.json" ]; then
-    ARGS+=(--include "$COPILOT_CONFIG_DIR/config.json:tmp/.copilot/config.json")
+    ARGS+=(--include "$COPILOT_CONFIG_DIR/config.json:$TAR_HOME/.copilot/config.json")
 fi
 
 # Copilot package tree (JS, WASM, native .node modules, ripgrep, etc.)
+# Place under $HOME/.cache/copilot/ matching the XDG_CACHE_HOME default.
 while IFS= read -r -d '' file; do
     rel="${file#$COPILOT_CACHE_DIR/}"
-    ARGS+=(--include "$file:tmp/.cache/copilot/$rel")
+    ARGS+=(--include "$file:$TAR_HOME/.cache/copilot/$rel")
 done < <(find "$COPILOT_PKG_DIR" -type f -print0)
 
 # Native .node modules and bundled ELF tools under the Copilot package tree are

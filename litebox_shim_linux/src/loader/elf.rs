@@ -203,6 +203,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         argv: Vec<CString>,
         envp: Vec<CString>,
         mut aux: AuxVec,
+        exec_filename: Option<&CString>,
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let global = &self.main.file.task.global;
         let process_state = self.main.file.task.process_state.borrow();
@@ -264,7 +265,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         let mut stack = UserStack::new(sp, super::DEFAULT_STACK_SIZE)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
         stack
-            .init(argv, envp, aux)
+            .init(argv, envp, aux, exec_filename)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ElfLoadInfo {

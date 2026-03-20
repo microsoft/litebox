@@ -2842,7 +2842,7 @@ impl<FS: ShimFS> Task<FS> {
             ctx.xgs.truncate(),
         );
 
-        match self.load_program(loader, argv_vec, envp_vec) {
+        match self.load_program(loader, argv_vec, envp_vec, Some(&path_cstr)) {
             Ok(()) => {
                 // Update /proc/self/exe to point to the new executable.
                 *self.fs.borrow().exe_path.write() = self.resolve_exe_path(&path);
@@ -2886,12 +2886,13 @@ impl<FS: ShimFS> Task<FS> {
         mut loader: crate::loader::elf::ElfLoader<'_, FS>,
         argv: Vec<alloc::ffi::CString>,
         mut envp: Vec<alloc::ffi::CString>,
+        exec_filename: Option<&alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
         if let Some(filter) = self.global.load_filter {
             filter(&mut envp);
         }
 
-        let load_info = loader.load(argv, envp, self.init_auxv())?;
+        let load_info = loader.load(argv, envp, self.init_auxv(), exec_filename)?;
 
         self.set_task_comm(loader.comm());
 
