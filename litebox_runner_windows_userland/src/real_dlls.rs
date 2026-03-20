@@ -58,6 +58,8 @@ pub struct NtdllInitLoadResult {
     pub syscall_map: litebox_common_windows::NtSyscallMap,
     /// Syscall number → export name for stubs not in NtSyscallId (for debug logging).
     pub unhandled_stubs: Vec<(u32, String)>,
+    /// RVA of KiUserExceptionDispatcher in ntdll (for SEH dispatch).
+    pub ki_user_exception_dispatcher_rva: Option<usize>,
 }
 
 /// Load only ntdll.dll from the tar for the ntdll-driven init approach.
@@ -193,6 +195,12 @@ pub fn load_ntdll_for_init(
          RtlUserThreadStart at 0x{rtl_user_thread_start_va:X}"
     );
 
+    // Also look up KiUserExceptionDispatcher for SEH dispatch.
+    let ki_user_exception_dispatcher_rva = exports
+        .iter()
+        .find(|e| e.name == Some("KiUserExceptionDispatcher"))
+        .map(|e| e.rva as usize);
+
     let ntdll = LoadedDll {
         name: String::from("ntdll.dll"),
         base_address: info.image_base,
@@ -218,6 +226,7 @@ pub fn load_ntdll_for_init(
         rtl_user_thread_start_va,
         syscall_map: rewrite.syscall_map,
         unhandled_stubs: rewrite.unhandled_stubs,
+        ki_user_exception_dispatcher_rva,
     })
 }
 

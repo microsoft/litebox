@@ -227,6 +227,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         syscall_map: Option<litebox_common_windows::NtSyscallMap>,
         /// Unhandled stub names for debug logging of unknown syscalls.
         unhandled_stubs: Vec<(u32, String)>,
+        /// RVA of KiUserExceptionDispatcher in ntdll for SEH dispatch.
+        ki_user_exception_dispatcher_rva: Option<usize>,
     }
 
     let mut mapper = PageManagerMapper {
@@ -383,6 +385,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             dll_tar_files: Some(tar_files),
             syscall_map: Some(result.syscall_map),
             unhandled_stubs: result.unhandled_stubs,
+            ki_user_exception_dispatcher_rva: result.ki_user_exception_dispatcher_rva,
         }
     } else {
         // ── Stub DLL path (original) ───────────────────────────────
@@ -770,6 +773,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             dll_tar_files: None,
             syscall_map: Some(litebox_common_windows::NtSyscallMap::identity()),
             unhandled_stubs: Vec::new(),
+            ki_user_exception_dispatcher_rva: None,
         }
     }; // end if real_dlls / else
 
@@ -1049,12 +1053,22 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         exe_path: exe_full_path,
         initial_rcx: context_ptr_arg,
         initial_rdx: ntdll_base_arg,
+        ki_user_exception_dispatcher_rva: load_result.ki_user_exception_dispatcher_rva,
     });
 
     // Pass tar files to the shim so it can serve DLLs via NtOpenFile.
     if let Some(tar_files) = load_result.dll_tar_files {
         shim.set_dll_tar_files(tar_files);
     }
+
+    // Capture NLS data from host and pass to shim (so shim doesn't call host APIs).
+    if let Some(nls) = capture_host_nls_data() {
+        shim.set_nls_data(nls);
+    }
+
+    // Create litebox core VFS and pass to shim for file I/O.
+    // TODO: wire up VFS creation with proper tar data and EXE seeding.
+    // For now, file I/O falls through to host passthrough when fs is None.
 
     // Attach the network stack to the shim for WinSock syscall dispatch.
     if let Some(ref net_arc) = net {
@@ -1615,4 +1629,61 @@ fn start_network_worker(
         .expect("failed to spawn network worker thread");
 
     Some(handle)
+}
+
+/// Capture NLS data from the host's real ntdll so the shim doesn't need to
+/// call host APIs (GetModuleHandleA, GetProcAddress, VirtualQuery) at runtime.
+fn capture_host_nls_data() -> Option<litebox_shim_windows::NlsData> {
+    type NtInitNlsFn = unsafe extern "system" fn(*mut *mut u8, *mut u32, *mut i64) -> i32;
+
+    unsafe extern "system" {
+        fn GetModuleHandleA(name: *const u8) -> *mut core::ffi::c_void;
+        fn GetProcAddress(
+            module: *mut core::ffi::c_void,
+            name: *const u8,
+        ) -> *mut core::ffi::c_void;
+        fn VirtualQuery(addr: *const u8, info: *mut u8, len: usize) -> usize;
+    }
+
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        if ntdll.is_null() {
+            return None;
+        }
+        let proc = GetProcAddress(ntdll, c"NtInitializeNlsFiles".as_ptr().cast());
+        if proc.is_null() {
+            return None;
+        }
+        let func: NtInitNlsFn = core::mem::transmute(proc);
+        let mut base: *mut u8 = core::ptr::null_mut();
+        let mut locale: u32 = 0;
+        let mut casing: i64 = 0;
+        let status = func(&mut base, &mut locale, &mut casing);
+        if status != 0 || base.is_null() {
+            return None;
+        }
+        // Query section size via VirtualQuery (MEMORY_BASIC_INFORMATION).
+        #[repr(C)]
+        struct Mbi {
+            base_address: usize,
+            alloc_base: usize,
+            alloc_protect: u32,
+            _pad0: u16,
+            _pad1: u16,
+            region_size: usize,
+            state: u32,
+            protect: u32,
+            type_: u32,
+            _pad2: u32,
+        }
+        let mut mbi = core::mem::zeroed::<Mbi>();
+        let ret = VirtualQuery(base, (&raw mut mbi).cast(), core::mem::size_of::<Mbi>());
+        let section_size = if ret != 0 { mbi.region_size } else { 0xD3000 };
+        let section = core::slice::from_raw_parts(base, section_size).to_vec();
+        Some(litebox_shim_windows::NlsData {
+            section,
+            locale_id: locale,
+            casing_size: casing,
+        })
+    }
 }

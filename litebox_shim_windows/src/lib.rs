@@ -66,11 +66,36 @@ use litebox_common_windows::stub_dlls;
 use litebox_common_windows::{NtSyscallId, NtSyscallMap};
 use litebox_platform_multiplex::Platform;
 
+/// Concrete layered filesystem type used by the NT shim.
+/// Same architecture as the Linux shim: in-memory (writable) on top of
+/// devices on top of tar read-only.
+pub type NtFS = litebox::fs::layered::FileSystem<
+    Platform,
+    litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::layered::FileSystem<
+        Platform,
+        litebox::fs::devices::FileSystem<Platform>,
+        litebox::fs::tar_ro::FileSystem<Platform>,
+    >,
+>;
+
 /// Pseudo-handle value for the current process (HANDLE)-1.
 const NT_CURRENT_PROCESS_HANDLE: usize = litebox_common_windows::NT_CURRENT_PROCESS;
 
 /// Page size for the Windows userland platform (4 KiB).
 const PAGE_SIZE: usize = 4096;
+
+/// Pre-captured NLS combined section data from the host kernel.
+/// The runner captures this once and passes it to the shim so the shim
+/// doesn't need to call host Win32 APIs (GetModuleHandleA, etc.).
+pub struct NlsData {
+    /// The combined NLS section bytes (typically ~0xD3000 = 864KB).
+    pub section: alloc::vec::Vec<u8>,
+    /// Default locale ID (e.g. 0x409 for en-US).
+    pub locale_id: u32,
+    /// Default casing table size.
+    pub casing_size: i64,
+}
 
 /// Per-process state shared across all threads in an NT guest process.
 ///
@@ -261,6 +286,11 @@ pub(crate) struct NtSharedState {
     /// ntdll-driven initialization. Keyed by lowercase filename.
     pub dll_tar_files:
         Mutex<Option<alloc::collections::BTreeMap<alloc::string::String, alloc::vec::Vec<u8>>>>,
+    /// Pre-captured NLS combined section data, locale ID, and casing size.
+    /// Set by the runner so the shim doesn't need to call host APIs.
+    pub nls_data: std::sync::OnceLock<NlsData>,
+    /// Litebox core VFS for file I/O.
+    pub fs: std::sync::OnceLock<alloc::sync::Arc<NtFS>>,
     /// Mapping from real Windows syscall numbers to `NtSyscallId`.
     /// Populated by the ntdll rewriter; used for dispatch.
     pub syscall_map: std::sync::OnceLock<NtSyscallMap>,
@@ -300,6 +330,8 @@ pub struct NtInitState {
     pub initial_rcx: Option<usize>,
     /// For ntdll-driven init: RDX value (ntdll base address).
     pub initial_rdx: Option<usize>,
+    /// RVA of KiUserExceptionDispatcher in ntdll, resolved from PE exports.
+    pub ki_user_exception_dispatcher_rva: Option<usize>,
 }
 
 /// A loaded module's name and base address for GetModuleHandleW.
@@ -340,6 +372,8 @@ impl NtShimEntrypoints {
             next_socket_id: Mutex::new(1),
             console_input_pending: Mutex::new(alloc::vec::Vec::new()),
             dll_tar_files: Mutex::new(None),
+            nls_data: std::sync::OnceLock::new(),
+            fs: std::sync::OnceLock::new(),
             syscall_map: std::sync::OnceLock::new(),
             unhandled_stubs: std::sync::OnceLock::new(),
         });
@@ -363,6 +397,16 @@ impl NtShimEntrypoints {
     /// Install unhandled stub names for debug logging of unknown syscalls.
     pub fn set_unhandled_stubs(&self, stubs: alloc::vec::Vec<(u32, alloc::string::String)>) {
         let _ = self.shared.unhandled_stubs.set(stubs);
+    }
+
+    /// Install pre-captured NLS data so the shim doesn't call host APIs.
+    pub fn set_nls_data(&self, data: NlsData) {
+        let _ = self.shared.nls_data.set(data);
+    }
+
+    /// Install the litebox core VFS for file I/O.
+    pub fn set_fs(&self, fs: alloc::sync::Arc<NtFS>) {
+        let _ = self.shared.fs.set(fs);
     }
 
     /// Create a new NT shim entrypoints for a child thread.
@@ -396,6 +440,7 @@ impl NtShimEntrypoints {
                 exe_path: parent_init.exe_path.clone(),
                 initial_rcx: None,
                 initial_rdx: None,
+                ki_user_exception_dispatcher_rva: parent_init.ki_user_exception_dispatcher_rva,
             }),
             child_thread_argument: Some(child_argument),
             fls_slots: Mutex::new([0usize; 128]),
@@ -568,6 +613,7 @@ impl NtShimEntrypoints {
                     // Read the UTF-16LE module name from guest memory,
                     // validating the pointer against the guest VA range.
                     let name = read_wide_string_bounded(
+                        &self.shared.process_state.pm,
                         module_name_va,
                         state.guest_va_start,
                         state.guest_va_end,
@@ -2525,9 +2571,9 @@ impl NtShimEntrypoints {
                     //   KeyNodeInformation:   LARGE_INTEGER + 4*ULONG = 24 bytes (+ Name)
                     //   KeyFullInformation:   LARGE_INTEGER + 9*ULONG = 44 bytes (+ Class)
                     let required: u32 = match info_class {
-                        0 => 16,                                              // KeyBasicInformation
-                        1 => 24,                                              // KeyNodeInformation
-                        2 => 44,                                              // KeyFullInformation
+                        0 => 16, // KeyBasicInformation
+                        1 => 24, // KeyNodeInformation
+                        2 => 44, // KeyFullInformation
                         _ => return (NtStatus::STATUS_INVALID_INFO_CLASS, false),
                     };
                     if result_length_ptr != 0 {
@@ -2556,146 +2602,68 @@ impl NtShimEntrypoints {
             NtSyscallId::NtInitializeNlsFiles => {
                 // NtInitializeNlsFiles(OUT PVOID *BaseAddress, OUT PLCID DefaultLocaleId,
                 //                      OUT PLARGE_INTEGER DefaultCasingTableSize)
-                // Returns the combined NLS locale section built by the kernel.
-                // We call the host's real NtInitializeNlsFiles to get the correct
-                // section data, then copy it into guest VA.
+                // Uses pre-captured NLS data from the runner (no host API calls).
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let base_addr_out = args.arg0; // PVOID*
-                let locale_id_out = args.arg1; // PLCID
-                let casing_size_out = args.arg2; // PLARGE_INTEGER (can be NULL)
+                let base_addr_out = args.arg0;
+                let locale_id_out = args.arg1;
+                let casing_size_out = args.arg2;
 
-                #[cfg(debug_assertions)]
-                {
-                    use litebox::platform::DebugLogProvider as _;
-                    let msg = alloc::format!(
-                        "NT shim: NtInitializeNlsFiles(base_out=0x{base_addr_out:X}, locale_out=0x{locale_id_out:X})\n"
-                    );
-                    litebox_platform_multiplex::platform().debug_log_print(&msg);
-                }
-
-                // Call the host's real NtInitializeNlsFiles via GetProcAddress.
-                type NtInitNlsFn =
-                    unsafe extern "system" fn(*mut *mut u8, *mut u32, *mut i64) -> i32;
-
-                let host_result: Result<(alloc::vec::Vec<u8>, u32, i64), NtStatus> = unsafe {
-                    // Get host ntdll's NtInitializeNlsFiles
-                    unsafe extern "system" {
-                        fn GetModuleHandleA(name: *const u8) -> *mut core::ffi::c_void;
-                        fn GetProcAddress(
-                            module: *mut core::ffi::c_void,
-                            name: *const u8,
-                        ) -> *mut core::ffi::c_void;
+                let Some(nls) = self.shared.nls_data.get() else {
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform()
+                            .debug_log_print("NT shim: NtInitializeNlsFiles: no NLS data set\n");
                     }
-
-                    let ntdll_mod = GetModuleHandleA(c"ntdll.dll".as_ptr().cast::<u8>());
-                    if ntdll_mod.is_null() {
-                        Err(NtStatus::STATUS_DLL_NOT_FOUND)
-                    } else {
-                        let proc = GetProcAddress(
-                            ntdll_mod,
-                            c"NtInitializeNlsFiles".as_ptr().cast::<u8>(),
-                        );
-                        if proc.is_null() {
-                            Err(NtStatus::STATUS_PROCEDURE_NOT_FOUND)
-                        } else {
-                            let func: NtInitNlsFn = core::mem::transmute(proc);
-                            let mut host_base: *mut u8 = core::ptr::null_mut();
-                            let mut host_locale: u32 = 0;
-                            let mut host_casing: i64 = 0;
-                            let status = func(&mut host_base, &mut host_locale, &mut host_casing);
-                            if status != 0 || host_base.is_null() {
-                                Err(NtStatus::from_raw(status as u32))
-                            } else {
-                                // Query the section size via VirtualQuery
-                                let mut mbi = core::mem::zeroed::<MemoryBasicInformation>();
-                                let ret = VirtualQuery(
-                                    host_base as usize,
-                                    &mut mbi,
-                                    core::mem::size_of::<MemoryBasicInformation>(),
-                                );
-                                let section_size = if ret != 0 {
-                                    mbi.region_size
-                                } else {
-                                    // Fallback: common NLS section is ~0xD3000
-                                    0xD3000
-                                };
-                                let data = core::slice::from_raw_parts(host_base, section_size);
-                                Ok((data.to_vec(), host_locale, host_casing))
-                            }
-                        }
-                    }
+                    return (NtStatus::STATUS_UNSUCCESSFUL, false);
                 };
 
-                match host_result {
-                    Ok((data, host_locale, host_casing)) => {
-                        use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
-                        use litebox::platform::RawConstPointer as _;
+                use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
+                use litebox::platform::RawConstPointer as _;
 
-                        let page_size = 4096usize;
-                        let alloc_size = (data.len() + page_size - 1) & !(page_size - 1);
-                        let nz_size =
-                            NonZeroPageSize::<4096>::new(alloc_size).expect("NLS alloc size");
+                let alloc_size = (nls.section.len() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                let nz_size =
+                    NonZeroPageSize::<PAGE_SIZE>::new(alloc_size).expect("NLS alloc size");
 
-                        let result = unsafe {
-                            self.shared.process_state.pm.create_readable_pages(
-                                None,
-                                nz_size,
-                                CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-                                |ptr| {
-                                    let dest = ptr.as_usize() as *mut u8;
-                                    core::ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
-                                    Ok(data.len())
-                                },
-                            )
-                        };
+                let data = &nls.section;
+                let result = unsafe {
+                    self.shared.process_state.pm.create_readable_pages(
+                        None,
+                        nz_size,
+                        CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                        |ptr| {
+                            let dest = ptr.as_usize() as *mut u8;
+                            core::ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
+                            Ok(data.len())
+                        },
+                    )
+                };
 
-                        match result {
-                            Ok(addr) => {
-                                let va = addr.as_usize();
-                                if base_addr_out != 0 {
-                                    unsafe {
-                                        core::ptr::write(base_addr_out as *mut u64, va as u64);
-                                    }
-                                }
-                                if locale_id_out != 0 {
-                                    unsafe {
-                                        core::ptr::write(locale_id_out as *mut u32, host_locale);
-                                    }
-                                }
-                                if casing_size_out != 0 {
-                                    unsafe {
-                                        core::ptr::write(casing_size_out as *mut i64, host_casing);
-                                    }
-                                }
-                                #[cfg(debug_assertions)]
-                                {
-                                    use litebox::platform::DebugLogProvider as _;
-                                    let msg = alloc::format!(
-                                        "NT shim: NLS InitializeNlsFiles mapped at 0x{:X} ({} bytes, locale=0x{:X})\n",
-                                        va,
-                                        data.len(),
-                                        host_locale
-                                    );
-                                    litebox_platform_multiplex::platform().debug_log_print(&msg);
-                                }
-                                (NtStatus::STATUS_SUCCESS, false)
-                            }
-                            Err(_) => (NtStatus::STATUS_NO_MEMORY, false),
+                match result {
+                    Ok(addr) => {
+                        let va = addr.as_usize();
+                        if base_addr_out != 0 {
+                            unsafe { core::ptr::write(base_addr_out as *mut u64, va as u64) }
                         }
-                    }
-                    Err(status) => {
+                        if locale_id_out != 0 {
+                            unsafe { core::ptr::write(locale_id_out as *mut u32, nls.locale_id) }
+                        }
+                        if casing_size_out != 0 {
+                            unsafe {
+                                core::ptr::write(casing_size_out as *mut i64, nls.casing_size)
+                            }
+                        }
                         #[cfg(debug_assertions)]
                         {
                             use litebox::platform::DebugLogProvider as _;
-                            litebox_platform_multiplex::platform().debug_log_print(
-                                &alloc::format!(
-                                    "NT shim: NtInitializeNlsFiles host call failed: 0x{:X}\n",
-                                    status.raw()
-                                ),
-                            );
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtInitializeNlsFiles mapped at 0x{va:X} ({} bytes, locale=0x{:X})\n",
+                                data.len(), nls.locale_id
+                            ));
                         }
-                        (status, false)
+                        (NtStatus::STATUS_SUCCESS, false)
                     }
+                    Err(_) => (NtStatus::STATUS_NO_MEMORY, false),
                 }
             }
 
@@ -2949,21 +2917,18 @@ impl NtShimEntrypoints {
                 const FRAME_SIZE: usize =
                     (EXCEPTION_RECORD_OFFSET + EXCEPTION_RECORD_SIZE + 0xF) & !0xF;
 
-                // Find ntdll base to compute KiUserExceptionDispatcher address.
-                // RVA 0x165C10 is the export address in our ntdll build.
-                const KI_USER_EXCEPTION_DISPATCHER_RVA: usize = 0x165C10;
-                let ntdll_base = self
-                    .init_state
-                    .as_ref()
-                    .and_then(|s| s.module_bases.iter().find(|m| m.name == "ntdll.dll"))
-                    .map_or(0, |m| m.base_address);
+                // Find KiUserExceptionDispatcher address from ntdll base + RVA.
+                let dispatcher_va = self.init_state.as_ref().and_then(|s| {
+                    let base = s
+                        .module_bases
+                        .iter()
+                        .find(|m| m.name == "ntdll.dll")
+                        .map(|m| m.base_address)?;
+                    let rva = s.ki_user_exception_dispatcher_rva?;
+                    Some(base + rva)
+                });
 
-                if ntdll_base == 0 {
-                    // No ntdll loaded ΓÇö can't dispatch. Return error.
-                    (NtStatus::STATUS_UNSUCCESSFUL, false)
-                } else {
-                    let dispatcher_va = ntdll_base + KI_USER_EXCEPTION_DISPATCHER_RVA;
-
+                if let Some(dispatcher_va) = dispatcher_va {
                     // Allocate frame on guest stack.
                     let new_rsp = (ctx.regs.rsp - FRAME_SIZE) & !0xF;
 
@@ -3001,6 +2966,8 @@ impl NtShimEntrypoints {
                         ));
                     }
                     (NtStatus::STATUS_SUCCESS, false)
+                } else {
+                    (NtStatus::STATUS_UNSUCCESSFUL, false)
                 }
             }
 
@@ -3459,104 +3426,28 @@ fn exception_to_ntstatus(info: &ExceptionInfo) -> NtStatus {
 /// through host memory if the guest passes a bad or unterminated pointer.
 const MAX_WIDE_STRING_CHARS: usize = 260;
 
-// ---------------------------------------------------------------------------
-// Minimal FFI for VirtualQuery ΓÇö used to probe whether guest pages are
-// committed before reading. We define the struct and extern inline to avoid
-// adding a windows-sys dependency to this no_std crate.
-// ---------------------------------------------------------------------------
-
-/// Subset of MEMORY_BASIC_INFORMATION (x86_64 layout, 48 bytes).
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-#[repr(C)]
-struct MemoryBasicInformation {
-    base_address: usize,
-    allocation_base: usize,
-    allocation_protect: u32,
-    _partition_id: u16,
-    _pad: u16,
-    region_size: usize,
-    state: u32,
-    protect: u32,
-    type_: u32,
-    _pad2: u32,
-}
-
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-unsafe extern "system" {
-    fn VirtualQuery(
-        lp_address: usize,
-        lp_buffer: *mut MemoryBasicInformation,
-        dw_length: usize,
-    ) -> usize;
-}
-
-/// Page state: committed (backed by physical storage).
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-const MEM_COMMIT: u32 = 0x1000;
-/// Page protection: no access.
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-const PAGE_NOACCESS: u32 = 0x01;
-/// Page protection modifier: guard page.
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-const PAGE_GUARD: u32 = 0x100;
-
-/// Check whether the byte range `[va, va+len)` is backed by committed,
-/// readable pages. Returns `false` for MEM_FREE, MEM_RESERVE, PAGE_NOACCESS,
-/// or PAGE_GUARD regions.
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-fn is_memory_readable(va: usize, len: usize) -> bool {
-    if len == 0 {
-        return true;
+/// Check whether the page at `va` has any permissions in the PageManager.
+/// Platform-agnostic replacement for VirtualQuery-based probing.
+fn is_page_readable(pm: &PageManager<Platform, PAGE_SIZE>, va: usize) -> bool {
+    let page_addr = va & !(PAGE_SIZE - 1);
+    if let (Some(addr), Some(size)) = (
+        litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(page_addr),
+        litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(PAGE_SIZE),
+    ) {
+        pm.get_memory_permissions(addr, size)
+            .is_some_and(|perms| !perms.is_empty())
+    } else {
+        false
     }
-    let Some(end) = va.checked_add(len) else {
-        return false;
-    };
-    let mut addr = va;
-    while addr < end {
-        let mut mbi = core::mem::MaybeUninit::<MemoryBasicInformation>::zeroed();
-        // SAFETY: mbi is a properly-sized output buffer for VirtualQuery.
-        let ret = unsafe {
-            VirtualQuery(
-                addr,
-                mbi.as_mut_ptr(),
-                core::mem::size_of::<MemoryBasicInformation>(),
-            )
-        };
-        if ret == 0 {
-            return false;
-        }
-        // SAFETY: VirtualQuery succeeded, so mbi is fully initialized.
-        let mbi = unsafe { mbi.assume_init() };
-        if mbi.state != MEM_COMMIT {
-            return false;
-        }
-        if mbi.protect == PAGE_NOACCESS || (mbi.protect & PAGE_GUARD) != 0 {
-            return false;
-        }
-        // Advance past this region.
-        let region_end = mbi.base_address + mbi.region_size;
-        addr = region_end;
-    }
-    true
-}
-
-/// Non-Windows stub: always returns false (no guest memory access possible).
-#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-fn is_memory_readable(_va: usize, _len: usize) -> bool {
-    false
 }
 
 /// Read a null-terminated UTF-16LE string from guest memory at `va`, with
-/// incremental page probing.
-///
-/// For each u16 we need to read, we ensure the containing page(s) are
-/// committed and readable via `VirtualQuery`. Probing is done lazily ΓÇö
-/// only pages actually touched are checked ΓÇö so a short string near the
-/// end of a committed region works correctly.
+/// incremental page probing via PageManager.
 ///
 /// Returns `None` if `va` is zero, outside the guest VA partition, the
 /// pages are not readable, or the string exceeds [`MAX_WIDE_STRING_CHARS`].
 fn read_wide_string_bounded(
+    pm: &PageManager<Platform, PAGE_SIZE>,
     va: usize,
     guest_va_start: usize,
     guest_va_end: usize,
@@ -3578,17 +3469,22 @@ fn read_wide_string_bounded(
         }
         // If the next u16 extends past our probed window, re-probe.
         if read_end > probed_up_to {
-            if !is_memory_readable(ptr, 2) {
+            if !is_page_readable(pm, ptr) {
                 return None;
             }
-            // VirtualQuery tells us the region extends to base + region_size.
-            // Rather than re-querying for every char, probe the remainder of
-            // this page so we amortise the syscall cost.
-            let page_end = (ptr & !0xFFF) + 0x1000;
-            probed_up_to = page_end;
+            // If the u16 straddles a page boundary, also probe the next page.
+            let next_page = (ptr & !0xFFF) + 0x1000;
+            if read_end > next_page && !is_page_readable(pm, next_page) {
+                return None;
+            }
+            // Cache probe up to the end of the last verified page.
+            probed_up_to = if read_end > next_page {
+                next_page + 0x1000
+            } else {
+                next_page
+            };
         }
-        // SAFETY: we just verified via VirtualQuery that [ptr, ptr+2) is
-        // backed by committed readable memory within the guest partition.
+        // SAFETY: PageManager confirmed the page is accessible.
         let wchar = unsafe { core::ptr::read_unaligned(ptr as *const u16) };
         if wchar == 0 {
             return Some(alloc::string::String::from_utf16_lossy(&chars));
