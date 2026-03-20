@@ -1150,7 +1150,17 @@ impl Server {
         file.read_to_end(&mut content).ok()?;
 
         // Quick ELF magic check
-        if content.len() < 4 || &content[..4] != b"\x7fELF" {
+        if content.len() < 18 || &content[..4] != b"\x7fELF" {
+            let _ = file.seek(SeekFrom::Start(0));
+            return None;
+        }
+
+        // Skip relocatable object files (.o) — they are linker input, not
+        // executable code. Patching them would corrupt the data the linker
+        // reads and can also cause panics that kill this 9P service thread.
+        let e_type = u16::from_le_bytes([content[16], content[17]]);
+        if e_type == 1 {
+            // ET_REL
             let _ = file.seek(SeekFrom::Start(0));
             return None;
         }

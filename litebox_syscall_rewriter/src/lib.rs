@@ -103,6 +103,18 @@ struct TextSectionInfo {
 ///
 /// This layout allows loaders to read just the last 32/20 bytes to get the metadata.
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    // Relocatable object files (.o) must not be patched: they are linker
+    // input, not executable code. Rewriting instructions or appending
+    // trampoline data would corrupt the object file for the linker.
+    // Check the ELF e_type field (bytes 16..18) before doing any work.
+    if input_binary.len() >= 18 {
+        let e_type = u16::from_le_bytes([input_binary[16], input_binary[17]]);
+        if e_type == 1 {
+            // ET_REL — relocatable object file
+            return Err(Error::UnsupportedObjectFile);
+        }
+    }
+
     // Make a single mutable, 8-byte-aligned copy of the input binary. This serves as both the
     // parse buffer (object::File::parse requires 8-byte alignment) and the output buffer for
     // in-place patching. We use a Vec<u64> to guarantee alignment, then view it as bytes.
