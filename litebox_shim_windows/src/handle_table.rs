@@ -40,11 +40,18 @@ pub enum NtObject {
     File {
         /// Guest-visible NT path.
         path: String,
-        /// Host file handle (Windows HANDLE as usize). 0 = invalid.
+        /// Host file handle (Windows HANDLE as usize). 0 = invalid/VFS-only.
         host_handle: usize,
         /// Shared file position (byte offset). Cloned on DuplicateHandle so
         /// both handles track the same underlying file pointer.
         position: SharedFilePosition,
+        /// VFS raw fd index into `RawDescriptorStorage`. `None` for legacy
+        /// host-only handles; `Some(idx)` for VFS-backed files.
+        raw_fd: Option<usize>,
+        /// Reference count for VFS fd. Multiple NT handles may share one VFS
+        /// fd (via DuplicateHandle). Only the last close actually closes the
+        /// VFS fd. `None` for host-only handles.
+        vfs_refcount: Option<Arc<core::sync::atomic::AtomicUsize>>,
     },
     /// A directory opened via NtCreateFile.
     Directory {
@@ -370,15 +377,33 @@ impl HandleTable {
                 path,
                 host_handle,
                 position,
+                raw_fd,
+                vfs_refcount,
             } => {
-                let new_host = duplicate_host_handle(*host_handle);
-                if new_host == 0 || new_host == usize::MAX {
-                    return None;
-                }
-                NtObject::File {
-                    path: path.clone(),
-                    host_handle: new_host,
-                    position: Arc::clone(position),
+                if raw_fd.is_some() {
+                    // VFS-backed file: share the same raw_fd and bump refcount.
+                    if let Some(rc) = vfs_refcount {
+                        rc.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    NtObject::File {
+                        path: path.clone(),
+                        host_handle: 0,
+                        position: Arc::clone(position),
+                        raw_fd: *raw_fd,
+                        vfs_refcount: vfs_refcount.clone(),
+                    }
+                } else {
+                    let new_host = duplicate_host_handle(*host_handle);
+                    if new_host == 0 || new_host == usize::MAX {
+                        return None;
+                    }
+                    NtObject::File {
+                        path: path.clone(),
+                        host_handle: new_host,
+                        position: Arc::clone(position),
+                        raw_fd: None,
+                        vfs_refcount: None,
+                    }
                 }
             }
             NtObject::Directory { path, .. } => NtObject::Directory {

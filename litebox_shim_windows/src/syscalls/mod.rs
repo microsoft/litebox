@@ -59,11 +59,45 @@ impl NtSyscallArgs {
 }
 
 /// NtClose — close a handle.
-pub(crate) fn nt_close(handles: &mut HandleTable, handle: u32) -> NtStatus {
-    if handles.close(handle).is_some() {
+pub(crate) fn nt_close(
+    handles: &mut HandleTable,
+    handle: u32,
+    shared: &crate::NtSharedState,
+) -> NtStatus {
+    if let Some(obj) = handles.close(handle) {
+        close_vfs_fd(&obj, shared);
         NtStatus::STATUS_SUCCESS
     } else {
         NtStatus::STATUS_INVALID_HANDLE
+    }
+}
+
+/// If `obj` is a VFS-backed File, decrement its refcount and close the VFS
+/// fd when the last reference is released.
+pub(crate) fn close_vfs_fd(obj: &NtObject, shared: &crate::NtSharedState) {
+    if let NtObject::File {
+        raw_fd: Some(fd),
+        vfs_refcount,
+        ..
+    } = obj
+    {
+        // If there is a refcount, only close when it reaches zero.
+        if let Some(rc) = vfs_refcount {
+            let prev = rc.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+            if prev > 1 {
+                // Other handles still reference this VFS fd.
+                return;
+            }
+        }
+        // Last reference (or no refcount) — close the fd on the filesystem
+        // and remove it from RDS.
+        let mut rds = shared.raw_fds.lock().unwrap();
+        if let Ok(typed_fd) = rds.fd_consume_raw_integer::<crate::NtFS>(*fd)
+            && let Some(fs) = shared.fs.get()
+        {
+            use litebox::fs::FileSystem as _;
+            let _ = fs.close(&typed_fd);
+        }
     }
 }
 

@@ -48,6 +48,7 @@ const SEC_IMAGE: u32 = 0x0100_0000;
 pub(crate) fn nt_create_section(
     ctx: &mut super::super::ExecutionContext,
     handles: &mut HandleTable,
+    shared: &crate::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let section_handle_ptr = args.arg0;
@@ -92,7 +93,7 @@ pub(crate) fn nt_create_section(
     }
 
     // SEC_IMAGE: read PE data from the file handle.
-    let Some(pe_data) = read_pe_from_handle(handles, file_handle) else {
+    let Some(pe_data) = read_pe_from_handle(handles, file_handle, shared) else {
         #[cfg(debug_assertions)]
         {
             use litebox::platform::DebugLogProvider as _;
@@ -147,10 +148,35 @@ pub(crate) fn nt_create_section(
     NtStatus::STATUS_SUCCESS
 }
 
-/// Read the full PE data from a file handle (MemoryFile or host File).
-fn read_pe_from_handle(handles: &HandleTable, file_handle: u32) -> Option<Vec<u8>> {
+/// Read the full PE data from a file handle (VFS, MemoryFile, or host File).
+fn read_pe_from_handle(
+    handles: &HandleTable,
+    file_handle: u32,
+    shared: &crate::NtSharedState,
+) -> Option<Vec<u8>> {
     match handles.get(file_handle)? {
         NtObject::MemoryFile { data, .. } => Some((**data).clone()),
+        NtObject::File {
+            raw_fd: Some(fd), ..
+        } => {
+            // Read from VFS.
+            let fs = shared.fs.get()?;
+            let typed_fd = {
+                let rds = shared.raw_fds.lock().unwrap();
+                rds.fd_from_raw_integer::<crate::NtFS>(*fd).ok()?
+            };
+            // Get file size via fd_file_status, then read the entire file.
+            use litebox::fs::FileSystem as _;
+            let status = fs.fd_file_status(&typed_fd).ok()?;
+            let size = status.size;
+            if size == 0 || size > 256 * 1024 * 1024 {
+                return None;
+            }
+            let mut buf = alloc::vec![0u8; size];
+            let bytes_read = fs.read(&typed_fd, &mut buf, Some(0)).ok()?;
+            buf.truncate(bytes_read);
+            Some(buf)
+        }
         NtObject::File { host_handle, .. } => {
             // Read the entire file from the host.
             read_entire_host_file(*host_handle)

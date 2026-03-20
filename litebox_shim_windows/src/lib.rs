@@ -291,6 +291,12 @@ pub(crate) struct NtSharedState {
     pub nls_data: std::sync::OnceLock<NlsData>,
     /// Litebox core VFS for file I/O.
     pub fs: std::sync::OnceLock<alloc::sync::Arc<NtFS>>,
+    /// Guest address space VA range (start..end) for pointer validation.
+    pub guest_va_start: core::sync::atomic::AtomicUsize,
+    pub guest_va_end: core::sync::atomic::AtomicUsize,
+    /// Raw descriptor storage for VFS file descriptors.
+    /// Maps raw integer fd indices to `TypedFd<NtFS>` handles.
+    pub raw_fds: Mutex<litebox::fd::RawDescriptorStorage>,
     /// Mapping from real Windows syscall numbers to `NtSyscallId`.
     /// Populated by the ntdll rewriter; used for dispatch.
     pub syscall_map: std::sync::OnceLock<NtSyscallMap>,
@@ -374,6 +380,9 @@ impl NtShimEntrypoints {
             dll_tar_files: Mutex::new(None),
             nls_data: std::sync::OnceLock::new(),
             fs: std::sync::OnceLock::new(),
+            guest_va_start: core::sync::atomic::AtomicUsize::new(0),
+            guest_va_end: core::sync::atomic::AtomicUsize::new(usize::MAX),
+            raw_fds: Mutex::new(litebox::fd::RawDescriptorStorage::new()),
             syscall_map: std::sync::OnceLock::new(),
             unhandled_stubs: std::sync::OnceLock::new(),
         });
@@ -487,6 +496,12 @@ impl NtShimEntrypoints {
                 }
             }
         }
+        self.shared
+            .guest_va_start
+            .store(state.guest_va_start, Ordering::Release);
+        self.shared
+            .guest_va_end
+            .store(state.guest_va_end, Ordering::Release);
         self.init_state = Some(state);
     }
 
@@ -612,11 +627,12 @@ impl NtShimEntrypoints {
                 } else if let Some(state) = &self.init_state {
                     // Read the UTF-16LE module name from guest memory,
                     // validating the pointer against the guest VA range.
-                    let name = read_wide_string_bounded(
+                    let name = read_wide_string_checked(
                         &self.shared.process_state.pm,
                         module_name_va,
                         state.guest_va_start,
                         state.guest_va_end,
+                        MAX_WIDE_STRING_CHARS,
                     );
                     if let Some(name) = name {
                         // Case-insensitive match against known modules.
@@ -880,6 +896,7 @@ impl NtShimEntrypoints {
                     &mut self.shared.handles.lock().unwrap(),
                     teb_va,
                     &cwd,
+                    &self.shared,
                 );
                 return (status, false);
             }
@@ -890,14 +907,14 @@ impl NtShimEntrypoints {
 
                 // Snapshot handle info under lock, then drop lock before I/O
                 // so that potentially blocking reads (UNC, pipes) don't stall
-                // the global handle table.  The close-after-validation race
-                // (another thread closing the handle mid-read) matches real
-                // Windows, where concurrent ReadFile + CloseHandle is UB.
-                // Position uses fetch_add (atomic RMW) so concurrent reads on
-                // duplicated handles don't lose increments.
+                // the global handle table.
                 enum ReadTarget {
                     File {
                         host_handle: usize,
+                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+                    },
+                    VfsFile {
+                        raw_fd: usize,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
                     },
                     Console,
@@ -905,6 +922,14 @@ impl NtShimEntrypoints {
                 let target = {
                     let handles = self.shared.handles.lock().unwrap();
                     match handles.get(h_file) {
+                        Some(crate::handle_table::NtObject::File {
+                            raw_fd: Some(fd),
+                            position,
+                            ..
+                        }) => ReadTarget::VfsFile {
+                            raw_fd: *fd,
+                            position: position.clone(),
+                        },
                         Some(crate::handle_table::NtObject::File {
                             host_handle,
                             position,
@@ -923,6 +948,15 @@ impl NtShimEntrypoints {
                 };
                 // Handle lock dropped.
                 let status = match target {
+                    ReadTarget::VfsFile { raw_fd, position } => {
+                        syscalls::k32_handlers::k32_read_file_vfs(
+                            ctx,
+                            raw_fd,
+                            &position,
+                            teb_va,
+                            &self.shared,
+                        )
+                    }
                     ReadTarget::File {
                         host_handle,
                         position,
@@ -950,6 +984,10 @@ impl NtShimEntrypoints {
                     Console {
                         is_stderr: bool,
                     },
+                    VfsFile {
+                        raw_fd: usize,
+                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+                    },
                     File {
                         host_handle: usize,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
@@ -963,6 +1001,14 @@ impl NtShimEntrypoints {
                                 is_stderr: *is_stderr,
                             }
                         }
+                        Some(crate::handle_table::NtObject::File {
+                            raw_fd: Some(fd),
+                            position,
+                            ..
+                        }) => WriteTarget::VfsFile {
+                            raw_fd: *fd,
+                            position: position.clone(),
+                        },
                         Some(crate::handle_table::NtObject::File {
                             host_handle,
                             position,
@@ -982,6 +1028,15 @@ impl NtShimEntrypoints {
                     WriteTarget::Console { is_stderr: _ } => {
                         syscalls::k32_handlers::k32_write_file_console(ctx)
                     }
+                    WriteTarget::VfsFile { raw_fd, position } => {
+                        syscalls::k32_handlers::k32_write_file_vfs(
+                            ctx,
+                            raw_fd,
+                            &position,
+                            teb_va,
+                            &self.shared,
+                        )
+                    }
                     WriteTarget::File {
                         host_handle,
                         position,
@@ -1000,6 +1055,7 @@ impl NtShimEntrypoints {
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
                     teb_va,
+                    &self.shared,
                 );
                 return (status, false);
             }
@@ -1016,6 +1072,7 @@ impl NtShimEntrypoints {
                     ctx,
                     &self.shared.handles.lock().unwrap(),
                     teb_va,
+                    &self.shared,
                 );
                 return (status, false);
             }
@@ -1025,6 +1082,7 @@ impl NtShimEntrypoints {
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
                     teb_va,
+                    &self.shared,
                 );
                 return (status, false);
             }
@@ -1034,6 +1092,7 @@ impl NtShimEntrypoints {
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
                     teb_va,
+                    &self.shared,
                 );
                 return (status, false);
             }
@@ -1134,7 +1193,11 @@ impl NtShimEntrypoints {
             }
             stub_dlls::K32_SET_CURRENT_DIRECTORY_W => {
                 let mut cwd = self.shared.current_directory.lock().unwrap();
-                let status = syscalls::k32_handlers::k32_set_current_directory_w(ctx, &mut cwd);
+                let status = syscalls::k32_handlers::k32_set_current_directory_w(
+                    ctx,
+                    &mut cwd,
+                    &self.shared,
+                );
                 return (status, false);
             }
 
@@ -1173,10 +1236,13 @@ impl NtShimEntrypoints {
             // --- File search ---
             stub_dlls::K32_FIND_FIRST_FILE_EX_W => {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
+                let cwd = self.shared.current_directory.lock().unwrap();
                 let status = syscalls::k32_handlers::k32_find_first_file_ex_w(
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
                     teb_va,
+                    &cwd,
+                    &self.shared,
                 );
                 return (status, false);
             }
@@ -1193,6 +1259,7 @@ impl NtShimEntrypoints {
                 let status = syscalls::k32_handlers::k32_find_close(
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
+                    &self.shared,
                 );
                 return (status, false);
             }
@@ -1445,6 +1512,10 @@ impl NtShimEntrypoints {
                     Console {
                         is_stderr: bool,
                     },
+                    VfsFile {
+                        raw_fd: usize,
+                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+                    },
                     File {
                         host_handle: usize,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
@@ -1460,6 +1531,14 @@ impl NtShimEntrypoints {
                             }
                         }
                         Some(crate::handle_table::NtObject::File {
+                            raw_fd: Some(fd),
+                            position,
+                            ..
+                        }) => NtWriteTarget::VfsFile {
+                            raw_fd: *fd,
+                            position: position.clone(),
+                        },
+                        Some(crate::handle_table::NtObject::File {
                             host_handle,
                             position,
                             ..
@@ -1474,6 +1553,9 @@ impl NtShimEntrypoints {
                     NtWriteTarget::Console { is_stderr } => {
                         syscalls::file::nt_write_file_console(ctx, is_stderr)
                     }
+                    NtWriteTarget::VfsFile { raw_fd, position } => {
+                        syscalls::file::nt_write_file_vfs(ctx, raw_fd, &position, &self.shared)
+                    }
                     NtWriteTarget::File {
                         host_handle,
                         position,
@@ -1484,14 +1566,20 @@ impl NtShimEntrypoints {
             }
             NtSyscallId::NtClose => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let status =
-                    syscalls::nt_close(&mut self.shared.handles.lock().unwrap(), args.arg0 as u32);
+                let status = syscalls::nt_close(
+                    &mut self.shared.handles.lock().unwrap(),
+                    args.arg0 as u32,
+                    &self.shared,
+                );
                 (status, false)
             }
             // Phase 2: File I/O
             NtSyscallId::NtCreateFile => {
-                let status =
-                    syscalls::file::nt_create_file(ctx, &mut self.shared.handles.lock().unwrap());
+                let status = syscalls::file::nt_create_file(
+                    ctx,
+                    &mut self.shared.handles.lock().unwrap(),
+                    &self.shared,
+                );
                 (status, false)
             }
             NtSyscallId::NtOpenFile => {
@@ -1499,6 +1587,7 @@ impl NtShimEntrypoints {
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
                     &self.shared.dll_tar_files,
+                    &self.shared,
                 );
                 (status, false)
             }
@@ -1508,6 +1597,10 @@ impl NtShimEntrypoints {
 
                 // Snapshot handle info under lock, drop before I/O.
                 enum NtReadTarget {
+                    VfsFile {
+                        raw_fd: usize,
+                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+                    },
                     File {
                         host_handle: usize,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
@@ -1522,6 +1615,14 @@ impl NtShimEntrypoints {
                 let target = {
                     let handles = self.shared.handles.lock().unwrap();
                     match handles.get(file_handle) {
+                        Some(crate::handle_table::NtObject::File {
+                            raw_fd: Some(fd),
+                            position,
+                            ..
+                        }) => NtReadTarget::VfsFile {
+                            raw_fd: *fd,
+                            position: position.clone(),
+                        },
                         Some(crate::handle_table::NtObject::File {
                             host_handle,
                             position,
@@ -1541,6 +1642,9 @@ impl NtShimEntrypoints {
                     }
                 };
                 let status = match target {
+                    NtReadTarget::VfsFile { raw_fd, position } => {
+                        syscalls::file::nt_read_file_vfs(ctx, raw_fd, &position, &self.shared)
+                    }
                     NtReadTarget::File {
                         host_handle,
                         position,
@@ -1576,6 +1680,7 @@ impl NtShimEntrypoints {
                     syscalls::file::nt_query_information_file(
                         ctx,
                         &self.shared.handles.lock().unwrap(),
+                        &self.shared,
                     )
                 };
                 (status, false)
@@ -1588,7 +1693,7 @@ impl NtShimEntrypoints {
                 (status, false)
             }
             NtSyscallId::NtQueryAttributesFile => {
-                let status = syscalls::file::nt_query_attributes_file(ctx);
+                let status = syscalls::file::nt_query_attributes_file(ctx, &self.shared);
                 (status, false)
             }
             // Phase 2: Memory management
@@ -1666,6 +1771,7 @@ impl NtShimEntrypoints {
                 let status = syscalls::file::nt_query_directory_file(
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
+                    &self.shared,
                 );
                 (status, false)
             }
@@ -2115,6 +2221,7 @@ impl NtShimEntrypoints {
                 let status = syscalls::section::nt_create_section(
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
+                    &self.shared,
                 );
                 (status, false)
             }
@@ -2563,9 +2670,7 @@ impl NtShimEntrypoints {
                     .unwrap()
                     .get(key_handle)
                     .is_some_and(|obj| matches!(obj, handle_table::NtObject::RegistryKey));
-                if !is_valid {
-                    (NtStatus::STATUS_INVALID_HANDLE, false)
-                } else {
+                if is_valid {
                     // Minimum fixed-header sizes per NT ABI:
                     //   KeyBasicInformation:  LARGE_INTEGER + 2*ULONG = 16 bytes (+ Name)
                     //   KeyNodeInformation:   LARGE_INTEGER + 4*ULONG = 24 bytes (+ Name)
@@ -2596,6 +2701,8 @@ impl NtShimEntrypoints {
                         }
                         (NtStatus::STATUS_SUCCESS, false)
                     }
+                } else {
+                    (NtStatus::STATUS_INVALID_HANDLE, false)
                 }
             }
 
@@ -2650,7 +2757,7 @@ impl NtShimEntrypoints {
                         }
                         if casing_size_out != 0 {
                             unsafe {
-                                core::ptr::write(casing_size_out as *mut i64, nls.casing_size)
+                                core::ptr::write(casing_size_out as *mut i64, nls.casing_size);
                             }
                         }
                         #[cfg(debug_assertions)]
@@ -3025,6 +3132,7 @@ impl NtShimEntrypoints {
                 let status = syscalls::section::nt_create_section(
                     ctx,
                     &mut self.shared.handles.lock().unwrap(),
+                    &self.shared,
                 );
                 (status, false)
             }
@@ -3428,7 +3536,7 @@ const MAX_WIDE_STRING_CHARS: usize = 260;
 
 /// Check whether the page at `va` has any permissions in the PageManager.
 /// Platform-agnostic replacement for VirtualQuery-based probing.
-fn is_page_readable(pm: &PageManager<Platform, PAGE_SIZE>, va: usize) -> bool {
+pub(crate) fn is_page_readable(pm: &PageManager<Platform, PAGE_SIZE>, va: usize) -> bool {
     let page_addr = va & !(PAGE_SIZE - 1);
     if let (Some(addr), Some(size)) = (
         litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(page_addr),
@@ -3445,12 +3553,13 @@ fn is_page_readable(pm: &PageManager<Platform, PAGE_SIZE>, va: usize) -> bool {
 /// incremental page probing via PageManager.
 ///
 /// Returns `None` if `va` is zero, outside the guest VA partition, the
-/// pages are not readable, or the string exceeds [`MAX_WIDE_STRING_CHARS`].
-fn read_wide_string_bounded(
+/// pages are not readable, or the string exceeds `max_chars`.
+pub(crate) fn read_wide_string_checked(
     pm: &PageManager<Platform, PAGE_SIZE>,
     va: usize,
     guest_va_start: usize,
     guest_va_end: usize,
+    max_chars: usize,
 ) -> Option<alloc::string::String> {
     if va == 0 || va < guest_va_start {
         return None;
@@ -3461,7 +3570,7 @@ fn read_wide_string_bounded(
     // Track the end of the currently-probed readable region.
     let mut probed_up_to: usize = va;
 
-    for _ in 0..MAX_WIDE_STRING_CHARS {
+    for _ in 0..max_chars {
         let read_end = ptr.checked_add(2)?;
         // Bounds-check against the guest partition.
         if read_end > guest_va_end {

@@ -1629,6 +1629,7 @@ pub(crate) fn k32_create_file_w(
     handles: &mut crate::handle_table::HandleTable,
     teb_va: usize,
     cwd: &str,
+    shared: &crate::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let filename_ptr = args.arg0;
@@ -1664,7 +1665,59 @@ pub(crate) fn k32_create_file_w(
     let want_read = desired_access & 0x8000_0001 != 0; // GENERIC_READ | FILE_READ_DATA
     let want_write = desired_access & 0x4000_0006 != 0; // GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA
 
-    // Pass share_mode and flags through to the host.
+    // Try VFS first.
+    if let Some(super::file::TranslatedPath::Vfs(vfs_path)) =
+        super::file::drive_path_to_vfs(&resolved)
+        && let Some(fs) = shared.fs.get()
+    {
+        // Map Win32 creation disposition to VFS OFlags.
+        // Win32 dispositions: CREATE_NEW=1, CREATE_ALWAYS=2,
+        // OPEN_EXISTING=3, OPEN_ALWAYS=4, TRUNCATE_EXISTING=5
+        let mut oflags = litebox::fs::OFlags::empty();
+        match creation_disposition {
+            3 => {} // OPEN_EXISTING — no CREAT
+            1 => oflags |= litebox::fs::OFlags::CREAT | litebox::fs::OFlags::EXCL,
+            4 => oflags |= litebox::fs::OFlags::CREAT,
+            5 => oflags |= litebox::fs::OFlags::TRUNC,
+            2 => oflags |= litebox::fs::OFlags::CREAT | litebox::fs::OFlags::TRUNC,
+            _ => {}
+        }
+        if want_write {
+            if want_read {
+                oflags |= litebox::fs::OFlags::RDWR;
+            } else {
+                oflags |= litebox::fs::OFlags::WRONLY;
+            }
+        } else {
+            oflags |= litebox::fs::OFlags::RDONLY;
+        }
+
+        use litebox::fs::FileSystem as _;
+        if let Ok(typed_fd) = fs.open(
+            &*vfs_path,
+            oflags,
+            litebox::fs::Mode::RUSR | litebox::fs::Mode::WUSR,
+        ) {
+            let raw_fd = {
+                let mut rds = shared.raw_fds.lock().unwrap();
+                rds.fd_into_raw_integer(typed_fd)
+            };
+            let nt_handle = handles.insert(crate::handle_table::NtObject::File {
+                path: resolved,
+                host_handle: 0,
+                position: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+                raw_fd: Some(raw_fd),
+                vfs_refcount: Some(alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(
+                    1,
+                ))),
+            });
+            ctx.regs.rax = nt_handle as usize;
+            return NtStatus::STATUS_SUCCESS;
+        }
+        // VFS open failed — fall through to host.
+    }
+
+    // Host fallback.
     let host_handle = super::file::host::open_file(
         &resolved,
         want_read || !want_write,
@@ -1685,6 +1738,8 @@ pub(crate) fn k32_create_file_w(
         path: resolved,
         host_handle,
         position: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+        raw_fd: None,
+        vfs_refcount: None,
     });
 
     ctx.regs.rax = nt_handle as usize;
@@ -1840,15 +1895,145 @@ pub(crate) fn k32_write_file_host(
     NtStatus::STATUS_SUCCESS
 }
 
+/// ReadFile for VFS-backed file handles. Called after handle-table lock is
+/// dropped. Uses the same Win32 argument convention as `k32_read_file_host`.
+pub(crate) fn k32_read_file_vfs(
+    ctx: &mut super::super::ExecutionContext,
+    raw_fd: usize,
+    position: &alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+    teb_va: usize,
+    shared: &crate::NtSharedState,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let buffer = args.arg1;
+    let bytes_to_read = args.arg2 as u32;
+    let bytes_read_ptr = args.arg3;
+
+    if buffer == 0 || bytes_to_read == 0 {
+        if bytes_read_ptr != 0 {
+            unsafe { core::ptr::write(bytes_read_ptr as *mut u32, 0) }
+        }
+        ctx.regs.rax = 1;
+        return NtStatus::STATUS_SUCCESS;
+    }
+
+    let Some(fs) = shared.fs.get() else {
+        set_guest_last_error(teb_va, 6); // ERROR_INVALID_HANDLE
+        ctx.regs.rax = 0;
+        return NtStatus::STATUS_SUCCESS;
+    };
+
+    let typed_fd = {
+        let rds = shared.raw_fds.lock().unwrap();
+        match rds.fd_from_raw_integer::<crate::NtFS>(raw_fd) {
+            Ok(fd) => fd,
+            Err(_) => {
+                set_guest_last_error(teb_va, 6);
+                ctx.regs.rax = 0;
+                return NtStatus::STATUS_SUCCESS;
+            }
+        }
+    };
+
+    let start = position.fetch_add(bytes_to_read as u64, Relaxed);
+    let buf = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, bytes_to_read as usize) };
+
+    use litebox::fs::FileSystem as _;
+    match fs.read(&typed_fd, buf, Some(start as usize)) {
+        Ok(read) => {
+            let over = bytes_to_read as u64 - read as u64;
+            if over > 0 {
+                position.fetch_sub(over, Relaxed);
+            }
+            if bytes_read_ptr != 0 {
+                unsafe { core::ptr::write(bytes_read_ptr as *mut u32, read as u32) }
+            }
+            ctx.regs.rax = 1;
+        }
+        Err(_) => {
+            position.fetch_sub(bytes_to_read as u64, Relaxed);
+            set_guest_last_error(teb_va, 5); // ERROR_ACCESS_DENIED
+            ctx.regs.rax = 0;
+        }
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
+/// WriteFile for VFS-backed file handles. Called after handle-table lock is
+/// dropped. Uses the same Win32 argument convention as `k32_write_file_host`.
+pub(crate) fn k32_write_file_vfs(
+    ctx: &mut super::super::ExecutionContext,
+    raw_fd: usize,
+    position: &alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+    teb_va: usize,
+    shared: &crate::NtSharedState,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let buffer = args.arg1;
+    let bytes_to_write = args.arg2 as u32;
+    let bytes_written_ptr = args.arg3;
+
+    if buffer == 0 || bytes_to_write == 0 {
+        if bytes_written_ptr != 0 {
+            unsafe { core::ptr::write(bytes_written_ptr as *mut u32, 0) }
+        }
+        ctx.regs.rax = 1;
+        return NtStatus::STATUS_SUCCESS;
+    }
+
+    let Some(fs) = shared.fs.get() else {
+        set_guest_last_error(teb_va, 6);
+        ctx.regs.rax = 0;
+        return NtStatus::STATUS_SUCCESS;
+    };
+
+    let typed_fd = {
+        let rds = shared.raw_fds.lock().unwrap();
+        match rds.fd_from_raw_integer::<crate::NtFS>(raw_fd) {
+            Ok(fd) => fd,
+            Err(_) => {
+                set_guest_last_error(teb_va, 6);
+                ctx.regs.rax = 0;
+                return NtStatus::STATUS_SUCCESS;
+            }
+        }
+    };
+
+    let start = position.fetch_add(bytes_to_write as u64, Relaxed);
+    let buf = unsafe { core::slice::from_raw_parts(buffer as *const u8, bytes_to_write as usize) };
+
+    use litebox::fs::FileSystem as _;
+    match fs.write(&typed_fd, buf, Some(start as usize)) {
+        Ok(written) => {
+            let over = bytes_to_write as u64 - written as u64;
+            if over > 0 {
+                position.fetch_sub(over, Relaxed);
+            }
+            if bytes_written_ptr != 0 {
+                unsafe { core::ptr::write(bytes_written_ptr as *mut u32, written as u32) }
+            }
+            ctx.regs.rax = 1;
+        }
+        Err(_) => {
+            position.fetch_sub(bytes_to_write as u64, Relaxed);
+            set_guest_last_error(teb_va, 5);
+            ctx.regs.rax = 0;
+        }
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
 /// CloseHandle(hObject) -> BOOL
 pub(crate) fn k32_close_handle(
     ctx: &mut super::super::ExecutionContext,
     handles: &mut crate::handle_table::HandleTable,
     teb_va: usize,
+    shared: &crate::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle = args.arg0 as u32;
-    if handles.close(handle).is_some() {
+    if let Some(obj) = handles.close(handle) {
+        super::close_vfs_fd(&obj, shared);
         ctx.regs.rax = 1;
     } else {
         set_guest_last_error(teb_va, 6); // ERROR_INVALID_HANDLE
@@ -1886,24 +2071,45 @@ pub(crate) fn k32_get_file_size_ex(
     ctx: &mut super::super::ExecutionContext,
     handles: &crate::handle_table::HandleTable,
     teb_va: usize,
+    shared: &crate::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle = args.arg0 as u32;
     let size_ptr = args.arg1;
 
     match handles.get(handle) {
+        Some(crate::handle_table::NtObject::File {
+            raw_fd: Some(fd), ..
+        }) => {
+            // VFS file — get size from fd_file_status.
+            if let Some(fs) = shared.fs.get() {
+                let rds = shared.raw_fds.lock().unwrap();
+                if let Ok(typed_fd) = rds.fd_from_raw_integer::<crate::NtFS>(*fd) {
+                    use litebox::fs::FileSystem as _;
+                    if let Ok(status) = fs.fd_file_status(&typed_fd) {
+                        if size_ptr != 0 {
+                            unsafe { core::ptr::write(size_ptr as *mut i64, status.size as i64) }
+                        }
+                        ctx.regs.rax = 1;
+                        return NtStatus::STATUS_SUCCESS;
+                    }
+                }
+            }
+            set_guest_last_error(teb_va, 6);
+            ctx.regs.rax = 0;
+        }
         Some(crate::handle_table::NtObject::File { host_handle, .. }) => {
             let size = super::file::host::get_file_size(*host_handle);
             if size >= 0 && size_ptr != 0 {
                 unsafe { core::ptr::write(size_ptr as *mut i64, size) }
                 ctx.regs.rax = 1;
             } else {
-                set_guest_last_error(teb_va, 6); // ERROR_INVALID_HANDLE
+                set_guest_last_error(teb_va, 6);
                 ctx.regs.rax = 0;
             }
         }
         _ => {
-            set_guest_last_error(teb_va, 6); // ERROR_INVALID_HANDLE
+            set_guest_last_error(teb_va, 6);
             ctx.regs.rax = 0;
         }
     }
@@ -1915,6 +2121,7 @@ pub(crate) fn k32_set_file_pointer_ex(
     ctx: &mut super::super::ExecutionContext,
     handles: &mut crate::handle_table::HandleTable,
     teb_va: usize,
+    shared: &crate::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle = args.arg0 as u32;
@@ -1924,26 +2131,31 @@ pub(crate) fn k32_set_file_pointer_ex(
 
     match handles.get(handle) {
         Some(crate::handle_table::NtObject::File {
-            host_handle,
+            raw_fd: Some(fd),
             position,
             ..
         }) => {
-            // Compute the new position from the cached value alone.
-            // FILE_BEGIN (0), FILE_CURRENT (1), and FILE_END (2).
-            // This avoids touching the host kernel file pointer, which is
-            // irrelevant since all I/O uses explicit-offset OVERLAPPED.
             let new_pos: i64 = match move_method {
                 0 => distance,                                 // FILE_BEGIN
                 1 => position.load(Relaxed) as i64 + distance, // FILE_CURRENT
                 2 => {
-                    // FILE_END — need the actual file size.
-                    let size = super::file::host::get_file_size(*host_handle);
-                    if size < 0 {
-                        set_guest_last_error(teb_va, super::file::host::get_last_error());
-                        ctx.regs.rax = 0;
-                        return NtStatus::STATUS_SUCCESS;
+                    // FILE_END — get file size from VFS.
+                    let size = (|| -> Option<i64> {
+                        let fs = shared.fs.get()?;
+                        let rds = shared.raw_fds.lock().unwrap();
+                        let typed_fd = rds.fd_from_raw_integer::<crate::NtFS>(*fd).ok()?;
+                        use litebox::fs::FileSystem as _;
+                        let st = fs.fd_file_status(&typed_fd).ok()?;
+                        Some(st.size as i64)
+                    })();
+                    match size {
+                        Some(s) => s + distance,
+                        None => {
+                            set_guest_last_error(teb_va, 6);
+                            ctx.regs.rax = 0;
+                            return NtStatus::STATUS_SUCCESS;
+                        }
                     }
-                    size + distance
                 }
                 _ => {
                     set_guest_last_error(teb_va, 87); // ERROR_INVALID_PARAMETER
@@ -1963,8 +2175,43 @@ pub(crate) fn k32_set_file_pointer_ex(
                 ctx.regs.rax = 1;
             }
         }
+        Some(crate::handle_table::NtObject::File {
+            host_handle,
+            position,
+            ..
+        }) => {
+            let new_pos: i64 = match move_method {
+                0 => distance,                                 // FILE_BEGIN
+                1 => position.load(Relaxed) as i64 + distance, // FILE_CURRENT
+                2 => {
+                    let size = super::file::host::get_file_size(*host_handle);
+                    if size < 0 {
+                        set_guest_last_error(teb_va, super::file::host::get_last_error());
+                        ctx.regs.rax = 0;
+                        return NtStatus::STATUS_SUCCESS;
+                    }
+                    size + distance
+                }
+                _ => {
+                    set_guest_last_error(teb_va, 87);
+                    ctx.regs.rax = 0;
+                    return NtStatus::STATUS_SUCCESS;
+                }
+            };
+
+            if new_pos < 0 {
+                set_guest_last_error(teb_va, 131);
+                ctx.regs.rax = 0;
+            } else {
+                position.store(new_pos as u64, Relaxed);
+                if new_pos_ptr != 0 {
+                    unsafe { core::ptr::write(new_pos_ptr as *mut i64, new_pos) }
+                }
+                ctx.regs.rax = 1;
+            }
+        }
         _ => {
-            set_guest_last_error(teb_va, 6); // ERROR_INVALID_HANDLE
+            set_guest_last_error(teb_va, 6);
             ctx.regs.rax = 0;
         }
     }
@@ -1978,11 +2225,33 @@ pub(crate) fn k32_set_end_of_file(
     ctx: &mut super::super::ExecutionContext,
     handles: &mut crate::handle_table::HandleTable,
     teb_va: usize,
+    shared: &crate::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle = args.arg0 as u32;
 
     match handles.get(handle) {
+        Some(crate::handle_table::NtObject::File {
+            raw_fd: Some(fd),
+            position,
+            ..
+        }) => {
+            // VFS truncate.
+            let current_pos = position.load(Relaxed) as usize;
+            let ok = (|| -> Option<()> {
+                let fs = shared.fs.get()?;
+                let rds = shared.raw_fds.lock().unwrap();
+                let typed_fd = rds.fd_from_raw_integer::<crate::NtFS>(*fd).ok()?;
+                use litebox::fs::FileSystem as _;
+                fs.truncate(&typed_fd, current_pos, false).ok()
+            })();
+            if ok.is_some() {
+                ctx.regs.rax = 1;
+            } else {
+                set_guest_last_error(teb_va, 5); // ERROR_ACCESS_DENIED
+                ctx.regs.rax = 0;
+            }
+        }
         Some(crate::handle_table::NtObject::File {
             host_handle,
             position,
@@ -1991,7 +2260,7 @@ pub(crate) fn k32_set_end_of_file(
             let current_pos = position.load(Relaxed) as i64;
             let result = super::file::host::set_end_of_file(*host_handle, current_pos);
             if result {
-                ctx.regs.rax = 1; // TRUE
+                ctx.regs.rax = 1;
             } else {
                 let err = super::file::host::get_last_error();
                 set_guest_last_error(teb_va, err);
@@ -2677,6 +2946,7 @@ pub(crate) fn k32_get_current_directory_w(
 pub(crate) fn k32_set_current_directory_w(
     ctx: &mut super::super::ExecutionContext,
     cwd: &mut alloc::string::String,
+    shared: &crate::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let path_ptr = args.arg0;
@@ -2704,11 +2974,26 @@ pub(crate) fn k32_set_current_directory_w(
     // Resolve relative paths against the current CWD.
     let mut new_dir = resolve_relative_path(&raw_path, cwd);
 
-    // Validate the target exists and is a directory.
-    let attrs = super::file::host::get_file_attributes(&new_dir);
-    if attrs == super::file::host::INVALID_FILE_ATTRIBUTES
-        || (attrs & super::file::host::FILE_ATTRIBUTE_DIRECTORY) == 0
+    // Try VFS validation first.
+    let valid = if let Some(super::file::TranslatedPath::Vfs(vfs_path)) =
+        super::file::drive_path_to_vfs(&new_dir)
     {
+        if let Some(fs) = shared.fs.get() {
+            use litebox::fs::FileSystem as _;
+            fs.file_status(&*vfs_path)
+                .map(|s| s.file_type == litebox::fs::FileType::Directory)
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    } else {
+        // Host fallback.
+        let attrs = super::file::host::get_file_attributes(&new_dir);
+        attrs != super::file::host::INVALID_FILE_ATTRIBUTES
+            && (attrs & super::file::host::FILE_ATTRIBUTE_DIRECTORY) != 0
+    };
+
+    if !valid {
         ctx.regs.rax = 0; // FALSE
         return NtStatus::STATUS_SUCCESS;
     }
@@ -2849,7 +3134,121 @@ pub(crate) fn k32_set_std_handle(ctx: &mut super::super::ExecutionContext) -> Nt
 // File search (FindFirstFileExW / FindNextFileW / FindClose)
 // ========================================================================
 
-/// FindFirstFileExW — real implementation using host file search.
+/// Try to enumerate files via VFS for a Win32 search pattern.
+///
+/// Returns:
+/// - `None` — path cannot be translated to VFS; fall back to host.
+/// - `Some(Ok(entries))` — VFS served the directory (may be empty).
+/// - `Some(Err(win32_err))` — VFS error; set as last error + return
+///   INVALID_HANDLE_VALUE.
+fn find_files_vfs(
+    pattern: &str,
+    shared: &crate::NtSharedState,
+) -> Option<Result<alloc::vec::Vec<crate::handle_table::DirEnumEntry>, u32>> {
+    use crate::handle_table::DirEnumEntry;
+
+    let fs = shared.fs.get()?;
+    use litebox::fs::FileSystem as _;
+
+    // Strip NT prefix if present, then convert to VFS path.
+    let clean = pattern
+        .strip_prefix("\\??\\")
+        .or_else(|| pattern.strip_prefix("\\DosDevices\\"))
+        .unwrap_or(pattern);
+
+    // Split into directory + filename pattern at the last backslash.
+    let (dir_part, file_pattern) = match clean.rfind('\\') {
+        Some(idx) => (&clean[..idx], &clean[idx + 1..]),
+        None => return None, // No directory component — can't determine VFS path.
+    };
+
+    // Convert directory to VFS path (C:\foo → /c/foo).
+    let vfs_dir = super::file::drive_path_to_vfs(dir_part)?;
+    let vfs_dir_str = match &vfs_dir {
+        super::file::TranslatedPath::Vfs(p) => p.as_str(),
+        super::file::TranslatedPath::Device(p) => p.as_str(),
+        super::file::TranslatedPath::Registry(_) => return None,
+    };
+
+    // Path is VFS-translatable — authoritative from here.
+    let dir_fd = match fs.open(
+        vfs_dir_str,
+        litebox::fs::OFlags::DIRECTORY | litebox::fs::OFlags::RDONLY,
+        litebox::fs::Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(e) => return Some(Err(map_open_error_to_win32(&e))),
+    };
+    let raw_entries = match fs.read_dir(&dir_fd) {
+        Ok(entries) => {
+            let _ = fs.close(&dir_fd);
+            entries
+        }
+        Err(e) => {
+            let _ = fs.close(&dir_fd);
+            return Some(Err(map_readdir_error_to_win32(&e)));
+        }
+    };
+
+    // Apply the filename pattern filter.
+    let pat_lower = file_pattern.to_ascii_lowercase();
+    let entries: alloc::vec::Vec<DirEnumEntry> = raw_entries
+        .into_iter()
+        .filter(|e| super::file::nt_wildcard_match(&e.name.to_ascii_lowercase(), &pat_lower))
+        .map(|e| {
+            let is_dir = e.file_type == litebox::fs::FileType::Directory;
+            let file_size = if is_dir {
+                0
+            } else {
+                let full = alloc::format!("{}/{}", vfs_dir_str, e.name);
+                fs.file_status(&*full).map(|s| s.size as i64).unwrap_or(0)
+            };
+            let attrs = if is_dir {
+                0x10 // FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                0x80 // FILE_ATTRIBUTE_NORMAL
+            };
+            DirEnumEntry {
+                name: e.name,
+                attributes: attrs,
+                file_size,
+                creation_time: 0,
+                last_access_time: 0,
+                last_write_time: 0,
+            }
+        })
+        .collect();
+
+    Some(Ok(entries))
+}
+
+/// Map a VFS `OpenError` to a Win32 error code.
+fn map_open_error_to_win32(e: &litebox::fs::errors::OpenError) -> u32 {
+    use litebox::fs::errors::OpenError;
+    match e {
+        OpenError::PathError(_) => 3,       // ERROR_PATH_NOT_FOUND
+        OpenError::AccessNotAllowed => 5,   // ERROR_ACCESS_DENIED
+        OpenError::NoWritePerms => 5,       // ERROR_ACCESS_DENIED
+        OpenError::ReadOnlyFileSystem => 5, // ERROR_ACCESS_DENIED
+        OpenError::AlreadyExists => 183,    // ERROR_ALREADY_EXISTS
+        OpenError::NotADirectory => 267,    // ERROR_DIRECTORY
+        OpenError::Io => 31,                // ERROR_GEN_FAILURE
+        _ => 2,                             // ERROR_FILE_NOT_FOUND
+    }
+}
+
+/// Map a VFS `ReadDirError` to a Win32 error code.
+fn map_readdir_error_to_win32(e: &litebox::fs::errors::ReadDirError) -> u32 {
+    use litebox::fs::errors::ReadDirError;
+    match e {
+        ReadDirError::ClosedFd => 6,        // ERROR_INVALID_HANDLE
+        ReadDirError::NotADirectory => 267, // ERROR_DIRECTORY
+        ReadDirError::Io => 31,             // ERROR_GEN_FAILURE
+        _ => 31,                            // ERROR_GEN_FAILURE
+    }
+}
+
+/// FindFirstFileExW — VFS-first with host fallback.
 ///
 /// Args: r10=lpFileName, rdx=fInfoLevelId, r8=lpFindFileData, r9=fSearchOp
 /// Returns: search handle in rax, or INVALID_HANDLE_VALUE on no match.
@@ -2857,6 +3256,8 @@ pub(crate) fn k32_find_first_file_ex_w(
     ctx: &mut super::super::ExecutionContext,
     handles: &mut crate::handle_table::HandleTable,
     teb_va: usize,
+    cwd: &str,
+    shared: &crate::NtSharedState,
 ) -> NtStatus {
     use crate::handle_table::{DirEnumEntry, NtObject};
 
@@ -2870,27 +3271,64 @@ pub(crate) fn k32_find_first_file_ex_w(
         return NtStatus::STATUS_SUCCESS;
     }
 
-    // Read the search pattern from guest memory (NUL-terminated UTF-16).
+    // Read the search pattern from guest memory (page-checked UTF-16).
     let pattern = {
-        let mut chars = alloc::vec::Vec::new();
-        let mut ptr = filename_ptr;
-        loop {
-            let ch = unsafe { core::ptr::read(ptr as *const u16) };
-            if ch == 0 {
-                break;
-            }
-            chars.push(ch);
-            ptr += 2;
-            if chars.len() > 32768 {
-                break;
+        let va_start = shared
+            .guest_va_start
+            .load(core::sync::atomic::Ordering::Acquire);
+        let va_end = shared
+            .guest_va_end
+            .load(core::sync::atomic::Ordering::Acquire);
+        match super::super::read_wide_string_checked(
+            &shared.process_state.pm,
+            filename_ptr,
+            va_start,
+            va_end,
+            32768,
+        ) {
+            Some(s) => s,
+            None => {
+                set_guest_last_error(teb_va, 87); // ERROR_INVALID_PARAMETER
+                ctx.regs.rax = usize::MAX;
+                return NtStatus::STATUS_SUCCESS;
             }
         }
-        alloc::string::String::from_utf16_lossy(&chars)
     };
 
+    // Resolve relative patterns against the guest CWD.
+    let pattern = resolve_relative_path(&pattern, cwd);
+
+    // ── VFS-first path ──────────────────────────────────────────────
+    // Split the pattern into directory + filename glob, try VFS first.
+    match find_files_vfs(&pattern, shared) {
+        Some(Ok(vfs_entries)) => {
+            if vfs_entries.is_empty() {
+                set_guest_last_error(teb_va, 2); // ERROR_FILE_NOT_FOUND
+                ctx.regs.rax = usize::MAX;
+                return NtStatus::STATUS_SUCCESS;
+            }
+            write_find_data(find_data_ptr, &vfs_entries[0]);
+            let handle = handles.insert(NtObject::FindSearch {
+                entries: vfs_entries,
+                next_index: 1,
+            });
+            ctx.regs.rax = handle as usize;
+            return NtStatus::STATUS_SUCCESS;
+        }
+        Some(Err(win32_err)) => {
+            set_guest_last_error(teb_va, win32_err);
+            ctx.regs.rax = usize::MAX;
+            return NtStatus::STATUS_SUCCESS;
+        }
+        None => {
+            // Not VFS-translatable — fall through to host.
+        }
+    }
+
+    // ── Host fallback ───────────────────────────────────────────────
     // Translate guest path to host path.
     let host_pattern = if pattern.starts_with("\\??\\") || pattern.starts_with("\\DosDevices\\") {
-        match super::file::translate_nt_path(&pattern) {
+        match super::file::translate_nt_path_to_host(&pattern) {
             Some(p) => p,
             None => {
                 ctx.regs.rax = usize::MAX;
@@ -2970,11 +3408,13 @@ pub(crate) fn k32_find_next_file_w(
 pub(crate) fn k32_find_close(
     ctx: &mut super::super::ExecutionContext,
     handles: &mut crate::handle_table::HandleTable,
+    shared: &crate::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let h_find = args.arg0 as u32;
 
-    if handles.close(h_find).is_some() {
+    if let Some(obj) = handles.close(h_find) {
+        super::close_vfs_fd(&obj, shared);
         ctx.regs.rax = 1; // TRUE
     } else {
         ctx.regs.rax = 0; // FALSE

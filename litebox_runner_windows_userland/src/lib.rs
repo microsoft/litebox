@@ -223,6 +223,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         rtl_user_thread_start_va: Option<usize>,
         /// For ntdll-driven init: tar file data for serving DLLs via NtOpenFile.
         dll_tar_files: Option<std::collections::BTreeMap<String, Vec<u8>>>,
+        /// Raw tar bytes for VFS TarFS layer creation.
+        tar_data: Option<Vec<u8>>,
         /// Mapping from real Windows syscall numbers to NtSyscallId.
         syscall_map: Option<litebox_common_windows::NtSyscallMap>,
         /// Unhandled stub names for debug logging of unknown syscalls.
@@ -383,6 +385,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             ldr_init_thunk_va: Some(result.ldr_init_thunk_va),
             rtl_user_thread_start_va: Some(result.rtl_user_thread_start_va),
             dll_tar_files: Some(tar_files),
+            tar_data: Some(tar_data),
             syscall_map: Some(result.syscall_map),
             unhandled_stubs: result.unhandled_stubs,
             ki_user_exception_dispatcher_rva: result.ki_user_exception_dispatcher_rva,
@@ -771,6 +774,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             ldr_init_thunk_va: None,
             rtl_user_thread_start_va: None,
             dll_tar_files: None,
+            tar_data: None,
             syscall_map: Some(litebox_common_windows::NtSyscallMap::identity()),
             unhandled_stubs: Vec::new(),
             ki_user_exception_dispatcher_rva: None,
@@ -1067,8 +1071,46 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     // Create litebox core VFS and pass to shim for file I/O.
-    // TODO: wire up VFS creation with proper tar data and EXE seeding.
-    // For now, file I/O falls through to host passthrough when fs is None.
+    // Architecture: InMemFS (writable) → DeviceFS → TarFS (read-only),
+    // matching the Linux shim's layered VFS pattern.
+    if let Some(tar_data) = load_result.tar_data {
+        use litebox::fs::FileSystem as _;
+
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
+        in_mem.with_root_privileges(|fs| {
+            // Create directory structure for guest EXE path.
+            fs.mkdir(
+                "/c",
+                litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+            )
+            .ok();
+            fs.mkdir(
+                "/c/app",
+                litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+            )
+            .ok();
+        });
+
+        let dev_fs = litebox::fs::devices::FileSystem::new(&litebox);
+        let tar_fs =
+            litebox::fs::tar_ro::FileSystem::new(&litebox, alloc::borrow::Cow::Owned(tar_data));
+
+        let inner = litebox::fs::layered::FileSystem::new(
+            &litebox,
+            dev_fs,
+            tar_fs,
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+        let vfs = litebox::fs::layered::FileSystem::new(
+            &litebox,
+            in_mem,
+            inner,
+            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+        );
+        let vfs_arc = alloc::sync::Arc::new(vfs);
+        shim.set_fs(vfs_arc);
+        eprintln!("[vfs] Layered VFS created (InMemFS → DeviceFS → TarFS)");
+    }
 
     // Attach the network stack to the shim for WinSock syscall dispatch.
     if let Some(ref net_arc) = net {

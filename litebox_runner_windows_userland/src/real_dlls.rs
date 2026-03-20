@@ -73,8 +73,8 @@ pub fn load_ntdll_for_init(
     mapper: &mut PmMapper<'_>,
     partition_start: usize,
 ) -> Result<NtdllInitLoadResult> {
-    let ntdll_data = tar_files
-        .get("ntdll.dll")
+    let ntdll_data = find_by_filename(tar_files, "ntdll.dll")
+        .map(|(_, data)| data)
         .ok_or_else(|| anyhow!("ntdll.dll not found in tar"))?;
 
     let ntdll_load_va = partition_start + REAL_DLL_OFFSET;
@@ -304,6 +304,25 @@ pub fn read_tar(tar_data: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         pos = data_start + ((size + 511) & !511);
     }
     Ok(files)
+}
+
+/// Look up an entry in the tar map by filename (last path component).
+///
+/// The tar may have VFS-style paths (e.g., `c/windows/system32/ntdll.dll`)
+/// or flat filenames (e.g., `ntdll.dll`). This searches by matching the
+/// last `/`-delimited component.
+pub fn find_by_filename<'a>(
+    tar_files: &'a BTreeMap<String, Vec<u8>>,
+    filename: &str,
+) -> Option<(&'a str, &'a Vec<u8>)> {
+    let target = filename.to_ascii_lowercase();
+    tar_files
+        .iter()
+        .find(|(k, _)| {
+            let basename = k.rsplit('/').next().unwrap_or(k);
+            basename == target
+        })
+        .map(|(k, v)| (k.as_str(), v))
 }
 
 // ── DLL loader ──────────────────────────────────────────────────────

@@ -123,22 +123,6 @@ pub(crate) mod host {
     }
 
     /// Read bytes from a host file handle.
-    pub fn read_file(handle: usize, buf: *mut u8, len: u32) -> (bool, u32) {
-        unsafe extern "system" {
-            fn ReadFile(
-                handle: usize,
-                buffer: *mut u8,
-                bytes_to_read: u32,
-                bytes_read: *mut u32,
-                overlapped: usize,
-            ) -> i32;
-        }
-
-        let mut bytes_read: u32 = 0;
-        let ok = unsafe { ReadFile(handle, buf, len, &raw mut bytes_read, 0) };
-        (ok != 0, bytes_read)
-    }
-
     /// Read bytes from a host file handle at an explicit byte offset.
     ///
     /// Uses OVERLAPPED to specify the file position so that the host kernel's
@@ -197,23 +181,6 @@ pub(crate) mod host {
         let mut bytes_read: u32 = 0;
         let ok = unsafe { ReadFile(stdin, buf, len, &raw mut bytes_read, 0) };
         (ok != 0, bytes_read)
-    }
-
-    /// Write bytes to a host file handle.
-    pub fn write_file(handle: usize, buf: *const u8, len: u32) -> (bool, u32) {
-        unsafe extern "system" {
-            fn WriteFile(
-                handle: usize,
-                buffer: *const u8,
-                bytes_to_write: u32,
-                bytes_written: *mut u32,
-                overlapped: usize,
-            ) -> i32;
-        }
-
-        let mut bytes_written: u32 = 0;
-        let ok = unsafe { WriteFile(handle, buf, len, &raw mut bytes_written, 0) };
-        (ok != 0, bytes_written)
     }
 
     /// Write bytes to a host file handle at an explicit byte offset.
@@ -495,26 +462,174 @@ pub(crate) mod host {
 }
 
 // ========================================================================
+// NT-style wildcard matching
+// ========================================================================
+
+/// Match a filename against an NT wildcard pattern (case-insensitive).
+///
+/// Supports `*` (match zero or more characters), `?` (match exactly one
+/// character), and the DOS-era `*.*` idiom which matches everything.
+/// Both `name` and `pattern` must already be lowercased by the caller.
+pub(crate) fn nt_wildcard_match(name: &str, pattern: &str) -> bool {
+    // Common fast paths.
+    if pattern == "*" || pattern == "*.*" {
+        return true;
+    }
+    glob_match(name.as_bytes(), pattern.as_bytes())
+}
+
+/// Recursive glob matcher for `*` and `?` wildcards.
+fn glob_match(name: &[u8], pattern: &[u8]) -> bool {
+    let mut ni = 0;
+    let mut pi = 0;
+    let mut star_pi = usize::MAX; // pattern index after last '*'
+    let mut star_ni = 0; // name index when last '*' was seen
+
+    while ni < name.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == name[ni]) {
+            ni += 1;
+            pi += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = pi + 1;
+            star_ni = ni;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            // Backtrack: let the '*' consume one more character.
+            star_ni += 1;
+            ni = star_ni;
+            pi = star_pi;
+        } else {
+            return false;
+        }
+    }
+    // Consume trailing '*' in pattern.
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+// ========================================================================
 // NT path translation
 // ========================================================================
 
-/// Translate an NT object path to a host filesystem path.
+/// Result of translating an NT object path.
+pub(crate) enum TranslatedPath {
+    /// A VFS filesystem path (e.g., `/c/windows/system32/ntdll.dll`).
+    Vfs(String),
+    /// A device path routed through DeviceFS.
+    Device(String),
+    /// A registry path — not handled by VFS.
+    Registry(String),
+}
+
+/// Translate an NT object path to a VFS path.
 ///
-/// Handles these prefixes:
-/// - `\??\C:\...` → `C:\...`
-/// - `\??\UNC\...` → `\\...`
-/// - `\DosDevices\C:\...` → `C:\...`
-/// - `\SystemRoot\...` → `C:\Windows\...`
+/// All VFS paths are lowercased (VFS is case-sensitive; Windows is not).
+/// Backslashes are converted to forward slashes.
 ///
-/// Returns `None` for device paths (\Device\...) that can't be mapped.
-pub(crate) fn translate_nt_path(nt_path: &str) -> Option<String> {
+/// | NT Path                              | VFS Path                        |
+/// |--------------------------------------|---------------------------------|
+/// | `\??\C:\Windows\System32\ntdll.dll`  | `/c/windows/system32/ntdll.dll` |
+/// | `\DosDevices\C:\foo.txt`             | `/c/foo.txt`                    |
+/// | `\SystemRoot\System32\ntdll.dll`     | `/c/windows/system32/ntdll.dll` |
+/// | `C:\Windows\System32\ntdll.dll`      | `/c/windows/system32/ntdll.dll` |
+/// | `\Device\ConDrv\Input`               | `/dev/stdin`                    |
+/// | `\Device\ConDrv\Output`              | `/dev/stdout`                   |
+/// | `\??\NUL`                            | `/dev/null`                     |
+/// | `\??\CON`                            | `/dev/stdout`                   |
+/// | `\??\CONIN$`                         | `/dev/stdin`                    |
+/// | `\??\CONOUT$`                        | `/dev/stdout`                   |
+///
+/// Returns `None` for paths that can't be mapped.
+pub(crate) fn translate_nt_path(nt_path: &str) -> Option<TranslatedPath> {
+    // \Device\ConDrv paths → DeviceFS
+    if let Some(rest) = nt_path.strip_prefix("\\Device\\ConDrv\\") {
+        let lower = rest.to_ascii_lowercase();
+        return match lower.as_str() {
+            "input" | "currentin" => Some(TranslatedPath::Device(String::from("/dev/stdin"))),
+            "output" | "currentout" => Some(TranslatedPath::Device(String::from("/dev/stdout"))),
+            _ => Some(TranslatedPath::Device(String::from("/dev/stdout"))),
+        };
+    }
+
+    // Registry paths
+    if nt_path.starts_with("\\Registry\\") || nt_path.starts_with("\\REGISTRY\\") {
+        return Some(TranslatedPath::Registry(String::from(nt_path)));
+    }
+
+    // \??\<something> paths
+    if let Some(rest) = nt_path.strip_prefix("\\??\\") {
+        // Special device names
+        let upper = rest.to_ascii_uppercase();
+        if upper == "NUL" {
+            return Some(TranslatedPath::Device(String::from("/dev/null")));
+        }
+        if upper == "CON" || upper == "CONOUT$" {
+            return Some(TranslatedPath::Device(String::from("/dev/stdout")));
+        }
+        if upper == "CONIN$" {
+            return Some(TranslatedPath::Device(String::from("/dev/stdin")));
+        }
+
+        // UNC path: \??\UNC\server\share → //server/share
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            let vfs = alloc::format!("//{}", unc.replace('\\', "/").to_ascii_lowercase());
+            return Some(TranslatedPath::Vfs(vfs));
+        }
+
+        // Drive path: \??\C:\path → /c/path
+        return drive_path_to_vfs(rest);
+    }
+
+    // \DosDevices\C:\path → /c/path
+    if let Some(rest) = nt_path.strip_prefix("\\DosDevices\\") {
+        return drive_path_to_vfs(rest);
+    }
+
+    // \SystemRoot\path → /c/windows/path
+    if let Some(rest) = nt_path.strip_prefix("\\SystemRoot\\") {
+        let vfs = alloc::format!(
+            "/c/windows/{}",
+            rest.replace('\\', "/").to_ascii_lowercase()
+        );
+        return Some(TranslatedPath::Vfs(vfs));
+    }
+    if nt_path == "\\SystemRoot" {
+        return Some(TranslatedPath::Vfs(String::from("/c/windows")));
+    }
+
+    // Bare drive path: C:\path → /c/path
+    if nt_path.len() >= 3 && nt_path.as_bytes()[1] == b':' {
+        return drive_path_to_vfs(nt_path);
+    }
+
+    None
+}
+
+/// Convert a drive-letter path like `C:\foo\bar` to VFS `/c/foo/bar`.
+pub(crate) fn drive_path_to_vfs(path: &str) -> Option<TranslatedPath> {
+    if path.len() < 2 || path.as_bytes()[1] != b':' {
+        return None;
+    }
+    let drive = (path.as_bytes()[0] as char).to_ascii_lowercase();
+    let rest = if path.len() > 2 {
+        &path[2..] // includes leading backslash
+    } else {
+        ""
+    };
+    let vfs = alloc::format!("/{drive}{}", rest.replace('\\', "/").to_ascii_lowercase());
+    Some(TranslatedPath::Vfs(vfs))
+}
+
+/// Legacy: translate NT path to a host path string.
+/// Used by code that hasn't been migrated to VFS yet.
+pub(crate) fn translate_nt_path_to_host(nt_path: &str) -> Option<String> {
     // Strip common NT prefixes.
     if let Some(rest) = nt_path.strip_prefix("\\??\\") {
         if let Some(stripped) = rest.strip_prefix("UNC\\") {
-            // UNC path: \??\UNC\server\share → \\server\share
             return Some(String::from("\\\\") + stripped);
         }
-        // Standard drive path: \??\C:\... → C:\...
         return Some(String::from(rest));
     }
     if let Some(rest) = nt_path.strip_prefix("\\DosDevices\\") {
@@ -528,11 +643,9 @@ pub(crate) fn translate_nt_path(nt_path: &str) -> Option<String> {
     {
         return Some(String::from("C:\\Windows"));
     }
-    // If it looks like a drive letter path already, pass through.
     if nt_path.len() >= 3 && nt_path.as_bytes()[1] == b':' {
         return Some(String::from(nt_path));
     }
-    // Unknown — return None to signal "object not found".
     None
 }
 
@@ -556,6 +669,72 @@ fn read_unicode_string_from_guest(us_va: usize) -> Option<String> {
 // NtCreateFile
 // ========================================================================
 
+/// Map a VFS `MkdirError` to the appropriate NTSTATUS.
+fn map_mkdir_error(e: litebox::fs::errors::MkdirError) -> NtStatus {
+    use litebox::fs::errors::MkdirError;
+    match e {
+        MkdirError::AlreadyExists => NtStatus::STATUS_OBJECT_NAME_COLLISION,
+        MkdirError::ReadOnlyFileSystem => NtStatus::STATUS_ACCESS_DENIED,
+        MkdirError::NoWritePerms => NtStatus::STATUS_ACCESS_DENIED,
+        MkdirError::Io => NtStatus::STATUS_UNEXPECTED_IO_ERROR,
+        MkdirError::PathError(_) => NtStatus::STATUS_OBJECT_NAME_NOT_FOUND,
+        _ => NtStatus::STATUS_OBJECT_NAME_NOT_FOUND,
+    }
+}
+
+fn map_open_error_to_ntstatus(e: &litebox::fs::errors::OpenError) -> NtStatus {
+    use litebox::fs::errors::OpenError;
+    match e {
+        OpenError::PathError(_) => NtStatus::STATUS_OBJECT_PATH_NOT_FOUND,
+        OpenError::AccessNotAllowed => NtStatus::STATUS_ACCESS_DENIED,
+        OpenError::NoWritePerms => NtStatus::STATUS_ACCESS_DENIED,
+        OpenError::ReadOnlyFileSystem => NtStatus::STATUS_ACCESS_DENIED,
+        OpenError::AlreadyExists => NtStatus::STATUS_OBJECT_NAME_COLLISION,
+        OpenError::NotADirectory => NtStatus::STATUS_NOT_A_DIRECTORY,
+        OpenError::Io => NtStatus::STATUS_UNEXPECTED_IO_ERROR,
+        _ => NtStatus::STATUS_OBJECT_NAME_NOT_FOUND,
+    }
+}
+
+fn map_readdir_error_to_ntstatus(e: &litebox::fs::errors::ReadDirError) -> NtStatus {
+    use litebox::fs::errors::ReadDirError;
+    match e {
+        ReadDirError::ClosedFd => NtStatus::STATUS_INVALID_HANDLE,
+        ReadDirError::NotADirectory => NtStatus::STATUS_NOT_A_DIRECTORY,
+        ReadDirError::Io => NtStatus::STATUS_UNEXPECTED_IO_ERROR,
+        _ => NtStatus::STATUS_UNEXPECTED_IO_ERROR,
+    }
+}
+
+/// Helper: insert a `NtObject::Directory` handle and write the IOSB.
+fn insert_directory_handle(
+    handles: &mut HandleTable,
+    nt_path: &str,
+    handle_out_ptr: usize,
+    io_status_ptr: usize,
+    iosb_information: u64,
+) -> NtStatus {
+    let dir_handle = handles.insert(NtObject::Directory {
+        path: alloc::string::String::from(nt_path),
+        enum_entries: alloc::vec::Vec::new(),
+        enum_index: 0,
+    });
+    unsafe {
+        core::ptr::write(handle_out_ptr as *mut u32, dir_handle);
+    }
+    if io_status_ptr != 0 {
+        let iosb = IoStatusBlock {
+            status: NtStatus::STATUS_SUCCESS.0,
+            _pad: 0,
+            information: iosb_information,
+        };
+        unsafe {
+            core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+        }
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
 /// NtCreateFile — open or create a file.
 ///
 /// NT signature:
@@ -577,6 +756,7 @@ fn read_unicode_string_from_guest(us_va: usize) -> Option<String> {
 pub(crate) fn nt_create_file(
     ctx: &mut super::super::ExecutionContext,
     handles: &mut HandleTable,
+    shared: &super::super::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle_out_ptr = args.arg0;
@@ -653,8 +833,200 @@ pub(crate) fn nt_create_file(
     // Check for directory opens.
     let is_directory = create_options & file_options::FILE_DIRECTORY_FILE != 0;
 
-    // Translate NT path to host path.
-    let Some(host_path) = translate_nt_path(&nt_path) else {
+    // Translate NT path using the VFS-aware translator.
+    let translated = translate_nt_path(&nt_path);
+
+    // Try VFS path first if VFS is available.
+    if let Some(ref translated) = translated
+        && let Some(fs) = shared.fs.get()
+    {
+        let vfs_path = match translated {
+            TranslatedPath::Vfs(p) => Some(p.as_str()),
+            TranslatedPath::Device(p) => Some(p.as_str()),
+            TranslatedPath::Registry(_) => None,
+        };
+
+        if let Some(path) = vfs_path {
+            use litebox::fs::FileSystem as _;
+
+            if is_directory {
+                // Directory operations on VFS-translatable paths stay in VFS.
+                let is_vfs_dir = fs
+                    .file_status(path)
+                    .is_ok_and(|s| s.file_type == litebox::fs::FileType::Directory);
+
+                match create_disposition {
+                    file_disposition::FILE_CREATE => {
+                        if is_vfs_dir {
+                            if io_status_ptr != 0 {
+                                write_iosb(
+                                    io_status_ptr,
+                                    NtStatus::STATUS_OBJECT_NAME_COLLISION,
+                                    0,
+                                );
+                            }
+                            return NtStatus::STATUS_OBJECT_NAME_COLLISION;
+                        }
+                        // Create in VFS.
+                        if let Err(e) = fs.mkdir(path, litebox::fs::Mode::RWXU) {
+                            return map_mkdir_error(e);
+                        }
+                        return insert_directory_handle(
+                            handles,
+                            &nt_path,
+                            handle_out_ptr,
+                            io_status_ptr,
+                            2, // FILE_CREATED
+                        );
+                    }
+                    file_disposition::FILE_OPEN => {
+                        if is_vfs_dir {
+                            return insert_directory_handle(
+                                handles,
+                                &nt_path,
+                                handle_out_ptr,
+                                io_status_ptr,
+                                1, // FILE_OPENED
+                            );
+                        }
+                        return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
+                    }
+                    file_disposition::FILE_OPEN_IF => {
+                        if is_vfs_dir {
+                            return insert_directory_handle(
+                                handles,
+                                &nt_path,
+                                handle_out_ptr,
+                                io_status_ptr,
+                                1, // FILE_OPENED
+                            );
+                        }
+                        // Create in VFS.
+                        if let Err(e) = fs.mkdir(path, litebox::fs::Mode::RWXU) {
+                            return map_mkdir_error(e);
+                        }
+                        return insert_directory_handle(
+                            handles,
+                            &nt_path,
+                            handle_out_ptr,
+                            io_status_ptr,
+                            2, // FILE_CREATED
+                        );
+                    }
+                    _ => {
+                        // FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF —
+                        // treat as "open existing" for directories.
+                        if is_vfs_dir {
+                            return insert_directory_handle(
+                                handles,
+                                &nt_path,
+                                handle_out_ptr,
+                                io_status_ptr,
+                                1, // FILE_OPENED
+                            );
+                        }
+                        return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
+                    }
+                }
+            }
+
+            // Map NT disposition to VFS OFlags.
+            let mut oflags = litebox::fs::OFlags::empty();
+            match create_disposition {
+                file_disposition::FILE_OPEN => {
+                    // Open existing — no CREAT
+                    oflags |= litebox::fs::OFlags::RDONLY;
+                }
+                file_disposition::FILE_CREATE => {
+                    oflags |= litebox::fs::OFlags::CREAT | litebox::fs::OFlags::EXCL;
+                }
+                file_disposition::FILE_OPEN_IF => {
+                    oflags |= litebox::fs::OFlags::CREAT;
+                }
+                file_disposition::FILE_OVERWRITE => {
+                    oflags |= litebox::fs::OFlags::TRUNC;
+                }
+                file_disposition::FILE_OVERWRITE_IF | file_disposition::FILE_SUPERSEDE => {
+                    oflags |= litebox::fs::OFlags::CREAT | litebox::fs::OFlags::TRUNC;
+                }
+                _ => {}
+            }
+
+            // Determine read/write from DesiredAccess.
+            let want_read = desired_access & 0x8000_0001 != 0;
+            let want_write = desired_access & 0x4000_0006 != 0;
+            if want_write {
+                if want_read {
+                    oflags |= litebox::fs::OFlags::RDWR;
+                } else {
+                    oflags |= litebox::fs::OFlags::WRONLY;
+                }
+            } else {
+                oflags |= litebox::fs::OFlags::RDONLY;
+            }
+
+            match fs.open(
+                path,
+                oflags,
+                litebox::fs::Mode::RUSR | litebox::fs::Mode::WUSR,
+            ) {
+                Ok(typed_fd) => {
+                    let raw_fd = {
+                        let mut rds = shared.raw_fds.lock().unwrap();
+                        rds.fd_into_raw_integer(typed_fd)
+                    };
+                    let handle = handles.insert(NtObject::File {
+                        path: nt_path,
+                        host_handle: 0, // Not a host handle — using VFS fd
+                        position: Arc::new(AtomicU64::new(0)),
+                        raw_fd: Some(raw_fd),
+                        vfs_refcount: Some(Arc::new(core::sync::atomic::AtomicUsize::new(1))),
+                    });
+                    unsafe {
+                        core::ptr::write(handle_out_ptr as *mut u32, handle);
+                    }
+                    if io_status_ptr != 0 {
+                        let info = match create_disposition {
+                            file_disposition::FILE_CREATE => 2, // FILE_CREATED
+                            file_disposition::FILE_OPEN => 1,   // FILE_OPENED
+                            _ => 1,
+                        };
+                        let iosb = IoStatusBlock {
+                            status: NtStatus::STATUS_SUCCESS.0,
+                            _pad: 0,
+                            information: info,
+                        };
+                        unsafe {
+                            core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+                        }
+                    }
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtCreateFile VFS OK path={path:?} raw_fd={raw_fd}\n",
+                        ));
+                    }
+                    return NtStatus::STATUS_SUCCESS;
+                }
+                Err(_e) => {
+                    // VFS open failed — fall through to host.
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtCreateFile VFS miss path={path:?}, falling through to host\n",
+                            ));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Host fallback path ──────────────────────────────────────────
+
+    // Translate NT path to host path for legacy host FFI.
+    let Some(host_path) = translate_nt_path_to_host(&nt_path) else {
         #[cfg(debug_assertions)]
         {
             use litebox::platform::DebugLogProvider as _;
@@ -788,6 +1160,8 @@ pub(crate) fn nt_create_file(
         path: nt_path,
         host_handle,
         position: Arc::new(AtomicU64::new(0)),
+        raw_fd: None,
+        vfs_refcount: None,
     });
 
     unsafe {
@@ -825,6 +1199,162 @@ pub(crate) fn nt_create_file(
     }
 
     NtStatus::STATUS_SUCCESS
+}
+
+// ========================================================================
+// NtReadFile / NtWriteFile — VFS path
+// ========================================================================
+
+/// NtReadFile — read from a VFS file descriptor.
+///
+/// Called after handle-table lock is dropped. Uses the raw_fd to look up
+/// the TypedFd in RawDescriptorStorage and reads via the VFS.
+pub(crate) fn nt_read_file_vfs(
+    ctx: &mut super::super::ExecutionContext,
+    raw_fd: usize,
+    position: &alloc::sync::Arc<AtomicU64>,
+    shared: &super::super::NtSharedState,
+) -> NtStatus {
+    let io_status_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+    let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
+    let length = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
+    let byte_offset_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x40) as *const usize) };
+
+    if buffer_ptr == 0 || length == 0 {
+        return NtStatus::STATUS_INVALID_PARAMETER;
+    }
+
+    const FILE_USE_FILE_POINTER_POSITION: i64 = -2;
+
+    let (read_offset, advance_pos) = if byte_offset_ptr != 0 {
+        let offset = unsafe { core::ptr::read(byte_offset_ptr as *const i64) };
+        if offset >= 0 {
+            (Some(offset as u64), false) // positional read
+        } else if offset == FILE_USE_FILE_POINTER_POSITION {
+            let pos = position.load(Relaxed);
+            (Some(pos), true) // sequential read
+        } else {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        }
+    } else {
+        let pos = position.load(Relaxed);
+        (Some(pos), true) // no offset pointer → sequential
+    };
+
+    let buf = unsafe { core::slice::from_raw_parts_mut(buffer_ptr as *mut u8, length as usize) };
+
+    // Look up the TypedFd from RDS and do the read.
+    let Some(fs) = shared.fs.get() else {
+        return NtStatus::STATUS_INVALID_HANDLE;
+    };
+
+    let typed_fd = {
+        let rds = shared.raw_fds.lock().unwrap();
+        match rds.fd_from_raw_integer::<super::super::NtFS>(raw_fd) {
+            Ok(fd) => fd,
+            Err(_) => return NtStatus::STATUS_INVALID_HANDLE,
+        }
+    };
+
+    use litebox::fs::FileSystem as _;
+    match fs.read(&typed_fd, buf, read_offset.map(|o| o as usize)) {
+        Ok(bytes_read) => {
+            if advance_pos {
+                position.fetch_add(bytes_read as u64, Relaxed);
+            }
+            if io_status_ptr != 0 {
+                let iosb = IoStatusBlock {
+                    status: NtStatus::STATUS_SUCCESS.0,
+                    _pad: 0,
+                    information: bytes_read as u64,
+                };
+                unsafe {
+                    core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+                }
+            }
+            if bytes_read == 0 {
+                NtStatus::STATUS_END_OF_FILE
+            } else {
+                NtStatus::STATUS_SUCCESS
+            }
+        }
+        Err(_) => NtStatus::STATUS_END_OF_FILE,
+    }
+}
+
+/// NtWriteFile — write to a VFS file descriptor.
+pub(crate) fn nt_write_file_vfs(
+    ctx: &mut super::super::ExecutionContext,
+    raw_fd: usize,
+    position: &alloc::sync::Arc<AtomicU64>,
+    shared: &super::super::NtSharedState,
+) -> NtStatus {
+    let io_status_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+    let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
+    let length = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
+    let byte_offset_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x40) as *const usize) };
+
+    if buffer_ptr == 0 || length == 0 {
+        if io_status_ptr != 0 {
+            let iosb = IoStatusBlock {
+                status: NtStatus::STATUS_SUCCESS.0,
+                _pad: 0,
+                information: 0,
+            };
+            unsafe {
+                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+            }
+        }
+        return NtStatus::STATUS_SUCCESS;
+    }
+
+    let (write_offset, advance_pos) = if byte_offset_ptr != 0 {
+        let offset = unsafe { core::ptr::read(byte_offset_ptr as *const i64) };
+        if offset >= 0 {
+            (Some(offset as u64), false)
+        } else {
+            let pos = position.load(Relaxed);
+            (Some(pos), true)
+        }
+    } else {
+        let pos = position.load(Relaxed);
+        (Some(pos), true)
+    };
+
+    let buf = unsafe { core::slice::from_raw_parts(buffer_ptr as *const u8, length as usize) };
+
+    let Some(fs) = shared.fs.get() else {
+        return NtStatus::STATUS_INVALID_HANDLE;
+    };
+
+    let typed_fd = {
+        let rds = shared.raw_fds.lock().unwrap();
+        match rds.fd_from_raw_integer::<super::super::NtFS>(raw_fd) {
+            Ok(fd) => fd,
+            Err(_) => return NtStatus::STATUS_INVALID_HANDLE,
+        }
+    };
+
+    use litebox::fs::FileSystem as _;
+    match fs.write(&typed_fd, buf, write_offset.map(|o| o as usize)) {
+        Ok(bytes_written) => {
+            if advance_pos {
+                position.fetch_add(bytes_written as u64, Relaxed);
+            }
+            if io_status_ptr != 0 {
+                let iosb = IoStatusBlock {
+                    status: NtStatus::STATUS_SUCCESS.0,
+                    _pad: 0,
+                    information: bytes_written as u64,
+                };
+                unsafe {
+                    core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
+        Err(_) => NtStatus::STATUS_UNSUCCESSFUL,
+    }
 }
 
 // ========================================================================
@@ -1083,6 +1613,7 @@ pub(crate) fn nt_write_file_host(
 pub(crate) fn nt_query_information_file(
     ctx: &mut super::super::ExecutionContext,
     handles: &HandleTable,
+    shared: &super::super::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let file_handle = args.arg0 as u32;
@@ -1097,6 +1628,77 @@ pub(crate) fn nt_query_information_file(
     };
 
     match obj {
+        NtObject::File {
+            raw_fd: Some(fd),
+            position,
+            ..
+        } => {
+            // VFS-backed file.
+            match info_class {
+                // FileBasicInformation (4) — synthesize from VFS.
+                4 => {
+                    let size = core::mem::size_of::<FileBasicInformation>();
+                    if (info_length as usize) < size || info_ptr == 0 {
+                        return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+                    }
+                    // Return default timestamps for VFS files.
+                    let info = FileBasicInformation {
+                        file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+                        ..FileBasicInformation::default()
+                    };
+                    unsafe {
+                        core::ptr::write(info_ptr as *mut FileBasicInformation, info);
+                    }
+                    write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, size);
+                    NtStatus::STATUS_SUCCESS
+                }
+                // FileStandardInformation (5) — get size from VFS.
+                5 => {
+                    let size = core::mem::size_of::<FileStandardInformation>();
+                    if (info_length as usize) < size || info_ptr == 0 {
+                        return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+                    }
+                    let file_size = (|| -> Option<i64> {
+                        let fs = shared.fs.get()?;
+                        let rds = shared.raw_fds.lock().unwrap();
+                        let typed_fd = rds.fd_from_raw_integer::<super::super::NtFS>(*fd).ok()?;
+                        use litebox::fs::FileSystem as _;
+                        let st = fs.fd_file_status(&typed_fd).ok()?;
+                        Some(st.size as i64)
+                    })()
+                    .unwrap_or(0);
+                    let info = FileStandardInformation {
+                        allocation_size: (file_size + 4095) & !4095,
+                        end_of_file: file_size,
+                        number_of_links: 1,
+                        delete_pending: 0,
+                        directory: 0,
+                        _pad: [0; 2],
+                    };
+                    unsafe {
+                        core::ptr::write(info_ptr as *mut FileStandardInformation, info);
+                    }
+                    write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, size);
+                    NtStatus::STATUS_SUCCESS
+                }
+                // FilePositionInformation (14) — from cached position.
+                14 => {
+                    let size = core::mem::size_of::<FilePositionInformation>();
+                    if (info_length as usize) < size || info_ptr == 0 {
+                        return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
+                    }
+                    let info = FilePositionInformation {
+                        current_byte_offset: position.load(Relaxed) as i64,
+                    };
+                    unsafe {
+                        core::ptr::write(info_ptr as *mut FilePositionInformation, info);
+                    }
+                    write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, size);
+                    NtStatus::STATUS_SUCCESS
+                }
+                _ => NtStatus::STATUS_INVALID_INFO_CLASS,
+            }
+        }
         NtObject::File {
             host_handle,
             position,
@@ -1260,6 +1862,32 @@ pub(crate) fn nt_set_information_file(
 
     match obj {
         NtObject::File {
+            raw_fd: Some(_),
+            position,
+            ..
+        } => match info_class {
+            // FilePositionInformation (14) — seek. VFS files just update cached position.
+            14 => {
+                let size = core::mem::size_of::<FilePositionInformation>();
+                if (info_length as usize) < size || info_ptr == 0 {
+                    return NtStatus::STATUS_INVALID_PARAMETER;
+                }
+                let info = unsafe { core::ptr::read(info_ptr as *const FilePositionInformation) };
+                if info.current_byte_offset >= 0 {
+                    position.store(info.current_byte_offset as u64, Relaxed);
+                    write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, size);
+                    NtStatus::STATUS_SUCCESS
+                } else {
+                    NtStatus::STATUS_INVALID_PARAMETER
+                }
+            }
+            13 => {
+                write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, 0);
+                NtStatus::STATUS_SUCCESS
+            }
+            _ => NtStatus::STATUS_INVALID_INFO_CLASS,
+        },
+        NtObject::File {
             host_handle,
             position,
             ..
@@ -1309,7 +1937,10 @@ pub(crate) fn nt_set_information_file(
 ///     PFILE_BASIC_INFORMATION FileInformation         // rdx
 /// );
 /// ```
-pub(crate) fn nt_query_attributes_file(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+pub(crate) fn nt_query_attributes_file(
+    ctx: &mut super::super::ExecutionContext,
+    shared: &super::super::NtSharedState,
+) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let obj_attr_ptr = args.arg0;
     let info_ptr = args.arg1;
@@ -1323,7 +1954,29 @@ pub(crate) fn nt_query_attributes_file(ctx: &mut super::super::ExecutionContext)
         return NtStatus::STATUS_OBJECT_NAME_INVALID;
     };
 
-    let Some(host_path) = translate_nt_path(&nt_path) else {
+    // Try VFS first — only for file paths (not directories).
+    if let Some(TranslatedPath::Vfs(ref vfs_path)) = translate_nt_path(&nt_path)
+        && let Some(fs) = shared.fs.get()
+    {
+        use litebox::fs::FileSystem as _;
+        if let Ok(status) = fs.file_status(&**vfs_path) {
+            if info_ptr != 0 {
+                let is_dir = status.file_type == litebox::fs::FileType::Directory;
+                let info = FileBasicInformation {
+                    file_attributes: if is_dir { 0x10 } else { 0x80 },
+                    ..FileBasicInformation::default()
+                };
+                unsafe {
+                    core::ptr::write(info_ptr as *mut FileBasicInformation, info);
+                }
+            }
+            return NtStatus::STATUS_SUCCESS;
+        }
+        // VFS file_status failed — fall through to host.
+    }
+
+    // Host fallback.
+    let Some(host_path) = translate_nt_path_to_host(&nt_path) else {
         return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
     };
 
@@ -1514,6 +2167,7 @@ pub(crate) fn nt_query_volume_information_file(
 pub(crate) fn nt_query_directory_file(
     ctx: &mut super::super::ExecutionContext,
     handles: &mut crate::handle_table::HandleTable,
+    shared: &super::super::NtSharedState,
 ) -> NtStatus {
     use crate::handle_table::DirEnumEntry;
 
@@ -1546,37 +2200,136 @@ pub(crate) fn nt_query_directory_file(
         enum_index,
     }) = handles.get_mut(file_handle)
     {
-        // Restart scan or first call — (re)populate from host filesystem.
+        // Restart scan or first call — (re)populate entries.
         if restart_scan || enum_entries.is_empty() {
-            let Some(host_dir) = translate_nt_path(path) else {
-                write_iosb(io_status_ptr, NtStatus::STATUS_OBJECT_PATH_NOT_FOUND, 0);
-                return NtStatus::STATUS_OBJECT_PATH_NOT_FOUND;
-            };
+            // Determine if this is a VFS-translatable path AND VFS is available.
+            let is_vfs_path = shared.fs.get().is_some()
+                && (matches!(
+                    drive_path_to_vfs(path),
+                    Some(TranslatedPath::Vfs(_) | TranslatedPath::Device(_))
+                ) || matches!(
+                    translate_nt_path(path),
+                    Some(TranslatedPath::Vfs(_) | TranslatedPath::Device(_))
+                ));
 
-            let filter = if filename_ptr != 0 {
-                read_unicode_string_from_guest(filename_ptr)
-            } else {
-                None
-            };
+            // Try VFS first. Returns Ok(entries) on success, Err(status) for
+            // real VFS errors, or the outer Option is None if not VFS-translatable.
+            let vfs_result: Option<Result<alloc::vec::Vec<DirEnumEntry>, NtStatus>> =
+                (|| -> Option<Result<alloc::vec::Vec<DirEnumEntry>, NtStatus>> {
+                    let vfs_path = match drive_path_to_vfs(path) {
+                        Some(TranslatedPath::Vfs(p)) => p,
+                        _ => match translate_nt_path(path) {
+                            Some(TranslatedPath::Vfs(p)) => p,
+                            _ => return None,
+                        },
+                    };
+                    let fs = shared.fs.get()?;
+                    use litebox::fs::FileSystem as _;
+                    let dir_fd = match fs.open(
+                        &*vfs_path,
+                        litebox::fs::OFlags::DIRECTORY | litebox::fs::OFlags::RDONLY,
+                        litebox::fs::Mode::empty(),
+                    ) {
+                        Ok(fd) => fd,
+                        Err(ref e) => return Some(Err(map_open_error_to_ntstatus(e))),
+                    };
+                    let entries = match fs.read_dir(&dir_fd) {
+                        Ok(e) => {
+                            let _ = fs.close(&dir_fd);
+                            e
+                        }
+                        Err(ref e) => {
+                            let _ = fs.close(&dir_fd);
+                            return Some(Err(map_readdir_error_to_ntstatus(e)));
+                        }
+                    };
+                    Some(Ok(entries
+                        .into_iter()
+                        .map(|e| {
+                            let is_dir = e.file_type == litebox::fs::FileType::Directory;
+                            let file_size = if is_dir {
+                                0
+                            } else {
+                                let full = alloc::format!("{}/{}", vfs_path, e.name);
+                                fs.file_status(&*full).map(|s| s.size as i64).unwrap_or(0)
+                            };
+                            let attrs = if is_dir {
+                                0x10 // FILE_ATTRIBUTE_DIRECTORY
+                            } else {
+                                0x80 // FILE_ATTRIBUTE_NORMAL
+                            };
+                            DirEnumEntry {
+                                name: e.name,
+                                attributes: attrs,
+                                file_size,
+                                creation_time: 0,
+                                last_access_time: 0,
+                                last_write_time: 0,
+                            }
+                        })
+                        .collect()))
+                })();
 
-            let search_pattern = if let Some(ref f) = filter {
-                alloc::format!("{host_dir}\\{f}")
-            } else {
-                alloc::format!("{host_dir}\\*")
-            };
+            match vfs_result {
+                Some(Ok(entries)) => {
+                    // Apply filename filter if provided.
+                    let filter = if filename_ptr != 0 {
+                        read_unicode_string_from_guest(filename_ptr)
+                    } else {
+                        None
+                    };
+                    *enum_entries = if let Some(ref pattern) = filter {
+                        let pat_lower = pattern.to_ascii_lowercase();
+                        entries
+                            .into_iter()
+                            .filter(|e| nt_wildcard_match(&e.name.to_ascii_lowercase(), &pat_lower))
+                            .collect()
+                    } else {
+                        entries
+                    };
+                }
+                Some(Err(status)) => {
+                    // Real VFS error — return immediately.
+                    write_iosb(io_status_ptr, status, 0);
+                    return status;
+                }
+                None if is_vfs_path => {
+                    // VFS-translatable but no fs available — empty result.
+                    *enum_entries = alloc::vec::Vec::new();
+                }
+                None => {
+                    // Fallback to host filesystem (non-VFS paths only).
+                    let Some(host_dir) = translate_nt_path_to_host(path) else {
+                        write_iosb(io_status_ptr, NtStatus::STATUS_OBJECT_PATH_NOT_FOUND, 0);
+                        return NtStatus::STATUS_OBJECT_PATH_NOT_FOUND;
+                    };
 
-            let host_entries = host::find_files(&search_pattern);
-            *enum_entries = host_entries
-                .into_iter()
-                .map(|e| DirEnumEntry {
-                    name: e.name,
-                    attributes: e.attributes,
-                    file_size: e.file_size,
-                    creation_time: e.creation_time,
-                    last_access_time: e.last_access_time,
-                    last_write_time: e.last_write_time,
-                })
-                .collect();
+                    let filter = if filename_ptr != 0 {
+                        read_unicode_string_from_guest(filename_ptr)
+                    } else {
+                        None
+                    };
+
+                    let search_pattern = if let Some(ref f) = filter {
+                        alloc::format!("{host_dir}\\{f}")
+                    } else {
+                        alloc::format!("{host_dir}\\*")
+                    };
+
+                    let host_entries = host::find_files(&search_pattern);
+                    *enum_entries = host_entries
+                        .into_iter()
+                        .map(|e| DirEnumEntry {
+                            name: e.name,
+                            attributes: e.attributes,
+                            file_size: e.file_size,
+                            creation_time: e.creation_time,
+                            last_access_time: e.last_access_time,
+                            last_write_time: e.last_write_time,
+                        })
+                        .collect();
+                }
+            }
             *enum_index = 0;
         }
 
@@ -1737,6 +2490,7 @@ pub(crate) fn nt_open_file(
     dll_tar_files: &std::sync::Mutex<
         Option<alloc::collections::BTreeMap<alloc::string::String, alloc::vec::Vec<u8>>>,
     >,
+    shared: &super::super::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let handle_out_ptr = args.arg0;
@@ -1766,6 +2520,81 @@ pub(crate) fn nt_open_file(
         let msg = alloc::format!("NT shim: NtOpenFile path={nt_path:?}\n");
         litebox_platform_multiplex::platform().debug_log_print(&msg);
     }
+
+    // ── VFS-first path ──────────────────────────────────────────────
+    // Try opening via VFS before falling back to dll_tar_files or host.
+    if let Some(translated) = translate_nt_path(&nt_path) {
+        let vfs_path = match &translated {
+            TranslatedPath::Vfs(p) => Some(p.as_str()),
+            TranslatedPath::Device(p) => Some(p.as_str()),
+            TranslatedPath::Registry(_) => None,
+        };
+        if let (Some(path), Some(fs)) = (vfs_path, shared.fs.get()) {
+            let is_directory = open_options & file_options::FILE_DIRECTORY_FILE != 0;
+
+            if is_directory {
+                // NtOpenFile is always "open existing" — validate the directory.
+                // VFS-translatable paths must not escape to host.
+                use litebox::fs::FileSystem as _;
+                let is_vfs_dir = fs
+                    .file_status(path)
+                    .is_ok_and(|s| s.file_type == litebox::fs::FileType::Directory);
+                if is_vfs_dir {
+                    return insert_directory_handle(
+                        handles,
+                        &nt_path,
+                        handle_out_ptr,
+                        io_status_ptr,
+                        1, // FILE_OPENED
+                    );
+                }
+                // Directory not found in VFS — authoritative failure.
+                return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+
+            use litebox::fs::FileSystem as _;
+            if let Ok(typed_fd) = fs.open(
+                path,
+                litebox::fs::OFlags::RDONLY,
+                litebox::fs::Mode::RUSR | litebox::fs::Mode::WUSR,
+            ) {
+                let raw_fd = {
+                    let mut rds = shared.raw_fds.lock().unwrap();
+                    rds.fd_into_raw_integer(typed_fd)
+                };
+                let handle = handles.insert(NtObject::File {
+                    path: nt_path,
+                    host_handle: 0,
+                    position: Arc::new(AtomicU64::new(0)),
+                    raw_fd: Some(raw_fd),
+                    vfs_refcount: Some(Arc::new(core::sync::atomic::AtomicUsize::new(1))),
+                });
+                unsafe {
+                    core::ptr::write(handle_out_ptr as *mut u32, handle);
+                }
+                if io_status_ptr != 0 {
+                    let iosb = IoStatusBlock {
+                        status: NtStatus::STATUS_SUCCESS.0,
+                        _pad: 0,
+                        information: 1,
+                    };
+                    unsafe {
+                        core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+                    }
+                }
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtOpenFile VFS OK path={path:?} raw_fd={raw_fd}\n",
+                    ));
+                }
+                return NtStatus::STATUS_SUCCESS;
+            }
+        }
+    }
+
+    // ── Legacy path: dll_tar_files lookup ────────────────────────────
 
     // Extract the filename (last path component) for tar lookup.
     let filename = nt_path
@@ -1821,7 +2650,7 @@ pub(crate) fn nt_open_file(
     let is_directory = open_options & file_options::FILE_DIRECTORY_FILE != 0;
 
     // Translate NT path to host path.
-    let Some(host_path) = translate_nt_path(&nt_path) else {
+    let Some(host_path) = translate_nt_path_to_host(&nt_path) else {
         #[cfg(debug_assertions)]
         {
             use litebox::platform::DebugLogProvider as _;
@@ -1876,6 +2705,8 @@ pub(crate) fn nt_open_file(
         path: nt_path,
         host_handle,
         position: Arc::new(AtomicU64::new(0)),
+        raw_fd: None,
+        vfs_refcount: None,
     });
     unsafe {
         core::ptr::write(handle_out_ptr as *mut u32, handle);

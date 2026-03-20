@@ -96,6 +96,7 @@ impl NtStatus {
     pub const STATUS_BREAKPOINT: Self = Self(0x8000_0003u32 as i32);
     pub const STATUS_ILLEGAL_INSTRUCTION: Self = Self(0xC000_001Du32 as i32);
     pub const STATUS_IN_PAGE_ERROR: Self = Self(0xC000_0006u32 as i32);
+    pub const STATUS_UNEXPECTED_IO_ERROR: Self = Self(0xC000_00E9u32 as i32);
 }
 
 impl core::fmt::Display for NtStatus {
