@@ -47,6 +47,7 @@ const ENAMETOOLONG: u32 = 36;
 const ENOSYS: u32 = 38;
 const ENOTEMPTY: u32 = 39;
 const EOPNOTSUPP: u32 = 95;
+const EROFS: u32 = 30;
 
 /// Error type for 9P operations
 #[derive(Debug, Error)]
@@ -78,6 +79,7 @@ impl From<Error> for OpenError {
                 EPERM | EACCES => OpenError::AccessNotAllowed,
                 ENOTDIR => OpenError::PathError(PathError::ComponentNotADirectory),
                 ENAMETOOLONG => OpenError::PathError(PathError::InvalidPathname),
+                EROFS => OpenError::ReadOnlyFileSystem,
                 _ => OpenError::Io,
             },
             Error::Interrupted => OpenError::Interrupted,
@@ -124,6 +126,7 @@ impl From<Error> for MkdirError {
                 EPERM | EACCES => MkdirError::NoWritePerms,
                 ENOTDIR => MkdirError::PathError(PathError::ComponentNotADirectory),
                 ENAMETOOLONG => MkdirError::PathError(PathError::InvalidPathname),
+                EROFS => MkdirError::ReadOnlyFileSystem,
                 _ => MkdirError::Io,
             },
             Error::Io | Error::InvalidResponse | Error::Interrupted => MkdirError::Io,

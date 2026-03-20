@@ -146,21 +146,41 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             if dir == path {
                 return Ok(());
             }
+            // Check if the ancestor already exists on the upper layer.
+            // This handles dirs created on upper in a prior layered mkdir
+            // (e.g., a parent that only exists in the in-mem FS because the
+            // lower layer couldn't create it).
+            match self.upper.file_status(dir) {
+                Ok(FileStatus {
+                    file_type: FileType::Directory,
+                    ..
+                }) => continue,
+                Ok(_) => return Err(MkdirError::PathError(PathError::ComponentNotADirectory)),
+                Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => {
+                    // Not on upper; check lower and migrate if found.
+                }
+                Err(FileStatusError::PathError(e @ PathError::NoSearchPerms { .. })) => {
+                    return Err(e)?;
+                }
+                Err(FileStatusError::PathError(PathError::ComponentNotADirectory)) => {
+                    return Err(MkdirError::PathError(PathError::ComponentNotADirectory));
+                }
+                Err(FileStatusError::PathError(PathError::InvalidPathname)) => {
+                    unreachable!("we just confirmed valid path")
+                }
+                Err(_) => return Err(MkdirError::Io),
+            }
             match self.ensure_lower_contains(dir) {
                 Ok(FileType::Directory) => {
-                    // The dir does in fact exist; we just need to confirm that the upper layer also
-                    // has it.
+                    // The dir exists on lower; mirror it on upper.
                     match self
                         .upper
                         .mkdir(dir, self.lower.file_status(dir).unwrap().mode)
                     {
-                        Ok(()) => {
-                            // fallthrough to next increasing ancestor
-                        }
+                        Ok(()) | Err(MkdirError::AlreadyExists) => {}
                         Err(e) => match e {
-                            MkdirError::AlreadyExists => {
-                                // perfectly fine, just fallthrough to next place in the loop
-                            }
                             MkdirError::ReadOnlyFileSystem
                             | MkdirError::Io
                             | MkdirError::NoWritePerms
@@ -176,6 +196,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                             ) => {
                                 unreachable!()
                             }
+                            _ => return Err(MkdirError::Io),
                         },
                     }
                 }
@@ -759,10 +780,12 @@ impl<
                     OpenError::PathError(
                         PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                     )
-                    | OpenError::ReadOnlyFileSystem,
+                    | OpenError::ReadOnlyFileSystem
+                    | OpenError::Io,
                 ) => {
-                    // Parent dir doesn't exist on lower, or lower is read-only
-                    // for this path — fall through to upper-layer creation.
+                    // Parent dir doesn't exist on lower, lower is read-only
+                    // for this path, or transport error — fall through to
+                    // upper-layer creation.
                 }
                 Err(e) => return Err(e),
             }
@@ -1639,9 +1662,11 @@ impl<
                     MkdirError::PathError(
                         PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                     )
-                    | MkdirError::ReadOnlyFileSystem,
+                    | MkdirError::ReadOnlyFileSystem
+                    | MkdirError::Io,
                 ) => {
-                    // Parent doesn't exist on lower — fall through to upper.
+                    // Parent doesn't exist on lower, or lower had a
+                    // transport error — fall through to upper.
                 }
                 Err(e) => return Err(e),
             }
@@ -1658,7 +1683,6 @@ impl<
             }
             Err(e) => match e {
                 MkdirError::NoWritePerms
-                | MkdirError::Io
                 | MkdirError::AlreadyExists
                 | MkdirError::ReadOnlyFileSystem
                 | MkdirError::PathError(
@@ -1671,8 +1695,11 @@ impl<
                 MkdirError::PathError(PathError::NoSuchFileOrDirectory) => {
                     unreachable!()
                 }
-                MkdirError::PathError(PathError::MissingComponent) => {
-                    // fallthrough
+                MkdirError::PathError(PathError::MissingComponent) | MkdirError::Io => {
+                    // MissingComponent: ancestor only exists on lower,
+                    // needs migration. Io: nested layered FS couldn't
+                    // resolve the path. Both cases fall through to
+                    // ancestor migration.
                 }
             },
         }
