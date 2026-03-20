@@ -58,10 +58,16 @@ bitflags::bitflags! {
 impl VmFlags {
     /// Compute the default `VM_MAY*` and `VM_SHARED` flags for a mapping.
     ///
-    /// Write permission (`VM_MAYWRITE`) is restricted only for shared **file-backed**
-    /// mappings, because writes cannot be propagated back to the underlying file.
-    pub(super) fn may_flags_for_mapping(shared: bool, file_backed: bool) -> Self {
-        let restrict_write = shared && file_backed;
+    /// Write permission (`VM_MAYWRITE`) is restricted for shared file-backed
+    /// mappings opened read-only, because writeback to a non-writable fd
+    /// cannot succeed. When the fd is writable, the shim's explicit writeback
+    /// mechanism handles flushing dirty pages to the file.
+    pub(super) fn may_flags_for_mapping(
+        shared: bool,
+        file_backed: bool,
+        fd_writable: bool,
+    ) -> Self {
+        let restrict_write = shared && file_backed && !fd_writable;
         let may = if restrict_write {
             Self::VM_MAY_ACCESS_FLAGS & !Self::VM_MAYWRITE
         } else {
@@ -143,6 +149,10 @@ bitflags::bitflags! {
         const NOREPLACE = 1 << 5;
         /// The mapping is shared.
         const SHARED = 1 << 6;
+        /// The underlying fd is writable. When set for a shared file-backed
+        /// mapping, the VMA gets `VM_MAYWRITE` so `mprotect(PROT_WRITE)` can
+        /// succeed later.
+        const FD_WRITABLE = 1 << 7;
     }
 }
 
@@ -894,13 +904,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
+        let fd_writable = flags.contains(CreatePagesFlags::FD_WRITABLE);
         unsafe {
             self.create_mapping(
                 suggested_new_address,
                 length,
                 VmArea::new(
                     VmFlags::from(perms)
-                        | VmFlags::may_flags_for_mapping(shared, file_backed)
+                        | VmFlags::may_flags_for_mapping(shared, file_backed, fd_writable)
                         | if flags.contains(CreatePagesFlags::IS_STACK) {
                             VmFlags::VM_GROWSDOWN
                         } else {

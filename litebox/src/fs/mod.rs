@@ -168,6 +168,16 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         None
     }
 
+    /// Check whether the given fd was opened with write access (`O_WRONLY` or
+    /// `O_RDWR`).
+    ///
+    /// This is a pure metadata query with no I/O side effects. The default
+    /// implementation conservatively returns `true`.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn is_writable(&self, fd: &TypedFd<Self>) -> bool {
+        true
+    }
+
     /// Get an `IOPollable` for a file descriptor, if the underlying device supports polling.
     ///
     /// Returns `Some(pollable)` for device types with async event support (e.g., PTY master),

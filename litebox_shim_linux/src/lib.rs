@@ -238,6 +238,7 @@ impl LinuxShimBuilder {
             thread_count: core::sync::atomic::AtomicI32::new(1),
             active_cow: litebox::sync::Mutex::new(None),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
             main_bss_start: core::sync::atomic::AtomicUsize::new(0),
             main_bss_end: core::sync::atomic::AtomicUsize::new(0),
             vfork_parking: Arc::new(VforkParking {
@@ -2096,6 +2097,9 @@ struct ProcessState {
     active_cow: litebox::sync::Mutex<Platform, Option<Arc<CowState>>>,
     /// Per-fd ELF patching state for the runtime syscall rewriter.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// Tracks `MAP_SHARED|PROT_WRITE` file-backed mappings for writeback on
+    /// `munmap`. See [`syscalls::mm::SharedFileMapping`] for details.
+    shared_file_mappings: litebox::sync::Mutex<Platform, syscalls::mm::SharedFileMappings>,
     /// Page-aligned start of the main binary's `.bss` region (zero-filled
     /// portion of the writable PT_LOAD segment). Set once during ELF loading.
     main_bss_start: core::sync::atomic::AtomicUsize,

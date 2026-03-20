@@ -955,6 +955,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
+    fn is_writable(&self, fd: &FileFd<Platform>) -> bool {
+        let descriptor_table = self.litebox.descriptor_table();
+        let Some(entry) = descriptor_table.get_entry(fd) else {
+            return false;
+        };
+        matches!(
+            &entry.entry,
+            Descriptor::File {
+                write_allowed: true,
+                ..
+            }
+        )
+    }
+
     fn open_at(
         &self,
         dirfd: &FileFd<Platform>,

@@ -46,16 +46,94 @@ pub(crate) struct ElfPatchState {
 /// Per-process collection of ELF patching state, keyed by fd number.
 pub(crate) type ElfPatchCache = BTreeMap<i32, ElfPatchState>;
 
+/// Tracks a `MAP_SHARED` file-backed mapping from a writable fd so that
+/// dirty data can be written back to the underlying file on `munmap` or
+/// `msync`.
+///
+/// LLD (and other tools) write output files via `mmap(MAP_SHARED)` + memory
+/// stores + `munmap`. In the sandbox, file-backed shared mappings are backed
+/// by anonymous memory (the 9P transport has no kernel-level page cache), so
+/// we must explicitly flush modified data back to the file.
+///
+/// # Known limitation: no per-page dirty tracking
+///
+/// Writeback granularity is per-fragment, not per-page. When a fragment has
+/// `needs_writeback == true`, its entire range is flushed. Because the
+/// backing memory is an anonymous snapshot taken at `mmap()` time, pages
+/// the guest never modified still hold stale file contents from that point.
+/// If another path (e.g. `write()`) updates the same file region after the
+/// mapping was created, writeback can overwrite those newer bytes with the
+/// stale snapshot.
+///
+/// True per-page dirty tracking would require write-protecting mapped pages
+/// and trapping on first write (page-fault-based dirty bitmap), which is a
+/// platform-layer change well beyond this writeback mechanism. The primary
+/// use case — tool output files created via `ftruncate` + `mmap` — is
+/// unaffected because the file is freshly created and there are no
+/// concurrent modifications to race against.
+pub(crate) struct SharedFileMapping {
+    /// Guest virtual address of the mapping.
+    pub addr: usize,
+    /// Length of the mapping (page-aligned).
+    pub len: usize,
+    /// Internal file handle for writeback. This is a duplicate created via
+    /// `Descriptors::duplicate()` that lives only in the global descriptor
+    /// table — it is NOT stored in the per-process `RawDescriptorStorage`,
+    /// so the guest cannot enumerate, close, or otherwise interfere with it.
+    ///
+    /// Contains a `TypedFd<FS>` type-erased as `Box<dyn Any + Send + Sync>`.
+    /// Writeback and close operations downcast back to `&TypedFd<FS>` and
+    /// call `fs.write()` / `fs.close()` directly.
+    internal_fd: InternalHandle,
+    /// File offset that was passed to `mmap`.
+    pub file_offset: usize,
+    /// Whether this mapping has been writable (and thus potentially dirty).
+    /// Set at mmap time if `PROT_WRITE` is requested, or later by
+    /// `sys_mprotect` when write permission is added. Writeback is skipped
+    /// for entries where this is `false` to avoid overwriting newer file
+    /// data with stale CoW pages.
+    needs_writeback: bool,
+}
+
+/// Per-process collection of shared file mappings pending writeback.
+pub(crate) type SharedFileMappings = alloc::vec::Vec<SharedFileMapping>;
+
+/// Type-erased internal file handle (contains `TypedFd<FS>`).
+type InternalHandle = alloc::boxed::Box<dyn core::any::Any + Send + Sync>;
+
+/// Read `len` bytes from guest address `addr` for MAP_SHARED writeback.
+///
+/// Fast path: the pages are already readable — `to_owned_slice()` succeeds.
+/// Slow path: the pages may have been made inaccessible via `mprotect(PROT_NONE)`.
+/// In that case we temporarily upgrade them to `PROT_READ`, read the data,
+/// and **restore them to inaccessible** so the caller's mapping permissions
+/// are not permanently altered.
+fn read_for_writeback(
+    pm: &litebox::mm::PageManager<litebox_platform_multiplex::Platform, { PAGE_SIZE }>,
+    addr: usize,
+    len: usize,
+) -> Option<alloc::boxed::Box<[u8]>> {
+    let src = crate::ConstPtr::<u8>::from_usize(addr);
+    if let Some(data) = src.to_owned_slice(len) {
+        return Some(data);
+    }
+    // Slow path: temporarily make pages readable.
+    // SAFETY: upgrading existing mapped pages to readable for writeback.
+    let ptr = crate::MutPtr::<u8>::from_usize(addr);
+    unsafe { pm.make_pages_readable(ptr, len) }.ok()?;
+    let data = src.to_owned_slice(len);
+    // Restore pages to inaccessible — the only non-readable state that
+    // could have caused the fast path to fail is PROT_NONE.
+    let _ = unsafe { pm.make_pages_inaccessible(ptr, len) };
+    data
+}
+
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     (addr + align - 1) & !(align - 1)
 }
 
-#[expect(
-    dead_code,
-    reason = "unused but exists to be symmetric to `align_up` here"
-)]
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
@@ -63,6 +141,81 @@ fn align_down(addr: usize, align: usize) -> usize {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    // ── Internal fd helpers for MAP_SHARED writeback ────────────────────
+
+    /// Create an internal file handle by duplicating `raw_fd` (a guest fd)
+    /// in the global descriptor table. The new entry is NOT stored in
+    /// `RawDescriptorStorage`, so the guest cannot see or close it.
+    fn duplicate_internal_fs_fd(&self, raw_fd: i32) -> Result<InternalHandle, Errno> {
+        let raw_fd_usize = usize::try_from(u32::try_from(raw_fd).map_err(|_| Errno::EBADF)?)
+            .map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+        // Retrieve the TypedFd for the guest fd, then release the RDS lock
+        // before taking the DT write lock (consistent lock ordering).
+        let arc_fd: alloc::sync::Arc<litebox::fd::TypedFd<FS>> = {
+            let rds = files.raw_descriptor_store.read();
+            rds.fd_from_raw_integer::<FS>(raw_fd_usize)
+                .map_err(|_| Errno::EBADF)?
+        };
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let new_fd = dt.duplicate(&*arc_fd).ok_or(Errno::EBADF)?;
+        drop(dt);
+        Ok(alloc::boxed::Box::new(new_fd))
+    }
+
+    /// Create a new internal file handle by duplicating an existing one.
+    /// Used when a partial munmap or mremap splits a mapping into fragments
+    /// that each need their own independent handle.
+    fn duplicate_internal_handle(
+        &self,
+        handle: &dyn core::any::Any,
+    ) -> Result<InternalHandle, Errno> {
+        let fd = handle
+            .downcast_ref::<litebox::fd::TypedFd<FS>>()
+            .ok_or(Errno::EBADF)?;
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let new_fd = dt.duplicate(fd).ok_or(Errno::EBADF)?;
+        drop(dt);
+        Ok(alloc::boxed::Box::new(new_fd))
+    }
+
+    /// Write to the file referenced by an internal handle.
+    fn internal_fs_write(
+        &self,
+        handle: &dyn core::any::Any,
+        buf: &[u8],
+        offset: Option<usize>,
+    ) -> Result<usize, Errno> {
+        let fd = handle
+            .downcast_ref::<litebox::fd::TypedFd<FS>>()
+            .ok_or(Errno::EBADF)?;
+        let files = self.files.borrow();
+        files.fs.write(fd, buf, offset).map_err(Errno::from)
+    }
+
+    /// Check whether the file referenced by an internal handle was opened
+    /// with write access. Pure metadata query — no I/O side effects.
+    fn internal_fs_is_writable(&self, handle: &dyn core::any::Any) -> bool {
+        let Some(fd) = handle.downcast_ref::<litebox::fd::TypedFd<FS>>() else {
+            return false;
+        };
+        let files = self.files.borrow();
+        files.fs.is_writable(fd)
+    }
+
+    /// Close an internal file handle. Takes ownership to ensure the handle
+    /// is dropped after the descriptor table entry is removed.
+    fn internal_fs_close(&self, handle: InternalHandle) {
+        if let Ok(fd) = handle.downcast::<litebox::fd::TypedFd<FS>>() {
+            let files = self.files.borrow();
+            let _ = files.fs.close(&*fd);
+            // `fd` is dropped here; OwnedFd::Drop is safe because
+            // fs.close() already called mark_as_closed().
+        }
+    }
+
+    // ── End of internal fd helpers ─────────────────────────────────────
+
     /// Get the FS-level path for a raw fd, if it's a filesystem fd.
     fn fd_path_for_raw(&self, fd: i32) -> Option<alloc::string::String> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
@@ -84,6 +237,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
@@ -91,6 +245,7 @@ impl<FS: ShimFS> Task<FS> {
         prot: ProtFlags,
         flags: MapFlags,
         ensure_space_after: bool,
+        fd_writable: bool,
         op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
     ) -> Result<MutPtr<u8>, MappingError> {
         litebox_common_linux::mm::do_mmap(
@@ -100,6 +255,7 @@ impl<FS: ShimFS> Task<FS> {
             prot,
             flags,
             ensure_space_after,
+            fd_writable,
             op,
         )
     }
@@ -113,9 +269,10 @@ impl<FS: ShimFS> Task<FS> {
         flags: MapFlags,
     ) -> Result<MutPtr<u8>, MappingError> {
         let op = |_| Ok(0);
-        self.do_mmap(suggested_addr, len, prot, flags, false, op)
+        self.do_mmap(suggested_addr, len, prot, flags, false, false, op)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn do_mmap_file(
         &self,
         suggested_addr: Option<usize>,
@@ -124,16 +281,17 @@ impl<FS: ShimFS> Task<FS> {
         flags: MapFlags,
         fd: i32,
         offset: usize,
+        fd_writable: bool,
     ) -> Result<MutPtr<u8>, MappingError> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
 
         // Perform the normal mmap first (CoW or memcpy fallback).
         let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset)
+            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset, fd_writable)
         {
             cow_result?
         } else {
-            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)?
+            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset, fd_writable)?
         };
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
@@ -535,6 +693,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Returns `Some(result)` if CoW was attempted (success or failure),
     /// `None` if CoW is not applicable (fall back to memcpy).
     // TODO(jb): does this need to be Option-Result or can it just be Option?
+    #[allow(clippy::too_many_arguments)]
     fn try_cow_mmap_file(
         &self,
         suggested_addr: Option<usize>,
@@ -543,6 +702,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: &MapFlags,
         fd: i32,
         offset: usize,
+        fd_writable: bool,
     ) -> Option<Result<MutPtr<u8>, MappingError>> {
         if !len.is_multiple_of(PAGE_SIZE) {
             return None;
@@ -627,6 +787,7 @@ impl<FS: ShimFS> Task<FS> {
                         true,
                         fixed_behavior == FixedAddressBehavior::Replace,
                         flags.contains(MapFlags::MAP_SHARED),
+                        fd_writable,
                     )
                 }
                 .unwrap();
@@ -638,6 +799,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Fallback mmap implementation using page-by-page memcpy, for files where the CoW attempt
     /// fails (either due to lack of support on platform, or non-static-backed data, etc.)
+    #[allow(clippy::too_many_arguments)]
     fn do_mmap_file_memcpy(
         &self,
         suggested_addr: Option<usize>,
@@ -646,6 +808,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: MapFlags,
         fd: i32,
         offset: usize,
+        fd_writable: bool,
     ) -> Result<MutPtr<u8>, MappingError> {
         let op = |ptr: MutPtr<u8>| -> Result<usize, MappingError> {
             // Note a malicious user may unmap ptr while we are reading.
@@ -684,6 +847,7 @@ impl<FS: ShimFS> Task<FS> {
             // Note we need to ensure that the space after the mapping is available
             // so that we could load trampoline code right after the mapping.
             offset == 0 && !fixed_addr,
+            fd_writable,
             op,
         )
     }
@@ -703,35 +867,13 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        // MAP_SHARED is partially supported:
-        // - Anonymous shared mappings are fully supported (no backing file concerns).
-        //   Note: since fork is not yet supported, shared anonymous mappings behave
-        //   identically to private ones (no cross-process sharing occurs).
-        // - File-backed shared mappings with PROT_WRITE: writes cannot be propagated
-        //   back to the underlying file, so we silently downgrade to MAP_PRIVATE
-        //   semantics. This is sufficient for applications that use MAP_SHARED|PROT_WRITE
-        //   for in-process mutable mappings (e.g. SQLite WAL, logging) but don't rely
-        //   on cross-process write visibility through the mapping.
-        if flags.contains(MapFlags::MAP_SHARED)
-            && prot.contains(ProtFlags::PROT_WRITE)
-            && !flags.contains(MapFlags::MAP_ANONYMOUS)
-        {
-            #[cfg(debug_assertions)]
-            {
-                let path = self
-                    .fd_path_for_raw(fd)
-                    .unwrap_or_else(|| alloc::format!("fd={fd}"));
-                litebox::log_println!(
-                    self.global.platform,
-                    "WARN: MAP_SHARED|PROT_WRITE on file-backed mapping downgraded to MAP_PRIVATE \
-                     (file={}, len={:#x}, offset={:#x}, prot={:?})",
-                    path,
-                    len,
-                    offset,
-                    prot
-                );
-            }
-        }
+        // MAP_SHARED file-backed mappings are executed with MAP_PRIVATE
+        // semantics (the sandbox has no kernel page cache for 9P files).
+        // We track the mapping so that `sys_munmap` can write back the dirty
+        // data to the underlying file, making tools like LLD (which write
+        // output via mmap + munmap) work correctly.
+        let is_shared_file =
+            flags.contains(MapFlags::MAP_SHARED) && !flags.contains(MapFlags::MAP_ANONYMOUS);
 
         if flags.intersects(
             MapFlags::MAP_32BIT
@@ -756,18 +898,418 @@ impl<FS: ShimFS> Task<FS> {
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
 
+        // For shared file-backed mappings, create an internal file handle and
+        // probe whether the fd is writable. Only writable fds get writeback
+        // tracking and VM_MAYWRITE on the VMA; read-only fds remain
+        // restricted so `mprotect(PROT_WRITE)` correctly fails.
+        let (internal_handle, fd_writable) = if is_shared_file {
+            let handle = self.duplicate_internal_fs_fd(fd)?;
+            let writable = self.internal_fs_is_writable(&*handle);
+            if writable {
+                (Some(handle), true)
+            } else {
+                self.internal_fs_close(handle);
+                (None, false)
+            }
+        } else {
+            (None, false)
+        };
+
+        // MAP_FIXED replaces any existing mapping in the target range.
+        // Snapshot overlapping MAP_SHARED tracking data while pages are still
+        // live; the actual writeback and tracking removal happen only after a
+        // successful mmap (so a failed mmap leaves tracking intact).
+        let fixed_snapshots = if flags.contains(MapFlags::MAP_FIXED)
+            && let Some(suggested) = suggested_addr
+        {
+            self.snapshot_shared_mappings(suggested, aligned_len)
+        } else {
+            alloc::vec::Vec::new()
+        };
+
+        let prot_write = prot.contains(ProtFlags::PROT_WRITE);
+
         let result = if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
         } else {
-            self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
+            self.do_mmap_file(
+                suggested_addr,
+                aligned_len,
+                prot,
+                flags,
+                fd,
+                offset,
+                fd_writable,
+            )
         };
-        result.map_err(Errno::from)
+
+        let mapped_addr = match result {
+            Ok(addr) => addr,
+            Err(e) => {
+                // Discard snapshots — tracking entries are still intact.
+                for (handle, _, _) in fixed_snapshots {
+                    self.internal_fs_close(handle);
+                }
+                // Clean up the internal handle if mmap itself failed.
+                if let Some(handle) = internal_handle {
+                    self.internal_fs_close(handle);
+                }
+                return Err(Errno::from(e));
+            }
+        };
+
+        // MAP_FIXED succeeded: write back displaced mapping data and remove
+        // their tracking entries.
+        if !fixed_snapshots.is_empty() {
+            for (handle, file_offset, data) in &fixed_snapshots {
+                let mut written = 0;
+                while written < data.len() {
+                    match self.internal_fs_write(
+                        &**handle,
+                        &data[written..],
+                        Some(*file_offset + written),
+                    ) {
+                        Ok(n) => written += n,
+                        Err(_) => break,
+                    }
+                }
+            }
+            for (handle, _, _) in fixed_snapshots {
+                self.internal_fs_close(handle);
+            }
+            // Remove tracking entries for the displaced range.
+            // The snapshot handles were temporary duplicates; the original
+            // tracking handles are closed by remove_shared_tracking.
+            self.remove_shared_tracking(suggested_addr.unwrap(), aligned_len);
+        }
+
+        // Record the mapping for writeback on munmap/exit/exec.
+        if let Some(handle) = internal_handle {
+            self.process_state
+                .borrow()
+                .shared_file_mappings
+                .lock()
+                .push(SharedFileMapping {
+                    addr: mapped_addr.as_usize(),
+                    len: aligned_len,
+                    internal_fd: handle,
+                    file_offset: offset,
+                    needs_writeback: prot_write,
+                });
+        }
+
+        Ok(mapped_addr)
+    }
+
+    /// Write back dirty data from `MAP_SHARED` file-backed mappings that
+    /// overlap `[unmap_start, unmap_start + unmap_len)`, then remove their
+    /// tracking entries. Must be called **before** the pages are deallocated.
+    fn writeback_shared_mappings(&self, unmap_start: usize, unmap_len: usize) {
+        let unmap_end = unmap_start + unmap_len;
+        let ps = self.process_state.borrow();
+        let mut mappings = ps.shared_file_mappings.lock();
+
+        // Collect handles to close after releasing the mappings lock.
+        let mut to_close: alloc::vec::Vec<InternalHandle> = alloc::vec::Vec::new();
+
+        // Drain entries that overlap the unmapped range.
+        let mut i = 0;
+        while i < mappings.len() {
+            let m = &mappings[i];
+            let m_end = m.addr + m.len;
+
+            // No overlap → skip.
+            if m.addr >= unmap_end || m_end <= unmap_start {
+                i += 1;
+                continue;
+            }
+
+            // Compute the overlapping region.
+            let wb_start = m.addr.max(unmap_start);
+            let wb_end = m_end.min(unmap_end);
+            let wb_file_offset = m.file_offset + (wb_start - m.addr);
+            let wb_len = wb_end - wb_start;
+
+            // Only write back if the mapping was ever writable (and thus
+            // potentially dirty). Read-only mappings are tracked for
+            // potential mprotect upgrades but contain unmodified CoW pages.
+            if m.needs_writeback {
+                let mut written = 0;
+                while written < wb_len {
+                    let chunk = (wb_len - written).min(PAGE_SIZE);
+                    if let Some(buf) = read_for_writeback(&ps.pm, wb_start + written, chunk) {
+                        let file_off = wb_file_offset + written;
+                        match self.internal_fs_write(&*m.internal_fd, &buf, Some(file_off)) {
+                            Ok(n) => written += n,
+                            Err(_) => break,
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // If the unmap covers the entire mapping, remove it.
+            if unmap_start <= m.addr && unmap_end >= m_end {
+                let removed = mappings.swap_remove(i);
+                to_close.push(removed.internal_fd);
+                // Don't increment i — swap_remove moved the last element here.
+            } else {
+                // Partial unmap: split the entry. The original handle goes to
+                // the first fragment; additional fragments get new duplicates.
+                let orig = mappings.remove(i);
+                let orig_addr = orig.addr;
+                let orig_file_offset = orig.file_offset;
+                let orig_needs_wb = orig.needs_writeback;
+
+                let need_left = orig_addr < unmap_start;
+                let need_right = m_end > unmap_end;
+
+                if need_left && need_right {
+                    // Two fragments: left gets original handle, right gets dup.
+                    let right_handle = self.duplicate_internal_handle(&*orig.internal_fd);
+                    mappings.insert(
+                        i,
+                        SharedFileMapping {
+                            addr: orig_addr,
+                            len: unmap_start - orig_addr,
+                            internal_fd: orig.internal_fd,
+                            file_offset: orig_file_offset,
+                            needs_writeback: orig_needs_wb,
+                        },
+                    );
+                    i += 1;
+                    if let Ok(rh) = right_handle {
+                        mappings.insert(
+                            i,
+                            SharedFileMapping {
+                                addr: unmap_end,
+                                len: m_end - unmap_end,
+                                internal_fd: rh,
+                                file_offset: orig_file_offset + (unmap_end - orig_addr),
+                                needs_writeback: orig_needs_wb,
+                            },
+                        );
+                        i += 1;
+                    }
+                } else if need_left {
+                    mappings.insert(
+                        i,
+                        SharedFileMapping {
+                            addr: orig_addr,
+                            len: unmap_start - orig_addr,
+                            internal_fd: orig.internal_fd,
+                            file_offset: orig_file_offset,
+                            needs_writeback: orig_needs_wb,
+                        },
+                    );
+                    i += 1;
+                } else if need_right {
+                    mappings.insert(
+                        i,
+                        SharedFileMapping {
+                            addr: unmap_end,
+                            len: m_end - unmap_end,
+                            internal_fd: orig.internal_fd,
+                            file_offset: orig_file_offset + (unmap_end - orig_addr),
+                            needs_writeback: orig_needs_wb,
+                        },
+                    );
+                    i += 1;
+                } else {
+                    to_close.push(orig.internal_fd);
+                }
+            }
+        }
+
+        // Release the mappings lock before closing handles (close takes the
+        // DT write lock; holding both is safe but releasing early is cleaner).
+        drop(mappings);
+        drop(ps);
+        for handle in to_close {
+            self.internal_fs_close(handle);
+        }
+    }
+
+    /// Remove and close tracking entries that overlap `[start, start + len)`
+    /// **without** reading from the mapped pages. Used after MAP_FIXED
+    /// replacement, where the pages have already been replaced and the data
+    /// was previously snapshotted.
+    fn remove_shared_tracking(&self, start: usize, len: usize) {
+        let end = start + len;
+        let ps = self.process_state.borrow();
+        let mut mappings = ps.shared_file_mappings.lock();
+        let mut to_close: alloc::vec::Vec<InternalHandle> = alloc::vec::Vec::new();
+
+        let mut i = 0;
+        while i < mappings.len() {
+            let m = &mappings[i];
+            let m_end = m.addr + m.len;
+
+            if m.addr >= end || m_end <= start {
+                i += 1;
+                continue;
+            }
+
+            // Fully covered → remove.
+            if start <= m.addr && end >= m_end {
+                let removed = mappings.swap_remove(i);
+                to_close.push(removed.internal_fd);
+            } else {
+                let orig = mappings.remove(i);
+                let orig_addr = orig.addr;
+                let orig_file_offset = orig.file_offset;
+                let orig_needs_wb = orig.needs_writeback;
+                let need_left = orig_addr < start;
+                let need_right = m_end > end;
+
+                if need_left && need_right {
+                    let right_handle = self.duplicate_internal_handle(&*orig.internal_fd);
+                    mappings.insert(
+                        i,
+                        SharedFileMapping {
+                            addr: orig_addr,
+                            len: start - orig_addr,
+                            internal_fd: orig.internal_fd,
+                            file_offset: orig_file_offset,
+                            needs_writeback: orig_needs_wb,
+                        },
+                    );
+                    i += 1;
+                    if let Ok(rh) = right_handle {
+                        mappings.insert(
+                            i,
+                            SharedFileMapping {
+                                addr: end,
+                                len: m_end - end,
+                                internal_fd: rh,
+                                file_offset: orig_file_offset + (end - orig_addr),
+                                needs_writeback: orig_needs_wb,
+                            },
+                        );
+                        i += 1;
+                    }
+                } else if need_left {
+                    mappings.insert(
+                        i,
+                        SharedFileMapping {
+                            addr: orig_addr,
+                            len: start - orig_addr,
+                            internal_fd: orig.internal_fd,
+                            file_offset: orig_file_offset,
+                            needs_writeback: orig_needs_wb,
+                        },
+                    );
+                    i += 1;
+                } else if need_right {
+                    mappings.insert(
+                        i,
+                        SharedFileMapping {
+                            addr: end,
+                            len: m_end - end,
+                            internal_fd: orig.internal_fd,
+                            file_offset: orig_file_offset + (end - orig_addr),
+                            needs_writeback: orig_needs_wb,
+                        },
+                    );
+                    i += 1;
+                } else {
+                    to_close.push(orig.internal_fd);
+                }
+            }
+        }
+
+        drop(mappings);
+        drop(ps);
+        for handle in to_close {
+            self.internal_fs_close(handle);
+        }
+    }
+
+    /// Write back and close **all** tracked `MAP_SHARED` file-backed mappings.
+    /// Called before `release_memory()` on exit and exec so dirty data is not
+    /// silently dropped.
+    pub(crate) fn flush_all_shared_mappings(&self) {
+        let ps = self.process_state.borrow();
+        let mut mappings = ps.shared_file_mappings.lock();
+
+        // Write back all fragments that were ever writable.
+        for m in mappings.iter() {
+            if !m.needs_writeback {
+                continue;
+            }
+            let mut written = 0;
+            while written < m.len {
+                let chunk = (m.len - written).min(PAGE_SIZE);
+                if let Some(buf) = read_for_writeback(&ps.pm, m.addr + written, chunk) {
+                    let file_off = m.file_offset + written;
+                    match self.internal_fs_write(&*m.internal_fd, &buf, Some(file_off)) {
+                        Ok(n) => written += n,
+                        Err(_) => break,
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Drain all entries and collect handles for closing.
+        let handles: alloc::vec::Vec<_> = mappings.drain(..).map(|m| m.internal_fd).collect();
+        drop(mappings);
+        drop(ps);
+
+        // Close each handle (each is independent — no shared-fd concern).
+        for handle in handles {
+            self.internal_fs_close(handle);
+        }
+    }
+
+    /// Write back all tracked `MAP_SHARED` file-backed mappings without
+    /// removing tracking entries or closing handles.
+    ///
+    /// Used in the shared-fork (vfork) path: the child flushes dirty data
+    /// while still sharing the parent's `ProcessState`, so the parent's
+    /// tracking and handles must remain intact for future use. The parent's
+    /// CoW restore will revert the in-memory pages after this flush, but the
+    /// file will already have the child's writes.
+    pub(crate) fn sync_all_shared_mappings(&self) {
+        let ps = self.process_state.borrow();
+        let mappings = ps.shared_file_mappings.lock();
+
+        for m in mappings.iter() {
+            if !m.needs_writeback {
+                continue;
+            }
+            let mut written = 0;
+            while written < m.len {
+                let chunk = (m.len - written).min(PAGE_SIZE);
+                if let Some(buf) = read_for_writeback(&ps.pm, m.addr + written, chunk) {
+                    let file_off = m.file_offset + written;
+                    match self.internal_fs_write(&*m.internal_fd, &buf, Some(file_off)) {
+                        Ok(n) => written += n,
+                        Err(_) => break,
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     /// Handle syscall `munmap`
-    #[inline]
     pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_munmap(&self.process_state.borrow().pm, addr, len)
+        if len == 0 || !addr.as_usize().is_multiple_of(PAGE_SIZE) {
+            return Err(Errno::EINVAL);
+        }
+        let aligned_len = align_up(len, PAGE_SIZE);
+        if addr.as_usize().checked_add(aligned_len).is_none() {
+            return Err(Errno::EINVAL);
+        }
+
+        // Write back any MAP_SHARED file-backed data before deallocating pages.
+        self.writeback_shared_mappings(addr.as_usize(), aligned_len);
+
+        litebox_common_linux::mm::sys_munmap(&self.process_state.borrow().pm, addr, aligned_len)
     }
 
     /// Handle syscall `mprotect`
@@ -816,10 +1358,113 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
         }
-        litebox_common_linux::mm::sys_mprotect(&self.process_state.borrow().pm, addr, len, prot)
+        let adding_write = prot.contains(ProtFlags::PROT_WRITE);
+        litebox_common_linux::mm::sys_mprotect(&self.process_state.borrow().pm, addr, len, prot)?;
+
+        // When PROT_WRITE is added to a range that overlaps a tracked
+        // MAP_SHARED file-backed mapping, mark the overlapping sub-range as
+        // needing writeback. We split entries so that only the portion made
+        // writable is flagged — this avoids writing back stale CoW pages
+        // from ranges that were never writable.
+        if adding_write {
+            let ps = self.process_state.borrow();
+            let mut mappings = ps.shared_file_mappings.lock();
+            let prot_start = addr.as_usize();
+            let prot_end = prot_start + align_up(len, PAGE_SIZE);
+
+            let mut i = 0;
+            while i < mappings.len() {
+                let m = &mappings[i];
+                let m_end = m.addr + m.len;
+
+                // Skip non-overlapping or already-dirty entries.
+                if m.needs_writeback || m.addr >= prot_end || m_end <= prot_start {
+                    i += 1;
+                    continue;
+                }
+
+                // Fully covered → just flip the flag, no split needed.
+                if prot_start <= m.addr && prot_end >= m_end {
+                    mappings[i].needs_writeback = true;
+                    i += 1;
+                    continue;
+                }
+
+                // Partial overlap → split into up to 3 fragments.
+                let orig = mappings.remove(i);
+                let orig_addr = orig.addr;
+                let orig_file_offset = orig.file_offset;
+
+                let need_left = orig_addr < prot_start;
+                let need_right = m_end > prot_end;
+
+                // Determine how many fragments need a handle.
+                // Left (clean) + middle (dirty) + right (clean).
+                let fragment_count = usize::from(need_left) + 1 + usize::from(need_right);
+                let mut handles = alloc::vec::Vec::with_capacity(fragment_count);
+                handles.push(orig.internal_fd);
+                for _ in 1..fragment_count {
+                    if let Ok(h) = self.duplicate_internal_handle(&*handles[0]) {
+                        handles.push(h);
+                    }
+                }
+                let mut h_iter = handles.into_iter();
+
+                if need_left && let Some(handle) = h_iter.next() {
+                    mappings.insert(
+                        i,
+                        SharedFileMapping {
+                            addr: orig_addr,
+                            len: prot_start - orig_addr,
+                            internal_fd: handle,
+                            file_offset: orig_file_offset,
+                            needs_writeback: false,
+                        },
+                    );
+                    i += 1;
+                }
+
+                // Middle fragment: the portion being made writable.
+                let mid_start = orig_addr.max(prot_start);
+                let mid_end = m_end.min(prot_end);
+                if let Some(handle) = h_iter.next() {
+                    mappings.insert(
+                        i,
+                        SharedFileMapping {
+                            addr: mid_start,
+                            len: mid_end - mid_start,
+                            internal_fd: handle,
+                            file_offset: orig_file_offset + (mid_start - orig_addr),
+                            needs_writeback: true,
+                        },
+                    );
+                    i += 1;
+                }
+
+                if need_right && let Some(handle) = h_iter.next() {
+                    mappings.insert(
+                        i,
+                        SharedFileMapping {
+                            addr: prot_end,
+                            len: m_end - prot_end,
+                            internal_fd: handle,
+                            file_offset: orig_file_offset + (prot_end - orig_addr),
+                            needs_writeback: false,
+                        },
+                    );
+                    i += 1;
+                }
+
+                // Close any leftover handles (defensive).
+                for leftover in h_iter {
+                    self.internal_fs_close(leftover);
+                }
+            }
+        }
+
+        Ok(())
     }
 
-    #[inline]
     pub(crate) fn sys_mremap(
         &self,
         old_addr: crate::MutPtr<u8>,
@@ -828,14 +1473,273 @@ impl<FS: ShimFS> Task<FS> {
         flags: MRemapFlags,
         new_addr: usize,
     ) -> Result<crate::MutPtr<u8>, Errno> {
-        litebox_common_linux::mm::sys_mremap(
+        // Replicate the common layer's cheap O(1) validation checks so that
+        // obviously-invalid requests are rejected before we allocate a
+        // potentially large tail snapshot buffer.
+        let valid_flags =
+            MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_MAYMOVE | MRemapFlags::MREMAP_DONTUNMAP;
+        if flags.intersects(valid_flags.complement()) {
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(MRemapFlags::MREMAP_FIXED) && !flags.contains(MRemapFlags::MREMAP_MAYMOVE)
+        {
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(MRemapFlags::MREMAP_DONTUNMAP)
+            && (!flags.contains(MRemapFlags::MREMAP_MAYMOVE) || old_size != new_size)
+        {
+            return Err(Errno::EINVAL);
+        }
+        let old_start = old_addr.as_usize();
+        if !old_start.is_multiple_of(PAGE_SIZE) {
+            return Err(Errno::EINVAL);
+        }
+        // The common layer aligns sizes down to PAGE_SIZE; mirror that here.
+        let old_aligned = align_down(old_size, PAGE_SIZE);
+        let new_aligned = align_down(new_size, PAGE_SIZE);
+        if new_aligned == 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        // If shrinking, snapshot dirty tail data while pages are still live.
+        // After the remap the tail pages are freed (anonymous memory), so we
+        // capture them now and only write back if the remap succeeds.
+        // Each snapshot gets a temporary DT duplicate so we can write back
+        // after releasing the mappings lock.
+        let tail_snapshots = if new_aligned < old_aligned {
+            self.snapshot_shared_mappings(old_start + new_aligned, old_aligned - new_aligned)
+        } else {
+            alloc::vec::Vec::new()
+        };
+
+        // Perform the remap — validates parameters and deallocates/moves pages.
+        let result = match litebox_common_linux::mm::sys_mremap(
             &self.process_state.borrow().pm,
             old_addr,
             old_size,
             new_size,
             flags,
             new_addr,
-        )
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                // Clean up temporary snapshot handles on failure.
+                for (handle, _, _) in tail_snapshots {
+                    self.internal_fs_close(handle);
+                }
+                return Err(e);
+            }
+        };
+
+        // Write back the snapshotted tail data now that the remap succeeded.
+        for (handle, file_offset, data) in &tail_snapshots {
+            let mut written = 0;
+            while written < data.len() {
+                match self.internal_fs_write(
+                    &**handle,
+                    &data[written..],
+                    Some(*file_offset + written),
+                ) {
+                    Ok(n) => written += n,
+                    Err(_) => break,
+                }
+            }
+        }
+        // Close the temporary snapshot handles.
+        for (handle, _, _) in tail_snapshots {
+            self.internal_fs_close(handle);
+        }
+
+        // Update tracking: relocate, split, and remove entries as needed.
+        let new_start = result.as_usize();
+        self.update_shared_tracking_for_remap(old_start, old_aligned, new_start, new_aligned);
+
+        Ok(result)
+    }
+
+    /// Snapshot data from tracked `MAP_SHARED` mappings overlapping
+    /// `[start, start+len)`.
+    ///
+    /// Returns `(temporary_handle, file_offset, owned_data)` tuples. Each
+    /// temporary handle is a DT duplicate of the mapping's internal fd so
+    /// it can be used after the mappings lock is released. The caller must
+    /// close these handles when done.
+    fn snapshot_shared_mappings(
+        &self,
+        start: usize,
+        len: usize,
+    ) -> alloc::vec::Vec<(InternalHandle, usize, alloc::boxed::Box<[u8]>)> {
+        if len == 0 {
+            return alloc::vec::Vec::new();
+        }
+        let end = start + len;
+        let ps = self.process_state.borrow();
+        let mappings = ps.shared_file_mappings.lock();
+        let mut snapshots = alloc::vec::Vec::new();
+
+        for m in mappings.iter() {
+            let m_end = m.addr + m.len;
+            if m.addr >= end || m_end <= start || !m.needs_writeback {
+                continue;
+            }
+            let wb_start = m.addr.max(start);
+            let wb_end = m_end.min(end);
+            let wb_file_offset = m.file_offset + (wb_start - m.addr);
+            let wb_len = wb_end - wb_start;
+
+            // Try fast path: read the entire overlap at once.
+            let src = crate::ConstPtr::<u8>::from_usize(wb_start);
+            let data = if let Some(data) = src.to_owned_slice(wb_len) {
+                data
+            } else {
+                // Slow path: some pages may be PROT_NONE. Read page by page
+                // so that read_for_writeback only touches individual pages
+                // (avoiding a bulk permission change on a mixed-permission range).
+                let mut buf = alloc::vec![0u8; wb_len];
+                let mut ok = true;
+                let mut offset = 0;
+                while offset < wb_len {
+                    let chunk = (wb_len - offset).min(PAGE_SIZE);
+                    if let Some(page) = read_for_writeback(&ps.pm, wb_start + offset, chunk) {
+                        buf[offset..offset + chunk].copy_from_slice(&page);
+                        offset += chunk;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                buf.into_boxed_slice()
+            };
+
+            // Create a temporary DT duplicate for this snapshot.
+            if let Ok(temp_handle) = self.duplicate_internal_handle(&*m.internal_fd) {
+                snapshots.push((temp_handle, wb_file_offset, data));
+            }
+        }
+
+        snapshots
+    }
+
+    /// Update shared mapping tracking after a successful `mremap`.
+    ///
+    /// Handles relocation (move), shrinking (tail removal), and subrange
+    /// remaps (splitting tracking entries that partially overlap the remapped
+    /// range).
+    fn update_shared_tracking_for_remap(
+        &self,
+        old_start: usize,
+        old_aligned: usize,
+        new_start: usize,
+        new_aligned: usize,
+    ) {
+        if old_aligned == 0 {
+            return;
+        }
+        let old_end = old_start + old_aligned;
+        let ps = self.process_state.borrow();
+        let mut mappings = ps.shared_file_mappings.lock();
+
+        let mut replacements: alloc::vec::Vec<SharedFileMapping> = alloc::vec::Vec::new();
+        let mut to_close: alloc::vec::Vec<InternalHandle> = alloc::vec::Vec::new();
+        let mut i = 0;
+
+        while i < mappings.len() {
+            let m = &mappings[i];
+            let m_end = m.addr + m.len;
+
+            if m_end <= old_start || m.addr >= old_end {
+                i += 1;
+                continue;
+            }
+
+            let orig = mappings.swap_remove(i);
+            let orig_addr = orig.addr;
+            let orig_end = orig_addr + orig.len;
+            let orig_file_offset = orig.file_offset;
+            let orig_needs_wb = orig.needs_writeback;
+
+            // Count how many replacement fragments need this handle.
+            let need_left = orig_addr < old_start;
+            let overlap_start = orig_addr.max(old_start);
+            let overlap_end = orig_end.min(old_end);
+            let delta = overlap_start - old_start;
+            let need_overlap = delta < new_aligned && {
+                let kept = (overlap_end - overlap_start).min(new_aligned - delta);
+                kept > 0
+            };
+            let need_right = orig_end > old_end;
+
+            // Determine which fragment gets the original handle and which
+            // get new duplicates. Priority: first fragment gets original.
+            let fragment_count =
+                usize::from(need_left) + usize::from(need_overlap) + usize::from(need_right);
+
+            if fragment_count == 0 {
+                to_close.push(orig.internal_fd);
+            } else {
+                // Distribute handles: first fragment gets the original,
+                // subsequent fragments get duplicates.
+                let mut handles = alloc::vec::Vec::with_capacity(fragment_count);
+                handles.push(orig.internal_fd); // original for first fragment
+                for _ in 1..fragment_count {
+                    if let Ok(h) = self.duplicate_internal_handle(&*handles[0]) {
+                        handles.push(h);
+                    }
+                }
+                let mut h_iter = handles.into_iter();
+
+                if need_left && let Some(handle) = h_iter.next() {
+                    replacements.push(SharedFileMapping {
+                        addr: orig_addr,
+                        len: old_start - orig_addr,
+                        internal_fd: handle,
+                        file_offset: orig_file_offset,
+                        needs_writeback: orig_needs_wb,
+                    });
+                }
+
+                if need_overlap {
+                    let kept_len = (overlap_end - overlap_start).min(new_aligned - delta);
+                    if let Some(handle) = h_iter.next() {
+                        replacements.push(SharedFileMapping {
+                            addr: new_start + delta,
+                            len: kept_len,
+                            internal_fd: handle,
+                            file_offset: orig_file_offset + (overlap_start - orig_addr),
+                            needs_writeback: orig_needs_wb,
+                        });
+                    }
+                }
+
+                if need_right && let Some(handle) = h_iter.next() {
+                    replacements.push(SharedFileMapping {
+                        addr: old_end,
+                        len: orig_end - old_end,
+                        internal_fd: handle,
+                        file_offset: orig_file_offset + (old_end - orig_addr),
+                        needs_writeback: orig_needs_wb,
+                    });
+                }
+
+                // Close any leftover handles (shouldn't happen, but defensive).
+                for leftover in h_iter {
+                    to_close.push(leftover);
+                }
+            }
+
+            // Don't increment i — swap_remove moved the last element here.
+        }
+
+        mappings.extend(replacements);
+        drop(mappings);
+        drop(ps);
+
+        for handle in to_close {
+            self.internal_fs_close(handle);
+        }
     }
 
     /// Handle syscall `brk`
@@ -1231,12 +2135,20 @@ mod tests {
     fn test_map_shared_readonly_file() {
         let task = init_platform(None);
 
+        // Create and write the file.
         let content = b"Hello, shared!";
         let fd = task
             .sys_open("shared.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
             .unwrap();
         let fd = i32::try_from(fd).unwrap();
         assert_eq!(task.sys_write(fd, content, None).unwrap(), content.len());
+        task.sys_close(fd).unwrap();
+
+        // Re-open read-only — mprotect(PROT_WRITE) must fail.
+        let fd = task
+            .sys_open("shared.txt", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
 
         // MAP_SHARED with PROT_READ on a file should succeed
         let addr = task
@@ -1249,7 +2161,7 @@ mod tests {
             content.as_slice(),
         );
 
-        // mprotect to add write permission should fail
+        // mprotect to add write permission should fail (fd is read-only)
         let err = task
             .sys_mprotect(addr, 0x1000, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
             .unwrap_err();

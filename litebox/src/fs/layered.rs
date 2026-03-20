@@ -2075,6 +2075,18 @@ impl<
         }
     }
 
+    fn is_writable(&self, fd: &FileFd<Platform, Upper, Lower>) -> bool {
+        self.litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| {
+                descriptor
+                    .entry
+                    .flags
+                    .intersects(OFlags::WRONLY | OFlags::RDWR)
+            })
+            .unwrap_or(false)
+    }
+
     fn get_io_pollable(
         &self,
         fd: &FileFd<Platform, Upper, Lower>,

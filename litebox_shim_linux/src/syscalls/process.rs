@@ -660,6 +660,19 @@ impl<FS: ShimFS> Task<FS> {
             // releasing resources like pipe write ends so that readers see EOF.
             self.close_all_fds();
 
+            // Flush MAP_SHARED writeback data BEFORE marking the process as
+            // exited. exit_process_with_callback() wakes parent waiters, so
+            // the parent can return from wait4() and immediately consume
+            // output files. The writeback must complete first.
+            let is_fork_child = self.fork_context.get_mut().is_some();
+            if is_fork_child {
+                // Non-destructive flush: the parent's tracking and handles
+                // must remain intact (we share ProcessState with the parent).
+                self.sync_all_shared_mappings();
+            } else {
+                self.flush_all_shared_mappings();
+            }
+
             let exit_status = {
                 let inner = self.thread.process.inner.lock();
                 match inner.exit_status {
@@ -721,6 +734,7 @@ impl<FS: ShimFS> Task<FS> {
                 // Release all user memory mappings before destroying the
                 // address space. This is safe because the process is
                 // exiting and no threads remain to access this memory.
+                // (MAP_SHARED writeback already completed above.)
                 let ps = self.process_state.borrow();
                 unsafe { ps.pm.release_memory(|_, _| true) }
                     .expect("failed to release memory on exit");
@@ -1550,6 +1564,7 @@ impl<FS: ShimFS> Task<FS> {
                 thread_count: core::sync::atomic::AtomicI32::new(1),
                 active_cow: litebox::sync::Mutex::new(None),
                 elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 main_bss_start: core::sync::atomic::AtomicUsize::new(0),
                 main_bss_end: core::sync::atomic::AtomicUsize::new(0),
                 vfork_parking: Arc::new(crate::VforkParking {
@@ -2804,6 +2819,13 @@ impl<FS: ShimFS> Task<FS> {
         // only affect the child's own copies.
         let mut vfork_done = None;
         if let Some(fc) = self.fork_context.borrow_mut().take() {
+            // Flush MAP_SHARED writeback data while still using the parent's
+            // ProcessState — the tracking entries and handles live there.
+            // After the ProcessState swap the parent's entries are gone from
+            // our view, and the parent's CoW restore will revert in-memory
+            // writes, so this is the last chance to persist child changes.
+            self.sync_all_shared_mappings();
+
             // Switch to the child's own VA partition.
             let child_range = {
                 use litebox::platform::AddressSpaceProvider;
@@ -2818,6 +2840,7 @@ impl<FS: ShimFS> Task<FS> {
                 thread_count: core::sync::atomic::AtomicI32::new(1),
                 active_cow: litebox::sync::Mutex::new(None),
                 elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 main_bss_start: core::sync::atomic::AtomicUsize::new(0),
                 main_bss_end: core::sync::atomic::AtomicUsize::new(0),
                 vfork_parking: Arc::new(crate::VforkParking {
@@ -2835,6 +2858,12 @@ impl<FS: ShimFS> Task<FS> {
             self.fs.replace(new_fs);
             vfork_done = Some(fc.vfork_done);
         }
+
+        // Flush MAP_SHARED writeback data for the child's own ProcessState
+        // (non-fork path, or any new mappings created after exec detach).
+        // In the fork path the shared parent mappings were already flushed
+        // above via sync_all_shared_mappings().
+        self.flush_all_shared_mappings();
 
         // Close CLOEXEC descriptors (now on the child's own FD table).
         self.close_on_exec();

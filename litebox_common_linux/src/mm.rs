@@ -26,6 +26,7 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn do_mmap<
     Platform: litebox::platform::RawPointerProvider
         + litebox::sync::RawSyncPrimitivesProvider
@@ -37,6 +38,7 @@ pub fn do_mmap<
     prot: ProtFlags,
     flags: MapFlags,
     ensure_space_after: bool,
+    fd_writable: bool,
     op: impl FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, litebox::mm::linux::MappingError>,
 ) -> Result<Platform::RawMutPointer<u8>, litebox::mm::linux::MappingError> {
     let flags = {
@@ -63,6 +65,7 @@ pub fn do_mmap<
             CreatePagesFlags::SHARED,
             flags.contains(MapFlags::MAP_SHARED),
         );
+        create_flags.set(CreatePagesFlags::FD_WRITABLE, fd_writable);
         create_flags
     };
     let suggested_addr = match suggested_addr {

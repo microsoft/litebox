@@ -674,6 +674,7 @@ where
     ///
     /// The `range` must be an already-mapped region with the given `permissions`.
     #[must_use]
+    #[allow(clippy::fn_params_excessive_bools)]
     pub unsafe fn register_existing_mapping(
         &self,
         range: PageRange<ALIGN>,
@@ -681,9 +682,11 @@ where
         is_file_backed: bool,
         replace: bool,
         shared: bool,
+        fd_writable: bool,
     ) -> Option<()> {
         let vma = VmArea::new(
-            VmFlags::from(permissions) | VmFlags::may_flags_for_mapping(shared, is_file_backed),
+            VmFlags::from(permissions)
+                | VmFlags::may_flags_for_mapping(shared, is_file_backed, fd_writable),
             is_file_backed,
         );
         let mut vmem = self.vmem.write();
