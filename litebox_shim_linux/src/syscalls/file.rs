@@ -1492,7 +1492,21 @@ impl<FS: ShimFS> Task<FS> {
                 0 => return Ok("/dev/stdin".to_string()),
                 1 => return Ok("/dev/stdout".to_string()),
                 2 => return Ok("/dev/stderr".to_string()),
-                _ => unimplemented!(),
+                _ => {
+                    let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+                    let files = self.files.borrow();
+                    return files
+                        .run_on_raw_fd(
+                            raw_fd,
+                            |typed_fd| files.fs.fd_path(typed_fd).ok_or(Errno::ENOENT),
+                            |_| Err(Errno::ENOENT),
+                            |_| Err(Errno::ENOENT),
+                            |_| Err(Errno::ENOENT),
+                            |_| Err(Errno::ENOENT),
+                            |_| Err(Errno::ENOENT),
+                        )
+                        .and_then(|r| r);
+                }
             }
         }
 
