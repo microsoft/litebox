@@ -485,7 +485,31 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
         self.connected_send_channel.try_write_one(msg)
     }
 
-    fn try_recvfrom(&self, mut buf: &mut [u8]) -> Result<usize, TryOpError<Errno>> {
+    fn try_recvfrom(
+        &self,
+        mut buf: &mut [u8],
+        seqpacket: bool,
+    ) -> Result<usize, TryOpError<Errno>> {
+        if seqpacket {
+            // SOCK_SEQPACKET: return exactly one message per recv call.
+            // If the buffer is smaller than the message, truncate (the
+            // remainder is discarded, matching Linux semantics without
+            // MSG_TRUNC).
+            return self
+                .recv_channel
+                .peek_and_consume_one(|msg| {
+                    let copy_len = buf.len().min(msg.data.len());
+                    buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
+                    Ok((true, copy_len))
+                })
+                .map_err(|e| match e {
+                    Errno::EAGAIN => TryOpError::TryAgain,
+                    other => TryOpError::Other(other),
+                });
+        }
+
+        // SOCK_STREAM: coalesce reads across messages, allow partial
+        // message consumption.
         let mut total_read = 0;
         while !buf.is_empty() {
             let n = match self.recv_channel.peek_and_consume_one(|msg| {
@@ -758,6 +782,7 @@ impl<FS: ShimFS> UnixStream<FS> {
         buf: &mut [u8],
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
+        seqpacket: bool,
     ) -> Result<usize, Errno> {
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -775,7 +800,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                         let conn = state
                             .connected()
                             .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
-                        let n = conn.try_recvfrom(buf)?;
+                        let n = conn.try_recvfrom(buf, seqpacket)?;
                         // For connected stream sockets, no need to return the source address
                         if let Some(source_addr) = source_addr.as_deref_mut() {
                             *source_addr = None;
@@ -1160,16 +1185,20 @@ enum UnixSocketInner<FS: ShimFS> {
 }
 pub(crate) struct UnixSocket<FS: ShimFS> {
     inner: UnixSocketInner<FS>,
+    /// The socket type as requested by the caller (e.g. SOCK_SEQPACKET),
+    /// which may differ from the transport used by `inner`.
+    sock_type: SockType,
     status: AtomicU32,
     options: Mutex<crate::Platform, SocketOptions>,
 }
 
 impl<FS: ShimFS> UnixSocket<FS> {
-    fn new_with_inner(inner: UnixSocketInner<FS>, flags: SockFlags) -> Self {
+    fn new_with_inner(inner: UnixSocketInner<FS>, sock_type: SockType, flags: SockFlags) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
         Self {
             inner,
+            sock_type,
             status: AtomicU32::new(status.bits()),
             options: litebox::sync::Mutex::new(SocketOptions::default()),
         }
@@ -1177,16 +1206,19 @@ impl<FS: ShimFS> UnixSocket<FS> {
 
     pub(super) fn new(sock_type: SockType, flags: SockFlags) -> Option<Self> {
         let inner = match sock_type {
-            SockType::Stream => UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Init(
-                UnixInitStream::new(),
-            ))),
+            // SeqPacket uses stream transport. This does not preserve message
+            // boundaries (reads can coalesce/split), but suffices for current
+            // callers (Rust Command::spawn error pipe sends a single message).
+            SockType::Stream | SockType::SeqPacket => UnixSocketInner::Stream(UnixStream::new(
+                UnixStreamState::Init(UnixInitStream::new()),
+            )),
             SockType::Datagram => UnixSocketInner::Datagram(UnixDatagram::new()),
             e => {
                 log_unsupported!("Unsupported unix socket type: {:?}", e);
                 return None;
             }
         };
-        Some(Self::new_with_inner(inner, flags))
+        Some(Self::new_with_inner(inner, sock_type, flags))
     }
 
     pub(super) fn bind(&self, task: &Task<FS>, addr: UnixSocketAddr) -> Result<(), Errno> {
@@ -1226,7 +1258,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                     self.get_status().contains(OFlags::NONBLOCK)
                         | flags.contains(SockFlags::NONBLOCK),
                 )?;
-                Ok(UnixSocket::new_with_inner(accepted, flags))
+                Ok(UnixSocket::new_with_inner(accepted, self.sock_type, flags))
             }
             UnixSocketInner::Datagram(_) => Err(Errno::EOPNOTSUPP),
         }
@@ -1279,9 +1311,10 @@ impl<FS: ShimFS> UnixSocket<FS> {
         let is_nonblocking =
             flags.contains(ReceiveFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
         let timeout = self.options.lock().recv_timeout;
+        let seqpacket = self.sock_type == SockType::SeqPacket;
         let ret = match &self.inner {
             UnixSocketInner::Stream(stream) => {
-                stream.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
+                stream.recvfrom(cx, timeout, buf, is_nonblocking, source_addr, seqpacket)
             }
             UnixSocketInner::Datagram(datagram) => {
                 datagram.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
@@ -1326,15 +1359,17 @@ impl<FS: ShimFS> UnixSocket<FS> {
         flags: SockFlags,
     ) -> Option<(UnixSocket<FS>, UnixSocket<FS>)> {
         match ty {
-            SockType::Stream => {
+            SockType::Stream | SockType::SeqPacket => {
                 let (conn1, conn2) = UnixConnectedStream::new_pair(None, None, None);
                 Some((
                     UnixSocket::new_with_inner(
                         UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Connected(conn1))),
+                        ty,
                         flags,
                     ),
                     UnixSocket::new_with_inner(
                         UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Connected(conn2))),
+                        ty,
                         flags,
                     ),
                 ))
@@ -1342,8 +1377,8 @@ impl<FS: ShimFS> UnixSocket<FS> {
             SockType::Datagram => {
                 let (datagram1, datagram2) = UnixDatagram::new_pair();
                 Some((
-                    UnixSocket::new_with_inner(UnixSocketInner::Datagram(datagram1), flags),
-                    UnixSocket::new_with_inner(UnixSocketInner::Datagram(datagram2), flags),
+                    UnixSocket::new_with_inner(UnixSocketInner::Datagram(datagram1), ty, flags),
+                    UnixSocket::new_with_inner(UnixSocketInner::Datagram(datagram2), ty, flags),
                 ))
             }
             _ => None,
@@ -1455,10 +1490,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 }
                 // Unix sockets don't track async errors
                 SocketOption::ERROR => 0,
-                SocketOption::TYPE => match self.inner {
-                    UnixSocketInner::Stream(_) => SockType::Stream as u32,
-                    UnixSocketInner::Datagram(_) => SockType::Datagram as u32,
-                },
+                SocketOption::TYPE => self.sock_type as u32,
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.truncate(),
                 SocketOption::PEERCRED => match &self.inner {
                     UnixSocketInner::Stream(stream) => {

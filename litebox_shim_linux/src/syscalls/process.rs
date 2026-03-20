@@ -1961,10 +1961,11 @@ pub(crate) struct ResourceLimits {
 
 impl ResourceLimits {
     const fn default() -> Self {
+        // Default all resources to unlimited, then override specific ones.
         seq_macro::seq!(N in 0..16 {
             let mut limits = [
                 #(
-                    AtomicRlimit::new(0, 0),
+                    AtomicRlimit::new(usize::MAX, usize::MAX),
                 )*
             ];
         });
@@ -2021,18 +2022,7 @@ impl<FS: ShimFS> Task<FS> {
         resource: litebox_common_linux::RlimitResource,
         new_limit: Option<litebox_common_linux::Rlimit>,
     ) -> Result<litebox_common_linux::Rlimit, Errno> {
-        let old_rlimit = match resource {
-            litebox_common_linux::RlimitResource::NOFILE
-            | litebox_common_linux::RlimitResource::STACK => {
-                self.thread.process.limits.get_rlimit(resource)
-            }
-            // Return "unlimited" for resources we don't actively track.
-            // Bash and other programs query these at startup (NPROC, AS, etc.).
-            _ => litebox_common_linux::Rlimit {
-                rlim_cur: usize::MAX,
-                rlim_max: usize::MAX,
-            },
-        };
+        let old_rlimit = self.thread.process.limits.get_rlimit(resource);
         if let Some(new_limit) = new_limit {
             if new_limit.rlim_cur > new_limit.rlim_max {
                 return Err(Errno::EINVAL);
@@ -2053,7 +2043,13 @@ impl<FS: ShimFS> Task<FS> {
                     self.thread.process.limits.set_rlimit(resource, new_limit);
                     self.files.borrow().set_max_fd(new_max_fd);
                 }
-                _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
+                // Resources like STACK and AS affect kernel-enforced limits
+                // that don't apply inside the sandbox. Accept the set call so
+                // programs that adjust their own rlimits (e.g. gcc, cargo)
+                // don't crash, but don't enforce the value.
+                _ => {
+                    self.thread.process.limits.set_rlimit(resource, new_limit);
+                }
             }
         }
         Ok(old_rlimit)
@@ -2793,14 +2789,14 @@ impl<FS: ShimFS> Task<FS> {
         // only affect the child's own copies.
         let mut vfork_done = None;
         if let Some(fc) = self.fork_context.borrow_mut().take() {
-            use litebox::platform::AddressSpaceProvider;
-
             // Switch to the child's own VA partition.
-            let child_range = self
-                .global
-                .platform
-                .address_space_range(fc.address_space_id)
-                .expect("child address space must be valid");
+            let child_range = {
+                use litebox::platform::AddressSpaceProvider;
+                self.global
+                    .platform
+                    .address_space_range(fc.address_space_id)
+                    .expect("child address space must be valid")
+            };
             let child_ps = Arc::new(crate::ProcessState {
                 pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
                 address_space_id: fc.address_space_id,

@@ -747,11 +747,12 @@ pub enum AddressFamily {
 
 #[repr(u32)]
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, IntEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, IntEnum)]
 pub enum SockType {
     Stream = 1,
     Datagram = 2,
     Raw = 3,
+    SeqPacket = 5,
 }
 
 bitflags::bitflags! {
