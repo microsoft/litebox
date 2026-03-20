@@ -2116,6 +2116,53 @@ mod layered {
             "deleted.txt must be hidden: {names:?}"
         );
     }
+
+    /// chmod/chown on a tombstoned path must return ENOENT, not mutate the
+    /// hidden lower inode.
+    #[test]
+    fn chmod_chown_tombstoned_path_returns_enoent() {
+        use crate::fs::layered::LayeringSemantics;
+
+        let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            let fd = fs
+                .open("/target.txt", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create /target.txt");
+            fs.close(&fd).expect("close");
+        });
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Unlink installs a tombstone.
+        fs.unlink("/target.txt").expect("unlink");
+
+        // chmod on the tombstoned path must fail.
+        let chmod_result = fs.chmod("/target.txt", all_rw);
+        assert!(
+            chmod_result.is_err(),
+            "chmod on tombstoned path must fail: {chmod_result:?}"
+        );
+
+        // chown on the tombstoned path must fail.
+        let chown_result = fs.chown("/target.txt", Some(0), Some(0));
+        assert!(
+            chown_result.is_err(),
+            "chown on tombstoned path must fail: {chown_result:?}"
+        );
+    }
 }
 
 mod stdio {

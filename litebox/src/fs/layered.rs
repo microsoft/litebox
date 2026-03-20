@@ -1273,15 +1273,32 @@ impl<
                 ChmodError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
-                    // fallthrough
+                    // fallthrough to lower
                 }
             },
+        }
+        // A tombstoned path is visibly absent in the layered namespace even
+        // though the hidden lower entry still physically exists.
+        if self
+            .root
+            .read()
+            .entries
+            .get(&*path)
+            .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+        {
+            return Err(ChmodError::PathError(PathError::NoSuchFileOrDirectory));
         }
         match self.ensure_lower_contains(&path) {
             Ok(_) => {}
             Err(FileStatusError::Io | FileStatusError::SymlinkLoop) => return Err(ChmodError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChmodError::PathError(e)),
             Err(FileStatusError::ClosedFd | FileStatusError::NotADirectory) => unreachable!(),
+        }
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            return self.lower.chmod(path.as_str(), mode);
         }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}
@@ -1318,15 +1335,32 @@ impl<
                 ChownError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
-                    // fallthrough
+                    // fallthrough to lower
                 }
             },
+        }
+        // A tombstoned path is visibly absent in the layered namespace even
+        // though the hidden lower entry still physically exists.
+        if self
+            .root
+            .read()
+            .entries
+            .get(&*path)
+            .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+        {
+            return Err(ChownError::PathError(PathError::NoSuchFileOrDirectory));
         }
         match self.ensure_lower_contains(&path) {
             Ok(_) => {}
             Err(FileStatusError::Io | FileStatusError::SymlinkLoop) => return Err(ChownError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChownError::PathError(e)),
             Err(FileStatusError::ClosedFd | FileStatusError::NotADirectory) => unreachable!(),
+        }
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            return self.lower.chown(path.as_str(), user, group);
         }
         match self.migrate_file_up(&path, true) {
             Ok(()) => {}

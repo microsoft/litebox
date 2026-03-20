@@ -299,9 +299,9 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
     fn from(value: ElfLoaderError) -> Self {
         match value {
             ElfLoaderError::OpenError(e) => e,
-            // Map parse errors to ENOENT rather than ENOEXEC. Returning
-            // ENOEXEC for non-ELF files (e.g. scripts) would cause glibc to
-            // retry execution via /bin/sh, which we don't support.
+            // Non-ELF files that also lack a #! shebang (handled earlier in
+            // sys_execve) reach here. Map to ENOENT to prevent glibc from
+            // retrying execution via /bin/sh for opaque binaries.
             ElfLoaderError::ParseError(_) => litebox_common_linux::errno::Errno::ENOENT,
             ElfLoaderError::InvalidStackAddr | ElfLoaderError::MappingError(_) => {
                 litebox_common_linux::errno::Errno::ENOMEM
