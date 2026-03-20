@@ -29,12 +29,24 @@ pub use rwlock::{
     MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 
-#[cfg(not(feature = "lock_tracing"))]
+#[cfg(not(any(feature = "lock_tracing", feature = "trace_fs")))]
 /// A convenience name for specific requirements from the platform
 pub trait RawSyncPrimitivesProvider: platform::RawMutexProvider + Sync + 'static {}
-#[cfg(not(feature = "lock_tracing"))]
+#[cfg(not(any(feature = "lock_tracing", feature = "trace_fs")))]
 impl<Platform> RawSyncPrimitivesProvider for Platform where
     Platform: platform::RawMutexProvider + Sync + 'static
+{
+}
+
+#[cfg(all(feature = "trace_fs", not(feature = "lock_tracing")))]
+/// A convenience name for specific requirements from the platform
+pub trait RawSyncPrimitivesProvider:
+    platform::RawMutexProvider + platform::DebugLogProvider + Sync + 'static
+{
+}
+#[cfg(all(feature = "trace_fs", not(feature = "lock_tracing")))]
+impl<Platform> RawSyncPrimitivesProvider for Platform where
+    Platform: platform::RawMutexProvider + platform::DebugLogProvider + Sync + 'static
 {
 }
 

@@ -396,11 +396,27 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
         let mode = mode & !self.get_umask();
-        let file = self
+        let file = match self
             .files
             .borrow()
             .fs
-            .open(&*path, flags - OFlags::CLOEXEC, mode)?;
+            .open(&*path, flags - OFlags::CLOEXEC, mode)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                #[cfg(feature = "trace_syscalls")]
+                if matches!(e, litebox::fs::errors::OpenError::Io) {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[OPEN-EIO] pid={} path={:?} flags={:?}",
+                        self.pid,
+                        path,
+                        flags,
+                    );
+                }
+                return Err(e.into());
+            }
+        };
         {
             let mut dt = self.global.litebox.descriptor_table_mut();
             if flags.contains(OFlags::CLOEXEC) {

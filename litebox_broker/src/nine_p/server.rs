@@ -113,10 +113,15 @@ impl Server {
         const INITIAL_MAX_SIZE: u32 = 1_048_576;
         let mut current_max = INITIAL_MAX_SIZE;
 
+        let mut request_count: u64 = 0;
+
         loop {
             // Read the raw message bytes, bounded by the negotiated msize
-            if transport::read_to_buf(transport, &mut rbuf, current_max).is_err() {
-                debug!("9P connection closed or read error");
+            if let Err(e) = transport::read_to_buf(transport, &mut rbuf, current_max) {
+                debug!(
+                    "9P connection closed or read error after {} requests: {:?}",
+                    request_count, e
+                );
                 return;
             }
 
@@ -127,16 +132,25 @@ impl Server {
             let (tag, request) = match TaggedFcall::decode(&rbuf) {
                 Ok(msg) => (msg.tag, OwnedRequest::from_fcall(msg.fcall)),
                 Err(_) => {
-                    warn!("9P decode error, closing connection");
+                    warn!(
+                        "9P decode error after {} requests (buf len={}), closing connection",
+                        request_count,
+                        rbuf.len()
+                    );
                     return;
                 }
             };
+
+            request_count += 1;
 
             let response = self.dispatch(request);
 
             // Log error responses at debug level
             if let Fcall::Rlerror(ref e) = response {
-                debug!("9P error response: errno={}", e.ecode);
+                debug!(
+                    "9P error response: errno={} (request #{})",
+                    e.ecode, request_count
+                );
             }
 
             let reply = TaggedFcall {
@@ -144,7 +158,10 @@ impl Server {
                 fcall: response,
             };
             if transport::write_message(transport, &mut wbuf, reply).is_err() {
-                warn!("9P write error, closing connection");
+                warn!(
+                    "9P write error after {} requests, closing connection",
+                    request_count
+                );
                 return;
             }
         }

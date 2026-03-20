@@ -24,6 +24,9 @@ use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
 use crate::{LiteBox, sync};
 
+#[cfg(feature = "trace_fs")]
+use crate::log_println;
+
 mod client;
 mod fcall;
 
@@ -711,12 +714,51 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             let (_, dfid) = self
                 .client
                 .walk(self.root.1, &components[..components.len() - 1])?;
-            self.client
-                .create(dfid, components.last().unwrap(), lflags, mode.bits(), 0)?
+            match self
+                .client
+                .create(dfid, components.last().unwrap(), lflags, mode.bits(), 0)
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    // Clunk the parent directory fid to avoid leaking it.
+                    let _ = self.client.clunk(dfid);
+                    return Err(e.into());
+                }
+            }
         } else {
-            let (_, new_fid) = self.client.walk(self.root.1, &components)?;
-            let qid = self.client.open(new_fid, lflags)?;
-            (qid, new_fid)
+            let walk_result = self.client.walk(self.root.1, &components);
+            #[cfg(feature = "trace_fs")]
+            if let Err(ref e) = walk_result {
+                log_println!(
+                    self.litebox.x.platform,
+                    "[9P-TRACE] walk FAILED path={:?} err={:?}",
+                    path,
+                    e,
+                );
+            }
+            let (_, new_fid) = walk_result?;
+            let open_result = self.client.open(new_fid, lflags);
+            #[cfg(feature = "trace_fs")]
+            if let Err(ref e) = open_result {
+                log_println!(
+                    self.litebox.x.platform,
+                    "[9P-TRACE] open FAILED path={:?} fid={} lflags={:?} err={:?}",
+                    path,
+                    new_fid,
+                    lflags,
+                    e,
+                );
+            }
+            match open_result {
+                Ok(qid) => (qid, new_fid),
+                Err(e) => {
+                    // Clunk the fid from the walk to avoid leaking it on the
+                    // server. Ignore clunk errors since the connection may
+                    // already be broken.
+                    let _ = self.client.clunk(new_fid);
+                    return Err(e.into());
+                }
+            }
         };
 
         let descriptor = Descriptor {

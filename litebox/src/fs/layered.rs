@@ -9,6 +9,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use hashbrown::{HashMap, HashSet};
 
+#[cfg(feature = "trace_fs")]
+use crate::log_println;
+
 use crate::LiteBox;
 use crate::fd::{InternalFd, TypedFd};
 use crate::path::Arg;
@@ -673,6 +676,19 @@ impl<
         // If we already have an entry saying it is a tombstone, then we need to quit out early;
         // otherwise, we'll check the levels.
         if let Some(entry) = self.root.read().entries.get(&path).cloned() {
+            #[cfg(feature = "trace_fs")]
+            if matches!(
+                self.layering_semantics,
+                LayeringSemantics::LowerLayerWritableFiles
+            ) {
+                log_println!(
+                    self.litebox.x.platform,
+                    "[LAYERED-TRACE] cache hit path={:?} entry={:?} flags={:?}",
+                    path,
+                    entry,
+                    flags,
+                );
+            }
             match entry.as_ref() {
                 EntryX::Tombstone => {
                     // The file has been cleared out; it used to exist on the lower level, but we
@@ -801,49 +817,64 @@ impl<
                     position: 0.into(),
                 }));
             }
-            Err(e) => match &e {
-                OpenError::AccessNotAllowed
-                | OpenError::Io
-                | OpenError::Interrupted
-                | OpenError::NoWritePerms
-                | OpenError::ReadOnlyFileSystem
-                | OpenError::AlreadyExists
-                | OpenError::ClosedFd
-                | OpenError::NotADirectory
-                | OpenError::TruncateError(
-                    TruncateError::IsDirectory
-                    | TruncateError::NotForWriting
-                    | TruncateError::IsTerminalDevice
-                    | TruncateError::ClosedFd
-                    | TruncateError::Io,
-                )
-                | OpenError::PathError(
-                    PathError::ComponentNotADirectory
-                    | PathError::InvalidPathname
-                    | PathError::NoSearchPerms { .. },
-                ) => {
-                    // None of these can be handled by lower level, just quit out early
-                    return Err(e);
+            Err(e) => {
+                #[cfg(feature = "trace_fs")]
+                if matches!(
+                    self.layering_semantics,
+                    LayeringSemantics::LowerLayerWritableFiles
+                ) {
+                    log_println!(
+                        self.litebox.x.platform,
+                        "[LAYERED-TRACE] upper.open FAILED path={:?} flags={:?} err={:?}",
+                        path,
+                        flags,
+                        e,
+                    );
                 }
-                OpenError::PathError(PathError::MissingComponent)
-                    if flags.contains(OFlags::CREAT) =>
-                {
-                    // We must check if the lower layer contains all the directories; if it does, we
-                    // can create the same directories and then re-trigger the open.
-                    let dirname = path.rsplit_once('/').unwrap().0;
-                    if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
-                        // We must migrate the directories above, and then re-trigger the open
-                        self.mkdir_migrating_ancestor_dirs(&path).unwrap();
-                        return self.open(path, flags, mode);
+                match &e {
+                    OpenError::AccessNotAllowed
+                    | OpenError::Io
+                    | OpenError::Interrupted
+                    | OpenError::NoWritePerms
+                    | OpenError::ReadOnlyFileSystem
+                    | OpenError::AlreadyExists
+                    | OpenError::ClosedFd
+                    | OpenError::NotADirectory
+                    | OpenError::TruncateError(
+                        TruncateError::IsDirectory
+                        | TruncateError::NotForWriting
+                        | TruncateError::IsTerminalDevice
+                        | TruncateError::ClosedFd
+                        | TruncateError::Io,
+                    )
+                    | OpenError::PathError(
+                        PathError::ComponentNotADirectory
+                        | PathError::InvalidPathname
+                        | PathError::NoSearchPerms { .. },
+                    ) => {
+                        // None of these can be handled by lower level, just quit out early
+                        return Err(e);
                     }
-                    // Otherwise, handle-able by a lower level, fallthrough
+                    OpenError::PathError(PathError::MissingComponent)
+                        if flags.contains(OFlags::CREAT) =>
+                    {
+                        // We must check if the lower layer contains all the directories; if it does, we
+                        // can create the same directories and then re-trigger the open.
+                        let dirname = path.rsplit_once('/').unwrap().0;
+                        if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                            // We must migrate the directories above, and then re-trigger the open
+                            self.mkdir_migrating_ancestor_dirs(&path).unwrap();
+                            return self.open(path, flags, mode);
+                        }
+                        // Otherwise, handle-able by a lower level, fallthrough
+                    }
+                    OpenError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    ) => {
+                        // Handle-able by a lower level, fallthrough
+                    }
                 }
-                OpenError::PathError(
-                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-                ) => {
-                    // Handle-able by a lower level, fallthrough
-                }
-            },
+            }
         }
         // We must check the lower level, creating an entry if needed
         let original_flags = flags;
@@ -866,7 +897,37 @@ impl<
         }
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
-        let lower_fd = self.lower.open(path.as_str(), flags, mode)?;
+        #[cfg(feature = "trace_fs")]
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            log_println!(
+                self.litebox.x.platform,
+                "[LAYERED-TRACE] trying lower.open path={:?} flags={:?}",
+                path,
+                flags,
+            );
+        }
+        let lower_fd = match self.lower.open(path.as_str(), flags, mode) {
+            Ok(fd) => fd,
+            Err(e) => {
+                #[cfg(feature = "trace_fs")]
+                if matches!(
+                    self.layering_semantics,
+                    LayeringSemantics::LowerLayerWritableFiles
+                ) {
+                    log_println!(
+                        self.litebox.x.platform,
+                        "[LAYERED-TRACE] lower.open FAILED path={:?} flags={:?} err={:?}",
+                        path,
+                        flags,
+                        e,
+                    );
+                }
+                return Err(e);
+            }
+        };
         let entry = if self.lower_fd_is_shareable(&lower_fd) {
             // Insert into root entries, handling the race where another thread may have
             // already inserted an entry for the same path between our earlier read-lock
