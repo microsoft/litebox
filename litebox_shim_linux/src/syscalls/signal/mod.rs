@@ -158,7 +158,22 @@ impl SignalState {
     /// Unlike [`clone_for_new_task`](Self::clone_for_new_task) (which shares
     /// signal handlers via `Arc` for threads), fork creates a deep copy of
     /// the handlers so the child process can modify them independently.
-    pub fn clone_for_fork(&self) -> Self {
+    ///
+    /// If `clear_altstack` is true, the child's alternate signal stack is
+    /// disabled (standard fork behavior). If false, the parent's altstack
+    /// is inherited (used with `CLONE_VM | CLONE_VFORK`).
+    pub fn clone_for_fork(&self, clear_altstack: bool) -> Self {
+        let altstack = if clear_altstack {
+            SigAltStack {
+                flags: SsFlags::DISABLE,
+                sp: 0,
+                size: 0,
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
+            }
+        } else {
+            self.altstack.get()
+        };
         Self {
             pending: RefCell::new(PendingSignals::new()),
             blocked: Cell::new(self.blocked.get()),
@@ -166,39 +181,38 @@ impl SignalState {
             // Deep-copy handlers so the child's rt_sigaction doesn't affect
             // the parent (important for vfork where both run concurrently).
             handlers: RefCell::new(Arc::new((*self.handlers.borrow()).as_ref().clone())),
-            altstack: SigAltStack {
-                flags: SsFlags::DISABLE,
-                sp: 0,
-                size: 0,
-                #[cfg(target_arch = "x86_64")]
-                __pad: 0,
-            }
-            .into(),
+            altstack: altstack.into(),
             last_exception: self.last_exception.clone(),
             restore_mask: Cell::new(None),
         }
     }
 
-    /// Resets signal state for an `execve` call.
-    pub(crate) fn reset_for_exec(&self) {
+    /// Resets user-installed signal handlers to `SIG_DFL`.
+    ///
+    /// Signals already set to `SIG_DFL` or `SIG_IGN` are left untouched.
+    /// Used by both `execve` (which also clears the altstack) and
+    /// `CLONE_CLEAR_SIGHAND` (which does not touch the altstack).
+    pub(crate) fn reset_caught_handlers(&self) {
         let mut handlers = self.handlers.borrow_mut();
         // Ensure that the signal handlers are no longer shared.
         let handlers = Arc::make_mut(&mut handlers);
-        // Reset the handlers to defaults.
         for handler in &mut handlers.inner.get_mut().handlers {
-            handler.action = SigAction {
-                sigaction: if handler.action.sigaction == SIG_IGN {
-                    SIG_IGN
-                } else {
-                    SIG_DFL
-                },
-                restorer: 0,
-                flags: SaFlags::empty(),
-                mask: SigSet::empty(),
-                #[cfg(target_arch = "x86_64")]
-                __pad: 0,
-            };
+            if handler.action.sigaction != SIG_DFL && handler.action.sigaction != SIG_IGN {
+                handler.action = SigAction {
+                    sigaction: SIG_DFL,
+                    restorer: 0,
+                    flags: SaFlags::empty(),
+                    mask: SigSet::empty(),
+                    #[cfg(target_arch = "x86_64")]
+                    __pad: 0,
+                };
+            }
         }
+    }
+
+    /// Resets signal state for an `execve` call.
+    pub(crate) fn reset_for_exec(&self) {
+        self.reset_caught_handlers();
         self.clear_sigaltstack();
     }
 }

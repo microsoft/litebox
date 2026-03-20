@@ -1298,7 +1298,11 @@ impl<FS: ShimFS> Task<FS> {
             | CloneFlags::CHILD_CLEARTID
             | CloneFlags::PARENT_SETTID
             // Ignored since we don't support sysv semaphores anyway.
-            | CloneFlags::SYSVSEM;
+            | CloneFlags::SYSVSEM
+            // glibc's posix_spawn uses CLONE_CLEAR_SIGHAND to reset signal
+            // dispositions in the child before exec. The shim already resets
+            // signal handlers during execve, so this is safe to accept.
+            | CloneFlags::CLEAR_SIGHAND;
         if flags.intersects(!fork_supported_flags) {
             #[cfg(feature = "trace_syscalls")]
             litebox::log_println!(
@@ -1632,7 +1636,18 @@ impl<FS: ShimFS> Task<FS> {
                         comm: self.comm.clone(),
                         fs: self.fs.clone(),
                         files: child_files,
-                        signals: self.signals.clone_for_fork(),
+                        signals: {
+                            // Linux sigaltstack(2): fork() inherits the
+                            // altstack; clone(CLONE_VM) without CLONE_VFORK
+                            // (i.e. threads) disables it. The fork path here
+                            // never has CLONE_VM without CLONE_VFORK (that's
+                            // the thread path), so always preserve altstack.
+                            let s = self.signals.clone_for_fork(false);
+                            if flags.contains(CloneFlags::CLEAR_SIGHAND) {
+                                s.reset_caught_handlers();
+                            }
+                            s
+                        },
                         fork_context: core::cell::RefCell::new(child_fork_context),
                         last_shell_write: core::cell::RefCell::new(None),
                         last_syscall: core::cell::Cell::new(None),
