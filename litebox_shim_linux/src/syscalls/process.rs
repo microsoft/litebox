@@ -1046,6 +1046,18 @@ impl<FS: ShimFS> Task<FS> {
             flags.remove(CloneFlags::DETACHED);
         }
 
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[TRACE-CLONE] pid={} flags={:?} exit_signal={} stack={:#x} stack_size={:#x} clone3={}",
+            self.pid,
+            flags,
+            exit_signal,
+            stack,
+            stack_size,
+            clone3,
+        );
+
         if cgroup != 0 {
             log_unsupported!("clone with cgroup");
             return Err(Errno::EINVAL);
@@ -1261,7 +1273,7 @@ impl<FS: ShimFS> Task<FS> {
         ctx: &litebox_common_linux::ExecutionContext,
         args: &litebox_common_linux::CloneArgs,
         flags: CloneFlags,
-        _clone3: bool,
+        clone3: bool,
     ) -> Result<usize, Errno> {
         use litebox::platform::AddressSpaceProvider;
 
@@ -1269,6 +1281,12 @@ impl<FS: ShimFS> Task<FS> {
         // and CLONE_THREAD requires CLONE_SIGHAND. Since the fork path has
         // !CLONE_VM, neither SIGHAND nor THREAD may be set.
         if flags.contains(CloneFlags::SIGHAND) {
+            #[cfg(feature = "trace_syscalls")]
+            litebox::log_println!(
+                self.global.platform,
+                "[TRACE-FORK] EINVAL: CLONE_SIGHAND without CLONE_VM, flags={:?}",
+                flags,
+            );
             return Err(Errno::EINVAL);
         }
 
@@ -1282,6 +1300,13 @@ impl<FS: ShimFS> Task<FS> {
             // Ignored since we don't support sysv semaphores anyway.
             | CloneFlags::SYSVSEM;
         if flags.intersects(!fork_supported_flags) {
+            #[cfg(feature = "trace_syscalls")]
+            litebox::log_println!(
+                self.global.platform,
+                "[TRACE-FORK] EINVAL: unsupported flags={:?} (unsupported={:?})",
+                flags,
+                flags & !fork_supported_flags,
+            );
             log_unsupported!(
                 "fork with unsupported flags: {:?}",
                 flags & !fork_supported_flags
@@ -1289,11 +1314,22 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        // Reject requests for a separate child stack. With vfork (userland)
-        // the child runs on the parent's stack; with independent fork (kernel)
-        // the child's stack is CoW-copied. Either way, an explicit stack
-        // pointer is not applicable for the fork path.
-        if args.stack != 0 || args.stack_size != 0 {
+        // clone3-based fork may provide an explicit child stack. This is how
+        // glibc/musl and Rust std implement posix_spawn: they allocate a small
+        // stack for the child to use between clone3 and execve. For non-vfork
+        // independent fork (kernel CoW), the child's address space is already
+        // a copy of the parent's, but the child stack pointer should be set to
+        // the provided stack. For vfork (shared address space), the child runs
+        // on this provided stack instead of the parent's. Without clone3, an
+        // explicit stack is not expected and is rejected.
+        if !clone3 && (args.stack != 0 || args.stack_size != 0) {
+            #[cfg(feature = "trace_syscalls")]
+            litebox::log_println!(
+                self.global.platform,
+                "[TRACE-FORK] EINVAL: non-clone3 fork with explicit child stack={:#x} stack_size={:#x}",
+                args.stack,
+                args.stack_size,
+            );
             log_unsupported!("fork with explicit child stack");
             return Err(Errno::EINVAL);
         }
@@ -1552,11 +1588,32 @@ impl<FS: ShimFS> Task<FS> {
         let parent_tls = None;
 
         let child_thread = ThreadState::new_process(child_pid);
+        // If clone3 provided an explicit stack, compute the stack top for the
+        // child. This is how glibc/Rust posix_spawn-style clone3 works: the
+        // caller allocates a small stack and the child uses it until execve.
+        let child_stack = if args.stack != 0 {
+            let base: usize = args.stack.truncate();
+            Some(base.wrapping_add(args.stack_size.truncate()))
+        } else {
+            None
+        };
+        // Handle CHILD_SETTID and CHILD_CLEARTID for the fork child.
+        let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) && args.child_tid != 0 {
+            Some(crate::MutPtr::<i32>::from_usize(args.child_tid.truncate()))
+        } else {
+            None
+        };
+        let clear_child_tid = if flags.contains(CloneFlags::CHILD_CLEARTID) && args.child_tid != 0 {
+            Some(crate::MutPtr::<i32>::from_usize(args.child_tid.truncate()))
+        } else {
+            None
+        };
         child_thread.init_state.set(ThreadInitState::NewThread {
-            stack: None,     // vfork: parent's stack; independent: CoW copy
+            stack: child_stack,
             tls: parent_tls, // inherit parent's guest TLS
-            set_child_tid: None,
+            set_child_tid,
         });
+        child_thread.clear_child_tid.set(clear_child_tid);
 
         let r = unsafe {
             self.global.platform.spawn_thread(
