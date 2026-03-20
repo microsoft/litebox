@@ -178,6 +178,68 @@ pub(crate) mod host {
         (ok != 0, bytes_written)
     }
 
+    /// Read bytes from a host file handle at a specific offset.
+    pub fn read_file_at(handle: usize, buf: *mut u8, len: u32, offset: u64) -> (bool, u32) {
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset_low: u32,
+            offset_high: u32,
+            h_event: usize,
+        }
+        unsafe extern "system" {
+            fn ReadFile(
+                handle: usize,
+                buffer: *mut u8,
+                bytes_to_read: u32,
+                bytes_read: *mut u32,
+                overlapped: *mut Overlapped,
+            ) -> i32;
+        }
+        let mut ovl = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset_low: offset as u32,
+            offset_high: (offset >> 32) as u32,
+            h_event: 0,
+        };
+        let mut bytes_read: u32 = 0;
+        let ok = unsafe { ReadFile(handle, buf, len, &raw mut bytes_read, &raw mut ovl) };
+        (ok != 0, bytes_read)
+    }
+
+    /// Write bytes to a host file handle at a specific offset.
+    pub fn write_file_at(handle: usize, buf: *const u8, len: u32, offset: u64) -> (bool, u32) {
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset_low: u32,
+            offset_high: u32,
+            h_event: usize,
+        }
+        unsafe extern "system" {
+            fn WriteFile(
+                handle: usize,
+                buffer: *const u8,
+                bytes_to_write: u32,
+                bytes_written: *mut u32,
+                overlapped: *mut Overlapped,
+            ) -> i32;
+        }
+        let mut ovl = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset_low: offset as u32,
+            offset_high: (offset >> 32) as u32,
+            h_event: 0,
+        };
+        let mut bytes_written: u32 = 0;
+        let ok = unsafe { WriteFile(handle, buf, len, &raw mut bytes_written, &raw mut ovl) };
+        (ok != 0, bytes_written)
+    }
+
     /// Get file size in bytes. Returns -1 on failure.
     pub fn get_file_size(handle: usize) -> i64 {
         unsafe extern "system" {
