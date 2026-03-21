@@ -105,13 +105,29 @@ pub struct NlsData {
 pub struct NtProcessState {
     /// Page manager for the guest address space.
     pub pm: PageManager<Platform, PAGE_SIZE>,
-    /// Tracks allocation base ΓåÆ aligned size for MEM_RELEASE.
+    /// Tracks allocation base → aligned size for MEM_RELEASE.
     /// MEM_RELEASE with size==0 must free the entire original allocation.
     alloc_tracker: Mutex<alloc::collections::BTreeMap<usize, usize>>,
-    /// Tracks SEC_IMAGE mappings (base ΓåÆ size) for NtQueryVirtualMemory.
+    /// Tracks SEC_IMAGE mappings (base → size) for NtQueryVirtualMemory.
     /// Pages within these ranges should report `MEM_IMAGE` type instead of
     /// `MEM_PRIVATE`, matching real NT kernel behavior.
     image_mappings: Mutex<alloc::collections::BTreeMap<usize, usize>>,
+    /// Tracks MEM_RESERVE-only VA ranges (no committed pages, no host alloc).
+    /// Key = base VA, Value = reserved size. Pure bookkeeping.
+    va_reservations: Mutex<alloc::collections::BTreeMap<usize, usize>>,
+    /// Tracks committed sub-ranges within VA-only reservations.
+    /// Key = page-aligned base VA, Value = (size, NT protection constant).
+    /// Only populated for pages inside `va_reservations`; small PM-backed
+    /// allocations go directly through the page manager.
+    va_committed: Mutex<alloc::collections::BTreeMap<usize, (usize, u32)>>,
+    /// Bump pointer for finding free VA for MEM_RESERVE-only allocations.
+    /// Grows downward from just below the guest VA end.
+    va_reserve_bump: core::sync::atomic::AtomicUsize,
+    /// Floor for the bump allocator (guest VA start). Bump must not go below.
+    va_reserve_floor: core::sync::atomic::AtomicUsize,
+    /// Immutable guest VA ceiling (set once). Fixed-base reservations are
+    /// validated against this, not the moving bump pointer.
+    va_reserve_ceiling: core::sync::atomic::AtomicUsize,
 }
 
 impl NtProcessState {
@@ -121,6 +137,11 @@ impl NtProcessState {
             pm,
             alloc_tracker: Mutex::new(alloc::collections::BTreeMap::new()),
             image_mappings: Mutex::new(alloc::collections::BTreeMap::new()),
+            va_reservations: Mutex::new(alloc::collections::BTreeMap::new()),
+            va_committed: Mutex::new(alloc::collections::BTreeMap::new()),
+            va_reserve_bump: core::sync::atomic::AtomicUsize::new(0),
+            va_reserve_floor: core::sync::atomic::AtomicUsize::new(0),
+            va_reserve_ceiling: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -181,9 +202,339 @@ impl NtProcessState {
             false
         }
     }
-}
 
-/// On debug builds, logs that an unimplemented syscall was attempted.
+    /// Initialize the VA reserve bump pointer and floor. Called once from the
+    /// runner after guest_va_start/end are known.
+    pub fn set_va_reserve_ceiling(&self, ceiling: usize) {
+        // Align down to 64K boundary (Windows allocation granularity).
+        let aligned = ceiling & !0xFFFF;
+        self.va_reserve_bump
+            .store(aligned, core::sync::atomic::Ordering::Release);
+        self.va_reserve_ceiling
+            .store(aligned, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Set the minimum VA the bump allocator may reach.
+    pub fn set_va_reserve_floor(&self, floor: usize) {
+        let aligned = (floor + 0xFFFF) & !0xFFFF; // align up
+        self.va_reserve_floor
+            .store(aligned, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Reserve a VA range without allocating host memory.
+    /// If `requested_base` is 0, picks a free address via bump allocator.
+    /// Returns the base address on success, or 0 on failure.
+    pub fn va_reserve(&self, requested_base: usize, size: usize) -> usize {
+        // Align size up to 64K (Windows allocation granularity).
+        let aligned_size = (size + 0xFFFF) & !0xFFFF;
+        let mut reservations = self.va_reservations.lock();
+
+        if requested_base != 0 {
+            // Fixed address: check for overlaps with existing reservations.
+            let aligned_base = requested_base & !0xFFFF;
+            let new_end = match aligned_base.checked_add(aligned_size) {
+                Some(end) => end,
+                None => return 0, // Overflow — reject.
+            };
+
+            // Validate against guest VA bounds (immutable ceiling, not
+            // the moving bump pointer).
+            let floor = self
+                .va_reserve_floor
+                .load(core::sync::atomic::Ordering::Acquire);
+            let ceiling = self
+                .va_reserve_ceiling
+                .load(core::sync::atomic::Ordering::Acquire);
+            if aligned_base < floor || new_end > ceiling {
+                return 0; // Outside guest VA bounds.
+            }
+
+            // Check reservation that starts at or before our end.
+            if let Some((&base, &sz)) = reservations.range(..new_end).next_back() {
+                if base.saturating_add(sz) > aligned_base {
+                    return 0; // Overlaps an existing reservation.
+                }
+            }
+
+            // Reject if the range overlaps any existing PM mapping (EXE, DLLs,
+            // stacks, heap pages, etc.).  This prevents a later demand-fault
+            // from silently replacing live pages with FIXED_ADDR.
+            for (range, _) in self.pm.mappings() {
+                if range.start < new_end && aligned_base < range.end {
+                    return 0; // Overlaps an existing PM mapping.
+                }
+            }
+
+            reservations.insert(aligned_base, aligned_size);
+            aligned_base
+        } else {
+            // Bump-allocate downward.  Use a CAS loop so concurrent callers
+            // cannot both claim the same VA range.
+            //
+            // NOTE: the PM overlap check below is not atomic with the CAS
+            // insertion.  A concurrent PM allocation could race with us.
+            // In practice this is safe because large VA reservations only
+            // happen during single-threaded ntdll init (LdrpInitializeProcess),
+            // and the bump region is at the top of the 128 TB VA space, far
+            // from where PM allocations land.
+            let floor = self
+                .va_reserve_floor
+                .load(core::sync::atomic::Ordering::Acquire);
+
+            // Cache PM mappings once for the overlap check (same approach as
+            // the fixed-base path).
+            let all_mappings = self.pm.mappings();
+
+            loop {
+                let current = self
+                    .va_reserve_bump
+                    .load(core::sync::atomic::Ordering::Acquire);
+                if current < aligned_size {
+                    return 0; // No space
+                }
+                let base = (current - aligned_size) & !0xFFFF;
+                if base < floor {
+                    return 0; // Would go below the guest VA floor.
+                }
+
+                // Reject if the candidate range overlaps any PM mapping.
+                let new_end = base.saturating_add(aligned_size);
+                let pm_overlap = all_mappings
+                    .iter()
+                    .any(|(range, _)| range.start < new_end && base < range.end);
+
+                // Also check existing VA-only reservations (lock already held).
+                let va_overlap = reservations
+                    .range(..new_end)
+                    .any(|entry| entry.0.saturating_add(*entry.1) > base);
+
+                if pm_overlap || va_overlap {
+                    // Skip past the conflicting region by trying a lower base.
+                    let pm_lowest = all_mappings
+                        .iter()
+                        .filter(|(range, _)| range.start < new_end && base < range.end)
+                        .map(|(range, _)| range.start)
+                        .min();
+                    let va_lowest = reservations
+                        .range(..new_end)
+                        .filter(|entry| entry.0.saturating_add(*entry.1) > base)
+                        .map(|entry| *entry.0)
+                        .min();
+                    let lowest_conflict =
+                        pm_lowest.into_iter().chain(va_lowest).min().unwrap_or(base);
+                    let next_bump = lowest_conflict & !0xFFFF;
+                    // Try to move the bump pointer below the conflict.
+                    let _ = self.va_reserve_bump.compare_exchange_weak(
+                        current,
+                        next_bump,
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                    );
+                    continue; // Retry with updated bump.
+                }
+
+                if self
+                    .va_reserve_bump
+                    .compare_exchange_weak(
+                        current,
+                        base,
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    reservations.insert(base, aligned_size);
+                    return base;
+                }
+                // Another thread won the race — retry with the updated value.
+            }
+        }
+    }
+
+    /// Check if an address falls within a VA-only reservation.
+    /// Returns Some((base, size)) if found.
+    pub fn va_reservation_at(&self, addr: usize) -> Option<(usize, usize)> {
+        let reservations = self.va_reservations.lock();
+        if let Some((&base, &size)) = reservations.range(..=addr).next_back() {
+            if addr < base.saturating_add(size) {
+                return Some((base, size));
+            }
+        }
+        None
+    }
+
+    /// Check if the *entire* range `[addr, addr+len)` falls within a single
+    /// VA-only reservation.  Returns `Some((base, size))` if so.
+    pub fn va_reservation_contains_range(&self, addr: usize, len: usize) -> Option<(usize, usize)> {
+        let end = addr.checked_add(len)?;
+        let reservations = self.va_reservations.lock();
+        if let Some((&base, &size)) = reservations.range(..=addr).next_back() {
+            let res_end = base.checked_add(size)?;
+            if addr >= base && end <= res_end {
+                return Some((base, size));
+            }
+        }
+        None
+    }
+
+    /// Remove a VA reservation. Returns the size if found.
+    /// Also removes all committed sub-ranges within the reservation.
+    pub fn va_unreserve(&self, base: usize) -> Option<usize> {
+        let size = self.va_reservations.lock().remove(&base)?;
+        // Remove committed sub-ranges that fall within [base, base+size).
+        let mut committed = self.va_committed.lock();
+        let range_end = base.saturating_add(size);
+        let keys_to_remove: alloc::vec::Vec<usize> =
+            committed.range(base..range_end).map(|(&k, _)| k).collect();
+        for k in keys_to_remove {
+            committed.remove(&k);
+        }
+        Some(size)
+    }
+
+    /// Record a committed sub-range within a VA-only reservation.
+    /// `protect` is the raw NT protection constant (e.g. `PAGE_READWRITE`).
+    /// Handles overlapping/nested commits by splitting and merging existing
+    /// entries so that `va_committed_protect()` always returns the correct
+    /// protection for every address.
+    pub fn va_commit(&self, base: usize, size: usize, protect: u32) {
+        let mut committed = self.va_committed.lock();
+        let new_end = base.saturating_add(size);
+
+        // Collect all existing entries that overlap [base, new_end).
+        let overlapping: alloc::vec::Vec<(usize, usize, u32)> = committed
+            .range(..new_end)
+            .filter_map(|(&cbase, &(csize, prot))| {
+                if cbase.saturating_add(csize) > base {
+                    Some((cbase, csize, prot))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Remove overlapping entries and re-insert non-overlapping tails/heads.
+        for (cbase, csize, cprot) in overlapping {
+            let cend = cbase.saturating_add(csize);
+            committed.remove(&cbase);
+
+            // Preserve the portion before our new range.
+            if cbase < base {
+                committed.insert(cbase, (base - cbase, cprot));
+            }
+            // Preserve the portion after our new range.
+            if cend > new_end {
+                committed.insert(new_end, (cend - new_end, cprot));
+            }
+        }
+
+        // Insert the new committed range.
+        committed.insert(base, (size, protect));
+    }
+
+    /// Decommit a sub-range within a VA-only reservation.
+    /// Removes committed tracking for pages in `[base, base+size)`.
+    /// Returns `true` if any committed ranges were removed/split.
+    pub fn va_decommit(&self, base: usize, size: usize) -> bool {
+        let mut committed = self.va_committed.lock();
+        let decommit_end = base.saturating_add(size);
+        let mut modified = false;
+
+        // Collect entries that overlap with [base, decommit_end).
+        // An entry at `cbase` with length `csize` overlaps if
+        // cbase < decommit_end && cbase+csize > base.
+        let overlapping: alloc::vec::Vec<(usize, usize, u32)> = committed
+            .range(..decommit_end)
+            .filter_map(|(&cbase, &(csize, prot))| {
+                if cbase.saturating_add(csize) > base {
+                    Some((cbase, csize, prot))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (cbase, csize, prot) in overlapping {
+            let cend = cbase.saturating_add(csize);
+            committed.remove(&cbase);
+            modified = true;
+
+            // Re-insert the portion before the decommit region.
+            if cbase < base {
+                committed.insert(cbase, (base - cbase, prot));
+            }
+            // Re-insert the portion after the decommit region.
+            if cend > decommit_end {
+                committed.insert(decommit_end, (cend - decommit_end, prot));
+            }
+        }
+        modified
+    }
+
+    /// Check if an address was committed within a VA reservation.
+    /// Returns `Some(nt_protect)` if the page at `addr` is committed.
+    pub fn va_committed_protect(&self, addr: usize) -> Option<u32> {
+        let committed = self.va_committed.lock();
+        if let Some((&cbase, &(csize, prot))) = committed.range(..=addr).next_back() {
+            if addr < cbase.saturating_add(csize) {
+                return Some(prot);
+            }
+        }
+        None
+    }
+
+    /// Check if the entire range `[base, base+size)` is committed.
+    /// Returns `true` only if every page in the range is covered by
+    /// committed entries (there may be multiple adjacent entries with
+    /// different protections).
+    pub fn va_committed_fully(&self, base: usize, size: usize) -> bool {
+        let committed = self.va_committed.lock();
+        let end = match base.checked_add(size) {
+            Some(e) => e,
+            None => return false,
+        };
+        let mut cursor = base;
+
+        while cursor < end {
+            if let Some((&cbase, &(csize, _))) = committed.range(..=cursor).next_back() {
+                let cend = cbase.saturating_add(csize);
+                if cursor >= cbase && cursor < cend {
+                    cursor = cend; // advance past this committed range
+                    continue;
+                }
+            }
+            return false; // gap found
+        }
+        true
+    }
+
+    /// Compute the region size (contiguous run of same state) starting at
+    /// `addr` within a VA reservation of `[res_base, res_base+res_size)`.
+    /// Returns the distance to the next state/protection boundary.
+    pub fn va_region_size_at(&self, addr: usize, res_base: usize, res_size: usize) -> usize {
+        let committed = self.va_committed.lock();
+        let res_end = res_base.saturating_add(res_size);
+
+        // Check if addr is inside a committed range.
+        if let Some((&cbase, &(csize, _prot))) = committed.range(..=addr).next_back() {
+            let cend = cbase.saturating_add(csize);
+            if addr >= cbase && addr < cend {
+                // Inside a committed range — region extends to end of this
+                // committed entry (capped by reservation end).
+                return cend.min(res_end) - addr;
+            }
+        }
+
+        // addr is in an uncommitted gap.  Find the start of the next committed
+        // range (or the reservation end).
+        if let Some((&next_base, _)) = committed.range(addr + 1..).next() {
+            if next_base < res_end {
+                return next_base - addr;
+            }
+        }
+        res_end - addr
+    }
+}
 macro_rules! log_unimplemented {
     ($($arg:tt)*) => {
         #[cfg(debug_assertions)]
@@ -505,6 +856,14 @@ impl NtShimEntrypoints {
         self.shared
             .guest_va_end
             .store(state.guest_va_end, Ordering::Release);
+        // Initialize the VA reservation bump allocator to grow downward
+        // from the top of the guest VA range, with a floor at the start.
+        self.shared
+            .process_state
+            .set_va_reserve_ceiling(state.guest_va_end);
+        self.shared
+            .process_state
+            .set_va_reserve_floor(state.guest_va_start);
         self.init_state = Some(state);
     }
 
@@ -1579,7 +1938,7 @@ impl NtShimEntrypoints {
             }
             NtSyscallId::NtProtectVirtualMemory => {
                 let status =
-                    syscalls::memory::nt_protect_virtual_memory(ctx, &self.shared.process_state.pm);
+                    syscalls::memory::nt_protect_virtual_memory(ctx, &self.shared.process_state);
                 (status, false)
             }
             NtSyscallId::NtQueryVirtualMemory => {
@@ -3130,6 +3489,15 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         // demand-commit it here by upgrading the faulting page to read-write.
         if info.exception == litebox::shim::Exception::PAGE_FAULT {
             let fault_addr = info.cr2 & !(PAGE_SIZE - 1);
+
+            // First: check if this is a PM-backed inaccessible page.
+            // This handles demand-commit for pages created via small
+            // MEM_RESERVE|MEM_COMMIT (PM placeholder pages) and stack growth.
+            // NOTE: this also auto-commits pure MEM_RESERVE pages on touch,
+            // which differs from real Windows (should fault).  In practice
+            // small MEM_RESERVE is always followed by MEM_COMMIT before
+            // access, so this is safe for current guests.  A proper fix
+            // would track PM-level commit state separately.
             if let (Some(addr), Some(page_size)) = (
                 litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(fault_addr),
                 litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(PAGE_SIZE),
@@ -3140,8 +3508,6 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                 .get_memory_permissions(addr, page_size)
                 && perms.is_empty()
             {
-                // Page is in a valid VMA but has no permissions (reserved).
-                // Demand-commit: upgrade to read-write.
                 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
                 let ptr =
                     <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(fault_addr);
@@ -3157,8 +3523,7 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                     {
                         use litebox::platform::DebugLogProvider as _;
                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "NT shim: demand-commit page fault at 0x{:X} \
-                                         (rip=0x{:X}) ΓåÆ committed RW\n",
+                            "NT shim: demand-commit PM page at 0x{:X} (rip=0x{:X})\n",
                             fault_addr,
                             ctx.regs.rip,
                         ));
@@ -3166,13 +3531,121 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                     return ContinueOperation::Resume;
                 }
             }
+
+            // Second: check if this is inside a VA-only reservation.
+            // Only allocate if the page was explicitly MEM_COMMIT'd — a fault
+            // on a purely reserved (uncommitted) page should remain a crash,
+            // matching real Windows behaviour.
+            if self
+                .shared
+                .process_state
+                .va_reservation_at(fault_addr)
+                .is_some()
+            {
+                // Look up the committed protection for this page.
+                if let Some(nt_prot) = self.shared.process_state.va_committed_protect(fault_addr) {
+                    use crate::syscalls::memory::{PageOp, nt_protect_to_page_op_pub};
+                    use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
+                    if let (Some(nz_addr), Some(nz_size)) = (
+                        NonZeroAddress::<PAGE_SIZE>::new(fault_addr),
+                        NonZeroPageSize::<PAGE_SIZE>::new(PAGE_SIZE),
+                    ) {
+                        let flags = CreatePagesFlags::FIXED_ADDR;
+                        let result = match nt_protect_to_page_op_pub(nt_prot) {
+                            PageOp::ReadWrite | PageOp::WriteCopy => unsafe {
+                                self.shared.process_state.pm.create_writable_pages(
+                                    Some(nz_addr),
+                                    nz_size,
+                                    flags,
+                                    |_| Ok(0),
+                                )
+                            },
+                            PageOp::ReadOnly => unsafe {
+                                self.shared.process_state.pm.create_readable_pages(
+                                    Some(nz_addr),
+                                    nz_size,
+                                    flags,
+                                    |_| Ok(0),
+                                )
+                            },
+                            PageOp::Execute | PageOp::ExecuteRead => unsafe {
+                                self.shared.process_state.pm.create_executable_pages(
+                                    Some(nz_addr),
+                                    nz_size,
+                                    flags,
+                                    |_| Ok(0),
+                                )
+                            },
+                            PageOp::ExecuteReadWrite => {
+                                // RWX: create as writable, then upgrade to RWX.
+                                let mut r = unsafe {
+                                    self.shared.process_state.pm.create_writable_pages(
+                                        Some(nz_addr),
+                                        nz_size,
+                                        flags,
+                                        |_| Ok(0),
+                                    )
+                                };
+                                if r.is_ok() {
+                                    use litebox::platform::{
+                                        RawConstPointer as _, RawPointerProvider,
+                                    };
+                                    let ptr =
+                                        <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(fault_addr);
+                                    if unsafe {
+                                        self.shared.process_state.pm.make_pages_rwx(ptr, PAGE_SIZE)
+                                    }
+                                    .is_err()
+                                    {
+                                        // RWX upgrade failed — remove the RW page
+                                        // to avoid leaving a non-executable page.
+                                        let _ = unsafe {
+                                            self.shared
+                                                .process_state
+                                                .pm
+                                                .remove_pages(ptr, PAGE_SIZE)
+                                        };
+                                        r = Err(litebox::mm::linux::MappingError::OutOfMemory);
+                                    }
+                                }
+                                r
+                            }
+                            PageOp::NoAccess => {
+                                // Committed with PAGE_NOACCESS: the page exists but
+                                // should fault.  Don't allocate — fall through.
+                                Err(litebox::mm::linux::MappingError::OutOfMemory)
+                            }
+                        };
+                        if result.is_ok() {
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: demand-page at 0x{:X} prot=0x{:X} (rip=0x{:X})\n",
+                                        fault_addr,
+                                        nt_prot,
+                                        ctx.regs.rip,
+                                    ),
+                                );
+                            }
+                            return ContinueOperation::Resume;
+                        }
+                    }
+                }
+                // Address is reserved but not committed — fall through to
+                // unhandled exception (crash), matching real Windows.
+            }
         }
 
         let status = exception_to_ntstatus(info);
 
+        // In debug builds, dump registers, stack, and code bytes to aid
+        // post-mortem analysis of unhandled guest exceptions.
         #[cfg(debug_assertions)]
         {
             use litebox::platform::DebugLogProvider as _;
+
             let msg = alloc::format!(
                 "NT shim: EXCEPTION at rip=0x{:X} rsp=0x{:X} status=0x{:08X}\n  \
                  rax=0x{:X} rcx=0x{:X} rdx=0x{:X} rbx=0x{:X}\n  \
@@ -3202,11 +3675,13 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             );
             litebox_platform_multiplex::platform().debug_log_print(&msg);
 
-            // Dump stack: 8 words below RSP and 48 words above (covers rsp+0x170)
+            // Dump a few stack words around RSP.
             let rsp = ctx.regs.rsp as u64;
-            let mut stack_dump = alloc::string::String::from("  stack (rsp-64..rsp+384):\n");
-            for offset in (-8i64..48).rev() {
+            let mut stack_dump = alloc::string::String::from("  stack (rsp-64..rsp+128):\n");
+            for offset in (-8i64..16).rev() {
                 let addr = (rsp as i64 + offset * 8) as u64;
+                // Safety: reading guest stack; may fault if unmapped, but
+                // we are already in a terminal exception handler.
                 let val = unsafe { core::ptr::read_unaligned(addr as *const u64) };
                 let marker = if offset == 0 { " <-- RSP" } else { "" };
                 stack_dump.push_str(&alloc::format!(
@@ -3215,38 +3690,15 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             }
             litebox_platform_multiplex::platform().debug_log_print(&stack_dump);
 
-            // Dump instruction bytes at crash RIP
+            // Dump instruction bytes around the crash RIP.
             let rip = ctx.regs.rip as u64;
             let mut insn_dump = alloc::format!("  code at rip=0x{rip:X}: ");
             for i in 0u64..16 {
                 let byte = unsafe { core::ptr::read((rip + i) as *const u8) };
                 insn_dump.push_str(&alloc::format!("{byte:02X} "));
             }
-            // Also show 8 bytes before rip for context
-            insn_dump.push_str(&alloc::format!("\n  code at rip-8=0x{:X}: ", rip - 8));
-            for i in 0u64..8 {
-                let byte = unsafe { core::ptr::read((rip - 8 + i) as *const u8) };
-                insn_dump.push_str(&alloc::format!("{byte:02X} "));
-            }
             insn_dump.push('\n');
             litebox_platform_multiplex::platform().debug_log_print(&insn_dump);
-
-            // Dump memory near R12 and R13 to understand initialized vs zero-filled regions.
-            for (label, base) in [("R12", ctx.regs.r12), ("R13", ctx.regs.r13)] {
-                if base != 0 {
-                    let mut mem = alloc::format!("  memory at {label}=0x{base:X}:\n");
-                    for off in (0usize..0xC0).step_by(8) {
-                        let addr = base as usize + off;
-                        let val = unsafe { core::ptr::read_unaligned(addr as *const u64) };
-                        if val != 0 {
-                            mem.push_str(&alloc::format!(
-                                "    [{label}+0x{off:03X}] = 0x{val:016X}\n"
-                            ));
-                        }
-                    }
-                    litebox_platform_multiplex::platform().debug_log_print(&mem);
-                }
-            }
         }
 
         self.exit_code.store(status.0, Ordering::Release);

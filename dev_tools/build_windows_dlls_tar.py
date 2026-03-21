@@ -72,7 +72,7 @@ def main():
     dlls = DEFAULT_DLLS + args.extra
     missing = []
 
-    with tarfile.open(args.output, "w") as tar:
+    with tarfile.open(args.output, "w", format=tarfile.USTAR_FORMAT) as tar:
         # Add DLLs under c/windows/system32/
         for dll in dlls:
             src = os.path.join(args.system32, dll)

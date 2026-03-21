@@ -176,40 +176,44 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             NtStatus::STATUS_SUCCESS
         }
         // SystemProcessorGroupInformation (0x37 = 55). Returns per-group
-        // processor info. Real kernel returns 24 bytes with processor mask
-        // at offset 8. We report 1 active processor.
+        // processor info as PROCESSOR_GROUP_INFO entries (48 bytes each).
+        // We report one group with 1 active processor.
         0x37 => {
-            const SPG_SIZE: usize = 24;
-            if (info_length as usize) < SPG_SIZE || info_ptr == 0 {
+            // PROCESSOR_GROUP_INFO layout (48 bytes):
+            //   offset 0: MaximumProcessorCount (BYTE)
+            //   offset 1: ActiveProcessorCount (BYTE)
+            //   offset 2: Reserved[38] (BYTE[38])
+            //   offset 40: ActiveProcessorMask (KAFFINITY = u64)
+            const PGI_SIZE: usize = 48;
+            if (info_length as usize) < PGI_SIZE || info_ptr == 0 {
                 if return_length_ptr != 0 {
                     unsafe {
-                        core::ptr::write(return_length_ptr as *mut u32, SPG_SIZE as u32);
+                        core::ptr::write(return_length_ptr as *mut u32, PGI_SIZE as u32);
                     }
                 }
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
             }
             unsafe {
-                core::ptr::write_bytes(
-                    info_ptr as *mut u8,
-                    0,
-                    core::cmp::min(info_length as usize, 0x408),
-                );
+                core::ptr::write_bytes(info_ptr as *mut u8, 0, PGI_SIZE);
                 let base = info_ptr as *mut u8;
-                // offset 8: processor mask (KAFFINITY) — 1 bit = 1 processor.
-                // Real kernel places mask here; ntdll reads it directly.
-                core::ptr::write(base.add(8).cast::<u64>(), 0x1);
+                // MaximumProcessorCount = 1
+                core::ptr::write(base, 1u8);
+                // ActiveProcessorCount = 1
+                core::ptr::write(base.add(1), 1u8);
+                // ActiveProcessorMask = 1 (bit 0 set)
+                core::ptr::write(base.add(40).cast::<u64>(), 0x1);
             }
             if return_length_ptr != 0 {
                 unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, SPG_SIZE as u32);
+                    core::ptr::write(return_length_ptr as *mut u32, PGI_SIZE as u32);
                 }
             }
             NtStatus::STATUS_SUCCESS
         }
         // SystemCodeIntegrityInformation (0xC0 = 192). ntdll checks CI flags.
         0xC0 => {
-            const SCI_SIZE: usize = 32;
-            if (info_length as usize) < 8 || info_ptr == 0 {
+            const SCI_SIZE: usize = 8;
+            if (info_length as usize) < SCI_SIZE || info_ptr == 0 {
                 if return_length_ptr != 0 {
                     unsafe {
                         core::ptr::write(return_length_ptr as *mut u32, SCI_SIZE as u32);
@@ -217,18 +221,17 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
                 }
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
             }
-            let fill = core::cmp::min(info_length as usize, SCI_SIZE);
             unsafe {
-                core::ptr::write_bytes(info_ptr as *mut u8, 0, fill);
+                core::ptr::write_bytes(info_ptr as *mut u8, 0, SCI_SIZE);
                 let base = info_ptr as *mut u8;
-                // offset 0: Length (ULONG) = 8 (CI info header size)
-                core::ptr::write(base.cast::<u32>(), 0x7);
+                // offset 0: Length (ULONG) = 8 (structure size)
+                core::ptr::write(base.cast::<u32>(), SCI_SIZE as u32);
                 // offset 4: CodeIntegrityOptions (ULONG) = 0x40
                 core::ptr::write(base.add(4).cast::<u32>(), 0x40);
             }
             if return_length_ptr != 0 {
                 unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, fill as u32);
+                    core::ptr::write(return_length_ptr as *mut u32, SCI_SIZE as u32);
                 }
             }
             NtStatus::STATUS_SUCCESS
@@ -369,23 +372,10 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
         }
         // SystemProcessorIdleCycleTimeInformation (0xD2) and
         // SystemProcessorCycleTimeInformation (0xD3): ntdll's loader queries
-        // these during image mapping to determine processor topology. Return
-        // zeroed data (single processor, all idle) rather than INFO_NOT_FOUND,
-        // which would cause the loader to skip per-processor initialization
-        // of internal data structures.
-        0xD2 | 0xD3 => {
-            if info_ptr != 0 && info_length > 0 {
-                unsafe {
-                    core::ptr::write_bytes(info_ptr as *mut u8, 0, info_length as usize);
-                }
-            }
-            if return_length_ptr != 0 {
-                unsafe {
-                    core::ptr::write(return_length_ptr as *mut u32, info_length);
-                }
-            }
-            NtStatus::STATUS_SUCCESS
-        }
+        // these during image mapping. Return NOT_IMPLEMENTED so ntdll skips
+        // the per-processor cycle time initialization rather than building
+        // incomplete data structures from zeroed data.
+        0xD2 | 0xD3 => NtStatus(0xC0000002_u32 as i32), // STATUS_NOT_IMPLEMENTED
         // Default: unknown classes in NtQuerySystemInformationEx. The real
         // kernel returns STATUS_INFO_NOT_FOUND (0xC0000004) for unknown or
         // unsupported Ex classes. We must match this specific status code

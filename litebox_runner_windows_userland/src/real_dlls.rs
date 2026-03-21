@@ -118,7 +118,11 @@ fn find_vfs_file_recursive(
             return Some(format!("{dir_path}{sep}{}", entry.name));
         }
         // Collect subdirectories for recursive search using VFS metadata.
-        if entry.file_type == litebox::fs::FileType::Directory {
+        // Skip "." and ".." to avoid infinite recursion.
+        if entry.file_type == litebox::fs::FileType::Directory
+            && entry.name != "."
+            && entry.name != ".."
+        {
             let sep = if dir_path.ends_with('/') { "" } else { "/" };
             subdirs.push(format!("{dir_path}{sep}{}", entry.name));
         }
@@ -219,12 +223,39 @@ pub fn load_ntdll_for_init(
         eprintln!("[real-dlls] unhandled stub: nr=0x{nr:04X} name={name}");
     }
 
-    // Patch INT3 breakpoints into the image bytes before mapping.
+    // -----------------------------------------------------------------------
+    // Binary patching of ntdll internals.
+    //
+    // ntdll.dll is a kernel-owned binary that assumes it runs inside a real
+    // Windows process managed by the kernel.  In our sandbox there is no
+    // kernel, no CSRSS, no real scheduling, and the host's
+    // KUSER_SHARED_DATA (KUSD) at 0x7FFE_0000 reports the host machine's
+    // topology (e.g. 16 CPUs) rather than the sandbox's virtualised one.
+    //
+    // We apply a series of targeted binary patches to the raw PE image
+    // bytes *before* loading them into guest memory.  This avoids the need
+    // for a full kernel shim for each affected code path.
+    //
+    //  Patch                        Why
+    //  ─────────────────────────────────────────────────────────────────
+    //  CsrClient* → return 0       No CSRSS server; calls would hang.
+    //  RtlGetCurrentProcessorNum-   Real impl uses rdtscp/rdpid which
+    //    berEx → return {0,0}       reads the host CPU id.
+    //  rdtscp → xor ecx,ecx; nop   Same reason; ECX (IA32_TSC_AUX)
+    //                               must always be 0 (= CPU 0).
+    //  KUSD disp32 0x7FFE → 0x7FFD Redirect reads of the kernel-mapped
+    //                               shared data page to a shadow copy
+    //                               where we control field values
+    //                               (ActiveProcessorCount = 1, etc.).
+    //
+    // Patches are additive: if ntdll is updated and a pattern no longer
+    // matches, we log a warning but continue — nothing crashes silently.
+    // -----------------------------------------------------------------------
     let mut image = rewrite.image;
     {
         // Find .text section to compute file offset from RVA
         let parsed_tmp = PeParsedFile::parse(&image)
-            .map_err(|e| anyhow!("Failed to parse for INT3 patching: {e}"))?;
+            .map_err(|e| anyhow!("Failed to parse for patching: {e}"))?;
         for &rva in error_path_rvas {
             if let Some(file_off) = parsed_tmp.rva_to_file_offset(rva as u32) {
                 image[file_off] = 0xCC; // INT3
@@ -234,9 +265,13 @@ pub fn load_ntdll_for_init(
             }
         }
 
-        // Patch CSR-related functions that try to connect to CSRSS. There is
-        // no CSRSS in the sandbox. We patch them to return STATUS_SUCCESS.
-        // Patch bytes: xor eax, eax ; ret  (31 C0 C3)
+        // --- Patch 1: CSRSS client stubs → return STATUS_SUCCESS -----------
+        //
+        // CsrClientConnectToServer and CsrClientCallServer try to talk to the
+        // Win32 subsystem server (csrss.exe) via LPC/ALPC.  There is no CSRSS
+        // in the sandbox, so these calls would deadlock.  Replacing the first
+        // three bytes with `xor eax, eax; ret` (31 C0 C3) makes them return 0
+        // (STATUS_SUCCESS / NTSTATUS 0) immediately.
         let csr_functions: &[&str] = &["CsrClientConnectToServer", "CsrClientCallServer"];
         // Collect (name, rva) first to avoid borrow conflicts with image.
         let csr_rvas: Vec<(String, u32)> = {
@@ -265,6 +300,174 @@ pub fn load_ntdll_for_init(
         for func_name in csr_functions {
             if !csr_rvas.iter().any(|(n, _)| n == func_name) {
                 eprintln!("[real-dlls] WARN: {func_name} not found in ntdll exports");
+            }
+        }
+
+        // --- Patch 2: RtlGetCurrentProcessorNumberEx → always CPU 0 --------
+        //
+        // The real implementation reads the host CPU number from the
+        // IA32_TSC_AUX MSR via `rdtscp` (or `rdpid`).  In the sandbox every
+        // thread must appear to run on virtual CPU 0 so that ntdll's segment
+        // heap, NUMA-aware allocator, and other per-processor structures all
+        // index into arena 0 (the only one that gets fully initialised in a
+        // single-CPU environment).
+        //
+        // Replacement: xor eax, eax ; mov [rcx], eax ; ret  (31 C0 89 01 C3)
+        // The function's signature is void(PPROCESSOR_NUMBER), so zeroing
+        // *rcx sets both Group and Number to 0.
+        {
+            let rva_opt = {
+                let exports = parsed_tmp.exports(&image);
+                exports
+                    .iter()
+                    .find(|e| e.name == Some("RtlGetCurrentProcessorNumberEx"))
+                    .map(|e| e.rva)
+            };
+            if let Some(rva) = rva_opt {
+                if let Some(off) = parsed_tmp.rva_to_file_offset(rva) {
+                    if off + 5 <= image.len() {
+                        image[off] = 0x31; // xor eax, eax
+                        image[off + 1] = 0xC0;
+                        image[off + 2] = 0x89; // mov [rcx], eax
+                        image[off + 3] = 0x01;
+                        image[off + 4] = 0xC3; // ret
+                        eprintln!(
+                            "[real-dlls] Patched RtlGetCurrentProcessorNumberEx at ntdll+0x{rva:X}"
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[real-dlls] WARN: RtlGetCurrentProcessorNumberEx not found in ntdll exports"
+                );
+            }
+        }
+
+        // --- Patch 3: rdtscp → xor ecx, ecx; nop  -------------------------
+        //
+        // `rdtscp` (0F 01 F9) writes the IA32_TSC_AUX value (host CPU id)
+        // into ECX alongside the timestamp in EDX:EAX.  ntdll uses the ECX
+        // result to choose per-processor data structures.  We replace every
+        // occurrence with `xor ecx, ecx; nop` (31 C9 90), which preserves
+        // the 3-byte instruction length and forces ECX = 0 (CPU 0).
+        //
+        // The timestamp in EDX:EAX is lost, but performance timing in the
+        // sandbox goes through NtQueryPerformanceCounter instead.
+        {
+            let text_section = parsed_tmp
+                .sections
+                .iter()
+                .find(|s| s.name.starts_with(b".text"));
+            let rdtscp_pattern: [u8; 3] = [0x0F, 0x01, 0xF9];
+            let replacement: [u8; 3] = [0x31, 0xC9, 0x90]; // xor ecx, ecx; nop
+            let mut count = 0u32;
+            if let Some(ts) = text_section {
+                let start = ts.pointer_to_raw_data as usize;
+                let end = (start + ts.size_of_raw_data as usize).min(image.len());
+                let text = &mut image[start..end];
+                let mut pos = 0usize;
+                while pos + 3 <= text.len() {
+                    if text[pos..pos + 3] == rdtscp_pattern {
+                        text[pos..pos + 3].copy_from_slice(&replacement);
+                        count += 1;
+                    }
+                    pos += 1;
+                }
+            }
+            if count > 0 {
+                eprintln!("[real-dlls] Replaced {count} rdtscp instructions with xor ecx, ecx");
+            }
+        }
+
+        // --- Patch 4: KUSD shadow page (0x7FFE → 0x7FFD) ------------------
+        //
+        // KUSER_SHARED_DATA (KUSD) at 0x7FFE_0000 is a read-only page the
+        // kernel maps into every process.  It exposes system-wide state:
+        // tick counts, OS version, QPC frequency, and — critically — the
+        // host's ActiveProcessorCount (offset 0x3C0).
+        //
+        // ntdll's segment heap reads ActiveProcessorCount during
+        // RtlCreateHeap to size per-processor arena arrays.  If the guest
+        // sees the host's real count (e.g. 16) it allocates 16 arena slots
+        // but only initialises the ones actually touched.  Later, when a
+        // heap allocation hashes to an uninitialised slot, the null arena
+        // pointer causes an access violation in RtlAllocateHeap.
+        //
+        // We cannot VirtualProtect the real KUSD (it's kernel-owned), so
+        // we allocate a shadow copy at 0x7FFD_0000 with the fields we need
+        // to override (ActiveProcessorCount = 1, etc.) and then rewrite
+        // ntdll's absolute `[disp32]` memory operands to read from the
+        // shadow instead.
+        //
+        // x86-64 SIB encoding for [disp32]: the ModR/M byte has MOD=00
+        // and R/M=100 (SIB follows), then SIB=0x25 (SS=00, Index=none,
+        // Base=disp32), then the 4-byte little-endian displacement.  We
+        // match this 6-byte sequence and change the 0xFE byte to 0xFD.
+        {
+            let shadow = create_kusd_shadow();
+            if shadow != 0 {
+                // Scan the ENTIRE image for the exact 4-byte displacement
+                // of each known KUSD offset. The displacement bytes for
+                // 0x7FFE_0xxx are [lo, hi, 0xFE, 0x7F]. We change the
+                // 0xFE byte to 0xFD, redirecting to 0x7FFD_0xxx.
+                //
+                // Known KUSD offsets accessed by ntdll (from disassembly):
+                let kusd_offsets: &[u16] = &[
+                    0x004, // TickCountMultiplier
+                    0x297, // NtGlobalFlag2 or similar
+                    0x2D6, // processor feature flag
+                    0x330, // cookie / security
+                    0x36A, // processor group info
+                    0x3C0, // ActiveProcessorCount ← critical for heap
+                    0x3EC, // SharedDataFlags
+                    0x708, // QPC-related
+                ];
+
+                let text_section = parsed_tmp
+                    .sections
+                    .iter()
+                    .find(|s| s.name.starts_with(b".text"));
+                let mut kusd_patch_count = 0u32;
+                if let Some(ts) = text_section {
+                    let file_start = ts.pointer_to_raw_data as usize;
+                    // Use size_of_raw_data (file-backed bytes), not virtual_size
+                    // which may extend past file data into the next section.
+                    let file_end = (file_start + ts.size_of_raw_data as usize).min(image.len());
+                    let text_bytes = &mut image[file_start..file_end];
+
+                    for &off in kusd_offsets {
+                        // Build the 4-byte displacement for 0x7FFE_0xxx.
+                        let disp: [u8; 4] =
+                            [(off & 0xFF) as u8, ((off >> 8) & 0xFF) as u8, 0xFE, 0x7F];
+
+                        // Scan for [ModR/M] [SIB=0x25] [disp32] in the text.
+                        // The SIB byte 0x25 = (SS=00, Index=100/none, Base=101/disp32).
+                        // The ModR/M byte must have MOD=00 and R/M=100 (SIB follow),
+                        // i.e., (byte & 0xC7) == 0x04. This 2-byte prefix excludes
+                        // false positives where 0x25 is the AND opcode or part of an
+                        // unrelated immediate.
+                        let mut pos = 1usize; // start at 1 to allow pos-1 check
+                        while pos + 5 <= text_bytes.len() {
+                            if text_bytes[pos] == 0x25
+                                && text_bytes[pos + 1..pos + 5] == disp
+                                && (text_bytes[pos - 1] & 0xC7) == 0x04
+                            {
+                                // Replace FE → FD at the 0xFE byte position.
+                                text_bytes[pos + 3] = 0xFD;
+                                kusd_patch_count += 1;
+                                pos += 5; // skip past this match
+                            } else {
+                                pos += 1;
+                            }
+                        }
+                    }
+                }
+                eprintln!(
+                    "[real-dlls] KUSD shadow at 0x{shadow:X}, patched {kusd_patch_count} \
+                     ntdll references"
+                );
+            } else {
+                eprintln!("[real-dlls] WARN: failed to allocate KUSD shadow page at 0x7FFD0000");
             }
         }
     }
@@ -636,4 +839,70 @@ pub fn load_real_dlls(
         iat_patches: all_patches,
         unresolved_imports: all_unresolved,
     })
+}
+
+// ---------------------------------------------------------------------------
+// KUSER_SHARED_DATA shadow
+// ---------------------------------------------------------------------------
+
+/// Offset of `ActiveProcessorCount` within KUSER_SHARED_DATA.
+const KUSD_ACTIVE_PROCESSOR_COUNT_OFFSET: usize = 0x3C0;
+
+/// Base address of the real KUSER_SHARED_DATA page.
+const KUSD_REAL_BASE: usize = 0x7FFE_0000;
+
+/// Target address for our shadow page (one 64KB block below real KUSD).
+const KUSD_SHADOW_BASE: usize = 0x7FFD_0000;
+
+/// Allocate a shadow KUSER_SHARED_DATA page at [`KUSD_SHADOW_BASE`],
+/// copy the host's real KUSD into it, and set `ActiveProcessorCount` to 1.
+///
+/// Returns the shadow base address on success, or 0 on failure.
+fn create_kusd_shadow() -> usize {
+    unsafe extern "system" {
+        fn VirtualAlloc(addr: usize, size: usize, alloc_type: u32, protect: u32) -> usize;
+    }
+
+    const MEM_COMMIT_RESERVE: u32 = 0x1000 | 0x2000; // MEM_COMMIT | MEM_RESERVE
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_READONLY: u32 = 0x02;
+    const PAGE_SIZE: usize = 0x1000;
+
+    // Try to allocate at the preferred shadow address.
+    let alloc = unsafe {
+        VirtualAlloc(
+            KUSD_SHADOW_BASE,
+            PAGE_SIZE,
+            MEM_COMMIT_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    if alloc == 0 {
+        return 0;
+    }
+    assert_eq!(alloc, KUSD_SHADOW_BASE);
+
+    // Copy the real KUSD page to the shadow.
+    unsafe {
+        core::ptr::copy_nonoverlapping(KUSD_REAL_BASE as *const u8, alloc as *mut u8, PAGE_SIZE);
+    }
+
+    // Override fields that must differ in the sandbox.
+    unsafe {
+        // ActiveProcessorCount → 1
+        let apc_ptr = (alloc + KUSD_ACTIVE_PROCESSOR_COUNT_OFFSET) as *mut u32;
+        core::ptr::write(apc_ptr, 1);
+    }
+
+    // Make the shadow read-only (mirrors the real KUSD's protection).
+    unsafe extern "system" {
+        fn VirtualProtect(addr: usize, size: usize, new_protect: u32, old_protect: *mut u32)
+        -> i32;
+    }
+    let mut old_prot: u32 = 0;
+    unsafe {
+        VirtualProtect(alloc, PAGE_SIZE, PAGE_READONLY, &mut old_prot);
+    }
+
+    alloc
 }

@@ -171,21 +171,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // Create layered VFS early so both boot loading and the shim share it.
         // Architecture: InMemFS (writable) → DeviceFS → TarFS (read-only).
         let vfs_arc = {
-            use litebox::fs::FileSystem as _;
-
-            let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
-            in_mem.with_root_privileges(|fs| {
-                fs.mkdir(
-                    "/c",
-                    litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-                )
-                .ok();
-                fs.mkdir(
-                    "/c/app",
-                    litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-                )
-                .ok();
-            });
+            let in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
 
             let dev_fs = litebox::fs::devices::FileSystem::new(&litebox);
             let tar_fs =

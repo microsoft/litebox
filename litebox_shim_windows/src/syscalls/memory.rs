@@ -7,7 +7,6 @@
 //! NtProtectVirtualMemory, and NtQueryVirtualMemory on top of
 //! the LiteBox PageManager.
 
-use litebox::mm::PageManager;
 use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::RawPointerProvider;
@@ -84,28 +83,37 @@ pub(crate) fn nt_allocate_virtual_memory(
         litebox_platform_multiplex::platform().debug_log_print(&msg);
     }
 
-    // MEM_COMMIT without MEM_RESERVE: upgrade existing pages (previously
-    // reserved as inaccessible) to the requested protection.
+    // MEM_COMMIT without MEM_RESERVE: commit pages inside an existing
+    // reservation, or upgrade permissions on already-committed pages.
     if has_commit && !has_reserve && requested_base != 0 {
-        // Reject extremely large commits (>= 100 GB). ntdll's loader
-        // creates a ~200 GB "mapping info index" via MEM_RESERVE then
-        // MEM_COMMIT. The kernel is expected to fill entries during
-        // NtMapViewOfSection(SEC_IMAGE); we don't implement that. Failing
-        // the commit causes ntdll to release the reservation and fall back
-        // to the traditional loader path that doesn't use this index.
-        const MAPPING_INFO_THRESHOLD: usize = 100 * 1024 * 1024 * 1024; // 100 GB
-        if aligned_size >= MAPPING_INFO_THRESHOLD {
+        let aligned_base = requested_base & !(PAGE_SIZE - 1);
+
+        // Check if this commit falls entirely inside a VA-only reservation.
+        // For large reservations (e.g. segment heap's 192 GB cage), don't
+        // allocate pages eagerly — demand-paging via VEH page fault handler
+        // will allocate individual pages on first touch.
+        if ps
+            .va_reservation_contains_range(aligned_base, aligned_size)
+            .is_some()
+        {
+            // Record the committed range and its protection so the
+            // demand-page handler can create pages with the right perms.
+            ps.va_commit(aligned_base, aligned_size, protect);
+            unsafe {
+                core::ptr::write(base_addr_ptr as *mut usize, aligned_base);
+                core::ptr::write(region_size_ptr as *mut usize, aligned_size);
+            }
             #[cfg(debug_assertions)]
             {
                 use litebox::platform::DebugLogProvider as _;
                 litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                    "NT shim: NtAllocateVirtualMemory MEM_COMMIT rejected (size 0x{aligned_size:X} >= threshold) → STATUS_INSUFFICIENT_RESOURCES\n",
+                    "NT shim: NtAllocateVirtualMemory → OK (lazy MEM_COMMIT in VA reservation) base=0x{aligned_base:X} size=0x{aligned_size:X}\n",
                 ));
             }
-            return NtStatus(0xC000009A_u32 as i32); // STATUS_INSUFFICIENT_RESOURCES
+            return NtStatus::STATUS_SUCCESS;
         }
 
-        let aligned_base = requested_base & !(PAGE_SIZE - 1);
+        // Not inside a VA reservation — upgrade existing PM pages.
         let ptr = raw_mut_ptr(aligned_base);
         let result = match nt_protect_to_page_op(protect) {
             PageOp::ReadWrite | PageOp::WriteCopy | PageOp::ExecuteReadWrite => unsafe {
@@ -146,20 +154,30 @@ pub(crate) fn nt_allocate_virtual_memory(
         return NtStatus::STATUS_INVALID_PARAMETER;
     };
 
-    // Reject extremely large reservations (>= 100 GB). ntdll's MI_MAP_INFO
-    // index is ~200 GB and requires kernel-side entry population during
-    // NtMapViewOfSection; we don't support that. Failing the reserve makes
-    // the caller fall back to the traditional loader path.
-    const MAPPING_INFO_RESERVE_THRESHOLD: usize = 100 * 1024 * 1024 * 1024;
-    if aligned_size >= MAPPING_INFO_RESERVE_THRESHOLD {
-        #[cfg(debug_assertions)]
-        {
-            use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "NT shim: NtAllocateVirtualMemory rejected (size 0x{aligned_size:X} >= 100GB threshold)\n",
-            ));
+    // MEM_RESERVE only: for small-to-moderate sizes, use PM inaccessible
+    // pages so page faults can be caught by VEH. For huge reservations
+    // (>= 1 GB), use pure VA bookkeeping to avoid consuming host VA.
+    if has_reserve && !has_commit {
+        const VA_ONLY_THRESHOLD: usize = 1024 * 1024 * 1024; // 1 GB
+        if aligned_size >= VA_ONLY_THRESHOLD {
+            let base = ps.va_reserve(requested_base, aligned_size);
+            if base == 0 {
+                return NtStatus(0xC000009A_u32 as i32); // STATUS_INSUFFICIENT_RESOURCES
+            }
+            ps.track_alloc(base, aligned_size);
+            unsafe {
+                core::ptr::write(base_addr_ptr as *mut usize, base);
+                core::ptr::write(region_size_ptr as *mut usize, aligned_size);
+            }
+            #[cfg(debug_assertions)]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "NT shim: NtAllocateVirtualMemory → OK (VA-only reserve) base=0x{base:X} size=0x{aligned_size:X}\n",
+                ));
+            }
+            return NtStatus::STATUS_SUCCESS;
         }
-        return NtStatus(0xC000009A_u32 as i32); // STATUS_INSUFFICIENT_RESOURCES
     }
 
     let flags = if requested_base != 0 {
@@ -175,13 +193,12 @@ pub(crate) fn nt_allocate_virtual_memory(
         None
     };
 
-    // MEM_RESERVE only: create inaccessible pages as a placeholder.
-    // MEM_RESERVE|MEM_COMMIT: create pages with the requested protection.
+    // MEM_RESERVE (small, via PM as inaccessible), MEM_RESERVE|MEM_COMMIT,
+    // or MEM_COMMIT fallthrough: allocate via PM.
     let result = if has_reserve && !has_commit {
-        // Reserve only — inaccessible placeholder pages.
+        // Reserve only — inaccessible placeholder pages via PM.
         unsafe { pm.create_inaccessible_pages(suggested, nz_size, flags, |_| Ok(0)) }
     } else {
-        // Reserve+commit (or commit-only fallback): allocate with requested protection.
         match nt_protect_to_page_op(protect) {
             PageOp::ReadWrite | PageOp::WriteCopy | PageOp::ExecuteReadWrite => unsafe {
                 pm.create_writable_pages(suggested, nz_size, flags, |_| Ok(0))
@@ -306,6 +323,21 @@ pub(crate) fn nt_allocate_virtual_memory_ex(
     // MEM_COMMIT without MEM_RESERVE: upgrade existing inaccessible pages.
     if has_commit && !has_reserve && requested_base != 0 {
         let aligned_base = requested_base & !(PAGE_SIZE - 1);
+
+        // If this commit falls entirely inside a VA-only reservation,
+        // succeed lazily (demand-paged on first touch).
+        if ps
+            .va_reservation_contains_range(aligned_base, aligned_size)
+            .is_some()
+        {
+            ps.va_commit(aligned_base, aligned_size, protect);
+            unsafe {
+                core::ptr::write(base_addr_ptr as *mut usize, aligned_base);
+                core::ptr::write(region_size_ptr as *mut usize, aligned_size);
+            }
+            return NtStatus::STATUS_SUCCESS;
+        }
+
         let ptr = raw_mut_ptr(aligned_base);
         let result = match nt_protect_to_page_op(protect) {
             PageOp::ReadWrite | PageOp::WriteCopy | PageOp::ExecuteReadWrite => unsafe {
@@ -343,7 +375,25 @@ pub(crate) fn nt_allocate_virtual_memory_ex(
     };
 
     let result = if has_reserve && !has_commit {
-        // Reserve only — inaccessible placeholder pages.
+        // Reserve only.  For very large reservations (≥ 1 GB, e.g. the
+        // segment heap's 192 GB cage) use VA-only bookkeeping to avoid
+        // consuming host commit charge.  Mirrors the same logic in
+        // NtAllocateVirtualMemory.
+        const VA_ONLY_THRESHOLD: usize = 1024 * 1024 * 1024; // 1 GB
+        if aligned_size >= VA_ONLY_THRESHOLD {
+            let aligned_base = requested_base & !(PAGE_SIZE - 1);
+            let base = ps.va_reserve(aligned_base, aligned_size);
+            if base != 0 {
+                ps.track_alloc(base, aligned_size);
+                unsafe {
+                    core::ptr::write(base_addr_ptr as *mut usize, base);
+                    core::ptr::write(region_size_ptr as *mut usize, aligned_size);
+                }
+                return NtStatus::STATUS_SUCCESS;
+            }
+            return NtStatus::STATUS_NO_MEMORY;
+        }
+        // Small reserve — inaccessible placeholder pages via PM.
         unsafe { pm.create_inaccessible_pages(suggested, nz_size, flags, |_| Ok(0)) }
     } else {
         match nt_protect_to_page_op(protect) {
@@ -440,6 +490,56 @@ pub(crate) fn nt_free_virtual_memory(
         // MEM_RELEASE: free pages from the address space.
         // size == 0: release the entire original allocation.
         // size != 0: partial release (NT kernel allows this to shrink a VAD).
+
+        // Check if this is a VA-only reservation.
+        if let Some((res_base, res_size)) = ps.va_reservation_at(base) {
+            // MEM_RELEASE must pass the original allocation base and size==0.
+            // Reject interior-address or partial releases.
+            if base != res_base || size != 0 {
+                return NtStatus::STATUS_INVALID_PARAMETER;
+            }
+            // Remove any demand-faulted PM pages within the reservation.
+            // Walk the PM mappings and unmap any that fall inside
+            // [res_base, res_base + res_size).
+            //
+            // NOTE: there is a theoretical race between this snapshot and the
+            // demand-fault handler — a concurrent fault could materialize a
+            // page after the snapshot but before va_unreserve clears bookkeeping.
+            // In practice this is safe because large VA reservations (segment
+            // heap) are only released at process exit, and ntdll init is
+            // single-threaded.
+            let res_end = res_base.saturating_add(res_size);
+            let all_mappings = ps.pm.mappings();
+            for (range, _) in &all_mappings {
+                if range.start >= res_end || range.end <= res_base {
+                    continue; // No overlap.
+                }
+                // Compute the overlapping sub-range to unmap.
+                let unmap_start = range.start.max(res_base);
+                let unmap_end = range.end.min(res_end);
+                let unmap_size = unmap_end - unmap_start;
+                if unmap_size > 0 {
+                    let ptr = raw_mut_ptr(unmap_start);
+                    let _ = unsafe { pm.remove_pages(ptr, unmap_size) };
+                }
+            }
+            let released_size = ps.va_unreserve(res_base).unwrap_or(0);
+            let _ = ps.untrack_alloc(res_base);
+            // Write back the base and released size per NT convention.
+            unsafe {
+                core::ptr::write(base_addr_ptr as *mut usize, res_base);
+                core::ptr::write(region_size_ptr as *mut usize, released_size);
+            }
+            #[cfg(debug_assertions)]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "NT shim: NtFreeVirtualMemory MEM_RELEASE (VA reservation) base=0x{res_base:X} size=0x{released_size:X}\n",
+                ));
+            }
+            return NtStatus::STATUS_SUCCESS;
+        }
+
         let release_size = if size == 0 {
             match ps.untrack_alloc(base) {
                 Some(tracked) => tracked,
@@ -490,6 +590,43 @@ pub(crate) fn nt_free_virtual_memory(
         if decommit_size == 0 {
             return NtStatus::STATUS_INVALID_PARAMETER;
         }
+
+        // Check if this falls *entirely* inside a VA-only reservation.
+        // Reject if the range would spill outside the reservation boundary.
+        if ps.va_reservation_at(base).is_some() {
+            if ps
+                .va_reservation_contains_range(base, decommit_size)
+                .is_none()
+            {
+                return NtStatus::STATUS_UNABLE_TO_FREE_VM;
+            }
+            ps.va_decommit(base, decommit_size);
+            // Walk PM mappings and only decommit pages that were actually
+            // demand-faulted.  A bulk make_pages_inaccessible on the entire
+            // range can fail on holes between faulted pages, leaving
+            // materialised pages still accessible.
+            let decommit_end = base + decommit_size;
+            for (range, _) in ps.pm.mappings() {
+                if range.start >= decommit_end || range.end <= base {
+                    continue;
+                }
+                let start = range.start.max(base);
+                let end = range.end.min(decommit_end);
+                if end > start {
+                    let ptr = raw_mut_ptr(start);
+                    let _ = unsafe { pm.make_pages_inaccessible(ptr, end - start) };
+                }
+            }
+            #[cfg(debug_assertions)]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "NT shim: NtFreeVirtualMemory MEM_DECOMMIT (VA reservation) base=0x{base:X} size=0x{decommit_size:X}\n",
+                ));
+            }
+            return NtStatus::STATUS_SUCCESS;
+        }
+
         let ptr = raw_mut_ptr(base);
         let result = unsafe { pm.make_pages_inaccessible(ptr, decommit_size) };
         #[cfg(debug_assertions)]
@@ -526,8 +663,9 @@ pub(crate) fn nt_free_virtual_memory(
 /// ```
 pub(crate) fn nt_protect_virtual_memory(
     ctx: &mut super::super::ExecutionContext,
-    pm: &PageManager<Platform, PAGE_SIZE>,
+    ps: &super::super::NtProcessState,
 ) -> NtStatus {
+    let pm = &ps.pm;
     let args = NtSyscallArgs::from_ctx(ctx);
 
     let base_addr_ptr = args.arg1;
@@ -567,11 +705,71 @@ pub(crate) fn nt_protect_virtual_memory(
         }
     }
 
+    // If the range is inside a VA-only reservation, update the lazy-commit
+    // bookkeeping so that future demand-faults and queries reflect the new
+    // protection.  Also update PM for any pages already materialised.
+    //
+    // NOTE: same snapshot-vs-fault race as MEM_RELEASE (see comment there).
+    // Safe in practice because VirtualProtect on large VA reservations
+    // happens during single-threaded ntdll init.
+    if ps
+        .va_reservation_contains_range(aligned_base, aligned_size)
+        .is_some()
+    {
+        // Real NT rejects VirtualProtect on uncommitted pages.
+        if !ps.va_committed_fully(aligned_base, aligned_size) {
+            return NtStatus(0xC000_0141u32 as i32); // STATUS_NOT_COMMITTED
+        }
+        // Update PM pages that were already demand-faulted first.  Walk
+        // mapped subranges individually (unmaterialised holes are skipped).
+        // Only update bookkeeping if all PM changes succeed.
+        let prot_end = aligned_base.saturating_add(aligned_size);
+        let op = nt_protect_to_page_op(new_protect);
+        let mut pm_failed = false;
+        for (range, _) in ps.pm.mappings() {
+            if range.start >= prot_end || range.end <= aligned_base {
+                continue;
+            }
+            let start = range.start.max(aligned_base);
+            let end = range.end.min(prot_end);
+            if end > start {
+                let sz = end - start;
+                let ptr = raw_mut_ptr(start);
+                let res = match op {
+                    PageOp::ReadWrite | PageOp::WriteCopy => unsafe {
+                        pm.make_pages_writable(ptr, sz)
+                    },
+                    PageOp::ExecuteReadWrite => unsafe { pm.make_pages_rwx(ptr, sz) },
+                    PageOp::ReadOnly => unsafe { pm.make_pages_readable(ptr, sz) },
+                    PageOp::Execute | PageOp::ExecuteRead => unsafe {
+                        pm.make_pages_executable(ptr, sz)
+                    },
+                    PageOp::NoAccess => unsafe { pm.make_pages_inaccessible(ptr, sz) },
+                };
+                if res.is_err() {
+                    pm_failed = true;
+                    break;
+                }
+            }
+        }
+        if pm_failed {
+            return NtStatus::STATUS_INVALID_PAGE_PROTECTION;
+        }
+        // PM changes succeeded — now update bookkeeping.
+        ps.va_commit(aligned_base, aligned_size, new_protect);
+        unsafe {
+            core::ptr::write(base_addr_ptr as *mut usize, aligned_base);
+            core::ptr::write(region_size_ptr as *mut usize, aligned_size);
+        }
+        return NtStatus::STATUS_SUCCESS;
+    }
+
     let ptr = raw_mut_ptr(aligned_base);
     let result = match nt_protect_to_page_op(new_protect) {
-        PageOp::ReadWrite | PageOp::WriteCopy | PageOp::ExecuteReadWrite => unsafe {
+        PageOp::ReadWrite | PageOp::WriteCopy => unsafe {
             pm.make_pages_writable(ptr, aligned_size)
         },
+        PageOp::ExecuteReadWrite => unsafe { pm.make_pages_rwx(ptr, aligned_size) },
         PageOp::ReadOnly => unsafe { pm.make_pages_readable(ptr, aligned_size) },
         PageOp::Execute | PageOp::ExecuteRead => unsafe {
             pm.make_pages_executable(ptr, aligned_size)
@@ -738,9 +936,15 @@ pub(crate) fn nt_query_virtual_memory(
     let mut found = false;
     for (range, flags) in &mappings {
         if aligned_addr >= range.start && aligned_addr < range.end {
-            state = mem_state::MEM_COMMIT;
             let perms = MemoryRegionPermissions::from(*flags);
-            protect = region_perms_to_nt_protect(perms);
+            if perms.is_empty() {
+                // Inaccessible VMA = MEM_RESERVE (not yet committed).
+                state = mem_state::MEM_RESERVE;
+                protect = 0;
+            } else {
+                state = mem_state::MEM_COMMIT;
+                protect = region_perms_to_nt_protect(perms);
+            }
             alloc_base = range.start;
             region_size = range.end - aligned_addr;
             found = true;
@@ -759,6 +963,26 @@ pub(crate) fn nt_query_virtual_memory(
                 found = true;
                 break;
             }
+        }
+    }
+
+    // If not found in PM, check VA-only reservations (MEM_RESERVE without
+    // MEM_COMMIT). These are pure bookkeeping entries with no host pages.
+    if !found {
+        if let Some((res_base, res_size)) = ps.va_reservation_at(aligned_addr) {
+            // Check if this page was explicitly committed (lazy).
+            if let Some(prot) = ps.va_committed_protect(aligned_addr) {
+                state = mem_state::MEM_COMMIT;
+                protect = prot;
+            } else {
+                state = mem_state::MEM_RESERVE;
+                protect = 0; // reserved but not committed → no page protection
+            }
+            alloc_base = res_base;
+            // Region size extends to the next state/protection boundary,
+            // not the entire reservation.
+            region_size = ps.va_region_size_at(aligned_addr, res_base, res_size);
+            found = true;
         }
     }
 
@@ -846,6 +1070,7 @@ pub(crate) fn nt_query_virtual_memory(
 }
 
 /// Internal page operation categories.
+#[derive(Clone, Copy)]
 pub(crate) enum PageOp {
     NoAccess,
     ReadOnly,
