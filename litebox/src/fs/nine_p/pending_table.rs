@@ -10,8 +10,6 @@
 //! Tag 0 is reserved for fire-and-forget clunks (the reader loop silently
 //! discards responses with tag 0).
 
-#![allow(dead_code)] // Used by upcoming pipelined client (Steps 3-5)
-
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ops::Deref;
@@ -103,6 +101,7 @@ pub(super) struct CompletedResponse<'a> {
 }
 
 impl CompletedResponse<'_> {
+    #[allow(dead_code)]
     pub(super) fn tag(&self) -> u16 {
         self.tag.0
     }
@@ -217,7 +216,12 @@ impl PendingTable {
 
     /// Spin-wait for the given tag's slot to reach COMPLETED state.
     ///
-    /// Returns `Err(())` if the client is poisoned (transport error).
+    /// Checks COMPLETED before poisoned, then re-checks COMPLETED after
+    /// observing poison so that an already-delivered response is not
+    /// discarded if the worker poisons the client immediately after
+    /// dispatching the final response (e.g., due to EOF on the transport).
+    ///
+    /// Returns `Err(tag)` if the client is poisoned before completion.
     pub(super) fn wait_for_completion<'a>(
         &'a self,
         tag: Tag,
@@ -226,11 +230,14 @@ impl PendingTable {
         let idx = (tag.0 - 1) as usize;
         let slot = &self.slots[idx];
         loop {
-            if poisoned.load(Ordering::Relaxed) {
-                return Err(tag);
-            }
             if slot.state.load(Ordering::Acquire) == COMPLETED {
                 return Ok(CompletedResponse { table: self, tag });
+            }
+            if poisoned.load(Ordering::Acquire) {
+                if slot.state.load(Ordering::Acquire) == COMPLETED {
+                    return Ok(CompletedResponse { table: self, tag });
+                }
+                return Err(tag);
             }
             core::hint::spin_loop();
         }

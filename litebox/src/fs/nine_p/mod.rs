@@ -361,15 +361,12 @@ struct WriteBuffer {
 ///
 /// - `Platform`: The platform provider that supplies synchronization primitives and other
 ///   platform-specific functionality.
-/// - `T`: The transport type that implements both `Read` and `Write` traits.
-pub struct FileSystem<
-    Platform: sync::RawSyncPrimitivesProvider,
-    T: transport::Read + transport::Write,
-> {
+/// - `W`: The transport write half type that implements the `Write` trait.
+pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> {
     /// Reference to the LiteBox instance
     litebox: LiteBox<Platform>,
     /// 9P client for protocol operations
-    client: client::Client<Platform, T>,
+    client: client::Client<Platform, W>,
     /// Root (attached to the root of the remote filesystem)
     root: (fcall::Qid, fcall::Fid, String),
     // cwd invariant: always ends with a `/`
@@ -414,19 +411,23 @@ pub struct FileSystem<
     cache_generation: AtomicUsize,
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    FileSystem<Platform, T>
-{
+impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<Platform, W> {
     /// Construct a new `FileSystem` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `FileSystem` handle is expected to be shared across all usage over the
     /// system.
     ///
+    /// Version negotiation and attach are performed synchronously using both
+    /// the writer and reader halves. After construction the reader is returned
+    /// for use by the response worker thread (see
+    /// [`WorkerHandle::poll_responses`]).
+    ///
     /// # Arguments
     ///
     /// * `litebox` - Reference to the LiteBox instance for platform access
-    /// * `transport` - The transport for 9P communication
+    /// * `writer` - Write half of the 9P transport
+    /// * `reader` - Read half of the 9P transport (returned after handshake)
     /// * `msize` - Maximum message size to negotiate
     /// * `username` - Username for authentication
     /// * `path` - Attach path (typically the root directory path)
@@ -434,32 +435,63 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     /// # Errors
     ///
     /// Returns an error if version negotiation or attach fails.
-    pub fn new(
+    pub fn new<R: transport::Read>(
         litebox: &LiteBox<Platform>,
-        transport: T,
+        writer: W,
+        reader: R,
         msize: u32,
         username: &str,
         path: &str,
-    ) -> Result<Self, Error> {
-        let client = client::Client::new(transport, msize)?;
+    ) -> Result<(Self, R), Error> {
+        let (client, reader, qid, fid) =
+            client::Client::new_with_handshake(writer, reader, msize, username, path)?;
         let max_write_payload = (client.msize() - fcall::IOHDRSZ) as usize;
-        let (qid, fid) = client.attach(username, path)?;
 
-        Ok(Self {
-            litebox: litebox.clone(),
-            client,
-            root: (qid, fid, String::from(path)),
-            current_working_dir: String::from("/"),
-            unlinkat_supported: AtomicBool::new(true),
-            write_buffers: sync::Mutex::new(BTreeMap::new()),
-            read_buffers: sync::Mutex::new(BTreeMap::new()),
-            stat_cache: sync::Mutex::new(BTreeMap::new()),
-            dir_fid_cache: sync::Mutex::new(BTreeMap::new()),
-            readlink_cache: sync::Mutex::new(BTreeMap::new()),
-            negative_stat_cache: sync::Mutex::new(BTreeSet::new()),
-            max_write_payload,
-            cache_generation: AtomicUsize::new(0),
-        })
+        Ok((
+            Self {
+                litebox: litebox.clone(),
+                client,
+                root: (qid, fid, String::from(path)),
+                current_working_dir: String::from("/"),
+                unlinkat_supported: AtomicBool::new(true),
+                write_buffers: sync::Mutex::new(BTreeMap::new()),
+                read_buffers: sync::Mutex::new(BTreeMap::new()),
+                stat_cache: sync::Mutex::new(BTreeMap::new()),
+                dir_fid_cache: sync::Mutex::new(BTreeMap::new()),
+                readlink_cache: sync::Mutex::new(BTreeMap::new()),
+                negative_stat_cache: sync::Mutex::new(BTreeSet::new()),
+                max_write_payload,
+                cache_generation: AtomicUsize::new(0),
+            },
+            reader,
+        ))
+    }
+
+    /// Returns the negotiated maximum message size.
+    pub fn msize(&self) -> u32 {
+        self.client.msize()
+    }
+
+    /// Create a worker handle that can be sent to a background thread.
+    ///
+    /// The handle holds an `Arc` reference to the shared client inner
+    /// state (pending table + poison flag) but **not** to the transport
+    /// writer.  This ensures that dropping the `FileSystem` closes the
+    /// writer, letting the worker observe EOF and exit cleanly.
+    ///
+    /// ```ignore
+    /// let (fs, mut reader) = FileSystem::new(litebox, writer, reader, ...)?;
+    /// let worker_handle = fs.worker_handle();
+    /// let msize = fs.msize();
+    /// std::thread::spawn(move || {
+    ///     let mut buf = Vec::with_capacity(msize as usize);
+    ///     while worker_handle.poll_responses(&mut reader, &mut buf) {}
+    /// });
+    /// ```
+    pub fn worker_handle(&self) -> WorkerHandle {
+        WorkerHandle {
+            inner: self.client.shared_inner(),
+        }
     }
 
     /// Flush the write-behind buffer for `fid` to the server.
@@ -731,7 +763,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     }
 
     /// Get the stored path from any fd's Descriptor.
-    fn descriptor_path(&self, dirfd: &FileFd<Platform, T>) -> Option<alloc::string::String> {
+    fn descriptor_path(&self, dirfd: &FileFd<Platform, W>) -> Option<alloc::string::String> {
         let descriptor_table = self.litebox.descriptor_table();
         let entry = descriptor_table.get_entry(dirfd)?;
         Some(entry.entry.path.clone())
@@ -740,7 +772,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     /// Get the stored path from a directory fd's Descriptor.
     fn dir_fd_path(
         &self,
-        dirfd: &FileFd<Platform, T>,
+        dirfd: &FileFd<Platform, W>,
     ) -> Result<alloc::string::String, super::DirFdError> {
         let descriptor_table = self.litebox.descriptor_table();
         let entry = descriptor_table
@@ -1077,8 +1109,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write> Drop
-    for FileSystem<Platform, T>
+impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> Drop
+    for FileSystem<Platform, W>
 {
     fn drop(&mut self) {
         // Clunk all cached directory fids.
@@ -1091,13 +1123,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    super::private::Sealed for FileSystem<Platform, T>
+impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::private::Sealed
+    for FileSystem<Platform, W>
 {
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    super::FileSystem for FileSystem<Platform, T>
+impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::FileSystem
+    for FileSystem<Platform, W>
 {
     fn walks_follow_symlinks(&self) -> bool {
         // The 9P broker walk canonicalizes every component via
@@ -1111,7 +1143,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         path: impl crate::path::Arg,
         flags: super::OFlags,
         mode: super::Mode,
-    ) -> Result<FileFd<Platform, T>, super::errors::OpenError> {
+    ) -> Result<FileFd<Platform, W>, super::errors::OpenError> {
         // TODO: we don't support non-blocking, so ignore that flag instead of returning an error
         let flags = flags - OFlags::NONBLOCK;
         let currently_supported_oflags: OFlags = OFlags::RDONLY
@@ -1307,7 +1339,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         Ok(fd)
     }
 
-    fn close(&self, fd: &FileFd<Platform, T>) -> Result<(), super::errors::CloseError> {
+    fn close(&self, fd: &FileFd<Platform, W>) -> Result<(), super::errors::CloseError> {
         let entry = self.litebox.descriptor_table_mut().remove(fd);
         if let Some(entry) = entry {
             // Flush any pending write-behind data before releasing the fid.
@@ -1330,7 +1362,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn read(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::ReadError> {
@@ -1456,7 +1488,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn write(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::WriteError> {
@@ -1582,7 +1614,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn seek(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
@@ -1624,7 +1656,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn truncate(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
         length: usize,
         reset_offset: bool,
     ) -> Result<(), super::errors::TruncateError> {
@@ -1913,7 +1945,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn read_dir(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
     ) -> Result<Vec<crate::fs::DirEntry>, super::errors::ReadDirError> {
         // Extract fid and qid, releasing the descriptor table lock
         // before performing potentially blocking I/O.
@@ -2041,7 +2073,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn fd_file_status(
         &self,
-        fd: &FileFd<Platform, T>,
+        fd: &FileFd<Platform, W>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         // Extract fid, qid, and path from the descriptor.
         let (fid, qid_path, path) = self
@@ -2153,11 +2185,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn open_at(
         &self,
-        dirfd: &FileFd<Platform, T>,
+        dirfd: &FileFd<Platform, W>,
         rel_path: impl crate::path::Arg,
         flags: super::OFlags,
         mode: super::Mode,
-    ) -> Result<FileFd<Platform, T>, super::errors::OpenError> {
+    ) -> Result<FileFd<Platform, W>, super::errors::OpenError> {
         let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
             super::DirFdError::ClosedFd => super::errors::OpenError::ClosedFd,
             super::DirFdError::NotADirectory => super::errors::OpenError::NotADirectory,
@@ -2179,7 +2211,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     /// all symlinks during walk anyway.
     fn stat_at(
         &self,
-        dirfd: &FileFd<Platform, T>,
+        dirfd: &FileFd<Platform, W>,
         rel_path: impl crate::path::Arg,
         _follow_symlinks: bool,
     ) -> Result<super::FileStatus, super::FileStatusError> {
@@ -2201,7 +2233,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn unlink_at(
         &self,
-        dirfd: &FileFd<Platform, T>,
+        dirfd: &FileFd<Platform, W>,
         rel_path: impl crate::path::Arg,
     ) -> Result<(), super::errors::UnlinkError> {
         let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
@@ -2219,7 +2251,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn readlink_at(
         &self,
-        dirfd: &FileFd<Platform, T>,
+        dirfd: &FileFd<Platform, W>,
         rel_path: impl crate::path::Arg,
     ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
         let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
@@ -2237,9 +2269,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     fn rename_at(
         &self,
-        old_dirfd: &FileFd<Platform, T>,
+        old_dirfd: &FileFd<Platform, W>,
         old_rel: impl crate::path::Arg,
-        new_dirfd: &FileFd<Platform, T>,
+        new_dirfd: &FileFd<Platform, W>,
         new_rel: impl crate::path::Arg,
     ) -> Result<(), super::errors::RenameError> {
         let old_dir = self.dir_fd_path(old_dirfd).map_err(|e| match e {
@@ -2265,13 +2297,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         self.rename(old_abs, new_abs)
     }
 
-    fn fd_path(&self, fd: &FileFd<Platform, T>) -> Option<alloc::string::String> {
+    fn fd_path(&self, fd: &FileFd<Platform, W>) -> Option<alloc::string::String> {
         self.descriptor_path(fd)
     }
 
     fn mkdir_at(
         &self,
-        dirfd: &FileFd<Platform, T>,
+        dirfd: &FileFd<Platform, W>,
         rel_path: impl crate::path::Arg,
         mode: super::Mode,
     ) -> Result<(), MkdirError> {
@@ -2304,9 +2336,36 @@ struct Descriptor {
     direct_write: bool,
 }
 
+/// Handle for the 9P response worker thread.
+///
+/// Holds an `Arc` reference to the shared client inner state (pending table
+/// and poison flag) so the worker can dispatch responses while the main
+/// [`FileSystem`] is in use by guest threads.
+///
+/// Crucially, this does **not** hold a reference to the transport writer.
+/// When the `FileSystem` is dropped the writer is closed immediately,
+/// allowing the worker to observe EOF on the reader and exit.
+pub struct WorkerHandle {
+    inner: alloc::sync::Arc<client::ClientInner>,
+}
+
+impl WorkerHandle {
+    /// Read one response from the reader and dispatch it to the pending table.
+    ///
+    /// Returns `false` when the connection is dead (EOF or error),
+    /// signalling the worker to exit its loop.
+    pub fn poll_responses<R: transport::Read>(
+        &self,
+        reader: &mut R,
+        reader_buf: &mut Vec<u8>,
+    ) -> bool {
+        self.inner.poll_responses(reader, reader_buf)
+    }
+}
+
 crate::fd::enable_fds_for_subsystem! {
-    @Platform: { sync::RawSyncPrimitivesProvider }, T: { transport::Read + transport::Write };
-    FileSystem<Platform, T>;
+    @Platform: { sync::RawSyncPrimitivesProvider }, W: { transport::Write };
+    FileSystem<Platform, W>;
     Descriptor;
-    -> FileFd<Platform, T>;
+    -> FileFd<Platform, W>;
 }

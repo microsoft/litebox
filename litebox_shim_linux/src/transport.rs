@@ -117,6 +117,131 @@ impl Drop for ShimTransport {
     }
 }
 
+/// Shared socket drop guard for split transport halves. Closes the socket
+/// when the last reference is dropped.
+struct SharedSocketDropGuard(Box<dyn DropGuard>);
+
+impl Drop for SharedSocketDropGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+// SAFETY: DropGuard is already required to be Send + Sync.
+unsafe impl Send for SharedSocketDropGuard {}
+unsafe impl Sync for SharedSocketDropGuard {}
+
+impl ShimTransport {
+    /// Split into separate write and read halves.
+    ///
+    /// The writer keeps the vfork deferred-lie logic (guest threads can block
+    /// in send when the TX ring is full). The reader has no vfork state
+    /// because it will be owned by a host worker thread that doesn't
+    /// participate in vfork parking.
+    ///
+    /// The underlying socket is kept alive until both halves are dropped.
+    pub fn split(self) -> (ShimTransportWriter, ShimTransportReader) {
+        // Prevent the original ShimTransport::drop from closing the socket;
+        // the shared drop guard takes over that responsibility.
+        let mut this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: we consume `self` through ManuallyDrop and will not access
+        // these fields again through `this`.
+        let drop_guard = unsafe { core::ptr::read(&raw mut this.drop_guard) };
+        let proxy = unsafe { core::ptr::read(&raw mut this.proxy) };
+        let interrupt = unsafe { core::ptr::read(&raw mut this.interrupt) };
+        let vfork_parking = unsafe { core::ptr::read(&raw mut this.vfork_parking) };
+
+        let shared_guard = Arc::new(SharedSocketDropGuard(drop_guard));
+
+        (
+            ShimTransportWriter {
+                proxy: Arc::clone(&proxy),
+                interrupt,
+                vfork_parking,
+                has_lied: core::sync::atomic::AtomicBool::new(false),
+                _drop_guard: Arc::clone(&shared_guard),
+            },
+            ShimTransportReader {
+                proxy,
+                _drop_guard: shared_guard,
+            },
+        )
+    }
+}
+
+/// Write half of a [`ShimTransport`]. Keeps the vfork deferred-lie logic
+/// because guest threads may block in `try_write` while holding the 9P
+/// client's write mutex.
+pub struct ShimTransportWriter {
+    proxy: Arc<NetworkProxy<Platform>>,
+    interrupt: Arc<core::sync::atomic::AtomicBool>,
+    vfork_parking: Arc<VforkParking>,
+    has_lied: core::sync::atomic::AtomicBool,
+    _drop_guard: Arc<SharedSocketDropGuard>,
+}
+
+impl ShimTransportWriter {
+    fn try_deferred_park(&self) {
+        deferred_park_impl(&self.interrupt, &self.vfork_parking, &self.has_lied);
+    }
+
+    fn maybe_reset_lie(&self) {
+        maybe_reset_lie_impl(&self.vfork_parking, &self.has_lied);
+    }
+}
+
+impl transport::Write for ShimTransportWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
+        self.maybe_reset_lie();
+        loop {
+            if self.interrupt.load(Ordering::Acquire) {
+                self.try_deferred_park();
+            }
+            match self.proxy.try_write(buf, SendFlags::empty(), None) {
+                Ok(n) => return Ok(n),
+                Err(litebox::net::errors::SendError::BufferFull) => {
+                    core::hint::spin_loop();
+                }
+                Err(e) => {
+                    if !matches!(e, litebox::net::errors::SendError::SocketInInvalidState) {
+                        use litebox::platform::DebugLogProvider as _;
+                        let msg = alloc::format!("9P transport: write IO error: {e:?}\n");
+                        litebox_platform_multiplex::platform().debug_log_print(&msg);
+                    }
+                    return Err(transport::WriteError::Io);
+                }
+            }
+        }
+    }
+}
+
+/// Read half of a [`ShimTransport`]. No vfork state — this half is owned
+/// by the 9P worker thread (a host thread that doesn't participate in
+/// vfork parking).
+pub struct ShimTransportReader {
+    proxy: Arc<NetworkProxy<Platform>>,
+    _drop_guard: Arc<SharedSocketDropGuard>,
+}
+
+impl transport::Read for ShimTransportReader {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
+        loop {
+            match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
+                Ok(0) => {
+                    core::hint::spin_loop();
+                }
+                Ok(n) => return Ok(n),
+                Err(e) => {
+                    use litebox::platform::DebugLogProvider as _;
+                    let msg = alloc::format!("9P transport: read IO error: {e:?}\n");
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                    return Err(transport::ReadError::Io);
+                }
+            }
+        }
+    }
+}
+
 impl ShimTransport {
     /// Attempt a deferred park: if vfork parking is requested, announce that
     /// we have "parked" (increment `parked_count`) but keep spinning. The
@@ -600,7 +725,10 @@ mod tests {
     fn connect_9p(
         task: &crate::Task<crate::DefaultFS>,
         server: &DiodServer,
-    ) -> nine_p::FileSystem<crate::Platform, ShimTransport> {
+    ) -> (
+        nine_p::FileSystem<crate::Platform, ShimTransportWriter>,
+        ShimTransportReader,
+    ) {
         let addr = socket_addr([10, 0, 0, 1], server.port);
         let transport = ShimTransport::connect(
             task.global.clone(),
@@ -610,13 +738,47 @@ mod tests {
         )
         .expect("failed to connect to 9P server via shim network");
 
+        let (writer, reader) = transport.split();
         let aname = server.export_path().to_str().unwrap();
         let username = std::env::var("USER")
             .or_else(|_| std::env::var("LOGNAME"))
             .unwrap_or_else(|_| std::string::String::from("nobody"));
 
-        nine_p::FileSystem::new(&task.global.litebox, transport, 65536, &username, aname)
-            .expect("failed to create 9P filesystem")
+        nine_p::FileSystem::new(
+            &task.global.litebox,
+            writer,
+            reader,
+            65536,
+            &username,
+            aname,
+        )
+        .expect("failed to create 9P filesystem")
+    }
+
+    /// Helper that creates a 9P filesystem with a background worker thread.
+    struct NinePHandle {
+        fs: nine_p::FileSystem<crate::Platform, ShimTransportWriter>,
+        _worker: std::thread::JoinHandle<()>,
+    }
+
+    impl NinePHandle {
+        fn new(task: &crate::Task<crate::DefaultFS>, server: &DiodServer) -> Self {
+            let (fs, mut reader) = connect_9p(task, server);
+            let worker_handle = fs.worker_handle();
+            let msize = fs.msize();
+            let worker = std::thread::spawn(move || {
+                let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+                while worker_handle.poll_responses(&mut reader, &mut buf) {}
+            });
+            Self {
+                fs,
+                _worker: worker,
+            }
+        }
+
+        fn fs(&self) -> &nine_p::FileSystem<crate::Platform, ShimTransportWriter> {
+            &self.fs
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -628,7 +790,8 @@ mod tests {
         let task = init_platform(Some(TUN_DEVICE_NAME));
 
         let server = DiodServer::start();
-        let fs = connect_9p(&task, &server);
+        let handle = NinePHandle::new(&task, &server);
+        let fs = handle.fs();
 
         // Create a file and write to it.
         let fd = fs
@@ -672,7 +835,8 @@ mod tests {
         )
         .unwrap();
 
-        let fs = connect_9p(&task, &server);
+        let handle = NinePHandle::new(&task, &server);
+        let fs = handle.fs();
 
         // Read file created on the host through 9P.
         let fd = fs

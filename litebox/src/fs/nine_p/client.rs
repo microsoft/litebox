@@ -1,18 +1,24 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! 9P client implementation
+//! Pipelined 9P client implementation
 //!
 //! This module provides a high-level client for the 9P2000.L protocol.
+//! Multiple guest threads can issue requests concurrently — each request
+//! acquires a tag from the [`PendingTable`](super::pending_table::PendingTable),
+//! sends its message under the write lock, then spin-waits for the dedicated
+//! worker thread to deliver the matching response.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use crate::utils::id_pool::IdPool;
 
 use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
+use super::pending_table::PendingTable;
 use super::transport::{self, Read, Write};
 
 /// Fid generator with thread-safe access
@@ -46,74 +52,105 @@ impl<Platform: RawSyncPrimitivesProvider> FidGenerator<Platform> {
 }
 
 /// 9P client state for writing to the connection
-struct ClientWriteState<T> {
-    /// The underlying transport
-    transport: T,
+struct ClientWriteState<W> {
+    /// The underlying transport (write half)
+    transport: W,
     /// Write buffer
     wbuf: Vec<u8>,
 }
 
-/// 9P client
+/// State shared between guest threads (via [`Client`]) and the worker thread
+/// (via [`super::WorkerHandle`]).
 ///
-/// This client provides synchronous 9P protocol operations. It uses a transport
-/// that implements both Read and Write traits.
-pub(super) struct Client<Platform: RawSyncPrimitivesProvider, T: Read + Write> {
-    /// Maximum message size negotiated with server
-    msize: u32,
-    /// Write state protected by a mutex
-    write_state: Mutex<Platform, ClientWriteState<T>>,
-    /// Read buffer for responses
-    rbuf: Mutex<Platform, Vec<u8>>,
-    /// Fid generator
-    fids: FidGenerator<Platform>,
-    /// Set once the transport has observed an unrecoverable write failure.
+/// Separated from `Client` so that the worker does **not** hold an `Arc` to
+/// the transport writer.  When the [`super::FileSystem`] is dropped, the
+/// `Client` (and its writer) is dropped immediately, closing the transport.
+/// The worker then observes EOF on the reader and exits.
+pub(super) struct ClientInner {
+    /// Pending request table — coordinates guest threads and the worker
+    pending_table: PendingTable,
+    /// Set once the transport has observed an unrecoverable I/O failure.
     poisoned: AtomicBool,
-    /// Next tag for synchronous operations
-    next_tag: AtomicU16,
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
-    /// Allocate the next request tag, wrapping back to `1` before `NOTAG`.
+impl ClientInner {
+    /// Called by the 9P worker thread in a loop. Reads one response from
+    /// the reader and dispatches it to the pending table by tag.
     ///
-    /// This client is synchronous and holds the transport lock until the
-    /// matching response is read, so there is never more than one request
-    /// in flight. That means tags only need to avoid `NOTAG`; they do not
-    /// need to be globally unique for the entire lifetime of the connection.
-    fn next_request_tag(&self) -> u16 {
-        let mut current = self.next_tag.load(Ordering::Relaxed);
-        loop {
-            let tag = match current {
-                0 | fcall::NOTAG => 1,
-                _ => current,
-            };
-            let next = if tag == fcall::NOTAG - 1 { 1 } else { tag + 1 };
-            match self.next_tag.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return tag,
-                Err(observed) => current = observed,
-            }
+    /// Returns `false` when the connection is dead (EOF or error),
+    /// signalling the worker to exit.
+    pub(super) fn poll_responses<R: Read>(&self, reader: &mut R, reader_buf: &mut Vec<u8>) -> bool {
+        if transport::read_to_buf(reader, reader_buf).is_err() {
+            self.poisoned.store(true, Ordering::Release);
+            return false;
         }
-    }
 
-    /// Create a new 9P client and perform version negotiation
+        if reader_buf.len() < 7 {
+            self.poisoned.store(true, Ordering::Release);
+            return false;
+        }
+        let tag = u16::from_le_bytes([reader_buf[5], reader_buf[6]]);
+
+        if tag == 0 {
+            // Fire-and-forget clunk response — discard
+            return true;
+        }
+
+        if !self.pending_table.complete(tag, reader_buf) {
+            // Response for unknown/freed tag — protocol desync
+            self.poisoned.store(true, Ordering::Release);
+            return false;
+        }
+        true
+    }
+}
+
+/// Pipelined 9P client.
+///
+/// Guest threads send requests through the write half (protected by a mutex)
+/// and spin-wait on the [`PendingTable`] for responses. A dedicated worker
+/// thread reads responses from the transport read half and dispatches them
+/// by tag via [`ClientInner::poll_responses`].
+pub(super) struct Client<Platform: RawSyncPrimitivesProvider, W: Write> {
+    /// Maximum message size negotiated with server
+    msize: u32,
+    /// Write state protected by a mutex (write half of transport)
+    write_state: Mutex<Platform, ClientWriteState<W>>,
+    /// Shared state visible to the worker thread
+    inner: Arc<ClientInner>,
+    /// Fid generator
+    fids: FidGenerator<Platform>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
+    /// Create a new 9P client, performing version negotiation and attach
+    /// synchronously using both halves of the transport.
+    ///
+    /// After construction the client only retains the write half; the read
+    /// half is returned to the caller for use by the response worker thread.
     ///
     /// # Arguments
-    /// * `transport` - The underlying transport for read/write operations
+    /// * `writer` - Write half of the transport
+    /// * `reader` - Read half of the transport (returned after handshake)
     /// * `max_msize` - Maximum message size to request
-    pub(super) fn new(mut transport: T, max_msize: u32) -> Result<Self, Error> {
+    /// * `uname` - Username for attach
+    /// * `aname` - Attach path (e.g. "/")
+    pub(super) fn new_with_handshake<R: Read>(
+        mut writer: W,
+        mut reader: R,
+        max_msize: u32,
+        uname: &str,
+        aname: &str,
+    ) -> Result<(Self, R, fcall::Qid, fcall::Fid), Error> {
         const MIN_MSIZE: u32 = 4096 + fcall::READDIRHDRSZ;
         let bufsize = max_msize.max(MIN_MSIZE);
 
         let mut wbuf = Vec::with_capacity(bufsize as usize);
         let mut rbuf = Vec::with_capacity(bufsize as usize);
 
-        // Perform version handshake
+        // --- Version handshake (synchronous) ---
         transport::write_message(
-            &mut transport,
+            &mut writer,
             &mut wbuf,
             TaggedFcall {
                 tag: fcall::NOTAG,
@@ -128,7 +165,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             transport::WriteError::Io => Error::Io,
         })?;
 
-        let response = transport::read_message(&mut transport, &mut rbuf)?;
+        let response = transport::read_message(&mut reader, &mut rbuf)?;
 
         let msize = match response {
             TaggedFcall {
@@ -147,17 +184,63 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             _ => return Err(Error::InvalidResponse),
         };
 
-        wbuf.truncate(msize as usize);
-        rbuf.truncate(msize as usize);
+        // --- Attach (synchronous) ---
+        let fids: FidGenerator<Platform> = FidGenerator::new();
+        let fid = fids.next()?;
+        transport::write_message(
+            &mut writer,
+            &mut wbuf,
+            TaggedFcall {
+                tag: 1,
+                fcall: Fcall::Tattach(fcall::Tattach {
+                    afid: fcall::NOFID,
+                    fid,
+                    n_uname: fcall::NONUNAME,
+                    uname: fcall::FcallStr::Borrowed(uname.as_bytes()),
+                    aname: fcall::FcallStr::Borrowed(aname.as_bytes()),
+                }),
+            },
+        )
+        .map_err(|e| match e {
+            transport::WriteError::Interrupted => Error::Interrupted,
+            transport::WriteError::Io => Error::Io,
+        })?;
 
-        Ok(Client {
+        let attach_resp = transport::read_message(&mut reader, &mut rbuf)?;
+        let (qid, root_fid) = match attach_resp {
+            TaggedFcall {
+                tag: 1,
+                fcall: Fcall::Rattach(fcall::Rattach { qid }),
+            } => (qid, fid),
+            TaggedFcall {
+                fcall: Fcall::Rlerror(e),
+                ..
+            } => {
+                fids.free(fid);
+                return Err(Error::from(e));
+            }
+            _ => {
+                fids.free(fid);
+                return Err(Error::InvalidResponse);
+            }
+        };
+
+        wbuf.truncate(msize as usize);
+
+        let client = Client {
             msize,
-            write_state: Mutex::new(ClientWriteState { transport, wbuf }),
-            rbuf: Mutex::new(rbuf),
-            fids: FidGenerator::new(),
-            poisoned: AtomicBool::new(false),
-            next_tag: AtomicU16::new(1),
-        })
+            write_state: Mutex::new(ClientWriteState {
+                transport: writer,
+                wbuf,
+            }),
+            inner: Arc::new(ClientInner {
+                pending_table: PendingTable::new(),
+                poisoned: AtomicBool::new(false),
+            }),
+            fids,
+        };
+
+        Ok((client, reader, qid, root_fid))
     }
 
     /// Returns the negotiated maximum message size.
@@ -165,68 +248,80 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         self.msize
     }
 
-    /// Send a request and wait for the response
+    /// Send a request and wait for the response via the pending table.
+    ///
+    /// 1. Allocate a tag from the bitmap (spin with backoff if full)
+    /// 2. Lock write half, encode + send the request, unlock
+    /// 3. Spin-wait for the worker to deliver the response
+    /// 4. Decode and process the response
     fn fcall<F, R>(&self, fcall: Fcall<'_>, f: F) -> Result<R, Error>
     where
         F: FnOnce(Fcall<'_>) -> Result<R, Error>,
     {
-        if self.poisoned.load(Ordering::Relaxed) {
+        if self.inner.poisoned.load(Ordering::Acquire) {
             return Err(Error::Io);
         }
-        let tag = self.next_request_tag();
 
-        let mut write_state = self.write_state.lock();
-        if self.poisoned.load(Ordering::Relaxed) {
-            return Err(Error::Io);
-        }
-        let ClientWriteState { transport, wbuf } = &mut *write_state;
-        transport::write_message(transport, wbuf, TaggedFcall { tag, fcall }).map_err(
-            |e| match e {
-                transport::WriteError::Interrupted => Error::Interrupted,
-                transport::WriteError::Io => {
-                    self.poisoned.store(true, Ordering::Relaxed);
-                    Error::Io
-                }
-            },
-        )?;
-
-        let mut rbuf = self.rbuf.lock();
-
-        // Loop until we get a response with matching tag (in case of stale responses)
-        // TODO: support concurrent requests by allowing out-of-order responses and matching tags accordingly
-        loop {
-            let response = transport::read_message(transport, &mut rbuf)?;
-            if response.tag == tag {
-                return f(response.fcall);
+        // 1. Allocate tag (spin with backoff if all in use)
+        let tag = loop {
+            if let Some(t) = self.inner.pending_table.alloc_tag() {
+                break t;
             }
-        }
+            if self.inner.poisoned.load(Ordering::Acquire) {
+                return Err(Error::Io);
+            }
+            core::hint::spin_loop();
+        };
+
+        // 2. Lock write half, encode + send, unlock
+        {
+            let mut write_state = self.write_state.lock();
+            if self.inner.poisoned.load(Ordering::Acquire) {
+                self.inner.pending_table.free_tag(tag);
+                return Err(Error::Io);
+            }
+            let ClientWriteState { transport, wbuf } = &mut *write_state;
+            if let Err(e) = transport::write_message(
+                transport,
+                wbuf,
+                TaggedFcall {
+                    tag: tag.get(),
+                    fcall,
+                },
+            ) {
+                self.inner.pending_table.free_tag(tag);
+                self.inner.poisoned.store(true, Ordering::Release);
+                return Err(match e {
+                    transport::WriteError::Interrupted => Error::Interrupted,
+                    transport::WriteError::Io => Error::Io,
+                });
+            }
+        } // write lock released here
+
+        // 3. Spin-wait for response from the worker thread
+        let completion = match self
+            .inner
+            .pending_table
+            .wait_for_completion(tag, &self.inner.poisoned)
+        {
+            Ok(c) => c,
+            Err(tag) => {
+                self.inner.pending_table.free_tag(tag);
+                return Err(Error::Io);
+            }
+        };
+
+        // 4. Decode response and process
+        let response =
+            fcall::TaggedFcall::decode(&completion).map_err(|_| Error::InvalidResponse)?;
+        f(response.fcall)
+        // completion dropped here → frees tag automatically
     }
 
-    /// Attach to a remote filesystem
-    pub(super) fn attach(
-        &self,
-        uname: &str,
-        aname: &str,
-    ) -> Result<(fcall::Qid, fcall::Fid), Error> {
-        let fid = self.fids.next()?;
-        let res = self.fcall(
-            Fcall::Tattach(fcall::Tattach {
-                afid: fcall::NOFID,
-                fid,
-                n_uname: fcall::NONUNAME,
-                uname: fcall::FcallStr::Borrowed(uname.as_bytes()),
-                aname: fcall::FcallStr::Borrowed(aname.as_bytes()),
-            }),
-            |response| match response {
-                Fcall::Rattach(fcall::Rattach { qid }) => Ok((qid, fid)),
-                Fcall::Rlerror(e) => Err(Error::from(e)),
-                _ => Err(Error::InvalidResponse),
-            },
-        );
-        if res.is_err() {
-            self.fids.free(fid);
-        }
-        res
+    /// Returns an `Arc` to the shared inner state so the worker can
+    /// dispatch responses without preventing the writer from being dropped.
+    pub(super) fn shared_inner(&self) -> Arc<ClientInner> {
+        Arc::clone(&self.inner)
     }
 
     /// Walks the path from the given fid.
@@ -574,18 +669,17 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
     /// Send a Tclunk without waiting for the Rclunk response.
     ///
-    /// This avoids a synchronous round-trip for fid cleanup. The Rclunk
-    /// will be received (and discarded via tag mismatch) by the next
-    /// `fcall()` call. The fid is intentionally NOT recycled to the pool
-    /// because the server may still reference it until it processes the
-    /// Tclunk; with u32 fids and short-lived sandboxes this is safe.
+    /// Uses tag 0 so the worker thread discards the response without
+    /// looking it up in the pending table. The fid is intentionally NOT
+    /// recycled to the pool because the server may still reference it
+    /// until it processes the Tclunk; with u32 fids and short-lived
+    /// sandboxes this is safe.
     pub(super) fn clunk_async(&self, fid: fcall::Fid) {
-        if self.poisoned.load(Ordering::Relaxed) {
+        if self.inner.poisoned.load(Ordering::Acquire) {
             return;
         }
-        let tag = self.next_request_tag();
         let mut write_state = self.write_state.lock();
-        if self.poisoned.load(Ordering::Relaxed) {
+        if self.inner.poisoned.load(Ordering::Acquire) {
             return;
         }
         let ClientWriteState { transport, wbuf } = &mut *write_state;
@@ -594,13 +688,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 transport,
                 wbuf,
                 TaggedFcall {
-                    tag,
+                    tag: 0, // fire-and-forget: worker discards tag-0 responses
                     fcall: Fcall::Tclunk(fcall::Tclunk { fid }),
                 },
             ),
             Err(transport::WriteError::Io)
         ) {
-            self.poisoned.store(true, Ordering::Relaxed);
+            self.inner.poisoned.store(true, Ordering::Release);
         }
     }
 
@@ -642,30 +736,14 @@ mod tests {
 
     use super::*;
 
-    struct MockTransport {
+    /// Read half: feeds pre-encoded responses from a `Cursor`.
+    struct MockReader {
         reads: Cursor<Vec<u8>>,
-        writes: Arc<StdMutex<Vec<Vec<u8>>>>,
     }
 
-    impl MockTransport {
-        fn new(reads: Vec<u8>, writes: Arc<StdMutex<Vec<Vec<u8>>>>) -> Self {
-            Self {
-                reads: Cursor::new(reads),
-                writes,
-            }
-        }
-    }
-
-    impl Read for MockTransport {
+    impl Read for MockReader {
         fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
             self.reads.read(buf).map_err(|_| transport::ReadError::Io)
-        }
-    }
-
-    impl Write for MockTransport {
-        fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
-            self.writes.lock().unwrap().push(buf.to_vec());
-            Ok(buf.len())
         }
     }
 
@@ -675,30 +753,122 @@ mod tests {
         buf
     }
 
-    #[test]
-    fn request_tag_wraps_before_notag() {
-        let writes = Arc::new(StdMutex::new(Vec::new()));
-        let mut responses = Vec::new();
-        responses.extend(encode_message(TaggedFcall {
+    /// Build a handshake response pair (Rversion + Rattach) for mock readers.
+    fn handshake_responses(msize: u32) -> Vec<u8> {
+        let mut resp = Vec::new();
+        resp.extend(encode_message(TaggedFcall {
             tag: fcall::NOTAG,
             fcall: Fcall::Rversion(fcall::Rversion {
-                msize: 8192,
+                msize,
                 version: fcall::FcallStr::Borrowed(b"9P2000.L"),
             }),
         }));
-        responses.extend(encode_message(TaggedFcall {
-            tag: fcall::NOTAG - 1,
-            fcall: Fcall::Rclunk(fcall::Rclunk {}),
-        }));
-        responses.extend(encode_message(TaggedFcall {
+        resp.extend(encode_message(TaggedFcall {
             tag: 1,
-            fcall: Fcall::Rclunk(fcall::Rclunk {}),
+            fcall: Fcall::Rattach(fcall::Rattach {
+                qid: fcall::Qid {
+                    typ: fcall::QidType::empty(),
+                    version: 0,
+                    path: 1,
+                },
+            }),
         }));
+        resp
+    }
 
-        let client =
-            Client::<MockPlatform, _>::new(MockTransport::new(responses, writes.clone()), 8192)
-                .expect("client should initialize");
-        client.next_tag.store(fcall::NOTAG - 1, Ordering::Relaxed);
+    /// Channel-based reader: blocks in `recv()` until data is fed via a sender.
+    struct ChannelReader {
+        rx: std::sync::mpsc::Receiver<Vec<u8>>,
+        buf: Cursor<Vec<u8>>,
+    }
+
+    impl Read for ChannelReader {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
+            if self.buf.position() as usize >= self.buf.get_ref().len() {
+                match self.rx.recv() {
+                    Ok(data) => self.buf = Cursor::new(data),
+                    Err(_) => return Err(transport::ReadError::Io),
+                }
+            }
+            self.buf.read(buf).map_err(|_| transport::ReadError::Io)
+        }
+    }
+
+    /// Writer that records each write and notifies via a channel.
+    struct NotifyWriter {
+        writes: Arc<StdMutex<Vec<Vec<u8>>>>,
+        notify_tx: StdMutex<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl Write for NotifyWriter {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
+            self.writes.lock().unwrap().push(buf.to_vec());
+            let _ = self.notify_tx.lock().unwrap().send(());
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn request_tag_wraps_before_notag() {
+        // In the pipelined client, tags are allocated from a 1..=64 bitmap,
+        // so they never reach NOTAG (u16::MAX). Verify two sequential fcalls
+        // get bitmap-allocated tags.
+        let write_log = Arc::new(StdMutex::new(Vec::new()));
+
+        // Channel-based reader: blocks until data is fed via the sender.
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        let (notify_tx, notify_rx) = std::sync::mpsc::channel::<()>();
+
+        let handshake_reader = MockReader {
+            reads: Cursor::new(handshake_responses(8192)),
+        };
+        let writer = NotifyWriter {
+            writes: write_log.clone(),
+            notify_tx: StdMutex::new(notify_tx),
+        };
+        let (client, _, _, _) = Client::<MockPlatform, _>::new_with_handshake(
+            writer,
+            handshake_reader,
+            8192,
+            "root",
+            "/",
+        )
+        .expect("client should initialize");
+
+        // Drain the handshake write notifications
+        while notify_rx.try_recv().is_ok() {}
+
+        let client = Arc::new(client);
+        let inner = client.shared_inner();
+        let channel_reader = ChannelReader {
+            rx,
+            buf: Cursor::new(Vec::new()),
+        };
+        let worker = std::thread::spawn(move || {
+            let mut reader = channel_reader;
+            let mut buf = Vec::with_capacity(8192);
+            while inner.poll_responses(&mut reader, &mut buf) {}
+        });
+
+        // Helper thread that feeds responses after each request is written.
+        let responder = std::thread::spawn(move || {
+            // Wait for first request write
+            notify_rx.recv().unwrap();
+            tx.send(encode_message(TaggedFcall {
+                tag: 1,
+                fcall: Fcall::Rclunk(fcall::Rclunk {}),
+            }))
+            .unwrap();
+            // Wait for second request write
+            notify_rx.recv().unwrap();
+            tx.send(encode_message(TaggedFcall {
+                tag: 1,
+                fcall: Fcall::Rclunk(fcall::Rclunk {}),
+            }))
+            .unwrap();
+            // Drop tx to signal EOF
+        });
 
         client
             .fcall(
@@ -719,48 +889,59 @@ mod tests {
             )
             .expect("second request should succeed");
 
-        let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 3, "version + 2 requests should be written");
+        responder.join().unwrap();
+        worker.join().unwrap();
 
-        let first = TaggedFcall::decode(&writes[1]).expect("decode first request");
-        let second = TaggedFcall::decode(&writes[2]).expect("decode second request");
-        assert_eq!(first.tag, fcall::NOTAG - 1);
-        assert_eq!(second.tag, 1);
+        let write_log = write_log.lock().unwrap();
+        assert_eq!(
+            write_log.len(),
+            4,
+            "version + attach + 2 requests should be written"
+        );
+
+        let first = TaggedFcall::decode(&write_log[2]).expect("decode first request");
+        let second = TaggedFcall::decode(&write_log[3]).expect("decode second request");
+        assert!(
+            first.tag >= 1 && first.tag <= 64,
+            "first tag {} should be bitmap-allocated (1..=64)",
+            first.tag
+        );
+        assert!(
+            second.tag >= 1 && second.tag <= 64,
+            "second tag {} should be bitmap-allocated (1..=64)",
+            second.tag
+        );
     }
 
-    struct PartialWriteThenFailTransport {
-        reads: Cursor<Vec<u8>>,
+    /// Write half that fails after a partial write, simulating a broken connection.
+    struct PartialWriteThenFailWriter {
         write_calls: Arc<StdMutex<usize>>,
-        allow_handshake_write: bool,
-        fail_after_partial: bool,
+        allow_handshake_writes: Arc<StdMutex<usize>>,
+        fail_after_partial: StdMutex<bool>,
     }
 
-    impl PartialWriteThenFailTransport {
-        fn new(reads: Vec<u8>, write_calls: Arc<StdMutex<usize>>) -> Self {
+    impl PartialWriteThenFailWriter {
+        fn new(write_calls: Arc<StdMutex<usize>>, handshake_writes: usize) -> Self {
             Self {
-                reads: Cursor::new(reads),
                 write_calls,
-                allow_handshake_write: true,
-                fail_after_partial: false,
+                allow_handshake_writes: Arc::new(StdMutex::new(handshake_writes)),
+                fail_after_partial: StdMutex::new(false),
             }
         }
     }
 
-    impl Read for PartialWriteThenFailTransport {
-        fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
-            self.reads.read(buf).map_err(|_| transport::ReadError::Io)
-        }
-    }
-
-    impl Write for PartialWriteThenFailTransport {
+    impl Write for PartialWriteThenFailWriter {
         fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
             *self.write_calls.lock().unwrap() += 1;
-            if self.allow_handshake_write {
-                self.allow_handshake_write = false;
+            let mut allowed = self.allow_handshake_writes.lock().unwrap();
+            if *allowed > 0 {
+                *allowed -= 1;
                 return Ok(buf.len());
             }
-            if !self.fail_after_partial {
-                self.fail_after_partial = true;
+            drop(allowed);
+            let mut failed = self.fail_after_partial.lock().unwrap();
+            if !*failed {
+                *failed = true;
                 return Ok(buf.len().min(3));
             }
             Err(transport::WriteError::Io)
@@ -770,24 +951,33 @@ mod tests {
     #[test]
     fn clunk_async_poisoned_write_failure_blocks_future_requests() {
         let write_calls = Arc::new(StdMutex::new(0));
-        let responses = encode_message(TaggedFcall {
-            tag: fcall::NOTAG,
-            fcall: Fcall::Rversion(fcall::Rversion {
-                msize: 8192,
-                version: fcall::FcallStr::Borrowed(b"9P2000.L"),
-            }),
-        });
 
-        let client = Client::<MockPlatform, _>::new(
-            PartialWriteThenFailTransport::new(responses, write_calls.clone()),
-            8192,
-        )
-        .expect("client should initialize");
+        let mut responses = handshake_responses(8192);
+        // No extra responses needed — clunk_async uses tag 0 (fire-and-forget)
+        // and the subsequent fcall will fail before waiting for a response.
+        // Add a tag-0 Rclunk so the reader doesn't immediately EOF:
+        responses.extend(encode_message(TaggedFcall {
+            tag: 0,
+            fcall: Fcall::Rclunk(fcall::Rclunk {}),
+        }));
+
+        let reader = MockReader {
+            reads: Cursor::new(responses),
+        };
+        // Allow 2 writes for the version+attach handshake
+        let writer = PartialWriteThenFailWriter::new(write_calls.clone(), 2);
+
+        let (client, _reader, _, _) =
+            Client::<MockPlatform, _>::new_with_handshake(writer, reader, 8192, "root", "/")
+                .expect("client should initialize");
+
+        // Reset write call counter after handshake
+        *write_calls.lock().unwrap() = 0;
 
         client.clunk_async(7);
         assert_eq!(
             *write_calls.lock().unwrap(),
-            3,
+            2,
             "async clunk should attempt a partial write and then fail"
         );
 
@@ -801,7 +991,7 @@ mod tests {
         assert!(matches!(result, Err(Error::Io)));
         assert_eq!(
             *write_calls.lock().unwrap(),
-            3,
+            2,
             "poisoned client must not send further requests"
         );
     }
