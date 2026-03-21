@@ -2204,18 +2204,22 @@ impl NtShimEntrypoints {
                 // For critical Session Manager keys, return a dummy handle
                 // so ntdll's init can proceed. NtQueryValueKey will return
                 // NOT_FOUND for individual values.
-                // Exclude "Segment Heap" ΓÇö we don't support segment heap,
-                // and returning NOT_FOUND here forces ntdll to use the
-                // traditional NT heap (RtlCreateHeap).
+                //
+                // The "Segment Heap" key is now ACCEPTED (not blocked).  When
+                // NtQueryValueKey asks for "Enabled" on this key, we return 0
+                // to disable the segment heap.  On Windows 10+, an ABSENT
+                // Segment Heap key means "enabled by default" — so blocking it
+                // was counterproductive.
                 let key_lower = key_name.to_ascii_lowercase();
-                let is_critical_key = (key_lower.contains("session manager")
+                let is_critical_key = key_lower.contains("session manager")
                     || key_lower.contains("knowndlls")
                     || key_lower.contains("nls")
                     || key_lower.contains("muilanguages")
                     || key_lower.contains("currentversion")
                     || key_lower.contains("\\registry\\user\\")
-                    || key_lower.contains("control panel"))
-                    && !key_lower.contains("segment heap");
+                    || key_lower.contains("control panel")
+                    || key_lower.contains("segment heap")
+                    || key_lower.ends_with(".exe");
                 if is_critical_key {
                     // Dump PEB NLS fields for debugging
                     #[cfg(debug_assertions)]
@@ -2308,12 +2312,27 @@ impl NtShimEntrypoints {
                     litebox_platform_multiplex::platform().debug_log_print(&msg);
                 }
 
-                // Return hardcoded values for critical NLS registry entries.
+                // Return hardcoded values for critical NLS registry entries
+                // and for IFEO FrontEndHeapDebugOptions (disable segment heap).
                 let name_lower = value_name.to_ascii_lowercase();
+
+                // REG_SZ values (string data).
                 let reg_value: Option<&str> = match name_lower.as_str() {
                     "acp" => Some("1252"),    // ANSI Code Page
                     "oemcp" => Some("437"),   // OEM Code Page
                     "maccp" => Some("10000"), // MAC Code Page
+                    _ => None,
+                };
+
+                // REG_DWORD values (4-byte integer).
+                let reg_dword: Option<u32> = match name_lower.as_str() {
+                    // Disable the NT segment heap.  The segment heap's 192 GB
+                    // VA cage has initialization issues with our demand-paging
+                    // model.  Returning Enabled=0 for the Segment Heap key
+                    // AND FrontEndHeapDebugOptions=0x08 covers both code paths
+                    // in ntdll's RtlCreateHeap.
+                    "frontendheapdebugoptions" => Some(0x08),
+                    "enabled" => Some(0),
                     _ => None,
                 };
 
@@ -2350,11 +2369,55 @@ impl NtShimEntrypoints {
                         }
                         (NtStatus::STATUS_SUCCESS, false)
                     } else {
-                        // Other info classes ΓÇö return NOT_IMPLEMENTED for now.
+                        // Other info classes — return NOT_IMPLEMENTED for now.
+                        (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                    }
+                } else if let Some(dword_val) = reg_dword {
+                    // REG_DWORD response.
+                    let data_bytes: usize = 4;
+                    let total_size: usize = 12 + data_bytes;
+                    if result_length_ptr != 0 {
+                        unsafe {
+                            core::ptr::write(result_length_ptr as *mut u32, total_size as u32);
+                        }
+                    }
+                    if (info_length as usize) < total_size || info_ptr == 0 {
+                        (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                    } else if info_class == 2 {
+                        // KeyValuePartialInformation
+                        unsafe {
+                            let base = info_ptr as *mut u8;
+                            core::ptr::write(base.cast::<u32>(), 0); // TitleIndex
+                            core::ptr::write(base.add(4).cast::<u32>(), 4); // Type = REG_DWORD
+                            core::ptr::write(base.add(8).cast::<u32>(), data_bytes as u32);
+                            core::ptr::write(base.add(12).cast::<u32>(), dword_val);
+                        }
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "NT shim: NtQueryValueKey returned {value_name}=0x{dword_val:X}\n",
+                                ),
+                            );
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
+                    } else {
                         (NtStatus::STATUS_NOT_IMPLEMENTED, false)
                     }
                 } else {
-                    (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                    let status = NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(
+                            &alloc::format!(
+                                "NT shim: NtQueryValueKey returned 0x{:08X}\n",
+                                status.0 as u32,
+                            ),
+                        );
+                    }
+                    (status, false)
                 }
             }
 
@@ -2513,26 +2576,36 @@ impl NtShimEntrypoints {
                 let dll_name = name.rsplit('\\').next().unwrap_or(&name).to_lowercase();
 
                 // Try to find this DLL in the VFS (tar_ro layer).
+                // The tar stores DLLs under c/windows/system32/, so in the VFS
+                // they appear at /c/windows/system32/{dll_name}.  We also check
+                // the root as a fallback.
                 let found = if dll_name.ends_with(".dll") {
                     if let Some(fs) = self.shared.fs.get() {
                         use litebox::fs::FileSystem as _;
-                        // DLLs in the tar are stored at the root level.
-                        let vfs_path = alloc::format!("/{dll_name}");
-                        if let Ok(fd) = fs.open(
-                            &vfs_path,
-                            litebox::fs::OFlags::RDONLY,
-                            litebox::fs::Mode::RUSR,
-                        ) {
-                            // Read the entire file into memory for PE parsing.
-                            let size = fs.fd_file_status(&fd).map(|s| s.size as usize).unwrap_or(0);
-                            let mut buf = alloc::vec![0u8; size];
-                            let bytes_read = fs.read(&fd, &mut buf, None).unwrap_or(0);
-                            buf.truncate(bytes_read);
-                            let _ = fs.close(&fd);
-                            if buf.is_empty() { None } else { Some(buf) }
-                        } else {
-                            None
+                        let search_paths = [
+                            alloc::format!("/c/windows/system32/{dll_name}"),
+                            alloc::format!("/{dll_name}"),
+                        ];
+                        let mut result = None;
+                        for vfs_path in &search_paths {
+                            if let Ok(fd) = fs.open(
+                                vfs_path,
+                                litebox::fs::OFlags::RDONLY,
+                                litebox::fs::Mode::RUSR,
+                            ) {
+                                let size =
+                                    fs.fd_file_status(&fd).map(|s| s.size as usize).unwrap_or(0);
+                                let mut buf = alloc::vec![0u8; size];
+                                let bytes_read = fs.read(&fd, &mut buf, None).unwrap_or(0);
+                                buf.truncate(bytes_read);
+                                let _ = fs.close(&fd);
+                                if !buf.is_empty() {
+                                    result = Some(buf);
+                                    break;
+                                }
+                            }
                         }
+                        result
                     } else {
                         None
                     }
@@ -3481,6 +3554,28 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             return ContinueOperation::Terminate;
         }
 
+        // ── Handle breakpoints (e.g. debugger traps) ──
+        //
+        // INT3 (0xCC) breakpoints may appear from stale debug traps or
+        // from our __fastfail rewrites (if we switch back to CC).  Log
+        // and terminate the guest with STATUS_BREAKPOINT.
+        if info.exception == litebox::shim::Exception::BREAKPOINT {
+            #[cfg(debug_assertions)]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "NT shim: BREAKPOINT at rip=0x{:X} rcx=0x{:X}\n",
+                    ctx.regs.rip,
+                    ctx.regs.rcx,
+                ));
+            }
+            self.exit_code.store(
+                NtStatus::STATUS_BREAKPOINT.0 as i32,
+                core::sync::atomic::Ordering::Release,
+            );
+            return ContinueOperation::Terminate;
+        }
+
         // Handle demand-commit page faults for reserved (inaccessible) pages.
         //
         // In the NT memory model, MEM_RESERVE creates inaccessible pages and
@@ -3638,6 +3733,83 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             }
         }
 
+        // ── Segment heap lazy context initialization fixup ──
+        //
+        // The NT segment heap (Windows 10+) reserves a huge VA range
+        // ("cage") via NtAllocateVirtualMemoryEx and creates per-context
+        // areas at cage_base + N*0x660.  During RtlCreateHeap the init
+        // loop may only fully initialise context 0 (at cage_base), leaving
+        // contexts 1 and 2 with all-zero data.
+        //
+        // Each per-context area stores a pointer at +0x18 to the
+        // _SEGMENT_HEAP structure.  RtlAllocateHeap reads this pointer,
+        // then indexes into HeapSegContexts (at heap+0x4A8) to find the
+        // segment context for the allocation.  The init code populates
+        // the HeapSegContexts array at cage_base+0x4A8 (not heap+0x4A8).
+        //
+        // Fix: when we detect a null deref from reading an uninitialised
+        // per-context area, we:
+        //   (a) initialise the per-context area (linked list + heap ptr),
+        //   (b) copy the HeapSegContexts entry from cage_base to heap so
+        //       the allocation code finds the segment context, and
+        //   (c) patch RCX with the heap pointer.
+        if info.exception == litebox::shim::Exception::PAGE_FAULT {
+            let raw_fault_addr = info.cr2;
+            if raw_fault_addr < 0x10000 {
+                let r13 = ctx.regs.r13 as usize;
+                if let Some((res_base, _)) =
+                    self.shared.process_state.va_reservation_at(r13)
+                {
+                    let heap_ptr =
+                        unsafe { core::ptr::read_unaligned((res_base + 0x18) as *const u64) };
+                    let val_n =
+                        unsafe { core::ptr::read_unaligned((r13 + 0x18) as *const u64) };
+
+                    if heap_ptr != 0 && val_n == 0 {
+                        // (a) Initialise the per-context area.
+                        unsafe {
+                            core::ptr::write(r13 as *mut u64, 0);
+                            core::ptr::write((r13 + 0x08) as *mut u64, (r13 + 8) as u64);
+                            core::ptr::write((r13 + 0x10) as *mut u64, (r13 + 8) as u64);
+                            core::ptr::write((r13 + 0x18) as *mut u64, heap_ptr);
+                        }
+
+                        // (b) Copy HeapSegContexts entry from cage → heap.
+                        // context_index is already in EAX (loaded by the
+                        // preceding `movzx eax, word [r12+0xAC]`).
+                        let ctx_idx = ctx.regs.rax & 0xFFFF;
+                        let cage_hs =
+                            res_base + (ctx_idx * 8) as usize + 0x4A8;
+                        let heap_hs =
+                            heap_ptr as usize + (ctx_idx * 8) as usize + 0x4A8;
+                        let seg_ctx_ptr =
+                            unsafe { core::ptr::read_unaligned(cage_hs as *const u64) };
+                        if seg_ctx_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(heap_hs as *mut u64, seg_ctx_ptr);
+                            }
+                        }
+
+                        // (c) Patch RCX (stale 0 from [R13+0x18]).
+                        ctx.regs.rcx = heap_ptr as usize;
+
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "NT shim: segment-heap lazy init fixup \
+                                     R13=0x{r13:X} ctx_idx={ctx_idx} \
+                                     heap=0x{heap_ptr:X} seg_ctx=0x{seg_ctx_ptr:X}\n",
+                                ),
+                            );
+                        }
+                        return ContinueOperation::Resume;
+                    }
+                }
+            }
+        }
+
         let status = exception_to_ntstatus(info);
 
         // In debug builds, dump registers, stack, and code bytes to aid
@@ -3675,10 +3847,10 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             );
             litebox_platform_multiplex::platform().debug_log_print(&msg);
 
-            // Dump a few stack words around RSP.
+            // Dump stack words around RSP (extended range to find return addresses).
             let rsp = ctx.regs.rsp as u64;
-            let mut stack_dump = alloc::string::String::from("  stack (rsp-64..rsp+128):\n");
-            for offset in (-8i64..16).rev() {
+            let mut stack_dump = alloc::string::String::from("  stack (rsp-64..rsp+320):\n");
+            for offset in (-8i64..40).rev() {
                 let addr = (rsp as i64 + offset * 8) as u64;
                 // Safety: reading guest stack; may fault if unmapped, but
                 // we are already in a terminal exception handler.
@@ -3699,6 +3871,112 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             }
             insn_dump.push('\n');
             litebox_platform_multiplex::platform().debug_log_print(&insn_dump);
+
+            // Dump PEB.ProcessHeap and heap metadata for debugging.
+            if let Some(ref init) = self.init_state {
+                let peb = init.peb_va;
+                let heap = unsafe { core::ptr::read((peb + 0x30) as *const usize) };
+                let msg = alloc::format!(
+                    "  PEB=0x{peb:X} PEB.ProcessHeap=0x{heap:X}\n"
+                );
+                litebox_platform_multiplex::platform().debug_log_print(&msg);
+
+                // Dump _SEGMENT_HEAP.HeapSegContexts (offset 0x4A8, array of
+                // 16 pointers) to check for corruption.
+                if heap != 0 {
+                    let mut seg_dump =
+                        alloc::format!("  _SEGMENT_HEAP at 0x{heap:X}:\n");
+                    // Signature at +0x10
+                    let sig = unsafe {
+                        core::ptr::read((heap + 0x10) as *const u32)
+                    };
+                    seg_dump.push_str(&alloc::format!(
+                        "    Signature=0x{sig:08X}\n"
+                    ));
+                    // HeapSegContexts array at +0x4A8
+                    for i in 0u64..16 {
+                        let ptr = unsafe {
+                            core::ptr::read(
+                                (heap as u64 + 0x4A8 + i * 8) as *const u64,
+                            )
+                        };
+                        if ptr != 0 {
+                            seg_dump.push_str(&alloc::format!(
+                                "    HeapSegContexts[{i}] = 0x{ptr:016X}\n"
+                            ));
+                        }
+                    }
+                    // Also dump first 256 bytes of heap as hex
+                    seg_dump.push_str("    First 256 bytes:\n");
+                    for row in 0..16u64 {
+                        let base = heap as u64 + row * 16;
+                        seg_dump.push_str(&alloc::format!("    +{:03X}: ", row * 16));
+                        for col in 0..16u64 {
+                            let b = unsafe {
+                                core::ptr::read((base + col) as *const u8)
+                            };
+                            seg_dump.push_str(&alloc::format!("{b:02X} "));
+                        }
+                        seg_dump.push('\n');
+                    }
+                    litebox_platform_multiplex::platform()
+                        .debug_log_print(&seg_dump);
+                }
+            }
+
+            // Dump more instructions before and after crash RIP.
+            let rip2 = ctx.regs.rip as u64;
+            let start = rip2.saturating_sub(32);
+            let mut pre_dump = alloc::format!("  code at rip-32: ");
+            for i in 0u64..64 {
+                let byte = unsafe { core::ptr::read((start + i) as *const u8) };
+                if start + i == rip2 {
+                    pre_dump.push_str(">> ");
+                }
+                pre_dump.push_str(&alloc::format!("{byte:02X} "));
+            }
+            pre_dump.push('\n');
+            litebox_platform_multiplex::platform().debug_log_print(&pre_dump);
+
+            // Dump R13 target memory (segment heap cage base area).
+            if ctx.regs.r13 != 0 {
+                let r13 = ctx.regs.r13 as u64;
+                // Show first 256 bytes from [R13 - 0xCC0] (should be cage base)
+                let cage_base = r13.saturating_sub(0xCC0);
+                let mut cage_dump = alloc::format!(
+                    "  cage_base=0x{cage_base:X} (R13-0xCC0):\n"
+                );
+                for row in 0..16u64 {
+                    let base_addr = cage_base + row * 16;
+                    cage_dump.push_str(&alloc::format!("    +{:03X}: ", row * 16));
+                    for col in 0..16u64 {
+                        let b = unsafe {
+                            core::ptr::read((base_addr + col) as *const u8)
+                        };
+                        cage_dump.push_str(&alloc::format!("{b:02X} "));
+                    }
+                    cage_dump.push('\n');
+                }
+                // Also dump around offset 0xCC0 (where the segment context
+                // back-pointer lives).
+                cage_dump.push_str(&alloc::format!(
+                    "  [R13] area (cage_base+0xCC0..+0xD40):\n"
+                ));
+                for row in 0..8u64 {
+                    let base_addr = r13 + row * 16;
+                    cage_dump.push_str(&alloc::format!(
+                        "    +{:03X}: ", 0xCC0 + row * 16
+                    ));
+                    for col in 0..16u64 {
+                        let b = unsafe {
+                            core::ptr::read((base_addr + col) as *const u8)
+                        };
+                        cage_dump.push_str(&alloc::format!("{b:02X} "));
+                    }
+                    cage_dump.push('\n');
+                }
+                litebox_platform_multiplex::platform().debug_log_print(&cage_dump);
+            }
         }
 
         self.exit_code.store(status.0, Ordering::Release);

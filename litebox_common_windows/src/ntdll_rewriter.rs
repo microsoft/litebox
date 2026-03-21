@@ -50,9 +50,16 @@ pub struct NtdllRewriteResult {
     /// The runner must write the actual shim syscall_entry address here
     /// after mapping the trampoline.
     pub entry_ptr_offset: usize,
-    /// Offset within the trampoline where the 8-byte GS table pointer lives.
-    /// The runner must write the platform's GS lookup table address here.
+    /// Offset within the trampoline where the 8-byte forward GS table pointer
+    /// lives (guest_gs → host_gs). The runner must write the platform's
+    /// forward GS lookup table address here.
     pub gs_table_ptr_offset: usize,
+    /// Offset within the trampoline where the 8-byte reverse GS table pointer
+    /// lives (host_gs → guest_gs). The runner must write the platform's
+    /// reverse GS lookup table address here. This table is used to detect
+    /// that GS is already the host TEB (e.g., after kernel exception dispatch)
+    /// and skip the swap.
+    pub reverse_gs_table_ptr_offset: usize,
     /// Number of syscall stubs that were rewritten (JMP-patched).
     pub stubs_rewritten: usize,
     /// Number of stubs whose export name matched a known `NtSyscallId`.
@@ -63,6 +70,9 @@ pub struct NtdllRewriteResult {
     /// Syscall number → export name for stubs NOT in `NtSyscallId`.
     /// Useful for debugging which unhandled syscalls are being called.
     pub unhandled_stubs: Vec<(u32, String)>,
+    /// Number of `int 0x29` (__fastfail) instructions that were replaced
+    /// with `int 3` (breakpoint) to keep them catchable by VEH.
+    pub fastfail_patched: usize,
 }
 
 /// The 4-byte prefix of every ntdll syscall stub.
@@ -128,112 +138,143 @@ pub fn rewrite_ntdll(
     // The stub does `mov r10,rcx` (save arg1) then JMPs here with the return
     // address still on the stack.
     //
-    // The trampoline must also swap GS from guest TEB to host TEB before
-    // entering the syscall callback, because `syscall_callback` reads TLS
-    // via `gs:[TLS_INDEX * 8 + TEB_TLS_SLOTS_OFFSET]`.
+    // The trampoline must swap GS from guest TEB to host TEB before entering
+    // the syscall callback, because `syscall_callback` reads TLS via
+    // `gs:[TLS_INDEX * 8 + TEB_TLS_SLOTS_OFFSET]`.
+    //
+    // However, the Windows kernel may have already reset GS to the host TEB
+    // (e.g., after exception dispatch or APC delivery). To handle both cases,
+    // the trampoline does a two-phase scan:
+    //
+    //   Phase 1: Scan the forward table (guest_gs → host_gs). If the current
+    //            GS matches a guest_gs entry, swap to the corresponding host_gs.
+    //   Phase 2: If not found, scan the reverse table (host_gs → guest_gs).
+    //            If the current GS matches a host_gs entry, it's already the
+    //            host TEB — skip the swap and proceed directly to the shim.
+    //   Miss:    If neither table matches, UD2 (unknown GS value).
     //
     // Layout:
     //   +0x00: 8-byte shim entry pointer (filled by runner)
-    //   +0x08: 8-byte GS table pointer (filled by runner)
-    //   +0x10: trampoline code:
-    //          pop  rcx                     ; 1 byte  — return addr → RCX
-    //          rdgsbase r11                 ; 5 bytes — guest GS → R11
-    //          push rcx                     ; 1 byte  — save return addr
-    //          mov  rcx, [rip+disp]         ; 7 bytes — load GS table ptr
-    //          .probe:
-    //          cmp  [rcx], r11              ; 3 bytes — match?
-    //          je   .found                  ; 2 bytes
-    //          add  rcx, 16                 ; 4 bytes — next entry
-    //          cmp  qword [rcx], 0          ; 4 bytes — sentinel?
-    //          jne  .probe                  ; 2 bytes
-    //          ud2                          ; 2 bytes — miss → crash
-    //          .found:
-    //          mov  rcx, [rcx+8]            ; 4 bytes — host GS
-    //          wrgsbase rcx                 ; 5 bytes — restore host GS
-    //          pop  rcx                     ; 1 byte  — restore return addr
-    //          jmp  [rip+disp]              ; 6 bytes — jump to shim entry
+    //   +0x08: 8-byte forward GS table pointer (guest→host, filled by runner)
+    //   +0x10: 8-byte reverse GS table pointer (host→guest, filled by runner)
+    //   +0x18: trampoline code
 
     let mut trampoline = vec![0xCCu8; PAGE_SIZE]; // fill with INT3 for safety
 
     let entry_ptr_offset = 0usize; // shim entry ptr at +0x00
-    let gs_table_ptr_offset = 8usize; // GS table ptr at +0x08
-    let code_offset = 16usize; // code starts at +0x10
+    let gs_table_ptr_offset = 8usize; // forward GS table ptr at +0x08
+    let reverse_gs_table_ptr_offset = 16usize; // reverse GS table ptr at +0x10
+    let code_offset = 24usize; // code starts at +0x18
     let trampoline_code_va = trampoline_va + code_offset as u64;
 
     let mut off = code_offset;
 
-    // +0: pop rcx  (59)
+    // pop rcx  (59) — return addr → RCX
     trampoline[off] = 0x59;
-    off += 1; // off = 17
+    off += 1;
 
-    // +1: rdgsbase r11  (F3 49 0F AE CB)
+    // rdgsbase r11  (F3 49 0F AE CB) — current GS → R11
     trampoline[off..off + 5].copy_from_slice(&[0xF3, 0x49, 0x0F, 0xAE, 0xCB]);
-    off += 5; // off = 22
+    off += 5;
 
-    // +6: push rcx  (51)
+    // push rcx  (51) — save return addr
     trampoline[off] = 0x51;
-    off += 1; // off = 23
+    off += 1;
 
-    // +7: mov rcx, [rip+disp32]  (48 8B 0D xx xx xx xx)
-    // RIP after this insn = code_offset + 7 + 7 = code_offset + 14
-    // Target = gs_table_ptr_offset (=8)
-    // disp = 8 - (code_offset + 14) = 8 - 30 = -22
-    let rip_after_mov = (code_offset + 14) as i32;
-    let mov_disp = (gs_table_ptr_offset as i32) - rip_after_mov;
+    // === Phase 1: scan forward table (guest_gs → host_gs) ===
+    //
+    // mov rcx, [rip+disp32]  (48 8B 0D xx xx xx xx) — load forward GS table ptr
+    let rip_after_fwd_mov = off + 7;
+    let fwd_mov_disp = (gs_table_ptr_offset as i32) - (rip_after_fwd_mov as i32);
     trampoline[off..off + 3].copy_from_slice(&[0x48, 0x8B, 0x0D]);
-    trampoline[off + 3..off + 7].copy_from_slice(&mov_disp.to_le_bytes());
-    off += 7; // off = 30  (.probe)
+    trampoline[off + 3..off + 7].copy_from_slice(&fwd_mov_disp.to_le_bytes());
+    off += 7;
 
-    // .probe:
-    let probe_off = off;
+    // .probe_fwd:
+    let probe_fwd_off = off;
     // cmp [rcx], r11  (4C 39 19)
     trampoline[off..off + 3].copy_from_slice(&[0x4C, 0x39, 0x19]);
-    off += 3; // off = 33
+    off += 3;
 
-    // je .found  (74 xx) — forward jump, will patch
-    let je_off = off;
+    // je .found_guest  (74 xx) — forward jump, will patch
+    let je_found_guest_off = off;
     trampoline[off] = 0x74;
-    off += 2; // off = 35
+    off += 2;
 
     // add rcx, 16  (48 83 C1 10)
     trampoline[off..off + 4].copy_from_slice(&[0x48, 0x83, 0xC1, 0x10]);
-    off += 4; // off = 39
+    off += 4;
 
-    // cmp qword [rcx], 0  (48 83 39 00)
+    // cmp qword [rcx], 0  (48 83 39 00) — sentinel?
     trampoline[off..off + 4].copy_from_slice(&[0x48, 0x83, 0x39, 0x00]);
-    off += 4; // off = 43
+    off += 4;
 
-    // jne .probe  (75 xx)
-    let back_disp = (probe_off as i32) - (off as i32 + 2);
+    // jne .probe_fwd  (75 xx)
+    let back_disp = (probe_fwd_off as i32) - (off as i32 + 2);
     trampoline[off] = 0x75;
     trampoline[off + 1] = back_disp as u8;
-    off += 2; // off = 45
+    off += 2;
 
-    // ud2 (0F 0B)
+    // === Phase 2: scan reverse table (host_gs → guest_gs) ===
+    // Not found in forward table. Check if GS is already the host TEB.
+    //
+    // mov rcx, [rip+disp32]  (48 8B 0D xx xx xx xx) — load reverse GS table ptr
+    let rip_after_rev_mov = off + 7;
+    let rev_mov_disp = (reverse_gs_table_ptr_offset as i32) - (rip_after_rev_mov as i32);
+    trampoline[off..off + 3].copy_from_slice(&[0x48, 0x8B, 0x0D]);
+    trampoline[off + 3..off + 7].copy_from_slice(&rev_mov_disp.to_le_bytes());
+    off += 7;
+
+    // .probe_rev:
+    let probe_rev_off = off;
+    // cmp [rcx], r11  (4C 39 19)
+    trampoline[off..off + 3].copy_from_slice(&[0x4C, 0x39, 0x19]);
+    off += 3;
+
+    // je .already_host  (74 xx) — forward jump, will patch
+    let je_already_host_off = off;
+    trampoline[off] = 0x74;
+    off += 2;
+
+    // add rcx, 16  (48 83 C1 10)
+    trampoline[off..off + 4].copy_from_slice(&[0x48, 0x83, 0xC1, 0x10]);
+    off += 4;
+
+    // cmp qword [rcx], 0  (48 83 39 00) — sentinel?
+    trampoline[off..off + 4].copy_from_slice(&[0x48, 0x83, 0x39, 0x00]);
+    off += 4;
+
+    // jne .probe_rev  (75 xx)
+    let back_disp_rev = (probe_rev_off as i32) - (off as i32 + 2);
+    trampoline[off] = 0x75;
+    trampoline[off + 1] = back_disp_rev as u8;
+    off += 2;
+
+    // ud2 (0F 0B) — not in either table
     trampoline[off..off + 2].copy_from_slice(&[0x0F, 0x0B]);
-    off += 2; // off = 47
+    off += 2;
 
-    // .found:
-    let found_off = off;
-    // Patch je .found displacement
-    trampoline[je_off + 1] = (found_off - (je_off + 2)) as u8;
+    // .found_guest: swap GS from guest to host
+    let found_guest_off = off;
+    trampoline[je_found_guest_off + 1] = (found_guest_off - (je_found_guest_off + 2)) as u8;
 
-    // mov rcx, [rcx+8]  (48 8B 49 08)
+    // mov rcx, [rcx+8]  (48 8B 49 08) — host GS from forward table
     trampoline[off..off + 4].copy_from_slice(&[0x48, 0x8B, 0x49, 0x08]);
-    off += 4; // off = 51
+    off += 4;
 
-    // wrgsbase rcx  (F3 48 0F AE D9)
+    // wrgsbase rcx  (F3 48 0F AE D9) — swap to host GS
     trampoline[off..off + 5].copy_from_slice(&[0xF3, 0x48, 0x0F, 0xAE, 0xD9]);
-    off += 5; // off = 56
+    off += 5;
 
-    // pop rcx  (59)
+    // .already_host: GS is already host TEB, skip swap
+    let already_host_off = off;
+    trampoline[je_already_host_off + 1] = (already_host_off - (je_already_host_off + 2)) as u8;
+
+    // pop rcx  (59) — restore return addr
     trampoline[off] = 0x59;
-    off += 1; // off = 57
+    off += 1;
 
-    // jmp [rip+disp32]  (FF 25 xx xx xx xx)
-    // RIP after this insn = off + 6
-    // Target = entry_ptr_offset (=0)
-    // disp = 0 - (off + 6)
+    // jmp [rip+disp32]  (FF 25 xx xx xx xx) — jump to shim entry
     let rip_after_jmp = (off + 6) as i32;
     let jmp_disp = (entry_ptr_offset as i32) - rip_after_jmp;
     trampoline[off] = 0xFF;
@@ -257,10 +298,12 @@ pub fn rewrite_ntdll(
                 trampoline,
                 entry_ptr_offset,
                 gs_table_ptr_offset,
+                reverse_gs_table_ptr_offset,
                 stubs_rewritten: 0,
                 stubs_identified: 0,
                 syscall_map: NtSyscallMap::from_pairs(&[]),
                 unhandled_stubs: Vec::new(),
+                fastfail_patched: 0,
             };
         }
     };
@@ -307,6 +350,35 @@ pub fn rewrite_ntdll(
         i += 1;
     }
 
+    // ── Neutralize `int 0x29` (__fastfail) instructions ──
+    //
+    // `int 0x29` triggers the Windows __fastfail mechanism, which
+    // terminates the process WITHOUT delivering the exception to VEH
+    // handlers.  Since the guest runs in the same host process, an
+    // uncaught __fastfail kills the sandbox.
+    //
+    // We replace every `CD 29` in ntdll's .text section with `EB 00`
+    // (JMP +0, i.e. jump to next instruction = NOP).  This is safer
+    // than `90 90` (two NOPs) because `90 90` could interfere with
+    // instruction alignment if the scanner hits a false-positive
+    // `CD 29` that is actually operand bytes.  `EB 00` is a 2-byte
+    // no-op that preserves the instruction boundary.
+    //
+    // When __fastfail is neutralized, the code after it (typically a
+    // `ret`) executes normally.  If the stack cookie WAS corrupted,
+    // the guest will likely crash at a subsequent access, which the
+    // sandbox CAN catch via VEH.
+    let mut fastfail_patched = 0usize;
+    let mut j = text_file_start;
+    while j + 1 < text_file_end {
+        if image[j] == 0xCD && image[j + 1] == 0x29 {
+            image[j] = 0xEB; // JMP rel8
+            image[j + 1] = 0x00; // offset 0 → fall through
+            fastfail_patched += 1;
+        }
+        j += 1;
+    }
+
     let syscall_map = NtSyscallMap::from_pairs(&syscall_pairs);
 
     NtdllRewriteResult {
@@ -314,10 +386,12 @@ pub fn rewrite_ntdll(
         trampoline,
         entry_ptr_offset,
         gs_table_ptr_offset,
+        reverse_gs_table_ptr_offset,
         stubs_rewritten,
         stubs_identified,
         syscall_map,
         unhandled_stubs,
+        fastfail_patched,
     }
 }
 

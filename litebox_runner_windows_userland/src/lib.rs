@@ -289,14 +289,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
         // Map the trampoline page.
         let syscall_entry = platform.get_syscall_entry_point() as u64;
-        let gs_table_ptr = platform.guest_gs_table_ptr() as u64;
+        let fwd_gs_table_ptr = platform.forward_gs_table_ptr() as u64;
+        let rev_gs_table_ptr = platform.reverse_gs_table_ptr() as u64;
         let tramp_va = result.trampoline_va;
         let entry_off = result.entry_ptr_offset;
         let gs_off = result.gs_table_ptr_offset;
+        let rev_gs_off = result.reverse_gs_table_ptr_offset;
 
         let mut tramp_data = result.trampoline;
         tramp_data[entry_off..entry_off + 8].copy_from_slice(&syscall_entry.to_le_bytes());
-        tramp_data[gs_off..gs_off + 8].copy_from_slice(&gs_table_ptr.to_le_bytes());
+        tramp_data[gs_off..gs_off + 8].copy_from_slice(&fwd_gs_table_ptr.to_le_bytes());
+        tramp_data[rev_gs_off..rev_gs_off + 8].copy_from_slice(&rev_gs_table_ptr.to_le_bytes());
 
         pm_mapper
             .pre_reserve(tramp_va, PAGE_SIZE)
@@ -396,20 +399,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let peb_teb_layout = PebTebLayout::at_base(PEB_TEB_BASE);
 
-    // ntdll's RtlAllocateHeap needs a real Windows heap.
-    let process_heap = {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn HeapCreate(
-                fl_options: u32,
-                dw_initial_size: usize,
-                dw_max_size: usize,
-            ) -> *mut core::ffi::c_void;
-        }
-        let h = unsafe { HeapCreate(0, 0, 0) };
-        assert!(!h.is_null(), "HeapCreate failed");
-        h as usize
-    };
+    // PEB.ProcessHeap is set to 0 so that ntdll's LdrpInitialize creates
+    // the process heap in the guest VA range via RtlCreateHeap (which calls
+    // NtAllocateVirtualMemory through our shim).  Setting this to a host
+    // HeapCreate handle causes heap metadata corruption because the host
+    // and guest ntdll versions may differ.
+    let process_heap: usize = 0;
 
     // Derive EXE names for PEB/TEB LDR entries from the actual PE file path.
     let (exe_full_path_str, exe_base_name_str) = if let Some(pe_path) = &cli_args.pe_file {

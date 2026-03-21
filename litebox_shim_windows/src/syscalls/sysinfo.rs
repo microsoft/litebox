@@ -62,9 +62,10 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
                 // MaximumUserModeAddress at offset 32 (ULONG_PTR)
                 core::ptr::write(base.add(32).cast::<u64>(), 0x7FFFFFFEFFFF);
                 // ActiveProcessorsAffinityMask at offset 40 (KAFFINITY)
-                core::ptr::write(base.add(40).cast::<u64>(), 1);
+                // Must match ActiveProcessorCount in KUSD shadow (4).
+                core::ptr::write(base.add(40).cast::<u64>(), 0xF); // bits 0-3 for 4 CPUs
                 // NumberOfProcessors at offset 48 (CCHAR)
-                core::ptr::write(base.add(48), 1);
+                core::ptr::write(base.add(48), 4);
             }
             if return_length_ptr != 0 {
                 unsafe {
@@ -164,9 +165,10 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
                 // offset 40: MaximumUserModeAddress (ULONG_PTR)
                 core::ptr::write(base.add(40).cast::<u64>(), 0x7FFF_FFFE_FFFF);
                 // offset 48: ActiveProcessorsAffinityMask (KAFFINITY)
-                core::ptr::write(base.add(48).cast::<u64>(), 1);
+                // Must match ActiveProcessorCount in KUSD shadow (4).
+                core::ptr::write(base.add(48).cast::<u64>(), 0xF); // bits 0-3 for 4 CPUs
                 // offset 56: NumberOfProcessors (CCHAR)
-                core::ptr::write(base.add(56), 1);
+                core::ptr::write(base.add(56), 4);
             }
             if return_length_ptr != 0 {
                 unsafe {

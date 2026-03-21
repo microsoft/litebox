@@ -561,27 +561,40 @@ impl WindowsUserland {
         THREAD_GS_BASE.set(value);
     }
 
-    /// Returns a pointer to the GS lookup table's first entry.
+    /// Returns a pointer to the forward GS table's first entry (guest→host).
     ///
     /// This pointer is stable for the lifetime of the platform and is passed
     /// to stub DLL builders so the trampoline asm can find the table.
-    pub fn guest_gs_table_ptr(&self) -> *const litebox_common_windows::gs_table::GsTableEntry {
-        self.guest_gs_table.base_ptr()
+    pub fn forward_gs_table_ptr(&self) -> *const litebox_common_windows::gs_table::GsTableEntry {
+        self.guest_gs_table.forward_base_ptr()
+    }
+
+    /// Returns a pointer to the reverse GS table's first entry (host→guest).
+    ///
+    /// This pointer is stable for the lifetime of the platform and is passed
+    /// to stub DLL builders so the trampoline asm can detect that GS is
+    /// already the host TEB and skip the swap.
+    pub fn reverse_gs_table_ptr(&self) -> *const litebox_common_windows::gs_table::GsTableEntry {
+        self.guest_gs_table.reverse_base_ptr()
     }
 }
 
-/// Host-owned guest GS → host GS lookup table.
+/// Bidirectional GS base lookup tables.
 ///
-/// Entries are written by the platform during thread start and removed on
-/// thread exit. The stub DLL trampolines do a lock-free linear scan of
-/// the raw entry array on every syscall entry.
+/// Contains two parallel tables:
+/// - **Forward** (`guest_gs → host_gs`): used when guest code enters the
+///   syscall trampoline with GS pointing at the guest TEB.
+/// - **Reverse** (`host_gs → guest_gs`): used when the Windows kernel has
+///   already restored GS to the host TEB before the trampoline runs (e.g.,
+///   after exception dispatch or APC delivery). The trampoline scans this
+///   table to confirm GS is already host and skips the swap.
 ///
 /// # Concurrency
 ///
 /// Insertions and removals go through a `Mutex`. The trampoline reads are
 /// lock-free — they rely on the publishing protocol:
-/// - insert: write `host_gs` first, then `guest_gs` (sentinel is 0)
-/// - remove: zero `guest_gs` first
+/// - insert: write value first, then key (sentinel is 0)
+/// - remove: write tombstone over key first
 ///
 /// This is safe because x86-64 guarantees that aligned 8-byte stores are
 /// atomic with respect to aligned 8-byte loads.
@@ -590,9 +603,14 @@ struct GuestGsTable {
 }
 
 struct GuestGsTableInner {
-    /// The raw table read by the trampoline asm. The last entry is always
-    /// the zero sentinel.
-    data: [litebox_common_windows::gs_table::GsTableEntry;
+    /// Forward table (guest_gs → host_gs). The trampoline scans field [0]
+    /// (guest_gs) to find a match, then reads field [1] (host_gs).
+    forward: [litebox_common_windows::gs_table::GsTableEntry;
+        litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES + 1],
+    /// Reverse table (host_gs → guest_gs). Uses the same GsTableEntry layout
+    /// but with swapped semantics: field [0] (guest_gs) stores the host GS
+    /// as the key, field [1] (host_gs) stores the guest GS as the value.
+    reverse: [litebox_common_windows::gs_table::GsTableEntry;
         litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES + 1],
 }
 
@@ -617,65 +635,100 @@ impl GuestGsTable {
     fn new() -> Self {
         Self {
             entries: Mutex::new(GuestGsTableInner {
-                data: [litebox_common_windows::gs_table::GsTableEntry::default();
+                forward: [litebox_common_windows::gs_table::GsTableEntry::default();
+                    litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES + 1],
+                reverse: [litebox_common_windows::gs_table::GsTableEntry::default();
                     litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES + 1],
             }),
         }
     }
 
-    /// Returns a stable pointer to the first entry for the trampoline asm.
-    fn base_ptr(&self) -> *const litebox_common_windows::gs_table::GsTableEntry {
-        // Safety: the Mutex protects the inner data, but we need a raw
-        // pointer for the trampoline. The pointer is stable because the
-        // GuestGsTable (and its inner array) lives in a Box with a stable
-        // address.
+    /// Returns a stable pointer to the first entry of the forward table
+    /// (guest_gs → host_gs) for the trampoline asm.
+    fn forward_base_ptr(&self) -> *const litebox_common_windows::gs_table::GsTableEntry {
         let guard = self.entries.lock().unwrap();
-        guard.data.as_ptr()
+        guard.forward.as_ptr()
     }
 
-    /// Insert a mapping. Writes `host_gs` before `guest_gs` so the
-    /// trampoline never sees a non-zero `guest_gs` with stale `host_gs`.
+    /// Returns a stable pointer to the first entry of the reverse table
+    /// (host_gs → guest_gs) for the trampoline asm.
+    fn reverse_base_ptr(&self) -> *const litebox_common_windows::gs_table::GsTableEntry {
+        let guard = self.entries.lock().unwrap();
+        guard.reverse.as_ptr()
+    }
+
+    /// Insert a mapping into both forward and reverse tables.
+    ///
+    /// Forward: `guest_gs` (key) → `host_gs` (value).
+    /// Reverse: `host_gs` (key) → `guest_gs` (value).
+    ///
+    /// Writes value before key so the trampoline never sees a non-zero key
+    /// with stale value.
     fn insert(&self, guest_gs: u64, host_gs: u64) -> Result<(), GuestGsTableError> {
         assert_ne!(guest_gs, 0, "cannot insert zero guest_gs (sentinel)");
+        assert_ne!(host_gs, 0, "cannot insert zero host_gs (sentinel)");
         let mut guard = self.entries.lock().unwrap();
-        // Check for duplicates and find first reusable slot (empty or tombstone).
-        let mut empty_idx = None;
-        for (i, entry) in guard.data.iter().enumerate() {
+
+        // --- Forward table (guest_gs → host_gs) ---
+        let mut fwd_idx = None;
+        for (i, entry) in guard.forward.iter().enumerate() {
             if entry.guest_gs == guest_gs {
                 return Err(GuestGsTableError::DuplicateGuestGs(guest_gs));
             }
             if (entry.guest_gs == 0
                 || entry.guest_gs == litebox_common_windows::gs_table::TOMBSTONE_GUEST_GS)
-                && empty_idx.is_none()
+                && fwd_idx.is_none()
             {
-                // Don't use the very last slot — it's the sentinel.
                 if i < litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES {
-                    empty_idx = Some(i);
+                    fwd_idx = Some(i);
                 }
             }
         }
-        let idx = empty_idx.ok_or(GuestGsTableError::Full)?;
-        // Publish: host_gs first, then guest_gs (makes entry visible).
-        let entry = &mut guard.data[idx];
-        // Use volatile writes to prevent reordering across the fence.
-        unsafe {
-            core::ptr::write_volatile(&raw mut entry.host_gs, host_gs);
+        let fwd_idx = fwd_idx.ok_or(GuestGsTableError::Full)?;
+
+        // --- Reverse table (host_gs → guest_gs) ---
+        // In the reverse table: guest_gs field = host_gs (key),
+        //                       host_gs field = guest_gs (value).
+        let mut rev_idx = None;
+        for (i, entry) in guard.reverse.iter().enumerate() {
+            if (entry.guest_gs == 0
+                || entry.guest_gs == litebox_common_windows::gs_table::TOMBSTONE_GUEST_GS)
+                && rev_idx.is_none()
+            {
+                if i < litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES {
+                    rev_idx = Some(i);
+                }
+            }
         }
+        let rev_idx = rev_idx.ok_or(GuestGsTableError::Full)?;
+
+        // Publish forward entry: value (host_gs) first, then key (guest_gs).
+        let fwd = &mut guard.forward[fwd_idx];
+        unsafe { core::ptr::write_volatile(&raw mut fwd.host_gs, host_gs) };
         core::sync::atomic::fence(Ordering::Release);
-        unsafe {
-            core::ptr::write_volatile(&raw mut entry.guest_gs, guest_gs);
-        }
+        unsafe { core::ptr::write_volatile(&raw mut fwd.guest_gs, guest_gs) };
+
+        // Publish reverse entry: value (guest_gs) first, then key (host_gs).
+        let rev = &mut guard.reverse[rev_idx];
+        unsafe { core::ptr::write_volatile(&raw mut rev.host_gs, guest_gs) };
+        core::sync::atomic::fence(Ordering::Release);
+        unsafe { core::ptr::write_volatile(&raw mut rev.guest_gs, host_gs) };
+
         Ok(())
     }
 
-    /// Remove a mapping by guest_gs. Writes a tombstone so the lock-free
-    /// trampoline scanner continues past the slot rather than stopping.
+    /// Remove a mapping from both forward and reverse tables.
+    ///
+    /// Writes a tombstone so the lock-free trampoline scanner continues
+    /// past the slot rather than stopping.
     fn remove(&self, guest_gs: u64) {
         let mut guard = self.entries.lock().unwrap();
-        for entry in &mut guard.data {
+
+        // Find and tombstone the forward entry.
+        let mut host_gs_val = 0u64;
+        for entry in &mut guard.forward {
             if entry.guest_gs == guest_gs {
-                // Write tombstone instead of zero so the scanner doesn't
-                // treat this as end-of-table.
+                host_gs_val = entry.host_gs;
                 unsafe {
                     core::ptr::write_volatile(
                         &raw mut entry.guest_gs,
@@ -683,15 +736,31 @@ impl GuestGsTable {
                     );
                 }
                 core::sync::atomic::fence(Ordering::Release);
-                unsafe {
-                    core::ptr::write_volatile(&raw mut entry.host_gs, 0);
+                unsafe { core::ptr::write_volatile(&raw mut entry.host_gs, 0) };
+                break;
+            }
+        }
+
+        // Find and tombstone the reverse entry (keyed by host_gs).
+        if host_gs_val != 0 {
+            for entry in &mut guard.reverse {
+                // In the reverse table, guest_gs field stores the host_gs key.
+                if entry.guest_gs == host_gs_val {
+                    unsafe {
+                        core::ptr::write_volatile(
+                            &raw mut entry.guest_gs,
+                            litebox_common_windows::gs_table::TOMBSTONE_GUEST_GS,
+                        );
+                    }
+                    core::sync::atomic::fence(Ordering::Release);
+                    unsafe { core::ptr::write_volatile(&raw mut entry.host_gs, 0) };
+                    break;
                 }
-                return;
             }
         }
     }
 
-    /// Lock-free lookup of host_gs for a given guest_gs.
+    /// Lock-free lookup of host_gs for a given guest_gs (forward table).
     ///
     /// Used by the VEH handler to restore host GS when an exception occurs
     /// while guest GS is active. Returns `None` if `current_gs` is not a
@@ -701,34 +770,17 @@ impl GuestGsTable {
         if current_gs == 0 {
             return None;
         }
-        // Lock-free scan using the raw base pointer (same as the trampoline asm).
-        // Safety: the base_ptr is stable, entries are published with volatile
-        // writes and a release fence, and we read with volatile loads.
-        let ptr = {
-            // base_ptr() locks the mutex, but we might be in VEH where we can't.
-            // The data address is stable (it's inside a Box that was leaked),
-            // so we can compute it from the known table base_ptr that was already
-            // saved at init time.
-            GS_TABLE_PTR.load(core::sync::atomic::Ordering::Acquire) as *const Self
-        };
+        let ptr = { GS_TABLE_PTR.load(core::sync::atomic::Ordering::Acquire) as *const Self };
         if ptr.is_null() {
             return None;
         }
-        // Safety: we read from the stable address computed from the leaked allocation.
-        // The entries are valid as long as the platform exists (forever).
         let entries = unsafe {
             let table = &*ptr;
-            // Lock the mutex if possible; otherwise just read raw.
             if let Ok(guard) = table.entries.try_lock() {
-                let base = guard.data.as_ptr();
+                let base = guard.forward.as_ptr();
                 drop(guard);
                 base
             } else {
-                // Can't lock — another thread holds it. The data is still
-                // readable at the same address; we just might see a partially
-                // updated entry. For the VEH use case (restoring host GS),
-                // a false negative is acceptable (we'd just fail to find TLS
-                // and return EXCEPTION_CONTINUE_SEARCH).
                 return None;
             }
         };
@@ -752,10 +804,17 @@ impl GuestGsTable {
 static GS_TABLE_PTR: std::sync::atomic::AtomicPtr<GuestGsTable> =
     std::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-/// Raw pointer to the first GsTableEntry in the table. Used by the VEH
-/// handler for lock-free, allocation-free GS restoration. Set once in
-/// `WindowsUserland::new()` alongside `GS_TABLE_PTR`.
+/// Raw pointer to the first entry of the forward GS table (guest→host).
+/// Used by the VEH handler for lock-free, allocation-free GS restoration.
+/// Set once in `WindowsUserland::new()` alongside `GS_TABLE_PTR`.
 static GS_TABLE_BASE_PTR: std::sync::atomic::AtomicPtr<
+    litebox_common_windows::gs_table::GsTableEntry,
+> = std::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Raw pointer to the first entry of the reverse GS table (host→guest).
+/// Used by the VEH trampoline to detect that GS is already the host TEB.
+/// Set once in `WindowsUserland::new()`.
+static REVERSE_GS_TABLE_BASE_PTR: std::sync::atomic::AtomicPtr<
     litebox_common_windows::gs_table::GsTableEntry,
 > = std::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
@@ -870,6 +929,48 @@ unsafe extern "system" fn vectored_exception_handler_inner(
                     0
                 }
             );
+        }
+        // Dump GS diagnostic info for ILLEGAL_INSTRUCTION (UD2 from trampoline
+        // GS scan miss).
+        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION {
+            let current_gs: u64;
+            unsafe {
+                core::arch::asm!("rdgsbase {}", out(reg) current_gs, options(nostack, preserves_flags));
+            }
+            eprintln!("[VEH-GS] ILLEGAL_INSTRUCTION diagnostic:");
+            eprintln!("  current GS (after VEH trampoline): 0x{:X}", current_gs);
+            eprintln!("  R11 (rdgsbase result at UD2): 0x{:X}", context.R11);
+            if let Some(tls) = get_tls_ptr() {
+                let tls = unsafe { &*tls };
+                eprintln!(
+                    "  expected guest_gs_base (TlsState): 0x{:X}",
+                    tls.guest_gs_base.get()
+                );
+                eprintln!("  is_in_guest: {}", tls.is_in_guest.get());
+            }
+            // Dump the GS table entries.
+            let table_base = GS_TABLE_BASE_PTR.load(core::sync::atomic::Ordering::Relaxed);
+            if !table_base.is_null() {
+                eprintln!("  GS table entries (base={:p}):", table_base);
+                for i in 0..litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES {
+                    let entry = unsafe { &*table_base.add(i) };
+                    if entry.guest_gs == 0 {
+                        eprintln!("    [{}] SENTINEL (end of table)", i);
+                        break;
+                    }
+                    eprintln!(
+                        "    [{}] guest_gs=0x{:X} host_gs=0x{:X}{}",
+                        i,
+                        entry.guest_gs,
+                        entry.host_gs,
+                        if entry.guest_gs == litebox_common_windows::gs_table::TOMBSTONE_GUEST_GS {
+                            " (TOMBSTONE)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
         }
     }
 
@@ -1316,9 +1417,15 @@ impl WindowsUserland {
             leaked.guest_gs_table.as_ref() as *const GuestGsTable as *mut GuestGsTable,
             core::sync::atomic::Ordering::Release,
         );
-        // Also publish the raw base pointer for the VEH handler's lock-free scan.
+        // Also publish the raw base pointers for the VEH handler's lock-free scan.
         GS_TABLE_BASE_PTR.store(
-            leaked.guest_gs_table.base_ptr() as *mut litebox_common_windows::gs_table::GsTableEntry,
+            leaked.guest_gs_table.forward_base_ptr()
+                as *mut litebox_common_windows::gs_table::GsTableEntry,
+            core::sync::atomic::Ordering::Release,
+        );
+        REVERSE_GS_TABLE_BASE_PTR.store(
+            leaked.guest_gs_table.reverse_base_ptr()
+                as *mut litebox_common_windows::gs_table::GsTableEntry,
             core::sync::atomic::Ordering::Release,
         );
 
@@ -1677,6 +1784,10 @@ fn run_thread_inner(
         global_gs_table()
             .insert(guest_gs, host_gs)
             .unwrap_or_else(|e| panic!("failed to register GS mapping: {e}"));
+        eprintln!(
+            "[GS] Registered mapping: guest_gs=0x{:X} host_gs=0x{:X}",
+            guest_gs, host_gs
+        );
         Some(GuestGsMappingGuard { guest_gs })
     } else {
         None

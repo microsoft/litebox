@@ -162,8 +162,10 @@ pub struct NtdllInitLoadResult {
     pub trampoline_va: usize,
     /// Offset within trampoline where the shim entry pointer goes.
     pub entry_ptr_offset: usize,
-    /// Offset within trampoline where the GS table pointer goes.
+    /// Offset within trampoline where the forward GS table pointer goes.
     pub gs_table_ptr_offset: usize,
+    /// Offset within trampoline where the reverse GS table pointer goes.
+    pub reverse_gs_table_ptr_offset: usize,
     /// Number of ntdll syscall stubs that were rewritten.
     pub stubs_rewritten: usize,
     /// Number of stubs whose syscall number was identified (matched export name).
@@ -215,8 +217,8 @@ pub fn load_ntdll_for_init(
     let rewrite =
         ntdll_rewriter::rewrite_ntdll(&ntdll_data, ntdll_load_va as u64, trampoline_va as u64);
     eprintln!(
-        "[real-dlls] Rewrote {} ntdll syscall stubs ({} identified)",
-        rewrite.stubs_rewritten, rewrite.stubs_identified
+        "[real-dlls] Rewrote {} ntdll syscall stubs ({} identified), {} __fastfail patched",
+        rewrite.stubs_rewritten, rewrite.stubs_identified, rewrite.fastfail_patched
     );
     // Log unhandled stubs for debugging.
     for (nr, name) in &rewrite.unhandled_stubs {
@@ -538,6 +540,7 @@ pub fn load_ntdll_for_init(
         trampoline_va,
         entry_ptr_offset: rewrite.entry_ptr_offset,
         gs_table_ptr_offset: rewrite.gs_table_ptr_offset,
+        reverse_gs_table_ptr_offset: rewrite.reverse_gs_table_ptr_offset,
         stubs_rewritten: rewrite.stubs_rewritten,
         stubs_identified: rewrite.stubs_identified,
         ldr_init_thunk_va,
@@ -559,8 +562,10 @@ pub struct RealDllLoadResult {
     pub trampoline_va: usize,
     /// Offset within trampoline where the shim entry pointer goes.
     pub entry_ptr_offset: usize,
-    /// Offset within trampoline where the GS table pointer goes.
+    /// Offset within trampoline where the forward GS table pointer goes.
     pub gs_table_ptr_offset: usize,
+    /// Offset within trampoline where the reverse GS table pointer goes.
+    pub reverse_gs_table_ptr_offset: usize,
     /// Number of ntdll syscall stubs that were rewritten.
     pub stubs_rewritten: usize,
     /// Number of stubs whose syscall number was identified.
@@ -629,8 +634,8 @@ pub fn load_real_dlls(
         let result =
             ntdll_rewriter::rewrite_ntdll(ntdll_data, ntdll_load_va as u64, trampoline_va as u64);
         eprintln!(
-            "[real-dlls] Rewrote {} ntdll syscall stubs ({} identified)",
-            result.stubs_rewritten, result.stubs_identified
+            "[real-dlls] Rewrote {} ntdll syscall stubs ({} identified), {} __fastfail patched",
+            result.stubs_rewritten, result.stubs_identified, result.fastfail_patched
         );
         result
     } else {
@@ -834,6 +839,7 @@ pub fn load_real_dlls(
         trampoline_va,
         entry_ptr_offset: rewrite.entry_ptr_offset,
         gs_table_ptr_offset: rewrite.gs_table_ptr_offset,
+        reverse_gs_table_ptr_offset: rewrite.reverse_gs_table_ptr_offset,
         stubs_rewritten: rewrite.stubs_rewritten,
         stubs_identified: rewrite.stubs_identified,
         iat_patches: all_patches,
@@ -889,9 +895,16 @@ fn create_kusd_shadow() -> usize {
 
     // Override fields that must differ in the sandbox.
     unsafe {
-        // ActiveProcessorCount → 1
+        // ActiveProcessorCount → 4
+        //
+        // The NT segment heap (Windows 10+) creates per-context structures
+        // indexed by a value derived from ActiveProcessorCount. With count=1,
+        // only context 0's structure gets initialized (at cage_base+0x0),
+        // but context 2 (backend, at cage_base+0xCC0) is still allocated and
+        // used — leading to a crash on uninitialized data. Setting count >= 3
+        // ensures all per-context structures are initialized.
         let apc_ptr = (alloc + KUSD_ACTIVE_PROCESSOR_COUNT_OFFSET) as *mut u32;
-        core::ptr::write(apc_ptr, 1);
+        core::ptr::write(apc_ptr, 4);
     }
 
     // Make the shadow read-only (mirrors the real KUSD's protection).
