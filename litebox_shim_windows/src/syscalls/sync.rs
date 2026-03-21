@@ -97,6 +97,24 @@ fn waitable_addr(w: &Waitable) -> usize {
 
 use crate::handle_table::ReleaseToken;
 
+/// Register a waker on a waitable object so signal paths can wake this thread.
+fn register_waker(w: &Waitable, waker: &litebox::event::wait::Waker<Platform>) {
+    match w {
+        Waitable::Event(e) => e.waiters.lock().push(waker.clone()),
+        Waitable::Semaphore(s) => s.waiters.lock().push(waker.clone()),
+        Waitable::Thread(t) => t.waiters.lock().push(waker.clone()),
+    }
+}
+
+/// Unregister a waker from a waitable object.
+fn unregister_waker(w: &Waitable, waker: &litebox::event::wait::Waker<Platform>) {
+    match w {
+        Waitable::Event(e) => e.waiters.lock().retain(|w| !w.ptr_eq(waker)),
+        Waitable::Semaphore(s) => s.waiters.lock().retain(|w| !w.ptr_eq(waker)),
+        Waitable::Thread(t) => t.waiters.lock().retain(|w| !w.ptr_eq(waker)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NtWaitForKeyedEvent (blocking — handle table lock NOT held)
 // ---------------------------------------------------------------------------
@@ -522,24 +540,32 @@ pub(crate) fn nt_wait_for_multiple_objects(
 
     if wait_type == 1 {
         // WaitAny: poll each handle, return first signaled.
-        // Validate all handles upfront.
-        {
+        // Pre-extract Arc references and validate all handles upfront.
+        let waitables: alloc::vec::Vec<Waitable> = {
             let handles = handles_mutex.lock();
+            let mut v = alloc::vec::Vec::with_capacity(handle_array.len());
             for &h in handle_array {
                 match handles.get(h) {
-                    Some(NtObject::Event(_) | NtObject::Semaphore(_) | NtObject::Thread(_)) => {}
+                    Some(NtObject::Event(e)) => v.push(Waitable::Event(Arc::clone(e))),
+                    Some(NtObject::Semaphore(s)) => v.push(Waitable::Semaphore(Arc::clone(s))),
+                    Some(NtObject::Thread(t)) => v.push(Waitable::Thread(Arc::clone(t))),
                     _ => return NtStatus::STATUS_INVALID_HANDLE,
                 }
             }
+            v
+        };
+
+        // Register our waker on all waitable objects.
+        for w in &waitables {
+            register_waker(w, wait_cx.waker());
         }
 
         let cx = wait_cx.with_timeout(timeout);
         let mut result_status = NtStatus::STATUS_TIMEOUT;
         let wait_result = cx.wait_until(|| {
-            let handles = handles_mutex.lock();
-            for (i, &h) in handle_array.iter().enumerate() {
-                match handles.get(h) {
-                    Some(NtObject::Event(e)) => {
+            for (i, w) in waitables.iter().enumerate() {
+                match w {
+                    Waitable::Event(e) => {
                         let mut signaled = e.state.lock();
                         if *signaled {
                             if !e.manual_reset {
@@ -549,7 +575,7 @@ pub(crate) fn nt_wait_for_multiple_objects(
                             return true;
                         }
                     }
-                    Some(NtObject::Semaphore(s)) => {
+                    Waitable::Semaphore(s) => {
                         let mut count = s.state.lock();
                         if *count > 0 {
                             *count -= 1;
@@ -557,20 +583,21 @@ pub(crate) fn nt_wait_for_multiple_objects(
                             return true;
                         }
                     }
-                    Some(NtObject::Thread(t)) => {
+                    Waitable::Thread(t) => {
                         if t.has_exited() {
                             result_status = NtStatus(i as i32);
                             return true;
                         }
                     }
-                    _ => {
-                        result_status = NtStatus::STATUS_INVALID_HANDLE;
-                        return true;
-                    }
                 }
             }
             false
         });
+
+        // Unregister wakers.
+        for w in &waitables {
+            unregister_waker(w, wait_cx.waker());
+        }
 
         match wait_result {
             Ok(()) => result_status,
@@ -609,6 +636,11 @@ pub(crate) fn nt_wait_for_multiple_objects(
             }
         }
         unique_indices.sort_unstable_by_key(|(addr, _)| *addr);
+
+        // Register our waker on all unique waitable objects.
+        for &(_, idx) in &unique_indices {
+            register_waker(&waitables[idx], wait_cx.waker());
+        }
 
         let cx = wait_cx.with_timeout(timeout);
         let wait_result = cx.wait_until(|| {
@@ -680,6 +712,11 @@ pub(crate) fn nt_wait_for_multiple_objects(
             ok
             // All guards drop here — locks released.
         });
+
+        // Unregister wakers.
+        for &(_, idx) in &unique_indices {
+            unregister_waker(&waitables[idx], wait_cx.waker());
+        }
 
         match wait_result {
             Ok(()) => NtStatus::STATUS_SUCCESS,
