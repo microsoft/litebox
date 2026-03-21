@@ -636,6 +636,16 @@ impl<
     Lower: super::FileSystem + 'static,
 > super::FileSystem for FileSystem<Platform, Upper, Lower>
 {
+    fn walks_follow_symlinks(&self) -> bool {
+        // Returns true if either layer follows symlinks during walks.
+        // The upper layer (in_mem/tar) has no symlinks, so it returns
+        // false (the default). The lower layer (9P) follows symlinks
+        // via server-side canonicalization. Using OR is correct because
+        // the upper layer never has symlinks that would need client-side
+        // resolution, and the lower layer resolves them server-side.
+        self.upper.walks_follow_symlinks() || self.lower.walks_follow_symlinks()
+    }
+
     fn open(
         &self,
         path: impl crate::path::Arg,

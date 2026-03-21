@@ -38,7 +38,8 @@ const AT_REMOVEDIR: u32 = 0x200;
 
 /// State for a single FID (file identifier) in the 9P server.
 struct FidState {
-    /// Host-side path this FID refers to.
+    /// Host-side path this FID refers to. After a successful walk, this
+    /// is the fully canonicalized (symlinks resolved) path.
     path: PathBuf,
     /// Open host file handle, if opened via `Tlopen` or `Tlcreate`.
     file: Option<fs::File>,
@@ -50,6 +51,9 @@ struct FidState {
     qid: fcall::Qid,
     /// Whether this FID has been opened (Tlopen/Tlcreate called).
     is_open: bool,
+    /// True when `path` was set by walk and is already canonical.
+    /// Allows lopen/lcreate to skip redundant re-canonicalization.
+    is_canonical: bool,
 }
 
 /// 9P2000.L server that serves files from a host directory.
@@ -101,6 +105,31 @@ impl Server {
         }
     }
 
+    /// Fast containment check when the path is already canonical (from walk).
+    /// Falls back to full canonicalization when `is_canonical` is false.
+    ///
+    /// # Safety assumption
+    ///
+    /// The `is_canonical` shortcut assumes the host filesystem under the
+    /// export root does not change between the walk that set the flag and
+    /// this check (e.g. no external process replaces a directory with a
+    /// symlink pointing outside the root). This is a standard TOCTOU
+    /// trade-off: the walk already canonicalized the path, so re-doing it
+    /// on every open/stat would be redundant in the normal case and costly.
+    /// If the export tree is mutated concurrently by untrusted code, this
+    /// shortcut should be disabled.
+    fn resolve_fid_path(&self, path: &Path, is_canonical: bool) -> Result<PathBuf, u32> {
+        if is_canonical {
+            if path.starts_with(&self.root) {
+                Ok(path.to_path_buf())
+            } else {
+                Err(libc::EPERM as u32)
+            }
+        } else {
+            self.resolve_and_check(path)
+        }
+    }
+
     /// Run the server loop, reading requests and sending responses.
     ///
     /// Returns when the connection is closed or an unrecoverable I/O error occurs.
@@ -114,13 +143,21 @@ impl Server {
         let mut current_max = INITIAL_MAX_SIZE;
 
         let mut request_count: u64 = 0;
+        let mut op_counts: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
 
         loop {
             // Read the raw message bytes, bounded by the negotiated msize
             if let Err(e) = transport::read_to_buf(transport, &mut rbuf, current_max) {
+                let mut sorted: Vec<_> = op_counts.iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(a.1));
+                let breakdown: String = sorted
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 debug!(
-                    "9P connection closed or read error after {} requests: {:?}",
-                    request_count, e
+                    "9P connection closed after {} requests: {:?}\n  ops: {}",
+                    request_count, e, breakdown
                 );
                 return;
             }
@@ -142,6 +179,35 @@ impl Server {
             };
 
             request_count += 1;
+
+            // Count per-operation type for profiling.
+            let op_name = match &request {
+                OwnedRequest::Version { .. } => "version",
+                OwnedRequest::Attach { .. } => "attach",
+                OwnedRequest::Walk { .. } => "walk",
+                OwnedRequest::Lopen { .. } => "lopen",
+                OwnedRequest::Lcreate { .. } => "lcreate",
+                OwnedRequest::Read { .. } => "read",
+                OwnedRequest::Write { .. } => "write",
+                OwnedRequest::Getattr { .. } => "getattr",
+                OwnedRequest::Setattr { .. } => "setattr",
+                OwnedRequest::Readdir { .. } => "readdir",
+                OwnedRequest::Mkdir { .. } => "mkdir",
+                OwnedRequest::Unlinkat { .. } => "unlinkat",
+                OwnedRequest::Rename { .. } => "rename",
+                OwnedRequest::Renameat { .. } => "renameat",
+                OwnedRequest::Statfs { .. } => "statfs",
+                OwnedRequest::Fsync { .. } => "fsync",
+                OwnedRequest::Clunk { .. } => "clunk",
+                OwnedRequest::Remove { .. } => "remove",
+                OwnedRequest::Flush => "flush",
+                OwnedRequest::Readlink { .. } => "readlink",
+                OwnedRequest::Statpath { .. } => "statpath",
+                OwnedRequest::Openpath { .. } => "openpath",
+                OwnedRequest::Readlinkpath { .. } => "readlinkpath",
+                OwnedRequest::Unknown => "unknown",
+            };
+            *op_counts.entry(op_name).or_insert(0) += 1;
 
             let response = self.dispatch(request);
 
@@ -220,6 +286,18 @@ impl Server {
             OwnedRequest::Remove { fid } => self.handle_remove(fcall::Tremove { fid }),
             OwnedRequest::Flush => Fcall::Rflush(fcall::Rflush {}),
             OwnedRequest::Readlink { fid } => self.handle_readlink(fid),
+            OwnedRequest::Statpath {
+                fid,
+                req_mask,
+                wnames,
+            } => self.handle_statpath(fid, req_mask, wnames),
+            OwnedRequest::Openpath {
+                fid,
+                new_fid,
+                flags,
+                wnames,
+            } => self.handle_openpath(fid, new_fid, flags, wnames),
+            OwnedRequest::Readlinkpath { fid, wnames } => self.handle_readlinkpath(fid, wnames),
             OwnedRequest::Unknown => error_response(libc::ENOSYS as u32),
         }
     }
@@ -277,6 +355,7 @@ impl Server {
                 patched_offset: 0,
                 qid,
                 is_open: false,
+                is_canonical: true,
             },
         );
 
@@ -306,6 +385,7 @@ impl Server {
         // Empty walk = clone the fid
         if wnames.is_empty() {
             let qid = src_fid.qid;
+            let is_canonical = src_fid.is_canonical;
             if fid != new_fid {
                 self.fids.insert(
                     new_fid,
@@ -316,6 +396,7 @@ impl Server {
                         patched_offset: 0,
                         qid,
                         is_open: false,
+                        is_canonical,
                     },
                 );
             }
@@ -389,6 +470,7 @@ impl Server {
                     state.file = None;
                     state.patched_data = None;
                     state.is_open = false;
+                    state.is_canonical = true;
                 }
             } else {
                 self.fids.insert(
@@ -400,6 +482,7 @@ impl Server {
                         patched_offset: 0,
                         qid,
                         is_open: false,
+                        is_canonical: true,
                     },
                 );
             }
@@ -414,8 +497,8 @@ impl Server {
 
     fn handle_lopen<'a>(&mut self, req: fcall::Tlopen) -> Fcall<'a> {
         // Extract what we need from fid state with an immutable borrow first
-        let (is_open, path) = match self.fids.get(&req.fid) {
-            Some(s) => (s.is_open, s.path.clone()),
+        let (is_open, path, is_canonical) = match self.fids.get(&req.fid) {
+            Some(s) => (s.is_open, s.path.clone(), s.is_canonical),
             None => return error_response(libc::EBADF as u32),
         };
 
@@ -430,8 +513,10 @@ impl Server {
             return error_response(libc::EIO as u32);
         }
 
-        // Resolve symlinks and verify containment
-        let resolved = match self.resolve_and_check(&path) {
+        // If the path was already canonicalized by walk, skip the
+        // expensive re-canonicalization and just verify containment.
+        // Otherwise, resolve symlinks before opening.
+        let resolved = match self.resolve_fid_path(&path, is_canonical) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
@@ -490,8 +575,9 @@ impl Server {
         mode: u32,
         _gid: u32,
     ) -> Fcall<'a> {
-        let state = match self.fids.get_mut(&fid) {
-            Some(s) => s,
+        // Extract what we need before taking a mutable borrow later.
+        let (parent_path, is_canonical) = match self.fids.get(&fid) {
+            Some(s) => (s.path.clone(), s.is_canonical),
             None => return error_response(libc::EBADF as u32),
         };
 
@@ -500,11 +586,12 @@ impl Server {
             return error_response(libc::EINVAL as u32);
         }
 
-        let target = state.path.join(&name);
+        let target = parent_path.join(&name);
 
-        // Containment check — resolve the parent directory to catch symlink escapes
-        let resolved_parent = match fs::canonicalize(&state.path) {
-            Ok(p) if p.starts_with(&self.root) => p,
+        // Containment check — resolve the parent directory to catch symlink escapes.
+        // Skip re-canonicalization if walk already produced a canonical path.
+        let resolved_parent = match self.resolve_fid_path(&parent_path, is_canonical) {
+            Ok(p) => p,
             _ => return error_response(libc::EPERM as u32),
         };
         let resolved_target = resolved_parent.join(&name);
@@ -550,12 +637,14 @@ impl Server {
                 let qid = metadata_to_qid(&meta);
 
                 // After create, the fid now represents the new file (not the parent dir)
+                let state = self.fids.get_mut(&fid).unwrap();
                 state.path = target;
                 state.file = Some(file);
                 state.patched_data = None;
                 state.patched_offset = 0;
                 state.qid = qid;
                 state.is_open = true;
+                state.is_canonical = false;
 
                 Fcall::Rlcreate(fcall::Rlcreate {
                     qid,
@@ -639,6 +728,166 @@ impl Server {
     // Stat / Setattr
     // ========================================================================
 
+    /// Walk a sequence of path components from a starting fid, returning
+    /// the resolved path. When `follow_final` is false, the last component
+    /// is not canonicalized (used by readlink to avoid following the
+    /// symlink it wants to read).
+    fn walk_path_components(
+        &self,
+        fid: u32,
+        wnames: &[Vec<u8>],
+        follow_final: bool,
+    ) -> Result<PathBuf, u32> {
+        let src_fid = self.fids.get(&fid).ok_or(libc::EBADF as u32)?;
+        let mut current_path = src_fid.path.clone();
+
+        for (i, name) in wnames.iter().enumerate() {
+            let component = std::str::from_utf8(name).map_err(|_| libc::ENOENT as u32)?;
+            if component.contains('/') || component.contains('\0') {
+                return Err(libc::ENOENT as u32);
+            }
+
+            let next = if component == "." {
+                current_path.clone()
+            } else if component == ".." {
+                if current_path == self.root {
+                    current_path.clone()
+                } else {
+                    current_path.parent().unwrap_or(&self.root).to_path_buf()
+                }
+            } else {
+                current_path.join(component)
+            };
+
+            let is_final = i == wnames.len() - 1;
+            if !is_final || follow_final {
+                let resolved = fs::canonicalize(&next).map_err(io_errno)?;
+                if !resolved.starts_with(&self.root) {
+                    return Err(libc::EACCES as u32);
+                }
+                current_path = resolved;
+            } else {
+                current_path = next;
+            }
+        }
+
+        Ok(current_path)
+    }
+
+    /// Combined walk + getattr + (implicit) clunk in one RPC.
+    /// Walks the path components from `fid`, stats the target, and returns
+    /// both the qid and attributes without allocating a client-visible fid.
+    fn handle_statpath<'a>(
+        &self,
+        fid: u32,
+        req_mask: fcall::GetattrMask,
+        wnames: Vec<Vec<u8>>,
+    ) -> Fcall<'a> {
+        let current_path = match self.walk_path_components(fid, &wnames, true) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
+        };
+
+        // Get attributes on the final path.
+        let meta = match fs::symlink_metadata(&current_path) {
+            Ok(m) => m,
+            Err(e) => return io_error_response(e),
+        };
+
+        let qid = metadata_to_qid(&meta);
+
+        Fcall::Rstatpath(fcall::Rstatpath {
+            valid: req_mask,
+            qid,
+            stat: fcall::Stat {
+                mode: meta.mode(),
+                uid: meta.uid(),
+                gid: meta.gid(),
+                nlink: meta.nlink(),
+                rdev: meta.rdev(),
+                size: meta.len(),
+                blksize: meta.blksize(),
+                blocks: meta.blocks(),
+                atime: new_time(meta.atime() as u64, meta.atime_nsec() as u64),
+                mtime: new_time(meta.mtime() as u64, meta.mtime_nsec() as u64),
+                ctime: new_time(meta.ctime() as u64, meta.ctime_nsec() as u64),
+                btime: fcall::Time::default(),
+                generation: 0,
+                data_version: 0,
+            },
+        })
+    }
+
+    /// Combined walk + lopen in one RPC.
+    /// Walks the path components from `fid`, opens the target, and assigns
+    /// the opened file to `new_fid`.
+    fn handle_openpath<'a>(
+        &mut self,
+        fid: u32,
+        new_fid: u32,
+        flags: fcall::LOpenFlags,
+        wnames: Vec<Vec<u8>>,
+    ) -> Fcall<'a> {
+        if self.fids.contains_key(&new_fid) && fid != new_fid {
+            return error_response(libc::EEXIST as u32);
+        }
+        if self.fids.len() >= MAX_FIDS && !self.fids.contains_key(&new_fid) {
+            return error_response(libc::ENOMEM as u32);
+        }
+
+        let current_path = match self.walk_path_components(fid, &wnames, true) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
+        };
+
+        // Policy checks (same as handle_lopen).
+        if self.policy.check(Action::Open, Some(&current_path)) == Decision::Deny {
+            return error_response(libc::EPERM as u32);
+        }
+        let is_write = flags.intersects(
+            fcall::LOpenFlags::O_WRONLY | fcall::LOpenFlags::O_RDWR | fcall::LOpenFlags::O_TRUNC,
+        );
+        if is_write && self.policy.check(Action::Write, Some(&current_path)) == Decision::Deny {
+            return error_response(libc::EPERM as u32);
+        }
+
+        let mut opts = fs::OpenOptions::new();
+        configure_open_options(&mut opts, flags);
+
+        match opts.open(&current_path) {
+            Ok(mut file) => {
+                let meta = match file.metadata() {
+                    Ok(m) => m,
+                    Err(e) => return io_error_response(e),
+                };
+                let qid = metadata_to_qid(&meta);
+
+                let is_read_only =
+                    !flags.intersects(fcall::LOpenFlags::O_WRONLY | fcall::LOpenFlags::O_RDWR);
+                let patched = self.try_patch_elf(&mut file, &current_path, is_read_only);
+
+                self.fids.insert(
+                    new_fid,
+                    FidState {
+                        path: current_path,
+                        file: Some(file),
+                        patched_data: patched,
+                        patched_offset: 0,
+                        qid,
+                        is_open: true,
+                        is_canonical: true,
+                    },
+                );
+
+                Fcall::Ropenpath(fcall::Ropenpath {
+                    qid,
+                    iounit: self.msize - fcall::IOHDRSZ,
+                })
+            }
+            Err(e) => io_error_response(e),
+        }
+    }
+
     fn handle_getattr<'a>(&mut self, req: fcall::Tgetattr) -> Fcall<'a> {
         let state = match self.fids.get(&req.fid) {
             Some(s) => s,
@@ -690,18 +939,17 @@ impl Server {
     }
 
     fn handle_setattr<'a>(&mut self, req: fcall::Tsetattr) -> Fcall<'a> {
-        let state = match self.fids.get_mut(&req.fid) {
-            Some(s) => s,
+        // Extract path/canonical info before mutable borrow for file handle.
+        let (path, is_canonical) = match self.fids.get(&req.fid) {
+            Some(s) => (s.path.clone(), s.is_canonical),
             None => return error_response(libc::EBADF as u32),
         };
 
         // chmod
         if req.valid.contains(fcall::SetattrMask::MODE) {
-            // Resolve symlinks to prevent jail escape
-            let resolved = match fs::canonicalize(&state.path) {
-                Ok(p) if p.starts_with(&self.root) => p,
-                Ok(_) => return error_response(libc::EPERM as u32),
-                Err(e) => return io_error_response(e),
+            let resolved = match self.resolve_fid_path(&path, is_canonical) {
+                Ok(p) => p,
+                Err(errno) => return error_response(errno),
             };
             if self.policy.check(Action::Chmod, Some(&resolved)) == Decision::Deny {
                 return error_response(libc::EPERM as u32);
@@ -717,15 +965,15 @@ impl Server {
 
         // truncate
         if req.valid.contains(fcall::SetattrMask::SIZE) {
-            // Resolve symlinks to prevent jail escape
-            let resolved = match fs::canonicalize(&state.path) {
-                Ok(p) if p.starts_with(&self.root) => p,
-                Ok(_) => return error_response(libc::EPERM as u32),
-                Err(e) => return io_error_response(e),
+            let resolved = match self.resolve_fid_path(&path, is_canonical) {
+                Ok(p) => p,
+                Err(errno) => return error_response(errno),
             };
             if self.policy.check(Action::Truncate, Some(&resolved)) == Decision::Deny {
                 return error_response(libc::EPERM as u32);
             }
+            // Re-borrow mutably only for the file handle access.
+            let state = self.fids.get_mut(&req.fid).unwrap();
             if let Some(ref file) = state.file {
                 if let Err(e) = file.set_len(req.stat.size) {
                     return io_error_response(e);
@@ -830,9 +1078,9 @@ impl Server {
         }
 
         // Resolve parent directory to catch symlink escapes
-        let resolved_parent = match fs::canonicalize(&state.path) {
-            Ok(p) if p.starts_with(&self.root) => p,
-            _ => return error_response(libc::EPERM as u32),
+        let resolved_parent = match self.resolve_fid_path(&state.path, state.is_canonical) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
         };
         let target = resolved_parent.join(&name);
         if !target.starts_with(&self.root) {
@@ -870,9 +1118,9 @@ impl Server {
         }
 
         // Resolve parent directory to catch symlink escapes
-        let resolved_parent = match fs::canonicalize(&state.path) {
-            Ok(p) if p.starts_with(&self.root) => p,
-            _ => return error_response(libc::EPERM as u32),
+        let resolved_parent = match self.resolve_fid_path(&state.path, state.is_canonical) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
         };
         let target = resolved_parent.join(&name);
         if !target.starts_with(&self.root) {
@@ -912,7 +1160,7 @@ impl Server {
             return error_response(libc::EINVAL as u32);
         }
 
-        let (src_path, dst_dir_path) = {
+        let (src_path, src_canonical, dst_dir_path, dst_canonical) = {
             let src = match self.fids.get(&fid) {
                 Some(s) => s,
                 None => return error_response(libc::EBADF as u32),
@@ -921,15 +1169,20 @@ impl Server {
                 Some(s) => s,
                 None => return error_response(libc::EBADF as u32),
             };
-            (src.path.clone(), dst_dir.path.clone())
+            (
+                src.path.clone(),
+                src.is_canonical,
+                dst_dir.path.clone(),
+                dst_dir.is_canonical,
+            )
         };
 
         // Resolve symlinks on both source and destination
-        let resolved_src = match self.resolve_and_check(&src_path) {
+        let resolved_src = match self.resolve_fid_path(&src_path, src_canonical) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
-        let resolved_dst_dir = match self.resolve_and_check(&dst_dir_path) {
+        let resolved_dst_dir = match self.resolve_fid_path(&dst_dir_path, dst_canonical) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
@@ -973,7 +1226,7 @@ impl Server {
             return error_response(libc::EINVAL as u32);
         }
 
-        let (old_dir_path, new_dir_path) = {
+        let (old_dir_path, old_canonical, new_dir_path, new_canonical) = {
             let old_dir = match self.fids.get(&olddfid) {
                 Some(s) => s,
                 None => return error_response(libc::EBADF as u32),
@@ -982,15 +1235,20 @@ impl Server {
                 Some(s) => s,
                 None => return error_response(libc::EBADF as u32),
             };
-            (old_dir.path.clone(), new_dir.path.clone())
+            (
+                old_dir.path.clone(),
+                old_dir.is_canonical,
+                new_dir.path.clone(),
+                new_dir.is_canonical,
+            )
         };
 
         // Resolve symlinks on both parent directories
-        let resolved_old_dir = match self.resolve_and_check(&old_dir_path) {
+        let resolved_old_dir = match self.resolve_fid_path(&old_dir_path, old_canonical) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
-        let resolved_new_dir = match self.resolve_and_check(&new_dir_path) {
+        let resolved_new_dir = match self.resolve_fid_path(&new_dir_path, new_canonical) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
@@ -1068,9 +1326,9 @@ impl Server {
         };
 
         // Resolve symlinks to prevent jail escape
-        let resolved = match fs::canonicalize(&state.path) {
-            Ok(p) if p.starts_with(&self.root) => p,
-            _ => return error_response(libc::EPERM as u32),
+        let resolved = match self.resolve_fid_path(&state.path, state.is_canonical) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
         };
 
         let is_dir = state.qid.typ.contains(fcall::QidType::DIR);
@@ -1103,6 +1361,24 @@ impl Server {
 
         match fs::read_link(&state.path) {
             Ok(target) => Fcall::Rreadlink(fcall::Rreadlink {
+                target: Cow::Owned(target.as_os_str().as_encoded_bytes().to_vec()),
+            }),
+            Err(e) => io_error_response(e),
+        }
+    }
+
+    /// Combined walk + readlink in one RPC.
+    /// Walks the path components from `fid` and reads the symlink target
+    /// of the final path without creating a client-visible fid.
+    fn handle_readlinkpath<'a>(&self, fid: u32, wnames: Vec<Vec<u8>>) -> Fcall<'a> {
+        // Don't follow the final symlink — we want to read it, not its target.
+        let current_path = match self.walk_path_components(fid, &wnames, false) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
+        };
+
+        match fs::read_link(&current_path) {
+            Ok(target) => Fcall::Rreadlinkpath(fcall::Rreadlinkpath {
                 target: Cow::Owned(target.as_os_str().as_encoded_bytes().to_vec()),
             }),
             Err(e) => io_error_response(e),
@@ -1281,6 +1557,21 @@ enum OwnedRequest {
     Readlink {
         fid: u32,
     },
+    Statpath {
+        fid: u32,
+        req_mask: fcall::GetattrMask,
+        wnames: Vec<Vec<u8>>,
+    },
+    Openpath {
+        fid: u32,
+        new_fid: u32,
+        flags: fcall::LOpenFlags,
+        wnames: Vec<Vec<u8>>,
+    },
+    Readlinkpath {
+        fid: u32,
+        wnames: Vec<Vec<u8>>,
+    },
     Unknown,
 }
 
@@ -1367,6 +1658,21 @@ impl OwnedRequest {
             Fcall::Tremove(r) => OwnedRequest::Remove { fid: r.fid },
             Fcall::Tflush(_) => OwnedRequest::Flush,
             Fcall::Treadlink(r) => OwnedRequest::Readlink { fid: r.fid },
+            Fcall::Tstatpath(r) => OwnedRequest::Statpath {
+                fid: r.fid,
+                req_mask: r.req_mask,
+                wnames: r.wnames.into_iter().map(|w| w.into_owned()).collect(),
+            },
+            Fcall::Topenpath(r) => OwnedRequest::Openpath {
+                fid: r.fid,
+                new_fid: r.new_fid,
+                flags: r.flags,
+                wnames: r.wnames.into_iter().map(|w| w.into_owned()).collect(),
+            },
+            Fcall::Treadlinkpath(r) => OwnedRequest::Readlinkpath {
+                fid: r.fid,
+                wnames: r.wnames.into_iter().map(|w| w.into_owned()).collect(),
+            },
             _ => OwnedRequest::Unknown,
         }
     }

@@ -386,10 +386,22 @@ repr_enum! {
         Rgetattr = 25,
         Tsetattr = 26,
         Rsetattr = 27,
+        /// Custom extension: walk + getattr + clunk in one RPC.
+        Tstatpath = 28,
+        /// Custom extension: response to Tstatpath.
+        Rstatpath = 29,
         Txattrwalk = 30,
         Rxattrwalk = 31,
         Txattrcreate = 32,
         Rxattrcreate = 33,
+        /// Custom extension: walk + lopen in one RPC.
+        Topenpath = 34,
+        /// Custom extension: response to Topenpath.
+        Ropenpath = 35,
+        /// Custom extension: walk + readlink + clunk in one RPC.
+        Treadlinkpath = 36,
+        /// Custom extension: response to Treadlinkpath.
+        Rreadlinkpath = 37,
         Treaddir = 40,
         Rreaddir = 41,
         Tfsync = 50,
@@ -742,6 +754,27 @@ Serializer! {
 }
 
 Serializer! {
+    /// Custom extension: walk to a path from a starting fid, get attributes,
+    /// and clunk the intermediate fid — all in one RPC.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Tstatpath<'a> {
+        pub(crate) fid: u32,
+        pub(crate) req_mask: GetattrMask,
+        pub(crate) wnames: VecFcallStr<'a>,
+    }
+}
+
+Serializer! {
+    /// Response to Tstatpath.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Rstatpath {
+        pub(crate) valid: GetattrMask,
+        pub(crate) qid: Qid,
+        pub(crate) stat: Stat,
+    }
+}
+
+Serializer! {
     /// Xattr walk request
     #[derive(Clone, Debug)]
     pub(crate) struct Txattrwalk<'a> {
@@ -774,6 +807,45 @@ Serializer! {
     /// Xattr create response
     #[derive(Clone, Debug)]
     pub(crate) struct Rxattrcreate {}
+}
+
+Serializer! {
+    /// Custom extension: walk to a path from a starting fid and open it,
+    /// all in one RPC. The server assigns `new_fid` to the opened file.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Topenpath<'a> {
+        pub(crate) fid: u32,
+        pub(crate) new_fid: u32,
+        pub(crate) flags: LOpenFlags,
+        pub(crate) wnames: VecFcallStr<'a>,
+    }
+}
+
+Serializer! {
+    /// Response to Topenpath.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Ropenpath {
+        pub(crate) qid: Qid,
+        pub(crate) iounit: u32,
+    }
+}
+
+Serializer! {
+    /// Custom extension: walk to a symlink path and read its target,
+    /// all in one RPC. No client-visible fid is created.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Treadlinkpath<'a> {
+        pub(crate) fid: u32,
+        pub(crate) wnames: VecFcallStr<'a>,
+    }
+}
+
+Serializer! {
+    /// Response to Treadlinkpath.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Rreadlinkpath<'a> {
+        pub(crate) target: DataBuf<'a>,
+    }
 }
 
 Serializer! {
@@ -1119,10 +1191,16 @@ fcall_types! {
     Rgetattr,
     Tsetattr,
     Rsetattr,
+    Tstatpath<'a>,
+    Rstatpath,
     Txattrwalk<'a>,
     Rxattrwalk,
     Txattrcreate<'a>,
     Rxattrcreate,
+    Topenpath<'a>,
+    Ropenpath,
+    Treadlinkpath<'a>,
+    Rreadlinkpath<'a>,
     Treaddir,
     Rreaddir<'a>,
     Tfsync,

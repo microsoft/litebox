@@ -60,6 +60,15 @@ mod private {
 /// However, users of any of these file systems might find benefit in having most of their code
 /// depend on this trait, rather than on any individual file system.
 pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
+    /// Whether the FS backend automatically follows symlinks during walk.
+    ///
+    /// When `true`, callers should skip client-side `realpath`-like
+    /// canonicalization because the backend already resolves symlinks.
+    /// Defaults to `false` (conservative).
+    fn walks_follow_symlinks(&self) -> bool {
+        false
+    }
+
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file
@@ -442,6 +451,7 @@ pub enum SeekWhence {
 /// elements might be added to this struct, allowing file systems to provide richer information
 /// about the status of files. However, users of LiteBox must not depend on the completeness or even
 /// layout of this particular type.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct FileStatus {
     /// File type

@@ -280,6 +280,33 @@ impl From<Rlerror> for Error {
 /// while keeping total memory use reasonable across many open files.
 const WRITE_BUFFER_CAPACITY: usize = 256 * 1024;
 
+/// Maximum read-ahead size per `Tread` RPC. When a caller requests a small
+/// read (e.g. 4 KB mmap page), we request this much from the server and
+/// cache the surplus for subsequent sequential reads.
+const READ_AHEAD_SIZE: usize = 1024 * 1024;
+
+/// Per-fid read-ahead buffer for coalescing small sequential reads into
+/// fewer, larger 9P `Tread` RPCs.
+struct ReadBuffer {
+    /// Cached data read ahead from the server.
+    data: Vec<u8>,
+    /// File offset where `data[0]` corresponds to.
+    file_offset: usize,
+    /// Unique file identity (qid.path) for cross-fid invalidation.
+    qid_path: u64,
+    /// True when the readahead RPC returned fewer bytes than requested,
+    /// meaning we've seen EOF at `file_offset + data.len()`. Subsequent
+    /// reads past the buffer range can return 0 without an RPC.
+    ///
+    /// Note: this memoization means that if the file is appended by
+    /// another process or host-side writer after EOF is observed, this
+    /// fd will continue to report EOF until the buffer is invalidated
+    /// (e.g. by a write to the same qid) or the fd is reopened. This
+    /// is acceptable in the sandbox model where the host export tree
+    /// is not expected to grow files concurrently.
+    eof_seen: bool,
+}
+
 /// Per-fid write-behind buffer for coalescing small sequential writes into
 /// fewer, larger 9P `Twrite` RPCs.
 struct WriteBuffer {
@@ -321,8 +348,26 @@ pub struct FileSystem<
     /// Per-fid write-behind buffers. Keyed by fid so that close/read can
     /// flush the right buffer without scanning all open files.
     write_buffers: sync::Mutex<Platform, BTreeMap<fcall::Fid, WriteBuffer>>,
+    /// Per-fid read-ahead buffers. Keyed by fid so that sequential reads
+    /// can be served from a single large `Tread` RPC without re-issuing
+    /// small requests to the server.
+    read_buffers: sync::Mutex<Platform, BTreeMap<fcall::Fid, ReadBuffer>>,
+    /// Client-side stat cache. Keyed by absolute path. Avoids repeated
+    /// walk+getattr+clunk RPCs for files that are stat'd frequently
+    /// (e.g. Cargo.toml, source files, target/ fingerprints).
+    /// Invalidated on write, truncate, rename, unlink, and create.
+    stat_cache: sync::Mutex<Platform, BTreeMap<String, super::FileStatus>>,
+    /// Directory fid cache. Keyed by absolute directory path. Stores
+    /// a server fid that remains alive so subsequent walks can start
+    /// from a cached ancestor instead of walking all the way from root.
+    dir_fid_cache: sync::Mutex<Platform, BTreeMap<String, (fcall::Fid, fcall::Qid)>>,
     /// Maximum single-RPC write payload (negotiated `msize - IOHDRSZ`).
     max_write_payload: usize,
+    /// Monotonically increasing generation counter. Bumped on every write,
+    /// truncate, or other mutation that invalidates cached data. Used to
+    /// prevent stale RPC results from being cached when a concurrent write
+    /// occurs during the RPC round-trip.
+    cache_generation: AtomicUsize,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
@@ -363,7 +408,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             current_working_dir: String::from("/"),
             unlinkat_supported: AtomicBool::new(true),
             write_buffers: sync::Mutex::new(BTreeMap::new()),
+            read_buffers: sync::Mutex::new(BTreeMap::new()),
+            stat_cache: sync::Mutex::new(BTreeMap::new()),
+            dir_fid_cache: sync::Mutex::new(BTreeMap::new()),
             max_write_payload,
+            cache_generation: AtomicUsize::new(0),
         })
     }
 
@@ -507,6 +556,80 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
     }
 
+    /// Discard all read-ahead buffers for the file identified by `qid_path`.
+    ///
+    /// Called when writes (from any fid) modify the file, making cached
+    /// read-ahead data potentially stale.
+    fn invalidate_read_buffers_for_file(&self, qid_path: u64) {
+        self.cache_generation.fetch_add(1, Ordering::SeqCst);
+        let mut buffers = self.read_buffers.lock();
+        buffers.retain(|_, rb| rb.qid_path != qid_path);
+    }
+
+    /// Invalidate all cached stat results for the file identified by
+    /// `qid_path` (inode). This handles alias paths (e.g. symlinks)
+    /// that refer to the same underlying file.
+    fn invalidate_stat_cache_by_qid(&self, qid_path: u64) {
+        self.cache_generation.fetch_add(1, Ordering::SeqCst);
+        let ino = qid_path as usize;
+        let mut cache = self.stat_cache.lock();
+        cache.retain(|_, status| status.node_info.ino != ino);
+    }
+
+    /// Invalidate cached stat for the parent directory of `path`.
+    /// Namespace operations (create, unlink, rename, mkdir, rmdir) change
+    /// the parent directory's mtime/nlink, so its cached stat must be
+    /// discarded. Uses qid-based invalidation to handle symlinked parents.
+    fn invalidate_parent_stat_cache(&self, path: &str) {
+        if let Some(pos) = path.rfind('/') {
+            let parent = if pos == 0 { "/" } else { &path[..pos] };
+            // Try qid-based invalidation to cover all aliases of the parent.
+            if let Ok((fid, qid)) = self.walk_to_with_qid(parent) {
+                let _ = self.client.clunk(fid);
+                self.invalidate_stat_cache_by_qid(qid.path);
+            } else {
+                // Fallback: remove by spelled path if walk fails.
+                self.cache_generation.fetch_add(1, Ordering::SeqCst);
+                let mut cache = self.stat_cache.lock();
+                cache.remove(parent);
+            }
+        }
+    }
+
+    /// Invalidate cached stat results for the given path and all descendants.
+    fn invalidate_stat_cache_tree(&self, path: &str) {
+        self.cache_generation.fetch_add(1, Ordering::SeqCst);
+        let mut cache = self.stat_cache.lock();
+        cache.retain(|k, _| k != path && !k.starts_with(&alloc::format!("{path}/")));
+    }
+
+    /// Invalidate cached directory fids for the given path and all descendants.
+    /// Clunks removed fids on the server.
+    fn invalidate_dir_fid_cache_tree(&self, path: &str) {
+        let mut cache = self.dir_fid_cache.lock();
+        let to_remove: Vec<String> = cache
+            .keys()
+            .filter(|k| k.as_str() == path || k.starts_with(&alloc::format!("{path}/")))
+            .cloned()
+            .collect();
+        for key in to_remove {
+            if let Some((fid, _)) = cache.remove(&key) {
+                let _ = self.client.clunk(fid);
+            }
+        }
+    }
+
+    /// Check whether a set of path components fits within a single compound
+    /// RPC message. The 9P encoding for wnames is:
+    /// `nwname(2) + sum(strlen_prefix(2) + bytes)` per component, plus a
+    /// fixed overhead for the message header and other fields (~30 bytes).
+    /// Returns `true` if a compound RPC with these wnames would fit in msize.
+    fn wnames_fit_in_msize(&self, wnames: &[&str]) -> bool {
+        const COMPOUND_RPC_OVERHEAD: usize = 30;
+        let wnames_size: usize = 2 + wnames.iter().map(|w| 2 + w.len()).sum::<usize>();
+        wnames_size + COMPOUND_RPC_OVERHEAD <= self.client.msize() as usize
+    }
+
     /// Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
     /// for any relative paths from current working directory.
     ///
@@ -562,81 +685,37 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         Ok(combined.normalized()?)
     }
 
-    /// Resolve symlinks in every component of `path` (like `realpath`).
-    ///
-    /// Walks each component, checking for symlinks at each prefix. When a
-    /// symlink is found, its target's components are spliced into the work
-    /// queue so nested symlinks within the target are also resolved.
-    /// Returns `SymlinkLoop` if more than `max_hops` symlinks are followed.
-    fn resolve_follow_symlinks(
-        &self,
-        path: alloc::string::String,
-        max_hops: usize,
-    ) -> Result<alloc::string::String, super::FileStatusError> {
-        let mut resolved = alloc::string::String::from("/");
-        let mut hops_remaining = max_hops;
-
-        let mut remaining: alloc::vec::Vec<alloc::string::String> = path
-            .split('/')
-            .filter(|c| !c.is_empty())
-            .map(alloc::string::String::from)
-            .collect();
-        let mut idx = 0;
-
-        while idx < remaining.len() {
-            let component = remaining[idx].clone();
-            idx += 1;
-
-            match component.as_str() {
-                "" | "." => continue,
-                ".." => {
-                    if let Some(pos) = resolved[..resolved.len().saturating_sub(1)].rfind('/') {
-                        resolved.truncate(pos + 1);
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-
-            if !resolved.ends_with('/') {
-                resolved.push('/');
-            }
-            resolved.push_str(&component);
-
-            if let Ok(t) = <Self as super::FileSystem>::read_link(self, &*resolved) {
-                if hops_remaining == 0 {
-                    return Err(super::FileStatusError::SymlinkLoop);
-                }
-                hops_remaining -= 1;
-
-                if t.starts_with('/') {
-                    resolved = alloc::string::String::from("/");
-                } else {
-                    let parent_end = resolved.rfind('/').unwrap_or(0).max(1);
-                    resolved.truncate(parent_end);
-                }
-
-                let tail: alloc::vec::Vec<alloc::string::String> = remaining.drain(idx..).collect();
-                remaining.truncate(0);
-                remaining.extend(
-                    t.split('/')
-                        .filter(|c| !c.is_empty())
-                        .map(alloc::string::String::from),
-                );
-                remaining.extend(tail);
-                idx = 0;
-            }
-        }
-
-        if resolved.len() > 1 && resolved.ends_with('/') {
-            resolved.pop();
-        }
-        Ok(resolved)
-    }
-
     /// Walk to a path and return the fid
     fn walk_to(&self, path: &str) -> Result<fcall::Fid, Error> {
         self.walk_to_with_qid(path).map(|(fid, _)| fid)
+    }
+
+    /// Find the longest cached directory prefix for a set of path components.
+    /// Returns a **cloned** fid (caller must clunk it) and the index of the
+    /// first uncached component. Cloning prevents use-after-clunk races with
+    /// concurrent `invalidate_dir_fid_cache_tree`.
+    fn find_cached_prefix(&self, components: &[&str]) -> Option<(fcall::Fid, usize)> {
+        let mut best_prefix_len = 0;
+        let mut best_fid = None;
+        let cache = self.dir_fid_cache.lock();
+        let mut prefix = String::new();
+        for (i, comp) in components.iter().enumerate() {
+            prefix.push('/');
+            prefix.push_str(comp);
+            if let Some(&(cached_fid, _)) = cache.get(&prefix) {
+                best_prefix_len = i + 1;
+                best_fid = Some(cached_fid);
+            }
+        }
+        // Clone the best match so invalidation can safely clunk the original.
+        if let Some(fid) = best_fid
+            && let Ok(cloned) = self.client.clone_fid(fid)
+        {
+            return Some((cloned, best_prefix_len));
+        }
+        // No cache hit, or clone failed (fid already clunked by racing
+        // invalidation) — fall back to root.
+        None
     }
 
     /// Walk to a path and return both the fid and the last qid.
@@ -647,12 +726,88 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .collect();
         if components.is_empty() {
             let fid = self.client.clone_fid(self.root.1)?;
-            Ok((fid, self.root.0))
-        } else {
-            let (qids, fid) = self.client.walk(self.root.1, &components)?;
-            let qid = qids.last().copied().ok_or(Error::InvalidResponse)?;
-            Ok((fid, qid))
+            return Ok((fid, self.root.0));
         }
+
+        // Find the longest cached directory prefix to start from.
+        let (best_fid, best_prefix_len, cloned_cache_fid) =
+            if let Some((cloned, prefix_len)) = self.find_cached_prefix(&components) {
+                (cloned, prefix_len, true)
+            } else {
+                (self.root.1, 0, false)
+            };
+
+        let remaining = &components[best_prefix_len..];
+        if remaining.is_empty() {
+            // Full path was cached as a directory — the cloned fid IS our result.
+            if cloned_cache_fid {
+                let cache = self.dir_fid_cache.lock();
+                let prefix: String = components.iter().fold(String::new(), |mut a, c| {
+                    a.push('/');
+                    a.push_str(c);
+                    a
+                });
+                let qid = cache.get(&prefix).map_or(self.root.0, |&(_, q)| q);
+                return Ok((best_fid, qid));
+            }
+            let fid = self.client.clone_fid(self.root.1)?;
+            return Ok((fid, self.root.0));
+        }
+
+        let (qids, fid) = match self.client.walk(best_fid, remaining) {
+            Ok(r) => {
+                if cloned_cache_fid {
+                    let _ = self.client.clunk(best_fid);
+                }
+                r
+            }
+            Err(e) => {
+                if cloned_cache_fid {
+                    let _ = self.client.clunk(best_fid);
+                }
+                return Err(e);
+            }
+        };
+        let qid = qids.last().copied().ok_or(Error::InvalidResponse)?;
+
+        // Opportunistically cache the parent directory for future walks.
+        // This costs 1 extra walk RPC on first visit but saves many RPCs
+        // on subsequent walks to sibling files in the same directory.
+        if components.len() > 1 && qids.len() >= 2 {
+            let parent_qid = qids[qids.len() - 2];
+            if parent_qid.typ.contains(fcall::QidType::DIR) {
+                let parent_path: String =
+                    components[..components.len() - 1]
+                        .iter()
+                        .fold(String::new(), |mut a, c| {
+                            a.push('/');
+                            a.push_str(c);
+                            a
+                        });
+                let mut cache = self.dir_fid_cache.lock();
+                if !cache.contains_key(&parent_path) {
+                    drop(cache);
+                    // Walk the full parent path from root — the cached prefix
+                    // fid was already clunked above.
+                    let parent_components = &components[..components.len() - 1];
+                    if let Ok((_, parent_fid)) = self.client.walk(self.root.1, parent_components) {
+                        // Recheck under lock to avoid leaking fids when two
+                        // threads race to populate the same cache entry.
+                        cache = self.dir_fid_cache.lock();
+                        if let Some(&(existing_fid, _)) = cache.get(&parent_path) {
+                            // Another thread won the race — clunk ours.
+                            drop(cache);
+                            let _ = self.client.clunk(parent_fid);
+                            let _ = existing_fid; // keep the winner
+                        } else {
+                            cache.insert(parent_path, (parent_fid, parent_qid));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((fid, qid))
     }
 
     /// Walk to the parent of a path and return the parent fid and the name of the final component
@@ -737,64 +892,76 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     /// Convert getattr response to FileStatus
     fn rgetattr_to_file_status(attr: &fcall::Rgetattr) -> Result<super::FileStatus, Error> {
-        let file_type = Self::qid_type_to_file_type(attr.qid.typ);
+        Self::stat_fields_to_file_status(attr.valid, attr.qid, &attr.stat)
+    }
 
-        if attr.valid.contains(fcall::GetattrMask::BASIC) {
+    fn rstatpath_to_file_status(resp: &fcall::Rstatpath) -> Result<super::FileStatus, Error> {
+        Self::stat_fields_to_file_status(resp.valid, resp.qid, &resp.stat)
+    }
+
+    fn stat_fields_to_file_status(
+        valid: fcall::GetattrMask,
+        qid: fcall::Qid,
+        stat: &fcall::Stat,
+    ) -> Result<super::FileStatus, Error> {
+        let file_type = Self::qid_type_to_file_type(qid.typ);
+
+        if valid.contains(fcall::GetattrMask::BASIC) {
             Ok(super::FileStatus {
                 file_type,
-                mode: super::Mode::from_bits_truncate(attr.stat.mode),
-                size: usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?,
+                mode: super::Mode::from_bits_truncate(stat.mode),
+                size: usize::try_from(stat.size).map_err(|_| Error::InvalidResponse)?,
                 owner: super::UserInfo {
-                    user: u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?,
-                    group: u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?,
+                    user: u16::try_from(stat.uid).map_err(|_| Error::InvalidResponse)?,
+                    group: u16::try_from(stat.gid).map_err(|_| Error::InvalidResponse)?,
                 },
                 node_info: super::NodeInfo {
                     dev: DEVICE_ID,
-                    ino: usize::try_from(attr.qid.path).map_err(|_| Error::InvalidResponse)?,
+                    ino: usize::try_from(qid.path).map_err(|_| Error::InvalidResponse)?,
                     rdev: NonZeroUsize::new(
-                        usize::try_from(attr.stat.rdev).map_err(|_| Error::InvalidResponse)?,
+                        usize::try_from(stat.rdev).map_err(|_| Error::InvalidResponse)?,
                     ),
                 },
-                blksize: usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?,
+                blksize: usize::try_from(stat.blksize).map_err(|_| Error::InvalidResponse)?,
             })
         } else {
             Ok(super::FileStatus {
                 file_type,
-                mode: if attr.valid.contains(fcall::GetattrMask::MODE) {
-                    super::Mode::from_bits_truncate(attr.stat.mode)
+                mode: if valid.contains(fcall::GetattrMask::MODE) {
+                    super::Mode::from_bits_truncate(stat.mode)
                 } else {
                     super::Mode::empty()
                 },
-                size: if attr.valid.contains(fcall::GetattrMask::SIZE) {
-                    usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?
+                size: if valid.contains(fcall::GetattrMask::SIZE) {
+                    usize::try_from(stat.size).map_err(|_| Error::InvalidResponse)?
                 } else {
                     0
                 },
                 owner: super::UserInfo {
-                    user: if attr.valid.contains(fcall::GetattrMask::UID) {
-                        u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?
+                    user: if valid.contains(fcall::GetattrMask::UID) {
+                        u16::try_from(stat.uid).map_err(|_| Error::InvalidResponse)?
                     } else {
                         0
                     },
-                    group: if attr.valid.contains(fcall::GetattrMask::GID) {
-                        u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?
+                    group: if valid.contains(fcall::GetattrMask::GID) {
+                        u16::try_from(stat.gid).map_err(|_| Error::InvalidResponse)?
                     } else {
                         0
                     },
                 },
                 node_info: super::NodeInfo {
                     dev: DEVICE_ID,
-                    ino: usize::try_from(attr.qid.path).map_err(|_| Error::InvalidResponse)?,
-                    rdev: if attr.valid.contains(fcall::GetattrMask::RDEV) {
+                    ino: usize::try_from(qid.path).map_err(|_| Error::InvalidResponse)?,
+                    rdev: if valid.contains(fcall::GetattrMask::RDEV) {
                         NonZeroUsize::new(
-                            usize::try_from(attr.stat.rdev).map_err(|_| Error::InvalidResponse)?,
+                            usize::try_from(stat.rdev).map_err(|_| Error::InvalidResponse)?,
                         )
                     } else {
                         None
                     },
                 },
-                blksize: if attr.valid.contains(fcall::GetattrMask::BLOCKS) {
-                    usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?
+                blksize: if valid.contains(fcall::GetattrMask::BLOCKS) {
+                    usize::try_from(stat.blksize).map_err(|_| Error::InvalidResponse)?
                 } else {
                     0
                 },
@@ -834,6 +1001,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     for FileSystem<Platform, T>
 {
     fn drop(&mut self) {
+        // Clunk all cached directory fids.
+        let cache = self.dir_fid_cache.lock();
+        for (_, &(fid, _)) in cache.iter() {
+            let _ = self.client.clunk(fid);
+        }
+        drop(cache);
         let _ = self.client.clunk(self.root.1);
     }
 }
@@ -846,6 +1019,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
     super::FileSystem for FileSystem<Platform, T>
 {
+    fn walks_follow_symlinks(&self) -> bool {
+        // The 9P broker walk canonicalizes every component via
+        // fs::canonicalize(), so symlinks are always resolved server-side.
+        true
+    }
+
     #[allow(clippy::similar_names)]
     fn open(
         &self,
@@ -916,6 +1095,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                                 let _ = self.client.clunk(existing_fid);
                                 return Err(e.into());
                             }
+                            self.invalidate_read_buffers_for_file(qid.path);
                         }
                         (qid, existing_fid)
                     }
@@ -942,70 +1122,113 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 }
             }
         } else {
-            let walk_result = self.client.walk(self.root.1, &components);
-            #[cfg(feature = "trace_fs")]
-            if let Err(ref e) = walk_result {
-                log_println!(
-                    self.litebox.x.platform,
-                    "[9P-TRACE] walk FAILED path={:?} err={:?}",
-                    path,
-                    e,
-                );
-            }
-            let (_qids, new_fid) = walk_result?;
-
-            // Strip O_TRUNC from the open flags — we apply it manually
-            // after flushing pending write-behind buffers to avoid
-            // truncating the file and then replaying stale buffered writes.
+            // Use the combined openpath RPC to save a round-trip when
+            // there is no O_TRUNC. With O_TRUNC we still need the
+            // separate open+setattr to ensure write buffers are flushed
+            // before truncation.
             let has_trunc = lflags.contains(fcall::LOpenFlags::O_TRUNC);
             let open_flags = lflags & !fcall::LOpenFlags::O_TRUNC;
 
-            let open_result = self.client.open(new_fid, open_flags);
-            #[cfg(feature = "trace_fs")]
-            if let Err(ref e) = open_result {
-                log_println!(
-                    self.litebox.x.platform,
-                    "[9P-TRACE] open FAILED path={:?} fid={} lflags={:?} err={:?}",
-                    path,
-                    new_fid,
-                    lflags,
-                    e,
-                );
-            }
-            match open_result {
-                Ok(qid) => {
-                    // Flush any pending write-behind data for the opened file
-                    // using the qid returned by open(), which is the target's
-                    // qid after symlink resolution.
-                    if self.flush_write_buffers_for_file(qid.path).is_err() {
-                        let _ = self.client.clunk(new_fid);
-                        return Err(OpenError::Io);
-                    }
-                    // Apply O_TRUNC now that buffered writes have been
-                    // drained, so the truncate isn't undone by a later
-                    // flush of stale data.
-                    if has_trunc {
-                        let stat = fcall::SetAttr {
-                            size: 0,
-                            ..Default::default()
-                        };
-                        if let Err(e) = self.client.setattr(new_fid, fcall::SetattrMask::SIZE, stat)
-                        {
-                            let _ = self.client.clunk(new_fid);
-                            return Err(e.into());
+            // Find the best cached directory prefix to minimize the walk
+            // portion of the RPC. find_cached_prefix returns a cloned fid
+            // that we must clunk after the openpath RPC.
+            let (start_fid, prefix_len, cloned_cache_fid) =
+                if let Some((cloned, plen)) = self.find_cached_prefix(&components) {
+                    (cloned, plen, true)
+                } else {
+                    (self.root.1, 0, false)
+                };
+            let remaining = &components[prefix_len..];
+
+            let (qid, opened_fid) = if self.wnames_fit_in_msize(remaining) {
+                let new_fid = match self.client.alloc_fid() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        if cloned_cache_fid {
+                            let _ = self.client.clunk(start_fid);
                         }
+                        return Err(e.into());
                     }
-                    (qid, new_fid)
+                };
+                let open_result = self
+                    .client
+                    .openpath(start_fid, new_fid, open_flags, remaining);
+
+                if cloned_cache_fid {
+                    let _ = self.client.clunk(start_fid);
                 }
-                Err(e) => {
-                    // Clunk the fid from the walk to avoid leaking it on the
-                    // server. Ignore clunk errors since the connection may
-                    // already be broken.
-                    let _ = self.client.clunk(new_fid);
+
+                #[cfg(feature = "trace_fs")]
+                if let Err(ref e) = open_result {
+                    log_println!(
+                        self.litebox.x.platform,
+                        "[9P-TRACE] openpath FAILED path={:?} fid={} lflags={:?} err={:?}",
+                        path,
+                        new_fid,
+                        lflags,
+                        e,
+                    );
+                }
+                match open_result {
+                    Ok(qid) => (qid, new_fid),
+                    Err(e) => {
+                        self.client.free_fid(new_fid);
+                        return Err(e.into());
+                    }
+                }
+            } else {
+                // Path too long for a single compound RPC — fall back to
+                // walk + open.
+                if cloned_cache_fid {
+                    let _ = self.client.clunk(start_fid);
+                }
+                let (_, walked_fid) = self.client.walk(self.root.1, &components)?;
+                match self.client.open(walked_fid, open_flags) {
+                    Ok(qid) => (qid, walked_fid),
+                    Err(e) => {
+                        let _ = self.client.clunk(walked_fid);
+                        return Err(e.into());
+                    }
+                }
+            };
+
+            // Flush any pending write-behind data for the opened file
+            // using the qid returned by open(), which is the target's
+            // qid after symlink resolution.
+            if self.flush_write_buffers_for_file(qid.path).is_err() {
+                let _ = self.client.clunk(opened_fid);
+                return Err(OpenError::Io);
+            }
+            // Apply O_TRUNC now that buffered writes have been
+            // drained, so the truncate isn't undone by a later
+            // flush of stale data.
+            if has_trunc {
+                let stat = fcall::SetAttr {
+                    size: 0,
+                    ..Default::default()
+                };
+                if let Err(e) = self
+                    .client
+                    .setattr(opened_fid, fcall::SetattrMask::SIZE, stat)
+                {
+                    let _ = self.client.clunk(opened_fid);
                     return Err(e.into());
                 }
+                // Truncation changes file content — invalidate all
+                // read-ahead buffers for sibling fids on this file.
+                self.invalidate_read_buffers_for_file(qid.path);
             }
+            (qid, opened_fid)
         };
+
+        // Invalidate stat cache when the file was created or truncated.
+        if flags.intersects(OFlags::CREAT | OFlags::TRUNC) {
+            self.invalidate_stat_cache_by_qid(new_qid.path);
+        }
+        // Creating a file changes the parent directory's mtime.
+        if flags.contains(OFlags::CREAT) {
+            self.invalidate_parent_stat_cache(&path);
+        }
 
         let descriptor = Descriptor {
             fid: new_fid,
@@ -1029,6 +1252,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             // unwritten remainder. Remove it unconditionally — the fid is
             // about to be clunked, so the remainder can never be flushed.
             self.write_buffers.lock().remove(&entry.entry.fid);
+            self.read_buffers.lock().remove(&entry.entry.fid);
+            // Stat cache may be stale after a write-buffer flush.
+            self.invalidate_stat_cache_by_qid(entry.entry.qid.path);
             let _ = self.client.clunk(entry.entry.fid);
             if flush_result.is_err() {
                 return Err(super::errors::CloseError::Io);
@@ -1066,16 +1292,101 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             None => current_offset,
         };
 
-        let bytes_read = self.client.read(fid, read_offset as u64, buf)?;
+        // Try to serve the read from the read-ahead buffer.
+        {
+            let mut buffers = self.read_buffers.lock();
+            if let Some(rb) = buffers.get_mut(&fid) {
+                let buf_end = rb.file_offset + rb.data.len();
+                if read_offset >= rb.file_offset && read_offset < buf_end {
+                    let start = read_offset - rb.file_offset;
+                    let available = rb.data.len() - start;
+                    let n = buf.len().min(available);
+                    buf[..n].copy_from_slice(&rb.data[start..start + n]);
+                    if offset.is_none() {
+                        self.litebox.descriptor_table().with_entry(fd, |desc| {
+                            desc.entry.offset.fetch_add(n, Ordering::SeqCst);
+                        });
+                    }
+                    return Ok(n);
+                }
+                // Read is past the buffer range. If we saw EOF, return 0
+                // without issuing another RPC.
+                if rb.eof_seen && read_offset >= buf_end {
+                    return Ok(0);
+                }
+                // Read not in buffer range — discard stale buffer.
+                buffers.remove(&fid);
+            }
+        }
 
-        // Update offset if not using explicit offset
+        // Issue a read-ahead RPC: request more than the caller asked for
+        // so that subsequent sequential reads can be served from the cache
+        // without extra RPCs. Cap at READ_AHEAD_SIZE to avoid huge allocations.
+        let readahead_size = if buf.len() >= READ_AHEAD_SIZE {
+            // Caller already wants a large read — no extra readahead needed.
+            buf.len()
+        } else {
+            READ_AHEAD_SIZE
+        };
+        let mut readahead_buf = alloc::vec![0u8; readahead_size];
+
+        // Snapshot generation before the read RPC so we can detect
+        // concurrent writes that would make the fetched data stale.
+        let gen_before = self.cache_generation.load(Ordering::SeqCst);
+
+        // client.read() returns at most msize-IOHDRSZ bytes per call, so we
+        // must loop to fill the readahead buffer. A short read (fewer bytes
+        // than the per-RPC limit) signals true EOF.
+        let mut total_read = 0;
+        let max_per_rpc = (self.client.msize() - fcall::IOHDRSZ) as usize;
+        loop {
+            let remaining = &mut readahead_buf[total_read..];
+            let chunk = self
+                .client
+                .read(fid, (read_offset + total_read) as u64, remaining)?;
+            if chunk == 0 {
+                break;
+            }
+            total_read += chunk;
+            if total_read >= readahead_size || chunk < remaining.len().min(max_per_rpc) {
+                break;
+            }
+        }
+
+        if total_read == 0 {
+            return Ok(0);
+        }
+
+        let eof_seen = total_read < readahead_size;
+
+        // Copy what the caller requested.
+        let n = buf.len().min(total_read);
+        buf[..n].copy_from_slice(&readahead_buf[..n]);
+
+        // Cache any surplus (or just the EOF flag) for future reads,
+        // but only if no concurrent write invalidated data during the RPC.
+        if (total_read > n || eof_seen)
+            && self.cache_generation.load(Ordering::SeqCst) == gen_before
+        {
+            self.read_buffers.lock().insert(
+                fid,
+                ReadBuffer {
+                    data: readahead_buf[n..total_read].to_vec(),
+                    file_offset: read_offset + n,
+                    qid_path,
+                    eof_seen,
+                },
+            );
+        }
+
+        // Update offset if not using explicit offset.
         if offset.is_none() {
             self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry.offset.fetch_add(bytes_read, Ordering::SeqCst);
+                desc.entry.offset.fetch_add(n, Ordering::SeqCst);
             });
         }
 
-        Ok(bytes_read)
+        Ok(n)
     }
 
     fn write(
@@ -1104,6 +1415,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         // preserves cross-fid write ordering without draining our own
         // buffer (which we may still coalesce into).
         self.flush_sibling_write_buffers(qid_path, fid)?;
+
+        // Invalidate any read-ahead buffers for this file — the write
+        // makes cached read data potentially stale.
+        self.invalidate_read_buffers_for_file(qid_path);
+
+        // Invalidate stat cache — file size/mtime will change.
+        self.invalidate_stat_cache_by_qid(qid_path);
 
         let write_offset = match offset {
             Some(o) => o,
@@ -1258,6 +1576,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         // would otherwise be lost or re-applied after the truncate.
         self.flush_write_buffers_for_file(qid.path)?;
 
+        // Invalidate read-ahead buffers — truncation changes file content.
+        self.invalidate_read_buffers_for_file(qid.path);
+
+        // Invalidate stat cache — file size will change.
+        self.invalidate_stat_cache_by_qid(qid.path);
+
         if qid.typ.contains(fcall::QidType::DIR) {
             return Err(super::errors::TruncateError::IsDirectory);
         }
@@ -1287,7 +1611,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         mode: super::Mode,
     ) -> Result<(), super::errors::ChmodError> {
         let path = self.absolute_path(path)?;
-        let fid = self.walk_to(&path)?;
+        let (fid, qid) = self.walk_to_with_qid(&path)?;
 
         let stat = fcall::SetAttr {
             mode: mode.bits(),
@@ -1296,6 +1620,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         let result = self.client.setattr(fid, fcall::SetattrMask::MODE, stat);
         let _ = self.client.clunk(fid);
+
+        if result.is_ok() {
+            self.invalidate_stat_cache_by_qid(qid.path);
+        }
 
         result.map_err(ChmodError::from)
     }
@@ -1307,7 +1635,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         group: Option<u16>,
     ) -> Result<(), super::errors::ChownError> {
         let path = self.absolute_path(path)?;
-        let fid = self.walk_to(&path)?;
+        let (fid, qid) = self.walk_to_with_qid(&path)?;
 
         let mut valid = fcall::SetattrMask::empty();
         let uid = match user {
@@ -1333,12 +1661,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let result = self.client.setattr(fid, valid, stat);
         let _ = self.client.clunk(fid);
 
+        if result.is_ok() {
+            self.invalidate_stat_cache_by_qid(qid.path);
+        }
+
         result.map_err(ChownError::from)
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {
-        self.remove_file_or_dir(path, true)
-            .map_err(UnlinkError::from)
+        let abs_path = self.absolute_path(&path).ok();
+        // Get the file's qid before removing so we can invalidate all aliases.
+        let qid = abs_path
+            .as_deref()
+            .and_then(|p| self.walk_to_with_qid(p).ok())
+            .map(|(fid, qid)| {
+                let _ = self.client.clunk(fid);
+                qid
+            });
+        let result = self
+            .remove_file_or_dir(path, true)
+            .map_err(UnlinkError::from);
+        if result.is_ok() {
+            if let Some(q) = qid {
+                self.invalidate_stat_cache_by_qid(q.path);
+            }
+            if let Some(ref p) = abs_path {
+                self.invalidate_parent_stat_cache(p);
+            }
+        }
+        result
     }
 
     fn rename(
@@ -1357,6 +1708,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let (src_fid, source_qid) = self
             .walk_to_with_qid(&old_path)
             .map_err(|_| super::errors::RenameError::ReadOnlyFileSystem)?;
+
+        // Try to get the destination file's qid (if it exists) so we can
+        // invalidate its cached aliases after rename overwrites it.
+        let dest_qid = self.walk_to_with_qid(&new_path).ok().map(|(fid, qid)| {
+            let _ = self.client.clunk(fid);
+            qid
+        });
 
         // Flush any pending write-behind data for the source file so that
         // the server has the latest contents before the rename. Propagate
@@ -1401,6 +1759,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let _ = self.client.clunk(dst_dir_fid);
 
         if result.is_ok() {
+            // Invalidate stat cache for both old and new paths, including
+            // any descendants (for directory renames) and all aliases via qid.
+            self.invalidate_stat_cache_by_qid(source_qid.path);
+            if let Some(dq) = dest_qid {
+                self.invalidate_stat_cache_by_qid(dq.path);
+            }
+            self.invalidate_stat_cache_tree(&old_path);
+            self.invalidate_stat_cache_tree(&new_path);
+            // Invalidate parent directories — rename changes their mtime.
+            self.invalidate_parent_stat_cache(&old_path);
+            self.invalidate_parent_stat_cache(&new_path);
+            // Invalidate dir fid cache for renamed directories.
+            self.invalidate_dir_fid_cache_tree(&old_path);
+            self.invalidate_dir_fid_cache_tree(&new_path);
+
             // Update the path stored in every open descriptor that still
             // refers to the old path (or a descendant). This keeps
             // Descriptor.path accurate for debugging/tracing. Write-behind
@@ -1425,12 +1798,37 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let result = self.client.mkdir(parent_fid, name, mode.bits(), 0);
         let _ = self.client.clunk(parent_fid);
 
+        if result.is_ok() {
+            self.invalidate_parent_stat_cache(&path);
+        }
+
         result.map(|_| ()).map_err(MkdirError::from)
     }
 
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
-        self.remove_file_or_dir(path, false)
-            .map_err(RmdirError::from)
+        let abs_path = self.absolute_path(&path).ok();
+        // Get the directory's qid before removing so we can invalidate all aliases.
+        let qid = abs_path
+            .as_deref()
+            .and_then(|p| self.walk_to_with_qid(p).ok())
+            .map(|(fid, qid)| {
+                let _ = self.client.clunk(fid);
+                qid
+            });
+        let result = self
+            .remove_file_or_dir(path, false)
+            .map_err(RmdirError::from);
+        if result.is_ok() {
+            if let Some(q) = qid {
+                self.invalidate_stat_cache_by_qid(q.path);
+            }
+            if let Some(ref p) = abs_path {
+                self.invalidate_stat_cache_tree(p);
+                self.invalidate_parent_stat_cache(p);
+                self.invalidate_dir_fid_cache_tree(p);
+            }
+        }
+        result
     }
 
     fn read_dir(
@@ -1482,34 +1880,125 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     ) -> Result<super::FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
 
-        let (fid, qid) = self.walk_to_with_qid(&path)?;
-
-        // Flush any pending write-behind data for this file so the server
-        // reports the correct file size and mtime.
-        if self.flush_write_buffers_for_file(qid.path).is_err() {
-            let _ = self.client.clunk(fid);
-            return Err(FileStatusError::Io);
+        // Check the stat cache first to avoid any RPCs.
+        {
+            let cache = self.stat_cache.lock();
+            if let Some(cached) = cache.get(&path) {
+                return Ok(cached.clone());
+            }
         }
 
-        let result = self.client.getattr(fid, fcall::GetattrMask::ALL);
-        let _ = self.client.clunk(fid);
+        // Split path into components for the statpath RPC.
+        let components: Vec<&str> = path
+            .normalized_components()
+            .map_err(|_| FileStatusError::PathError(PathError::InvalidPathname))?
+            .collect();
 
-        result
-            .and_then(|attr| Self::rgetattr_to_file_status(&attr))
-            .map_err(FileStatusError::from)
+        // Find the best starting fid from the dir_fid_cache.
+        let (start_fid, prefix_len, cloned_cache_fid) =
+            if let Some((cloned, plen)) = self.find_cached_prefix(&components) {
+                (cloned, plen, true)
+            } else {
+                (self.root.1, 0, false)
+            };
+        let remaining = &components[prefix_len..];
+
+        // Snapshot generation before RPC so we can detect concurrent writes.
+        let gen_before = self.cache_generation.load(Ordering::SeqCst);
+
+        // Check if there are any pending write buffers at all. If there
+        // are none, we can skip the flush entirely and use a single
+        // statpath RPC.
+        let has_pending_writes = !self.write_buffers.lock().is_empty();
+
+        if has_pending_writes {
+            if cloned_cache_fid {
+                let _ = self.client.clunk(start_fid);
+            }
+            // Fall back to walk + flush + getattr + clunk to ensure
+            // correct size/mtime after pending writes.
+            let (fid, qid) = self.walk_to_with_qid(&path)?;
+            if self.flush_write_buffers_for_file(qid.path).is_err() {
+                let _ = self.client.clunk(fid);
+                return Err(FileStatusError::Io);
+            }
+            let result = self.client.getattr(fid, fcall::GetattrMask::ALL);
+            let _ = self.client.clunk(fid);
+            let status = result
+                .and_then(|attr| Self::rgetattr_to_file_status(&attr))
+                .map_err(FileStatusError::from)?;
+            // Only cache if no concurrent mutation occurred during the RPC.
+            if self.cache_generation.load(Ordering::SeqCst) == gen_before {
+                self.stat_cache.lock().insert(path, status.clone());
+            }
+            Ok(status)
+        } else if self.wnames_fit_in_msize(remaining) {
+            // Fast path: single statpath RPC (walk + getattr + clunk
+            // combined on the server).
+            let result = self
+                .client
+                .statpath(start_fid, fcall::GetattrMask::ALL, remaining);
+
+            if cloned_cache_fid {
+                let _ = self.client.clunk(start_fid);
+            }
+
+            let result = result.map_err(FileStatusError::from)?;
+            let status = Self::rstatpath_to_file_status(&result).map_err(FileStatusError::from)?;
+            // Only cache if no concurrent mutation occurred during the RPC.
+            if self.cache_generation.load(Ordering::SeqCst) == gen_before {
+                self.stat_cache.lock().insert(path, status.clone());
+            }
+            Ok(status)
+        } else {
+            // Path too long for a single compound RPC — fall back to
+            // walk + getattr + clunk.
+            if cloned_cache_fid {
+                let _ = self.client.clunk(start_fid);
+            }
+            let (fid, _) = self.walk_to_with_qid(&path)?;
+            let result = self.client.getattr(fid, fcall::GetattrMask::ALL);
+            let _ = self.client.clunk(fid);
+            let status = result
+                .and_then(|attr| Self::rgetattr_to_file_status(&attr))
+                .map_err(FileStatusError::from)?;
+            if self.cache_generation.load(Ordering::SeqCst) == gen_before {
+                self.stat_cache.lock().insert(path, status.clone());
+            }
+            Ok(status)
+        }
     }
 
     fn fd_file_status(
         &self,
         fd: &FileFd<Platform, T>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        // Extract fid and qid, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
-        let (fid, qid_path) = self
+        // Extract fid, qid, and path from the descriptor.
+        let (fid, qid_path, path) = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid.path))
+            .with_entry(fd, |desc| {
+                (desc.entry.fid, desc.entry.qid.path, desc.entry.path.clone())
+            })
             .ok_or(super::errors::FileStatusError::ClosedFd)?;
+
+        // If there are no pending write buffers for this file, the
+        // stat cache (populated by statpath/file_status) may be valid.
+        // Verify the cached entry's inode matches the descriptor's qid
+        // to avoid returning metadata for a different file that now
+        // occupies the same path (e.g. after unlink + recreate or rename).
+        let has_pending_writes = {
+            let buffers = self.write_buffers.lock();
+            buffers.values().any(|wb| wb.qid_path == qid_path)
+        };
+        if !has_pending_writes {
+            let cache = self.stat_cache.lock();
+            if let Some(cached) = cache.get(&path)
+                && cached.node_info.ino == qid_path as usize
+            {
+                return Ok(cached.clone());
+            }
+        }
 
         // Flush all pending writes for this file (across all fids) so the
         // server reports the correct file size.
@@ -1517,8 +2006,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         // Perform blocking I/O without holding any locks.
         let attr = self.client.getattr(fid, fcall::GetattrMask::ALL)?;
+        let status = Self::rgetattr_to_file_status(&attr)?;
 
-        Ok(Self::rgetattr_to_file_status(&attr)?)
+        // Do NOT populate stat_cache here. The descriptor's path may be
+        // stale if the file was unlinked and recreated — fstat() on the
+        // open fd returns metadata for the deleted inode, which would
+        // poison the path-keyed cache for the new file.
+
+        Ok(status)
     }
 
     fn read_link(
@@ -1528,12 +2023,49 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let abs = self
             .absolute_path(path)
             .map_err(super::errors::ReadLinkError::PathError)?;
-        let fid = self
-            .walk_to(&abs)
-            .map_err(|_| super::errors::ReadLinkError::Io)?;
-        let target = self.client.readlink(fid);
-        let _ = self.client.clunk(fid);
-        let target = target.map_err(|_| super::errors::ReadLinkError::Io)?;
+
+        // Use the combined readlinkpath RPC (walk + readlink + clunk in one
+        // round-trip) with dir_fid_cache prefix lookup.
+        let components: Vec<&str> = abs
+            .normalized_components()
+            .map_err(|_| super::errors::ReadLinkError::Io)?
+            .collect();
+        let (start_fid, prefix_len, cloned_cache_fid) =
+            if let Some((cloned, plen)) = self.find_cached_prefix(&components) {
+                (cloned, plen, true)
+            } else {
+                (self.root.1, 0, false)
+            };
+        let remaining = &components[prefix_len..];
+
+        let target = if self.wnames_fit_in_msize(remaining) {
+            let result = self.client.readlinkpath(start_fid, remaining);
+            if cloned_cache_fid {
+                let _ = self.client.clunk(start_fid);
+            }
+            result.map_err(|_| super::errors::ReadLinkError::Io)?
+        } else {
+            // Path too long for a single compound RPC — walk to the parent
+            // directory and issue readlinkpath with just the final component.
+            // A single component always fits in msize, and readlinkpath
+            // doesn't follow the final symlink (unlike walk_to which
+            // canonicalizes everything).
+            if cloned_cache_fid {
+                let _ = self.client.clunk(start_fid);
+            }
+            if components.is_empty() {
+                return Err(super::errors::ReadLinkError::Io);
+            }
+            let parent_components = &components[..components.len() - 1];
+            let final_name = components[components.len() - 1];
+            let (_, parent_fid) = self
+                .client
+                .walk(self.root.1, parent_components)
+                .map_err(|_| super::errors::ReadLinkError::Io)?;
+            let result = self.client.readlinkpath(parent_fid, &[final_name]);
+            let _ = self.client.clunk(parent_fid);
+            result.map_err(|_| super::errors::ReadLinkError::Io)?
+        };
         alloc::string::String::from_utf8(target).map_err(|_| super::errors::ReadLinkError::Io)
     }
 
@@ -1556,11 +2088,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         self.open(abs, flags, mode)
     }
 
+    /// Note: `_follow_symlinks` is currently ignored because
+    /// `walks_follow_symlinks()` returns `true` for 9P, meaning the
+    /// shim already handles follow/nofollow at the syscall layer by
+    /// choosing `stat_at` vs `lstat`. The 9P walk will follow
+    /// symlinks regardless, so both stat and lstat end up resolving
+    /// the same target. This is acceptable since the broker resolves
+    /// all symlinks during walk anyway.
     fn stat_at(
         &self,
         dirfd: &FileFd<Platform, T>,
         rel_path: impl crate::path::Arg,
-        follow_symlinks: bool,
+        _follow_symlinks: bool,
     ) -> Result<super::FileStatus, super::FileStatusError> {
         let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
             super::DirFdError::ClosedFd => super::FileStatusError::ClosedFd,
@@ -1571,15 +2110,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .as_rust_str()
             .map_err(|e| super::FileStatusError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(super::FileStatusError::PathError)?;
-        // When following symlinks, resolve the full chain (up to 40 hops).
-        // Relative targets are resolved against the symlink's parent
-        // directory, not the process CWD.
-        let resolved = if follow_symlinks {
-            self.resolve_follow_symlinks(abs, 40)?
-        } else {
-            abs
-        };
-        self.file_status(resolved)
+        // The 9P broker walk already follows symlinks (via
+        // `fs::canonicalize` per component), so we can skip the
+        // client-side symlink resolution chain. Just pass the path
+        // directly — walk_to + getattr will see the target.
+        self.file_status(abs)
     }
 
     fn unlink_at(

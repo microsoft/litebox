@@ -1380,7 +1380,9 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         let status = match fs_path {
             FsPath::Absolute { path } => {
-                if follow_symlinks {
+                // Skip client-side symlink resolution when the FS follows
+                // symlinks during walk (e.g., 9P with canonicalizing broker).
+                if follow_symlinks && !files.fs.walks_follow_symlinks() {
                     let path_str = path.to_str().map_err(|_| Errno::EINVAL)?;
                     let resolved = self.canonicalize_path(path_str)?;
                     files.fs.file_status(&*resolved)?
@@ -1755,7 +1757,9 @@ impl<FS: ShimFS> Task<FS> {
     /// The `pathname` must be absolute.
     fn do_stat(&self, pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, Errno> {
         let normalized_path = pathname.normalized()?;
-        let path = if follow_symlink {
+        // Skip client-side symlink resolution when the FS backend follows
+        // symlinks during walk (e.g., 9P with a canonicalizing broker).
+        let path = if follow_symlink && !self.files.borrow().fs.walks_follow_symlinks() {
             self.canonicalize_path(normalized_path.as_str())?
         } else {
             normalized_path
