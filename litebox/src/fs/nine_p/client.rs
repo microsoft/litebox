@@ -6,7 +6,7 @@
 //! This module provides a high-level client for the 9P2000.L protocol.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use crate::utils::id_pool::IdPool;
@@ -66,6 +66,8 @@ pub(super) struct Client<Platform: RawSyncPrimitivesProvider, T: Read + Write> {
     rbuf: Mutex<Platform, Vec<u8>>,
     /// Fid generator
     fids: FidGenerator<Platform>,
+    /// Set once the transport has observed an unrecoverable write failure.
+    poisoned: AtomicBool,
     /// Next tag for synchronous operations
     next_tag: AtomicU16,
 }
@@ -153,6 +155,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             write_state: Mutex::new(ClientWriteState { transport, wbuf }),
             rbuf: Mutex::new(rbuf),
             fids: FidGenerator::new(),
+            poisoned: AtomicBool::new(false),
             next_tag: AtomicU16::new(1),
         })
     }
@@ -167,14 +170,23 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     where
         F: FnOnce(Fcall<'_>) -> Result<R, Error>,
     {
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(Error::Io);
+        }
         let tag = self.next_request_tag();
 
         let mut write_state = self.write_state.lock();
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(Error::Io);
+        }
         let ClientWriteState { transport, wbuf } = &mut *write_state;
         transport::write_message(transport, wbuf, TaggedFcall { tag, fcall }).map_err(
             |e| match e {
                 transport::WriteError::Interrupted => Error::Interrupted,
-                transport::WriteError::Io => Error::Io,
+                transport::WriteError::Io => {
+                    self.poisoned.store(true, Ordering::Relaxed);
+                    Error::Io
+                }
             },
         )?;
 
@@ -268,12 +280,12 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             wqids.append(&mut new_wqids);
             // Clunk the old fid if it's not the original fid
             if f != fid {
-                let _ = self.clunk(f);
+                self.clunk_async(f);
             }
             f = new_f;
             // It means that the walk failed at the nwqid-th element
             if new_len < wnames.len() {
-                let _ = self.clunk(f);
+                self.clunk_async(f);
                 return Err(Error::Remote(super::ENOENT));
             }
         }
@@ -600,6 +612,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Clunk (close) a fid
+    #[allow(dead_code)]
     pub(super) fn clunk(&self, fid: fcall::Fid) -> Result<(), Error> {
         let result = self.fcall(
             Fcall::Tclunk(fcall::Tclunk { fid }),
@@ -611,6 +624,38 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         );
         self.fids.free(fid);
         result
+    }
+
+    /// Send a Tclunk without waiting for the Rclunk response.
+    ///
+    /// This avoids a synchronous round-trip for fid cleanup. The Rclunk
+    /// will be received (and discarded via tag mismatch) by the next
+    /// `fcall()` call. The fid is intentionally NOT recycled to the pool
+    /// because the server may still reference it until it processes the
+    /// Tclunk; with u32 fids and short-lived sandboxes this is safe.
+    pub(super) fn clunk_async(&self, fid: fcall::Fid) {
+        if self.poisoned.load(Ordering::Relaxed) {
+            return;
+        }
+        let tag = self.next_request_tag();
+        let mut write_state = self.write_state.lock();
+        if self.poisoned.load(Ordering::Relaxed) {
+            return;
+        }
+        let ClientWriteState { transport, wbuf } = &mut *write_state;
+        if matches!(
+            transport::write_message(
+                transport,
+                wbuf,
+                TaggedFcall {
+                    tag,
+                    fcall: Fcall::Tclunk(fcall::Tclunk { fid }),
+                },
+            ),
+            Err(transport::WriteError::Io)
+        ) {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Clone a fid (walk with empty path)
@@ -751,5 +796,83 @@ mod tests {
         let second = TaggedFcall::decode(&writes[2]).expect("decode second request");
         assert_eq!(first.tag, fcall::NOTAG - 1);
         assert_eq!(second.tag, 1);
+    }
+
+    struct PartialWriteThenFailTransport {
+        reads: Cursor<Vec<u8>>,
+        write_calls: Arc<StdMutex<usize>>,
+        allow_handshake_write: bool,
+        fail_after_partial: bool,
+    }
+
+    impl PartialWriteThenFailTransport {
+        fn new(reads: Vec<u8>, write_calls: Arc<StdMutex<usize>>) -> Self {
+            Self {
+                reads: Cursor::new(reads),
+                write_calls,
+                allow_handshake_write: true,
+                fail_after_partial: false,
+            }
+        }
+    }
+
+    impl Read for PartialWriteThenFailTransport {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
+            self.reads.read(buf).map_err(|_| transport::ReadError::Io)
+        }
+    }
+
+    impl Write for PartialWriteThenFailTransport {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
+            *self.write_calls.lock().unwrap() += 1;
+            if self.allow_handshake_write {
+                self.allow_handshake_write = false;
+                return Ok(buf.len());
+            }
+            if !self.fail_after_partial {
+                self.fail_after_partial = true;
+                return Ok(buf.len().min(3));
+            }
+            Err(transport::WriteError::Io)
+        }
+    }
+
+    #[test]
+    fn clunk_async_poisoned_write_failure_blocks_future_requests() {
+        let write_calls = Arc::new(StdMutex::new(0));
+        let responses = encode_message(TaggedFcall {
+            tag: fcall::NOTAG,
+            fcall: Fcall::Rversion(fcall::Rversion {
+                msize: 8192,
+                version: fcall::FcallStr::Borrowed(b"9P2000.L"),
+            }),
+        });
+
+        let client = Client::<MockPlatform, _>::new(
+            PartialWriteThenFailTransport::new(responses, write_calls.clone()),
+            8192,
+        )
+        .expect("client should initialize");
+
+        client.clunk_async(7);
+        assert_eq!(
+            *write_calls.lock().unwrap(),
+            3,
+            "async clunk should attempt a partial write and then fail"
+        );
+
+        let result = client.fcall(
+            Fcall::Tclunk(fcall::Tclunk { fid: 8 }),
+            |response| match response {
+                Fcall::Rclunk(_) => Ok(()),
+                _ => Err(Error::InvalidResponse),
+            },
+        );
+        assert!(matches!(result, Err(Error::Io)));
+        assert_eq!(
+            *write_calls.lock().unwrap(),
+            3,
+            "poisoned client must not send further requests"
+        );
     }
 }

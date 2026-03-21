@@ -600,7 +600,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             let parent = if pos == 0 { "/" } else { &path[..pos] };
             // Try qid-based invalidation to cover all aliases of the parent.
             if let Ok((fid, qid)) = self.walk_to_with_qid(parent) {
-                let _ = self.client.clunk(fid);
+                self.client.clunk_async(fid);
                 self.invalidate_stat_cache_by_qid(qid.path);
             } else {
                 // Fallback: remove by spelled path if walk fails.
@@ -629,7 +629,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .collect();
         for key in to_remove {
             if let Some((fid, _)) = cache.remove(&key) {
-                let _ = self.client.clunk(fid);
+                self.client.clunk_async(fid);
             }
         }
     }
@@ -821,13 +821,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let (qids, fid) = match self.client.walk(best_fid, remaining) {
             Ok(r) => {
                 if cloned_cache_fid {
-                    let _ = self.client.clunk(best_fid);
+                    self.client.clunk_async(best_fid);
                 }
                 r
             }
             Err(e) => {
                 if cloned_cache_fid {
-                    let _ = self.client.clunk(best_fid);
+                    self.client.clunk_async(best_fid);
                 }
                 return Err(e);
             }
@@ -861,7 +861,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                         if let Some(&(existing_fid, _)) = cache.get(&parent_path) {
                             // Another thread won the race — clunk ours.
                             drop(cache);
-                            let _ = self.client.clunk(parent_fid);
+                            self.client.clunk_async(parent_fid);
                             let _ = existing_fid; // keep the winner
                         } else {
                             cache.insert(parent_path, (parent_fid, parent_qid));
@@ -1045,7 +1045,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             let result =
                 self.client
                     .unlinkat(parent_fid, name, if is_file { 0 } else { AT_REMOVEDIR });
-            let _ = self.client.clunk(parent_fid);
+            self.client.clunk_async(parent_fid);
             if let Err(Error::Remote(ENOSYS | EOPNOTSUPP)) = &result {
                 self.unlinkat_supported.store(false, Ordering::SeqCst);
                 // fall back to `remove`
@@ -1068,10 +1068,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         // Clunk all cached directory fids.
         let cache = self.dir_fid_cache.lock();
         for (_, &(fid, _)) in cache.iter() {
-            let _ = self.client.clunk(fid);
+            self.client.clunk_async(fid);
         }
         drop(cache);
-        let _ = self.client.clunk(self.root.1);
+        self.client.clunk_async(self.root.1);
     }
 }
 
@@ -1134,7 +1134,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             let existing = self.client.walk(self.root.1, &components);
             if let Ok((_qids, existing_fid)) = existing {
                 if flags.contains(super::OFlags::EXCL) {
-                    let _ = self.client.clunk(existing_fid);
+                    self.client.clunk_async(existing_fid);
                     return Err(OpenError::AlreadyExists);
                 }
                 // File exists — strip O_TRUNC and open normally, then
@@ -1144,7 +1144,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 match self.client.open(existing_fid, open_flags) {
                     Ok(qid) => {
                         if self.flush_write_buffers_for_file(qid.path).is_err() {
-                            let _ = self.client.clunk(existing_fid);
+                            self.client.clunk_async(existing_fid);
                             return Err(OpenError::Io);
                         }
                         if has_trunc {
@@ -1156,7 +1156,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                                 self.client
                                     .setattr(existing_fid, fcall::SetattrMask::SIZE, stat)
                             {
-                                let _ = self.client.clunk(existing_fid);
+                                self.client.clunk_async(existing_fid);
                                 return Err(e.into());
                             }
                             self.invalidate_read_buffers_for_file(qid.path);
@@ -1164,7 +1164,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                         (qid, existing_fid)
                     }
                     Err(e) => {
-                        let _ = self.client.clunk(existing_fid);
+                        self.client.clunk_async(existing_fid);
                         return Err(e.into());
                     }
                 }
@@ -1180,7 +1180,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 {
                     Ok(result) => result,
                     Err(e) => {
-                        let _ = self.client.clunk(dfid);
+                        self.client.clunk_async(dfid);
                         return Err(e.into());
                     }
                 }
@@ -1209,7 +1209,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                     Ok(f) => f,
                     Err(e) => {
                         if cloned_cache_fid {
-                            let _ = self.client.clunk(start_fid);
+                            self.client.clunk_async(start_fid);
                         }
                         return Err(e.into());
                     }
@@ -1219,7 +1219,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                     .openpath(start_fid, new_fid, open_flags, remaining);
 
                 if cloned_cache_fid {
-                    let _ = self.client.clunk(start_fid);
+                    self.client.clunk_async(start_fid);
                 }
 
                 #[cfg(feature = "trace_fs")]
@@ -1244,13 +1244,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 // Path too long for a single compound RPC — fall back to
                 // walk + open.
                 if cloned_cache_fid {
-                    let _ = self.client.clunk(start_fid);
+                    self.client.clunk_async(start_fid);
                 }
                 let (_, walked_fid) = self.client.walk(self.root.1, &components)?;
                 match self.client.open(walked_fid, open_flags) {
                     Ok(qid) => (qid, walked_fid),
                     Err(e) => {
-                        let _ = self.client.clunk(walked_fid);
+                        self.client.clunk_async(walked_fid);
                         return Err(e.into());
                     }
                 }
@@ -1260,7 +1260,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             // using the qid returned by open(), which is the target's
             // qid after symlink resolution.
             if self.flush_write_buffers_for_file(qid.path).is_err() {
-                let _ = self.client.clunk(opened_fid);
+                self.client.clunk_async(opened_fid);
                 return Err(OpenError::Io);
             }
             // Apply O_TRUNC now that buffered writes have been
@@ -1275,7 +1275,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                     .client
                     .setattr(opened_fid, fcall::SetattrMask::SIZE, stat)
                 {
-                    let _ = self.client.clunk(opened_fid);
+                    self.client.clunk_async(opened_fid);
                     return Err(e.into());
                 }
                 // Truncation changes file content — invalidate all
@@ -1326,7 +1326,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             self.read_buffers.lock().remove(&entry.entry.fid);
             // Stat cache may be stale after a write-buffer flush.
             self.invalidate_stat_cache_by_qid(entry.entry.qid.path);
-            let _ = self.client.clunk(entry.entry.fid);
+            self.client.clunk_async(entry.entry.fid);
             if flush_result.is_err() {
                 return Err(super::errors::CloseError::Io);
             }
@@ -1690,7 +1690,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         };
 
         let result = self.client.setattr(fid, fcall::SetattrMask::MODE, stat);
-        let _ = self.client.clunk(fid);
+        self.client.clunk_async(fid);
 
         if result.is_ok() {
             self.invalidate_stat_cache_by_qid(qid.path);
@@ -1730,7 +1730,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         };
 
         let result = self.client.setattr(fid, valid, stat);
-        let _ = self.client.clunk(fid);
+        self.client.clunk_async(fid);
 
         if result.is_ok() {
             self.invalidate_stat_cache_by_qid(qid.path);
@@ -1746,7 +1746,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .as_deref()
             .and_then(|p| self.walk_to_with_qid(p).ok())
             .map(|(fid, qid)| {
-                let _ = self.client.clunk(fid);
+                self.client.clunk_async(fid);
                 qid
             });
         let result = self
@@ -1785,7 +1785,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         // Try to get the destination file's qid (if it exists) so we can
         // invalidate its cached aliases after rename overwrites it.
         let dest_qid = self.walk_to_with_qid(&new_path).ok().map(|(fid, qid)| {
-            let _ = self.client.clunk(fid);
+            self.client.clunk_async(fid);
             qid
         });
 
@@ -1793,7 +1793,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         // the server has the latest contents before the rename. Propagate
         // flush errors — a silent drop would lose acknowledged writes.
         if self.flush_write_buffers_for_file(source_qid.path).is_err() {
-            let _ = self.client.clunk(src_fid);
+            self.client.clunk_async(src_fid);
             return Err(super::errors::RenameError::Io);
         }
 
@@ -1801,13 +1801,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let new_components: Vec<&str> = new_path
             .normalized_components()
             .map_err(|_| {
-                let _ = self.client.clunk(src_fid);
+                self.client.clunk_async(src_fid);
                 super::errors::RenameError::ReadOnlyFileSystem
             })?
             .collect();
 
         if new_components.is_empty() {
-            let _ = self.client.clunk(src_fid);
+            self.client.clunk_async(src_fid);
             return Err(super::errors::RenameError::ReadOnlyFileSystem);
         }
 
@@ -1817,19 +1817,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             if let Ok(f) = self.client.clone_fid(self.root.1) {
                 f
             } else {
-                let _ = self.client.clunk(src_fid);
+                self.client.clunk_async(src_fid);
                 return Err(super::errors::RenameError::ReadOnlyFileSystem);
             }
         } else if let Ok((_, f)) = self.client.walk(self.root.1, parent_components) {
             f
         } else {
-            let _ = self.client.clunk(src_fid);
+            self.client.clunk_async(src_fid);
             return Err(super::errors::RenameError::ReadOnlyFileSystem);
         };
 
         let result = self.client.rename(src_fid, dst_dir_fid, new_name);
-        let _ = self.client.clunk(src_fid);
-        let _ = self.client.clunk(dst_dir_fid);
+        self.client.clunk_async(src_fid);
+        self.client.clunk_async(dst_dir_fid);
 
         if result.is_ok() {
             // Clear negative and readlink caches FIRST so concurrent
@@ -1876,7 +1876,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let (parent_fid, name) = self.walk_to_parent(&path)?;
 
         let result = self.client.mkdir(parent_fid, name, mode.bits(), 0);
-        let _ = self.client.clunk(parent_fid);
+        self.client.clunk_async(parent_fid);
 
         if result.is_ok() {
             // Clear negative cache FIRST so concurrent file_status calls
@@ -1895,7 +1895,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .as_deref()
             .and_then(|p| self.walk_to_with_qid(p).ok())
             .map(|(fid, qid)| {
-                let _ = self.client.clunk(fid);
+                self.client.clunk_async(fid);
                 qid
             });
         let result = self
@@ -2010,7 +2010,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         if has_pending_writes {
             if cloned_cache_fid {
-                let _ = self.client.clunk(start_fid);
+                self.client.clunk_async(start_fid);
             }
             // Fall back to walk + flush + getattr + clunk to ensure
             // correct size/mtime after pending writes.
@@ -2023,11 +2023,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 }
             };
             if self.flush_write_buffers_for_file(qid.path).is_err() {
-                let _ = self.client.clunk(fid);
+                self.client.clunk_async(fid);
                 return Err(FileStatusError::Io);
             }
             let result = self.client.getattr(fid, fcall::GetattrMask::ALL);
-            let _ = self.client.clunk(fid);
+            self.client.clunk_async(fid);
             let status = result
                 .and_then(|attr| Self::rgetattr_to_file_status(&attr))
                 .map_err(FileStatusError::from)?;
@@ -2044,7 +2044,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 .statpath(start_fid, fcall::GetattrMask::ALL, remaining);
 
             if cloned_cache_fid {
-                let _ = self.client.clunk(start_fid);
+                self.client.clunk_async(start_fid);
             }
 
             match result {
@@ -2066,7 +2066,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             // Path too long for a single compound RPC — fall back to
             // walk + getattr + clunk.
             if cloned_cache_fid {
-                let _ = self.client.clunk(start_fid);
+                self.client.clunk_async(start_fid);
             }
             let (fid, _) = match self.walk_to_with_qid(&path) {
                 Ok(r) => r,
@@ -2077,7 +2077,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 }
             };
             let result = self.client.getattr(fid, fcall::GetattrMask::ALL);
-            let _ = self.client.clunk(fid);
+            self.client.clunk_async(fid);
             let status = result
                 .and_then(|attr| Self::rgetattr_to_file_status(&attr))
                 .map_err(FileStatusError::from)?;
@@ -2173,7 +2173,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let target = if self.wnames_fit_in_msize(remaining) {
             let result = self.client.readlinkpath(start_fid, remaining);
             if cloned_cache_fid {
-                let _ = self.client.clunk(start_fid);
+                self.client.clunk_async(start_fid);
             }
             result.map_err(|_| super::errors::ReadLinkError::Io)?
         } else {
@@ -2183,7 +2183,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             // doesn't follow the final symlink (unlike walk_to which
             // canonicalizes everything).
             if cloned_cache_fid {
-                let _ = self.client.clunk(start_fid);
+                self.client.clunk_async(start_fid);
             }
             if components.is_empty() {
                 return Err(super::errors::ReadLinkError::Io);
@@ -2195,7 +2195,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 .walk(self.root.1, parent_components)
                 .map_err(|_| super::errors::ReadLinkError::Io)?;
             let result = self.client.readlinkpath(parent_fid, &[final_name]);
-            let _ = self.client.clunk(parent_fid);
+            self.client.clunk_async(parent_fid);
             result.map_err(|_| super::errors::ReadLinkError::Io)?
         };
         let target_str = alloc::string::String::from_utf8(target)
