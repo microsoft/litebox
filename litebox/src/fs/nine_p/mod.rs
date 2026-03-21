@@ -138,6 +138,36 @@ impl From<Error> for MkdirError {
     }
 }
 
+impl From<Error> for super::errors::ReadLinkError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::InvalidPathname => {
+                super::errors::ReadLinkError::PathError(PathError::InvalidPathname)
+            }
+            Error::Remote(errno) => match errno {
+                ENOENT => super::errors::ReadLinkError::PathError(PathError::NoSuchFileOrDirectory),
+                ENOTDIR => {
+                    super::errors::ReadLinkError::PathError(PathError::ComponentNotADirectory)
+                }
+                ENAMETOOLONG => super::errors::ReadLinkError::PathError(PathError::InvalidPathname),
+                EINVAL => super::errors::ReadLinkError::NotASymlink,
+                EPERM | EACCES => {
+                    super::errors::ReadLinkError::PathError(PathError::NoSearchPerms {
+                        #[cfg(debug_assertions)]
+                        dir: String::new(),
+                        #[cfg(debug_assertions)]
+                        perms: super::Mode::empty(),
+                    })
+                }
+                _ => super::errors::ReadLinkError::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::Interrupted => {
+                super::errors::ReadLinkError::Io
+            }
+        }
+    }
+}
+
 impl From<Error> for ReadDirError {
     fn from(e: Error) -> Self {
         match e {
@@ -671,17 +701,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         cache.retain(|k| k.as_str() != path && !k.starts_with(&prefix));
     }
 
-    /// Check whether a set of path components fits within a single compound
-    /// RPC message. The 9P encoding for wnames is:
-    /// `nwname(2) + sum(strlen_prefix(2) + bytes)` per component, plus a
-    /// fixed overhead for the message header and other fields (~30 bytes).
-    /// Returns `true` if a compound RPC with these wnames would fit in msize.
-    fn wnames_fit_in_msize(&self, wnames: &[&str]) -> bool {
-        const COMPOUND_RPC_OVERHEAD: usize = 30;
-        let wnames_size: usize = 2 + wnames.iter().map(|w| 2 + w.len()).sum::<usize>();
-        wnames_size + COMPOUND_RPC_OVERHEAD <= self.client.msize() as usize
-    }
-
     /// If `err` is ENOENT and no concurrent mutation happened, insert `path`
     /// into the negative stat cache so subsequent lookups can skip the RPC.
     fn try_cache_negative(&self, path: &str, err: &FileStatusError, gen_before: usize) {
@@ -959,10 +978,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         Self::stat_fields_to_file_status(attr.valid, attr.qid, &attr.stat)
     }
 
-    fn rstatpath_to_file_status(resp: &fcall::Rstatpath) -> Result<super::FileStatus, Error> {
-        Self::stat_fields_to_file_status(resp.valid, resp.qid, &resp.stat)
-    }
-
     fn stat_fields_to_file_status(
         valid: fcall::GetattrMask,
         qid: fcall::Qid,
@@ -1186,16 +1201,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 }
             }
         } else {
-            // Use the combined openpath RPC to save a round-trip when
-            // there is no O_TRUNC. With O_TRUNC we still need the
-            // separate open+setattr to ensure write buffers are flushed
-            // before truncation.
+            // Standard walk + open sequence.
             let has_trunc = lflags.contains(fcall::LOpenFlags::O_TRUNC);
             let open_flags = lflags & !fcall::LOpenFlags::O_TRUNC;
 
-            // Find the best cached directory prefix to minimize the walk
-            // portion of the RPC. find_cached_prefix returns a cloned fid
-            // that we must clunk after the openpath RPC.
+            // Find the best cached directory prefix to minimize the walk.
             let (start_fid, prefix_len, cloned_cache_fid) =
                 if let Some((cloned, plen)) = self.find_cached_prefix(&components) {
                     (cloned, plen, true)
@@ -1204,9 +1214,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 };
             let remaining = &components[prefix_len..];
 
-            let (qid, opened_fid) = if self.wnames_fit_in_msize(remaining) {
-                let new_fid = match self.client.alloc_fid() {
-                    Ok(f) => f,
+            let (qid, opened_fid) = {
+                let (_, walked_fid) = match self.client.walk(start_fid, remaining) {
+                    Ok(r) => r,
                     Err(e) => {
                         if cloned_cache_fid {
                             self.client.clunk_async(start_fid);
@@ -1214,42 +1224,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                         return Err(e.into());
                     }
                 };
-                let open_result = self
-                    .client
-                    .openpath(start_fid, new_fid, open_flags, remaining);
-
                 if cloned_cache_fid {
                     self.client.clunk_async(start_fid);
                 }
 
                 #[cfg(feature = "trace_fs")]
-                if let Err(ref e) = open_result {
-                    log_println!(
-                        self.litebox.x.platform,
-                        "[9P-TRACE] openpath FAILED path={:?} fid={} lflags={:?} err={:?}",
-                        path,
-                        new_fid,
-                        lflags,
-                        e,
-                    );
-                }
-                match open_result {
-                    Ok(qid) => (qid, new_fid),
-                    Err(e) => {
-                        self.client.free_fid(new_fid);
-                        return Err(e.into());
-                    }
-                }
-            } else {
-                // Path too long for a single compound RPC — fall back to
-                // walk + open.
-                if cloned_cache_fid {
-                    self.client.clunk_async(start_fid);
-                }
-                let (_, walked_fid) = self.client.walk(self.root.1, &components)?;
+                let trace_fid = walked_fid;
+
                 match self.client.open(walked_fid, open_flags) {
                     Ok(qid) => (qid, walked_fid),
                     Err(e) => {
+                        #[cfg(feature = "trace_fs")]
+                        log_println!(
+                            self.litebox.x.platform,
+                            "[9P-TRACE] open FAILED path={:?} fid={} lflags={:?} err={:?}",
+                            path,
+                            trace_fid,
+                            lflags,
+                            e,
+                        );
                         self.client.clunk_async(walked_fid);
                         return Err(e.into());
                     }
@@ -1988,31 +1981,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             }
         }
 
-        // Split path into components for the statpath RPC.
-        let components: Vec<&str> = path
+        // Validate the path before issuing RPCs.
+        let _ = path
             .normalized_components()
             .map_err(|_| FileStatusError::PathError(PathError::InvalidPathname))?
-            .collect();
-
-        // Find the best starting fid from the dir_fid_cache.
-        let (start_fid, prefix_len, cloned_cache_fid) =
-            if let Some((cloned, plen)) = self.find_cached_prefix(&components) {
-                (cloned, plen, true)
-            } else {
-                (self.root.1, 0, false)
-            };
-        let remaining = &components[prefix_len..];
+            .count();
 
         // Check if there are any pending write buffers at all. If there
-        // are none, we can skip the flush entirely and use a single
-        // statpath RPC.
+        // are, we must flush before querying attributes.
         let has_pending_writes = !self.write_buffers.lock().is_empty();
 
         if has_pending_writes {
-            if cloned_cache_fid {
-                self.client.clunk_async(start_fid);
-            }
-            // Fall back to walk + flush + getattr + clunk to ensure
+            // Walk + flush + getattr + clunk to ensure
             // correct size/mtime after pending writes.
             let (fid, qid) = match self.walk_to_with_qid(&path) {
                 Ok(r) => r,
@@ -2036,38 +2016,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 self.stat_cache.lock().insert(path, status.clone());
             }
             Ok(status)
-        } else if self.wnames_fit_in_msize(remaining) {
-            // Fast path: single statpath RPC (walk + getattr + clunk
-            // combined on the server).
-            let result = self
-                .client
-                .statpath(start_fid, fcall::GetattrMask::ALL, remaining);
-
-            if cloned_cache_fid {
-                self.client.clunk_async(start_fid);
-            }
-
-            match result {
-                Err(e) => {
-                    let e = FileStatusError::from(e);
-                    self.try_cache_negative(&path, &e, gen_before);
-                    Err(e)
-                }
-                Ok(result) => {
-                    let status =
-                        Self::rstatpath_to_file_status(&result).map_err(FileStatusError::from)?;
-                    if self.cache_generation.load(Ordering::SeqCst) == gen_before {
-                        self.stat_cache.lock().insert(path, status.clone());
-                    }
-                    Ok(status)
-                }
-            }
         } else {
-            // Path too long for a single compound RPC — fall back to
-            // walk + getattr + clunk.
-            if cloned_cache_fid {
-                self.client.clunk_async(start_fid);
-            }
+            // Standard walk + getattr + clunk sequence.
             let (fid, _) = match self.walk_to_with_qid(&path) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2102,7 +2052,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .ok_or(super::errors::FileStatusError::ClosedFd)?;
 
         // If there are no pending write buffers for this file, the
-        // stat cache (populated by statpath/file_status) may be valid.
+        // stat cache (populated by file_status) may be valid.
         // Verify the cached entry's inode matches the descriptor's qid
         // to avoid returning metadata for a different file that now
         // occupies the same path (e.g. after unlink + recreate or rename).
@@ -2156,11 +2106,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             }
         }
 
-        // Use the combined readlinkpath RPC (walk + readlink + clunk in one
-        // round-trip) with dir_fid_cache prefix lookup.
+        // Use standard walk + readlink + clunk sequence with
+        // dir_fid_cache prefix lookup.
         let components: Vec<&str> = abs
             .normalized_components()
-            .map_err(|_| super::errors::ReadLinkError::Io)?
+            .map_err(|_| super::errors::ReadLinkError::PathError(PathError::InvalidPathname))?
             .collect();
         let (start_fid, prefix_len, cloned_cache_fid) =
             if let Some((cloned, plen)) = self.find_cached_prefix(&components) {
@@ -2170,33 +2120,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             };
         let remaining = &components[prefix_len..];
 
-        let target = if self.wnames_fit_in_msize(remaining) {
-            let result = self.client.readlinkpath(start_fid, remaining);
+        let target = {
+            let (_, walked_fid) = match self.client.walk(start_fid, remaining) {
+                Ok(r) => r,
+                Err(e) => {
+                    if cloned_cache_fid {
+                        self.client.clunk_async(start_fid);
+                    }
+                    return Err(e.into());
+                }
+            };
             if cloned_cache_fid {
                 self.client.clunk_async(start_fid);
             }
-            result.map_err(|_| super::errors::ReadLinkError::Io)?
-        } else {
-            // Path too long for a single compound RPC — walk to the parent
-            // directory and issue readlinkpath with just the final component.
-            // A single component always fits in msize, and readlinkpath
-            // doesn't follow the final symlink (unlike walk_to which
-            // canonicalizes everything).
-            if cloned_cache_fid {
-                self.client.clunk_async(start_fid);
-            }
-            if components.is_empty() {
-                return Err(super::errors::ReadLinkError::Io);
-            }
-            let parent_components = &components[..components.len() - 1];
-            let final_name = components[components.len() - 1];
-            let (_, parent_fid) = self
-                .client
-                .walk(self.root.1, parent_components)
-                .map_err(|_| super::errors::ReadLinkError::Io)?;
-            let result = self.client.readlinkpath(parent_fid, &[final_name]);
-            self.client.clunk_async(parent_fid);
-            result.map_err(|_| super::errors::ReadLinkError::Io)?
+            let result = self.client.readlink(walked_fid);
+            self.client.clunk_async(walked_fid);
+            result.map_err(super::errors::ReadLinkError::from)?
         };
         let target_str = alloc::string::String::from_utf8(target)
             .map_err(|_| super::errors::ReadLinkError::Io)?;

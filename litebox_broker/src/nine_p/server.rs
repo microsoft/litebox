@@ -42,6 +42,8 @@ struct FidState {
     /// Host-side path this FID refers to. After a successful walk, this
     /// is the fully canonicalized (symlinks resolved) path.
     path: PathBuf,
+    /// Unresolved final symlink path from the last successful walk, if any.
+    readlink_path: Option<PathBuf>,
     /// Open host file handle, if opened via `Tlopen` or `Tlcreate`.
     file: Option<fs::File>,
     /// If the file was ELF-patched, the full rewritten content.
@@ -203,9 +205,6 @@ impl Server {
                 OwnedRequest::Remove { .. } => "remove",
                 OwnedRequest::Flush => "flush",
                 OwnedRequest::Readlink { .. } => "readlink",
-                OwnedRequest::Statpath { .. } => "statpath",
-                OwnedRequest::Openpath { .. } => "openpath",
-                OwnedRequest::Readlinkpath { .. } => "readlinkpath",
                 OwnedRequest::Unknown => "unknown",
             };
             *op_counts.entry(op_name).or_insert(0) += 1;
@@ -287,18 +286,6 @@ impl Server {
             OwnedRequest::Remove { fid } => self.handle_remove(fcall::Tremove { fid }),
             OwnedRequest::Flush => Fcall::Rflush(fcall::Rflush {}),
             OwnedRequest::Readlink { fid } => self.handle_readlink(fid),
-            OwnedRequest::Statpath {
-                fid,
-                req_mask,
-                wnames,
-            } => self.handle_statpath(fid, req_mask, wnames),
-            OwnedRequest::Openpath {
-                fid,
-                new_fid,
-                flags,
-                wnames,
-            } => self.handle_openpath(fid, new_fid, flags, wnames),
-            OwnedRequest::Readlinkpath { fid, wnames } => self.handle_readlinkpath(fid, wnames),
             OwnedRequest::Unknown => error_response(libc::ENOSYS as u32),
         }
     }
@@ -351,6 +338,7 @@ impl Server {
             fid,
             FidState {
                 path,
+                readlink_path: None,
                 file: None,
                 patched_data: None,
                 patched_offset: 0,
@@ -382,16 +370,19 @@ impl Server {
 
         let mut current_path = src_fid.path.clone();
         let mut wqids = Vec::new();
+        let mut readlink_path = None;
 
         // Empty walk = clone the fid
         if wnames.is_empty() {
             let qid = src_fid.qid;
             let is_canonical = src_fid.is_canonical;
+            let readlink_path = src_fid.readlink_path.clone();
             if fid != new_fid {
                 self.fids.insert(
                     new_fid,
                     FidState {
                         path: current_path,
+                        readlink_path,
                         file: None,
                         patched_data: None,
                         patched_offset: 0,
@@ -432,6 +423,14 @@ impl Server {
                 current_path.join(component)
             };
 
+            let is_final = wqids.len() + 1 == wnames.len();
+            if is_final
+                && let Ok(meta) = fs::symlink_metadata(&next)
+                && meta.file_type().is_symlink()
+            {
+                readlink_path = Some(next.clone());
+            }
+
             // Canonicalize to follow symlinks. This resolves the real path
             // so subsequent walk steps work correctly even through symlinks.
             let resolved = match fs::canonicalize(&next) {
@@ -467,6 +466,7 @@ impl Server {
                 // In-place update
                 if let Some(state) = self.fids.get_mut(&fid) {
                     state.path = current_path;
+                    state.readlink_path = readlink_path;
                     state.qid = qid;
                     state.file = None;
                     state.patched_data = None;
@@ -478,6 +478,7 @@ impl Server {
                     new_fid,
                     FidState {
                         path: current_path,
+                        readlink_path,
                         file: None,
                         patched_data: None,
                         patched_offset: 0,
@@ -558,6 +559,7 @@ impl Server {
                 state.patched_offset = 0;
                 state.qid = qid;
                 state.is_open = true;
+                state.readlink_path = None;
 
                 Fcall::Rlopen(fcall::Rlopen {
                     qid,
@@ -646,6 +648,7 @@ impl Server {
                 state.qid = qid;
                 state.is_open = true;
                 state.is_canonical = false;
+                state.readlink_path = None;
 
                 Fcall::Rlcreate(fcall::Rlcreate {
                     qid,
@@ -773,120 +776,6 @@ impl Server {
         }
 
         Ok(current_path)
-    }
-
-    /// Combined walk + getattr + (implicit) clunk in one RPC.
-    /// Walks the path components from `fid`, stats the target, and returns
-    /// both the qid and attributes without allocating a client-visible fid.
-    fn handle_statpath<'a>(
-        &self,
-        fid: u32,
-        req_mask: fcall::GetattrMask,
-        wnames: Vec<Vec<u8>>,
-    ) -> Fcall<'a> {
-        let current_path = match self.walk_path_components(fid, &wnames, true) {
-            Ok(p) => p,
-            Err(errno) => return error_response(errno),
-        };
-
-        // Get attributes on the final path.
-        let meta = match fs::symlink_metadata(&current_path) {
-            Ok(m) => m,
-            Err(e) => return io_error_response(e),
-        };
-
-        let qid = metadata_to_qid(&meta);
-
-        Fcall::Rstatpath(fcall::Rstatpath {
-            valid: req_mask,
-            qid,
-            stat: fcall::Stat {
-                mode: meta.mode(),
-                uid: meta.uid(),
-                gid: meta.gid(),
-                nlink: meta.nlink(),
-                rdev: meta.rdev(),
-                size: meta.len(),
-                blksize: meta.blksize(),
-                blocks: meta.blocks(),
-                atime: new_time(meta.atime() as u64, meta.atime_nsec() as u64),
-                mtime: new_time(meta.mtime() as u64, meta.mtime_nsec() as u64),
-                ctime: new_time(meta.ctime() as u64, meta.ctime_nsec() as u64),
-                btime: fcall::Time::default(),
-                generation: 0,
-                data_version: 0,
-            },
-        })
-    }
-
-    /// Combined walk + lopen in one RPC.
-    /// Walks the path components from `fid`, opens the target, and assigns
-    /// the opened file to `new_fid`.
-    fn handle_openpath<'a>(
-        &mut self,
-        fid: u32,
-        new_fid: u32,
-        flags: fcall::LOpenFlags,
-        wnames: Vec<Vec<u8>>,
-    ) -> Fcall<'a> {
-        if self.fids.contains_key(&new_fid) && fid != new_fid {
-            return error_response(libc::EEXIST as u32);
-        }
-        if self.fids.len() >= MAX_FIDS && !self.fids.contains_key(&new_fid) {
-            return error_response(libc::ENOMEM as u32);
-        }
-
-        let current_path = match self.walk_path_components(fid, &wnames, true) {
-            Ok(p) => p,
-            Err(errno) => return error_response(errno),
-        };
-
-        // Policy checks (same as handle_lopen).
-        if self.policy.check(Action::Open, Some(&current_path)) == Decision::Deny {
-            return error_response(libc::EPERM as u32);
-        }
-        let is_write = flags.intersects(
-            fcall::LOpenFlags::O_WRONLY | fcall::LOpenFlags::O_RDWR | fcall::LOpenFlags::O_TRUNC,
-        );
-        if is_write && self.policy.check(Action::Write, Some(&current_path)) == Decision::Deny {
-            return error_response(libc::EPERM as u32);
-        }
-
-        let mut opts = fs::OpenOptions::new();
-        configure_open_options(&mut opts, flags);
-
-        match opts.open(&current_path) {
-            Ok(mut file) => {
-                let meta = match file.metadata() {
-                    Ok(m) => m,
-                    Err(e) => return io_error_response(e),
-                };
-                let qid = metadata_to_qid(&meta);
-
-                let is_read_only =
-                    !flags.intersects(fcall::LOpenFlags::O_WRONLY | fcall::LOpenFlags::O_RDWR);
-                let patched = self.try_patch_elf(&mut file, &current_path, is_read_only);
-
-                self.fids.insert(
-                    new_fid,
-                    FidState {
-                        path: current_path,
-                        file: Some(file),
-                        patched_data: patched,
-                        patched_offset: 0,
-                        qid,
-                        is_open: true,
-                        is_canonical: true,
-                    },
-                );
-
-                Fcall::Ropenpath(fcall::Ropenpath {
-                    qid,
-                    iounit: self.msize - fcall::IOHDRSZ,
-                })
-            }
-            Err(e) => io_error_response(e),
-        }
     }
 
     fn handle_getattr<'a>(&mut self, req: fcall::Tgetattr) -> Fcall<'a> {
@@ -1360,26 +1249,9 @@ impl Server {
             None => return error_response(libc::EBADF as u32),
         };
 
-        match fs::read_link(&state.path) {
+        let readlink_path = state.readlink_path.as_deref().unwrap_or(&state.path);
+        match fs::read_link(readlink_path) {
             Ok(target) => Fcall::Rreadlink(fcall::Rreadlink {
-                target: Cow::Owned(target.as_os_str().as_encoded_bytes().to_vec()),
-            }),
-            Err(e) => io_error_response(e),
-        }
-    }
-
-    /// Combined walk + readlink in one RPC.
-    /// Walks the path components from `fid` and reads the symlink target
-    /// of the final path without creating a client-visible fid.
-    fn handle_readlinkpath<'a>(&self, fid: u32, wnames: Vec<Vec<u8>>) -> Fcall<'a> {
-        // Don't follow the final symlink — we want to read it, not its target.
-        let current_path = match self.walk_path_components(fid, &wnames, false) {
-            Ok(p) => p,
-            Err(errno) => return error_response(errno),
-        };
-
-        match fs::read_link(&current_path) {
-            Ok(target) => Fcall::Rreadlinkpath(fcall::Rreadlinkpath {
                 target: Cow::Owned(target.as_os_str().as_encoded_bytes().to_vec()),
             }),
             Err(e) => io_error_response(e),
@@ -1558,21 +1430,6 @@ enum OwnedRequest {
     Readlink {
         fid: u32,
     },
-    Statpath {
-        fid: u32,
-        req_mask: fcall::GetattrMask,
-        wnames: Vec<Vec<u8>>,
-    },
-    Openpath {
-        fid: u32,
-        new_fid: u32,
-        flags: fcall::LOpenFlags,
-        wnames: Vec<Vec<u8>>,
-    },
-    Readlinkpath {
-        fid: u32,
-        wnames: Vec<Vec<u8>>,
-    },
     Unknown,
 }
 
@@ -1659,21 +1516,6 @@ impl OwnedRequest {
             Fcall::Tremove(r) => OwnedRequest::Remove { fid: r.fid },
             Fcall::Tflush(_) => OwnedRequest::Flush,
             Fcall::Treadlink(r) => OwnedRequest::Readlink { fid: r.fid },
-            Fcall::Tstatpath(r) => OwnedRequest::Statpath {
-                fid: r.fid,
-                req_mask: r.req_mask,
-                wnames: r.wnames.into_iter().map(|w| w.into_owned()).collect(),
-            },
-            Fcall::Topenpath(r) => OwnedRequest::Openpath {
-                fid: r.fid,
-                new_fid: r.new_fid,
-                flags: r.flags,
-                wnames: r.wnames.into_iter().map(|w| w.into_owned()).collect(),
-            },
-            Fcall::Treadlinkpath(r) => OwnedRequest::Readlinkpath {
-                fid: r.fid,
-                wnames: r.wnames.into_iter().map(|w| w.into_owned()).collect(),
-            },
             _ => OwnedRequest::Unknown,
         }
     }

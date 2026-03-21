@@ -323,34 +323,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         )
     }
 
-    /// Walk to a path relative to `fid` and open it in one RPC.
-    /// The server assigns `new_fid` to the opened file.
-    pub(super) fn openpath<S: AsRef<[u8]>>(
-        &self,
-        fid: fcall::Fid,
-        new_fid: fcall::Fid,
-        flags: fcall::LOpenFlags,
-        wnames: &[S],
-    ) -> Result<fcall::Qid, Error> {
-        let wnames: Vec<fcall::FcallStr<'_>> = wnames
-            .iter()
-            .map(|s| fcall::FcallStr::Borrowed(s.as_ref()))
-            .collect();
-        self.fcall(
-            Fcall::Topenpath(fcall::Topenpath {
-                fid,
-                new_fid,
-                flags,
-                wnames,
-            }),
-            |response| match response {
-                Fcall::Ropenpath(fcall::Ropenpath { qid, .. }) => Ok(qid),
-                Fcall::Rlerror(e) => Err(Error::from(e)),
-                _ => Err(Error::InvalidResponse),
-            },
-        )
-    }
-
     /// Create a file with the given name and flags.
     ///
     /// The input dfid initially represents the parent directory of the new file.
@@ -431,32 +403,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             Fcall::Tgetattr(fcall::Tgetattr { fid, req_mask }),
             |response| match response {
                 Fcall::Rgetattr(r) => Ok(r),
-                Fcall::Rlerror(e) => Err(Error::from(e)),
-                _ => Err(Error::InvalidResponse),
-            },
-        )
-    }
-
-    /// Walk to a path relative to `fid`, get attributes, and clunk the
-    /// walked fid — all in one RPC. Returns the same data as Rgetattr.
-    pub(super) fn statpath<S: AsRef<[u8]>>(
-        &self,
-        fid: fcall::Fid,
-        req_mask: GetattrMask,
-        wnames: &[S],
-    ) -> Result<fcall::Rstatpath, Error> {
-        let wnames: Vec<fcall::FcallStr<'_>> = wnames
-            .iter()
-            .map(|s| fcall::FcallStr::Borrowed(s.as_ref()))
-            .collect();
-        self.fcall(
-            Fcall::Tstatpath(fcall::Tstatpath {
-                fid,
-                req_mask,
-                wnames,
-            }),
-            |response| match response {
-                Fcall::Rstatpath(r) => Ok(r),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },
@@ -672,28 +618,12 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         self.fids.free(fid);
     }
 
-    /// Allocate a new fid number from the pool without issuing any RPCs.
-    /// The caller is responsible for using the fid in a subsequent RPC
-    /// (e.g., openpath) and calling `free_fid` if the RPC fails.
-    pub(super) fn alloc_fid(&self) -> Result<fcall::Fid, Error> {
-        self.fids.next()
-    }
-
-    /// Walk to a path relative to `fid` and read its symlink target
-    /// in one RPC. No client-visible fid is created.
-    pub(super) fn readlinkpath<S: AsRef<[u8]>>(
-        &self,
-        fid: fcall::Fid,
-        wnames: &[S],
-    ) -> Result<alloc::vec::Vec<u8>, Error> {
-        let wnames: Vec<fcall::FcallStr<'_>> = wnames
-            .iter()
-            .map(|s| fcall::FcallStr::Borrowed(s.as_ref()))
-            .collect();
+    /// Read the target of a symlink identified by `fid`.
+    pub(super) fn readlink(&self, fid: fcall::Fid) -> Result<alloc::vec::Vec<u8>, Error> {
         self.fcall(
-            Fcall::Treadlinkpath(fcall::Treadlinkpath { fid, wnames }),
+            Fcall::Treadlink(fcall::Treadlink { fid }),
             |response| match response {
-                Fcall::Rreadlinkpath(r) => Ok(r.target.into_owned()),
+                Fcall::Rreadlink(r) => Ok(r.target.into_owned()),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },
