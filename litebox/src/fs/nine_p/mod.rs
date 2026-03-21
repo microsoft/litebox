@@ -30,6 +30,7 @@ use crate::log_println;
 
 mod client;
 mod fcall;
+mod pending_table;
 
 pub mod transport;
 
