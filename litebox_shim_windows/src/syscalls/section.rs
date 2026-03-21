@@ -148,22 +148,19 @@ pub(crate) fn nt_create_section(
     NtStatus::STATUS_SUCCESS
 }
 
-/// Read the full PE data from a file handle (VFS, MemoryFile, or host File).
+/// Read the full PE data from a file handle (VFS-backed).
 fn read_pe_from_handle(
     handles: &HandleTable,
     file_handle: u32,
     shared: &crate::NtSharedState,
 ) -> Option<Vec<u8>> {
     match handles.get(file_handle)? {
-        NtObject::MemoryFile { data, .. } => Some((**data).clone()),
-        NtObject::File {
-            raw_fd: Some(fd), ..
-        } => {
+        NtObject::File { raw_fd, .. } => {
             // Read from VFS.
             let fs = shared.fs.get()?;
             let typed_fd = {
-                let rds = shared.raw_fds.lock().unwrap();
-                rds.fd_from_raw_integer::<crate::NtFS>(*fd).ok()?
+                let rds = shared.raw_fds.lock();
+                rds.fd_from_raw_integer::<crate::NtFS>(*raw_fd).ok()?
             };
             // Get file size via fd_file_status, then read the entire file.
             use litebox::fs::FileSystem as _;
@@ -177,69 +174,7 @@ fn read_pe_from_handle(
             buf.truncate(bytes_read);
             Some(buf)
         }
-        NtObject::File { host_handle, .. } => {
-            // Read the entire file from the host.
-            read_entire_host_file(*host_handle)
-        }
         _ => None,
-    }
-}
-
-/// Read an entire file from a host Windows HANDLE.
-#[cfg(target_os = "windows")]
-fn read_entire_host_file(host_handle: usize) -> Option<Vec<u8>> {
-    unsafe extern "system" {
-        fn GetFileSizeEx(h: usize, size: *mut i64) -> i32;
-        fn SetFilePointerEx(h: usize, pos: i64, new_pos: *mut i64, method: u32) -> i32;
-        fn ReadFile(
-            h: usize,
-            buf: *mut u8,
-            len: u32,
-            bytes_read: *mut u32,
-            overlapped: usize,
-        ) -> i32;
-    }
-
-    let mut file_size: i64 = 0;
-    if unsafe { GetFileSizeEx(host_handle, &mut file_size) } == 0 {
-        return None;
-    }
-    if file_size <= 0 || file_size > 256 * 1024 * 1024 {
-        // Sanity check: DLLs shouldn't be > 256MB.
-        return None;
-    }
-
-    // Seek to beginning.
-    unsafe {
-        SetFilePointerEx(host_handle, 0, core::ptr::null_mut(), 0);
-    }
-
-    let mut buf = alloc::vec![0u8; file_size as usize];
-    let mut total_read = 0usize;
-    while total_read < buf.len() {
-        let mut bytes_read: u32 = 0;
-        let to_read = (buf.len() - total_read).min(u32::MAX as usize) as u32;
-        let ok = unsafe {
-            ReadFile(
-                host_handle,
-                buf[total_read..].as_mut_ptr(),
-                to_read,
-                &mut bytes_read,
-                0,
-            )
-        };
-        if ok == 0 || bytes_read == 0 {
-            break;
-        }
-        total_read += bytes_read as usize;
-    }
-
-    if total_read == buf.len() {
-        Some(buf)
-    } else {
-        // Partial read ΓÇö return what we got (PE parser will validate).
-        buf.truncate(total_read);
-        Some(buf)
     }
 }
 

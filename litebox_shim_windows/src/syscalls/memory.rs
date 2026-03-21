@@ -663,7 +663,7 @@ pub(crate) fn nt_query_virtual_memory(
         }
         // Check dynamically loaded images (SEC_IMAGE via NtMapViewOfSection).
         {
-            let img_mappings = ps.image_mappings.lock().unwrap();
+            let img_mappings = ps.image_mappings.lock();
             if let Some((&base, &size)) = img_mappings
                 .range(..=query_addr)
                 .next_back()
@@ -782,7 +782,7 @@ pub(crate) fn nt_query_virtual_memory(
     // correct the allocation base to the image base.
     let mem_type = if state == mem_state::MEM_COMMIT {
         // Check SEC_IMAGE mappings (dynamically loaded via NtMapViewOfSection).
-        let img_mappings = ps.image_mappings.lock().unwrap();
+        let img_mappings = ps.image_mappings.lock();
         let dyn_img = img_mappings
             .range(..=aligned_addr)
             .next_back()

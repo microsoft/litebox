@@ -14,7 +14,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use std::sync::{Condvar, Mutex};
+use spin::Mutex;
 
 /// The first allocatable handle value. Windows handles start at 4.
 const FIRST_HANDLE: u32 = 4;
@@ -40,18 +40,15 @@ pub enum NtObject {
     File {
         /// Guest-visible NT path.
         path: String,
-        /// Host file handle (Windows HANDLE as usize). 0 = invalid/VFS-only.
-        host_handle: usize,
         /// Shared file position (byte offset). Cloned on DuplicateHandle so
         /// both handles track the same underlying file pointer.
         position: SharedFilePosition,
-        /// VFS raw fd index into `RawDescriptorStorage`. `None` for legacy
-        /// host-only handles; `Some(idx)` for VFS-backed files.
-        raw_fd: Option<usize>,
+        /// VFS raw fd index into `RawDescriptorStorage`.
+        raw_fd: usize,
         /// Reference count for VFS fd. Multiple NT handles may share one VFS
         /// fd (via DuplicateHandle). Only the last close actually closes the
-        /// VFS fd. `None` for host-only handles.
-        vfs_refcount: Option<Arc<core::sync::atomic::AtomicUsize>>,
+        /// VFS fd.
+        vfs_refcount: Arc<core::sync::atomic::AtomicUsize>,
     },
     /// A directory opened via NtCreateFile.
     Directory {
@@ -90,15 +87,6 @@ pub enum NtObject {
         /// Key into `NtSharedState::sockets`.
         sock_id: u32,
     },
-    /// An in-memory file (e.g., a DLL served from the tar archive).
-    MemoryFile {
-        /// Guest-visible NT path.
-        path: String,
-        /// File content bytes.
-        data: Arc<Vec<u8>>,
-        /// Current read position.
-        position: Arc<core::sync::atomic::AtomicU64>,
-    },
     /// An NT section object (NtCreateSection).
     Section {
         /// The raw PE data (for SEC_IMAGE sections).
@@ -133,8 +121,6 @@ pub enum NtObject {
 pub struct EventObject {
     /// Mutex-protected signaled state.
     pub state: Mutex<bool>,
-    /// Condvar for waiters to block on.
-    pub condvar: Condvar,
     /// True = manual-reset, false = auto-reset.
     pub manual_reset: bool,
 }
@@ -144,7 +130,6 @@ impl EventObject {
     pub fn new(manual_reset: bool, initial_state: bool) -> Self {
         Self {
             state: Mutex::new(initial_state),
-            condvar: Condvar::new(),
             manual_reset,
         }
     }
@@ -152,15 +137,13 @@ impl EventObject {
 
 /// Internal state for an NT thread object.
 ///
-/// Tracks thread exit status and provides a condvar for WaitForSingleObject
+/// Tracks thread exit status; waiters use spin-polling for WaitForSingleObject
 /// on thread handles.
 #[derive(Debug)]
 pub struct ThreadObject {
     /// Thread exit code, set when the thread terminates.
     /// None = still running, Some(code) = exited.
     pub exit_status: Mutex<Option<i32>>,
-    /// Condvar signaled when the thread exits.
-    pub condvar: Condvar,
     /// Pseudo thread ID for GetCurrentThreadId / OwningThread in CRITICAL_SECTION.
     pub thread_id: u32,
 }
@@ -170,20 +153,18 @@ impl ThreadObject {
     pub fn new(thread_id: u32) -> Self {
         Self {
             exit_status: Mutex::new(None),
-            condvar: Condvar::new(),
             thread_id,
         }
     }
 
     /// Mark the thread as exited with the given exit code.
     pub fn set_exited(&self, code: i32) {
-        *self.exit_status.lock().unwrap() = Some(code);
-        self.condvar.notify_all();
+        *self.exit_status.lock() = Some(code);
     }
 
     /// Returns true if the thread has exited.
     pub fn has_exited(&self) -> bool {
-        self.exit_status.lock().unwrap().is_some()
+        self.exit_status.lock().is_some()
     }
 }
 
@@ -192,8 +173,6 @@ impl ThreadObject {
 pub struct SemaphoreObject {
     /// Mutex-protected current count.
     pub state: Mutex<i32>,
-    /// Condvar for waiters to block on.
-    pub condvar: Condvar,
     /// Maximum count.
     pub max_count: i32,
 }
@@ -203,7 +182,6 @@ impl SemaphoreObject {
     pub fn new(initial_count: i32, max_count: i32) -> Self {
         Self {
             state: Mutex::new(initial_count),
-            condvar: Condvar::new(),
             max_count,
         }
     }
@@ -219,8 +197,6 @@ impl SemaphoreObject {
 pub struct KeyedEventObject {
     /// Per-key queue state with per-caller release tokens for 1:1 matching.
     pub state: Mutex<BTreeMap<usize, KeyedWaiterQueue>>,
-    /// Condvar shared by all waiters/releasers on this keyed event object.
-    pub condvar: Condvar,
     /// Monotonic counter for unique release token IDs.
     next_release_id: Mutex<u64>,
 }
@@ -265,14 +241,13 @@ impl KeyedEventObject {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(BTreeMap::new()),
-            condvar: Condvar::new(),
             next_release_id: Mutex::new(0),
         }
     }
 
     /// Allocate a unique release token ID.
     pub fn alloc_release_id(&self) -> u64 {
-        let mut id = self.next_release_id.lock().unwrap();
+        let mut id = self.next_release_id.lock();
         let val = *id;
         *id = val.wrapping_add(1);
         val
@@ -341,19 +316,8 @@ impl HandleTable {
     }
 
     /// Close a handle, returning the object if it existed.
-    ///
-    /// For File objects with host handles, the caller is responsible for
-    /// closing the host handle (via `close_host_handle`).
     pub fn close(&mut self, handle: u32) -> Option<NtObject> {
-        let obj = self.objects.remove(&handle);
-        // If this is a File with a host handle, close it.
-        if let Some(NtObject::File { host_handle, .. }) = &obj
-            && *host_handle != 0
-            && *host_handle != usize::MAX
-        {
-            close_host_handle(*host_handle);
-        }
-        obj
+        self.objects.remove(&handle)
     }
 
     /// Returns true if the handle exists in the table.
@@ -362,10 +326,9 @@ impl HandleTable {
     }
 
     /// Duplicate a handle, creating a new handle table entry pointing to
-    /// the same underlying object. For File objects, a new host handle is
-    /// obtained via DuplicateHandle and the position `Arc` is cloned so both
-    /// handles share the same file pointer state. Returns the new handle,
-    /// or `None` if the source handle doesn't exist or duplication fails.
+    /// the same underlying object. For VFS File objects, the `Arc` position
+    /// and refcount are shared so both handles see the same file state.
+    /// Returns the new handle, or `None` if the source doesn't exist.
     pub fn duplicate(&mut self, source: u32) -> Option<u32> {
         let obj = self.objects.get(&source)?;
         let new_obj = match obj {
@@ -375,35 +338,17 @@ impl HandleTable {
             },
             NtObject::File {
                 path,
-                host_handle,
                 position,
                 raw_fd,
                 vfs_refcount,
             } => {
-                if raw_fd.is_some() {
-                    // VFS-backed file: share the same raw_fd and bump refcount.
-                    if let Some(rc) = vfs_refcount {
-                        rc.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    }
-                    NtObject::File {
-                        path: path.clone(),
-                        host_handle: 0,
-                        position: Arc::clone(position),
-                        raw_fd: *raw_fd,
-                        vfs_refcount: vfs_refcount.clone(),
-                    }
-                } else {
-                    let new_host = duplicate_host_handle(*host_handle);
-                    if new_host == 0 || new_host == usize::MAX {
-                        return None;
-                    }
-                    NtObject::File {
-                        path: path.clone(),
-                        host_handle: new_host,
-                        position: Arc::clone(position),
-                        raw_fd: None,
-                        vfs_refcount: None,
-                    }
+                // VFS-backed file: share the same raw_fd and bump refcount.
+                vfs_refcount.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                NtObject::File {
+                    path: path.clone(),
+                    position: Arc::clone(position),
+                    raw_fd: *raw_fd,
+                    vfs_refcount: Arc::clone(vfs_refcount),
                 }
             }
             NtObject::Directory { path, .. } => NtObject::Directory {
@@ -421,17 +366,6 @@ impl HandleTable {
             NtObject::KeyedEvent(k) => NtObject::KeyedEvent(Arc::clone(k)),
             NtObject::Thread(t) => NtObject::Thread(Arc::clone(t)),
             NtObject::Socket { sock_id } => NtObject::Socket { sock_id: *sock_id },
-            NtObject::MemoryFile {
-                path,
-                data,
-                position,
-            } => NtObject::MemoryFile {
-                path: path.clone(),
-                data: Arc::clone(data),
-                position: Arc::new(core::sync::atomic::AtomicU64::new(
-                    position.load(core::sync::atomic::Ordering::Relaxed),
-                )),
-            },
             NtObject::Section {
                 pe_data,
                 image_size,
@@ -467,48 +401,6 @@ impl Default for HandleTable {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Close a Windows host file handle.
-#[cfg(target_os = "windows")]
-fn close_host_handle(handle: usize) {
-    unsafe extern "system" {
-        fn CloseHandle(handle: usize) -> i32;
-    }
-    unsafe {
-        CloseHandle(handle);
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn close_host_handle(_handle: usize) {}
-
-/// Duplicate a Windows host file handle via DuplicateHandle.
-#[cfg(target_os = "windows")]
-fn duplicate_host_handle(handle: usize) -> usize {
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> usize;
-        fn DuplicateHandle(
-            source_process: usize,
-            source_handle: usize,
-            target_process: usize,
-            target_handle: *mut usize,
-            desired_access: u32,
-            inherit: i32,
-            options: u32,
-        ) -> i32;
-    }
-
-    let mut new_handle: usize = 0;
-    let current = unsafe { GetCurrentProcess() };
-    // DUPLICATE_SAME_ACCESS = 0x2
-    let ok = unsafe { DuplicateHandle(current, handle, current, &raw mut new_handle, 0, 0, 0x2) };
-    if ok != 0 { new_handle } else { 0 }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn duplicate_host_handle(_handle: usize) -> usize {
-    0
 }
 
 #[cfg(test)]

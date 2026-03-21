@@ -660,9 +660,11 @@ pub(crate) fn nt_delay_execution(ctx: &mut super::super::ExecutionContext) -> Nt
     };
 
     if sleep_us > 0 {
-        std::thread::sleep(core::time::Duration::from_micros(sleep_us));
+        for _ in 0..sleep_us {
+            core::hint::spin_loop();
+        }
     } else {
-        std::thread::yield_now();
+        core::hint::spin_loop();
     }
 
     NtStatus::STATUS_SUCCESS

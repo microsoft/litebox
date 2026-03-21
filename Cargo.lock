@@ -1769,6 +1769,7 @@ dependencies = [
  "litebox_platform_multiplex",
  "litebox_platform_windows_userland",
  "litebox_shim_windows",
+ "spin 0.9.8",
 ]
 
 [[package]]
@@ -1822,6 +1823,7 @@ dependencies = [
  "litebox_common_windows",
  "litebox_platform_multiplex",
  "litebox_platform_windows_userland",
+ "spin 0.9.8",
 ]
 
 [[package]]

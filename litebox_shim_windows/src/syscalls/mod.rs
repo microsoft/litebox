@@ -76,23 +76,19 @@ pub(crate) fn nt_close(
 /// fd when the last reference is released.
 pub(crate) fn close_vfs_fd(obj: &NtObject, shared: &crate::NtSharedState) {
     if let NtObject::File {
-        raw_fd: Some(fd),
+        raw_fd,
         vfs_refcount,
         ..
     } = obj
     {
-        // If there is a refcount, only close when it reaches zero.
-        if let Some(rc) = vfs_refcount {
-            let prev = rc.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
-            if prev > 1 {
-                // Other handles still reference this VFS fd.
-                return;
-            }
+        let prev = vfs_refcount.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+        if prev > 1 {
+            // Other handles still reference this VFS fd.
+            return;
         }
-        // Last reference (or no refcount) — close the fd on the filesystem
-        // and remove it from RDS.
-        let mut rds = shared.raw_fds.lock().unwrap();
-        if let Ok(typed_fd) = rds.fd_consume_raw_integer::<crate::NtFS>(*fd)
+        // Last reference — close the fd on the filesystem and remove it from RDS.
+        let mut rds = shared.raw_fds.lock();
+        if let Ok(typed_fd) = rds.fd_consume_raw_integer::<crate::NtFS>(*raw_fd)
             && let Some(fs) = shared.fs.get()
         {
             use litebox::fs::FileSystem as _;

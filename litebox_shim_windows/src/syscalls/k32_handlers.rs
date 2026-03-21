@@ -836,7 +836,7 @@ pub(crate) fn k32_get_environment_strings_w(
     ctx: &mut super::super::ExecutionContext,
     env_vars: &alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
     ps: &super::super::NtProcessState,
-    pool: &std::sync::Mutex<alloc::vec::Vec<(usize, usize, bool)>>,
+    pool: &spin::Mutex<alloc::vec::Vec<(usize, usize, bool)>>,
 ) -> NtStatus {
     use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
     use litebox::platform::RawConstPointer as _;
@@ -855,7 +855,7 @@ pub(crate) fn k32_get_environment_strings_w(
     let aligned_size = (byte_len + 4095) & !4095;
 
     // Search the pool for a free block large enough to reuse.
-    let mut pool_ref = pool.lock().unwrap();
+    let mut pool_ref = pool.lock();
     if let Some(idx) = pool_ref
         .iter()
         .position(|(_, sz, in_use)| !in_use && byte_len <= *sz)
@@ -887,7 +887,7 @@ pub(crate) fn k32_get_environment_strings_w(
                         byte_len,
                     );
                 }
-                pool.lock().unwrap().push((va, aligned_size, true)); // in-use
+                pool.lock().push((va, aligned_size, true)); // in-use
                 ctx.regs.rax = va;
             }
             Err(_) => {
@@ -907,13 +907,13 @@ pub(crate) fn k32_get_environment_strings_w(
 pub(crate) fn k32_free_environment_strings_w(
     ctx: &mut super::super::ExecutionContext,
     _ps: &super::super::NtProcessState,
-    pool: &std::sync::Mutex<alloc::vec::Vec<(usize, usize, bool)>>,
+    pool: &spin::Mutex<alloc::vec::Vec<(usize, usize, bool)>>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let block_va = args.arg0;
 
     if block_va != 0 {
-        let mut pool_ref = pool.lock().unwrap();
+        let mut pool_ref = pool.lock();
         if let Some(entry) = pool_ref.iter_mut().find(|(va, _, _)| *va == block_va) {
             entry.2 = false; // mark as free
         }
@@ -1699,89 +1699,27 @@ pub(crate) fn k32_create_file_w(
             litebox::fs::Mode::RUSR | litebox::fs::Mode::WUSR,
         ) {
             let raw_fd = {
-                let mut rds = shared.raw_fds.lock().unwrap();
+                let mut rds = shared.raw_fds.lock();
                 rds.fd_into_raw_integer(typed_fd)
             };
             let nt_handle = handles.insert(crate::handle_table::NtObject::File {
                 path: resolved,
-                host_handle: 0,
                 position: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
-                raw_fd: Some(raw_fd),
-                vfs_refcount: Some(alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(
-                    1,
-                ))),
+                raw_fd,
+                vfs_refcount: alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(1)),
             });
             ctx.regs.rax = nt_handle as usize;
             return NtStatus::STATUS_SUCCESS;
         }
-        // VFS open failed — fall through to host.
-    }
-
-    // Host fallback.
-    let host_handle = super::file::host::open_file(
-        &resolved,
-        want_read || !want_write,
-        want_write,
-        creation_disposition,
-        share_mode,
-        flags_and_attributes,
-    );
-
-    if host_handle == super::file::host::INVALID_HANDLE {
-        let err = super::file::host::get_last_error();
-        set_guest_last_error(teb_va, err);
+        // VFS open failed — authoritative error, no host fallback.
+        set_guest_last_error(teb_va, 2); // ERROR_FILE_NOT_FOUND
         ctx.regs.rax = usize::MAX; // INVALID_HANDLE_VALUE
         return NtStatus::STATUS_SUCCESS;
     }
 
-    let nt_handle = handles.insert(crate::handle_table::NtObject::File {
-        path: resolved,
-        host_handle,
-        position: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
-        raw_fd: None,
-        vfs_refcount: None,
-    });
-
-    ctx.regs.rax = nt_handle as usize;
-    NtStatus::STATUS_SUCCESS
-}
-
-/// ReadFile for host file handles. Called after handle-table lock is dropped
-/// so that potentially blocking reads (UNC paths, pipes) don't stall the
-/// global handle table. Uses `fetch_add` for atomic position updates.
-pub(crate) fn k32_read_file_host(
-    ctx: &mut super::super::ExecutionContext,
-    host_handle: usize,
-    position: &alloc::sync::Arc<core::sync::atomic::AtomicU64>,
-    teb_va: usize,
-) -> NtStatus {
-    let args = NtSyscallArgs::from_ctx(ctx);
-    let buffer = args.arg1;
-    let bytes_to_read = args.arg2 as u32;
-    let bytes_read_ptr = args.arg3;
-
-    // Reserve the byte range atomically before I/O so concurrent readers
-    // on duplicated handles get non-overlapping offsets.
-    let start = position.fetch_add(bytes_to_read as u64, Relaxed);
-    let (ok, read) =
-        super::file::host::read_file_at(host_handle, buffer as *mut u8, bytes_to_read, start);
-    if ok {
-        // Correct the over-advance if we read fewer bytes than reserved.
-        let over = bytes_to_read as u64 - read as u64;
-        if over > 0 {
-            position.fetch_sub(over, Relaxed);
-        }
-        if bytes_read_ptr != 0 {
-            unsafe { core::ptr::write(bytes_read_ptr as *mut u32, read) }
-        }
-        ctx.regs.rax = 1;
-    } else {
-        // Undo entire reservation on failure.
-        position.fetch_sub(bytes_to_read as u64, Relaxed);
-        let err = super::file::host::get_last_error();
-        set_guest_last_error(teb_va, err);
-        ctx.regs.rax = 0;
-    }
+    // Path not VFS-translatable — no host fallback.
+    set_guest_last_error(teb_va, 2); // ERROR_FILE_NOT_FOUND
+    ctx.regs.rax = usize::MAX; // INVALID_HANDLE_VALUE
     NtStatus::STATUS_SUCCESS
 }
 
@@ -1791,7 +1729,7 @@ pub(crate) fn k32_read_file_host(
 pub(crate) fn k32_read_file_console(
     ctx: &mut super::super::ExecutionContext,
     teb_va: usize,
-    console_pending: &std::sync::Mutex<alloc::vec::Vec<u8>>,
+    console_pending: &spin::Mutex<alloc::vec::Vec<u8>>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let buffer = args.arg1;
@@ -1800,7 +1738,7 @@ pub(crate) fn k32_read_file_console(
 
     // Hold pending mutex for the entire operation to serialize with
     // ReadConsoleW on the same stdin stream.
-    let mut pending = console_pending.lock().unwrap();
+    let mut pending = console_pending.lock();
     let mut filled = 0u32;
 
     // Drain any bytes stashed by ReadConsoleW first.
@@ -1814,19 +1752,22 @@ pub(crate) fn k32_read_file_console(
     }
 
     if filled < bytes_to_read {
-        let remaining = bytes_to_read - filled;
-        let (ok, read) =
-            super::file::host::read_stdin((buffer + filled as usize) as *mut u8, remaining);
-        if ok {
-            filled += read;
-        } else if filled == 0 {
-            let err = super::file::host::get_last_error();
-            set_guest_last_error(teb_va, err);
-            if bytes_read_ptr != 0 {
-                unsafe { core::ptr::write(bytes_read_ptr as *mut u32, 0) }
+        let remaining = (bytes_to_read - filled) as usize;
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut((buffer + filled as usize) as *mut u8, remaining)
+        };
+        use litebox::platform::StdioProvider as _;
+        match litebox_platform_multiplex::platform().read_from_stdin(buf) {
+            Ok(n) => filled += n as u32,
+            Err(_) if filled == 0 => {
+                set_guest_last_error(teb_va, 109); // ERROR_BROKEN_PIPE
+                if bytes_read_ptr != 0 {
+                    unsafe { core::ptr::write(bytes_read_ptr as *mut u32, 0) }
+                }
+                ctx.regs.rax = 0;
+                return NtStatus::STATUS_SUCCESS;
             }
-            ctx.regs.rax = 0;
-            return NtStatus::STATUS_SUCCESS;
+            Err(_) => {} // partial data already in buffer — return what we have
         }
     }
 
@@ -1860,41 +1801,6 @@ pub(crate) fn k32_write_file_console(ctx: &mut super::super::ExecutionContext) -
     NtStatus::STATUS_SUCCESS
 }
 
-/// WriteFile for host file handles. Called after handle-table lock is dropped.
-pub(crate) fn k32_write_file_host(
-    ctx: &mut super::super::ExecutionContext,
-    host_handle: usize,
-    position: &alloc::sync::Arc<core::sync::atomic::AtomicU64>,
-    teb_va: usize,
-) -> NtStatus {
-    let args = NtSyscallArgs::from_ctx(ctx);
-    let buffer = args.arg1;
-    let bytes_to_write = args.arg2 as u32;
-    let bytes_written_ptr = args.arg3;
-
-    // Reserve the byte range atomically before I/O so concurrent writers
-    // on duplicated handles get non-overlapping offsets.
-    let start = position.fetch_add(bytes_to_write as u64, Relaxed);
-    let (ok, written) =
-        super::file::host::write_file_at(host_handle, buffer as *const u8, bytes_to_write, start);
-    if ok {
-        let over = bytes_to_write as u64 - written as u64;
-        if over > 0 {
-            position.fetch_sub(over, Relaxed);
-        }
-        if bytes_written_ptr != 0 {
-            unsafe { core::ptr::write(bytes_written_ptr as *mut u32, written) }
-        }
-        ctx.regs.rax = 1;
-    } else {
-        position.fetch_sub(bytes_to_write as u64, Relaxed);
-        let err = super::file::host::get_last_error();
-        set_guest_last_error(teb_va, err);
-        ctx.regs.rax = 0;
-    }
-    NtStatus::STATUS_SUCCESS
-}
-
 /// ReadFile for VFS-backed file handles. Called after handle-table lock is
 /// dropped. Uses the same Win32 argument convention as `k32_read_file_host`.
 pub(crate) fn k32_read_file_vfs(
@@ -1924,7 +1830,7 @@ pub(crate) fn k32_read_file_vfs(
     };
 
     let typed_fd = {
-        let rds = shared.raw_fds.lock().unwrap();
+        let rds = shared.raw_fds.lock();
         match rds.fd_from_raw_integer::<crate::NtFS>(raw_fd) {
             Ok(fd) => fd,
             Err(_) => {
@@ -1988,7 +1894,7 @@ pub(crate) fn k32_write_file_vfs(
     };
 
     let typed_fd = {
-        let rds = shared.raw_fds.lock().unwrap();
+        let rds = shared.raw_fds.lock();
         match rds.fd_from_raw_integer::<crate::NtFS>(raw_fd) {
             Ok(fd) => fd,
             Err(_) => {
@@ -2078,13 +1984,11 @@ pub(crate) fn k32_get_file_size_ex(
     let size_ptr = args.arg1;
 
     match handles.get(handle) {
-        Some(crate::handle_table::NtObject::File {
-            raw_fd: Some(fd), ..
-        }) => {
+        Some(crate::handle_table::NtObject::File { raw_fd, .. }) => {
             // VFS file — get size from fd_file_status.
             if let Some(fs) = shared.fs.get() {
-                let rds = shared.raw_fds.lock().unwrap();
-                if let Ok(typed_fd) = rds.fd_from_raw_integer::<crate::NtFS>(*fd) {
+                let rds = shared.raw_fds.lock();
+                if let Ok(typed_fd) = rds.fd_from_raw_integer::<crate::NtFS>(*raw_fd) {
                     use litebox::fs::FileSystem as _;
                     if let Ok(status) = fs.fd_file_status(&typed_fd) {
                         if size_ptr != 0 {
@@ -2097,16 +2001,6 @@ pub(crate) fn k32_get_file_size_ex(
             }
             set_guest_last_error(teb_va, 6);
             ctx.regs.rax = 0;
-        }
-        Some(crate::handle_table::NtObject::File { host_handle, .. }) => {
-            let size = super::file::host::get_file_size(*host_handle);
-            if size >= 0 && size_ptr != 0 {
-                unsafe { core::ptr::write(size_ptr as *mut i64, size) }
-                ctx.regs.rax = 1;
-            } else {
-                set_guest_last_error(teb_va, 6);
-                ctx.regs.rax = 0;
-            }
         }
         _ => {
             set_guest_last_error(teb_va, 6);
@@ -2131,9 +2025,7 @@ pub(crate) fn k32_set_file_pointer_ex(
 
     match handles.get(handle) {
         Some(crate::handle_table::NtObject::File {
-            raw_fd: Some(fd),
-            position,
-            ..
+            raw_fd, position, ..
         }) => {
             let new_pos: i64 = match move_method {
                 0 => distance,                                 // FILE_BEGIN
@@ -2142,8 +2034,8 @@ pub(crate) fn k32_set_file_pointer_ex(
                     // FILE_END — get file size from VFS.
                     let size = (|| -> Option<i64> {
                         let fs = shared.fs.get()?;
-                        let rds = shared.raw_fds.lock().unwrap();
-                        let typed_fd = rds.fd_from_raw_integer::<crate::NtFS>(*fd).ok()?;
+                        let rds = shared.raw_fds.lock();
+                        let typed_fd = rds.fd_from_raw_integer::<crate::NtFS>(*raw_fd).ok()?;
                         use litebox::fs::FileSystem as _;
                         let st = fs.fd_file_status(&typed_fd).ok()?;
                         Some(st.size as i64)
@@ -2175,41 +2067,6 @@ pub(crate) fn k32_set_file_pointer_ex(
                 ctx.regs.rax = 1;
             }
         }
-        Some(crate::handle_table::NtObject::File {
-            host_handle,
-            position,
-            ..
-        }) => {
-            let new_pos: i64 = match move_method {
-                0 => distance,                                 // FILE_BEGIN
-                1 => position.load(Relaxed) as i64 + distance, // FILE_CURRENT
-                2 => {
-                    let size = super::file::host::get_file_size(*host_handle);
-                    if size < 0 {
-                        set_guest_last_error(teb_va, super::file::host::get_last_error());
-                        ctx.regs.rax = 0;
-                        return NtStatus::STATUS_SUCCESS;
-                    }
-                    size + distance
-                }
-                _ => {
-                    set_guest_last_error(teb_va, 87);
-                    ctx.regs.rax = 0;
-                    return NtStatus::STATUS_SUCCESS;
-                }
-            };
-
-            if new_pos < 0 {
-                set_guest_last_error(teb_va, 131);
-                ctx.regs.rax = 0;
-            } else {
-                position.store(new_pos as u64, Relaxed);
-                if new_pos_ptr != 0 {
-                    unsafe { core::ptr::write(new_pos_ptr as *mut i64, new_pos) }
-                }
-                ctx.regs.rax = 1;
-            }
-        }
         _ => {
             set_guest_last_error(teb_va, 6);
             ctx.regs.rax = 0;
@@ -2232,16 +2089,14 @@ pub(crate) fn k32_set_end_of_file(
 
     match handles.get(handle) {
         Some(crate::handle_table::NtObject::File {
-            raw_fd: Some(fd),
-            position,
-            ..
+            raw_fd, position, ..
         }) => {
             // VFS truncate.
             let current_pos = position.load(Relaxed) as usize;
             let ok = (|| -> Option<()> {
                 let fs = shared.fs.get()?;
-                let rds = shared.raw_fds.lock().unwrap();
-                let typed_fd = rds.fd_from_raw_integer::<crate::NtFS>(*fd).ok()?;
+                let rds = shared.raw_fds.lock();
+                let typed_fd = rds.fd_from_raw_integer::<crate::NtFS>(*raw_fd).ok()?;
                 use litebox::fs::FileSystem as _;
                 fs.truncate(&typed_fd, current_pos, false).ok()
             })();
@@ -2249,21 +2104,6 @@ pub(crate) fn k32_set_end_of_file(
                 ctx.regs.rax = 1;
             } else {
                 set_guest_last_error(teb_va, 5); // ERROR_ACCESS_DENIED
-                ctx.regs.rax = 0;
-            }
-        }
-        Some(crate::handle_table::NtObject::File {
-            host_handle,
-            position,
-            ..
-        }) => {
-            let current_pos = position.load(Relaxed) as i64;
-            let result = super::file::host::set_end_of_file(*host_handle, current_pos);
-            if result {
-                ctx.regs.rax = 1;
-            } else {
-                let err = super::file::host::get_last_error();
-                set_guest_last_error(teb_va, err);
                 ctx.regs.rax = 0;
             }
         }
@@ -2325,7 +2165,7 @@ pub(crate) fn k32_read_console_w(
     ctx: &mut super::super::ExecutionContext,
     is_console_input: bool,
     teb_va: usize,
-    pending: &std::sync::Mutex<alloc::vec::Vec<u8>>,
+    pending: &spin::Mutex<alloc::vec::Vec<u8>>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let buffer_ptr = args.arg1;
@@ -2349,28 +2189,35 @@ pub(crate) fn k32_read_console_w(
     // Hold the pending mutex for the entire operation to prevent concurrent
     // readers from both seeing an empty buffer, both reading stdin, and then
     // one overwriting the other's leftover bytes.
-    let mut pending_guard = pending.lock().unwrap();
+    let mut pending_guard = pending.lock();
     let mut buf = core::mem::take(&mut *pending_guard);
 
     // If the carry-over buffer is empty, do an initial read from host stdin.
     if buf.is_empty() {
         let mut raw = alloc::vec![0u8; 4096];
-        let (ok, n) = super::file::host::read_stdin(raw.as_mut_ptr(), 4096);
-        if !ok || n == 0 {
-            if chars_read_ptr != 0 {
-                unsafe { core::ptr::write(chars_read_ptr as *mut u32, 0) }
+        use litebox::platform::StdioProvider as _;
+        match litebox_platform_multiplex::platform().read_from_stdin(&mut raw) {
+            Ok(n) if n > 0 => {
+                raw.truncate(n);
+                buf = raw;
             }
-            if ok {
-                ctx.regs.rax = 1; // EOF
-            } else {
-                let err = super::file::host::get_last_error();
-                set_guest_last_error(teb_va, err);
+            Ok(_) => {
+                // EOF
+                if chars_read_ptr != 0 {
+                    unsafe { core::ptr::write(chars_read_ptr as *mut u32, 0) }
+                }
+                ctx.regs.rax = 1;
+                return NtStatus::STATUS_SUCCESS;
+            }
+            Err(_) => {
+                set_guest_last_error(teb_va, 109); // ERROR_BROKEN_PIPE
+                if chars_read_ptr != 0 {
+                    unsafe { core::ptr::write(chars_read_ptr as *mut u32, 0) }
+                }
                 ctx.regs.rax = 0;
+                return NtStatus::STATUS_SUCCESS;
             }
-            return NtStatus::STATUS_SUCCESS;
         }
-        raw.truncate(n as usize);
-        buf = raw;
     }
 
     // Try to decode complete characters from what we have.
@@ -2388,9 +2235,11 @@ pub(crate) fn k32_read_console_w(
         // entirely of an incomplete UTF-8 sequence. Try one more read from
         // stdin to complete it.
         let mut raw = alloc::vec![0u8; 4096];
-        let (ok, n) = super::file::host::read_stdin(raw.as_mut_ptr(), 4096);
-        if ok && n > 0 {
-            buf.extend_from_slice(&raw[..n as usize]);
+        use litebox::platform::StdioProvider as _;
+        if let Ok(n) = litebox_platform_multiplex::platform().read_from_stdin(&mut raw)
+            && n > 0
+        {
+            buf.extend_from_slice(&raw[..n]);
         }
 
         // Retry decode after appending new bytes.
@@ -2987,10 +2836,8 @@ pub(crate) fn k32_set_current_directory_w(
             false
         }
     } else {
-        // Host fallback.
-        let attrs = super::file::host::get_file_attributes(&new_dir);
-        attrs != super::file::host::INVALID_FILE_ATTRIBUTES
-            && (attrs & super::file::host::FILE_ATTRIBUTE_DIRECTORY) != 0
+        // No VFS path — not found.
+        false
     };
 
     if !valid {
@@ -3259,7 +3106,7 @@ pub(crate) fn k32_find_first_file_ex_w(
     cwd: &str,
     shared: &crate::NtSharedState,
 ) -> NtStatus {
-    use crate::handle_table::{DirEnumEntry, NtObject};
+    use crate::handle_table::NtObject;
 
     let args = NtSyscallArgs::from_ctx(ctx);
     let filename_ptr = args.arg0;
@@ -3313,63 +3160,20 @@ pub(crate) fn k32_find_first_file_ex_w(
                 next_index: 1,
             });
             ctx.regs.rax = handle as usize;
-            return NtStatus::STATUS_SUCCESS;
+            NtStatus::STATUS_SUCCESS
         }
         Some(Err(win32_err)) => {
             set_guest_last_error(teb_va, win32_err);
             ctx.regs.rax = usize::MAX;
-            return NtStatus::STATUS_SUCCESS;
+            NtStatus::STATUS_SUCCESS
         }
         None => {
-            // Not VFS-translatable — fall through to host.
+            // Not VFS-translatable — no file found.
+            set_guest_last_error(teb_va, 2); // ERROR_FILE_NOT_FOUND
+            ctx.regs.rax = usize::MAX;
+            NtStatus::STATUS_SUCCESS
         }
     }
-
-    // ── Host fallback ───────────────────────────────────────────────
-    // Translate guest path to host path.
-    let host_pattern = if pattern.starts_with("\\??\\") || pattern.starts_with("\\DosDevices\\") {
-        match super::file::translate_nt_path_to_host(&pattern) {
-            Some(p) => p,
-            None => {
-                ctx.regs.rax = usize::MAX;
-                return NtStatus::STATUS_SUCCESS;
-            }
-        }
-    } else {
-        pattern
-    };
-
-    let entries = super::file::host::find_files(&host_pattern);
-    if entries.is_empty() {
-        set_guest_last_error(teb_va, 2); // ERROR_FILE_NOT_FOUND
-        ctx.regs.rax = usize::MAX;
-        return NtStatus::STATUS_SUCCESS;
-    }
-
-    // Write the first entry into the WIN32_FIND_DATAW buffer.
-    write_find_data(find_data_ptr, &entries[0]);
-
-    // Convert host entries to DirEnumEntry for the handle.
-    let dir_entries: alloc::vec::Vec<DirEnumEntry> = entries
-        .into_iter()
-        .map(|e| DirEnumEntry {
-            name: e.name,
-            attributes: e.attributes,
-            file_size: e.file_size,
-            creation_time: e.creation_time,
-            last_access_time: e.last_access_time,
-            last_write_time: e.last_write_time,
-        })
-        .collect();
-
-    // Store the search state in a handle. next_index=1 since we returned [0].
-    let handle = handles.insert(NtObject::FindSearch {
-        entries: dir_entries,
-        next_index: 1,
-    });
-
-    ctx.regs.rax = handle as usize;
-    NtStatus::STATUS_SUCCESS
 }
 
 /// FindNextFileW(hFindFile, lpFindFileData) -> BOOL
@@ -3422,7 +3226,7 @@ pub(crate) fn k32_find_close(
     NtStatus::STATUS_SUCCESS
 }
 
-/// Write a DirEnumEntry (or host::FindFileEntry) into a WIN32_FIND_DATAW
+/// Write a DirEnumEntry into a WIN32_FIND_DATAW
 /// structure at the given guest pointer.
 ///
 /// WIN32_FIND_DATAW layout (592 bytes total):
@@ -3468,7 +3272,7 @@ fn write_find_data<T: FindDataSource>(ptr: usize, entry: &T) {
     }
 }
 
-/// Trait to abstract over both host::FindFileEntry and DirEnumEntry.
+/// Trait to abstract over DirEnumEntry for find data output.
 trait FindDataSource {
     fn name(&self) -> &str;
     fn attributes(&self) -> u32;
@@ -3476,27 +3280,6 @@ trait FindDataSource {
     fn creation_time(&self) -> i64;
     fn last_access_time(&self) -> i64;
     fn last_write_time(&self) -> i64;
-}
-
-impl FindDataSource for super::file::host::FindFileEntry {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn attributes(&self) -> u32 {
-        self.attributes
-    }
-    fn file_size(&self) -> i64 {
-        self.file_size
-    }
-    fn creation_time(&self) -> i64 {
-        self.creation_time
-    }
-    fn last_access_time(&self) -> i64 {
-        self.last_access_time
-    }
-    fn last_write_time(&self) -> i64 {
-        self.last_write_time
-    }
 }
 
 impl FindDataSource for crate::handle_table::DirEnumEntry {
@@ -4170,14 +3953,16 @@ pub(crate) fn k32_sleep(ctx: &mut super::super::ExecutionContext) -> NtStatus {
     let ms = args.arg0 as u32;
 
     if ms == 0 {
-        std::thread::yield_now();
+        core::hint::spin_loop();
     } else if ms == 0xFFFF_FFFF {
         // INFINITE — sleep forever (shouldn't happen in practice).
         loop {
-            std::thread::sleep(core::time::Duration::from_secs(86400));
+            core::hint::spin_loop();
         }
     } else {
-        std::thread::sleep(core::time::Duration::from_millis(ms as u64));
+        for _ in 0..ms as u64 * 1000 {
+            core::hint::spin_loop();
+        }
     }
 
     NtStatus::STATUS_SUCCESS
@@ -4329,7 +4114,7 @@ pub(crate) fn k32_enter_critical_section(
                     owner.store(tid, Ordering::Release);
                     return NtStatus::STATUS_SUCCESS;
                 }
-                Err(_) => std::thread::yield_now(),
+                Err(_) => core::hint::spin_loop(),
             }
         }
     }

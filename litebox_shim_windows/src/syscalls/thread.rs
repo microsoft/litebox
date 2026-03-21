@@ -65,7 +65,7 @@ pub(crate) fn nt_create_thread_ex(
 
     // Allocate a thread ID.
     let tid = {
-        let mut id = shim.shared.next_thread_id.lock().unwrap();
+        let mut id = shim.shared.next_thread_id.lock();
         let val = *id;
         *id = val + 1;
         val
@@ -198,7 +198,6 @@ pub(crate) fn nt_create_thread_ex(
         .shared
         .handles
         .lock()
-        .unwrap()
         .insert(NtObject::Thread(Arc::clone(&thread_obj)));
 
     // Write the handle to the caller's output.

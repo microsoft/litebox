@@ -54,10 +54,9 @@
 )]
 
 extern crate alloc;
-extern crate std;
 
 use core::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Mutex;
+use spin::Mutex;
 
 use litebox::mm::PageManager;
 use litebox::shim::{ContinueOperation, ExceptionInfo};
@@ -126,18 +125,18 @@ impl NtProcessState {
 
     /// Record an allocation (base address ΓåÆ size in bytes).
     pub fn track_alloc(&self, base: usize, size: usize) {
-        self.alloc_tracker.lock().unwrap().insert(base, size);
+        self.alloc_tracker.lock().insert(base, size);
     }
 
     /// Look up and remove the tracked allocation size for `base`.
     /// Returns `None` if the base was never tracked.
     pub fn untrack_alloc(&self, base: usize) -> Option<usize> {
-        self.alloc_tracker.lock().unwrap().remove(&base)
+        self.alloc_tracker.lock().remove(&base)
     }
 
     /// Returns `true` if `addr` falls within any tracked allocation range.
     pub fn is_tracked_alloc(&self, addr: usize) -> bool {
-        let tracker = self.alloc_tracker.lock().unwrap();
+        let tracker = self.alloc_tracker.lock();
         // Find the largest base Γëñ addr and check if addr < base + size.
         if let Some((&base, &size)) = tracker.range(..=addr).next_back() {
             addr < base + size
@@ -169,12 +168,12 @@ impl NtProcessState {
 
     /// Record a SEC_IMAGE mapping (base ΓåÆ size) for NtQueryVirtualMemory.
     pub fn track_image_mapping(&self, base: usize, size: usize) {
-        self.image_mappings.lock().unwrap().insert(base, size);
+        self.image_mappings.lock().insert(base, size);
     }
 
     /// Returns `true` if `addr` falls within a SEC_IMAGE mapping.
     pub fn is_image_mapping(&self, addr: usize) -> bool {
-        let mappings = self.image_mappings.lock().unwrap();
+        let mappings = self.image_mappings.lock();
         if let Some((&base, &size)) = mappings.range(..=addr).next_back() {
             addr < base + size
         } else {
@@ -271,8 +270,7 @@ pub(crate) struct NtSharedState {
     pub next_thread_id: Mutex<u32>,
     /// Optional smoltcp network stack for WinSock syscalls.
     /// Set by the runner after creating the Network instance.
-    pub net:
-        std::sync::OnceLock<alloc::sync::Arc<std::sync::Mutex<litebox::net::Network<Platform>>>>,
+    pub net: spin::Once<alloc::sync::Arc<spin::Mutex<litebox::net::Network<Platform>>>>,
     /// Socket storage: maps socket IDs ΓåÆ owned `SocketFd` handles.
     /// Socket IDs are also stored in the handle table as `NtObject::Socket { sock_id }`.
     pub sockets: Mutex<alloc::collections::BTreeMap<u32, litebox::net::SocketFd<Platform>>>,
@@ -282,15 +280,11 @@ pub(crate) struct NtSharedState {
     /// have not yet been returned to the guest.  Preserves excess and
     /// incomplete UTF-8 tails across calls.
     pub console_input_pending: Mutex<alloc::vec::Vec<u8>>,
-    /// DLL files from the tar archive, for serving via NtOpenFile during
-    /// ntdll-driven initialization. Keyed by lowercase filename.
-    pub dll_tar_files:
-        Mutex<Option<alloc::collections::BTreeMap<alloc::string::String, alloc::vec::Vec<u8>>>>,
     /// Pre-captured NLS combined section data, locale ID, and casing size.
     /// Set by the runner so the shim doesn't need to call host APIs.
-    pub nls_data: std::sync::OnceLock<NlsData>,
+    pub nls_data: spin::Once<NlsData>,
     /// Litebox core VFS for file I/O.
-    pub fs: std::sync::OnceLock<alloc::sync::Arc<NtFS>>,
+    pub fs: spin::Once<alloc::sync::Arc<NtFS>>,
     /// Guest address space VA range (start..end) for pointer validation.
     pub guest_va_start: core::sync::atomic::AtomicUsize,
     pub guest_va_end: core::sync::atomic::AtomicUsize,
@@ -299,9 +293,9 @@ pub(crate) struct NtSharedState {
     pub raw_fds: Mutex<litebox::fd::RawDescriptorStorage>,
     /// Mapping from real Windows syscall numbers to `NtSyscallId`.
     /// Populated by the ntdll rewriter; used for dispatch.
-    pub syscall_map: std::sync::OnceLock<NtSyscallMap>,
+    pub syscall_map: spin::Once<NtSyscallMap>,
     /// Syscall number ΓåÆ export name for unhandled stubs (debug logging).
-    pub unhandled_stubs: std::sync::OnceLock<alloc::vec::Vec<(u32, alloc::string::String)>>,
+    pub unhandled_stubs: spin::Once<alloc::vec::Vec<(u32, alloc::string::String)>>,
 }
 
 /// State set by the runner to configure the initial thread.
@@ -331,11 +325,9 @@ pub struct NtInitState {
     /// Full path of the main executable (for GetModuleFileNameW).
     pub exe_path: alloc::string::String,
     /// For ntdll-driven init: RCX value (CONTEXT* pointer on guest stack).
-    /// When set, init() uses this as RCX instead of entry_point, allowing
-    /// the NtContinue slow path to restore all registers properly.
-    pub initial_rcx: Option<usize>,
+    pub initial_rcx: usize,
     /// For ntdll-driven init: RDX value (ntdll base address).
-    pub initial_rdx: Option<usize>,
+    pub initial_rdx: usize,
     /// RVA of KiUserExceptionDispatcher in ntdll, resolved from PE exports.
     pub ki_user_exception_dispatcher_rva: Option<usize>,
 }
@@ -373,18 +365,17 @@ impl NtShimEntrypoints {
             env_block_pool: Mutex::new(alloc::vec::Vec::new()),
             current_directory: Mutex::new(alloc::string::String::from("C:\\")),
             next_thread_id: Mutex::new(2), // TID 1 is the main thread
-            net: std::sync::OnceLock::new(),
+            net: spin::Once::new(),
             sockets: Mutex::new(alloc::collections::BTreeMap::new()),
             next_socket_id: Mutex::new(1),
             console_input_pending: Mutex::new(alloc::vec::Vec::new()),
-            dll_tar_files: Mutex::new(None),
-            nls_data: std::sync::OnceLock::new(),
-            fs: std::sync::OnceLock::new(),
+            nls_data: spin::Once::new(),
+            fs: spin::Once::new(),
             guest_va_start: core::sync::atomic::AtomicUsize::new(0),
             guest_va_end: core::sync::atomic::AtomicUsize::new(usize::MAX),
             raw_fds: Mutex::new(litebox::fd::RawDescriptorStorage::new()),
-            syscall_map: std::sync::OnceLock::new(),
-            unhandled_stubs: std::sync::OnceLock::new(),
+            syscall_map: spin::Once::new(),
+            unhandled_stubs: spin::Once::new(),
         });
         Self {
             exit_code: AtomicI32::new(0),
@@ -400,22 +391,22 @@ impl NtShimEntrypoints {
     /// Install the syscall mapping table produced by the ntdll rewriter.
     /// Must be called before entering the guest.
     pub fn set_syscall_map(&self, map: NtSyscallMap) {
-        let _ = self.shared.syscall_map.set(map);
+        let _ = self.shared.syscall_map.call_once(|| map);
     }
 
     /// Install unhandled stub names for debug logging of unknown syscalls.
     pub fn set_unhandled_stubs(&self, stubs: alloc::vec::Vec<(u32, alloc::string::String)>) {
-        let _ = self.shared.unhandled_stubs.set(stubs);
+        let _ = self.shared.unhandled_stubs.call_once(|| stubs);
     }
 
     /// Install pre-captured NLS data so the shim doesn't call host APIs.
     pub fn set_nls_data(&self, data: NlsData) {
-        let _ = self.shared.nls_data.set(data);
+        let _ = self.shared.nls_data.call_once(|| data);
     }
 
     /// Install the litebox core VFS for file I/O.
     pub fn set_fs(&self, fs: alloc::sync::Arc<NtFS>) {
-        let _ = self.shared.fs.set(fs);
+        let _ = self.shared.fs.call_once(|| fs);
     }
 
     /// Create a new NT shim entrypoints for a child thread.
@@ -447,8 +438,8 @@ impl NtShimEntrypoints {
                 guest_va_start: parent_init.guest_va_start,
                 guest_va_end: parent_init.guest_va_end,
                 exe_path: parent_init.exe_path.clone(),
-                initial_rcx: None,
-                initial_rdx: None,
+                initial_rcx: 0,
+                initial_rdx: 0,
                 ki_user_exception_dispatcher_rva: parent_init.ki_user_exception_dispatcher_rva,
             }),
             child_thread_argument: Some(child_argument),
@@ -464,7 +455,7 @@ impl NtShimEntrypoints {
         // Parse the environment block (double-NUL terminated UTF-16LE) into
         // the backing env var map so Get/SetEnvironmentVariableW work.
         if state.env_block_va != 0 {
-            let mut env_map = self.shared.env_vars.lock().unwrap();
+            let mut env_map = self.shared.env_vars.lock();
             let mut ptr = state.env_block_va;
             loop {
                 // Read one UTF-16 NUL-terminated string.
@@ -522,23 +513,8 @@ impl NtShimEntrypoints {
 
     /// Attach the smoltcp network stack for WinSock syscall dispatch.
     /// Must be called before running the guest if networking is needed.
-    pub fn set_network(
-        &self,
-        net: alloc::sync::Arc<std::sync::Mutex<litebox::net::Network<Platform>>>,
-    ) {
-        self.shared
-            .net
-            .set(net)
-            .unwrap_or_else(|_| panic!("set_network called more than once"));
-    }
-
-    /// Provide DLL tar files so the shim can serve DLLs via NtOpenFile
-    /// during ntdll-driven initialization.
-    pub fn set_dll_tar_files(
-        &self,
-        files: alloc::collections::BTreeMap<alloc::string::String, alloc::vec::Vec<u8>>,
-    ) {
-        *self.shared.dll_tar_files.lock().unwrap() = Some(files);
+    pub fn set_network(&self, net: alloc::sync::Arc<spin::Mutex<litebox::net::Network<Platform>>>) {
+        self.shared.net.call_once(|| net);
     }
 
     /// Dispatch an NT syscall or kernel32 syscall.
@@ -571,13 +547,11 @@ impl NtShimEntrypoints {
                 return (NtStatus::STATUS_SUCCESS, false);
             }
             stub_dlls::K32_WRITE_CONSOLE_A => {
-                let status =
-                    syscalls::k32_write_console_a(ctx, &self.shared.handles.lock().unwrap());
+                let status = syscalls::k32_write_console_a(ctx, &self.shared.handles.lock());
                 return (status, false);
             }
             stub_dlls::K32_WRITE_CONSOLE_W => {
-                let status =
-                    syscalls::k32_write_console_w(ctx, &self.shared.handles.lock().unwrap());
+                let status = syscalls::k32_write_console_w(ctx, &self.shared.handles.lock());
                 return (status, false);
             }
             stub_dlls::K32_EXIT_PROCESS => {
@@ -731,8 +705,8 @@ impl NtShimEntrypoints {
             stub_dlls::K32_TLS_ALLOC => {
                 let status = syscalls::k32_handlers::k32_tls_alloc(
                     ctx,
-                    &mut self.shared.tls_next.lock().unwrap(),
-                    &mut self.shared.tls_free_list.lock().unwrap(),
+                    &mut self.shared.tls_next.lock(),
+                    &mut self.shared.tls_free_list.lock(),
                 );
                 return (status, false);
             }
@@ -752,11 +726,11 @@ impl NtShimEntrypoints {
             }
             stub_dlls::K32_TLS_FREE => {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let tls_next = *self.shared.tls_next.lock().unwrap();
+                let tls_next = *self.shared.tls_next.lock();
                 let status = syscalls::k32_handlers::k32_tls_free(
                     ctx,
                     tls_next,
-                    &mut self.shared.tls_free_list.lock().unwrap(),
+                    &mut self.shared.tls_free_list.lock(),
                     teb_va,
                 );
                 return (status, false);
@@ -765,36 +739,33 @@ impl NtShimEntrypoints {
             stub_dlls::K32_FLS_ALLOC => {
                 let status = syscalls::k32_handlers::k32_fls_alloc(
                     ctx,
-                    &mut self.shared.fls_next.lock().unwrap(),
-                    &mut self.shared.fls_free_list.lock().unwrap(),
+                    &mut self.shared.fls_next.lock(),
+                    &mut self.shared.fls_free_list.lock(),
                 );
                 return (status, false);
             }
             stub_dlls::K32_FLS_GET_VALUE => {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let status = syscalls::k32_handlers::k32_fls_get_value(
-                    ctx,
-                    &self.fls_slots.lock().unwrap(),
-                    teb_va,
-                );
+                let status =
+                    syscalls::k32_handlers::k32_fls_get_value(ctx, &self.fls_slots.lock(), teb_va);
                 return (status, false);
             }
             stub_dlls::K32_FLS_SET_VALUE => {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
                 let status = syscalls::k32_handlers::k32_fls_set_value(
                     ctx,
-                    &mut self.fls_slots.lock().unwrap(),
+                    &mut self.fls_slots.lock(),
                     teb_va,
                 );
                 return (status, false);
             }
             stub_dlls::K32_FLS_FREE => {
-                let fls_next = *self.shared.fls_next.lock().unwrap();
+                let fls_next = *self.shared.fls_next.lock();
                 let status = syscalls::k32_handlers::k32_fls_free(
                     ctx,
                     fls_next,
-                    &mut self.shared.fls_free_list.lock().unwrap(),
-                    &mut self.fls_slots.lock().unwrap(),
+                    &mut self.shared.fls_free_list.lock(),
+                    &mut self.fls_slots.lock(),
                 );
                 return (status, false);
             }
@@ -802,7 +773,7 @@ impl NtShimEntrypoints {
             stub_dlls::K32_SET_UNHANDLED_EXCEPTION_FILTER => {
                 let status = syscalls::k32_handlers::k32_set_unhandled_exception_filter(
                     ctx,
-                    &mut self.shared.unhandled_exception_filter.lock().unwrap(),
+                    &mut self.shared.unhandled_exception_filter.lock(),
                 );
                 return (status, false);
             }
@@ -821,7 +792,7 @@ impl NtShimEntrypoints {
             stub_dlls::K32_GET_ENVIRONMENT_STRINGS_W => {
                 let status = syscalls::k32_handlers::k32_get_environment_strings_w(
                     ctx,
-                    &self.shared.env_vars.lock().unwrap(),
+                    &self.shared.env_vars.lock(),
                     &self.shared.process_state,
                     &self.shared.env_block_pool,
                 );
@@ -831,7 +802,7 @@ impl NtShimEntrypoints {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
                 let status = syscalls::k32_handlers::k32_get_environment_variable_w(
                     ctx,
-                    &self.shared.env_vars.lock().unwrap(),
+                    &self.shared.env_vars.lock(),
                     teb_va,
                 );
                 return (status, false);
@@ -890,10 +861,10 @@ impl NtShimEntrypoints {
             // --- Kernel32 file I/O wrappers ---
             stub_dlls::K32_CREATE_FILE_W => {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let cwd = self.shared.current_directory.lock().unwrap();
+                let cwd = self.shared.current_directory.lock();
                 let status = syscalls::k32_handlers::k32_create_file_w(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     teb_va,
                     &cwd,
                     &self.shared,
@@ -909,10 +880,6 @@ impl NtShimEntrypoints {
                 // so that potentially blocking reads (UNC, pipes) don't stall
                 // the global handle table.
                 enum ReadTarget {
-                    File {
-                        host_handle: usize,
-                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
-                    },
                     VfsFile {
                         raw_fd: usize,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
@@ -920,22 +887,12 @@ impl NtShimEntrypoints {
                     Console,
                 }
                 let target = {
-                    let handles = self.shared.handles.lock().unwrap();
+                    let handles = self.shared.handles.lock();
                     match handles.get(h_file) {
                         Some(crate::handle_table::NtObject::File {
-                            raw_fd: Some(fd),
-                            position,
-                            ..
+                            raw_fd, position, ..
                         }) => ReadTarget::VfsFile {
-                            raw_fd: *fd,
-                            position: position.clone(),
-                        },
-                        Some(crate::handle_table::NtObject::File {
-                            host_handle,
-                            position,
-                            ..
-                        }) => ReadTarget::File {
-                            host_handle: *host_handle,
+                            raw_fd: *raw_fd,
                             position: position.clone(),
                         },
                         Some(crate::handle_table::NtObject::ConsoleInput) => ReadTarget::Console,
@@ -957,15 +914,6 @@ impl NtShimEntrypoints {
                             &self.shared,
                         )
                     }
-                    ReadTarget::File {
-                        host_handle,
-                        position,
-                    } => syscalls::k32_handlers::k32_read_file_host(
-                        ctx,
-                        host_handle,
-                        &position,
-                        teb_va,
-                    ),
                     ReadTarget::Console => syscalls::k32_handlers::k32_read_file_console(
                         ctx,
                         teb_va,
@@ -988,13 +936,9 @@ impl NtShimEntrypoints {
                         raw_fd: usize,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
                     },
-                    File {
-                        host_handle: usize,
-                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
-                    },
                 }
                 let target = {
-                    let handles = self.shared.handles.lock().unwrap();
+                    let handles = self.shared.handles.lock();
                     match handles.get(h_file) {
                         Some(crate::handle_table::NtObject::ConsoleOutput { is_stderr }) => {
                             WriteTarget::Console {
@@ -1002,19 +946,9 @@ impl NtShimEntrypoints {
                             }
                         }
                         Some(crate::handle_table::NtObject::File {
-                            raw_fd: Some(fd),
-                            position,
-                            ..
+                            raw_fd, position, ..
                         }) => WriteTarget::VfsFile {
-                            raw_fd: *fd,
-                            position: position.clone(),
-                        },
-                        Some(crate::handle_table::NtObject::File {
-                            host_handle,
-                            position,
-                            ..
-                        }) => WriteTarget::File {
-                            host_handle: *host_handle,
+                            raw_fd: *raw_fd,
                             position: position.clone(),
                         },
                         _ => {
@@ -1037,15 +971,6 @@ impl NtShimEntrypoints {
                             &self.shared,
                         )
                     }
-                    WriteTarget::File {
-                        host_handle,
-                        position,
-                    } => syscalls::k32_handlers::k32_write_file_host(
-                        ctx,
-                        host_handle,
-                        &position,
-                        teb_va,
-                    ),
                 };
                 return (status, false);
             }
@@ -1053,24 +978,22 @@ impl NtShimEntrypoints {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
                 let status = syscalls::k32_handlers::k32_close_handle(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     teb_va,
                     &self.shared,
                 );
                 return (status, false);
             }
             stub_dlls::K32_GET_FILE_TYPE => {
-                let status = syscalls::k32_handlers::k32_get_file_type(
-                    ctx,
-                    &self.shared.handles.lock().unwrap(),
-                );
+                let status =
+                    syscalls::k32_handlers::k32_get_file_type(ctx, &self.shared.handles.lock());
                 return (status, false);
             }
             stub_dlls::K32_GET_FILE_SIZE_EX => {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
                 let status = syscalls::k32_handlers::k32_get_file_size_ex(
                     ctx,
-                    &self.shared.handles.lock().unwrap(),
+                    &self.shared.handles.lock(),
                     teb_va,
                     &self.shared,
                 );
@@ -1080,7 +1003,7 @@ impl NtShimEntrypoints {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
                 let status = syscalls::k32_handlers::k32_set_file_pointer_ex(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     teb_va,
                     &self.shared,
                 );
@@ -1090,7 +1013,7 @@ impl NtShimEntrypoints {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
                 let status = syscalls::k32_handlers::k32_set_end_of_file(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     teb_va,
                     &self.shared,
                 );
@@ -1110,7 +1033,7 @@ impl NtShimEntrypoints {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
                 let handle = ctx.regs.r10 as u32;
                 let is_console_input = matches!(
-                    self.shared.handles.lock().unwrap().get(handle),
+                    self.shared.handles.lock().get(handle),
                     Some(crate::handle_table::NtObject::ConsoleInput)
                 );
                 let status = if is_console_input {
@@ -1178,7 +1101,7 @@ impl NtShimEntrypoints {
 
             // --- Path / directory ---
             stub_dlls::K32_GET_FULL_PATH_NAME_W => {
-                let cwd = self.shared.current_directory.lock().unwrap();
+                let cwd = self.shared.current_directory.lock();
                 let status = syscalls::k32_handlers::k32_get_full_path_name_w(ctx, &cwd);
                 return (status, false);
             }
@@ -1187,12 +1110,12 @@ impl NtShimEntrypoints {
                 return (status, false);
             }
             stub_dlls::K32_GET_CURRENT_DIRECTORY_W => {
-                let cwd = self.shared.current_directory.lock().unwrap();
+                let cwd = self.shared.current_directory.lock();
                 let status = syscalls::k32_handlers::k32_get_current_directory_w(ctx, &cwd);
                 return (status, false);
             }
             stub_dlls::K32_SET_CURRENT_DIRECTORY_W => {
-                let mut cwd = self.shared.current_directory.lock().unwrap();
+                let mut cwd = self.shared.current_directory.lock();
                 let status = syscalls::k32_handlers::k32_set_current_directory_w(
                     ctx,
                     &mut cwd,
@@ -1205,7 +1128,7 @@ impl NtShimEntrypoints {
             stub_dlls::K32_DUPLICATE_HANDLE => {
                 let status = syscalls::k32_handlers::k32_duplicate_handle(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                 );
                 return (status, false);
             }
@@ -1214,7 +1137,7 @@ impl NtShimEntrypoints {
             stub_dlls::K32_SET_ENVIRONMENT_VARIABLE_W => {
                 let status = syscalls::k32_handlers::k32_set_environment_variable_w(
                     ctx,
-                    &mut self.shared.env_vars.lock().unwrap(),
+                    &mut self.shared.env_vars.lock(),
                 );
                 return (status, false);
             }
@@ -1236,10 +1159,10 @@ impl NtShimEntrypoints {
             // --- File search ---
             stub_dlls::K32_FIND_FIRST_FILE_EX_W => {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
-                let cwd = self.shared.current_directory.lock().unwrap();
+                let cwd = self.shared.current_directory.lock();
                 let status = syscalls::k32_handlers::k32_find_first_file_ex_w(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     teb_va,
                     &cwd,
                     &self.shared,
@@ -1250,7 +1173,7 @@ impl NtShimEntrypoints {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
                 let status = syscalls::k32_handlers::k32_find_next_file_w(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     teb_va,
                 );
                 return (status, false);
@@ -1258,7 +1181,7 @@ impl NtShimEntrypoints {
             stub_dlls::K32_FIND_CLOSE => {
                 let status = syscalls::k32_handlers::k32_find_close(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     &self.shared,
                 );
                 return (status, false);
@@ -1350,7 +1273,7 @@ impl NtShimEntrypoints {
                 let handle = args.arg0 as u32;
                 let millis = args.arg1 as u32;
                 let waitable = {
-                    let handles = self.shared.handles.lock().unwrap();
+                    let handles = self.shared.handles.lock();
                     syscalls::sync::lookup_waitable(&handles, handle)
                 };
                 let timeout = if millis == 0xFFFF_FFFF {
@@ -1516,14 +1439,10 @@ impl NtShimEntrypoints {
                         raw_fd: usize,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
                     },
-                    File {
-                        host_handle: usize,
-                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
-                    },
                     Invalid,
                 }
                 let target = {
-                    let handles = self.shared.handles.lock().unwrap();
+                    let handles = self.shared.handles.lock();
                     match handles.get(file_handle) {
                         Some(crate::handle_table::NtObject::ConsoleOutput { is_stderr }) => {
                             NtWriteTarget::Console {
@@ -1531,19 +1450,9 @@ impl NtShimEntrypoints {
                             }
                         }
                         Some(crate::handle_table::NtObject::File {
-                            raw_fd: Some(fd),
-                            position,
-                            ..
+                            raw_fd, position, ..
                         }) => NtWriteTarget::VfsFile {
-                            raw_fd: *fd,
-                            position: position.clone(),
-                        },
-                        Some(crate::handle_table::NtObject::File {
-                            host_handle,
-                            position,
-                            ..
-                        }) => NtWriteTarget::File {
-                            host_handle: *host_handle,
+                            raw_fd: *raw_fd,
                             position: position.clone(),
                         },
                         _ => NtWriteTarget::Invalid,
@@ -1556,10 +1465,6 @@ impl NtShimEntrypoints {
                     NtWriteTarget::VfsFile { raw_fd, position } => {
                         syscalls::file::nt_write_file_vfs(ctx, raw_fd, &position, &self.shared)
                     }
-                    NtWriteTarget::File {
-                        host_handle,
-                        position,
-                    } => syscalls::file::nt_write_file_host(ctx, host_handle, &position),
                     NtWriteTarget::Invalid => NtStatus::STATUS_INVALID_HANDLE,
                 };
                 (status, false)
@@ -1567,7 +1472,7 @@ impl NtShimEntrypoints {
             NtSyscallId::NtClose => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let status = syscalls::nt_close(
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     args.arg0 as u32,
                     &self.shared,
                 );
@@ -1577,7 +1482,7 @@ impl NtShimEntrypoints {
             NtSyscallId::NtCreateFile => {
                 let status = syscalls::file::nt_create_file(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     &self.shared,
                 );
                 (status, false)
@@ -1585,8 +1490,7 @@ impl NtShimEntrypoints {
             NtSyscallId::NtOpenFile => {
                 let status = syscalls::file::nt_open_file(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
-                    &self.shared.dll_tar_files,
+                    &mut self.shared.handles.lock(),
                     &self.shared,
                 );
                 (status, false)
@@ -1601,40 +1505,16 @@ impl NtShimEntrypoints {
                         raw_fd: usize,
                         position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
                     },
-                    File {
-                        host_handle: usize,
-                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
-                    },
-                    MemoryFile {
-                        data: alloc::sync::Arc<alloc::vec::Vec<u8>>,
-                        position: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
-                    },
                     Console,
                     Invalid,
                 }
                 let target = {
-                    let handles = self.shared.handles.lock().unwrap();
+                    let handles = self.shared.handles.lock();
                     match handles.get(file_handle) {
                         Some(crate::handle_table::NtObject::File {
-                            raw_fd: Some(fd),
-                            position,
-                            ..
+                            raw_fd, position, ..
                         }) => NtReadTarget::VfsFile {
-                            raw_fd: *fd,
-                            position: position.clone(),
-                        },
-                        Some(crate::handle_table::NtObject::File {
-                            host_handle,
-                            position,
-                            ..
-                        }) => NtReadTarget::File {
-                            host_handle: *host_handle,
-                            position: position.clone(),
-                        },
-                        Some(crate::handle_table::NtObject::MemoryFile {
-                            data, position, ..
-                        }) => NtReadTarget::MemoryFile {
-                            data: data.clone(),
+                            raw_fd: *raw_fd,
                             position: position.clone(),
                         },
                         Some(crate::handle_table::NtObject::ConsoleInput) => NtReadTarget::Console,
@@ -1645,51 +1525,22 @@ impl NtShimEntrypoints {
                     NtReadTarget::VfsFile { raw_fd, position } => {
                         syscalls::file::nt_read_file_vfs(ctx, raw_fd, &position, &self.shared)
                     }
-                    NtReadTarget::File {
-                        host_handle,
-                        position,
-                    } => syscalls::file::nt_read_file_host(ctx, host_handle, &position),
-                    NtReadTarget::MemoryFile { data, position } => {
-                        syscalls::file::nt_read_file_memory(ctx, &data, &position)
-                    }
                     NtReadTarget::Console => syscalls::file::nt_read_file_console(ctx),
                     NtReadTarget::Invalid => NtStatus::STATUS_INVALID_HANDLE,
                 };
                 (status, false)
             }
             NtSyscallId::NtQueryInformationFile => {
-                // Check if this is a MemoryFile (need special handling).
-                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let file_handle = args.arg0 as u32;
-                let mem_info = {
-                    let handles = self.shared.handles.lock().unwrap();
-                    match handles.get(file_handle) {
-                        Some(crate::handle_table::NtObject::MemoryFile {
-                            data, position, ..
-                        }) => Some((data.clone(), position.clone())),
-                        _ => None,
-                    }
-                };
-                let status = if let Some((data, position)) = mem_info {
-                    syscalls::file::nt_query_information_file_memory(
-                        ctx,
-                        data.len() as u64,
-                        &position,
-                    )
-                } else {
-                    syscalls::file::nt_query_information_file(
-                        ctx,
-                        &self.shared.handles.lock().unwrap(),
-                        &self.shared,
-                    )
-                };
+                let status = syscalls::file::nt_query_information_file(
+                    ctx,
+                    &self.shared.handles.lock(),
+                    &self.shared,
+                );
                 (status, false)
             }
             NtSyscallId::NtSetInformationFile => {
-                let status = syscalls::file::nt_set_information_file(
-                    ctx,
-                    &mut self.shared.handles.lock().unwrap(),
-                );
+                let status =
+                    syscalls::file::nt_set_information_file(ctx, &mut self.shared.handles.lock());
                 (status, false)
             }
             NtSyscallId::NtQueryAttributesFile => {
@@ -1770,23 +1621,21 @@ impl NtShimEntrypoints {
             NtSyscallId::NtQueryDirectoryFile => {
                 let status = syscalls::file::nt_query_directory_file(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     &self.shared,
                 );
                 (status, false)
             }
             // Phase 3: Sync primitives
             NtSyscallId::NtCreateKeyedEvent => {
-                let status = syscalls::sync::nt_create_keyed_event(
-                    ctx,
-                    &mut self.shared.handles.lock().unwrap(),
-                );
+                let status =
+                    syscalls::sync::nt_create_keyed_event(ctx, &mut self.shared.handles.lock());
                 (status, false)
             }
             NtSyscallId::NtWaitForKeyedEvent => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let keyed = {
-                    let handles = self.shared.handles.lock().unwrap();
+                    let handles = self.shared.handles.lock();
                     syscalls::sync::lookup_keyed_event(&handles, args.arg0 as u32)
                 };
                 match keyed {
@@ -1797,7 +1646,7 @@ impl NtShimEntrypoints {
             NtSyscallId::NtReleaseKeyedEvent => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let keyed = {
-                    let handles = self.shared.handles.lock().unwrap();
+                    let handles = self.shared.handles.lock();
                     syscalls::sync::lookup_keyed_event(&handles, args.arg0 as u32)
                 };
                 match keyed {
@@ -1806,41 +1655,34 @@ impl NtShimEntrypoints {
                 }
             }
             NtSyscallId::NtCreateEvent => {
-                let status =
-                    syscalls::sync::nt_create_event(ctx, &mut self.shared.handles.lock().unwrap());
+                let status = syscalls::sync::nt_create_event(ctx, &mut self.shared.handles.lock());
                 (status, false)
             }
             NtSyscallId::NtSetEvent => {
-                let status =
-                    syscalls::sync::nt_set_event(ctx, &self.shared.handles.lock().unwrap());
+                let status = syscalls::sync::nt_set_event(ctx, &self.shared.handles.lock());
                 (status, false)
             }
             NtSyscallId::NtResetEvent => {
-                let status =
-                    syscalls::sync::nt_reset_event(ctx, &self.shared.handles.lock().unwrap());
+                let status = syscalls::sync::nt_reset_event(ctx, &self.shared.handles.lock());
                 (status, false)
             }
             NtSyscallId::NtClearEvent => {
-                let status =
-                    syscalls::sync::nt_clear_event(ctx, &self.shared.handles.lock().unwrap());
+                let status = syscalls::sync::nt_clear_event(ctx, &self.shared.handles.lock());
                 (status, false)
             }
             NtSyscallId::NtCreateSemaphore => {
-                let status = syscalls::sync::nt_create_semaphore(
-                    ctx,
-                    &mut self.shared.handles.lock().unwrap(),
-                );
+                let status =
+                    syscalls::sync::nt_create_semaphore(ctx, &mut self.shared.handles.lock());
                 (status, false)
             }
             NtSyscallId::NtReleaseSemaphore => {
-                let status =
-                    syscalls::sync::nt_release_semaphore(ctx, &self.shared.handles.lock().unwrap());
+                let status = syscalls::sync::nt_release_semaphore(ctx, &self.shared.handles.lock());
                 (status, false)
             }
             NtSyscallId::NtWaitForSingleObject => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let waitable = {
-                    let handles = self.shared.handles.lock().unwrap();
+                    let handles = self.shared.handles.lock();
                     syscalls::sync::lookup_waitable(&handles, args.arg0 as u32)
                 };
                 match waitable {
@@ -1859,7 +1701,7 @@ impl NtShimEntrypoints {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let source_handle = args.arg1 as u32;
                 let target_handle_va = args.arg3;
-                let mut handles = self.shared.handles.lock().unwrap();
+                let mut handles = self.shared.handles.lock();
 
                 // Handle pseudo-handles: -1 = current process, -2 = current thread.
                 let new_obj = if source_handle == 0xFFFFFFFF {
@@ -1908,7 +1750,7 @@ impl NtShimEntrypoints {
                 }
 
                 // Look up the handle and validate it's a thread object.
-                let handles = self.shared.handles.lock().unwrap();
+                let handles = self.shared.handles.lock();
                 match handles.get(handle) {
                     Some(handle_table::NtObject::Thread(t)) => {
                         if t.thread_id == self.thread_id {
@@ -2035,7 +1877,6 @@ impl NtShimEntrypoints {
                         .shared
                         .handles
                         .lock()
-                        .unwrap()
                         .insert(handle_table::NtObject::RegistryKey);
                     if key_handle_ptr != 0 {
                         unsafe {
@@ -2220,7 +2061,7 @@ impl NtShimEntrypoints {
             NtSyscallId::NtCreateSection => {
                 let status = syscalls::section::nt_create_section(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     &self.shared,
                 );
                 (status, false)
@@ -2228,7 +2069,7 @@ impl NtShimEntrypoints {
             NtSyscallId::NtMapViewOfSection => {
                 let status = syscalls::section::nt_map_view_of_section(
                     ctx,
-                    &self.shared.handles.lock().unwrap(),
+                    &self.shared.handles.lock(),
                     &self.shared.process_state,
                 );
                 (status, false)
@@ -2291,11 +2132,27 @@ impl NtShimEntrypoints {
                 // "\KnownDlls\kernelbase.dll" or just "kernelbase.dll".
                 let dll_name = name.rsplit('\\').next().unwrap_or(&name).to_lowercase();
 
-                // Try to find this DLL in the tar archive.
+                // Try to find this DLL in the VFS (tar_ro layer).
                 let found = if dll_name.ends_with(".dll") {
-                    let tar_files = self.shared.dll_tar_files.lock().unwrap();
-                    if let Some(ref files) = *tar_files {
-                        files.get(&dll_name).cloned()
+                    if let Some(fs) = self.shared.fs.get() {
+                        use litebox::fs::FileSystem as _;
+                        // DLLs in the tar are stored at the root level.
+                        let vfs_path = alloc::format!("/{dll_name}");
+                        if let Ok(fd) = fs.open(
+                            &vfs_path,
+                            litebox::fs::OFlags::RDONLY,
+                            litebox::fs::Mode::RUSR,
+                        ) {
+                            // Read the entire file into memory for PE parsing.
+                            let size = fs.fd_file_status(&fd).map(|s| s.size as usize).unwrap_or(0);
+                            let mut buf = alloc::vec![0u8; size];
+                            let bytes_read = fs.read(&fd, &mut buf, None).unwrap_or(0);
+                            buf.truncate(bytes_read);
+                            let _ = fs.close(&fd);
+                            if buf.is_empty() { None } else { Some(buf) }
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -2307,7 +2164,7 @@ impl NtShimEntrypoints {
                     // Parse PE and create a Section handle (like NtCreateSection).
                     match litebox_common_windows::pe_parser::PeParsedFile::parse(&pe_data) {
                         Ok(parsed) => {
-                            let handle = self.shared.handles.lock().unwrap().insert(
+                            let handle = self.shared.handles.lock().insert(
                                 crate::handle_table::NtObject::Section {
                                     pe_data: alloc::sync::Arc::new(pe_data.clone()),
                                     image_size: parsed.size_of_image,
@@ -2357,8 +2214,7 @@ impl NtShimEntrypoints {
                 }
             }
             NtSyscallId::NtQuerySection => {
-                let status =
-                    syscalls::section::nt_query_section(ctx, &self.shared.handles.lock().unwrap());
+                let status = syscalls::section::nt_query_section(ctx, &self.shared.handles.lock());
                 (status, false)
             }
             NtSyscallId::NtSetInformationProcess => {
@@ -2667,7 +2523,6 @@ impl NtShimEntrypoints {
                     .shared
                     .handles
                     .lock()
-                    .unwrap()
                     .get(key_handle)
                     .is_some_and(|obj| matches!(obj, handle_table::NtObject::RegistryKey));
                 if is_valid {
@@ -2797,140 +2652,25 @@ impl NtShimEntrypoints {
                 };
 
                 let nls_path = alloc::format!("C:\\Windows\\System32\\{nls_filename}");
-                let nls_data = std::fs::read(&nls_path);
 
-                match nls_data {
-                    Ok(data) => {
-                        use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
-                        use litebox::platform::RawConstPointer as _;
-
-                        let page_size = 4096usize;
-                        let alloc_size = (data.len() + page_size - 1) & !(page_size - 1);
-                        let nz_size =
-                            NonZeroPageSize::<4096>::new(alloc_size).expect("NLS alloc size");
-
-                        let result = unsafe {
-                            self.shared.process_state.pm.create_readable_pages(
-                                None,
-                                nz_size,
-                                CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-                                |ptr| {
-                                    // Copy NLS data into the mapped pages.
-                                    let dest = ptr.as_usize() as *mut u8;
-                                    core::ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
-                                    Ok(data.len())
-                                },
-                            )
-                        };
-
-                        match result {
-                            Ok(addr) => {
-                                let va = addr.as_usize();
-                                // Write SectionPointer (arg3) and SectionSize (arg4).
-                                let section_ptr_out = args.arg3;
-                                let section_size_out =
-                                    unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
-                                #[cfg(debug_assertions)]
-                                {
-                                    use litebox::platform::DebugLogProvider as _;
-                                    litebox_platform_multiplex::platform().debug_log_print(
-                                        &alloc::format!(
-                                            "NT shim: NLS {} at 0x{:X} ({} bytes) ptr_out=0x{:X} size_out=0x{:X}\n",
-                                            nls_filename, va, data.len(), section_ptr_out, section_size_out
-                                        ),
-                                    );
-                                }
-                                if section_ptr_out != 0 {
-                                    unsafe {
-                                        core::ptr::write(section_ptr_out as *mut u64, va as u64);
-                                    }
-                                }
-                                if section_size_out != 0 {
-                                    unsafe {
-                                        core::ptr::write(
-                                            section_size_out as *mut u32,
-                                            data.len() as u32,
-                                        );
-                                    }
-                                }
-                                #[cfg(debug_assertions)]
-                                {
-                                    use litebox::platform::DebugLogProvider as _;
-                                    let msg = alloc::format!(
-                                        "NT shim: NLS mapped {} at 0x{:X} ({} bytes)\n",
-                                        nls_filename,
-                                        va,
-                                        data.len()
-                                    );
-                                    litebox_platform_multiplex::platform().debug_log_print(&msg);
-                                }
-                                // Set PEB codepage/NLS data pointers ΓÇö the kernel
-                                // normally does this during process creation.
-                                if let Some(init) = self.init_state.as_ref() {
-                                    if section_type == 11 {
-                                        // Codepage data. Match codepage number to
-                                        // ACP (PEB+0x34C) or OEMCP (PEB+0x34E).
-                                        let acp = unsafe {
-                                            core::ptr::read_unaligned(
-                                                (init.peb_va + 0x34C) as *const u16,
-                                            )
-                                        };
-                                        let oemcp = unsafe {
-                                            core::ptr::read_unaligned(
-                                                (init.peb_va + 0x34E) as *const u16,
-                                            )
-                                        };
-                                        if section_data == acp as u32 {
-                                            // PEB+0x350 = AnsiCodePageData
-                                            unsafe {
-                                                core::ptr::write(
-                                                    (init.peb_va + 0x350) as *mut u64,
-                                                    va as u64,
-                                                );
-                                            }
-                                        }
-                                        if section_data == oemcp as u32 {
-                                            // PEB+0x358 = OemCodePageData
-                                            unsafe {
-                                                core::ptr::write(
-                                                    (init.peb_va + 0x358) as *mut u64,
-                                                    va as u64,
-                                                );
-                                            }
-                                        }
-                                    } else if section_type == 14 {
-                                        // Type 0xE (14): Unicode case table (l_intl.nls)
-                                        // PEB+0x360 = UnicodeCaseTableData
-                                        unsafe {
-                                            core::ptr::write(
-                                                (init.peb_va + 0x360) as *mut u64,
-                                                va as u64,
-                                            );
-                                        }
-                                    }
-                                }
-                                (NtStatus::STATUS_SUCCESS, false)
-                            }
-                            Err(_) => (NtStatus::STATUS_NO_MEMORY, false),
-                        }
-                    }
-                    Err(_) => {
-                        #[cfg(debug_assertions)]
-                        {
-                            use litebox::platform::DebugLogProvider as _;
-                            let msg = alloc::format!("NT shim: NLS file not found: {nls_path}\n");
-                            litebox_platform_multiplex::platform().debug_log_print(&msg);
-                        }
-                        (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
-                    }
+                // In no_std mode we cannot read host files. NLS data must be
+                // provided by the runner via set_nls_data().  Return not-found
+                // so the caller falls back to its built-in path.
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let msg =
+                        alloc::format!("NT shim: NLS file not available (no_std): {nls_path}\n");
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
                 }
+                (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
             }
 
             NtSyscallId::NtCreateWaitCompletionPacket => {
                 // Thread pool wait completion packet ΓÇö allocate a dummy handle.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle_ptr = args.arg0; // PHANDLE
-                let mut handles = self.shared.handles.lock().unwrap();
+                let mut handles = self.shared.handles.lock();
                 let h = handles.insert(handle_table::NtObject::Stub {
                     kind: alloc::string::String::from("WaitCompletionPacket"),
                 });
@@ -2945,7 +2685,7 @@ impl NtShimEntrypoints {
                 // Allocate a dummy handle so the pool init doesn't fail.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle_ptr = args.arg0; // PHANDLE
-                let mut handles = self.shared.handles.lock().unwrap();
+                let mut handles = self.shared.handles.lock();
                 let h = handles.insert(handle_table::NtObject::Stub {
                     kind: alloc::string::String::from("IoCompletion"),
                 });
@@ -2961,7 +2701,7 @@ impl NtShimEntrypoints {
                 // thread creation won't happen but the pool init will succeed.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle_ptr = args.arg0; // PHANDLE
-                let mut handles = self.shared.handles.lock().unwrap();
+                let mut handles = self.shared.handles.lock();
                 let h = handles.insert(handle_table::NtObject::Stub {
                     kind: alloc::string::String::from("WorkerFactory"),
                 });
@@ -2976,7 +2716,7 @@ impl NtShimEntrypoints {
                 // Allocate a dummy handle so pool init doesn't abort.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle_ptr = args.arg0; // PHANDLE
-                let mut handles = self.shared.handles.lock().unwrap();
+                let mut handles = self.shared.handles.lock();
                 let h = handles.insert(handle_table::NtObject::Stub {
                     kind: alloc::string::String::from("Timer2"),
                 });
@@ -2993,7 +2733,7 @@ impl NtShimEntrypoints {
                 // file-based loading.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle_ptr = args.arg0 as *mut u64;
-                let mut handles = self.shared.handles.lock().unwrap();
+                let mut handles = self.shared.handles.lock();
                 let h = handles.insert(handle_table::NtObject::Stub {
                     kind: alloc::string::String::from("DirectoryObject"),
                 });
@@ -3131,7 +2871,7 @@ impl NtShimEntrypoints {
                 // NtCreateSection handler which reads the first 7 arguments.
                 let status = syscalls::section::nt_create_section(
                     ctx,
-                    &mut self.shared.handles.lock().unwrap(),
+                    &mut self.shared.handles.lock(),
                     &self.shared,
                 );
                 (status, false)
@@ -3143,7 +2883,7 @@ impl NtShimEntrypoints {
                 // existing handler which reads the standard 10 arguments.
                 let status = syscalls::section::nt_map_view_of_section(
                     ctx,
-                    &self.shared.handles.lock().unwrap(),
+                    &self.shared.handles.lock(),
                     &self.shared.process_state,
                 );
                 (status, false)
@@ -3160,7 +2900,7 @@ impl NtShimEntrypoints {
                 // NtQuerySymbolicLinkObject can return the path.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle_ptr = args.arg0 as *mut u64;
-                let mut handles = self.shared.handles.lock().unwrap();
+                let mut handles = self.shared.handles.lock();
                 let h = handles.insert(handle_table::NtObject::Stub {
                     kind: alloc::string::String::from("SymbolicLink"),
                 });
@@ -3236,7 +2976,7 @@ impl NtShimEntrypoints {
                 let ioctl_code = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
 
                 let is_condrv = {
-                    let handles = self.shared.handles.lock().unwrap();
+                    let handles = self.shared.handles.lock();
                     handles.get(file_handle).is_some_and(|obj| {
                         matches!(obj, handle_table::NtObject::Stub { kind } if kind == "ConDrv")
                     })
@@ -3287,17 +3027,13 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             if let Some(argument) = self.child_thread_argument {
                 // Child thread: RCX = argument (first Win64 parameter).
                 ctx.regs.rcx = argument;
-            } else if let Some(rcx) = state.initial_rcx {
+            } else if state.initial_rcx != 0 {
                 // ntdll-driven init: RCX = CONTEXT* on guest stack,
                 // RDX = ntdll base address. Since RCX != RIP, the platform
                 // uses the NtContinue slow path which restores all registers.
-                ctx.regs.rcx = rcx;
-                if let Some(rdx) = state.initial_rdx {
-                    ctx.regs.rdx = rdx;
-                }
+                ctx.regs.rcx = state.initial_rcx;
+                ctx.regs.rdx = state.initial_rdx;
             } else {
-                // Stub-DLL path: set rcx = rip so the platform uses the sysret
-                // fast path for initial entry.
                 ctx.regs.rcx = state.entry_point;
             }
         }

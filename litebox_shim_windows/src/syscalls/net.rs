@@ -119,7 +119,7 @@ pub(crate) fn dispatch_ws2_syscall(
 /// Look up the socket ID for a WinSock SOCKET handle value.
 /// Returns `None` if the handle doesn't exist or isn't a socket.
 fn sock_id_for_handle(shared: &NtSharedState, handle: u32) -> Option<u32> {
-    let handles = shared.handles.lock().unwrap();
+    let handles = shared.handles.lock();
     match handles.get(handle) {
         Some(crate::handle_table::NtObject::Socket { sock_id }) => Some(*sock_id),
         _ => None,
@@ -129,10 +129,10 @@ fn sock_id_for_handle(shared: &NtSharedState, handle: u32) -> Option<u32> {
 /// Allocate a new socket ID and insert the SocketFd into the socket table.
 /// Returns the allocated socket ID.
 fn insert_socket(shared: &NtSharedState, fd: litebox::net::SocketFd<crate::Platform>) -> u32 {
-    let mut next = shared.next_socket_id.lock().unwrap();
+    let mut next = shared.next_socket_id.lock();
     let id = *next;
     *next = next.wrapping_add(1);
-    shared.sockets.lock().unwrap().insert(id, fd);
+    shared.sockets.lock().insert(id, fd);
     id
 }
 
@@ -196,7 +196,7 @@ fn ws2_socket(
     };
 
     let socket_fd = {
-        let mut net = net_arc.lock().unwrap();
+        let mut net = net_arc.lock();
         match net.socket(protocol) {
             Ok(fd) => fd,
             Err(_) => return wsa_fail(ctx, teb_va, WSAEMFILE),
@@ -205,7 +205,7 @@ fn ws2_socket(
 
     let sock_id = insert_socket(shared, socket_fd);
     let handle = {
-        let mut handles = shared.handles.lock().unwrap();
+        let mut handles = shared.handles.lock();
         handles.insert(crate::handle_table::NtObject::Socket { sock_id })
     };
 
@@ -223,7 +223,7 @@ fn ws2_closesocket(
 
     // Remove from handle table and get socket ID.
     let sock_id = {
-        let mut handles = shared.handles.lock().unwrap();
+        let mut handles = shared.handles.lock();
         match handles.close(sock) {
             Some(crate::handle_table::NtObject::Socket { sock_id }) => sock_id,
             _ => return wsa_fail(ctx, teb_va, WSAENOTSOCK),
@@ -231,12 +231,12 @@ fn ws2_closesocket(
     };
 
     // Remove from socket table — this also provides the SocketFd for close().
-    let Some(socket_fd) = shared.sockets.lock().unwrap().remove(&sock_id) else {
+    let Some(socket_fd) = shared.sockets.lock().remove(&sock_id) else {
         return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
 
     if let Some(net_arc) = shared.net.get() {
-        let mut net = net_arc.lock().unwrap();
+        let mut net = net_arc.lock();
         let _ = net.close(&socket_fd, litebox::net::CloseBehavior::Immediate);
     }
 
@@ -269,11 +269,11 @@ fn ws2_shutdown(
         _ => return wsa_fail(ctx, teb_va, WSAEINVAL),
     };
 
-    let sockets = shared.sockets.lock().unwrap();
+    let sockets = shared.sockets.lock();
     let Some(socket_fd) = sockets.get(&sock_id) else {
         return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
-    let mut net = net_arc.lock().unwrap();
+    let mut net = net_arc.lock();
     match net.shutdown(socket_fd, read, write) {
         Ok(()) => wsa_ok(ctx, teb_va, 0),
         Err(_) => wsa_fail(ctx, teb_va, WSAENOTCONN),
@@ -375,18 +375,22 @@ fn ws2_connect(
     let mut check_progress = false;
     loop {
         let result = {
-            let sockets = shared.sockets.lock().unwrap();
+            let sockets = shared.sockets.lock();
             let Some(socket_fd) = sockets.get(&sock_id) else {
                 return wsa_fail(ctx, teb_va, WSAENOTSOCK);
             };
-            let mut net = net_arc.lock().unwrap();
+            let mut net = net_arc.lock();
             net.connect(socket_fd, &addr, check_progress)
         };
         match result {
             Ok(()) => return wsa_ok(ctx, teb_va, 0),
             Err(litebox::net::errors::ConnectError::InProgress) => {
                 check_progress = true;
-                std::thread::sleep(core::time::Duration::from_millis(1));
+                {
+                    for _ in 0..1_000 {
+                        core::hint::spin_loop();
+                    }
+                };
             }
             Err(litebox::net::errors::ConnectError::TimedOut) => {
                 return wsa_fail(ctx, teb_va, WSAETIMEDOUT);
@@ -427,17 +431,21 @@ fn ws2_send(shared: &NtSharedState, ctx: &mut ExecutionContext, teb_va: usize) -
     // Blocking send: retry on BufferFull.
     loop {
         let result = {
-            let sockets = shared.sockets.lock().unwrap();
+            let sockets = shared.sockets.lock();
             let Some(socket_fd) = sockets.get(&sock_id) else {
                 return wsa_fail(ctx, teb_va, WSAENOTSOCK);
             };
-            let mut net = net_arc.lock().unwrap();
+            let mut net = net_arc.lock();
             net.send(socket_fd, buf, litebox::net::SendFlags::empty(), None)
         };
         match result {
             Ok(n) => return wsa_ok(ctx, teb_va, n),
             Err(litebox::net::errors::SendError::BufferFull) => {
-                std::thread::sleep(core::time::Duration::from_millis(1));
+                {
+                    for _ in 0..1_000 {
+                        core::hint::spin_loop();
+                    }
+                };
             }
             Err(litebox::net::errors::SendError::SocketInInvalidState) => {
                 return wsa_fail(ctx, teb_va, WSAENOTCONN);
@@ -468,18 +476,22 @@ fn ws2_recv(shared: &NtSharedState, ctx: &mut ExecutionContext, teb_va: usize) -
     // Blocking recv: retry while no data and socket is still open.
     loop {
         let result = {
-            let sockets = shared.sockets.lock().unwrap();
+            let sockets = shared.sockets.lock();
             let Some(socket_fd) = sockets.get(&sock_id) else {
                 return wsa_fail(ctx, teb_va, WSAENOTSOCK);
             };
-            let mut net = net_arc.lock().unwrap();
+            let mut net = net_arc.lock();
             net.receive(socket_fd, buf, litebox::net::ReceiveFlags::empty(), None)
         };
         match result {
             Ok(n) if n > 0 => return wsa_ok(ctx, teb_va, n),
             Ok(_) => {
                 // 0 bytes — socket open but no data yet; retry.
-                std::thread::sleep(core::time::Duration::from_millis(1));
+                {
+                    for _ in 0..1_000 {
+                        core::hint::spin_loop();
+                    }
+                };
             }
             Err(litebox::net::errors::ReceiveError::OperationFinished) => {
                 // TCP FIN received — graceful close → return 0.
@@ -525,17 +537,21 @@ fn ws2_sendto(
 
     loop {
         let result = {
-            let sockets = shared.sockets.lock().unwrap();
+            let sockets = shared.sockets.lock();
             let Some(socket_fd) = sockets.get(&sock_id) else {
                 return wsa_fail(ctx, teb_va, WSAENOTSOCK);
             };
-            let mut net = net_arc.lock().unwrap();
+            let mut net = net_arc.lock();
             net.send(socket_fd, buf, litebox::net::SendFlags::empty(), dest)
         };
         match result {
             Ok(n) => return wsa_ok(ctx, teb_va, n),
             Err(litebox::net::errors::SendError::BufferFull) => {
-                std::thread::sleep(core::time::Duration::from_millis(1));
+                {
+                    for _ in 0..1_000 {
+                        core::hint::spin_loop();
+                    }
+                };
             }
             Err(_) => return wsa_fail(ctx, teb_va, WSAENOTCONN),
         }
@@ -574,11 +590,11 @@ fn ws2_recvfrom(
             None
         };
         let result = {
-            let sockets = shared.sockets.lock().unwrap();
+            let sockets = shared.sockets.lock();
             let Some(socket_fd) = sockets.get(&sock_id) else {
                 return wsa_fail(ctx, teb_va, WSAENOTSOCK);
             };
-            let mut net = net_arc.lock().unwrap();
+            let mut net = net_arc.lock();
             net.receive(
                 socket_fd,
                 buf,
@@ -596,7 +612,11 @@ fn ws2_recvfrom(
                 return wsa_ok(ctx, teb_va, n);
             }
             Ok(_) => {
-                std::thread::sleep(core::time::Duration::from_millis(1));
+                {
+                    for _ in 0..1_000 {
+                        core::hint::spin_loop();
+                    }
+                };
             }
             Err(litebox::net::errors::ReceiveError::OperationFinished) => {
                 return wsa_ok(ctx, teb_va, 0);
@@ -629,11 +649,11 @@ fn ws2_bind(shared: &NtSharedState, ctx: &mut ExecutionContext, teb_va: usize) -
         return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
-    let sockets = shared.sockets.lock().unwrap();
+    let sockets = shared.sockets.lock();
     let Some(socket_fd) = sockets.get(&sock_id) else {
         return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
-    let mut net = net_arc.lock().unwrap();
+    let mut net = net_arc.lock();
     match net.bind(socket_fd, &addr) {
         Ok(()) => wsa_ok(ctx, teb_va, 0),
         Err(litebox::net::errors::BindError::PortAlreadyInUse(_)) => {
@@ -664,11 +684,11 @@ fn ws2_listen(
         return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
-    let sockets = shared.sockets.lock().unwrap();
+    let sockets = shared.sockets.lock();
     let Some(socket_fd) = sockets.get(&sock_id) else {
         return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
-    let mut net = net_arc.lock().unwrap();
+    let mut net = net_arc.lock();
     match net.listen(socket_fd, backlog.max(1)) {
         Ok(()) => wsa_ok(ctx, teb_va, 0),
         Err(_) => wsa_fail(ctx, teb_va, WSAEINVAL),
@@ -710,13 +730,13 @@ fn ws2_accept(
             None
         };
         let result = {
-            let sockets = shared.sockets.lock().unwrap();
+            let sockets = shared.sockets.lock();
             let Some(socket_fd) = sockets.get(&sock_id) else {
                 set_last_wsa_error(teb_va, WSAENOTSOCK);
                 ctx.regs.rax = INVALID_SOCKET;
                 return (NtStatus::STATUS_SUCCESS, false);
             };
-            let mut net = net_arc.lock().unwrap();
+            let mut net = net_arc.lock();
             net.accept(socket_fd, peer_ref)
         };
         match result {
@@ -726,7 +746,7 @@ fn ws2_accept(
                 }
                 let new_sock_id = insert_socket(shared, new_fd);
                 let handle = {
-                    let mut handles = shared.handles.lock().unwrap();
+                    let mut handles = shared.handles.lock();
                     handles.insert(crate::handle_table::NtObject::Socket {
                         sock_id: new_sock_id,
                     })
@@ -734,7 +754,11 @@ fn ws2_accept(
                 return wsa_ok(ctx, teb_va, handle as usize);
             }
             Err(litebox::net::errors::AcceptError::NoConnectionsReady) => {
-                std::thread::sleep(core::time::Duration::from_millis(1));
+                {
+                    for _ in 0..1_000 {
+                        core::hint::spin_loop();
+                    }
+                };
             }
             Err(_) => {
                 set_last_wsa_error(teb_va, WSAEINVAL);
@@ -841,11 +865,11 @@ fn ws2_getsockname(
         return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
-    let sockets = shared.sockets.lock().unwrap();
+    let sockets = shared.sockets.lock();
     let Some(socket_fd) = sockets.get(&sock_id) else {
         return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
-    let net = net_arc.lock().unwrap();
+    let net = net_arc.lock();
     match net.get_local_addr(socket_fd) {
         Ok(addr) => {
             write_sockaddr(&addr, name_ptr, namelen_ptr);
@@ -874,11 +898,11 @@ fn ws2_getpeername(
         return wsa_fail(ctx, teb_va, WSANOTINITIALISED);
     };
 
-    let sockets = shared.sockets.lock().unwrap();
+    let sockets = shared.sockets.lock();
     let Some(socket_fd) = sockets.get(&sock_id) else {
         return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
-    let net = net_arc.lock().unwrap();
+    let net = net_arc.lock();
     match net.get_remote_addr(socket_fd) {
         Ok(addr) => {
             write_sockaddr(&addr, name_ptr, namelen_ptr);

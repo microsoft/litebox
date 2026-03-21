@@ -10,10 +10,13 @@
 //! accept pre-looked-up `Arc<T>` objects. The dispatch code in `lib.rs`
 //! locks the handle table briefly to clone the `Arc`, then drops the lock
 //! before calling the handler. This ensures the handle table mutex is never
-//! held while a thread blocks on a Condvar.
+//! held while a thread spins on a poll loop.
 
 use alloc::sync::Arc;
 use core::time::Duration;
+
+use litebox::platform::Instant as _;
+use litebox::platform::TimeProvider as _;
 
 use crate::handle_table::{
     EventObject, HandleTable, KeyedEventObject, NtObject, SemaphoreObject, ThreadObject,
@@ -112,7 +115,7 @@ pub(crate) fn wait_for_keyed_event(
     let timeout_ptr = args.arg3;
     let timeout = read_timeout(timeout_ptr);
 
-    let mut state = keyed.state.lock().unwrap();
+    let mut state = keyed.state.lock();
     let q = state.entry(key).or_default();
 
     // If a pending release token exists (releaser posted before we arrived),
@@ -123,81 +126,61 @@ pub(crate) fn wait_for_keyed_event(
         if q.is_empty() {
             state.remove(&key);
         }
-        keyed.condvar.notify_all();
         return NtStatus::STATUS_SUCCESS;
     }
 
-    // No release available — register as a waiter and block.
+    // No release available — register as a waiter and spin-poll.
     // Only already-registered waiters can consume `ready` slots (set by
     // releasers that found q.waiters > 0). This prevents a new waiter
     // from stealing a ready wake meant for a previously blocked waiter.
     q.waiters += 1;
+    drop(state);
 
-    if let Some(dur) = timeout {
-        let deadline = std::time::Instant::now() + dur;
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                if let Some(q) = state.get_mut(&key) {
-                    q.waiters = q.waiters.saturating_sub(1);
-                    if q.is_empty() {
-                        state.remove(&key);
-                    }
-                }
-                return NtStatus::STATUS_TIMEOUT;
-            }
-            let (guard, _) = keyed.condvar.wait_timeout(state, remaining).unwrap();
-            state = guard;
+    let deadline = timeout.map(|dur| {
+        litebox_platform_multiplex::platform()
+            .now()
+            .checked_add(dur)
+            .expect("keyed event deadline overflow")
+    });
+
+    loop {
+        core::hint::spin_loop();
+        let mut state = keyed.state.lock();
+
+        if let Some(dl) = deadline
+            && litebox_platform_multiplex::platform().now() >= dl
+        {
             if let Some(q) = state.get_mut(&key) {
-                // A releaser found us (already registered) and incremented ready.
-                if q.ready > 0 {
-                    q.ready -= 1;
-                    q.waiters -= 1;
-                    if q.is_empty() {
-                        state.remove(&key);
-                    }
-                    return NtStatus::STATUS_SUCCESS;
+                q.waiters = q.waiters.saturating_sub(1);
+                if q.is_empty() {
+                    state.remove(&key);
                 }
-                // Or a pending release token appeared while we were blocked.
-                if let Some(token) = q.pending_releases.front_mut() {
-                    token.consumed = true;
-                    let _ = q.pending_releases.pop_front();
-                    q.waiters -= 1;
-                    if q.is_empty() {
-                        state.remove(&key);
-                    }
-                    keyed.condvar.notify_all();
-                    return NtStatus::STATUS_SUCCESS;
-                }
-            } else {
-                return NtStatus::STATUS_SUCCESS;
             }
+            return NtStatus::STATUS_TIMEOUT;
         }
-    } else {
-        loop {
-            state = keyed.condvar.wait(state).unwrap();
-            if let Some(q) = state.get_mut(&key) {
-                if q.ready > 0 {
-                    q.ready -= 1;
-                    q.waiters -= 1;
-                    if q.is_empty() {
-                        state.remove(&key);
-                    }
-                    return NtStatus::STATUS_SUCCESS;
+
+        if let Some(q) = state.get_mut(&key) {
+            // A releaser found us (already registered) and incremented ready.
+            if q.ready > 0 {
+                q.ready -= 1;
+                q.waiters -= 1;
+                if q.is_empty() {
+                    state.remove(&key);
                 }
-                if let Some(token) = q.pending_releases.front_mut() {
-                    token.consumed = true;
-                    let _ = q.pending_releases.pop_front();
-                    q.waiters -= 1;
-                    if q.is_empty() {
-                        state.remove(&key);
-                    }
-                    keyed.condvar.notify_all();
-                    return NtStatus::STATUS_SUCCESS;
-                }
-            } else {
                 return NtStatus::STATUS_SUCCESS;
             }
+            // Or a pending release token appeared while we were spinning.
+            if let Some(token) = q.pending_releases.front_mut() {
+                token.consumed = true;
+                let _ = q.pending_releases.pop_front();
+                q.waiters -= 1;
+                if q.is_empty() {
+                    state.remove(&key);
+                }
+                return NtStatus::STATUS_SUCCESS;
+            }
+        } else {
+            return NtStatus::STATUS_SUCCESS;
         }
     }
 }
@@ -221,58 +204,54 @@ pub(crate) fn release_keyed_event(
 
     let timeout = read_timeout(timeout_ptr);
 
-    let mut state = keyed.state.lock().unwrap();
+    let mut state = keyed.state.lock();
     let q = state.entry(key).or_default();
 
     if q.waiters > q.ready {
         // An unmatched blocked waiter exists — increment ready to wake exactly one.
         q.ready += 1;
-        keyed.condvar.notify_all();
         return NtStatus::STATUS_SUCCESS;
     }
 
-    // No waiter yet — push a per-releaser token and block until consumed.
+    // No waiter yet — push a per-releaser token and spin-poll until consumed.
     let my_id = keyed.alloc_release_id();
     q.pending_releases.push_back(ReleaseToken {
         id: my_id,
         consumed: false,
     });
+    drop(state);
 
-    if let Some(dur) = timeout {
-        let deadline = std::time::Instant::now() + dur;
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                // Timeout — retract our specific token if still present.
-                if let Some(q) = state.get_mut(&key) {
-                    q.pending_releases.retain(|t| t.id != my_id);
-                    if q.is_empty() {
-                        state.remove(&key);
-                    }
+    let deadline = timeout.map(|dur| {
+        litebox_platform_multiplex::platform()
+            .now()
+            .checked_add(dur)
+            .expect("keyed event release deadline overflow")
+    });
+
+    loop {
+        core::hint::spin_loop();
+        let mut state = keyed.state.lock();
+
+        if let Some(dl) = deadline
+            && litebox_platform_multiplex::platform().now() >= dl
+        {
+            // Timeout — retract our specific token if still present.
+            if let Some(q) = state.get_mut(&key) {
+                q.pending_releases.retain(|t| t.id != my_id);
+                if q.is_empty() {
+                    state.remove(&key);
                 }
-                return NtStatus::STATUS_TIMEOUT;
             }
-            let (guard, _) = keyed.condvar.wait_timeout(state, remaining).unwrap();
-            state = guard;
-            // Check if our specific token was consumed (removed from queue).
-            if let Some(q) = state.get(&key) {
-                if !q.pending_releases.iter().any(|t| t.id == my_id) {
-                    return NtStatus::STATUS_SUCCESS;
-                }
-            } else {
-                return NtStatus::STATUS_SUCCESS;
-            }
+            return NtStatus::STATUS_TIMEOUT;
         }
-    } else {
-        loop {
-            state = keyed.condvar.wait(state).unwrap();
-            if let Some(q) = state.get(&key) {
-                if !q.pending_releases.iter().any(|t| t.id == my_id) {
-                    return NtStatus::STATUS_SUCCESS;
-                }
-            } else {
+
+        // Check if our specific token was consumed (removed from queue).
+        if let Some(q) = state.get(&key) {
+            if !q.pending_releases.iter().any(|t| t.id == my_id) {
                 return NtStatus::STATUS_SUCCESS;
             }
+        } else {
+            return NtStatus::STATUS_SUCCESS;
         }
     }
 }
@@ -329,15 +308,10 @@ pub(crate) fn nt_set_event(
         _ => return NtStatus::STATUS_INVALID_HANDLE,
     };
 
-    let mut signaled = event.state.lock().unwrap();
+    let mut signaled = event.state.lock();
     let prev = *signaled as i32;
     *signaled = true;
-
-    if event.manual_reset {
-        event.condvar.notify_all();
-    } else {
-        event.condvar.notify_one();
-    }
+    // Spin-polling waiters will see the updated state on their next iteration.
 
     if prev_state_va != 0 {
         unsafe {
@@ -366,7 +340,7 @@ pub(crate) fn nt_reset_event(
         _ => return NtStatus::STATUS_INVALID_HANDLE,
     };
 
-    let mut signaled = event.state.lock().unwrap();
+    let mut signaled = event.state.lock();
     let prev = *signaled as i32;
     *signaled = false;
 
@@ -392,7 +366,7 @@ pub(crate) fn nt_clear_event(
         _ => return NtStatus::STATUS_INVALID_HANDLE,
     };
 
-    let mut signaled = event.state.lock().unwrap();
+    let mut signaled = event.state.lock();
     *signaled = false;
 
     NtStatus::STATUS_SUCCESS
@@ -447,7 +421,7 @@ pub(crate) fn nt_release_semaphore(
         _ => return NtStatus::STATUS_INVALID_HANDLE,
     };
 
-    let mut count = sem.state.lock().unwrap();
+    let mut count = sem.state.lock();
     let prev = *count;
 
     if release_count <= 0 || prev + release_count > sem.max_count {
@@ -455,11 +429,7 @@ pub(crate) fn nt_release_semaphore(
     }
 
     *count = prev + release_count;
-
-    // Wake up to release_count waiters.
-    for _ in 0..release_count {
-        sem.condvar.notify_one();
-    }
+    // Spin-polling waiters will see the updated count on their next iteration.
 
     if prev_count_va != 0 {
         unsafe {
@@ -523,7 +493,7 @@ pub(crate) fn wait_thread_with_timeout(
 /// Returns STATUS_WAIT_0 + index (for WaitAny) or STATUS_SUCCESS (for WaitAll).
 pub(crate) fn nt_wait_for_multiple_objects(
     ctx: &mut super::super::ExecutionContext,
-    handles_mutex: &std::sync::Mutex<HandleTable>,
+    handles_mutex: &spin::Mutex<HandleTable>,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let count = args.arg0;
@@ -543,11 +513,16 @@ pub(crate) fn nt_wait_for_multiple_objects(
 
     if wait_type == 1 {
         // WaitAny: poll each handle, return first signaled.
-        let deadline = timeout.map(|dur| std::time::Instant::now() + dur);
+        let deadline = timeout.map(|dur| {
+            litebox_platform_multiplex::platform()
+                .now()
+                .checked_add(dur)
+                .expect("wait deadline overflow")
+        });
 
         // Validate all handles upfront.
         {
-            let handles = handles_mutex.lock().unwrap();
+            let handles = handles_mutex.lock();
             for &h in handle_array {
                 match handles.get(h) {
                     Some(NtObject::Event(_) | NtObject::Semaphore(_) | NtObject::Thread(_)) => {}
@@ -558,11 +533,11 @@ pub(crate) fn nt_wait_for_multiple_objects(
 
         loop {
             {
-                let handles = handles_mutex.lock().unwrap();
+                let handles = handles_mutex.lock();
                 for (i, &h) in handle_array.iter().enumerate() {
                     match handles.get(h) {
                         Some(NtObject::Event(e)) => {
-                            let mut signaled = e.state.lock().unwrap();
+                            let mut signaled = e.state.lock();
                             if *signaled {
                                 if !e.manual_reset {
                                     *signaled = false;
@@ -572,7 +547,7 @@ pub(crate) fn nt_wait_for_multiple_objects(
                             }
                         }
                         Some(NtObject::Semaphore(s)) => {
-                            let mut count = s.state.lock().unwrap();
+                            let mut count = s.state.lock();
                             if *count > 0 {
                                 *count -= 1;
                                 return NtStatus(i as i32);
@@ -589,13 +564,13 @@ pub(crate) fn nt_wait_for_multiple_objects(
             } // handle table lock dropped
 
             if let Some(dl) = deadline
-                && std::time::Instant::now() >= dl
+                && litebox_platform_multiplex::platform().now() >= dl
             {
                 return NtStatus::STATUS_TIMEOUT;
             }
 
             // Yield before retrying.
-            std::thread::sleep(Duration::from_millis(1));
+            core::hint::spin_loop();
         }
     } else {
         // WaitAll: atomically check and consume all handles in one pass.
@@ -603,11 +578,16 @@ pub(crate) fn nt_wait_for_multiple_objects(
         // in different orders, we sort objects by raw pointer address before
         // locking. We also deduplicate aliased handles (same Arc) to avoid
         // self-deadlock.
-        let deadline = timeout.map(|dur| std::time::Instant::now() + dur);
+        let deadline = timeout.map(|dur| {
+            litebox_platform_multiplex::platform()
+                .now()
+                .checked_add(dur)
+                .expect("wait deadline overflow")
+        });
 
         // Pre-extract Arc references.
         let waitables: alloc::vec::Vec<Waitable> = {
-            let handles = handles_mutex.lock().unwrap();
+            let handles = handles_mutex.lock();
             let mut v = alloc::vec::Vec::with_capacity(handle_array.len());
             for &h in handle_array {
                 match handles.get(h) {
@@ -635,27 +615,25 @@ pub(crate) fn nt_wait_for_multiple_objects(
         loop {
             // Lock unique objects in sorted address order, check all signaled.
             let all_signaled = {
-                let mut event_guards: alloc::vec::Vec<(usize, std::sync::MutexGuard<'_, bool>)> =
+                let mut event_guards: alloc::vec::Vec<(usize, spin::MutexGuard<'_, bool>)> =
                     alloc::vec::Vec::new();
-                let mut sem_guards: alloc::vec::Vec<(usize, std::sync::MutexGuard<'_, i32>)> =
+                let mut sem_guards: alloc::vec::Vec<(usize, spin::MutexGuard<'_, i32>)> =
                     alloc::vec::Vec::new();
-                let mut thread_guards: alloc::vec::Vec<(
-                    usize,
-                    std::sync::MutexGuard<'_, Option<i32>>,
-                )> = alloc::vec::Vec::new();
+                let mut thread_guards: alloc::vec::Vec<(usize, spin::MutexGuard<'_, Option<i32>>)> =
+                    alloc::vec::Vec::new();
 
                 let mut ok = true;
                 for &(addr, idx) in &unique_indices {
                     match &waitables[idx] {
                         Waitable::Event(e) => {
-                            let g = e.state.lock().unwrap();
+                            let g = e.state.lock();
                             if !*g {
                                 ok = false;
                             }
                             event_guards.push((addr, g));
                         }
                         Waitable::Semaphore(s) => {
-                            let g = s.state.lock().unwrap();
+                            let g = s.state.lock();
                             let occurrences = waitables
                                 .iter()
                                 .filter(|w| matches!(w, Waitable::Semaphore(s2) if Arc::as_ptr(s2) as usize == addr))
@@ -666,7 +644,7 @@ pub(crate) fn nt_wait_for_multiple_objects(
                             sem_guards.push((addr, g));
                         }
                         Waitable::Thread(t) => {
-                            let g = t.exit_status.lock().unwrap();
+                            let g = t.exit_status.lock();
                             if g.is_none() {
                                 ok = false;
                             }
@@ -713,12 +691,12 @@ pub(crate) fn nt_wait_for_multiple_objects(
             }
 
             if let Some(dl) = deadline
-                && std::time::Instant::now() >= dl
+                && litebox_platform_multiplex::platform().now() >= dl
             {
                 return NtStatus::STATUS_TIMEOUT;
             }
 
-            std::thread::sleep(Duration::from_millis(1));
+            core::hint::spin_loop();
         }
     }
 }
@@ -727,92 +705,88 @@ pub(crate) fn nt_wait_for_multiple_objects(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Wait on an event object.
+/// Wait on an event object using spin-polling.
 fn wait_event(event: &Arc<EventObject>, timeout: Option<Duration>) -> NtStatus {
-    let mut signaled = event.state.lock().unwrap();
+    let deadline = timeout.map(|dur| {
+        litebox_platform_multiplex::platform()
+            .now()
+            .checked_add(dur)
+            .expect("event wait deadline overflow")
+    });
 
-    if let Some(dur) = timeout {
-        let deadline = std::time::Instant::now() + dur;
-        loop {
+    loop {
+        {
+            let mut signaled = event.state.lock();
             if *signaled {
                 if !event.manual_reset {
                     *signaled = false;
                 }
                 return NtStatus::STATUS_SUCCESS;
             }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return NtStatus::STATUS_TIMEOUT;
-            }
-            let (guard, _) = event.condvar.wait_timeout(signaled, remaining).unwrap();
-            signaled = guard;
         }
-    } else {
-        loop {
-            if *signaled {
-                if !event.manual_reset {
-                    *signaled = false;
-                }
-                return NtStatus::STATUS_SUCCESS;
-            }
-            signaled = event.condvar.wait(signaled).unwrap();
+
+        if let Some(dl) = deadline
+            && litebox_platform_multiplex::platform().now() >= dl
+        {
+            return NtStatus::STATUS_TIMEOUT;
         }
+
+        core::hint::spin_loop();
     }
 }
 
-/// Wait on a semaphore object.
+/// Wait on a semaphore object using spin-polling.
 fn wait_semaphore(sem: &Arc<SemaphoreObject>, timeout: Option<Duration>) -> NtStatus {
-    let mut count = sem.state.lock().unwrap();
+    let deadline = timeout.map(|dur| {
+        litebox_platform_multiplex::platform()
+            .now()
+            .checked_add(dur)
+            .expect("semaphore wait deadline overflow")
+    });
 
-    if let Some(dur) = timeout {
-        let deadline = std::time::Instant::now() + dur;
-        loop {
+    loop {
+        {
+            let mut count = sem.state.lock();
             if *count > 0 {
                 *count -= 1;
                 return NtStatus::STATUS_SUCCESS;
             }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return NtStatus::STATUS_TIMEOUT;
-            }
-            let (guard, _) = sem.condvar.wait_timeout(count, remaining).unwrap();
-            count = guard;
         }
-    } else {
-        loop {
-            if *count > 0 {
-                *count -= 1;
-                return NtStatus::STATUS_SUCCESS;
-            }
-            count = sem.condvar.wait(count).unwrap();
+
+        if let Some(dl) = deadline
+            && litebox_platform_multiplex::platform().now() >= dl
+        {
+            return NtStatus::STATUS_TIMEOUT;
         }
+
+        core::hint::spin_loop();
     }
 }
 
 /// Wait for a thread to exit. A thread object becomes signaled when it terminates.
 fn wait_thread(thread: &Arc<ThreadObject>, timeout: Option<Duration>) -> NtStatus {
-    let mut status = thread.exit_status.lock().unwrap();
+    let deadline = timeout.map(|dur| {
+        litebox_platform_multiplex::platform()
+            .now()
+            .checked_add(dur)
+            .expect("thread wait deadline overflow")
+    });
 
-    if let Some(dur) = timeout {
-        let deadline = std::time::Instant::now() + dur;
-        loop {
+    loop {
+        {
+            let status = thread.exit_status.lock();
             if status.is_some() {
                 return NtStatus::STATUS_SUCCESS;
             }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return NtStatus::STATUS_TIMEOUT;
-            }
-            let (guard, _) = thread.condvar.wait_timeout(status, remaining).unwrap();
-            status = guard;
         }
-    } else {
-        loop {
-            if status.is_some() {
-                return NtStatus::STATUS_SUCCESS;
-            }
-            status = thread.condvar.wait(status).unwrap();
+
+        if let Some(dl) = deadline
+            && litebox_platform_multiplex::platform().now() >= dl
+        {
+            return NtStatus::STATUS_TIMEOUT;
         }
+
+        core::hint::spin_loop();
     }
 }
 

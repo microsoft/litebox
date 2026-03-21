@@ -22,446 +22,6 @@ use crate::handle_table::{HandleTable, NtObject};
 use super::NtSyscallArgs;
 
 // ========================================================================
-// Host file operations (Windows FFI)
-// ========================================================================
-
-#[cfg(target_os = "windows")]
-pub(crate) mod host {
-    /// INVALID_HANDLE_VALUE
-    pub const INVALID_HANDLE: usize = usize::MAX;
-
-    /// FILE_ATTRIBUTE_DIRECTORY
-    pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-    /// INVALID_FILE_ATTRIBUTES (GetFileAttributesW failure sentinel).
-    pub const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
-
-    /// Query file attributes on the host. Returns INVALID_FILE_ATTRIBUTES
-    /// on failure.
-    pub fn get_file_attributes(path: &str) -> u32 {
-        use alloc::vec::Vec;
-
-        unsafe extern "system" {
-            fn GetFileAttributesW(name: *const u16) -> u32;
-        }
-
-        let mut wide: Vec<u16> = path.encode_utf16().collect();
-        wide.push(0);
-        unsafe { GetFileAttributesW(wide.as_ptr()) }
-    }
-
-    /// Get the last Win32 error code.
-    pub fn get_last_error() -> u32 {
-        unsafe extern "system" {
-            fn GetLastError() -> u32;
-        }
-        unsafe { GetLastError() }
-    }
-
-    /// Create a directory on the host. Returns 0 on success, or a Win32 error code.
-    pub fn create_directory(path: &str) -> u32 {
-        use alloc::vec::Vec;
-
-        unsafe extern "system" {
-            fn CreateDirectoryW(name: *const u16, security: usize) -> i32;
-        }
-
-        let mut wide: Vec<u16> = path.encode_utf16().collect();
-        wide.push(0);
-        if unsafe { CreateDirectoryW(wide.as_ptr(), 0) } != 0 {
-            0 // success
-        } else {
-            get_last_error()
-        }
-    }
-
-    /// Open a file on the host. `disposition` is the Win32 creation disposition
-    /// (CREATE_NEW=1, CREATE_ALWAYS=2, OPEN_EXISTING=3, OPEN_ALWAYS=4,
-    /// TRUNCATE_EXISTING=5). `share_mode` and `flags_and_attrs` are passed
-    /// through to the host CreateFileW. Returns a Windows HANDLE as usize, or
-    /// INVALID_HANDLE on failure.
-    pub fn open_file(
-        path: &str,
-        read: bool,
-        write: bool,
-        disposition: u32,
-        share_mode: u32,
-        flags_and_attrs: u32,
-    ) -> usize {
-        use alloc::vec::Vec;
-
-        unsafe extern "system" {
-            fn CreateFileW(
-                name: *const u16,
-                access: u32,
-                share_mode: u32,
-                security: usize,
-                disposition: u32,
-                flags: u32,
-                template: usize,
-            ) -> usize;
-        }
-
-        let mut wide: Vec<u16> = path.encode_utf16().collect();
-        wide.push(0);
-
-        let access = if read && write {
-            0x8000_0000u32 | 0x4000_0000 // GENERIC_READ | GENERIC_WRITE
-        } else if write {
-            0x4000_0000 // GENERIC_WRITE
-        } else {
-            0x8000_0000 // GENERIC_READ
-        };
-
-        // Default to FILE_ATTRIBUTE_NORMAL if the caller passed 0 for attrs.
-        let flags = if flags_and_attrs == 0 {
-            0x80
-        } else {
-            flags_and_attrs
-        };
-
-        unsafe { CreateFileW(wide.as_ptr(), access, share_mode, 0, disposition, flags, 0) }
-    }
-
-    /// Read bytes from a host file handle.
-    /// Read bytes from a host file handle at an explicit byte offset.
-    ///
-    /// Uses OVERLAPPED to specify the file position so that the host kernel's
-    /// implicit file pointer is never consulted. This makes the caller's
-    /// cached position the single source of truth.
-    pub fn read_file_at(handle: usize, buf: *mut u8, len: u32, offset: u64) -> (bool, u32) {
-        unsafe extern "system" {
-            fn ReadFile(
-                handle: usize,
-                buffer: *mut u8,
-                bytes_to_read: u32,
-                bytes_read: *mut u32,
-                overlapped: usize,
-            ) -> i32;
-        }
-
-        #[repr(C)]
-        struct Overlapped {
-            internal: usize,
-            internal_high: usize,
-            offset_low: u32,
-            offset_high: u32,
-            h_event: usize,
-        }
-
-        let mut ovl = Overlapped {
-            internal: 0,
-            internal_high: 0,
-            offset_low: offset as u32,
-            offset_high: (offset >> 32) as u32,
-            h_event: 0,
-        };
-        let mut bytes_read: u32 = 0;
-        // Safety: overlapped pointer is valid for the duration of the call.
-        let ok = unsafe { ReadFile(handle, buf, len, &raw mut bytes_read, &raw mut ovl as usize) };
-        (ok != 0, bytes_read)
-    }
-
-    /// Read bytes from the host's stdin handle.
-    pub fn read_stdin(buf: *mut u8, len: u32) -> (bool, u32) {
-        unsafe extern "system" {
-            fn GetStdHandle(n: u32) -> usize;
-            fn ReadFile(
-                handle: usize,
-                buffer: *mut u8,
-                bytes_to_read: u32,
-                bytes_read: *mut u32,
-                overlapped: usize,
-            ) -> i32;
-        }
-
-        let stdin = unsafe { GetStdHandle(0xFFFF_FFF6) }; // STD_INPUT_HANDLE
-        if stdin == 0 || stdin == usize::MAX {
-            return (false, 0);
-        }
-        let mut bytes_read: u32 = 0;
-        let ok = unsafe { ReadFile(stdin, buf, len, &raw mut bytes_read, 0) };
-        (ok != 0, bytes_read)
-    }
-
-    /// Write bytes to a host file handle at an explicit byte offset.
-    ///
-    /// Uses OVERLAPPED to specify the file position so that the host kernel's
-    /// implicit file pointer is never consulted.
-    pub fn write_file_at(handle: usize, buf: *const u8, len: u32, offset: u64) -> (bool, u32) {
-        unsafe extern "system" {
-            fn WriteFile(
-                handle: usize,
-                buffer: *const u8,
-                bytes_to_write: u32,
-                bytes_written: *mut u32,
-                overlapped: usize,
-            ) -> i32;
-        }
-
-        #[repr(C)]
-        struct Overlapped {
-            internal: usize,
-            internal_high: usize,
-            offset_low: u32,
-            offset_high: u32,
-            h_event: usize,
-        }
-
-        let mut ovl = Overlapped {
-            internal: 0,
-            internal_high: 0,
-            offset_low: offset as u32,
-            offset_high: (offset >> 32) as u32,
-            h_event: 0,
-        };
-        let mut bytes_written: u32 = 0;
-        // Safety: overlapped pointer is valid for the duration of the call.
-        let ok = unsafe {
-            WriteFile(
-                handle,
-                buf,
-                len,
-                &raw mut bytes_written,
-                &raw mut ovl as usize,
-            )
-        };
-        (ok != 0, bytes_written)
-    }
-
-    /// Get file size in bytes. Returns -1 on failure.
-    pub fn get_file_size(handle: usize) -> i64 {
-        unsafe extern "system" {
-            fn GetFileSizeEx(handle: usize, size: *mut i64) -> i32;
-        }
-
-        let mut size: i64 = 0;
-        let ok = unsafe { GetFileSizeEx(handle, &raw mut size) };
-        if ok != 0 { size } else { -1 }
-    }
-
-    /// Set file position. Returns new position or -1 on failure.
-    pub fn set_file_position(handle: usize, offset: i64, method: u32) -> i64 {
-        unsafe extern "system" {
-            fn SetFilePointerEx(
-                handle: usize,
-                distance: i64,
-                new_pointer: *mut i64,
-                method: u32,
-            ) -> i32;
-        }
-
-        let mut new_pos: i64 = 0;
-        let ok = unsafe { SetFilePointerEx(handle, offset, &raw mut new_pos, method) };
-        if ok != 0 { new_pos } else { -1 }
-    }
-
-    /// Set end-of-file at the given position.
-    pub fn set_end_of_file(handle: usize, position: i64) -> bool {
-        unsafe extern "system" {
-            fn SetFilePointerEx(
-                handle: usize,
-                distance: i64,
-                new_pointer: *mut i64,
-                method: u32,
-            ) -> i32;
-            fn SetEndOfFile(handle: usize) -> i32;
-        }
-
-        // First seek to the position, then set EOF there.
-        let ok = unsafe { SetFilePointerEx(handle, position, core::ptr::null_mut(), 0) };
-        if ok == 0 {
-            return false;
-        }
-        unsafe { SetEndOfFile(handle) != 0 }
-    }
-
-    /// Get file attributes/times.
-    pub fn get_file_info(handle: usize) -> Option<(u32, i64, i64, i64, i64)> {
-        #[repr(C)]
-        struct ByHandleFileInformation {
-            attributes: u32,
-            creation_time_low: u32,
-            creation_time_high: u32,
-            last_access_time_low: u32,
-            last_access_time_high: u32,
-            last_write_time_low: u32,
-            last_write_time_high: u32,
-            volume_serial: u32,
-            size_high: u32,
-            size_low: u32,
-            num_links: u32,
-            file_index_high: u32,
-            file_index_low: u32,
-        }
-
-        unsafe extern "system" {
-            fn GetFileInformationByHandle(handle: usize, info: *mut ByHandleFileInformation)
-            -> i32;
-        }
-
-        let mut info = core::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
-        let ok = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
-        if ok == 0 {
-            return None;
-        }
-        let info = unsafe { info.assume_init() };
-        let ft = |low: u32, high: u32| -> i64 { ((high as i64) << 32) | (low as i64) };
-        Some((
-            info.attributes,
-            ft(info.creation_time_low, info.creation_time_high),
-            ft(info.last_access_time_low, info.last_access_time_high),
-            ft(info.last_write_time_low, info.last_write_time_high),
-            ft(info.last_write_time_low, info.last_write_time_high), // change = write
-        ))
-    }
-
-    /// A single directory entry returned by `find_files`.
-    pub struct FindFileEntry {
-        pub name: alloc::string::String,
-        pub attributes: u32,
-        pub file_size: i64,
-        pub creation_time: i64,
-        pub last_access_time: i64,
-        pub last_write_time: i64,
-    }
-
-    /// Enumerate directory entries matching a search pattern (e.g. "C:\\dir\\*").
-    pub fn find_files(pattern: &str) -> alloc::vec::Vec<FindFileEntry> {
-        use alloc::vec::Vec;
-
-        #[repr(C)]
-        struct Win32FindDataW {
-            attributes: u32,
-            creation_time_low: u32,
-            creation_time_high: u32,
-            last_access_time_low: u32,
-            last_access_time_high: u32,
-            last_write_time_low: u32,
-            last_write_time_high: u32,
-            size_high: u32,
-            size_low: u32,
-            _reserved0: u32,
-            _reserved1: u32,
-            file_name: [u16; 260],
-            alternate_name: [u16; 14],
-        }
-
-        unsafe extern "system" {
-            fn FindFirstFileW(name: *const u16, data: *mut Win32FindDataW) -> usize;
-            fn FindNextFileW(handle: usize, data: *mut Win32FindDataW) -> i32;
-            fn FindClose(handle: usize) -> i32;
-        }
-
-        const INVALID_HANDLE_VALUE: usize = usize::MAX;
-
-        let mut wide: Vec<u16> = pattern.encode_utf16().collect();
-        wide.push(0);
-
-        let mut results = Vec::new();
-        let mut data = core::mem::MaybeUninit::<Win32FindDataW>::uninit();
-
-        // Safety: FFI call with valid aligned buffer.
-        let find_handle = unsafe { FindFirstFileW(wide.as_ptr(), data.as_mut_ptr()) };
-        if find_handle == INVALID_HANDLE_VALUE {
-            return results;
-        }
-
-        let ft = |low: u32, high: u32| -> i64 { ((high as i64) << 32) | (low as i64) };
-
-        loop {
-            let d = unsafe { data.assume_init_ref() };
-            // Read the NUL-terminated filename.
-            let name_len = d.file_name.iter().position(|&c| c == 0).unwrap_or(260);
-            let name = alloc::string::String::from_utf16_lossy(&d.file_name[..name_len]);
-
-            results.push(FindFileEntry {
-                name,
-                attributes: d.attributes,
-                file_size: ((d.size_high as i64) << 32) | (d.size_low as i64),
-                creation_time: ft(d.creation_time_low, d.creation_time_high),
-                last_access_time: ft(d.last_access_time_low, d.last_access_time_high),
-                last_write_time: ft(d.last_write_time_low, d.last_write_time_high),
-            });
-
-            // Safety: FFI call.
-            if unsafe { FindNextFileW(find_handle, data.as_mut_ptr()) } == 0 {
-                break;
-            }
-        }
-
-        // Safety: FFI call.
-        unsafe {
-            FindClose(find_handle);
-        }
-        results
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) mod host {
-    pub const INVALID_HANDLE: usize = usize::MAX;
-    pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-    pub const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
-    pub fn get_file_attributes(_path: &str) -> u32 {
-        INVALID_FILE_ATTRIBUTES
-    }
-    pub fn get_last_error() -> u32 {
-        2 // ERROR_FILE_NOT_FOUND
-    }
-    pub fn create_directory(_path: &str) -> u32 {
-        5 // ERROR_ACCESS_DENIED
-    }
-    pub fn open_file(
-        _path: &str,
-        _read: bool,
-        _write: bool,
-        _disposition: u32,
-        _share_mode: u32,
-        _flags_and_attrs: u32,
-    ) -> usize {
-        INVALID_HANDLE
-    }
-    pub fn read_file(_handle: usize, _buf: *mut u8, _len: u32) -> (bool, u32) {
-        (false, 0)
-    }
-    pub fn read_file_at(_handle: usize, _buf: *mut u8, _len: u32, _offset: u64) -> (bool, u32) {
-        (false, 0)
-    }
-    pub fn read_stdin(_buf: *mut u8, _len: u32) -> (bool, u32) {
-        (false, 0)
-    }
-    pub fn write_file(_handle: usize, _buf: *const u8, _len: u32) -> (bool, u32) {
-        (false, 0)
-    }
-    pub fn write_file_at(_handle: usize, _buf: *const u8, _len: u32, _offset: u64) -> (bool, u32) {
-        (false, 0)
-    }
-    pub fn get_file_size(_handle: usize) -> i64 {
-        -1
-    }
-    pub fn set_file_position(_handle: usize, _offset: i64, _method: u32) -> i64 {
-        -1
-    }
-    pub fn set_end_of_file(_handle: usize, _position: i64) -> bool {
-        false
-    }
-    pub fn get_file_info(_handle: usize) -> Option<(u32, i64, i64, i64, i64)> {
-        None
-    }
-    pub struct FindFileEntry {
-        pub name: alloc::string::String,
-        pub attributes: u32,
-        pub file_size: i64,
-        pub creation_time: i64,
-        pub last_access_time: i64,
-        pub last_write_time: i64,
-    }
-    pub fn find_files(_pattern: &str) -> alloc::vec::Vec<FindFileEntry> {
-        alloc::vec::Vec::new()
-    }
-}
-
-// ========================================================================
 // NT-style wildcard matching
 // ========================================================================
 
@@ -620,33 +180,6 @@ pub(crate) fn drive_path_to_vfs(path: &str) -> Option<TranslatedPath> {
     };
     let vfs = alloc::format!("/{drive}{}", rest.replace('\\', "/").to_ascii_lowercase());
     Some(TranslatedPath::Vfs(vfs))
-}
-
-/// Legacy: translate NT path to a host path string.
-/// Used by code that hasn't been migrated to VFS yet.
-pub(crate) fn translate_nt_path_to_host(nt_path: &str) -> Option<String> {
-    // Strip common NT prefixes.
-    if let Some(rest) = nt_path.strip_prefix("\\??\\") {
-        if let Some(stripped) = rest.strip_prefix("UNC\\") {
-            return Some(String::from("\\\\") + stripped);
-        }
-        return Some(String::from(rest));
-    }
-    if let Some(rest) = nt_path.strip_prefix("\\DosDevices\\") {
-        return Some(String::from(rest));
-    }
-    if let Some(rest) = nt_path.strip_prefix("\\SystemRoot\\") {
-        return Some(String::from("C:\\Windows\\") + rest);
-    }
-    if let Some(rest) = nt_path.strip_prefix("\\SystemRoot")
-        && rest.is_empty()
-    {
-        return Some(String::from("C:\\Windows"));
-    }
-    if nt_path.len() >= 3 && nt_path.as_bytes()[1] == b':' {
-        return Some(String::from(nt_path));
-    }
-    None
 }
 
 /// Read a UNICODE_STRING from guest memory and return the string contents.
@@ -972,15 +505,14 @@ pub(crate) fn nt_create_file(
             ) {
                 Ok(typed_fd) => {
                     let raw_fd = {
-                        let mut rds = shared.raw_fds.lock().unwrap();
+                        let mut rds = shared.raw_fds.lock();
                         rds.fd_into_raw_integer(typed_fd)
                     };
                     let handle = handles.insert(NtObject::File {
                         path: nt_path,
-                        host_handle: 0, // Not a host handle — using VFS fd
                         position: Arc::new(AtomicU64::new(0)),
-                        raw_fd: Some(raw_fd),
-                        vfs_refcount: Some(Arc::new(core::sync::atomic::AtomicUsize::new(1))),
+                        raw_fd,
+                        vfs_refcount: Arc::new(core::sync::atomic::AtomicUsize::new(1)),
                     });
                     unsafe {
                         core::ptr::write(handle_out_ptr as *mut u32, handle);
@@ -1009,196 +541,29 @@ pub(crate) fn nt_create_file(
                     }
                     return NtStatus::STATUS_SUCCESS;
                 }
-                Err(_e) => {
-                    // VFS open failed — fall through to host.
+                Err(e) => {
+                    // VFS open failed — authoritative error, no host fallback.
                     #[cfg(debug_assertions)]
                     {
                         use litebox::platform::DebugLogProvider as _;
                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                                "NT shim: NtCreateFile VFS miss path={path:?}, falling through to host\n",
-                            ));
+                            "NT shim: NtCreateFile VFS error path={path:?} err={e:?}\n",
+                        ));
                     }
+                    return map_open_error_to_ntstatus(&e);
                 }
             }
         }
     }
 
-    // ── Host fallback path ──────────────────────────────────────────
-
-    // Translate NT path to host path for legacy host FFI.
-    let Some(host_path) = translate_nt_path_to_host(&nt_path) else {
-        #[cfg(debug_assertions)]
-        {
-            use litebox::platform::DebugLogProvider as _;
-            let msg = alloc::format!("NT shim: NtCreateFile path not translatable: {nt_path:?}\n");
-            litebox_platform_multiplex::platform().debug_log_print(&msg);
-        }
-        return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
-    };
-
-    if is_directory {
-        let attrs = host::get_file_attributes(&host_path);
-        let dir_exists =
-            attrs != host::INVALID_FILE_ATTRIBUTES && attrs & host::FILE_ATTRIBUTE_DIRECTORY != 0;
-
-        match create_disposition {
-            file_disposition::FILE_OPEN => {
-                // Must exist.
-                if !dir_exists {
-                    return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
-                }
-            }
-            file_disposition::FILE_CREATE => {
-                // Must NOT exist.
-                if dir_exists {
-                    return NtStatus::STATUS_OBJECT_NAME_COLLISION;
-                }
-                // Create the directory on the host.
-                let err = host::create_directory(&host_path);
-                if err != 0 {
-                    return map_win32_error_to_ntstatus(err);
-                }
-            }
-            file_disposition::FILE_OPEN_IF => {
-                // Open if exists, create if missing.
-                if !dir_exists {
-                    let err = host::create_directory(&host_path);
-                    if err != 0 {
-                        return map_win32_error_to_ntstatus(err);
-                    }
-                }
-            }
-            _ => {
-                // FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF don't
-                // apply to directories — treat as "open existing".
-                if !dir_exists {
-                    return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
-                }
-            }
-        }
-
-        // Validate it's actually a directory (may have just been created).
-        if !dir_exists {
-            let check = host::get_file_attributes(&host_path);
-            if check == host::INVALID_FILE_ATTRIBUTES || check & host::FILE_ATTRIBUTE_DIRECTORY == 0
-            {
-                return NtStatus::STATUS_NOT_A_DIRECTORY;
-            }
-        }
-
-        // Directory handle — store as a Directory object.
-        let handle = handles.insert(NtObject::Directory {
-            path: nt_path.clone(),
-            enum_entries: alloc::vec::Vec::new(),
-            enum_index: 0,
-        });
-        unsafe {
-            core::ptr::write(handle_out_ptr as *mut u32, handle);
-        }
-        let iosb_info = if create_disposition == file_disposition::FILE_CREATE
-            || (create_disposition == file_disposition::FILE_OPEN_IF && !dir_exists)
-        {
-            2 // FILE_CREATED
-        } else {
-            1 // FILE_OPENED
-        };
-        if io_status_ptr != 0 {
-            let iosb = IoStatusBlock {
-                status: NtStatus::STATUS_SUCCESS.0,
-                _pad: 0,
-                information: iosb_info,
-            };
-            unsafe {
-                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-            }
-        }
-        return NtStatus::STATUS_SUCCESS;
+    // Path not translatable to VFS — no host fallback.
+    #[cfg(debug_assertions)]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        let msg = alloc::format!("NT shim: NtCreateFile path not translatable: {nt_path:?}\n");
+        litebox_platform_multiplex::platform().debug_log_print(&msg);
     }
-
-    // Determine access mode.
-    let want_read = desired_access & 0x8000_0001 != 0; // GENERIC_READ or FILE_READ_DATA
-    let want_write = desired_access & 0x4000_0006 != 0; // GENERIC_WRITE or FILE_WRITE_DATA|APPEND
-
-    // Map NT file disposition to Win32 creation disposition.
-    let win32_disposition = match create_disposition {
-        file_disposition::FILE_SUPERSEDE => 2,    // CREATE_ALWAYS
-        file_disposition::FILE_OPEN => 3,         // OPEN_EXISTING
-        file_disposition::FILE_CREATE => 1,       // CREATE_NEW
-        file_disposition::FILE_OPEN_IF => 4,      // OPEN_ALWAYS
-        file_disposition::FILE_OVERWRITE => 5,    // TRUNCATE_EXISTING
-        file_disposition::FILE_OVERWRITE_IF => 2, // CREATE_ALWAYS (create + truncate)
-        _ => 3,                                   // OPEN_EXISTING (default)
-    };
-
-    // Map NT share_access to Win32 share mode (same bit values).
-    // Zero means exclusive open — no sharing.
-    let win32_share = share_access;
-
-    // Map file attributes. FILE_ATTRIBUTE_NORMAL = 0x80.
-    let win32_attrs = if file_attributes == 0 {
-        0x80 // FILE_ATTRIBUTE_NORMAL
-    } else {
-        file_attributes
-    };
-
-    let host_handle = host::open_file(
-        &host_path,
-        want_read || !want_write,
-        want_write,
-        win32_disposition,
-        win32_share,
-        win32_attrs,
-    );
-
-    if host_handle == host::INVALID_HANDLE {
-        let win_err = host::get_last_error();
-        return map_win32_error_to_ntstatus(win_err);
-    }
-
-    // Insert into handle table.
-    let handle = handles.insert(NtObject::File {
-        path: nt_path,
-        host_handle,
-        position: Arc::new(AtomicU64::new(0)),
-        raw_fd: None,
-        vfs_refcount: None,
-    });
-
-    unsafe {
-        core::ptr::write(handle_out_ptr as *mut u32, handle);
-    }
-
-    if io_status_ptr != 0 {
-        let info = match create_disposition {
-            file_disposition::FILE_OPEN => 1,   // FILE_OPENED
-            file_disposition::FILE_CREATE => 2, // FILE_CREATED
-            file_disposition::FILE_OPEN_IF => {
-                // OPEN_ALWAYS sets ERROR_ALREADY_EXISTS(183) when file existed.
-                let err = host::get_last_error();
-                if err == 183 { 1 } else { 2 } // FILE_OPENED vs FILE_CREATED
-            }
-            file_disposition::FILE_SUPERSEDE => {
-                // CREATE_ALWAYS: ERROR_ALREADY_EXISTS(183) if existing file replaced.
-                let err = host::get_last_error();
-                if err == 183 { 0 } else { 2 } // FILE_SUPERSEDED(0) vs FILE_CREATED(2)
-            }
-            file_disposition::FILE_OVERWRITE_IF => {
-                let err = host::get_last_error();
-                if err == 183 { 3 } else { 2 } // FILE_OVERWRITTEN vs FILE_CREATED
-            }
-            _ => 1,
-        };
-        let iosb = IoStatusBlock {
-            status: NtStatus::STATUS_SUCCESS.0,
-            _pad: 0,
-            information: info,
-        };
-        unsafe {
-            core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-        }
-    }
-
-    NtStatus::STATUS_SUCCESS
+    NtStatus::STATUS_OBJECT_NAME_NOT_FOUND
 }
 
 // ========================================================================
@@ -1249,7 +614,7 @@ pub(crate) fn nt_read_file_vfs(
     };
 
     let typed_fd = {
-        let rds = shared.raw_fds.lock().unwrap();
+        let rds = shared.raw_fds.lock();
         match rds.fd_from_raw_integer::<super::super::NtFS>(raw_fd) {
             Ok(fd) => fd,
             Err(_) => return NtStatus::STATUS_INVALID_HANDLE,
@@ -1328,7 +693,7 @@ pub(crate) fn nt_write_file_vfs(
     };
 
     let typed_fd = {
-        let rds = shared.raw_fds.lock().unwrap();
+        let rds = shared.raw_fds.lock();
         match rds.fd_from_raw_integer::<super::super::NtFS>(raw_fd) {
             Ok(fd) => fd,
             Err(_) => return NtStatus::STATUS_INVALID_HANDLE,
@@ -1357,82 +722,12 @@ pub(crate) fn nt_write_file_vfs(
     }
 }
 
+/// FILE_ATTRIBUTE_DIRECTORY — used for directory metadata.
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
 // ========================================================================
-// NtReadFile
+// NtReadFile — console only; host read path removed (all files via VFS).
 // ========================================================================
-
-/// NtReadFile — read from a host file handle.
-///
-/// Called after handle-table lock is dropped. Takes extracted handle info.
-pub(crate) fn nt_read_file_host(
-    ctx: &mut super::super::ExecutionContext,
-    host_handle: usize,
-    position: &alloc::sync::Arc<AtomicU64>,
-) -> NtStatus {
-    // Stack arguments.
-    let io_status_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
-    let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
-    let length = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
-    let byte_offset_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x40) as *const usize) };
-
-    if buffer_ptr == 0 || length == 0 {
-        return NtStatus::STATUS_INVALID_PARAMETER;
-    }
-
-    // NT ByteOffset sentinels:
-    //   >= 0                      → positional I/O (pread), no position mutation
-    //   -2 (USE_FILE_POINTER_POS) → use & advance the shared current position
-    //   -1 and all others         → invalid for reads
-    //   NULL pointer              → use & advance the shared current position
-    const FILE_USE_FILE_POINTER_POSITION: i64 = -2;
-
-    let (read_pos, reserved) = if byte_offset_ptr != 0 {
-        let offset = unsafe { core::ptr::read(byte_offset_ptr as *const i64) };
-        if offset >= 0 {
-            // Positional read: don't mutate the shared position.
-            (offset as u64, 0u64)
-        } else if offset == FILE_USE_FILE_POINTER_POSITION {
-            let start = position.fetch_add(length as u64, Relaxed);
-            (start, length as u64)
-        } else {
-            return NtStatus::STATUS_INVALID_PARAMETER;
-        }
-    } else {
-        let start = position.fetch_add(length as u64, Relaxed);
-        (start, length as u64)
-    };
-
-    let (ok, bytes_read) = host::read_file_at(host_handle, buffer_ptr as *mut u8, length, read_pos);
-
-    if ok {
-        if reserved > 0 {
-            let over = reserved - bytes_read as u64;
-            if over > 0 {
-                position.fetch_sub(over, Relaxed);
-            }
-        }
-        if io_status_ptr != 0 {
-            let iosb = IoStatusBlock {
-                status: NtStatus::STATUS_SUCCESS.0,
-                _pad: 0,
-                information: bytes_read as u64,
-            };
-            unsafe {
-                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-            }
-        }
-        if bytes_read == 0 {
-            NtStatus::STATUS_END_OF_FILE
-        } else {
-            NtStatus::STATUS_SUCCESS
-        }
-    } else {
-        if reserved > 0 {
-            position.fetch_sub(reserved, Relaxed);
-        }
-        NtStatus::STATUS_ACCESS_DENIED
-    }
-}
 
 /// NtReadFile — read from ConsoleInput.
 ///
@@ -1513,87 +808,6 @@ pub(crate) fn nt_write_file_console(
     NtStatus::STATUS_SUCCESS
 }
 
-/// NtWriteFile — write to a host file handle.
-///
-/// Called after handle-table lock is dropped. Takes extracted handle info.
-/// Supports ByteOffset at [rsp+0x40].
-pub(crate) fn nt_write_file_host(
-    ctx: &mut super::super::ExecutionContext,
-    host_handle: usize,
-    position: &alloc::sync::Arc<AtomicU64>,
-) -> NtStatus {
-    let io_status_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
-    let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
-    let length = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
-    let byte_offset_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x40) as *const usize) };
-
-    if buffer_ptr == 0 || length == 0 {
-        return NtStatus::STATUS_INVALID_PARAMETER;
-    }
-
-    // NT ByteOffset sentinels:
-    //   >= 0                        → positional I/O (pwrite), no position mutation
-    //   -2 (USE_FILE_POINTER_POS)   → use & advance the shared current position
-    //   -1 (WRITE_TO_END_OF_FILE)   → append at EOF
-    //   all others                  → invalid
-    //   NULL pointer                → use & advance the shared current position
-    const FILE_USE_FILE_POINTER_POSITION: i64 = -2;
-    const FILE_WRITE_TO_END_OF_FILE: i64 = -1;
-
-    let (write_pos, reserved) = if byte_offset_ptr != 0 {
-        let offset = unsafe { core::ptr::read(byte_offset_ptr as *const i64) };
-        if offset >= 0 {
-            // Positional write: don't mutate the shared position.
-            (offset as u64, 0u64)
-        } else if offset == FILE_USE_FILE_POINTER_POSITION {
-            let start = position.fetch_add(length as u64, Relaxed);
-            (start, length as u64)
-        } else if offset == FILE_WRITE_TO_END_OF_FILE {
-            // Append at EOF: query actual file size for the write offset.
-            // Don't mutate the shared position — the caller explicitly asked
-            // for EOF, not "advance current pointer."
-            let size = host::get_file_size(host_handle);
-            if size < 0 {
-                return NtStatus::STATUS_UNSUCCESSFUL;
-            }
-            (size as u64, 0u64)
-        } else {
-            return NtStatus::STATUS_INVALID_PARAMETER;
-        }
-    } else {
-        let start = position.fetch_add(length as u64, Relaxed);
-        (start, length as u64)
-    };
-
-    let (ok, bytes_written) =
-        host::write_file_at(host_handle, buffer_ptr as *const u8, length, write_pos);
-
-    if ok {
-        if reserved > 0 {
-            let over = reserved - bytes_written as u64;
-            if over > 0 {
-                position.fetch_sub(over, Relaxed);
-            }
-        }
-        if io_status_ptr != 0 {
-            let iosb = IoStatusBlock {
-                status: NtStatus::STATUS_SUCCESS.0,
-                _pad: 0,
-                information: bytes_written as u64,
-            };
-            unsafe {
-                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-            }
-        }
-        NtStatus::STATUS_SUCCESS
-    } else {
-        if reserved > 0 {
-            position.fetch_sub(reserved, Relaxed);
-        }
-        NtStatus::STATUS_ACCESS_DENIED
-    }
-}
-
 // ========================================================================
 // NtQueryInformationFile
 // ========================================================================
@@ -1629,11 +843,9 @@ pub(crate) fn nt_query_information_file(
 
     match obj {
         NtObject::File {
-            raw_fd: Some(fd),
-            position,
-            ..
+            raw_fd, position, ..
         } => {
-            // VFS-backed file.
+            // All files are now VFS-backed (raw_fd is always Some).
             match info_class {
                 // FileBasicInformation (4) — synthesize from VFS.
                 4 => {
@@ -1660,8 +872,10 @@ pub(crate) fn nt_query_information_file(
                     }
                     let file_size = (|| -> Option<i64> {
                         let fs = shared.fs.get()?;
-                        let rds = shared.raw_fds.lock().unwrap();
-                        let typed_fd = rds.fd_from_raw_integer::<super::super::NtFS>(*fd).ok()?;
+                        let rds = shared.raw_fds.lock();
+                        let typed_fd = rds
+                            .fd_from_raw_integer::<super::super::NtFS>(*raw_fd)
+                            .ok()?;
                         use litebox::fs::FileSystem as _;
                         let st = fs.fd_file_status(&typed_fd).ok()?;
                         Some(st.size as i64)
@@ -1699,75 +913,6 @@ pub(crate) fn nt_query_information_file(
                 _ => NtStatus::STATUS_INVALID_INFO_CLASS,
             }
         }
-        NtObject::File {
-            host_handle,
-            position,
-            ..
-        } => match info_class {
-            // FileBasicInformation (4)
-            4 => {
-                let size = core::mem::size_of::<FileBasicInformation>();
-                if (info_length as usize) < size || info_ptr == 0 {
-                    return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
-                }
-                let info = if let Some((attrs, ctime, atime, wtime, chtime)) =
-                    host::get_file_info(*host_handle)
-                {
-                    FileBasicInformation {
-                        creation_time: ctime,
-                        last_access_time: atime,
-                        last_write_time: wtime,
-                        change_time: chtime,
-                        file_attributes: attrs,
-                        _pad: 0,
-                    }
-                } else {
-                    FileBasicInformation::default()
-                };
-                unsafe {
-                    core::ptr::write(info_ptr as *mut FileBasicInformation, info);
-                }
-                write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, size);
-                NtStatus::STATUS_SUCCESS
-            }
-            // FileStandardInformation (5)
-            5 => {
-                let size = core::mem::size_of::<FileStandardInformation>();
-                if (info_length as usize) < size || info_ptr == 0 {
-                    return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
-                }
-                let file_size = host::get_file_size(*host_handle);
-                let info = FileStandardInformation {
-                    allocation_size: (file_size + 4095) & !4095, // round up to page
-                    end_of_file: file_size,
-                    number_of_links: 1,
-                    delete_pending: 0,
-                    directory: 0,
-                    _pad: [0; 2],
-                };
-                unsafe {
-                    core::ptr::write(info_ptr as *mut FileStandardInformation, info);
-                }
-                write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, size);
-                NtStatus::STATUS_SUCCESS
-            }
-            // FilePositionInformation (14)
-            14 => {
-                let size = core::mem::size_of::<FilePositionInformation>();
-                if (info_length as usize) < size || info_ptr == 0 {
-                    return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
-                }
-                let info = FilePositionInformation {
-                    current_byte_offset: position.load(Relaxed) as i64,
-                };
-                unsafe {
-                    core::ptr::write(info_ptr as *mut FilePositionInformation, info);
-                }
-                write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, size);
-                NtStatus::STATUS_SUCCESS
-            }
-            _ => NtStatus::STATUS_INVALID_INFO_CLASS,
-        },
         NtObject::ConsoleOutput { .. } | NtObject::ConsoleInput => {
             // Console handles: return minimal info.
             match info_class {
@@ -1796,7 +941,7 @@ pub(crate) fn nt_query_information_file(
                         return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
                     }
                     let info = FileBasicInformation {
-                        file_attributes: host::FILE_ATTRIBUTE_DIRECTORY,
+                        file_attributes: FILE_ATTRIBUTE_DIRECTORY,
                         ..FileBasicInformation::default()
                     };
                     unsafe {
@@ -1861,11 +1006,7 @@ pub(crate) fn nt_set_information_file(
     };
 
     match obj {
-        NtObject::File {
-            raw_fd: Some(_),
-            position,
-            ..
-        } => match info_class {
+        NtObject::File { position, .. } => match info_class {
             // FilePositionInformation (14) — seek. VFS files just update cached position.
             14 => {
                 let size = core::mem::size_of::<FilePositionInformation>();
@@ -1882,35 +1023,6 @@ pub(crate) fn nt_set_information_file(
                 }
             }
             13 => {
-                write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, 0);
-                NtStatus::STATUS_SUCCESS
-            }
-            _ => NtStatus::STATUS_INVALID_INFO_CLASS,
-        },
-        NtObject::File {
-            host_handle,
-            position,
-            ..
-        } => match info_class {
-            // FilePositionInformation (14) — seek
-            14 => {
-                let size = core::mem::size_of::<FilePositionInformation>();
-                if (info_length as usize) < size || info_ptr == 0 {
-                    return NtStatus::STATUS_INVALID_PARAMETER;
-                }
-                let info = unsafe { core::ptr::read(info_ptr as *const FilePositionInformation) };
-                let new_pos = host::set_file_position(*host_handle, info.current_byte_offset, 0);
-                if new_pos >= 0 {
-                    position.store(new_pos as u64, Relaxed);
-                    write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, size);
-                    NtStatus::STATUS_SUCCESS
-                } else {
-                    NtStatus::STATUS_INVALID_PARAMETER
-                }
-            }
-            // FileDispositionInformation (13) — mark for delete-on-close
-            13 => {
-                // Accept but ignore for now.
                 write_iosb(io_status_ptr, NtStatus::STATUS_SUCCESS, 0);
                 NtStatus::STATUS_SUCCESS
             }
@@ -1972,77 +1084,11 @@ pub(crate) fn nt_query_attributes_file(
             }
             return NtStatus::STATUS_SUCCESS;
         }
-        // VFS file_status failed — fall through to host.
+        // VFS file_status failed — authoritative, no host fallback.
     }
 
-    // Host fallback.
-    let Some(host_path) = translate_nt_path_to_host(&nt_path) else {
-        return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
-    };
-
-    // Use GetFileAttributesW which works for both files and directories
-    // without needing FILE_FLAG_BACKUP_SEMANTICS.
-    let attrs = host::get_file_attributes(&host_path);
-    if attrs == host::INVALID_FILE_ATTRIBUTES {
-        return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
-    }
-
-    if info_ptr != 0 {
-        // GetFileAttributesW only returns attributes, not timestamps.
-        // Open the file with BACKUP_SEMANTICS to get full info if possible.
-        let open_flags = if attrs & host::FILE_ATTRIBUTE_DIRECTORY != 0 {
-            0x02000000 | 0x80 // FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL
-        } else {
-            0x80 // FILE_ATTRIBUTE_NORMAL
-        };
-        let handle = host::open_file(
-            &host_path,
-            true,
-            false,
-            3,
-            0x01 | 0x02 | 0x04, // FILE_SHARE_READ | WRITE | DELETE
-            open_flags,
-        );
-        let info = if handle == host::INVALID_HANDLE {
-            // Fallback: at least return the attributes from GetFileAttributesW.
-            FileBasicInformation {
-                file_attributes: attrs,
-                ..FileBasicInformation::default()
-            }
-        } else {
-            let result = if let Some((a, ctime, atime, wtime, chtime)) = host::get_file_info(handle)
-            {
-                FileBasicInformation {
-                    creation_time: ctime,
-                    last_access_time: atime,
-                    last_write_time: wtime,
-                    change_time: chtime,
-                    file_attributes: a,
-                    _pad: 0,
-                }
-            } else {
-                FileBasicInformation {
-                    file_attributes: attrs,
-                    ..FileBasicInformation::default()
-                }
-            };
-            #[cfg(target_os = "windows")]
-            {
-                unsafe extern "system" {
-                    fn CloseHandle(handle: usize) -> i32;
-                }
-                unsafe {
-                    CloseHandle(handle);
-                }
-            }
-            result
-        };
-        unsafe {
-            core::ptr::write(info_ptr as *mut FileBasicInformation, info);
-        }
-    }
-
-    NtStatus::STATUS_SUCCESS
+    // Path not translatable to VFS — not found.
+    NtStatus::STATUS_OBJECT_NAME_NOT_FOUND
 }
 
 /// Helper: write an IO_STATUS_BLOCK to guest memory.
@@ -2298,36 +1344,9 @@ pub(crate) fn nt_query_directory_file(
                     *enum_entries = alloc::vec::Vec::new();
                 }
                 None => {
-                    // Fallback to host filesystem (non-VFS paths only).
-                    let Some(host_dir) = translate_nt_path_to_host(path) else {
-                        write_iosb(io_status_ptr, NtStatus::STATUS_OBJECT_PATH_NOT_FOUND, 0);
-                        return NtStatus::STATUS_OBJECT_PATH_NOT_FOUND;
-                    };
-
-                    let filter = if filename_ptr != 0 {
-                        read_unicode_string_from_guest(filename_ptr)
-                    } else {
-                        None
-                    };
-
-                    let search_pattern = if let Some(ref f) = filter {
-                        alloc::format!("{host_dir}\\{f}")
-                    } else {
-                        alloc::format!("{host_dir}\\*")
-                    };
-
-                    let host_entries = host::find_files(&search_pattern);
-                    *enum_entries = host_entries
-                        .into_iter()
-                        .map(|e| DirEnumEntry {
-                            name: e.name,
-                            attributes: e.attributes,
-                            file_size: e.file_size,
-                            creation_time: e.creation_time,
-                            last_access_time: e.last_access_time,
-                            last_write_time: e.last_write_time,
-                        })
-                        .collect();
+                    // Path not VFS-translatable — no host fallback.
+                    write_iosb(io_status_ptr, NtStatus::STATUS_OBJECT_PATH_NOT_FOUND, 0);
+                    return NtStatus::STATUS_OBJECT_PATH_NOT_FOUND;
                 }
             }
             *enum_index = 0;
@@ -2487,9 +1506,6 @@ pub(crate) fn nt_query_directory_file(
 pub(crate) fn nt_open_file(
     ctx: &mut super::super::ExecutionContext,
     handles: &mut HandleTable,
-    dll_tar_files: &std::sync::Mutex<
-        Option<alloc::collections::BTreeMap<alloc::string::String, alloc::vec::Vec<u8>>>,
-    >,
     shared: &super::super::NtSharedState,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
@@ -2499,7 +1515,7 @@ pub(crate) fn nt_open_file(
     let io_status_ptr = args.arg3;
 
     // Stack arguments.
-    let share_access = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const u32) };
+    let _share_access = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const u32) };
     let open_options = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
 
     if handle_out_ptr == 0 || obj_attr_ptr == 0 {
@@ -2521,8 +1537,7 @@ pub(crate) fn nt_open_file(
         litebox_platform_multiplex::platform().debug_log_print(&msg);
     }
 
-    // ── VFS-first path ──────────────────────────────────────────────
-    // Try opening via VFS before falling back to dll_tar_files or host.
+    // ── VFS path ─────────────────────────────────────────────────────
     if let Some(translated) = translate_nt_path(&nt_path) {
         let vfs_path = match &translated {
             TranslatedPath::Vfs(p) => Some(p.as_str()),
@@ -2553,326 +1568,65 @@ pub(crate) fn nt_open_file(
             }
 
             use litebox::fs::FileSystem as _;
-            if let Ok(typed_fd) = fs.open(
+            match fs.open(
                 path,
                 litebox::fs::OFlags::RDONLY,
                 litebox::fs::Mode::RUSR | litebox::fs::Mode::WUSR,
             ) {
-                let raw_fd = {
-                    let mut rds = shared.raw_fds.lock().unwrap();
-                    rds.fd_into_raw_integer(typed_fd)
-                };
-                let handle = handles.insert(NtObject::File {
-                    path: nt_path,
-                    host_handle: 0,
-                    position: Arc::new(AtomicU64::new(0)),
-                    raw_fd: Some(raw_fd),
-                    vfs_refcount: Some(Arc::new(core::sync::atomic::AtomicUsize::new(1))),
-                });
-                unsafe {
-                    core::ptr::write(handle_out_ptr as *mut u32, handle);
-                }
-                if io_status_ptr != 0 {
-                    let iosb = IoStatusBlock {
-                        status: NtStatus::STATUS_SUCCESS.0,
-                        _pad: 0,
-                        information: 1,
+                Ok(typed_fd) => {
+                    let raw_fd = {
+                        let mut rds = shared.raw_fds.lock();
+                        rds.fd_into_raw_integer(typed_fd)
                     };
+                    let handle = handles.insert(NtObject::File {
+                        path: nt_path,
+                        position: Arc::new(AtomicU64::new(0)),
+                        raw_fd,
+                        vfs_refcount: Arc::new(core::sync::atomic::AtomicUsize::new(1)),
+                    });
                     unsafe {
-                        core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+                        core::ptr::write(handle_out_ptr as *mut u32, handle);
                     }
+                    if io_status_ptr != 0 {
+                        let iosb = IoStatusBlock {
+                            status: NtStatus::STATUS_SUCCESS.0,
+                            _pad: 0,
+                            information: 1,
+                        };
+                        unsafe {
+                            core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+                        }
+                    }
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtOpenFile VFS OK path={path:?} raw_fd={raw_fd}\n",
+                        ));
+                    }
+                    return NtStatus::STATUS_SUCCESS;
                 }
-                #[cfg(debug_assertions)]
-                {
-                    use litebox::platform::DebugLogProvider as _;
-                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                        "NT shim: NtOpenFile VFS OK path={path:?} raw_fd={raw_fd}\n",
-                    ));
-                }
-                return NtStatus::STATUS_SUCCESS;
-            }
-        }
-    }
-
-    // ── Legacy path: dll_tar_files lookup ────────────────────────────
-
-    // Extract the filename (last path component) for tar lookup.
-    let filename = nt_path
-        .rsplit('\\')
-        .next()
-        .unwrap_or(&nt_path)
-        .to_ascii_lowercase();
-
-    // Check if the file is available in the DLL tar archive.
-    let tar_data = {
-        let tar_guard = dll_tar_files.lock().unwrap();
-        if let Some(ref files) = *tar_guard {
-            files.get(&filename).cloned()
-        } else {
-            None
-        }
-    };
-
-    if let Some(data) = tar_data {
-        #[cfg(debug_assertions)]
-        {
-            use litebox::platform::DebugLogProvider as _;
-            let msg = alloc::format!(
-                "NT shim: NtOpenFile serving '{}' from tar ({} bytes)\n",
-                filename,
-                data.len()
-            );
-            litebox_platform_multiplex::platform().debug_log_print(&msg);
-        }
-
-        let handle = handles.insert(NtObject::MemoryFile {
-            path: nt_path,
-            data: Arc::new(data),
-            position: Arc::new(AtomicU64::new(0)),
-        });
-        unsafe {
-            core::ptr::write(handle_out_ptr as *mut u32, handle);
-        }
-        if io_status_ptr != 0 {
-            let iosb = IoStatusBlock {
-                status: NtStatus::STATUS_SUCCESS.0,
-                _pad: 0,
-                information: 1, // FILE_OPENED
-            };
-            unsafe {
-                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-            }
-        }
-        return NtStatus::STATUS_SUCCESS;
-    }
-
-    // Not in tar — check if it's a directory open.
-    let is_directory = open_options & file_options::FILE_DIRECTORY_FILE != 0;
-
-    // Translate NT path to host path.
-    let Some(host_path) = translate_nt_path_to_host(&nt_path) else {
-        #[cfg(debug_assertions)]
-        {
-            use litebox::platform::DebugLogProvider as _;
-            let msg = alloc::format!("NT shim: NtOpenFile path not translatable: {nt_path:?}\n");
-            litebox_platform_multiplex::platform().debug_log_print(&msg);
-        }
-        return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
-    };
-
-    if is_directory {
-        let attrs = host::get_file_attributes(&host_path);
-        if attrs == host::INVALID_FILE_ATTRIBUTES || attrs & host::FILE_ATTRIBUTE_DIRECTORY == 0 {
-            return NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        let handle = handles.insert(NtObject::Directory {
-            path: nt_path,
-            enum_entries: alloc::vec::Vec::new(),
-            enum_index: 0,
-        });
-        unsafe {
-            core::ptr::write(handle_out_ptr as *mut u32, handle);
-        }
-        if io_status_ptr != 0 {
-            let iosb = IoStatusBlock {
-                status: NtStatus::STATUS_SUCCESS.0,
-                _pad: 0,
-                information: 1, // FILE_OPENED
-            };
-            unsafe {
-                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-            }
-        }
-        return NtStatus::STATUS_SUCCESS;
-    }
-
-    // Open as a regular file via host pass-through.
-    let host_handle = host::open_file(
-        &host_path,
-        true,  // read access
-        false, // no write
-        3,     // OPEN_EXISTING
-        share_access,
-        0x80, // FILE_ATTRIBUTE_NORMAL
-    );
-
-    if host_handle == host::INVALID_HANDLE {
-        let win_err = host::get_last_error();
-        return map_win32_error_to_ntstatus(win_err);
-    }
-
-    let handle = handles.insert(NtObject::File {
-        path: nt_path,
-        host_handle,
-        position: Arc::new(AtomicU64::new(0)),
-        raw_fd: None,
-        vfs_refcount: None,
-    });
-    unsafe {
-        core::ptr::write(handle_out_ptr as *mut u32, handle);
-    }
-    if io_status_ptr != 0 {
-        let iosb = IoStatusBlock {
-            status: NtStatus::STATUS_SUCCESS.0,
-            _pad: 0,
-            information: 1, // FILE_OPENED
-        };
-        unsafe {
-            core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-        }
-    }
-    NtStatus::STATUS_SUCCESS
-}
-
-// ========================================================================
-// NtReadFile for MemoryFile handles
-// ========================================================================
-
-/// NtReadFile — read from an in-memory file (DLLs served from tar).
-pub(crate) fn nt_read_file_memory(
-    ctx: &mut super::super::ExecutionContext,
-    data: &[u8],
-    position: &Arc<AtomicU64>,
-) -> NtStatus {
-    // Stack arguments (same layout as NtReadFile for host files).
-    let io_status_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
-    let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
-    let length = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
-    let byte_offset_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x40) as *const usize) };
-
-    if buffer_ptr == 0 || length == 0 {
-        return NtStatus::STATUS_INVALID_PARAMETER;
-    }
-
-    // Determine read offset.
-    let offset = if byte_offset_ptr != 0 {
-        let off = unsafe { core::ptr::read(byte_offset_ptr as *const i64) };
-        if off >= 0 {
-            off as u64
-        } else {
-            position.load(Relaxed)
-        }
-    } else {
-        position.load(Relaxed)
-    };
-
-    let file_len = data.len() as u64;
-    if offset >= file_len {
-        // At or past EOF.
-        if io_status_ptr != 0 {
-            let iosb = IoStatusBlock {
-                status: NtStatus::STATUS_END_OF_FILE.0,
-                _pad: 0,
-                information: 0,
-            };
-            unsafe {
-                core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-            }
-        }
-        return NtStatus::STATUS_END_OF_FILE;
-    }
-
-    let avail = (file_len - offset) as usize;
-    let to_read = (length as usize).min(avail);
-
-    // Copy data to guest buffer.
-    let src = &data[offset as usize..offset as usize + to_read];
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), buffer_ptr as *mut u8, to_read);
-    }
-
-    // Update position.
-    position.store(offset + to_read as u64, Relaxed);
-
-    if io_status_ptr != 0 {
-        let iosb = IoStatusBlock {
-            status: NtStatus::STATUS_SUCCESS.0,
-            _pad: 0,
-            information: to_read as u64,
-        };
-        unsafe {
-            core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-        }
-    }
-    NtStatus::STATUS_SUCCESS
-}
-
-/// NtQueryInformationFile for MemoryFile handles.
-pub(crate) fn nt_query_information_file_memory(
-    ctx: &mut super::super::ExecutionContext,
-    data_len: u64,
-    position: &Arc<AtomicU64>,
-) -> NtStatus {
-    let args = NtSyscallArgs::from_ctx(ctx);
-    let io_status_ptr = args.arg1;
-
-    // Stack args for NtQueryInformationFile.
-    let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
-    let buffer_len = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
-    let info_class = unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) };
-
-    match info_class {
-        // FileStandardInformation (5)
-        5 => {
-            if buffer_len < core::mem::size_of::<FileStandardInformation>() as u32 {
-                return NtStatus::STATUS_BUFFER_TOO_SMALL;
-            }
-            let info = FileStandardInformation {
-                allocation_size: data_len as i64,
-                end_of_file: data_len as i64,
-                number_of_links: 1,
-                delete_pending: 0,
-                directory: 0,
-                _pad: [0; 2],
-            };
-            unsafe {
-                core::ptr::write(buffer_ptr as *mut FileStandardInformation, info);
-            }
-            if io_status_ptr != 0 {
-                let iosb = IoStatusBlock {
-                    status: NtStatus::STATUS_SUCCESS.0,
-                    _pad: 0,
-                    information: core::mem::size_of::<FileStandardInformation>() as u64,
-                };
-                unsafe {
-                    core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+                Err(e) => {
+                    // VFS open failed — authoritative error, no host fallback.
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtOpenFile VFS error path={path:?} err={e:?}\n",
+                        ));
+                    }
+                    return map_open_error_to_ntstatus(&e);
                 }
             }
-            NtStatus::STATUS_SUCCESS
-        }
-        // FilePositionInformation (14)
-        14 => {
-            if buffer_len < core::mem::size_of::<FilePositionInformation>() as u32 {
-                return NtStatus::STATUS_BUFFER_TOO_SMALL;
-            }
-            let info = FilePositionInformation {
-                current_byte_offset: position.load(Relaxed) as i64,
-            };
-            unsafe {
-                core::ptr::write(buffer_ptr as *mut FilePositionInformation, info);
-            }
-            if io_status_ptr != 0 {
-                let iosb = IoStatusBlock {
-                    status: NtStatus::STATUS_SUCCESS.0,
-                    _pad: 0,
-                    information: core::mem::size_of::<FilePositionInformation>() as u64,
-                };
-                unsafe {
-                    core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
-                }
-            }
-            NtStatus::STATUS_SUCCESS
-        }
-        other => {
-            #[cfg(debug_assertions)]
-            {
-                use litebox::platform::DebugLogProvider as _;
-                let msg = alloc::format!(
-                    "NT shim: NtQueryInformationFile(MemoryFile) unhandled class {other}\n"
-                );
-                litebox_platform_multiplex::platform().debug_log_print(&msg);
-            }
-            NtStatus::STATUS_NOT_IMPLEMENTED
         }
     }
+
+    // Path not translatable to VFS — no host fallback.
+    #[cfg(debug_assertions)]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        let msg = alloc::format!("NT shim: NtOpenFile path not translatable: {nt_path:?}\n");
+        litebox_platform_multiplex::platform().debug_log_print(&msg);
+    }
+    NtStatus::STATUS_OBJECT_NAME_NOT_FOUND
 }

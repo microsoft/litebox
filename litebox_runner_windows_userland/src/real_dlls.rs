@@ -19,6 +19,71 @@ use litebox_common_windows::ntdll_rewriter;
 use litebox_common_windows::pe_loader::{IatPatch, LoadedModule, load_pe};
 use litebox_common_windows::pe_parser::PeParsedFile;
 
+/// Read an entire file from VFS into a `Vec<u8>`.
+///
+/// Opens the file at `path`, queries its size, reads it, and closes the fd.
+pub fn read_vfs_file(fs: &litebox_shim_windows::NtFS, path: &str) -> Result<Vec<u8>> {
+    use litebox::fs::FileSystem as _;
+
+    let fd = fs
+        .open(path, litebox::fs::OFlags::RDONLY, litebox::fs::Mode::RUSR)
+        .map_err(|e| anyhow!("VFS open {path:?}: {e:?}"))?;
+    let size = fs.fd_file_status(&fd).map(|s| s.size).unwrap_or(0);
+    let mut buf = vec![0u8; size];
+    let n = fs.read(&fd, &mut buf, None).unwrap_or(0);
+    buf.truncate(n);
+    let _ = fs.close(&fd);
+    if buf.is_empty() {
+        return Err(anyhow!("VFS file {path:?} is empty or unreadable"));
+    }
+    Ok(buf)
+}
+
+/// Find a file in VFS by its basename (case-insensitive) under `dir_path`.
+///
+/// Lists the directory entries and returns the full VFS path of the first
+/// file whose name matches `target_name` (case-insensitive).
+pub fn find_vfs_file(
+    fs: &litebox_shim_windows::NtFS,
+    dir_path: &str,
+    target_name: &str,
+) -> Option<String> {
+    use litebox::fs::FileSystem as _;
+
+    let fd = fs
+        .open(
+            dir_path,
+            litebox::fs::OFlags::RDONLY | litebox::fs::OFlags::DIRECTORY,
+            litebox::fs::Mode::RUSR,
+        )
+        .ok()?;
+    let entries = fs.read_dir(&fd).ok()?;
+    let _ = fs.close(&fd);
+
+    let target_lower = target_name.to_ascii_lowercase();
+    for entry in &entries {
+        if entry.name.to_ascii_lowercase() == target_lower {
+            let sep = if dir_path.ends_with('/') { "" } else { "/" };
+            return Some(format!("{dir_path}{sep}{}", entry.name));
+        }
+    }
+    None
+}
+
+/// Find a file anywhere in the VFS by searching known directories.
+///
+/// Searches root (`/`) and common Windows paths for `filename`.
+pub fn find_vfs_file_by_name(fs: &litebox_shim_windows::NtFS, filename: &str) -> Option<String> {
+    // Search directories in priority order: root, then Windows System32 paths.
+    let search_dirs = ["/", "/c/windows/system32", "/c/windows"];
+    for dir in &search_dirs {
+        if let Some(path) = find_vfs_file(fs, dir, filename) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Information about a loaded DLL in guest memory.
 #[allow(dead_code)]
 pub struct LoadedDll {
@@ -62,21 +127,22 @@ pub struct NtdllInitLoadResult {
     pub ki_user_exception_dispatcher_rva: Option<usize>,
 }
 
-/// Load only ntdll.dll from the tar for the ntdll-driven init approach.
+/// Load only ntdll.dll from VFS for the ntdll-driven init approach.
 ///
-/// The ntdll image is rewritten (syscall stubs patched to use the trampoline),
-/// and its `LdrInitializeThunk` and `RtlUserThreadStart` exports are located.
-/// The runner should start execution at `LdrInitializeThunk` with a CONTEXT
-/// pointing to `RtlUserThreadStart` + the EXE entry point.
+/// Finds ntdll.dll in the VFS, rewrites its syscall stubs to use the
+/// trampoline, and loads it into guest memory via `mapper`.
 pub fn load_ntdll_for_init(
-    tar_files: &BTreeMap<String, Vec<u8>>,
+    fs: &litebox_shim_windows::NtFS,
     mapper: &mut PmMapper<'_>,
     partition_start: usize,
 ) -> Result<NtdllInitLoadResult> {
-    let ntdll_data = find_by_filename(tar_files, "ntdll.dll")
-        .map(|(_, data)| data)
-        .ok_or_else(|| anyhow!("ntdll.dll not found in tar"))?;
-
+    let ntdll_path = find_vfs_file_by_name(fs, "ntdll.dll")
+        .ok_or_else(|| anyhow!("ntdll.dll not found in VFS"))?;
+    let ntdll_data = read_vfs_file(fs, &ntdll_path)?;
+    eprintln!(
+        "[real-dlls] Read ntdll.dll from VFS ({} bytes, path={ntdll_path:?})",
+        ntdll_data.len()
+    );
     let ntdll_load_va = partition_start + REAL_DLL_OFFSET;
 
     let trampoline_va = partition_start + TRAMPOLINE_OFFSET;
@@ -94,7 +160,7 @@ pub fn load_ntdll_for_init(
 
     // Rewrite ntdll syscall stubs.
     let rewrite =
-        ntdll_rewriter::rewrite_ntdll(ntdll_data, ntdll_load_va as u64, trampoline_va as u64);
+        ntdll_rewriter::rewrite_ntdll(&ntdll_data, ntdll_load_va as u64, trampoline_va as u64);
     eprintln!(
         "[real-dlls] Rewrote {} ntdll syscall stubs ({} identified)",
         rewrite.stubs_rewritten, rewrite.stubs_identified
@@ -266,64 +332,6 @@ const DLL_SPACING: usize = 0x0400_0000; // 64MB
 const TRAMPOLINE_OFFSET: usize = REAL_DLL_OFFSET - 0x1_0000;
 
 // ── Tar reader ──────────────────────────────────────────────────────
-
-/// Extract all files from a ustar tar archive into a name→data map.
-/// Names are lowercased. Ignores directory entries and non-regular files.
-pub fn read_tar(tar_data: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
-    let mut files = BTreeMap::new();
-    let mut pos = 0;
-    while pos + 512 <= tar_data.len() {
-        let header = &tar_data[pos..pos + 512];
-        // End-of-archive: two consecutive zero blocks.
-        if header.iter().all(|&b| b == 0) {
-            break;
-        }
-        // Parse size from octal field at offset 124..136.
-        let size_str = core::str::from_utf8(&header[124..136])
-            .map_err(|_| anyhow!("invalid tar size field"))?
-            .trim_end_matches('\0')
-            .trim();
-        let size = usize::from_str_radix(size_str, 8)
-            .map_err(|_| anyhow!("invalid tar size: {size_str:?}"))?;
-        // Parse name from offset 0..100, NUL-terminated.
-        let name_end = header[..100].iter().position(|&b| b == 0).unwrap_or(100);
-        let name = core::str::from_utf8(&header[..name_end])
-            .map_err(|_| anyhow!("invalid tar name"))?
-            .to_lowercase();
-        // Type flag at offset 156: '0' or '\0' = regular file.
-        let typeflag = header[156];
-        let data_start = pos + 512;
-        let data_end = data_start + size;
-        if data_end > tar_data.len() {
-            return Err(anyhow!("tar entry {name} truncated"));
-        }
-        if (typeflag == b'0' || typeflag == 0) && size > 0 {
-            files.insert(name, tar_data[data_start..data_end].to_vec());
-        }
-        // Advance past header + data (padded to 512-byte boundary).
-        pos = data_start + ((size + 511) & !511);
-    }
-    Ok(files)
-}
-
-/// Look up an entry in the tar map by filename (last path component).
-///
-/// The tar may have VFS-style paths (e.g., `c/windows/system32/ntdll.dll`)
-/// or flat filenames (e.g., `ntdll.dll`). This searches by matching the
-/// last `/`-delimited component.
-pub fn find_by_filename<'a>(
-    tar_files: &'a BTreeMap<String, Vec<u8>>,
-    filename: &str,
-) -> Option<(&'a str, &'a Vec<u8>)> {
-    let target = filename.to_ascii_lowercase();
-    tar_files
-        .iter()
-        .find(|(k, _)| {
-            let basename = k.rsplit('/').next().unwrap_or(k);
-            basename == target
-        })
-        .map(|(k, v)| (k.as_str(), v))
-}
 
 // ── DLL loader ──────────────────────────────────────────────────────
 
