@@ -111,13 +111,14 @@ fn find_vfs_file_recursive(
 
     for entry in &entries {
         let name_lower = entry.name.to_ascii_lowercase();
-        if name_lower.ends_with(&target_lower) {
+        if name_lower.ends_with(&target_lower)
+            && entry.file_type != litebox::fs::FileType::Directory
+        {
             let sep = if dir_path.ends_with('/') { "" } else { "/" };
             return Some(format!("{dir_path}{sep}{}", entry.name));
         }
-        // Collect subdirectories for recursive search.
-        // Heuristic: entries without a file extension are likely directories.
-        if !entry.name.contains('.') {
+        // Collect subdirectories for recursive search using VFS metadata.
+        if entry.file_type == litebox::fs::FileType::Directory {
             let sep = if dir_path.ends_with('/') { "" } else { "/" };
             subdirs.push(format!("{dir_path}{sep}{}", entry.name));
         }

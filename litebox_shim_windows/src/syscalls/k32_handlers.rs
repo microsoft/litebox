@@ -3958,17 +3958,15 @@ pub(crate) fn k32_sleep(
     let args = NtSyscallArgs::from_ctx(ctx);
     let ms = args.arg0 as u32;
 
-    if ms == 0 {
-        core::hint::spin_loop();
-    } else {
-        let timeout = if ms == 0xFFFF_FFFF {
-            None // INFINITE
-        } else {
-            Some(core::time::Duration::from_millis(u64::from(ms)))
-        };
-        let cx = wait_cx.with_timeout(timeout);
-        let _ = cx.sleep();
-    }
+    // Sleep(0) yields the current timeslice. We use a minimal 1µs wait
+    // so the platform can actually yield to other threads.
+    let timeout = match ms {
+        0 => Some(core::time::Duration::from_micros(1)),
+        0xFFFF_FFFF => None, // INFINITE
+        _ => Some(core::time::Duration::from_millis(u64::from(ms))),
+    };
+    let cx = wait_cx.with_timeout(timeout);
+    let _ = cx.sleep();
 
     NtStatus::STATUS_SUCCESS
 }

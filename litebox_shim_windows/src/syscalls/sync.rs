@@ -127,6 +127,9 @@ pub(crate) fn wait_for_keyed_event(
         if q.is_empty() {
             state.remove(&key);
         }
+        drop(state);
+        // Wake releasers so they can see their token was consumed.
+        keyed.wake_waiters();
         return NtStatus::STATUS_SUCCESS;
     }
 
@@ -136,6 +139,8 @@ pub(crate) fn wait_for_keyed_event(
     // from stealing a ready wake meant for a previously blocked waiter.
     q.waiters += 1;
     drop(state);
+
+    keyed.waiters.lock().push(wait_cx.waker().clone());
 
     let cx = wait_cx.with_timeout(timeout);
     let result = cx.wait_until(|| {
@@ -164,20 +169,12 @@ pub(crate) fn wait_for_keyed_event(
         false
     });
 
+    keyed.waiters.lock().retain(|w| !w.ptr_eq(wait_cx.waker()));
+
     match result {
         Ok(()) => NtStatus::STATUS_SUCCESS,
-        Err(litebox::event::wait::WaitError::TimedOut) => {
-            // Timeout — deregister as a waiter.
-            let mut state = keyed.state.lock();
-            if let Some(q) = state.get_mut(&key) {
-                q.waiters = q.waiters.saturating_sub(1);
-                if q.is_empty() {
-                    state.remove(&key);
-                }
-            }
-            NtStatus::STATUS_TIMEOUT
-        }
-        Err(litebox::event::wait::WaitError::Interrupted) => {
+        Err(litebox::event::wait::WaitError::TimedOut)
+        | Err(litebox::event::wait::WaitError::Interrupted) => {
             let mut state = keyed.state.lock();
             if let Some(q) = state.get_mut(&key) {
                 q.waiters = q.waiters.saturating_sub(1);
@@ -216,6 +213,8 @@ pub(crate) fn release_keyed_event(
     if q.waiters > q.ready {
         // An unmatched blocked waiter exists — increment ready to wake exactly one.
         q.ready += 1;
+        drop(state);
+        keyed.wake_waiters();
         return NtStatus::STATUS_SUCCESS;
     }
 
@@ -227,6 +226,8 @@ pub(crate) fn release_keyed_event(
     });
     drop(state);
 
+    keyed.waiters.lock().push(wait_cx.waker().clone());
+
     let cx = wait_cx.with_timeout(timeout);
     let result = cx.wait_until(|| {
         let state = keyed.state.lock();
@@ -236,6 +237,8 @@ pub(crate) fn release_keyed_event(
             true
         }
     });
+
+    keyed.waiters.lock().retain(|w| !w.ptr_eq(wait_cx.waker()));
 
     match result {
         Ok(()) => NtStatus::STATUS_SUCCESS,
@@ -308,7 +311,9 @@ pub(crate) fn nt_set_event(
     let mut signaled = event.state.lock();
     let prev = *signaled as i32;
     *signaled = true;
-    // Spin-polling waiters will see the updated state on their next iteration.
+    drop(signaled);
+    // Wake all blocked waiters so they re-evaluate.
+    event.wake_waiters();
 
     if prev_state_va != 0 {
         unsafe {
@@ -426,7 +431,9 @@ pub(crate) fn nt_release_semaphore(
     }
 
     *count = prev + release_count;
-    // Spin-polling waiters will see the updated count on their next iteration.
+    drop(count);
+    // Wake all blocked waiters so they re-evaluate.
+    sem.wake_waiters();
 
     if prev_count_va != 0 {
         unsafe {
@@ -691,6 +698,9 @@ fn wait_event(
     timeout: Option<Duration>,
     wait_cx: &WaitContext<'_, Platform>,
 ) -> NtStatus {
+    // Register our waker so signal paths can wake us.
+    event.waiters.lock().push(wait_cx.waker().clone());
+
     let cx = wait_cx.with_timeout(timeout);
     let result = cx.wait_until(|| {
         let mut signaled = event.state.lock();
@@ -702,6 +712,9 @@ fn wait_event(
         }
         false
     });
+
+    // Unregister our waker.
+    event.waiters.lock().retain(|w| !w.ptr_eq(wait_cx.waker()));
 
     match result {
         Ok(()) => NtStatus::STATUS_SUCCESS,
@@ -715,6 +728,8 @@ fn wait_semaphore(
     timeout: Option<Duration>,
     wait_cx: &WaitContext<'_, Platform>,
 ) -> NtStatus {
+    sem.waiters.lock().push(wait_cx.waker().clone());
+
     let cx = wait_cx.with_timeout(timeout);
     let result = cx.wait_until(|| {
         let mut count = sem.state.lock();
@@ -724,6 +739,8 @@ fn wait_semaphore(
         }
         false
     });
+
+    sem.waiters.lock().retain(|w| !w.ptr_eq(wait_cx.waker()));
 
     match result {
         Ok(()) => NtStatus::STATUS_SUCCESS,
@@ -737,11 +754,15 @@ fn wait_thread(
     timeout: Option<Duration>,
     wait_cx: &WaitContext<'_, Platform>,
 ) -> NtStatus {
+    thread.waiters.lock().push(wait_cx.waker().clone());
+
     let cx = wait_cx.with_timeout(timeout);
     let result = cx.wait_until(|| {
         let status = thread.exit_status.lock();
         status.is_some()
     });
+
+    thread.waiters.lock().retain(|w| !w.ptr_eq(wait_cx.waker()));
 
     match result {
         Ok(()) => NtStatus::STATUS_SUCCESS,

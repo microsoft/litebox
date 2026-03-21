@@ -16,6 +16,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
+use litebox_platform_multiplex::Platform;
+
+/// Type alias for thread wakers used by sync object waiters.
+type SyncWaker = litebox::event::wait::Waker<Platform>;
+
 /// The first allocatable handle value. Windows handles start at 4.
 const FIRST_HANDLE: u32 = 4;
 /// Handle increment (Windows allocates handles in steps of 4).
@@ -27,7 +32,6 @@ const HANDLE_STEP: u32 = 4;
 pub type SharedFilePosition = Arc<core::sync::atomic::AtomicU64>;
 
 /// An NT kernel object.
-#[derive(Debug)]
 pub enum NtObject {
     /// Console input stream (stdin).
     ConsoleInput,
@@ -117,12 +121,14 @@ pub enum NtObject {
 /// - **Manual-reset**: stays signaled until explicitly reset. NtSetEvent wakes
 ///   all waiters.
 /// - **Auto-reset**: automatically resets after waking one waiter.
-#[derive(Debug)]
 pub struct EventObject {
     /// Mutex-protected signaled state.
     pub state: Mutex<bool>,
     /// True = manual-reset, false = auto-reset.
     pub manual_reset: bool,
+    /// Wakers for threads blocked in wait_event. Signaling paths wake
+    /// all registered wakers so that `wait_until` re-evaluates.
+    pub waiters: Mutex<Vec<SyncWaker>>,
 }
 
 impl EventObject {
@@ -131,21 +137,30 @@ impl EventObject {
         Self {
             state: Mutex::new(initial_state),
             manual_reset,
+            waiters: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Wake all threads waiting on this event.
+    pub fn wake_waiters(&self) {
+        for w in self.waiters.lock().iter() {
+            w.wake();
         }
     }
 }
 
 /// Internal state for an NT thread object.
 ///
-/// Tracks thread exit status; waiters use spin-polling for WaitForSingleObject
-/// on thread handles.
-#[derive(Debug)]
+/// Tracks thread exit status. Waiters block via WaitContext and are woken
+/// when the thread exits.
 pub struct ThreadObject {
     /// Thread exit code, set when the thread terminates.
     /// None = still running, Some(code) = exited.
     pub exit_status: Mutex<Option<i32>>,
     /// Pseudo thread ID for GetCurrentThreadId / OwningThread in CRITICAL_SECTION.
     pub thread_id: u32,
+    /// Wakers for threads blocked in wait_thread.
+    pub waiters: Mutex<Vec<SyncWaker>>,
 }
 
 impl ThreadObject {
@@ -154,12 +169,16 @@ impl ThreadObject {
         Self {
             exit_status: Mutex::new(None),
             thread_id,
+            waiters: Mutex::new(Vec::new()),
         }
     }
 
-    /// Mark the thread as exited with the given exit code.
+    /// Mark the thread as exited with the given exit code and wake all waiters.
     pub fn set_exited(&self, code: i32) {
         *self.exit_status.lock() = Some(code);
+        for w in self.waiters.lock().iter() {
+            w.wake();
+        }
     }
 
     /// Returns true if the thread has exited.
@@ -169,12 +188,13 @@ impl ThreadObject {
 }
 
 /// Internal state for an NT semaphore object.
-#[derive(Debug)]
 pub struct SemaphoreObject {
     /// Mutex-protected current count.
     pub state: Mutex<i32>,
     /// Maximum count.
     pub max_count: i32,
+    /// Wakers for threads blocked in wait_semaphore.
+    pub waiters: Mutex<Vec<SyncWaker>>,
 }
 
 impl SemaphoreObject {
@@ -183,6 +203,14 @@ impl SemaphoreObject {
         Self {
             state: Mutex::new(initial_count),
             max_count,
+            waiters: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Wake all threads waiting on this semaphore.
+    pub fn wake_waiters(&self) {
+        for w in self.waiters.lock().iter() {
+            w.wake();
         }
     }
 }
@@ -193,12 +221,13 @@ impl SemaphoreObject {
 /// SRW locks and condition variables. Each wait/release pair is matched 1:1:
 /// one NtReleaseKeyedEvent wakes exactly one NtWaitForKeyedEvent on the same
 /// key, and vice versa.
-#[derive(Debug)]
 pub struct KeyedEventObject {
     /// Per-key queue state with per-caller release tokens for 1:1 matching.
     pub state: Mutex<BTreeMap<usize, KeyedWaiterQueue>>,
     /// Monotonic counter for unique release token IDs.
     next_release_id: Mutex<u64>,
+    /// Wakers for threads blocked in wait/release on this keyed event.
+    pub waiters: Mutex<Vec<SyncWaker>>,
 }
 
 /// Per-key queue state inside a keyed event.
@@ -242,6 +271,7 @@ impl KeyedEventObject {
         Self {
             state: Mutex::new(BTreeMap::new()),
             next_release_id: Mutex::new(0),
+            waiters: Mutex::new(Vec::new()),
         }
     }
 
@@ -251,6 +281,13 @@ impl KeyedEventObject {
         let val = *id;
         *id = val.wrapping_add(1);
         val
+    }
+
+    /// Wake all threads waiting on this keyed event.
+    pub fn wake_waiters(&self) {
+        for w in self.waiters.lock().iter() {
+            w.wake();
+        }
     }
 }
 
@@ -269,7 +306,6 @@ pub struct DirEnumEntry {
 ///
 /// Thread-safety: The handle table is not internally synchronized. The shim
 /// must ensure single-threaded access (Phase 1) or wrap in a Mutex (Phase 3+).
-#[derive(Debug)]
 pub struct HandleTable {
     /// Map from handle value to object.
     objects: BTreeMap<u32, NtObject>,
