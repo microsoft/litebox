@@ -215,8 +215,9 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     };
 
     let litebox = shim.litebox();
-    let nine_p_fs = litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/")
-        .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+    let nine_p_fs =
+        litebox::fs::nine_p::FileSystem::new(litebox, transport, 4 * 1024 * 1024, "root", "/")
+            .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
 
     if cfg!(debug_assertions) {
         eprintln!("9P broker connected.");

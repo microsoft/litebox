@@ -8,6 +8,7 @@
 //! for Plan 9 from Bell Labs. 9P2000.L is a Linux-specific variant that provides better
 //! compatibility with POSIX semantics.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
@@ -274,6 +275,24 @@ impl From<Rlerror> for Error {
     }
 }
 
+/// Maximum write-behind buffer size per open file. Tuned to be large enough
+/// to coalesce many small writes (e.g., cargo build emitting .d/.rmeta files)
+/// while keeping total memory use reasonable across many open files.
+const WRITE_BUFFER_CAPACITY: usize = 256 * 1024;
+
+/// Per-fid write-behind buffer for coalescing small sequential writes into
+/// fewer, larger 9P `Twrite` RPCs.
+struct WriteBuffer {
+    /// Buffered data waiting to be flushed.
+    data: Vec<u8>,
+    /// File offset where `data[0]` will be written.
+    file_offset: usize,
+    /// Unique file identity from the server qid (like an inode number).
+    /// Used for cross-fid flush matching so that alias paths (e.g.
+    /// symlinks) to the same file still observe each other's writes.
+    qid_path: u64,
+}
+
 /// A backing implementation for [`FileSystem`](super::FileSystem) using a 9P2000.L-based network
 /// file system.
 ///
@@ -299,6 +318,11 @@ pub struct FileSystem<
     current_working_dir: String,
     /// Whether `unlinkat` is supported by the server
     unlinkat_supported: AtomicBool,
+    /// Per-fid write-behind buffers. Keyed by fid so that close/read can
+    /// flush the right buffer without scanning all open files.
+    write_buffers: sync::Mutex<Platform, BTreeMap<fcall::Fid, WriteBuffer>>,
+    /// Maximum single-RPC write payload (negotiated `msize - IOHDRSZ`).
+    max_write_payload: usize,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
@@ -329,6 +353,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         path: &str,
     ) -> Result<Self, Error> {
         let client = client::Client::new(transport, msize)?;
+        let max_write_payload = (client.msize() - fcall::IOHDRSZ) as usize;
         let (qid, fid) = client.attach(username, path)?;
 
         Ok(Self {
@@ -337,7 +362,149 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             root: (qid, fid, String::from(path)),
             current_working_dir: String::from("/"),
             unlinkat_supported: AtomicBool::new(true),
+            write_buffers: sync::Mutex::new(BTreeMap::new()),
+            max_write_payload,
         })
+    }
+
+    /// Flush the write-behind buffer for `fid` to the server.
+    ///
+    /// Sends the buffered data in a loop (in case it exceeds the per-RPC
+    /// payload limit) and removes the buffer entry on success. On partial
+    /// failure, the unwritten remainder is re-inserted so it is not lost.
+    /// Returns `Ok(())` even if there was no buffer for this fid.
+    fn flush_write_buffer(&self, fid: fcall::Fid) -> Result<(), Error> {
+        let wb = self.write_buffers.lock().remove(&fid);
+        if let Some(wb) = wb {
+            self.do_flush_write_buffer(fid, wb)?;
+        }
+        Ok(())
+    }
+
+    /// Flush all write-behind buffers for the file identified by `qid_path`.
+    ///
+    /// Called before operations that need to see the latest server state
+    /// for a file (read, seek, truncate, stat, open on same file). Matches
+    /// on the server-assigned file identity so alias paths (symlinks) are
+    /// handled correctly. Returns an error if any flush fails; unwritten
+    /// remainders are preserved in the buffer map.
+    fn flush_write_buffers_for_file(&self, qid_path: u64) -> Result<(), Error> {
+        let to_flush: Vec<(fcall::Fid, WriteBuffer)> = {
+            let mut buffers = self.write_buffers.lock();
+            let fids: Vec<fcall::Fid> = buffers
+                .iter()
+                .filter(|(_, wb)| wb.qid_path == qid_path)
+                .map(|(&fid, _)| fid)
+                .collect();
+            fids.into_iter()
+                .filter_map(|fid| buffers.remove(&fid).map(|wb| (fid, wb)))
+                .collect()
+        };
+        let mut first_err = None;
+        for (fid, wb) in to_flush {
+            if let Err(e) = self.do_flush_write_buffer(fid, wb)
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Flush all write-behind buffers for the file identified by
+    /// `qid_path`, **except** for `exclude_fid`. Used by `write()` to
+    /// drain sibling-fid buffers before buffering new data, preserving
+    /// cross-fid write ordering.
+    fn flush_sibling_write_buffers(
+        &self,
+        qid_path: u64,
+        exclude_fid: fcall::Fid,
+    ) -> Result<(), Error> {
+        let to_flush: Vec<(fcall::Fid, WriteBuffer)> = {
+            let mut buffers = self.write_buffers.lock();
+            let fids: Vec<fcall::Fid> = buffers
+                .iter()
+                .filter(|&(&f, wb)| wb.qid_path == qid_path && f != exclude_fid)
+                .map(|(&fid, _)| fid)
+                .collect();
+            fids.into_iter()
+                .filter_map(|fid| buffers.remove(&fid).map(|wb| (fid, wb)))
+                .collect()
+        };
+        let mut first_err = None;
+        for (fid, wb) in to_flush {
+            if let Err(e) = self.do_flush_write_buffer(fid, wb)
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// If `path` equals `old_prefix` or lives under it, return the
+    /// corresponding path under `new_prefix`. Otherwise return `None`.
+    fn rebase_path(path: &str, old_prefix: &str, new_prefix: &str) -> Option<String> {
+        if path == old_prefix {
+            Some(String::from(new_prefix))
+        } else if let Some(suffix) = path.strip_prefix(old_prefix) {
+            // Only match a real child (path separator immediately after prefix).
+            if suffix.starts_with('/') {
+                let mut new = String::from(new_prefix);
+                new.push_str(suffix);
+                Some(new)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Send the contents of a `WriteBuffer` to the server in a write loop.
+    ///
+    /// On partial failure, the unwritten remainder is re-inserted into the
+    /// buffer map so that bytes acknowledged by earlier `write()` calls are
+    /// not silently discarded.
+    fn do_flush_write_buffer(&self, fid: fcall::Fid, wb: WriteBuffer) -> Result<(), Error> {
+        let mut written = 0;
+        while written < wb.data.len() {
+            match self
+                .client
+                .write(fid, (wb.file_offset + written) as u64, &wb.data[written..])
+            {
+                Ok(0) => {
+                    self.reinsert_remainder(fid, &wb, written);
+                    return Err(Error::Io);
+                }
+                Ok(n) => {
+                    written += n;
+                }
+                Err(e) => {
+                    self.reinsert_remainder(fid, &wb, written);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-insert the unwritten tail of a partially flushed `WriteBuffer`.
+    fn reinsert_remainder(&self, fid: fcall::Fid, wb: &WriteBuffer, written: usize) {
+        if written < wb.data.len() {
+            let remainder = WriteBuffer {
+                data: wb.data[written..].to_vec(),
+                file_offset: wb.file_offset + written,
+                qid_path: wb.qid_path,
+            };
+            self.write_buffers.lock().insert(fid, remainder);
+        }
     }
 
     /// Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
@@ -469,17 +636,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
     /// Walk to a path and return the fid
     fn walk_to(&self, path: &str) -> Result<fcall::Fid, Error> {
+        self.walk_to_with_qid(path).map(|(fid, _)| fid)
+    }
+
+    /// Walk to a path and return both the fid and the last qid.
+    fn walk_to_with_qid(&self, path: &str) -> Result<(fcall::Fid, fcall::Qid), Error> {
         let components: Vec<&str> = path
             .normalized_components()
             .map_err(|_| Error::InvalidPathname)?
             .collect();
         if components.is_empty() {
-            // Clone the root fid
-            self.client.clone_fid(self.root.1)
+            let fid = self.client.clone_fid(self.root.1)?;
+            Ok((fid, self.root.0))
         } else {
-            self.client
-                .walk(self.root.1, &components)
-                .map(|(_, fid)| fid)
+            let (qids, fid) = self.client.walk(self.root.1, &components)?;
+            let qid = qids.last().copied().ok_or(Error::InvalidResponse)?;
+            Ok((fid, qid))
         }
     }
 
@@ -703,6 +875,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
 
         let path = self.absolute_path(path)?;
+
         let components: Vec<&str> = path
             .normalized_components()
             .map_err(|_| OpenError::PathError(PathError::InvalidPathname))?
@@ -711,18 +884,61 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let needs_create = flags.contains(super::OFlags::CREAT);
 
         let (new_qid, new_fid) = if needs_create {
-            let (_, dfid) = self
-                .client
-                .walk(self.root.1, &components[..components.len() - 1])?;
-            match self
-                .client
-                .create(dfid, components.last().unwrap(), lflags, mode.bits(), 0)
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    // Clunk the parent directory fid to avoid leaking it.
-                    let _ = self.client.clunk(dfid);
-                    return Err(e.into());
+            // Try to walk to the target first. If it already exists, fall
+            // through to the regular open path which flushes write-behind
+            // buffers and handles O_TRUNC correctly. Only use Tlcreate for
+            // truly new files.
+            let existing = self.client.walk(self.root.1, &components);
+            if let Ok((_qids, existing_fid)) = existing {
+                if flags.contains(super::OFlags::EXCL) {
+                    let _ = self.client.clunk(existing_fid);
+                    return Err(OpenError::AlreadyExists);
+                }
+                // File exists — strip O_TRUNC and open normally, then
+                // flush buffers and apply truncation manually.
+                let has_trunc = lflags.contains(fcall::LOpenFlags::O_TRUNC);
+                let open_flags = lflags & !fcall::LOpenFlags::O_TRUNC & !fcall::LOpenFlags::O_CREAT;
+                match self.client.open(existing_fid, open_flags) {
+                    Ok(qid) => {
+                        if self.flush_write_buffers_for_file(qid.path).is_err() {
+                            let _ = self.client.clunk(existing_fid);
+                            return Err(OpenError::Io);
+                        }
+                        if has_trunc {
+                            let stat = fcall::SetAttr {
+                                size: 0,
+                                ..Default::default()
+                            };
+                            if let Err(e) =
+                                self.client
+                                    .setattr(existing_fid, fcall::SetattrMask::SIZE, stat)
+                            {
+                                let _ = self.client.clunk(existing_fid);
+                                return Err(e.into());
+                            }
+                        }
+                        (qid, existing_fid)
+                    }
+                    Err(e) => {
+                        let _ = self.client.clunk(existing_fid);
+                        return Err(e.into());
+                    }
+                }
+            } else {
+                // File does not exist — create it. No flush needed since
+                // there can be no pending writes to a nonexistent file.
+                let (_, dfid) = self
+                    .client
+                    .walk(self.root.1, &components[..components.len() - 1])?;
+                match self
+                    .client
+                    .create(dfid, components.last().unwrap(), lflags, mode.bits(), 0)
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        let _ = self.client.clunk(dfid);
+                        return Err(e.into());
+                    }
                 }
             }
         } else {
@@ -736,8 +952,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                     e,
                 );
             }
-            let (_, new_fid) = walk_result?;
-            let open_result = self.client.open(new_fid, lflags);
+            let (_qids, new_fid) = walk_result?;
+
+            // Strip O_TRUNC from the open flags — we apply it manually
+            // after flushing pending write-behind buffers to avoid
+            // truncating the file and then replaying stale buffered writes.
+            let has_trunc = lflags.contains(fcall::LOpenFlags::O_TRUNC);
+            let open_flags = lflags & !fcall::LOpenFlags::O_TRUNC;
+
+            let open_result = self.client.open(new_fid, open_flags);
             #[cfg(feature = "trace_fs")]
             if let Err(ref e) = open_result {
                 log_println!(
@@ -750,7 +973,30 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 );
             }
             match open_result {
-                Ok(qid) => (qid, new_fid),
+                Ok(qid) => {
+                    // Flush any pending write-behind data for the opened file
+                    // using the qid returned by open(), which is the target's
+                    // qid after symlink resolution.
+                    if self.flush_write_buffers_for_file(qid.path).is_err() {
+                        let _ = self.client.clunk(new_fid);
+                        return Err(OpenError::Io);
+                    }
+                    // Apply O_TRUNC now that buffered writes have been
+                    // drained, so the truncate isn't undone by a later
+                    // flush of stale data.
+                    if has_trunc {
+                        let stat = fcall::SetAttr {
+                            size: 0,
+                            ..Default::default()
+                        };
+                        if let Err(e) = self.client.setattr(new_fid, fcall::SetattrMask::SIZE, stat)
+                        {
+                            let _ = self.client.clunk(new_fid);
+                            return Err(e.into());
+                        }
+                    }
+                    (qid, new_fid)
+                }
                 Err(e) => {
                     // Clunk the fid from the walk to avoid leaking it on the
                     // server. Ignore clunk errors since the connection may
@@ -766,6 +1012,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             offset: AtomicUsize::new(0),
             qid: new_qid,
             path: path.clone(),
+            direct_write: flags.intersects(OFlags::SYNC | OFlags::DSYNC | OFlags::APPEND),
         };
 
         let fd = self.litebox.descriptor_table_mut().insert(descriptor);
@@ -775,7 +1022,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     fn close(&self, fd: &FileFd<Platform, T>) -> Result<(), super::errors::CloseError> {
         let entry = self.litebox.descriptor_table_mut().remove(fd);
         if let Some(entry) = entry {
+            // Flush any pending write-behind data before releasing the fid.
+            // Propagate flush errors so callers know about data loss.
+            let flush_result = self.flush_write_buffer(entry.entry.fid);
+            // On flush failure, do_flush_write_buffer re-inserts the
+            // unwritten remainder. Remove it unconditionally — the fid is
+            // about to be clunked, so the remainder can never be flushed.
+            self.write_buffers.lock().remove(&entry.entry.fid);
             let _ = self.client.clunk(entry.entry.fid);
+            if flush_result.is_err() {
+                return Err(super::errors::CloseError::Io);
+            }
         }
         Ok(())
     }
@@ -786,15 +1043,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::ReadError> {
-        // Extract fid and current offset, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
-        let (fid, current_offset) = self
+        // Extract fid, current offset, and qid, releasing the descriptor
+        // table lock before performing potentially blocking I/O.
+        let (fid, current_offset, qid_path) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |desc| {
-                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
+                (
+                    desc.entry.fid,
+                    desc.entry.offset.load(Ordering::SeqCst),
+                    desc.entry.qid.path,
+                )
             })
             .ok_or(super::errors::ReadError::ClosedFd)?;
+
+        // Flush all pending write-behind data for this file (across all
+        // fids) so the read sees the latest bytes on the server.
+        self.flush_write_buffers_for_file(qid_path)?;
 
         let read_offset = match offset {
             Some(o) => o,
@@ -819,31 +1084,117 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::WriteError> {
-        // Extract fid and current offset, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
-        let (fid, current_offset) = self
+        // Extract fid, current offset, sync flag, and qid from the
+        // descriptor, releasing the table lock before any I/O.
+        let (fid, current_offset, direct_write, qid_path) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |desc| {
-                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
+                (
+                    desc.entry.fid,
+                    desc.entry.offset.load(Ordering::SeqCst),
+                    desc.entry.direct_write,
+                    desc.entry.qid.path,
+                )
             })
             .ok_or(super::errors::WriteError::ClosedFd)?;
+
+        // Flush any sibling-fid buffers for the same file so that earlier
+        // writes from other fds reach the server before this one.  This
+        // preserves cross-fid write ordering without draining our own
+        // buffer (which we may still coalesce into).
+        self.flush_sibling_write_buffers(qid_path, fid)?;
 
         let write_offset = match offset {
             Some(o) => o,
             None => current_offset,
         };
 
-        let bytes_written = self.client.write(fid, write_offset as u64, buf)?;
+        let total = buf.len();
 
-        // Update offset if not using explicit offset
+        // O_SYNC / O_DSYNC: bypass buffering entirely so data hits the
+        // server before write() returns.
+        if direct_write {
+            let mut written = 0;
+            while written < total {
+                let n = self
+                    .client
+                    .write(fid, (write_offset + written) as u64, &buf[written..])?;
+                if n == 0 {
+                    break;
+                }
+                written += n;
+            }
+            if offset.is_none() {
+                self.litebox.descriptor_table().with_entry(fd, |desc| {
+                    desc.entry.offset.fetch_add(written, Ordering::SeqCst);
+                });
+            }
+            return Ok(written);
+        }
+
+        let buf_cap = WRITE_BUFFER_CAPACITY.min(self.max_write_payload);
+
+        // Try to coalesce into the write-behind buffer.
+        let mut buffers = self.write_buffers.lock();
+        if let Some(wb) = buffers.get_mut(&fid) {
+            let expected_offset = wb.file_offset + wb.data.len();
+            if write_offset == expected_offset && wb.data.len() + total <= buf_cap {
+                // Sequential and fits — append without any RPC.
+                wb.data.extend_from_slice(buf);
+                drop(buffers);
+                if offset.is_none() {
+                    self.litebox.descriptor_table().with_entry(fd, |desc| {
+                        desc.entry.offset.fetch_add(total, Ordering::SeqCst);
+                    });
+                }
+                return Ok(total);
+            }
+            // Non-sequential or buffer full — flush the old buffer first.
+            let old_wb = buffers.remove(&fid).unwrap();
+            drop(buffers);
+            self.do_flush_write_buffer(fid, old_wb)?;
+        } else {
+            drop(buffers);
+        }
+
+        // If the write is small enough, start a new buffer.
+        if total <= buf_cap {
+            self.write_buffers.lock().insert(
+                fid,
+                WriteBuffer {
+                    data: Vec::from(buf),
+                    file_offset: write_offset,
+                    qid_path,
+                },
+            );
+            if offset.is_none() {
+                self.litebox.descriptor_table().with_entry(fd, |desc| {
+                    desc.entry.offset.fetch_add(total, Ordering::SeqCst);
+                });
+            }
+            return Ok(total);
+        }
+
+        // Large write — send directly in a loop (no point buffering).
+        let mut written = 0;
+        while written < total {
+            let n = self
+                .client
+                .write(fid, (write_offset + written) as u64, &buf[written..])?;
+            if n == 0 {
+                break;
+            }
+            written += n;
+        }
+
         if offset.is_none() {
             self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry.offset.fetch_add(bytes_written, Ordering::SeqCst);
+                desc.entry.offset.fetch_add(written, Ordering::SeqCst);
             });
         }
 
-        Ok(bytes_written)
+        Ok(written)
     }
 
     fn seek(
@@ -854,13 +1205,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     ) -> Result<usize, SeekError> {
         // Extract fid and current offset, releasing the descriptor table lock
         // before performing potentially blocking I/O (getattr for SeekWhence::RelativeToEnd).
-        let (fid, current_offset) = self
+        let (fid, current_offset, qid_path) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |desc| {
-                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
+                (
+                    desc.entry.fid,
+                    desc.entry.offset.load(Ordering::SeqCst),
+                    desc.entry.qid.path,
+                )
             })
             .ok_or(SeekError::ClosedFd)?;
+
+        // Flush all pending write-behind data for this file (across all
+        // fids) since the seek changes the file position.
+        self.flush_write_buffers_for_file(qid_path)?;
 
         let base = match whence {
             super::SeekWhence::RelativeToBeginning => 0,
@@ -893,6 +1252,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .descriptor_table()
             .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid))
             .ok_or(super::errors::TruncateError::ClosedFd)?;
+
+        // Flush all pending writes for this file (across all fids) before
+        // truncating — buffered data from sibling fids past the new size
+        // would otherwise be lost or re-applied after the truncate.
+        self.flush_write_buffers_for_file(qid.path)?;
 
         if qid.typ.contains(fcall::QidType::DIR) {
             return Err(super::errors::TruncateError::IsDirectory);
@@ -989,10 +1353,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .absolute_path(new)
             .map_err(|_| super::errors::RenameError::ReadOnlyFileSystem)?;
 
-        // Walk to the source file
-        let src_fid = self
-            .walk_to(&old_path)
+        // Walk to the source file to get its qid for buffer flushing.
+        let (src_fid, source_qid) = self
+            .walk_to_with_qid(&old_path)
             .map_err(|_| super::errors::RenameError::ReadOnlyFileSystem)?;
+
+        // Flush any pending write-behind data for the source file so that
+        // the server has the latest contents before the rename. Propagate
+        // flush errors — a silent drop would lose acknowledged writes.
+        if self.flush_write_buffers_for_file(source_qid.path).is_err() {
+            let _ = self.client.clunk(src_fid);
+            return Err(super::errors::RenameError::Io);
+        }
 
         // Walk to the destination parent directory
         let new_components: Vec<&str> = new_path
@@ -1027,6 +1399,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let result = self.client.rename(src_fid, dst_dir_fid, new_name);
         let _ = self.client.clunk(src_fid);
         let _ = self.client.clunk(dst_dir_fid);
+
+        if result.is_ok() {
+            // Update the path stored in every open descriptor that still
+            // refers to the old path (or a descendant). This keeps
+            // Descriptor.path accurate for debugging/tracing. Write-behind
+            // buffer matching uses qid_path (file identity), so renames
+            // are transparent to cross-fid flush logic.
+            let table = self.litebox.descriptor_table();
+            for (_, mut desc) in table.iter_mut::<Self>() {
+                if let Some(new) = Self::rebase_path(&desc.entry.path, &old_path, &new_path) {
+                    desc.entry.path = new;
+                }
+            }
+        }
 
         result.map_err(|_| super::errors::RenameError::ReadOnlyFileSystem)
     }
@@ -1095,7 +1481,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         path: impl crate::path::Arg,
     ) -> Result<super::FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
-        let fid = self.walk_to(&path)?;
+
+        let (fid, qid) = self.walk_to_with_qid(&path)?;
+
+        // Flush any pending write-behind data for this file so the server
+        // reports the correct file size and mtime.
+        if self.flush_write_buffers_for_file(qid.path).is_err() {
+            let _ = self.client.clunk(fid);
+            return Err(FileStatusError::Io);
+        }
 
         let result = self.client.getattr(fid, fcall::GetattrMask::ALL);
         let _ = self.client.clunk(fid);
@@ -1109,13 +1503,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         &self,
         fd: &FileFd<Platform, T>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        // Extract fid, releasing the descriptor table lock
+        // Extract fid and qid, releasing the descriptor table lock
         // before performing potentially blocking I/O.
-        let fid = self
+        let (fid, qid_path) = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| desc.entry.fid)
+            .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid.path))
             .ok_or(super::errors::FileStatusError::ClosedFd)?;
+
+        // Flush all pending writes for this file (across all fids) so the
+        // server reports the correct file size.
+        self.flush_write_buffers_for_file(qid_path)?;
 
         // Perform blocking I/O without holding any locks.
         let attr = self.client.getattr(fid, fcall::GetattrMask::ALL)?;
@@ -1283,6 +1681,10 @@ struct Descriptor {
     qid: fcall::Qid,
     /// Path used to open this file
     path: alloc::string::String,
+    /// Whether writes on this fd must bypass the write-behind buffer and
+    /// go directly to the server. Set for O_SYNC, O_DSYNC (durability) and
+    /// O_APPEND (atomicity of append point).
+    direct_write: bool,
 }
 
 crate::fd::enable_fds_for_subsystem! {

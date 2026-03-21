@@ -40,7 +40,11 @@ pub enum OpenError {
 /// Possible errors from [`FileSystem::close`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
-pub enum CloseError {}
+pub enum CloseError {
+    /// An I/O error occurred while flushing buffered writes.
+    #[error("I/O error during close flush")]
+    Io,
+}
 
 /// Possible errors from [`FileSystem::read`]
 #[non_exhaustive]

@@ -157,6 +157,11 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         })
     }
 
+    /// Returns the negotiated maximum message size.
+    pub(super) fn msize(&self) -> u32 {
+        self.msize
+    }
+
     /// Send a request and wait for the response
     fn fcall<F, R>(&self, fcall: Fcall<'_>, f: F) -> Result<R, Error>
     where
