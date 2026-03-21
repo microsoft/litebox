@@ -8,7 +8,7 @@
 //! for Plan 9 from Bell Labs. 9P2000.L is a Linux-specific variant that provides better
 //! compatibility with POSIX semantics.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
@@ -361,6 +361,19 @@ pub struct FileSystem<
     /// a server fid that remains alive so subsequent walks can start
     /// from a cached ancestor instead of walking all the way from root.
     dir_fid_cache: sync::Mutex<Platform, BTreeMap<String, (fcall::Fid, fcall::Qid)>>,
+    /// Readlink result cache. Keyed by absolute symlink path, stores
+    /// the target string returned by `readlink`. Avoids repeated
+    /// readlinkpath RPCs for symlinks that are read many times during
+    /// a build (e.g. `/usr/lib/libfoo.so` → `libfoo.so.1`).
+    /// Invalidated on unlink, rename, and create (which can replace a
+    /// symlink).
+    readlink_cache: sync::Mutex<Platform, BTreeMap<String, String>>,
+    /// Negative stat cache. Stores absolute paths for which `file_status`
+    /// returned ENOENT. Avoids repeated walk+getattr RPCs for paths
+    /// that don't exist (e.g. Cargo probing optional config files).
+    /// Invalidated on create, mkdir, rename-to, and symlink which can
+    /// make previously non-existent paths exist.
+    negative_stat_cache: sync::Mutex<Platform, BTreeSet<String>>,
     /// Maximum single-RPC write payload (negotiated `msize - IOHDRSZ`).
     max_write_payload: usize,
     /// Monotonically increasing generation counter. Bumped on every write,
@@ -411,6 +424,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             read_buffers: sync::Mutex::new(BTreeMap::new()),
             stat_cache: sync::Mutex::new(BTreeMap::new()),
             dir_fid_cache: sync::Mutex::new(BTreeMap::new()),
+            readlink_cache: sync::Mutex::new(BTreeMap::new()),
+            negative_stat_cache: sync::Mutex::new(BTreeSet::new()),
             max_write_payload,
             cache_generation: AtomicUsize::new(0),
         })
@@ -619,6 +634,43 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
     }
 
+    /// Invalidate cached readlink results for specific paths.
+    fn invalidate_readlink_cache(&self, paths: &[&str]) {
+        self.cache_generation.fetch_add(1, Ordering::SeqCst);
+        let mut cache = self.readlink_cache.lock();
+        for path in paths {
+            cache.remove(*path);
+        }
+    }
+
+    /// Invalidate cached readlink results for a path and all descendants
+    /// (e.g. when a directory is renamed or removed).
+    fn invalidate_readlink_cache_tree(&self, path: &str) {
+        self.cache_generation.fetch_add(1, Ordering::SeqCst);
+        let prefix = alloc::format!("{path}/");
+        let mut cache = self.readlink_cache.lock();
+        cache.retain(|k, _| k != path && !k.starts_with(&prefix));
+    }
+
+    /// Invalidate negative stat cache entries for specific paths.
+    fn invalidate_negative_stat_cache(&self, paths: &[&str]) {
+        self.cache_generation.fetch_add(1, Ordering::SeqCst);
+        let mut cache = self.negative_stat_cache.lock();
+        for path in paths {
+            cache.remove(*path);
+        }
+    }
+
+    /// Invalidate negative stat cache entries for a path and all descendants
+    /// (e.g. when a directory is created, previously non-existent children
+    /// might now be reachable).
+    fn invalidate_negative_stat_cache_tree(&self, path: &str) {
+        self.cache_generation.fetch_add(1, Ordering::SeqCst);
+        let prefix = alloc::format!("{path}/");
+        let mut cache = self.negative_stat_cache.lock();
+        cache.retain(|k| k.as_str() != path && !k.starts_with(&prefix));
+    }
+
     /// Check whether a set of path components fits within a single compound
     /// RPC message. The 9P encoding for wnames is:
     /// `nwname(2) + sum(strlen_prefix(2) + bytes)` per component, plus a
@@ -628,6 +680,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         const COMPOUND_RPC_OVERHEAD: usize = 30;
         let wnames_size: usize = 2 + wnames.iter().map(|w| 2 + w.len()).sum::<usize>();
         wnames_size + COMPOUND_RPC_OVERHEAD <= self.client.msize() as usize
+    }
+
+    /// If `err` is ENOENT and no concurrent mutation happened, insert `path`
+    /// into the negative stat cache so subsequent lookups can skip the RPC.
+    fn try_cache_negative(&self, path: &str, err: &FileStatusError, gen_before: usize) {
+        if matches!(
+            err,
+            FileStatusError::PathError(PathError::NoSuchFileOrDirectory)
+        ) && self.cache_generation.load(Ordering::SeqCst) == gen_before
+        {
+            self.negative_stat_cache.lock().insert(path.into());
+        }
     }
 
     /// Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
@@ -1221,6 +1285,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             (qid, opened_fid)
         };
 
+        // Clear negative and readlink caches FIRST so concurrent
+        // file_status calls cannot observe a stale ENOENT while the
+        // remaining stat-cache invalidation is still in progress.
+        if flags.contains(OFlags::CREAT) {
+            self.invalidate_negative_stat_cache(&[&path]);
+            self.invalidate_readlink_cache(&[&path]);
+        }
         // Invalidate stat cache when the file was created or truncated.
         if flags.intersects(OFlags::CREAT | OFlags::TRUNC) {
             self.invalidate_stat_cache_by_qid(new_qid.path);
@@ -1687,6 +1758,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             }
             if let Some(ref p) = abs_path {
                 self.invalidate_parent_stat_cache(p);
+                // Unlink may remove a symlink — invalidate readlink cache.
+                self.invalidate_readlink_cache(&[p]);
             }
         }
         result
@@ -1759,6 +1832,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let _ = self.client.clunk(dst_dir_fid);
 
         if result.is_ok() {
+            // Clear negative and readlink caches FIRST so concurrent
+            // file_status calls cannot observe a stale ENOENT while the
+            // remaining stat/dir-fid invalidation is still in progress.
+            self.invalidate_negative_stat_cache_tree(&old_path);
+            self.invalidate_negative_stat_cache_tree(&new_path);
+            self.invalidate_readlink_cache_tree(&old_path);
+            self.invalidate_readlink_cache_tree(&new_path);
             // Invalidate stat cache for both old and new paths, including
             // any descendants (for directory renames) and all aliases via qid.
             self.invalidate_stat_cache_by_qid(source_qid.path);
@@ -1799,6 +1879,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let _ = self.client.clunk(parent_fid);
 
         if result.is_ok() {
+            // Clear negative cache FIRST so concurrent file_status calls
+            // cannot observe a stale ENOENT during parent stat invalidation.
+            self.invalidate_negative_stat_cache(&[&path]);
             self.invalidate_parent_stat_cache(&path);
         }
 
@@ -1826,6 +1909,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 self.invalidate_stat_cache_tree(p);
                 self.invalidate_parent_stat_cache(p);
                 self.invalidate_dir_fid_cache_tree(p);
+                // Removing a directory invalidates readlink entries under it
+                // and any negative cache children are no longer reachable.
+                self.invalidate_readlink_cache_tree(p);
             }
         }
         result
@@ -1888,6 +1974,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             }
         }
 
+        // Snapshot generation before consulting other caches or issuing any
+        // RPC so we can detect namespace mutations racing with this lookup.
+        let gen_before = self.cache_generation.load(Ordering::SeqCst);
+
+        // Check the negative stat cache — if we previously got ENOENT
+        // for this path and no namespace mutations have invalidated it,
+        // we can return the error without any RPCs.
+        {
+            let neg_cache = self.negative_stat_cache.lock();
+            if neg_cache.contains(&path) {
+                return Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory));
+            }
+        }
+
         // Split path into components for the statpath RPC.
         let components: Vec<&str> = path
             .normalized_components()
@@ -1903,9 +2003,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             };
         let remaining = &components[prefix_len..];
 
-        // Snapshot generation before RPC so we can detect concurrent writes.
-        let gen_before = self.cache_generation.load(Ordering::SeqCst);
-
         // Check if there are any pending write buffers at all. If there
         // are none, we can skip the flush entirely and use a single
         // statpath RPC.
@@ -1917,7 +2014,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             }
             // Fall back to walk + flush + getattr + clunk to ensure
             // correct size/mtime after pending writes.
-            let (fid, qid) = self.walk_to_with_qid(&path)?;
+            let (fid, qid) = match self.walk_to_with_qid(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    let e = FileStatusError::from(e);
+                    self.try_cache_negative(&path, &e, gen_before);
+                    return Err(e);
+                }
+            };
             if self.flush_write_buffers_for_file(qid.path).is_err() {
                 let _ = self.client.clunk(fid);
                 return Err(FileStatusError::Io);
@@ -1943,20 +2047,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 let _ = self.client.clunk(start_fid);
             }
 
-            let result = result.map_err(FileStatusError::from)?;
-            let status = Self::rstatpath_to_file_status(&result).map_err(FileStatusError::from)?;
-            // Only cache if no concurrent mutation occurred during the RPC.
-            if self.cache_generation.load(Ordering::SeqCst) == gen_before {
-                self.stat_cache.lock().insert(path, status.clone());
+            match result {
+                Err(e) => {
+                    let e = FileStatusError::from(e);
+                    self.try_cache_negative(&path, &e, gen_before);
+                    Err(e)
+                }
+                Ok(result) => {
+                    let status =
+                        Self::rstatpath_to_file_status(&result).map_err(FileStatusError::from)?;
+                    if self.cache_generation.load(Ordering::SeqCst) == gen_before {
+                        self.stat_cache.lock().insert(path, status.clone());
+                    }
+                    Ok(status)
+                }
             }
-            Ok(status)
         } else {
             // Path too long for a single compound RPC — fall back to
             // walk + getattr + clunk.
             if cloned_cache_fid {
                 let _ = self.client.clunk(start_fid);
             }
-            let (fid, _) = self.walk_to_with_qid(&path)?;
+            let (fid, _) = match self.walk_to_with_qid(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    let e = FileStatusError::from(e);
+                    self.try_cache_negative(&path, &e, gen_before);
+                    return Err(e);
+                }
+            };
             let result = self.client.getattr(fid, fcall::GetattrMask::ALL);
             let _ = self.client.clunk(fid);
             let status = result
@@ -2024,6 +2143,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .absolute_path(path)
             .map_err(super::errors::ReadLinkError::PathError)?;
 
+        // Snapshot generation before consulting the cache or issuing any
+        // RPC so we don't populate the cache with a target raced by a
+        // concurrent namespace mutation.
+        let gen_before = self.cache_generation.load(Ordering::SeqCst);
+
+        // Check the readlink cache first to avoid any RPCs.
+        {
+            let cache = self.readlink_cache.lock();
+            if let Some(cached) = cache.get(&abs) {
+                return Ok(cached.clone());
+            }
+        }
+
         // Use the combined readlinkpath RPC (walk + readlink + clunk in one
         // round-trip) with dir_fid_cache prefix lookup.
         let components: Vec<&str> = abs
@@ -2066,7 +2198,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             let _ = self.client.clunk(parent_fid);
             result.map_err(|_| super::errors::ReadLinkError::Io)?
         };
-        alloc::string::String::from_utf8(target).map_err(|_| super::errors::ReadLinkError::Io)
+        let target_str = alloc::string::String::from_utf8(target)
+            .map_err(|_| super::errors::ReadLinkError::Io)?;
+
+        // Cache the readlink result. Symlink targets are immutable unless
+        // the symlink is replaced (unlink + symlink), which is handled by
+        // cache invalidation in unlink/rename/create.
+        if self.cache_generation.load(Ordering::SeqCst) == gen_before {
+            self.readlink_cache.lock().insert(abs, target_str.clone());
+        }
+
+        Ok(target_str)
     }
 
     fn open_at(
