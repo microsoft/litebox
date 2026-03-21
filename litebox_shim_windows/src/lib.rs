@@ -58,6 +58,7 @@ extern crate alloc;
 use core::sync::atomic::{AtomicI32, Ordering};
 use spin::Mutex;
 
+use litebox::event::wait::WaitState;
 use litebox::mm::PageManager;
 use litebox::shim::{ContinueOperation, ExceptionInfo};
 use litebox_common_windows::ntstatus::NtStatus;
@@ -236,6 +237,8 @@ pub struct NtShimEntrypoints {
     /// Per-thread ID. Main thread = 1, child threads get monotonically
     /// increasing IDs from `NtSharedState::next_thread_id`.
     thread_id: u32,
+    /// Per-thread wait state for proper blocking waits (sleep, events, etc.).
+    wait_state: WaitState<Platform>,
     /// Process-wide shared state (handles, env, CWD, etc.).
     shared: alloc::sync::Arc<NtSharedState>,
 }
@@ -384,6 +387,7 @@ impl NtShimEntrypoints {
             fls_slots: Mutex::new([0usize; 128]),
             thread_obj: None,
             thread_id: 1, // Main thread is always TID 1
+            wait_state: WaitState::new(litebox_platform_multiplex::platform()),
             shared,
         }
     }
@@ -407,6 +411,13 @@ impl NtShimEntrypoints {
     /// Install the litebox core VFS for file I/O.
     pub fn set_fs(&self, fs: alloc::sync::Arc<NtFS>) {
         let _ = self.shared.fs.call_once(|| fs);
+    }
+
+    /// Returns a wait context for the current thread, suitable for blocking
+    /// waits (sleep, event waits, etc.). Uses the platform's blocking
+    /// primitives instead of busy-spinning.
+    pub(crate) fn wait_cx(&self) -> litebox::event::wait::WaitContext<'_, Platform> {
+        self.wait_state.context()
     }
 
     /// Create a new NT shim entrypoints for a child thread.
@@ -446,6 +457,7 @@ impl NtShimEntrypoints {
             fls_slots: Mutex::new([0usize; 128]),
             thread_obj: Some(thread_obj),
             thread_id,
+            wait_state: WaitState::new(litebox_platform_multiplex::platform()),
             shared,
         }
     }
@@ -1226,11 +1238,11 @@ impl NtShimEntrypoints {
             }
             // --- Phase 3B: Sleep ---
             stub_dlls::K32_SLEEP => {
-                let status = syscalls::k32_handlers::k32_sleep(ctx);
+                let status = syscalls::k32_handlers::k32_sleep(ctx, &self.wait_cx());
                 return (status, false);
             }
             stub_dlls::K32_SLEEP_EX => {
-                let status = syscalls::k32_handlers::k32_sleep_ex(ctx);
+                let status = syscalls::k32_handlers::k32_sleep_ex(ctx, &self.wait_cx());
                 return (status, false);
             }
             // --- Phase 3B: Critical sections ---
@@ -1284,13 +1296,13 @@ impl NtShimEntrypoints {
                 let status = match waitable {
                     Some(w) => match &w {
                         syscalls::sync::Waitable::Event(e) => {
-                            syscalls::sync::wait_event_with_timeout(e, timeout)
+                            syscalls::sync::wait_event_with_timeout(e, timeout, &self.wait_cx())
                         }
                         syscalls::sync::Waitable::Semaphore(s) => {
-                            syscalls::sync::wait_semaphore_with_timeout(s, timeout)
+                            syscalls::sync::wait_semaphore_with_timeout(s, timeout, &self.wait_cx())
                         }
                         syscalls::sync::Waitable::Thread(t) => {
-                            syscalls::sync::wait_thread_with_timeout(t, timeout)
+                            syscalls::sync::wait_thread_with_timeout(t, timeout, &self.wait_cx())
                         }
                     },
                     None => NtStatus::STATUS_INVALID_HANDLE,
@@ -1605,7 +1617,7 @@ impl NtShimEntrypoints {
                 (status, false)
             }
             NtSyscallId::NtDelayExecution => {
-                let status = syscalls::sysinfo::nt_delay_execution(ctx);
+                let status = syscalls::sysinfo::nt_delay_execution(ctx, &self.wait_cx());
                 (status, false)
             }
             NtSyscallId::NtSetInformationThread => {
@@ -1639,7 +1651,10 @@ impl NtShimEntrypoints {
                     syscalls::sync::lookup_keyed_event(&handles, args.arg0 as u32)
                 };
                 match keyed {
-                    Some(k) => (syscalls::sync::wait_for_keyed_event(ctx, &k), false),
+                    Some(k) => (
+                        syscalls::sync::wait_for_keyed_event(ctx, &k, &self.wait_cx()),
+                        false,
+                    ),
                     None => (NtStatus::STATUS_INVALID_HANDLE, false),
                 }
             }
@@ -1650,7 +1665,10 @@ impl NtShimEntrypoints {
                     syscalls::sync::lookup_keyed_event(&handles, args.arg0 as u32)
                 };
                 match keyed {
-                    Some(k) => (syscalls::sync::release_keyed_event(ctx, &k), false),
+                    Some(k) => (
+                        syscalls::sync::release_keyed_event(ctx, &k, &self.wait_cx()),
+                        false,
+                    ),
                     None => (NtStatus::STATUS_INVALID_HANDLE, false),
                 }
             }
@@ -1686,13 +1704,16 @@ impl NtShimEntrypoints {
                     syscalls::sync::lookup_waitable(&handles, args.arg0 as u32)
                 };
                 match waitable {
-                    Some(w) => (syscalls::sync::wait_single(ctx, &w), false),
+                    Some(w) => (syscalls::sync::wait_single(ctx, &w, &self.wait_cx()), false),
                     None => (NtStatus::STATUS_INVALID_HANDLE, false),
                 }
             }
             NtSyscallId::NtWaitForMultipleObjects => {
-                let status =
-                    syscalls::sync::nt_wait_for_multiple_objects(ctx, &self.shared.handles);
+                let status = syscalls::sync::nt_wait_for_multiple_objects(
+                    ctx,
+                    &self.shared.handles,
+                    &self.wait_cx(),
+                );
                 (status, false)
             }
             NtSyscallId::NtDuplicateObject => {

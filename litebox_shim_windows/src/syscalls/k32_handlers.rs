@@ -1693,28 +1693,31 @@ pub(crate) fn k32_create_file_w(
         }
 
         use litebox::fs::FileSystem as _;
-        if let Ok(typed_fd) = fs.open(
+        match fs.open(
             &*vfs_path,
             oflags,
             litebox::fs::Mode::RUSR | litebox::fs::Mode::WUSR,
         ) {
-            let raw_fd = {
-                let mut rds = shared.raw_fds.lock();
-                rds.fd_into_raw_integer(typed_fd)
-            };
-            let nt_handle = handles.insert(crate::handle_table::NtObject::File {
-                path: resolved,
-                position: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
-                raw_fd,
-                vfs_refcount: alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(1)),
-            });
-            ctx.regs.rax = nt_handle as usize;
-            return NtStatus::STATUS_SUCCESS;
+            Ok(typed_fd) => {
+                let raw_fd = {
+                    let mut rds = shared.raw_fds.lock();
+                    rds.fd_into_raw_integer(typed_fd)
+                };
+                let nt_handle = handles.insert(crate::handle_table::NtObject::File {
+                    path: resolved,
+                    position: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
+                    raw_fd,
+                    vfs_refcount: alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(1)),
+                });
+                ctx.regs.rax = nt_handle as usize;
+                return NtStatus::STATUS_SUCCESS;
+            }
+            Err(e) => {
+                set_guest_last_error(teb_va, map_open_error_to_win32(&e));
+                ctx.regs.rax = usize::MAX; // INVALID_HANDLE_VALUE
+                return NtStatus::STATUS_SUCCESS;
+            }
         }
-        // VFS open failed — authoritative error, no host fallback.
-        set_guest_last_error(teb_va, 2); // ERROR_FILE_NOT_FOUND
-        ctx.regs.rax = usize::MAX; // INVALID_HANDLE_VALUE
-        return NtStatus::STATUS_SUCCESS;
     }
 
     // Path not VFS-translatable — no host fallback.
@@ -3948,21 +3951,23 @@ pub(crate) fn k32_unhandled_exception_filter(ctx: &mut super::super::ExecutionCo
 /// Sleep(DWORD dwMilliseconds)
 ///
 /// Suspends the current thread for the specified number of milliseconds.
-pub(crate) fn k32_sleep(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+pub(crate) fn k32_sleep(
+    ctx: &mut super::super::ExecutionContext,
+    wait_cx: &litebox::event::wait::WaitContext<'_, litebox_platform_multiplex::Platform>,
+) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let ms = args.arg0 as u32;
 
     if ms == 0 {
         core::hint::spin_loop();
-    } else if ms == 0xFFFF_FFFF {
-        // INFINITE — sleep forever (shouldn't happen in practice).
-        loop {
-            core::hint::spin_loop();
-        }
     } else {
-        for _ in 0..ms as u64 * 1000 {
-            core::hint::spin_loop();
-        }
+        let timeout = if ms == 0xFFFF_FFFF {
+            None // INFINITE
+        } else {
+            Some(core::time::Duration::from_millis(u64::from(ms)))
+        };
+        let cx = wait_cx.with_timeout(timeout);
+        let _ = cx.sleep();
     }
 
     NtStatus::STATUS_SUCCESS
@@ -3971,10 +3976,13 @@ pub(crate) fn k32_sleep(ctx: &mut super::super::ExecutionContext) -> NtStatus {
 /// SleepEx(DWORD dwMilliseconds, BOOL bAlertable)
 ///
 /// Same as Sleep but with alertable wait. We ignore the alertable flag.
-pub(crate) fn k32_sleep_ex(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+pub(crate) fn k32_sleep_ex(
+    ctx: &mut super::super::ExecutionContext,
+    wait_cx: &litebox::event::wait::WaitContext<'_, litebox_platform_multiplex::Platform>,
+) -> NtStatus {
     // SleepEx returns 0 if the sleep completed, WAIT_IO_COMPLETION (0xC0) if
     // an APC was dispatched. We never dispatch APCs, so always return 0.
-    k32_sleep(ctx);
+    k32_sleep(ctx, wait_cx);
     ctx.regs.rax = 0;
     NtStatus::STATUS_SUCCESS
 }

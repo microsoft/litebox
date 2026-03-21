@@ -70,15 +70,63 @@ pub fn find_vfs_file(
     None
 }
 
-/// Find a file anywhere in the VFS by searching known directories.
+/// Find a file anywhere in the VFS by searching known directories,
+/// then falling back to a recursive search from the root.
 ///
-/// Searches root (`/`) and common Windows paths for `filename`.
+/// Searches root (`/`) and common Windows paths first for `filename`,
+/// then recursively searches the entire VFS tree.
 pub fn find_vfs_file_by_name(fs: &litebox_shim_windows::NtFS, filename: &str) -> Option<String> {
     // Search directories in priority order: root, then Windows System32 paths.
     let search_dirs = ["/", "/c/windows/system32", "/c/windows"];
     for dir in &search_dirs {
         if let Some(path) = find_vfs_file(fs, dir, filename) {
             return Some(path);
+        }
+    }
+    // Fall back to recursive search from root.
+    find_vfs_file_recursive(fs, "/", filename)
+}
+
+/// Recursively search a VFS directory tree for a file by basename suffix
+/// (case-insensitive). Returns the full VFS path if found.
+fn find_vfs_file_recursive(
+    fs: &litebox_shim_windows::NtFS,
+    dir_path: &str,
+    target_suffix: &str,
+) -> Option<String> {
+    use litebox::fs::FileSystem as _;
+
+    let fd = fs
+        .open(
+            dir_path,
+            litebox::fs::OFlags::RDONLY | litebox::fs::OFlags::DIRECTORY,
+            litebox::fs::Mode::RUSR,
+        )
+        .ok()?;
+    let entries = fs.read_dir(&fd).ok()?;
+    let _ = fs.close(&fd);
+
+    let target_lower = target_suffix.to_ascii_lowercase();
+    let mut subdirs = Vec::new();
+
+    for entry in &entries {
+        let name_lower = entry.name.to_ascii_lowercase();
+        if name_lower.ends_with(&target_lower) {
+            let sep = if dir_path.ends_with('/') { "" } else { "/" };
+            return Some(format!("{dir_path}{sep}{}", entry.name));
+        }
+        // Collect subdirectories for recursive search.
+        // Heuristic: entries without a file extension are likely directories.
+        if !entry.name.contains('.') {
+            let sep = if dir_path.ends_with('/') { "" } else { "/" };
+            subdirs.push(format!("{dir_path}{sep}{}", entry.name));
+        }
+    }
+
+    // Recurse into subdirectories.
+    for subdir in subdirs {
+        if let Some(found) = find_vfs_file_recursive(fs, &subdir, target_suffix) {
+            return Some(found);
         }
     }
     None

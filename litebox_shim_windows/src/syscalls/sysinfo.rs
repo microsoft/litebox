@@ -642,7 +642,10 @@ pub(crate) fn nt_query_information_process(
 /// ```
 ///
 /// DelayInterval is negative for relative time (in 100ns units).
-pub(crate) fn nt_delay_execution(ctx: &mut super::super::ExecutionContext) -> NtStatus {
+pub(crate) fn nt_delay_execution(
+    ctx: &mut super::super::ExecutionContext,
+    wait_cx: &litebox::event::wait::WaitContext<'_, litebox_platform_multiplex::Platform>,
+) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let delay_ptr = args.arg1;
 
@@ -652,7 +655,7 @@ pub(crate) fn nt_delay_execution(ctx: &mut super::super::ExecutionContext) -> Nt
 
     let delay_100ns = unsafe { core::ptr::read(delay_ptr as *const i64) };
 
-    // Negative = relative time. Convert to microseconds for the platform sleep.
+    // Negative = relative time in 100ns units.
     let sleep_us = match delay_100ns.cmp(&0) {
         core::cmp::Ordering::Less => delay_100ns.unsigned_abs() / 10,
         core::cmp::Ordering::Equal => 0,
@@ -660,9 +663,9 @@ pub(crate) fn nt_delay_execution(ctx: &mut super::super::ExecutionContext) -> Nt
     };
 
     if sleep_us > 0 {
-        for _ in 0..sleep_us {
-            core::hint::spin_loop();
-        }
+        let timeout = core::time::Duration::from_micros(sleep_us);
+        let cx = wait_cx.with_timeout(timeout);
+        let _ = cx.sleep();
     } else {
         core::hint::spin_loop();
     }
