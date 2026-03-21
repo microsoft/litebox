@@ -252,6 +252,10 @@ impl transport::Write for ShimTransport {
 /// The implementation checks the interrupt / vfork-parking flags between each
 /// poll cycle (the platform returns [`WouldBlock`] after a short timeout) so
 /// that `park_other_threads()` can still stop this thread.
+///
+/// Use [`ShimMessageChannel::split`] to obtain separate read/write halves for
+/// the pipelined 9P client: the writer stays with guest threads (keeps
+/// deferred-lie logic), the reader goes to the 9P worker thread.
 pub struct ShimMessageChannel {
     interrupt: Arc<core::sync::atomic::AtomicBool>,
     vfork_parking: Arc<VforkParking>,
@@ -274,47 +278,31 @@ impl ShimMessageChannel {
         }
     }
 
+    /// Split into separate write and read halves.
+    ///
+    /// The writer keeps the vfork deferred-lie logic (guest threads can block
+    /// in send when the socket buffer is full). The reader has no vfork state
+    /// because it will be owned by a host worker thread that doesn't
+    /// participate in vfork parking.
+    pub fn split(self) -> (ShimMessageChannelWriter, ShimMessageChannelReader) {
+        (
+            ShimMessageChannelWriter {
+                interrupt: self.interrupt,
+                vfork_parking: self.vfork_parking,
+                has_lied: self.has_lied,
+            },
+            ShimMessageChannelReader {},
+        )
+    }
+
     /// Same deferred park logic as [`ShimTransport::try_deferred_park`].
     fn try_deferred_park(&self) {
-        use litebox::platform::RawMutex as _;
-
-        if self.has_lied.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let park_val = self
-            .vfork_parking
-            .park
-            .underlying_atomic()
-            .load(Ordering::Acquire);
-        if park_val == 0 {
-            return;
-        }
-
-        self.has_lied.store(true, Ordering::Relaxed);
-        self.vfork_parking
-            .deferred_lie_count
-            .fetch_add(1, Ordering::Release);
-        self.vfork_parking
-            .parked_count
-            .underlying_atomic()
-            .fetch_add(1, Ordering::Release);
-        self.vfork_parking.parked_count.wake_all();
+        deferred_park_impl(&self.interrupt, &self.vfork_parking, &self.has_lied);
     }
 
     /// Reset the lie flag when the vfork that triggered it is over.
     fn maybe_reset_lie(&self) {
-        if self.has_lied.load(Ordering::Relaxed) {
-            use litebox::platform::RawMutex as _;
-            let park_val = self
-                .vfork_parking
-                .park
-                .underlying_atomic()
-                .load(Ordering::Acquire);
-            if park_val == 0 {
-                self.has_lied.store(false, Ordering::Relaxed);
-            }
-        }
+        maybe_reset_lie_impl(&self.vfork_parking, &self.has_lied);
     }
 }
 
@@ -325,15 +313,10 @@ impl transport::Read for ShimMessageChannel {
             if self.interrupt.load(Ordering::Acquire) {
                 self.try_deferred_park();
             }
-            match litebox::platform::RawMessageProvider::recv_raw_message(
-                litebox_platform_multiplex::platform(),
-                buf,
-            ) {
+            match recv_raw_message(buf) {
                 Ok(0) => return Err(transport::ReadError::Io),
                 Ok(n) => return Ok(n),
                 Err(litebox::platform::ReceiveError::WouldBlock) => {
-                    // Platform returned after its internal timeout (~1ms).
-                    // Loop to check interrupt flags and retry.
                     core::hint::spin_loop();
                 }
                 Err(litebox::platform::ReceiveError::Eof) => {
@@ -352,18 +335,138 @@ impl transport::Write for ShimMessageChannel {
             if self.interrupt.load(Ordering::Acquire) {
                 self.try_deferred_park();
             }
-            match litebox::platform::RawMessageProvider::send_raw_message(
-                litebox_platform_multiplex::platform(),
-                buf,
-            ) {
+            match send_raw_message(buf) {
                 Ok(n) => return Ok(n),
                 Err(litebox::platform::SendError::Io(11 /* EAGAIN/EWOULDBLOCK */)) => {
-                    // Platform returned after its internal timeout (~1ms).
-                    // Loop to check interrupt/vfork flags and retry.
                     core::hint::spin_loop();
                 }
                 Err(_) => return Err(transport::WriteError::Io),
             }
+        }
+    }
+}
+
+// -- Split halves ---------------------------------------------------------
+
+/// Write half of a [`ShimMessageChannel`]. Keeps the vfork deferred-lie
+/// logic because guest threads may block in `send_raw_message` while
+/// holding the 9P client's write mutex.
+pub struct ShimMessageChannelWriter {
+    interrupt: Arc<core::sync::atomic::AtomicBool>,
+    vfork_parking: Arc<VforkParking>,
+    has_lied: core::sync::atomic::AtomicBool,
+}
+
+impl ShimMessageChannelWriter {
+    fn try_deferred_park(&self) {
+        deferred_park_impl(&self.interrupt, &self.vfork_parking, &self.has_lied);
+    }
+
+    fn maybe_reset_lie(&self) {
+        maybe_reset_lie_impl(&self.vfork_parking, &self.has_lied);
+    }
+}
+
+impl transport::Write for ShimMessageChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
+        self.maybe_reset_lie();
+        loop {
+            if self.interrupt.load(Ordering::Acquire) {
+                self.try_deferred_park();
+            }
+            match send_raw_message(buf) {
+                Ok(n) => return Ok(n),
+                Err(litebox::platform::SendError::Io(11 /* EAGAIN/EWOULDBLOCK */)) => {
+                    core::hint::spin_loop();
+                }
+                Err(_) => return Err(transport::WriteError::Io),
+            }
+        }
+    }
+}
+
+/// Read half of a [`ShimMessageChannel`]. No vfork state — this half is
+/// owned by the 9P worker thread (a host thread that doesn't participate
+/// in vfork parking).
+pub struct ShimMessageChannelReader {}
+
+impl transport::Read for ShimMessageChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
+        loop {
+            match recv_raw_message(buf) {
+                Ok(0) => return Err(transport::ReadError::Io),
+                Ok(n) => return Ok(n),
+                Err(litebox::platform::ReceiveError::WouldBlock) => {
+                    core::hint::spin_loop();
+                }
+                Err(litebox::platform::ReceiveError::Eof) => {
+                    return Err(transport::ReadError::Io);
+                }
+                Err(_) => return Err(transport::ReadError::Io),
+            }
+        }
+    }
+}
+
+// -- Shared helpers -------------------------------------------------------
+
+/// Platform recv wrapper (avoids repeating the fully-qualified call).
+fn recv_raw_message(buf: &mut [u8]) -> Result<usize, litebox::platform::ReceiveError> {
+    litebox::platform::RawMessageProvider::recv_raw_message(
+        litebox_platform_multiplex::platform(),
+        buf,
+    )
+}
+
+/// Platform send wrapper.
+fn send_raw_message(buf: &[u8]) -> Result<usize, litebox::platform::SendError> {
+    litebox::platform::RawMessageProvider::send_raw_message(
+        litebox_platform_multiplex::platform(),
+        buf,
+    )
+}
+
+/// Deferred park logic shared by [`ShimMessageChannel`] and its write half.
+fn deferred_park_impl(
+    _interrupt: &core::sync::atomic::AtomicBool,
+    vfork_parking: &VforkParking,
+    has_lied: &core::sync::atomic::AtomicBool,
+) {
+    use litebox::platform::RawMutex as _;
+
+    if has_lied.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let park_val = vfork_parking
+        .park
+        .underlying_atomic()
+        .load(Ordering::Acquire);
+    if park_val == 0 {
+        return;
+    }
+
+    has_lied.store(true, Ordering::Relaxed);
+    vfork_parking
+        .deferred_lie_count
+        .fetch_add(1, Ordering::Release);
+    vfork_parking
+        .parked_count
+        .underlying_atomic()
+        .fetch_add(1, Ordering::Release);
+    vfork_parking.parked_count.wake_all();
+}
+
+/// Reset the lie flag when the vfork that triggered it is over.
+fn maybe_reset_lie_impl(vfork_parking: &VforkParking, has_lied: &core::sync::atomic::AtomicBool) {
+    if has_lied.load(Ordering::Relaxed) {
+        use litebox::platform::RawMutex as _;
+        let park_val = vfork_parking
+            .park
+            .underlying_atomic()
+            .load(Ordering::Acquire);
+        if park_val == 0 {
+            has_lied.store(false, Ordering::Relaxed);
         }
     }
 }
