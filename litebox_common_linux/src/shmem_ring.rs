@@ -11,11 +11,14 @@
 //! # Layout (per direction)
 //!
 //! ```text
-//! Offset  0: writer_pos: AtomicU32     // monotonically increasing write cursor
-//! Offset  4: reader_pos: AtomicU32     // monotonically increasing read cursor
-//! Offset  8: writer_closed: AtomicU32  // non-zero after writer drops
-//! Offset 12: reader_closed: AtomicU32  // non-zero after reader drops
-//! Offset 16: data[RING_DATA_SIZE]      // ring data region
+//! Offset  0: writer_pos: AtomicU32        // monotonically increasing write cursor
+//! Offset  4: reader_pos: AtomicU32        // monotonically increasing read cursor
+//! Offset  8: writer_closed: AtomicU32     // non-zero after writer drops
+//! Offset 12: reader_closed: AtomicU32     // non-zero after reader drops
+//! Offset 16: reader_sleeping: AtomicU32   // 1 if reader is in futex_wait
+//! Offset 20: writer_sleeping: AtomicU32   // 1 if writer is in futex_wait
+//! Offset 24: _pad[2]: [u32; 2]           // pad to 32 bytes
+//! Offset 32: data[RING_DATA_SIZE]         // ring data region
 //! ```
 //!
 //! # Protocol
@@ -30,17 +33,33 @@
 //! This is a lock-free SPSC design: one process writes, the other reads,
 //! coordinated solely through `Acquire`/`Release` atomics on the two cursors.
 //!
+//! # Notification (futex-based, sleeping-flag scheme)
+//!
+//! When the ring is empty (reader) or full (writer), the waiting side:
+//! 1. Spins for `SPIN_LIMIT` iterations (fast path, no syscalls).
+//! 2. Sets its `*_sleeping` flag, issues a `SeqCst` fence, re-checks the
+//!    ring condition, and calls `futex(FUTEX_WAIT)` on the relevant cursor.
+//!
+//! The producing side checks the peer's sleeping flag after each data transfer
+//! and calls `futex(FUTEX_WAKE)` only when the peer is actually blocked.
+//! This eliminates spurious wake syscalls on the fast path (inspired by
+//! virtio's notification suppression).
+//!
+//! Uses shared futex (without `FUTEX_PRIVATE_FLAG`) for cross-process
+//! coordination over `MAP_SHARED` memfd regions.
+//!
 //! # Shutdown
 //!
-//! When the [`RingWriter`] is dropped it sets `writer_closed` in the header.
-//! The [`RingReader`] will drain any remaining data and then return `Ok(0)`
-//! (EOF). Conversely, when the [`RingReader`] is dropped it sets
-//! `reader_closed`, causing the writer to return [`io::ErrorKind::BrokenPipe`]
-//! once the ring is full.
+//! When the [`RingWriter`] is dropped it sets `writer_closed` in the header
+//! and wakes any sleeping reader via futex. The [`RingReader`] will drain any
+//! remaining data and then return `Ok(0)` (EOF). Conversely, when the
+//! [`RingReader`] is dropped it sets `reader_closed` and wakes any sleeping
+//! writer, causing the writer to return [`io::ErrorKind::BrokenPipe`] once the
+//! ring is full.
 
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{self, AtomicU32, Ordering};
 
 /// Size of the data region in each ring buffer direction.
 pub const RING_DATA_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
@@ -48,19 +67,28 @@ pub const RING_DATA_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 /// Total size of the shared memory region per direction (header + data).
 pub const RING_TOTAL_SIZE: usize = size_of::<RingHeader>() + RING_DATA_SIZE;
 
+/// Number of spin-loop iterations before falling back to futex.
+const SPIN_LIMIT: u32 = 128;
+
 /// Header at the start of each ring buffer's shared-memory region.
 ///
-/// Four adjacent `AtomicU32` values: cursors at offsets 0 and 4, close
-/// flags at offsets 8 and 12.
+/// Cursors at offsets 0 and 4, close flags at 8 and 12, sleeping flags at
+/// 16 and 20, padding to 32 bytes for data-region alignment.
 #[repr(C)]
 struct RingHeader {
     writer_pos: AtomicU32,
     reader_pos: AtomicU32,
     writer_closed: AtomicU32,
     reader_closed: AtomicU32,
+    /// Set to 1 by the reader before entering `futex_wait` on `writer_pos`.
+    reader_sleeping: AtomicU32,
+    /// Set to 1 by the writer before entering `futex_wait` on `reader_pos`.
+    writer_sleeping: AtomicU32,
+    /// Pad to 32 bytes so the data region is 16-byte aligned (SIMD friendly).
+    _pad: [u32; 2],
 }
 
-const _: () = assert!(size_of::<RingHeader>() == 16);
+const _: () = assert!(size_of::<RingHeader>() == 32);
 const _: () = assert!(RING_DATA_SIZE.is_power_of_two());
 // RING_DATA_SIZE fits in u32 (4 MiB < 4 GiB).
 #[allow(clippy::cast_possible_truncation)]
@@ -74,6 +102,46 @@ const _: () = assert!(RING_TOTAL_SIZE <= i64::MAX as usize);
 const RING_DATA_SIZE_U32: u32 = RING_DATA_SIZE as u32;
 /// Bitmask for modular indexing into the data region.
 const RING_DATA_MASK: u32 = RING_DATA_SIZE_U32 - 1;
+
+// ---------------------------------------------------------------------------
+// Futex helpers (shared, not private — for cross-process MAP_SHARED memfd)
+// ---------------------------------------------------------------------------
+
+/// Block until `*addr != expected` or a `futex_wake` on the same address.
+///
+/// Uses `FUTEX_WAIT` (without `FUTEX_PRIVATE_FLAG`) so it works across
+/// processes sharing the same `MAP_SHARED` page.
+///
+/// Spurious wakeups (`EINTR`, `EAGAIN`) are harmless — callers always
+/// re-check the ring condition in a loop.
+fn futex_wait(addr: &AtomicU32, expected: u32) {
+    // SAFETY: `addr` points into a valid `MAP_SHARED` mmap region (or stack
+    // for tests). The futex syscall reads the u32 at `addr` atomically.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            core::ptr::from_ref::<AtomicU32>(addr),
+            libc::FUTEX_WAIT,
+            expected,
+            std::ptr::null::<libc::timespec>(),
+        );
+    }
+}
+
+/// Wake at most one thread blocked in `futex_wait` on `addr`.
+///
+/// If no thread is waiting, this is a no-op (~200ns syscall overhead).
+fn futex_wake(addr: &AtomicU32) {
+    // SAFETY: same as `futex_wait` — `addr` is in a valid mapped region.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            core::ptr::from_ref::<AtomicU32>(addr),
+            libc::FUTEX_WAKE,
+            1i32,
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RAII wrapper for an mmap'd region
@@ -277,22 +345,61 @@ impl io::Write for RingWriter {
         if buf.is_empty() {
             return Ok(0);
         }
+        let mut spin_count = 0u32;
         loop {
             let space = self.available_space()?;
             if space > 0 {
                 let n = buf.len().min(space as usize);
                 self.push_bytes(&buf[..n]);
+                // Dekker fence: ensure pushed data (writer_pos store) is
+                // globally visible before we check the reader's sleeping flag.
+                // Without this, on weakly-ordered architectures the load of
+                // reader_sleeping could be reordered before the writer_pos
+                // store, causing the reader to miss both the data and the wake.
+                atomic::fence(Ordering::SeqCst);
+                let header = self.mmap.header();
+                if header.reader_sleeping.load(Ordering::Acquire) != 0 {
+                    // Store 0 to break a concurrent futex_wait's
+                    // expected-value check if the wake syscall arrives
+                    // before the reader enters the kernel.
+                    header.reader_sleeping.store(0, Ordering::Release);
+                    futex_wake(&header.reader_sleeping);
+                }
                 return Ok(n);
             }
-            // Ring is full — check whether the reader has closed before spinning.
+            // Ring is full — check whether the reader has closed before waiting.
             if self.mmap.header().reader_closed.load(Ordering::Acquire) != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "ring reader closed",
                 ));
             }
-            std::hint::spin_loop();
-            std::thread::yield_now();
+            if spin_count < SPIN_LIMIT {
+                std::hint::spin_loop();
+                spin_count += 1;
+            } else {
+                // Arm futex wait on our sleeping flag.  We wait on
+                // writer_sleeping (not reader_pos) so that close events
+                // can break the wait by storing 0 to this flag.
+                let header = self.mmap.header();
+                header.writer_sleeping.store(1, Ordering::Release);
+                // SeqCst fence: prevent store-load reorder (Dekker pattern).
+                // Without this, the re-check below could be reordered before
+                // the sleeping flag store on weakly-ordered architectures,
+                // causing a lost wakeup.
+                atomic::fence(Ordering::SeqCst);
+                // Re-check both space AND close flag to prevent lost-wake race.
+                if self.available_space().unwrap_or(0) > 0 {
+                    header.writer_sleeping.store(0, Ordering::Relaxed);
+                    continue;
+                }
+                if header.reader_closed.load(Ordering::Acquire) != 0 {
+                    header.writer_sleeping.store(0, Ordering::Relaxed);
+                    continue;
+                }
+                futex_wait(&header.writer_sleeping, 1);
+                header.writer_sleeping.store(0, Ordering::Relaxed);
+            }
         }
     }
 
@@ -306,6 +413,15 @@ impl io::Write for RingWriter {
 impl Drop for RingWriter {
     fn drop(&mut self) {
         self.mmap.header().writer_closed.store(1, Ordering::Release);
+        // Ensure the close flag is globally visible before the wake.
+        atomic::fence(Ordering::SeqCst);
+        let header = self.mmap.header();
+        // Wake any sleeping reader by clearing its flag (breaks futex_wait's
+        // expected-value check) and issuing a wake.
+        if header.reader_sleeping.load(Ordering::Acquire) != 0 {
+            header.reader_sleeping.store(0, Ordering::Release);
+            futex_wake(&header.reader_sleeping);
+        }
     }
 }
 
@@ -381,11 +497,20 @@ impl io::Read for RingReader {
         if buf.is_empty() {
             return Ok(0);
         }
+        let mut spin_count = 0u32;
         loop {
             let avail = self.available_data()?;
             if avail > 0 {
                 let n = buf.len().min(avail as usize);
                 self.pop_bytes(&mut buf[..n]);
+                // Dekker fence: ensure consumed data (reader_pos store) is
+                // globally visible before checking writer's sleeping flag.
+                atomic::fence(Ordering::SeqCst);
+                let header = self.mmap.header();
+                if header.writer_sleeping.load(Ordering::Acquire) != 0 {
+                    header.writer_sleeping.store(0, Ordering::Release);
+                    futex_wake(&header.writer_sleeping);
+                }
                 return Ok(n);
             }
             // Ring is empty — check whether the writer has closed.
@@ -397,12 +522,39 @@ impl io::Read for RingReader {
                 if avail > 0 {
                     let n = buf.len().min(avail as usize);
                     self.pop_bytes(&mut buf[..n]);
+                    atomic::fence(Ordering::SeqCst);
+                    let header = self.mmap.header();
+                    if header.writer_sleeping.load(Ordering::Acquire) != 0 {
+                        header.writer_sleeping.store(0, Ordering::Release);
+                        futex_wake(&header.writer_sleeping);
+                    }
                     return Ok(n);
                 }
                 return Ok(0); // EOF
             }
-            std::hint::spin_loop();
-            std::thread::yield_now();
+            if spin_count < SPIN_LIMIT {
+                std::hint::spin_loop();
+                spin_count += 1;
+            } else {
+                // Arm futex wait on our sleeping flag.  We wait on
+                // reader_sleeping (not writer_pos) so that close events
+                // can break the wait by storing 0 to this flag.
+                let header = self.mmap.header();
+                header.reader_sleeping.store(1, Ordering::Release);
+                // SeqCst fence: prevent store-load reorder (Dekker pattern).
+                atomic::fence(Ordering::SeqCst);
+                // Re-check both data AND close flag to prevent lost-wake race.
+                if self.available_data().unwrap_or(0) > 0 {
+                    header.reader_sleeping.store(0, Ordering::Relaxed);
+                    continue;
+                }
+                if header.writer_closed.load(Ordering::Acquire) != 0 {
+                    header.reader_sleeping.store(0, Ordering::Relaxed);
+                    continue;
+                }
+                futex_wait(&header.reader_sleeping, 1);
+                header.reader_sleeping.store(0, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -410,6 +562,12 @@ impl io::Read for RingReader {
 impl Drop for RingReader {
     fn drop(&mut self) {
         self.mmap.header().reader_closed.store(1, Ordering::Release);
+        atomic::fence(Ordering::SeqCst);
+        let header = self.mmap.header();
+        if header.writer_sleeping.load(Ordering::Acquire) != 0 {
+            header.writer_sleeping.store(0, Ordering::Release);
+            futex_wake(&header.writer_sleeping);
+        }
     }
 }
 
@@ -477,10 +635,14 @@ impl ShmemRingPair {
         tx_mmap.header().reader_pos.store(0, Ordering::Relaxed);
         tx_mmap.header().writer_closed.store(0, Ordering::Relaxed);
         tx_mmap.header().reader_closed.store(0, Ordering::Relaxed);
+        tx_mmap.header().reader_sleeping.store(0, Ordering::Relaxed);
+        tx_mmap.header().writer_sleeping.store(0, Ordering::Relaxed);
         rx_mmap.header().writer_pos.store(0, Ordering::Relaxed);
         rx_mmap.header().reader_pos.store(0, Ordering::Relaxed);
         rx_mmap.header().writer_closed.store(0, Ordering::Relaxed);
         rx_mmap.header().reader_closed.store(0, Ordering::Relaxed);
+        rx_mmap.header().reader_sleeping.store(0, Ordering::Relaxed);
+        rx_mmap.header().writer_sleeping.store(0, Ordering::Relaxed);
 
         let pair = Self {
             tx: RingWriter::new(tx_mmap),
