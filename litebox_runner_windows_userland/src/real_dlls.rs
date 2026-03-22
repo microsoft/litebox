@@ -17,6 +17,7 @@ use crate::PmMapper;
 use anyhow::{Result, anyhow};
 use litebox_common_windows::ntdll_rewriter;
 use litebox_common_windows::pe_loader::{IatPatch, LoadedModule, load_pe};
+use litebox_common_windows::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION;
 use litebox_common_windows::pe_parser::PeParsedFile;
 
 /// Read an entire file from VFS into a `Vec<u8>`.
@@ -472,6 +473,49 @@ pub fn load_ntdll_for_init(
                 eprintln!("[real-dlls] WARN: failed to allocate KUSD shadow page at 0x7FFD0000");
             }
         }
+
+        // --- Patch 5: Inverted function table empty-table crash guard --------
+        //
+        // ntdll's internal RtlpLookupFunctionTable reads the inverted function
+        // table at [rsp+0xF8].  When the table is empty (first entry is NULL),
+        // it falls through to `mov rax, [rdi]` at RVA 0x101FC where rdi is the
+        // lookup address (often 0 from an earlier failed query).  This crashes.
+        //
+        // On real Windows the table is always populated because the kernel's
+        // loader calls RtlInsertInvertedFunctionTable for every image.  In our
+        // sandbox the table may remain empty because ntdll's registration path
+        // hasn't fully initialised.
+        //
+        // Fix: replace the crashing `mov rax, [rdi]; cmp rbx, rax` (6 bytes)
+        // with `jmp` to the existing error-return path at RVA 0x10402 which
+        // sets eax = STATUS_BAD_STACK (0xC0000028) and jumps to the epilog.
+        // This path is only reached when the table is empty (je from 0x101DD).
+        //
+        //   Before: 48 8B 07 48 3B D8  (mov rax,[rdi]; cmp rbx,rax)
+        //   After:  E9 01 02 00 00 90  (jmp +0x201 → 0x10402; nop)
+        {
+            const PATCH_RVA: u32 = 0x101FC;
+            const EXPECTED: [u8; 6] = [0x48, 0x8B, 0x07, 0x48, 0x3B, 0xD8];
+            // jmp rel32 to RVA 0x10402:  rel32 = 0x10402 - (0x101FC + 5) = 0x201
+            const REPLACEMENT: [u8; 6] = [0xE9, 0x01, 0x02, 0x00, 0x00, 0x90];
+
+            if let Some(off) = parsed_tmp.rva_to_file_offset(PATCH_RVA) {
+                if off + 6 <= image.len() && image[off..off + 6] == EXPECTED {
+                    image[off..off + 6].copy_from_slice(&REPLACEMENT);
+                    eprintln!(
+                        "[real-dlls] Patched inverted function table crash guard at ntdll+0x{PATCH_RVA:X}"
+                    );
+                } else {
+                    eprintln!(
+                        "[real-dlls] WARN: inverted function table pattern mismatch at ntdll+0x{PATCH_RVA:X}"
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[real-dlls] WARN: could not map RVA 0x{PATCH_RVA:X} to file offset for function table patch"
+                );
+            }
+        }
     }
 
     // Parse and load ntdll into guest memory.
@@ -520,6 +564,62 @@ pub fn load_ntdll_for_init(
         .iter()
         .find(|e| e.name == Some("KiUserExceptionDispatcher"))
         .map(|e| e.rva as usize);
+
+    // --- Populate the inverted function table for ntdll -----------------------
+    //
+    // On real Windows the kernel writes ntdll's RUNTIME_FUNCTION table into
+    // `KiUserInvertedFunctionTable` before giving control to user mode.  Our
+    // guest ntdll's copy is initialised from the PE file where entry 0 is all
+    // zeroes.  Without it, RtlDispatchException can't walk the SEH chain and
+    // any exception during init becomes unhandleable (infinite NtRaiseException
+    // loop).
+    //
+    // KiUserInvertedFunctionTable layout:
+    //   +0x00  u32  CurrentSize (already 1 in the PE)
+    //   +0x04  u32  MaximumSize (512)
+    //   +0x08  u32  Epoch
+    //   +0x0C  u8   Overflow + 3 reserved
+    //   +0x10  Entry[0]:
+    //     +0x00  u64  ExceptionDirectory   (ptr to RUNTIME_FUNCTION array)
+    //     +0x08  u64  ImageBase
+    //     +0x10  u32  ImageSize
+    //     +0x14  u32  ExceptionDirectorySize
+    if let Some(ift_export) = exports
+        .iter()
+        .find(|e| e.name == Some("KiUserInvertedFunctionTable"))
+    {
+        let ift_va = ntdll_load_va + ift_export.rva as usize;
+        // Exception directory (.pdata) from the PE data directories.
+        if parsed.data_directories.len() > IMAGE_DIRECTORY_ENTRY_EXCEPTION {
+            let exc_dir = &parsed.data_directories[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+            if exc_dir.virtual_address != 0 && exc_dir.size != 0 {
+                let entry_va = ift_va + 0x10; // first table entry
+                let exc_dir_va = ntdll_load_va + exc_dir.virtual_address as usize;
+
+                // Safety: ift_va points into committed guest memory (ntdll's
+                // .mrdata section) that we just loaded.
+                unsafe {
+                    // Entry.ExceptionDirectory (u64)
+                    (entry_va as *mut u64).write(exc_dir_va as u64);
+                    // Entry.ImageBase (u64)
+                    ((entry_va + 8) as *mut u64).write(ntdll_load_va as u64);
+                    // Entry.ImageSize (u32)
+                    ((entry_va + 16) as *mut u32).write(parsed.size_of_image);
+                    // Entry.ExceptionDirectorySize (u32)
+                    ((entry_va + 20) as *mut u32).write(exc_dir.size);
+                }
+
+                eprintln!(
+                    "[real-dlls] Populated KiUserInvertedFunctionTable entry 0: \
+                     ExcDir=0x{exc_dir_va:X} Base=0x{ntdll_load_va:X} \
+                     Size=0x{:X} ExcSize=0x{:X}",
+                    parsed.size_of_image, exc_dir.size
+                );
+            }
+        }
+    } else {
+        eprintln!("[real-dlls] WARN: KiUserInvertedFunctionTable export not found");
+    }
 
     let ntdll = LoadedDll {
         name: String::from("ntdll.dll"),

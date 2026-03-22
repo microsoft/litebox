@@ -100,13 +100,9 @@ pub(crate) fn nt_allocate_virtual_memory(
             .va_reservation_contains_range(aligned_base, aligned_size)
             .is_some()
         {
-            let pm_has_pages = ps
-                .pm
-                .mappings()
-                .iter()
-                .any(|(range, _)| {
-                    range.start < aligned_base + aligned_size && aligned_base < range.end
-                });
+            let pm_has_pages = ps.pm.mappings().iter().any(|(range, _)| {
+                range.start < aligned_base + aligned_size && aligned_base < range.end
+            });
             if !pm_has_pages {
                 // Pure VA reservation — record lazy commit for demand-paging.
                 ps.va_commit(aligned_base, aligned_size, protect);
@@ -171,20 +167,6 @@ pub(crate) fn nt_allocate_virtual_memory(
     // pages so page faults can be caught by VEH. For huge reservations
     // (>= 1 GB), use pure VA bookkeeping to avoid consuming host VA.
     if has_reserve && !has_commit {
-        // Reject the segment heap's ~192 GB VA cage (same as the Ex path).
-        const SEGMENT_HEAP_CAGE_THRESHOLD: usize = 128 * 1024 * 1024 * 1024;
-        if aligned_size >= SEGMENT_HEAP_CAGE_THRESHOLD {
-            #[cfg(debug_assertions)]
-            {
-                use litebox::platform::DebugLogProvider as _;
-                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                    "NT shim: NtAllocateVirtualMemory → rejecting segment heap cage \
-                     (size=0x{aligned_size:X})\n"
-                ));
-            }
-            return NtStatus(0xC000_009A_u32 as i32); // STATUS_INSUFFICIENT_RESOURCES
-        }
-
         const VA_ONLY_THRESHOLD: usize = 1024 * 1024 * 1024; // 1 GB
         if aligned_size >= VA_ONLY_THRESHOLD {
             let base = ps.va_reserve(requested_base, aligned_size);
@@ -406,23 +388,6 @@ pub(crate) fn nt_allocate_virtual_memory_ex(
         // segment heap's 192 GB cage) use VA-only bookkeeping to avoid
         // consuming host commit charge.  Mirrors the same logic in
         // NtAllocateVirtualMemory.
-
-        // Reject the segment heap's ~192 GB VA cage.  RtlCreateHeap
-        // treats this as an allocation failure and falls back to the
-        // traditional NT heap, which is fully compatible with our
-        // demand-paging model.
-        const SEGMENT_HEAP_CAGE_THRESHOLD: usize = 128 * 1024 * 1024 * 1024; // 128 GB
-        if aligned_size >= SEGMENT_HEAP_CAGE_THRESHOLD {
-            #[cfg(debug_assertions)]
-            {
-                use litebox::platform::DebugLogProvider as _;
-                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                    "NT shim: NtAllocateVirtualMemoryEx → rejecting segment heap cage \
-                     (size=0x{aligned_size:X})\n"
-                ));
-            }
-            return NtStatus(0xC000_009A_u32 as i32); // STATUS_INSUFFICIENT_RESOURCES
-        }
 
         const VA_ONLY_THRESHOLD: usize = 1024 * 1024 * 1024; // 1 GB
         if aligned_size >= VA_ONLY_THRESHOLD {
@@ -836,9 +801,11 @@ pub(crate) fn nt_protect_virtual_memory(
         // grows downward from the top of the guest VA space, and PM can also
         // allocate addresses in that range, causing overlap.  If PM has
         // actual pages at this address, fall through to the direct PM path.
-        let pm_has_pages = ps.pm.mappings().iter().any(|(range, _)| {
-            range.start <= aligned_base && range.end > aligned_base
-        });
+        let pm_has_pages = ps
+            .pm
+            .mappings()
+            .iter()
+            .any(|(range, _)| range.start <= aligned_base && range.end > aligned_base);
         if !pm_has_pages {
             // Real NT rejects VirtualProtect on uncommitted pages.
             return NtStatus(0xC000_0141u32 as i32); // STATUS_NOT_COMMITTED
@@ -960,6 +927,15 @@ pub(crate) fn nt_query_virtual_memory(
                 return NtStatus::STATUS_SUCCESS;
             }
         }
+        // Address not inside any known image.  Return STATUS_INVALID_ADDRESS
+        // so the caller (e.g. RtlpLookupFunctionTable) takes its "no image"
+        // path.  Previously we returned ntdll's range as a workaround for a
+        // __fastfail on the error path, but all __fastfail sites in ntdll and
+        // loaded DLLs are now patched (patch_fastfail), so this is safe.
+        //
+        // Returning ntdll's range caused an infinite retry loop because the
+        // caller saw the address as "inside an image", searched .pdata,
+        // found nothing, and retried.
         return NtStatus::STATUS_INVALID_ADDRESS;
     }
 

@@ -66,6 +66,49 @@ use litebox_common_windows::stub_dlls;
 use litebox_common_windows::{NtSyscallId, NtSyscallMap};
 use litebox_platform_multiplex::Platform;
 
+/// Check if a memory address is committed (readable) using host VirtualQuery.
+///
+/// Used by the debug exception dump to avoid recursive faults when reading
+/// guest stack or code memory that might not be mapped.
+#[cfg(debug_assertions)]
+fn is_addr_committed(addr: usize) -> bool {
+    #[repr(C)]
+    struct MemoryBasicInformation {
+        base_address: usize,
+        allocation_base: usize,
+        allocation_protect: u32,
+        _pad1: u32,
+        region_size: usize,
+        state: u32,
+        _protect: u32,
+        _type: u32,
+        _pad2: u32,
+    }
+    unsafe extern "system" {
+        fn VirtualQuery(
+            address: usize,
+            buffer: *mut MemoryBasicInformation,
+            length: usize,
+        ) -> usize;
+    }
+    const MEM_COMMIT: u32 = 0x1000;
+    let mut mbi = core::mem::MaybeUninit::<MemoryBasicInformation>::zeroed();
+    // Safety: VirtualQuery reads the host process's virtual memory info.
+    let ret = unsafe {
+        VirtualQuery(
+            addr,
+            mbi.as_mut_ptr(),
+            core::mem::size_of::<MemoryBasicInformation>(),
+        )
+    };
+    if ret != 0 {
+        let mbi = unsafe { mbi.assume_init() };
+        mbi.state == MEM_COMMIT
+    } else {
+        false
+    }
+}
+
 /// Concrete layered filesystem type used by the NT shim.
 /// Same architecture as the Linux shim: in-memory (writable) on top of
 /// devices on top of tar read-only.
@@ -590,6 +633,10 @@ pub struct NtShimEntrypoints {
     thread_id: u32,
     /// Per-thread wait state for proper blocking waits (sleep, events, etc.).
     wait_state: WaitState<Platform>,
+    /// Guard against infinite SEH forwarding loops: counts how many times
+    /// we've forwarded an exception to KiUserExceptionDispatcher without the
+    /// guest successfully resuming (syscall resets this to 0).
+    seh_forward_count: core::sync::atomic::AtomicU32,
     /// Process-wide shared state (handles, env, CWD, etc.).
     shared: alloc::sync::Arc<NtSharedState>,
 }
@@ -739,6 +786,7 @@ impl NtShimEntrypoints {
             thread_obj: None,
             thread_id: 1, // Main thread is always TID 1
             wait_state: WaitState::new(litebox_platform_multiplex::platform()),
+            seh_forward_count: core::sync::atomic::AtomicU32::new(0),
             shared,
         }
     }
@@ -809,6 +857,7 @@ impl NtShimEntrypoints {
             thread_obj: Some(thread_obj),
             thread_id,
             wait_state: WaitState::new(litebox_platform_multiplex::platform()),
+            seh_forward_count: core::sync::atomic::AtomicU32::new(0),
             shared,
         }
     }
@@ -2410,12 +2459,10 @@ impl NtShimEntrypoints {
                     #[cfg(debug_assertions)]
                     {
                         use litebox::platform::DebugLogProvider as _;
-                        litebox_platform_multiplex::platform().debug_log_print(
-                            &alloc::format!(
-                                "NT shim: NtQueryValueKey returned 0x{:08X}\n",
-                                status.0 as u32,
-                            ),
-                        );
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtQueryValueKey returned 0x{:08X}\n",
+                            status.0 as u32,
+                        ));
                     }
                     (status, false)
                 }
@@ -2469,10 +2516,9 @@ impl NtShimEntrypoints {
                     ctx.regs.r15 = r64(0xF0);
                     // Restore EFlags (offset 0x44 in CONTEXT).
                     ctx.eflags = r32(0x44) as usize;
-                    // Restore FP/XSAVE state from CONTEXT.FltSave (offset 0x100,
-                    // 512-byte FXSAVE area). The platform's slow NtContinue path
-                    // copies ctx.fp_regs into the host CONTEXT, so we must
-                    // populate it here for the state to carry over.
+                    // Restore FP state from CONTEXT.FltSave (offset 0x100,
+                    // 512-byte FXSAVE area) and initialize the XSAVE header
+                    // so that xrstor64 restores x87/SSE correctly.
                     let flt_save_offset = 0x100;
                     let fxsave_size = 512.min(ctx.fp_regs.data.len());
                     core::ptr::copy_nonoverlapping(
@@ -2480,6 +2526,18 @@ impl NtShimEntrypoints {
                         ctx.fp_regs.data.as_mut_ptr(),
                         fxsave_size,
                     );
+                    // Zero the XSAVE tail (header + extended state) and set
+                    // xstate_bv bits for x87|SSE so xrstor64 loads the FXSAVE
+                    // data above instead of re-initializing those components.
+                    if ctx.fp_regs.data.len() > 512 {
+                        core::ptr::write_bytes(
+                            ctx.fp_regs.data.as_mut_ptr().add(512),
+                            0,
+                            ctx.fp_regs.data.len() - 512,
+                        );
+                        let xstate_bv = ctx.fp_regs.data.as_mut_ptr().add(512) as *mut u64;
+                        *xstate_bv = 0x3; // x87 (bit 0) | SSE (bit 1)
+                    }
                 }
                 #[cfg(debug_assertions)]
                 {
@@ -2492,11 +2550,85 @@ impl NtShimEntrypoints {
                         ctx.regs.rdx
                     ));
                 }
-                // NtContinue does not return an NTSTATUS ΓÇö it switches context.
+                // NtContinue does not return an NTSTATUS — it switches context.
                 // We return STATUS_SUCCESS but the dispatch loop must NOT
                 // overwrite rax (it was already set from the CONTEXT).
-                // Leave rcx != rip so the platform uses the slow NtContinue
-                // path which correctly restores ALL registers from the context.
+                // RCX may differ from RIP; the platform's switch_to_guest
+                // handles this correctly (restores all registers including RCX).
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            // NtContinueEx(CONTEXT*, KCONTINUE_ARGUMENT*) — extended version.
+            // The second argument specifies continuation mode (e.g. yielded
+            // continuation).  We ignore it and treat this identically to
+            // NtContinue: restore the CONTEXT and resume.
+            NtSyscallId::NtContinueEx => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let context_ptr = args.arg0;
+                unsafe {
+                    let p = context_ptr as *const u8;
+                    let r64 = |off: usize| {
+                        u64::from_le_bytes(
+                            core::slice::from_raw_parts(p.add(off), 8)
+                                .try_into()
+                                .unwrap(),
+                        ) as usize
+                    };
+                    let r32 = |off: usize| {
+                        u32::from_le_bytes(
+                            core::slice::from_raw_parts(p.add(off), 4)
+                                .try_into()
+                                .unwrap(),
+                        )
+                    };
+                    ctx.regs.rip = r64(0xF8);
+                    ctx.regs.rsp = r64(0x98);
+                    ctx.regs.rax = r64(0x78);
+                    ctx.regs.rcx = r64(0x80);
+                    ctx.regs.rdx = r64(0x88);
+                    ctx.regs.rbx = r64(0x90);
+                    ctx.regs.rbp = r64(0xA0);
+                    ctx.regs.rsi = r64(0xA8);
+                    ctx.regs.rdi = r64(0xB0);
+                    ctx.regs.r8 = r64(0xB8);
+                    ctx.regs.r9 = r64(0xC0);
+                    ctx.regs.r10 = r64(0xC8);
+                    ctx.regs.r11 = r64(0xD0);
+                    ctx.regs.r12 = r64(0xD8);
+                    ctx.regs.r13 = r64(0xE0);
+                    ctx.regs.r14 = r64(0xE8);
+                    ctx.regs.r15 = r64(0xF0);
+                    ctx.eflags = r32(0x44) as usize;
+                    // Restore FP state and initialize XSAVE header (same as
+                    // NtContinue above).
+                    let flt_save_offset = 0x100;
+                    let fxsave_size = 512.min(ctx.fp_regs.data.len());
+                    core::ptr::copy_nonoverlapping(
+                        p.add(flt_save_offset),
+                        ctx.fp_regs.data.as_mut_ptr(),
+                        fxsave_size,
+                    );
+                    if ctx.fp_regs.data.len() > 512 {
+                        core::ptr::write_bytes(
+                            ctx.fp_regs.data.as_mut_ptr().add(512),
+                            0,
+                            ctx.fp_regs.data.len() - 512,
+                        );
+                        let xstate_bv = ctx.fp_regs.data.as_mut_ptr().add(512) as *mut u64;
+                        *xstate_bv = 0x3; // x87 (bit 0) | SSE (bit 1)
+                    }
+                }
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtContinueEx: new RIP=0x{:X}, RSP=0x{:X}, RCX=0x{:X}, RDX=0x{:X}\n",
+                        ctx.regs.rip,
+                        ctx.regs.rsp,
+                        ctx.regs.rcx,
+                        ctx.regs.rdx
+                    ));
+                }
                 (NtStatus::STATUS_SUCCESS, false)
             }
 
@@ -2957,6 +3089,67 @@ impl NtShimEntrypoints {
                         }
                     }
                 }
+                // Walk PEB.Ldr module list to dump loaded DLLs and their
+                // init status, helping identify which DLL's DllMain failed.
+                if let Some(init) = self.init_state.as_ref() {
+                    use litebox::platform::DebugLogProvider as _;
+                    let peb = init.peb_va;
+                    // PEB+0x18 = Ldr (PEB_LDR_DATA*)
+                    let ldr = unsafe { core::ptr::read((peb + 0x18) as *const usize) };
+                    if ldr != 0 {
+                        // PEB_LDR_DATA+0x10 = InLoadOrderModuleList (LIST_ENTRY)
+                        let list_head = ldr + 0x10;
+                        let mut entry = unsafe { core::ptr::read(list_head as *const usize) };
+                        let mut count = 0u32;
+                        litebox_platform_multiplex::platform()
+                            .debug_log_print("  Loaded modules (InLoadOrder):\n");
+                        while entry != list_head && count < 50 {
+                            // LDR_DATA_TABLE_ENTRY:
+                            //   +0x30 = DllBase (PVOID)
+                            //   +0x40 = SizeOfImage (ULONG)
+                            //   +0x48 = FullDllName (UNICODE_STRING)
+                            //   +0x58 = BaseDllName (UNICODE_STRING)
+                            //   +0x68 = Flags (ULONG)
+                            let dll_base =
+                                unsafe { core::ptr::read((entry + 0x30) as *const usize) };
+                            let size_of_image =
+                                unsafe { core::ptr::read((entry + 0x40) as *const u32) };
+                            let name_len = unsafe { core::ptr::read((entry + 0x58) as *const u16) };
+                            let name_buf =
+                                unsafe { core::ptr::read((entry + 0x58 + 8) as *const usize) };
+                            let flags = unsafe { core::ptr::read((entry + 0x68) as *const u32) };
+
+                            let name = if name_buf != 0 && name_len > 0 {
+                                let chars = unsafe {
+                                    core::slice::from_raw_parts(
+                                        name_buf as *const u16,
+                                        (name_len / 2) as usize,
+                                    )
+                                };
+                                alloc::string::String::from_utf16_lossy(chars)
+                            } else {
+                                alloc::string::String::from("???")
+                            };
+
+                            // Flag 0x80000 = LDRP_PROCESS_ATTACH_CALLED
+                            // Flag 0x100000 = LDRP_PROCESS_ATTACH_FAILED
+                            let init_status = if flags & 0x10_0000 != 0 {
+                                "FAILED"
+                            } else if flags & 0x8_0000 != 0 {
+                                "OK"
+                            } else {
+                                "not-called"
+                            };
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "    {name}: base=0x{dll_base:X} size=0x{size_of_image:X} flags=0x{flags:X} init={init_status}\n",
+                                ),
+                            );
+                            entry = unsafe { core::ptr::read(entry as *const usize) };
+                            count += 1;
+                        }
+                    }
+                }
                 self.exit_code.store(status as i32, Ordering::Release);
                 (NtStatus::STATUS_SUCCESS, true)
             }
@@ -3202,12 +3395,108 @@ impl NtShimEntrypoints {
                 // EXCEPTION_RECORD and CONTEXT onto the guest stack in the
                 // layout KiUserExceptionDispatcher expects, then redirect RIP.
                 //
+                // When FirstChance is FALSE (0), it means the exception was not
+                // handled on first pass. On real Windows the kernel terminates
+                // the process. We do the same to avoid infinite loops.
+                //
                 // Stack layout for KiUserExceptionDispatcher:
                 //   [RSP+0x000]: CONTEXT         (0x4D0 bytes)
                 //   [RSP+0x4F0]: EXCEPTION_RECORD (0x98 bytes)
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let exc_record_ptr = args.arg0; // EXCEPTION_RECORD*
                 let context_ptr = args.arg1; // CONTEXT*
+                let first_chance = args.arg2; // BOOLEAN (0 = second chance)
+
+                let exc_code = unsafe { *(exc_record_ptr as *const u32) };
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let exc_addr = unsafe { *((exc_record_ptr + 0x10) as *const u64) };
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtRaiseException: code=0x{exc_code:X} addr=0x{exc_addr:X} first_chance={first_chance} rsp=0x{:X}\n",
+                        ctx.regs.rsp,
+                    ));
+                    // Dump TEB stack limits for diagnosis of STATUS_BAD_STACK
+                    if exc_code == 0xC0000028 {
+                        if let Some(ref init) = self.init_state {
+                            let teb = init.teb_va;
+                            let stack_base = unsafe { *((teb + 0x08) as *const u64) };
+                            let stack_limit = unsafe { *((teb + 0x10) as *const u64) };
+                            let dealloc_stack = unsafe { *((teb + 0x1478) as *const u64) };
+                            let teb_self = unsafe { *((teb + 0x30) as *const u64) };
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "  STATUS_BAD_STACK diag: teb_va=0x{teb:X} self=0x{teb_self:X}\n  \
+                                 StackBase=0x{stack_base:X} StackLimit=0x{stack_limit:X} \
+                                 DeallocationStack=0x{dealloc_stack:X}\n  \
+                                 guest_rsp=0x{:X}\n",
+                                ctx.regs.rsp,
+                            ));
+                            // Dump guest stack to find the caller chain of
+                            // RtlRaiseStatus(STATUS_BAD_STACK).
+                            // The RtlRaiseStatus frame is ~0x598 bytes, so we
+                            // need to scan well past it to find the return addr.
+                            let rsp = ctx.regs.rsp as usize;
+                            let ntdll_lo = init
+                                .module_bases
+                                .iter()
+                                .find(|m| m.name == "ntdll.dll")
+                                .map_or(0usize, |m| m.base_address);
+                            let ntdll_hi = ntdll_lo
+                                + init
+                                    .module_bases
+                                    .iter()
+                                    .find(|m| m.name == "ntdll.dll")
+                                    .map_or(0usize, |m| m.image_size);
+                            let mut trace = alloc::string::String::from(
+                                "  Stack scan for ntdll return addresses:\n",
+                            );
+                            for i in 0..256usize {
+                                let addr = rsp + i * 8;
+                                if addr >= stack_base as usize {
+                                    break;
+                                }
+                                let val = unsafe { *(addr as *const u64) };
+                                let v = val as usize;
+                                if v >= ntdll_lo && v < ntdll_hi {
+                                    trace.push_str(&alloc::format!(
+                                        "    [rsp+0x{:04X}] = 0x{val:X} (ntdll+0x{:X})\n",
+                                        i * 8,
+                                        v - ntdll_lo,
+                                    ));
+                                }
+                            }
+                            litebox_platform_multiplex::platform().debug_log_print(&trace);
+
+                            // Dump bytes around the caller of RtlRaiseStatus so
+                            // we can disassemble the failing inline stack check.
+                            // From the stack scan, the call is at ntdll+0xE6EE
+                            // (return addr = ntdll+0xE6F3).
+                            let dump_rvas: &[usize] = &[0xE6C0, 0xE310];
+                            for &base_rva in dump_rvas {
+                                let dump_addr = ntdll_lo + base_rva;
+                                let mut hex = alloc::format!(
+                                    "  Bytes at ntdll+0x{base_rva:X} (VA=0x{dump_addr:X}):\n    ",
+                                );
+                                for j in 0..64usize {
+                                    let b = unsafe { *((dump_addr + j) as *const u8) };
+                                    hex.push_str(&alloc::format!("{b:02X} "));
+                                    if j % 16 == 15 && j < 63 {
+                                        hex.push_str("\n    ");
+                                    }
+                                }
+                                hex.push('\n');
+                                litebox_platform_multiplex::platform().debug_log_print(&hex);
+                            }
+                        }
+                    }
+                }
+
+                // Second-chance: terminate the guest process.
+                if first_chance == 0 {
+                    self.exit_code.store(exc_code as i32, Ordering::Release);
+                    return (NtStatus(exc_code as i32), true);
+                }
 
                 const CONTEXT_SIZE: usize = 0x4D0;
                 const EXCEPTION_RECORD_SIZE: usize = 0x98;
@@ -3460,6 +3749,58 @@ impl NtShimEntrypoints {
                 }
             }
 
+            NtSyscallId::NtCallbackReturn => {
+                // NtCallbackReturn is used to return from a user-mode callback
+                // dispatched by the kernel (e.g., KiUserCallbackDispatcher).
+                // In our sandbox, we don't dispatch real kernel callbacks, so
+                // this should never be called from guest ntdll. If it is, it
+                // means the host kernel dispatched a callback to our thread
+                // (perhaps from user32/win32k). Just return success.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtQueryWnfStateData => {
+                // WNF (Windows Notification Facility) state query. Modern
+                // Windows DLLs use WNF to check feature flags during init.
+                // Return STATUS_UNSUCCESSFUL to indicate no state is published,
+                // which makes callers use their default code paths.
+                (NtStatus::STATUS_UNSUCCESSFUL, false)
+            }
+
+            NtSyscallId::NtReadVirtualMemory => {
+                // NtReadVirtualMemory(ProcessHandle, BaseAddress, Buffer,
+                //                     NumberOfBytesToRead, NumberOfBytesRead)
+                // For self-process reads (handle = NtCurrentProcess), this is
+                // equivalent to memcpy.  Kernelbase calls this during init to
+                // read PEB fields.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0;
+                let base_address = args.arg1;
+                let buffer = args.arg2;
+                let bytes_to_read = args.arg3;
+                let bytes_read_ptr =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+
+                if handle == NT_CURRENT_PROCESS_HANDLE {
+                    // Self-process: simple memcpy.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            base_address as *const u8,
+                            buffer as *mut u8,
+                            bytes_to_read,
+                        );
+                    }
+                    if bytes_read_ptr != 0 {
+                        unsafe {
+                            core::ptr::write(bytes_read_ptr as *mut usize, bytes_to_read);
+                        }
+                    }
+                    (NtStatus::STATUS_SUCCESS, false)
+                } else {
+                    (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                }
+            }
+
             other => {
                 log_unimplemented!("syscall {:?} (nr=0x{:04X})", other, raw_nr);
                 (NtStatus::STATUS_NOT_IMPLEMENTED, false)
@@ -3494,6 +3835,10 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        // A successful syscall means the guest resumed after any prior
+        // exception forwarding.  Reset the SEH forward counter.
+        self.seh_forward_count.store(0, Ordering::Relaxed);
+
         let nr = ctx.regs.orig_rax as u32;
 
         #[cfg(debug_assertions)]
@@ -3517,8 +3862,9 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         // Special case: NtContinue restores the full context including rax,
         // so we must not overwrite it.
         let is_kernel32 = nr >= 0x1000;
-        let is_context_switch = self.shared.syscall_map.get().and_then(|m| m.lookup(nr))
-            == Some(NtSyscallId::NtContinue);
+        let syscall_id = self.shared.syscall_map.get().and_then(|m| m.lookup(nr));
+        let is_context_switch = syscall_id == Some(NtSyscallId::NtContinue)
+            || syscall_id == Some(NtSyscallId::NtContinueEx);
         if !is_kernel32 && !is_context_switch {
             ctx.regs.rax = status.0 as u32 as usize;
         }
@@ -3733,37 +4079,139 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             }
         }
 
+        // ── NULL-region dereference fixup for DLL initialization ──
+        //
+        // During ntdll's DLL loading phase, several system DLLs (user32,
+        // gdi32full, etc.) try to read from pointers loaded from PEB fields
+        // or global variables that are NULL because we don't connect to
+        // csrss/win32k. Two patterns are observed:
+        //
+        // Pattern A — literal NULL deref (cr2 = 0):
+        //   mov rax, [rip+disp]     ; load global → NULL
+        //   test byte [rax], N      ; crash at virtual address 0
+        //   je/jne ...              ; conditional branch
+        //
+        //   We can't map a page at VA 0 (PageManager rejects address 0).
+        //   Instead we detect the faulting instruction: if it's `test byte
+        //   [rax], imm8` (F6 00 xx) with RAX=0, we skip the 3-byte insn
+        //   and set ZF=1 so the subsequent conditional branch takes the
+        //   "not initialized" path.
+        //
+        // Pattern B — NULL-based offset deref (0 < cr2 < 0x200000):
+        //   mov rcx, gs:[0x60]      ; PEB
+        //   mov rcx, [rcx+0xF8]     ; PEB.pShimData → NULL
+        //   cmp dword [rcx+disp32], 0  ; crash at 0 + disp32
+        //
+        //   For non-zero low addresses, we can map a zero-filled read-only
+        //   page via PageManager. The DLL init code reads zeros ("not
+        //   initialized") and takes the appropriate fallback path.
+        if info.exception == litebox::shim::Exception::PAGE_FAULT
+            && info.cr2 < 0x200000
+            && (info.error_code & 2) == 0
+        // read fault only (bit 1 = write)
+        {
+            if info.cr2 == 0 {
+                // Pattern A: literal NULL deref. Skip the faulting instruction.
+                let rip = ctx.regs.rip;
+                if is_addr_committed(rip) && is_addr_committed(rip + 2) {
+                    let b0 = unsafe { core::ptr::read(rip as *const u8) };
+                    let b1 = unsafe { core::ptr::read((rip + 1) as *const u8) };
+                    // F6 /0 ib = test byte [rax], imm8  (ModRM=0x00 → [rax])
+                    if b0 == 0xF6 && b1 == 0x00 {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            let imm = unsafe { core::ptr::read((rip + 2) as *const u8) };
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NULL fixup (pattern A) at rip=0x{:X}: test byte [rax=0], 0x{:02X} → skip, set ZF\n",
+                                rip, imm,
+                            ));
+                        }
+                        ctx.regs.rip += 3;
+                        // ZF=1 (bit 6), clear SF/CF/OF/AF/PF
+                        ctx.regs.eflags = (ctx.regs.eflags & !0x8D5) | 0x40;
+                        return ContinueOperation::Resume;
+                    }
+                }
+            } else {
+                // Pattern B: NULL-based offset (cr2 > 0). Map a zero page via
+                // host VirtualAlloc, because the faulting address is below the
+                // guest VA range and the PageManager refuses it.
+                //
+                // NOTE: Windows does not allow VirtualAlloc below the system
+                // minimum allocation address (typically 0x10000 = 64KB).
+                // For fault addresses in the first 64KB, we skip this and
+                // fall through to SEH forwarding.
+                let fault_page = info.cr2 & !(PAGE_SIZE - 1);
+                if fault_page >= 0x10000 {
+                    unsafe extern "system" {
+                        fn VirtualAlloc(
+                            address: usize,
+                            size: usize,
+                            alloc_type: u32,
+                            protect: u32,
+                        ) -> usize;
+                    }
+                    const MEM_COMMIT: u32 = 0x1000;
+                    const MEM_RESERVE: u32 = 0x2000;
+                    const PAGE_READONLY: u32 = 0x02;
+                    // Safety: VirtualAlloc is a host Win32 API; we ask for a
+                    // single read-only zero page at the faulting page address.
+                    let result = unsafe {
+                        VirtualAlloc(
+                            fault_page,
+                            PAGE_SIZE,
+                            MEM_COMMIT | MEM_RESERVE,
+                            PAGE_READONLY,
+                        )
+                    };
+                    // VirtualAlloc must return the exact requested address.
+                    // If it returns a different address, that's a stray
+                    // allocation — we can't use it (the fault page is still
+                    // unmapped and the instruction would fault again).
+                    if result == fault_page {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NULL fixup (pattern B): host VirtualAlloc page at 0x{:X} for read at 0x{:X} (rip=0x{:X})\n",
+                                fault_page, info.cr2, ctx.regs.rip,
+                            ));
+                        }
+                        return ContinueOperation::Resume;
+                    }
+                    // If we got a different address, free the stray allocation.
+                    if result != 0 {
+                        unsafe extern "system" {
+                            fn VirtualFree(address: usize, size: usize, free_type: u32) -> i32;
+                        }
+                        const MEM_RELEASE: u32 = 0x8000;
+                        unsafe { VirtualFree(result, 0, MEM_RELEASE) };
+                    }
+                }
+                // Could not map the faulting page — fall through to SEH
+                // forwarding below (if available).
+            }
+        }
+
         // ── Segment heap lazy context initialization fixup ──
         //
-        // The NT segment heap (Windows 10+) reserves a huge VA range
-        // ("cage") via NtAllocateVirtualMemoryEx and creates per-context
-        // areas at cage_base + N*0x660.  During RtlCreateHeap the init
-        // loop may only fully initialise context 0 (at cage_base), leaving
-        // contexts 1 and 2 with all-zero data.
-        //
-        // Each per-context area stores a pointer at +0x18 to the
-        // _SEGMENT_HEAP structure.  RtlAllocateHeap reads this pointer,
-        // then indexes into HeapSegContexts (at heap+0x4A8) to find the
-        // segment context for the allocation.  The init code populates
-        // the HeapSegContexts array at cage_base+0x4A8 (not heap+0x4A8).
-        //
-        // Fix: when we detect a null deref from reading an uninitialised
-        // per-context area, we:
-        //   (a) initialise the per-context area (linked list + heap ptr),
-        //   (b) copy the HeapSegContexts entry from cage_base to heap so
-        //       the allocation code finds the segment context, and
-        //   (c) patch RCX with the heap pointer.
-        if info.exception == litebox::shim::Exception::PAGE_FAULT {
+        // NOTE: This fixup is disabled because we disable the segment heap
+        // via FrontEndHeapDebugOptions=0x8 in NtQueryValueKey. The fixup
+        // was originally needed when the segment heap was active but its
+        // per-context areas weren't fully initialized. With the segment
+        // heap disabled, this code path should never be needed and its
+        // broad `fault_addr < 0x10000` check can cause false positives
+        // (e.g., a NULL deref in user32.dll would be misidentified as a
+        // heap context fault, causing a secondary crash on unrelated reads).
+        if false && info.exception == litebox::shim::Exception::PAGE_FAULT {
             let raw_fault_addr = info.cr2;
             if raw_fault_addr < 0x10000 {
                 let r13 = ctx.regs.r13 as usize;
-                if let Some((res_base, _)) =
-                    self.shared.process_state.va_reservation_at(r13)
-                {
+                if let Some((res_base, _)) = self.shared.process_state.va_reservation_at(r13) {
                     let heap_ptr =
                         unsafe { core::ptr::read_unaligned((res_base + 0x18) as *const u64) };
-                    let val_n =
-                        unsafe { core::ptr::read_unaligned((r13 + 0x18) as *const u64) };
+                    let val_n = unsafe { core::ptr::read_unaligned((r13 + 0x18) as *const u64) };
 
                     if heap_ptr != 0 && val_n == 0 {
                         // (a) Initialise the per-context area.
@@ -3778,10 +4226,8 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                         // context_index is already in EAX (loaded by the
                         // preceding `movzx eax, word [r12+0xAC]`).
                         let ctx_idx = ctx.regs.rax & 0xFFFF;
-                        let cage_hs =
-                            res_base + (ctx_idx * 8) as usize + 0x4A8;
-                        let heap_hs =
-                            heap_ptr as usize + (ctx_idx * 8) as usize + 0x4A8;
+                        let cage_hs = res_base + (ctx_idx * 8) as usize + 0x4A8;
+                        let heap_hs = heap_ptr as usize + (ctx_idx * 8) as usize + 0x4A8;
                         let seg_ctx_ptr =
                             unsafe { core::ptr::read_unaligned(cage_hs as *const u64) };
                         if seg_ctx_ptr != 0 {
@@ -3807,6 +4253,152 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                         return ContinueOperation::Resume;
                     }
                 }
+            }
+        }
+
+        // ── Forward unhandled guest exceptions to ntdll's ──
+        // ── KiUserExceptionDispatcher (guest SEH chain)    ──
+        //
+        // This is what the real Windows kernel does: when a user-mode exception
+        // is not handled by the kernel, it builds an EXCEPTION_RECORD + CONTEXT
+        // frame on the user stack and redirects RIP to KiUserExceptionDispatcher,
+        // which walks the guest's SEH chain (__try/__except, C++ catch, etc.).
+        //
+        // During DLL init, many DLLs have __try/__except guards around their
+        // initialization that handle ACCESS_VIOLATION gracefully (e.g., user32
+        // checking Win32 subsystem connection). Without SEH forwarding, these
+        // exceptions terminate the process unnecessarily.
+        //
+        // Stack layout for KiUserExceptionDispatcher (x64):
+        //   [RSP+0x000]: CONTEXT          (0x4D0 bytes)
+        //   [RSP+0x4F0]: EXCEPTION_RECORD (0x98 bytes)
+        //
+        // Guard: limit forwarding to MAX_SEH_FORWARDS per thread to prevent
+        // infinite loops (e.g., if the SEH handler itself faults on the same
+        // instruction).
+        const MAX_SEH_FORWARDS: u32 = 64;
+        if self.seh_forward_count.load(Ordering::Relaxed) < MAX_SEH_FORWARDS {
+            let dispatcher_va = self.init_state.as_ref().and_then(|s| {
+                let base = s
+                    .module_bases
+                    .iter()
+                    .find(|m| m.name == "ntdll.dll")
+                    .map(|m| m.base_address)?;
+                let rva = s.ki_user_exception_dispatcher_rva?;
+                Some(base + rva)
+            });
+
+            if let Some(dispatcher_va) = dispatcher_va {
+                let fwd_count = self.seh_forward_count.fetch_add(1, Ordering::Relaxed);
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let exc_name = match info.exception {
+                        litebox::shim::Exception::PAGE_FAULT => "PAGE_FAULT",
+                        litebox::shim::Exception::INVALID_OPCODE => "INVALID_OPCODE",
+                        litebox::shim::Exception::BREAKPOINT => "BREAKPOINT",
+                        _ => "OTHER",
+                    };
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: SEH forward #{fwd_count}: {exc_name} cr2=0x{:X} rip=0x{:X} rsp=0x{:X}\n",
+                        info.cr2, ctx.regs.rip, ctx.regs.rsp,
+                    ));
+                }
+
+                const CONTEXT_SIZE: usize = 0x4D0;
+                const EXCEPTION_RECORD_OFFSET: usize = 0x4F0;
+                const EXCEPTION_RECORD_SIZE: usize = 0x98;
+                const FRAME_SIZE: usize =
+                    (EXCEPTION_RECORD_OFFSET + EXCEPTION_RECORD_SIZE + 0xF) & !0xF;
+
+                let new_rsp = (ctx.regs.rsp - FRAME_SIZE) & !0xF;
+
+                // Zero the entire frame first.
+                unsafe { core::ptr::write_bytes(new_rsp as *mut u8, 0, FRAME_SIZE) };
+
+                // ── Build CONTEXT at [new_rsp] ──
+                //
+                // Populate the CONTEXT structure with the guest's current
+                // register state so that if the SEH handler calls NtContinue
+                // (or RtlRestoreContext), the guest resumes correctly.
+                let c = new_rsp as *mut u8;
+                unsafe {
+                    // ContextFlags: CONTEXT_FULL = CONTEXT_CONTROL |
+                    //               CONTEXT_INTEGER | CONTEXT_FLOATING_POINT
+                    core::ptr::write(c.add(0x30) as *mut u32, 0x10_000B);
+                    // Segment selectors (standard x64 user mode values).
+                    core::ptr::write(c.add(0x38) as *mut u16, 0x33); // SegCs
+                    core::ptr::write(c.add(0x42) as *mut u16, 0x2B); // SegSs
+                    // EFlags
+                    core::ptr::write(c.add(0x44) as *mut u32, ctx.regs.eflags as u32);
+                    // FltSave (offset 0x100): copy the guest's current FP state
+                    // so NtContinue can restore it when the SEH handler resumes.
+                    let fxsave_size = 512.min(ctx.fp_regs.data.len());
+                    core::ptr::copy_nonoverlapping(
+                        ctx.fp_regs.data.as_ptr(),
+                        c.add(0x100),
+                        fxsave_size,
+                    );
+                    // Integer registers
+                    core::ptr::write(c.add(0x78) as *mut u64, ctx.regs.rax as u64);
+                    core::ptr::write(c.add(0x80) as *mut u64, ctx.regs.rcx as u64);
+                    core::ptr::write(c.add(0x88) as *mut u64, ctx.regs.rdx as u64);
+                    core::ptr::write(c.add(0x90) as *mut u64, ctx.regs.rbx as u64);
+                    core::ptr::write(c.add(0x98) as *mut u64, ctx.regs.rsp as u64);
+                    core::ptr::write(c.add(0xA0) as *mut u64, ctx.regs.rbp as u64);
+                    core::ptr::write(c.add(0xA8) as *mut u64, ctx.regs.rsi as u64);
+                    core::ptr::write(c.add(0xB0) as *mut u64, ctx.regs.rdi as u64);
+                    core::ptr::write(c.add(0xB8) as *mut u64, ctx.regs.r8 as u64);
+                    core::ptr::write(c.add(0xC0) as *mut u64, ctx.regs.r9 as u64);
+                    core::ptr::write(c.add(0xC8) as *mut u64, ctx.regs.r10 as u64);
+                    core::ptr::write(c.add(0xD0) as *mut u64, ctx.regs.r11 as u64);
+                    core::ptr::write(c.add(0xD8) as *mut u64, ctx.regs.r12 as u64);
+                    core::ptr::write(c.add(0xE0) as *mut u64, ctx.regs.r13 as u64);
+                    core::ptr::write(c.add(0xE8) as *mut u64, ctx.regs.r14 as u64);
+                    core::ptr::write(c.add(0xF0) as *mut u64, ctx.regs.r15 as u64);
+                    core::ptr::write(c.add(0xF8) as *mut u64, ctx.regs.rip as u64);
+                }
+
+                // ── Build EXCEPTION_RECORD at [new_rsp + 0x4F0] ──
+                let e = (new_rsp + EXCEPTION_RECORD_OFFSET) as *mut u8;
+                let exc_code = match info.exception {
+                    litebox::shim::Exception::PAGE_FAULT => 0xC000_0005u32, // ACCESS_VIOLATION
+                    litebox::shim::Exception::INVALID_OPCODE => 0xC000_001Du32, // ILLEGAL_INSTRUCTION
+                    _ => 0xC000_0005u32,
+                };
+                unsafe {
+                    // ExceptionCode (+0x00)
+                    core::ptr::write(e.add(0x00) as *mut u32, exc_code);
+                    // ExceptionFlags (+0x04): 0 = continuable
+                    // ExceptionRecord (+0x08): NULL (no chained record)
+                    // ExceptionAddress (+0x10): the faulting instruction
+                    core::ptr::write(e.add(0x10) as *mut u64, ctx.regs.rip as u64);
+                    // NumberParameters (+0x18)
+                    if info.exception == litebox::shim::Exception::PAGE_FAULT {
+                        core::ptr::write(e.add(0x18) as *mut u32, 2);
+                        // ExceptionInformation[0]: 0=read, 1=write, 8=DEP
+                        let access_type: u64 = if (info.error_code & 2) != 0 { 1 } else { 0 };
+                        core::ptr::write(e.add(0x20) as *mut u64, access_type);
+                        // ExceptionInformation[1]: faulting virtual address
+                        core::ptr::write(e.add(0x28) as *mut u64, info.cr2 as u64);
+                    }
+                }
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: forwarding exception to guest SEH: code=0x{:X} addr=0x{:X} rip=0x{:X} → KiUserExceptionDispatcher @ 0x{:X}\n",
+                        exc_code, info.cr2, ctx.regs.rip, dispatcher_va,
+                    ));
+                }
+
+                // Redirect guest execution to KiUserExceptionDispatcher.
+                ctx.regs.rsp = new_rsp;
+                ctx.regs.rip = dispatcher_va;
+                // Set RCX = RIP for the platform's sysret fast-path check.
+                ctx.regs.rcx = dispatcher_va;
+                return ContinueOperation::Resume;
             }
         }
 
@@ -3848,17 +4440,22 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             litebox_platform_multiplex::platform().debug_log_print(&msg);
 
             // Dump stack words around RSP (extended range to find return addresses).
+            // Guard each read via VirtualQuery to prevent recursive faults on
+            // unmapped guest pages.
             let rsp = ctx.regs.rsp as u64;
             let mut stack_dump = alloc::string::String::from("  stack (rsp-64..rsp+320):\n");
             for offset in (-8i64..40).rev() {
                 let addr = (rsp as i64 + offset * 8) as u64;
-                // Safety: reading guest stack; may fault if unmapped, but
-                // we are already in a terminal exception handler.
-                let val = unsafe { core::ptr::read_unaligned(addr as *const u64) };
                 let marker = if offset == 0 { " <-- RSP" } else { "" };
-                stack_dump.push_str(&alloc::format!(
-                    "    [{addr:016X}] = 0x{val:016X}{marker}\n"
-                ));
+                if is_addr_committed(addr as usize) {
+                    let val = unsafe { core::ptr::read_unaligned(addr as *const u64) };
+                    stack_dump.push_str(&alloc::format!(
+                        "    [{addr:016X}] = 0x{val:016X}{marker}\n"
+                    ));
+                } else {
+                    stack_dump
+                        .push_str(&alloc::format!("    [{addr:016X}] = <unmapped>{marker}\n"));
+                }
             }
             litebox_platform_multiplex::platform().debug_log_print(&stack_dump);
 
@@ -3866,8 +4463,12 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             let rip = ctx.regs.rip as u64;
             let mut insn_dump = alloc::format!("  code at rip=0x{rip:X}: ");
             for i in 0u64..16 {
-                let byte = unsafe { core::ptr::read((rip + i) as *const u8) };
-                insn_dump.push_str(&alloc::format!("{byte:02X} "));
+                if is_addr_committed((rip + i) as usize) {
+                    let byte = unsafe { core::ptr::read((rip + i) as *const u8) };
+                    insn_dump.push_str(&alloc::format!("{byte:02X} "));
+                } else {
+                    insn_dump.push_str("?? ");
+                }
             }
             insn_dump.push('\n');
             litebox_platform_multiplex::platform().debug_log_print(&insn_dump);
@@ -3876,30 +4477,20 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             if let Some(ref init) = self.init_state {
                 let peb = init.peb_va;
                 let heap = unsafe { core::ptr::read((peb + 0x30) as *const usize) };
-                let msg = alloc::format!(
-                    "  PEB=0x{peb:X} PEB.ProcessHeap=0x{heap:X}\n"
-                );
+                let msg = alloc::format!("  PEB=0x{peb:X} PEB.ProcessHeap=0x{heap:X}\n");
                 litebox_platform_multiplex::platform().debug_log_print(&msg);
 
                 // Dump _SEGMENT_HEAP.HeapSegContexts (offset 0x4A8, array of
                 // 16 pointers) to check for corruption.
                 if heap != 0 {
-                    let mut seg_dump =
-                        alloc::format!("  _SEGMENT_HEAP at 0x{heap:X}:\n");
+                    let mut seg_dump = alloc::format!("  _SEGMENT_HEAP at 0x{heap:X}:\n");
                     // Signature at +0x10
-                    let sig = unsafe {
-                        core::ptr::read((heap + 0x10) as *const u32)
-                    };
-                    seg_dump.push_str(&alloc::format!(
-                        "    Signature=0x{sig:08X}\n"
-                    ));
+                    let sig = unsafe { core::ptr::read((heap + 0x10) as *const u32) };
+                    seg_dump.push_str(&alloc::format!("    Signature=0x{sig:08X}\n"));
                     // HeapSegContexts array at +0x4A8
                     for i in 0u64..16 {
-                        let ptr = unsafe {
-                            core::ptr::read(
-                                (heap as u64 + 0x4A8 + i * 8) as *const u64,
-                            )
-                        };
+                        let ptr =
+                            unsafe { core::ptr::read((heap as u64 + 0x4A8 + i * 8) as *const u64) };
                         if ptr != 0 {
                             seg_dump.push_str(&alloc::format!(
                                 "    HeapSegContexts[{i}] = 0x{ptr:016X}\n"
@@ -3912,15 +4503,12 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                         let base = heap as u64 + row * 16;
                         seg_dump.push_str(&alloc::format!("    +{:03X}: ", row * 16));
                         for col in 0..16u64 {
-                            let b = unsafe {
-                                core::ptr::read((base + col) as *const u8)
-                            };
+                            let b = unsafe { core::ptr::read((base + col) as *const u8) };
                             seg_dump.push_str(&alloc::format!("{b:02X} "));
                         }
                         seg_dump.push('\n');
                     }
-                    litebox_platform_multiplex::platform()
-                        .debug_log_print(&seg_dump);
+                    litebox_platform_multiplex::platform().debug_log_print(&seg_dump);
                 }
             }
 
@@ -3943,34 +4531,24 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                 let r13 = ctx.regs.r13 as u64;
                 // Show first 256 bytes from [R13 - 0xCC0] (should be cage base)
                 let cage_base = r13.saturating_sub(0xCC0);
-                let mut cage_dump = alloc::format!(
-                    "  cage_base=0x{cage_base:X} (R13-0xCC0):\n"
-                );
+                let mut cage_dump = alloc::format!("  cage_base=0x{cage_base:X} (R13-0xCC0):\n");
                 for row in 0..16u64 {
                     let base_addr = cage_base + row * 16;
                     cage_dump.push_str(&alloc::format!("    +{:03X}: ", row * 16));
                     for col in 0..16u64 {
-                        let b = unsafe {
-                            core::ptr::read((base_addr + col) as *const u8)
-                        };
+                        let b = unsafe { core::ptr::read((base_addr + col) as *const u8) };
                         cage_dump.push_str(&alloc::format!("{b:02X} "));
                     }
                     cage_dump.push('\n');
                 }
                 // Also dump around offset 0xCC0 (where the segment context
                 // back-pointer lives).
-                cage_dump.push_str(&alloc::format!(
-                    "  [R13] area (cage_base+0xCC0..+0xD40):\n"
-                ));
+                cage_dump.push_str(&alloc::format!("  [R13] area (cage_base+0xCC0..+0xD40):\n"));
                 for row in 0..8u64 {
                     let base_addr = r13 + row * 16;
-                    cage_dump.push_str(&alloc::format!(
-                        "    +{:03X}: ", 0xCC0 + row * 16
-                    ));
+                    cage_dump.push_str(&alloc::format!("    +{:03X}: ", 0xCC0 + row * 16));
                     for col in 0..16u64 {
-                        let b = unsafe {
-                            core::ptr::read((base_addr + col) as *const u8)
-                        };
+                        let b = unsafe { core::ptr::read((base_addr + col) as *const u8) };
                         cage_dump.push_str(&alloc::format!("{b:02X} "));
                     }
                     cage_dump.push('\n');

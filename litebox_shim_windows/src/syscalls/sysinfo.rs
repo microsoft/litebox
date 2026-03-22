@@ -344,6 +344,13 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
                         core::ptr::write(return_length_ptr as *mut u32, ENTRY_SIZE);
                     }
                 }
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "  NtQuerySystemInformationEx(0x6B): buffer too small (ptr=0x{info_ptr:X} len={info_length}), returning INFO_LENGTH_MISMATCH\n"
+                    ));
+                }
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
             }
             unsafe {
@@ -374,10 +381,23 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
         }
         // SystemProcessorIdleCycleTimeInformation (0xD2) and
         // SystemProcessorCycleTimeInformation (0xD3): ntdll's loader queries
-        // these during image mapping. Return NOT_IMPLEMENTED so ntdll skips
-        // the per-processor cycle time initialization rather than building
-        // incomplete data structures from zeroed data.
-        0xD2 | 0xD3 => NtStatus(0xC0000002_u32 as i32), // STATUS_NOT_IMPLEMENTED
+        // these during image mapping. Return SUCCESS with zeroed data so the
+        // caller doesn't retry in an infinite loop. The output buffer is
+        // already zeroed by the caller.
+        0xD2 | 0xD3 => {
+            // Zero the output buffer (may already be zero, but be safe).
+            if info_ptr != 0 && info_length > 0 {
+                unsafe {
+                    core::ptr::write_bytes(info_ptr as *mut u8, 0, info_length as usize);
+                }
+            }
+            if return_length_ptr != 0 {
+                unsafe {
+                    core::ptr::write(return_length_ptr as *mut u32, info_length);
+                }
+            }
+            NtStatus::STATUS_SUCCESS
+        }
         // Default: unknown classes in NtQuerySystemInformationEx. The real
         // kernel returns STATUS_INFO_NOT_FOUND (0xC0000004) for unknown or
         // unsupported Ex classes. We must match this specific status code

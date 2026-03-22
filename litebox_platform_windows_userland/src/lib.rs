@@ -918,8 +918,15 @@ unsafe extern "system" fn vectored_exception_handler_inner(
         static VEH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = VEH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 20 {
+            let current_gs: u64;
+            unsafe {
+                core::arch::asm!("rdgsbase {}", out(reg) current_gs, options(nostack, preserves_flags));
+            }
+            let guest_gs_val = get_tls_ptr()
+                .map(|p| unsafe { &*p }.guest_gs_base.get())
+                .unwrap_or(0);
             eprintln!(
-                "[VEH] #{} code=0x{:08X} rip=0x{:X} addr=0x{:X}",
+                "[VEH] #{} code=0x{:08X} rip=0x{:X} addr=0x{:X} gs=0x{:X} guest_gs=0x{:X}{}",
                 n,
                 exception_record.ExceptionCode as u32,
                 context.Rip,
@@ -927,7 +934,14 @@ unsafe extern "system" fn vectored_exception_handler_inner(
                     exception_record.ExceptionInformation[1] as u64
                 } else {
                     0
-                }
+                },
+                current_gs,
+                guest_gs_val,
+                if current_gs == guest_gs_val {
+                    " GS=GUEST!"
+                } else {
+                    ""
+                },
             );
         }
         // Dump GS diagnostic info for ILLEGAL_INSTRUCTION (UD2 from trampoline
@@ -997,6 +1011,43 @@ unsafe extern "system" fn vectored_exception_handler_inner(
     }
     tls.is_in_guest.set(false);
 
+    // Handle EXCEPTION_SINGLE_STEP for instruction-level tracing.
+    // When TF is set in EFLAGS (by the switch_to_guest code), each guest
+    // instruction triggers this exception. We log the RIP and re-set TF
+    // so tracing continues.
+    const EXCEPTION_SINGLE_STEP: i32 = 0x80000004_u32 as i32;
+    if exception_record.ExceptionCode == EXCEPTION_SINGLE_STEP {
+        #[cfg(debug_assertions)]
+        {
+            static STEP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = STEP_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 500 {
+                // Read 4 bytes at RIP for compact trace.
+                let rip = context.Rip;
+                let b0 = unsafe { *(rip as *const u8) };
+                let b1 = unsafe { *((rip + 1) as *const u8) };
+                let b2 = unsafe { *((rip + 2) as *const u8) };
+                let b3 = unsafe { *((rip + 3) as *const u8) };
+                eprintln!("[STEP #{n}] rip=0x{rip:X} [{b0:02X} {b1:02X} {b2:02X} {b3:02X}]");
+            }
+        }
+        // Re-enable TF for the next instruction.
+        context.EFlags |= 0x100;
+        // Restore guest state: re-set is_in_guest, restore guest GS.
+        tls.is_in_guest.set(true);
+        let guest_gs = tls.guest_gs_base.get();
+        if guest_gs != 0 {
+            unsafe {
+                core::arch::asm!(
+                    "wrgsbase {gs}",
+                    gs = in(reg) guest_gs,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     // Debug output exceptions raised by the guest (e.g., OutputDebugStringA/W
     // under CRT init). These are informational only; silently resume.
     // We must restore guest GS before returning because the trampoline skips
@@ -1024,10 +1075,24 @@ unsafe extern "system" fn vectored_exception_handler_inner(
 
     // Cast to ExecutionContext — PtRegs is at offset 0 of ExecutionContext, so
     // the pointer to PtRegs is also a valid pointer to ExecutionContext.
-    let exec_ctx = unsafe {
-        &mut *(tls.guest_context_top.get().wrapping_sub(1)
-            as *mut litebox_common_linux::ExecutionContext)
-    };
+    let ctx_top = tls.guest_context_top.get();
+    #[cfg(debug_assertions)]
+    {
+        eprintln!(
+            "[VEH-exc] guest exception: code=0x{:08X} rip=0x{:X} addr=0x{:X} guest_context_top={:p} host_sp={:p}",
+            exception_record.ExceptionCode as u32,
+            context.Rip,
+            if exception_record.NumberParameters >= 2 {
+                exception_record.ExceptionInformation[1] as u64
+            } else {
+                0
+            },
+            ctx_top,
+            tls.host_sp.get(),
+        );
+    }
+    let exec_ctx =
+        unsafe { &mut *(ctx_top.wrapping_sub(1) as *mut litebox_common_linux::ExecutionContext) };
     save_guest_context(exec_ctx, context, context as *const _);
 
     // If it looks like fs base was cleared, then go through the interrupt path
@@ -2163,9 +2228,26 @@ DEFAULT_MXCSR:
 /// destructors.
 ///
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContext) -> ! {
+    /// Restores the full guest register state and jumps to the guest RIP
+    /// entirely in user-mode — no kernel round-trip.
+    ///
+    /// Technique: before popping registers, we stage the guest RIP at
+    /// `(guest_rsp - 8)` on the guest stack. The pop sequence restores
+    /// ALL GP registers (including RCX). After `popfq` and `pop rsp`,
+    /// we `lea rsp, [rsp - 8]` (flags-preserving) to point at the
+    /// staged RIP, then `ret` to jump there. This avoids the old
+    /// NtContinue kernel path which could lose our custom GS base.
     #[unsafe(naked)]
     extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::ExecutionContext) -> ! {
         core::arch::naked_asm!(
+            // === switch_to_guest_start..switch_to_guest_end ===
+            // This range is checked by ThreadHandle::interrupt() to detect
+            // when a thread is in the process of entering guest code. If
+            // interrupted here, the thread is redirected to interrupt_callback
+            // and re-enters switch_to_guest later. The ExecutionContext is
+            // not modified below, so re-entry is safe (the pre-staging write
+            // to the guest stack is idempotent).
+            "switch_to_guest_start:",
             // Restore guest FP/SIMD state before touching any guest registers.
             // rcx = ptr to ExecutionContext; fp_regs is at offset FP_REGS_OFFSET.
             // First check xsave_enabled in TlsState (GS still points to host TEB).
@@ -2185,14 +2267,19 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
             // points to the host TEB here, so we can read the TLS slot.
             // This must happen AFTER FP restore (so any fault sees host GS)
             // and BEFORE we start restoring guest registers.
-            // Re-read TlsState (r11 was loaded above but may have been used).
             "mov     r11, QWORD PTR [r11 + {GUEST_GS_BASE}]",
             "test    r11, r11",
             "jz      2f",
             "wrgsbase r11",
             "2:",
+            // Pre-stage: write guest RIP at (guest_rsp - 8) so we can
+            // restore ALL registers (including RCX) and use `ret` to
+            // jump to the guest. This does NOT modify the ExecutionContext,
+            // so it is idempotent and safe if an interrupt causes re-entry.
+            "mov     r11, QWORD PTR [rcx + {PT_RSP}]",
+            "mov     rax, QWORD PTR [rcx + {PT_RIP}]",
+            "mov     QWORD PTR [r11 - 8], rax",
             // Load all registers from the guest context structure.
-            "switch_to_guest_start:",
             "mov rsp, rcx",
             "pop r15",
             "pop r14",
@@ -2205,16 +2292,15 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
             "pop r9",
             "pop r8",
             "pop rax",
-            "pop rcx",
+            "pop rcx",       // guest's actual RCX
             "pop rdx",
             "pop rsi",
             "pop rdi",
-            "pop rcx",    // skip orig_rax
-            "pop rcx",    // read rip into rcx
-            "add rsp, 8", // skip cs
+            "add rsp, 24",   // skip orig_rax + rip + cs
             "popfq",
-            "pop rsp",
-            "jmp rcx", // jump to the entry point of the thread
+            "pop rsp",                        // rsp = guest_rsp
+            "lea rsp, QWORD PTR [rsp - 8]",  // rsp = guest_rsp - 8 (no flags clobber)
+            "ret",                            // pop staged RIP → guest, rsp = guest_rsp
             "switch_to_guest_end:",
             FP_REGS_OFFSET = const core::mem::offset_of!(litebox_common_linux::ExecutionContext, fp_regs),
             TLS_INDEX = sym TLS_INDEX,
@@ -2222,102 +2308,9 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
             XSAVE_ENABLED = const core::mem::offset_of!(TlsState, xsave_enabled),
             XSAVE_MASK_LO = const core::mem::offset_of!(TlsState, xsave_mask_lo),
             XSAVE_MASK_HI = const core::mem::offset_of!(TlsState, xsave_mask_hi),
+            PT_RIP = const core::mem::offset_of!(litebox_common_linux::PtRegs, rip),
+            PT_RSP = const core::mem::offset_of!(litebox_common_linux::PtRegs, rsp),
         );
-    }
-
-    fn switch_to_guest_ntcontinue(
-        tls: &TlsState,
-        ctx: &litebox_common_linux::ExecutionContext,
-    ) -> ! {
-        use litebox::utils::ReinterpretSignedExt;
-        use windows_sys::Win32::System::Diagnostics::Debug::{
-            CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_FLOATING_POINT_AMD64, CONTEXT_INTEGER_AMD64,
-        };
-        #[link(name = "ntdll")]
-        unsafe extern "system" {
-            fn NtContinue(
-                ctx: *const CONTEXT,
-                raise_alert: u8,
-            ) -> windows_sys::Win32::Foundation::NTSTATUS;
-        }
-        let win_ctx = tls.continue_context.get();
-        // SAFETY: no other code accesses `continue_context` while `is_in_guest` is false.
-        unsafe {
-            win_ctx.write(CONTEXT {
-                ContextFlags: CONTEXT_CONTROL_AMD64
-                    | CONTEXT_INTEGER_AMD64
-                    | CONTEXT_FLOATING_POINT_AMD64,
-                EFlags: ctx.eflags.truncate(),
-                Rax: ctx.rax as u64,
-                Rcx: ctx.rcx as u64,
-                Rdx: ctx.rdx as u64,
-                Rbx: ctx.rbx as u64,
-                Rsp: ctx.rsp as u64,
-                Rbp: ctx.rbp as u64,
-                Rsi: ctx.rsi as u64,
-                Rdi: ctx.rdi as u64,
-                R8: ctx.r8 as u64,
-                R9: ctx.r9 as u64,
-                R10: ctx.r10 as u64,
-                R11: ctx.r11 as u64,
-                R12: ctx.r12 as u64,
-                R13: ctx.r13 as u64,
-                R14: ctx.r14 as u64,
-                R15: ctx.r15 as u64,
-                Rip: ctx.rip as u64,
-                ..CONTEXT::default()
-            });
-            // Copy guest FP state into the CONTEXT's FXSAVE area (FltSave).
-            // FltSave is an XSAVE_FORMAT struct (512 bytes), layout-compatible
-            // with the first 512 bytes of our FpRegs (which may be 832 bytes
-            // when using XSAVE). Only copy the 512-byte FXSAVE portion.
-            core::ptr::copy_nonoverlapping(
-                ctx.fp_regs.data.as_ptr(),
-                &raw mut (*win_ctx).Anonymous.FltSave as *mut u8,
-                512,
-            );
-        }
-        // Ensure the context is written before we set `is_in_guest` so that
-        // `ThreadHandle::interrupt` can see a consistent state.
-        std::sync::atomic::compiler_fence(Ordering::Release);
-        tls.is_in_guest.set(true);
-        // Restore guest GS base before entering the kernel. SWAPGS in the
-        // NtContinue syscall entry/exit preserves the user GS base across
-        // the round-trip, so the guest resumes with GS = guest TEB.
-        let guest_gs = tls.guest_gs_base.get();
-        unsafe {
-            // When XSAVE is enabled, pre-load the full FP/SIMD state (including
-            // AVX upper halves) via xrstor64 before NtContinue. NtContinue will
-            // restore x87/SSE from CONTEXT.FltSave, but the AVX upper halves
-            // (not represented in CONTEXT) will persist from our xrstor.
-            if tls.xsave_enabled.get() != 0 {
-                let mask_lo = tls.xsave_mask_lo.get();
-                let mask_hi = tls.xsave_mask_hi.get();
-                let fp_ptr = ctx.fp_regs.data.as_ptr();
-                core::arch::asm!(
-                    "xrstor64 [{buf}]",
-                    buf = in(reg) fp_ptr,
-                    in("eax") mask_lo,
-                    in("edx") mask_hi,
-                    options(nostack),
-                );
-            }
-            if guest_gs != 0 {
-                core::arch::asm!(
-                    "wrgsbase {gs}",
-                    gs = in(reg) guest_gs,
-                    options(nostack, preserves_flags)
-                );
-            }
-            let status = NtContinue(win_ctx, 0);
-            panic!(
-                "NtContinue failed: {}",
-                std::io::Error::from_raw_os_error(
-                    windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
-                        .reinterpret_as_signed(),
-                ),
-            );
-        }
     }
 
     let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
@@ -2326,19 +2319,19 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
     // Restore fsbase for the guest.
     WindowsUserland::restore_thread_fs_base();
 
-    // The fast path for switching to the guest relies on rcx == rip.This is
-    // the common case, because the syscall instruction sets rcx to rip at entry
-    // to the kernel. When this is not the case, we use NtContinue to jump to
-    // the guest with the full register state.
-    //
-    // This is much slower, but it is only used for things like signal handlers,
-    // so it should not be on the critical path.
-    if ctx.rcx == ctx.rip {
-        tls.is_in_guest.set(true);
-        switch_to_guest_sysret(ctx)
-    } else {
-        switch_to_guest_ntcontinue(tls, ctx)
+    #[cfg(debug_assertions)]
+    {
+        static LAST_RIP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let prev = LAST_RIP.swap(ctx.rip as u64, Ordering::Relaxed);
+        if ctx.rip as u64 != prev {
+            eprintln!(
+                "[switch-guest] rip=0x{:X} rsp=0x{:X} rax=0x{:X} rcx=0x{:X}",
+                ctx.rip, ctx.rsp, ctx.rax, ctx.rcx,
+            );
+        }
     }
+    tls.is_in_guest.set(true);
+    switch_to_guest_sysret(ctx)
 }
 
 fn thread_start(
@@ -2726,22 +2719,14 @@ impl ThreadHandle {
             ..switch_to_guest_end as *const () as usize)
             .contains(&(context.Rip.truncate()))
         {
-            // Case 1: jump to interrupt callback without saving the guest
-            // context, since it's already saved.
+            // Case 1: in the switch-to-guest asm (FP restore, GS swap, or
+            // register pop). The guest context is already saved in the
+            // ExecutionContext, so just redirect to the interrupt callback.
             true
         } else if is_in_ntdll_or_this(context.Rip.truncate()) {
-            // Case 2/3: we can't distinguish between them. For case 2 we don't
-            // need to do anything, but for case 3 we need to update the
-            // NtContinue context to point to the interrupt callback (the guest
-            // context is already up to date).
-            //
-            // In case 2, the NtContinue context is not being used, so it is
-            // safe to update it anyway.
-
-            // SAFETY: `continue_context` is not accessed by user-mode code
-            // while `is_in_guest` is true.
-            let continue_context = unsafe { &mut *target_tls.continue_context.get() };
-            set_context_to_interrupt_callback(target_tls, continue_context);
+            // Case 2: in platform Rust code between is_in_guest=true and
+            // the naked asm entry. The interrupt flag is already set; it
+            // will be checked before the next switch_to_guest call.
             false
         } else {
             // Case 4: save the guest context and jump to interrupt callback.

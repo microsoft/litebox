@@ -161,6 +161,10 @@ pub enum NtSyscallId {
     NtApphelpCacheControl,
     NtSubscribeWnfStateChange,
     NtUnsubscribeWnfStateChange,
+    NtCallbackReturn,
+    NtQueryWnfStateData,
+    NtReadVirtualMemory,
+    NtContinueEx,
 }
 
 /// Mapping from real Windows syscall numbers to `NtSyscallId`.
@@ -284,6 +288,10 @@ impl NtSyscallMap {
             NtSyscallId::NtApphelpCacheControl,
             NtSyscallId::NtSubscribeWnfStateChange,
             NtSyscallId::NtUnsubscribeWnfStateChange,
+            NtSyscallId::NtCallbackReturn,
+            NtSyscallId::NtQueryWnfStateData,
+            NtSyscallId::NtReadVirtualMemory,
+            NtSyscallId::NtContinueEx,
         ];
         let pairs: alloc::vec::Vec<(u32, NtSyscallId)> =
             all.iter().map(|&id| (id as u32, id)).collect();
@@ -389,6 +397,10 @@ pub fn name_to_syscall_id(name: &str) -> Option<NtSyscallId> {
         "NtApphelpCacheControl" => NtSyscallId::NtApphelpCacheControl,
         "NtSubscribeWnfStateChange" => NtSyscallId::NtSubscribeWnfStateChange,
         "NtUnsubscribeWnfStateChange" => NtSyscallId::NtUnsubscribeWnfStateChange,
+        "NtCallbackReturn" => NtSyscallId::NtCallbackReturn,
+        "NtQueryWnfStateData" => NtSyscallId::NtQueryWnfStateData,
+        "NtReadVirtualMemory" => NtSyscallId::NtReadVirtualMemory,
+        "NtContinueEx" => NtSyscallId::NtContinueEx,
         _ => return None,
     };
     Some(id)

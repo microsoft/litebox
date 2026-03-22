@@ -77,6 +77,145 @@ pub struct CliArgs {
 /// user-recoverable conditions.
 #[allow(clippy::items_after_statements)]
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    // Install a last-resort crash handler so we always see what RIP/code
+    // killed the process, even if VEH failed to catch the exception.
+    unsafe {
+        #[repr(C)]
+        struct ExceptionRecord {
+            exception_code: u32,
+            exception_flags: u32,
+            exception_record: usize,
+            exception_address: usize,
+            number_parameters: u32,
+            _pad: u32,
+            exception_information: [usize; 15],
+        }
+        // Windows x64 CONTEXT — use byte array for reliability.
+        #[repr(C)]
+        struct Context {
+            data: [u8; 1232],
+        }
+        #[repr(C)]
+        struct ExceptionPointers {
+            exception_record: *const ExceptionRecord,
+            context_record: *const Context,
+        }
+        unsafe extern "system" fn crash_filter(info: *mut ExceptionPointers) -> i32 {
+            let info = unsafe { &*info };
+            let rec = unsafe { &*info.exception_record };
+            let ctx_bytes = unsafe { &(*info.context_record).data };
+            // Rip at offset 0xF8, Rsp at offset 0x98
+            let rip = u64::from_le_bytes(ctx_bytes[0xF8..0x100].try_into().unwrap_or([0; 8]));
+            let rsp = u64::from_le_bytes(ctx_bytes[0x98..0xA0].try_into().unwrap_or([0; 8]));
+            eprintln!(
+                "[CRASH] Unhandled exception: code=0x{:08X} addr=0x{:X} rip=0x{:X} rsp=0x{:X}",
+                rec.exception_code, rec.exception_address, rip, rsp,
+            );
+            if rec.number_parameters >= 2 {
+                eprintln!(
+                    "[CRASH]   info[0]=0x{:X} info[1]=0x{:X}",
+                    rec.exception_information[0], rec.exception_information[1],
+                );
+            }
+            -1 // EXCEPTION_EXECUTE_HANDLER
+        }
+        unsafe extern "system" {
+            fn SetUnhandledExceptionFilter(
+                filter: Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>,
+            ) -> usize;
+        }
+        SetUnhandledExceptionFilter(Some(crash_filter));
+    }
+
+    // Secondary VEH at HIGHEST priority — catches exceptions BEFORE the main
+    // VEH handler to diagnose cases where the main handler crashes.
+    // Capture stderr handle NOW (while GS = host TEB) so VEH can write
+    // even when GS = guest TEB.
+    unsafe {
+        #[repr(C)]
+        struct ExPtrs2 {
+            exception_record: *const u8,
+            context_record: *const u8,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetStdHandle(n: u32) -> *mut core::ffi::c_void;
+            fn WriteFile(
+                h: *mut core::ffi::c_void,
+                buf: *const u8,
+                len: u32,
+                written: *mut u32,
+                ovl: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+        static mut STDERR_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
+        STDERR_HANDLE = GetStdHandle(0xFFFF_FFF4u32); // STD_ERROR_HANDLE
+        unsafe extern "system" fn early_veh(info: *mut ExPtrs2) -> i32 {
+            // Zero-allocation, GS-independent handler: uses pre-captured handle.
+            let info = unsafe { &*info };
+            let code = unsafe { *(info.exception_record as *const u32) };
+            let ctx = info.context_record;
+            let rip = unsafe { *(ctx.add(0xF8) as *const u64) };
+            // Format into a stack buffer (no heap allocation).
+            let mut buf = [0u8; 128];
+            let len = {
+                let prefix = b"[EARLY-VEH] code=0x";
+                buf[..prefix.len()].copy_from_slice(prefix);
+                let mut pos = prefix.len();
+                pos += hex_u32(&mut buf[pos..], code);
+                let mid = b" rip=0x";
+                buf[pos..pos + mid.len()].copy_from_slice(mid);
+                pos += mid.len();
+                pos += hex_u64(&mut buf[pos..], rip);
+                buf[pos] = b'\n';
+                pos + 1
+            };
+            let mut written = 0u32;
+            WriteFile(
+                STDERR_HANDLE,
+                buf.as_ptr(),
+                len as u32,
+                &mut written,
+                core::ptr::null_mut(),
+            );
+            0 // EXCEPTION_CONTINUE_SEARCH
+        }
+        // Minimal hex formatters (no allocation).
+        fn hex_u32(buf: &mut [u8], v: u32) -> usize {
+            let mut n = 0;
+            for i in (0..8).rev() {
+                let nibble = ((v >> (i * 4)) & 0xF) as u8;
+                buf[n] = if nibble < 10 {
+                    b'0' + nibble
+                } else {
+                    b'A' + nibble - 10
+                };
+                n += 1;
+            }
+            n
+        }
+        fn hex_u64(buf: &mut [u8], v: u64) -> usize {
+            let mut n = 0;
+            for i in (0..16).rev() {
+                let nibble = ((v >> (i * 4)) & 0xF) as u8;
+                buf[n] = if nibble < 10 {
+                    b'0' + nibble
+                } else {
+                    b'A' + nibble - 10
+                };
+                n += 1;
+            }
+            n
+        }
+        unsafe extern "system" {
+            fn AddVectoredExceptionHandler(
+                first: u32,
+                handler: Option<unsafe extern "system" fn(*mut ExPtrs2) -> i32>,
+            ) -> usize;
+        }
+        AddVectoredExceptionHandler(1, Some(early_veh)); // 1 = head (highest priority)
+    }
+
     // The EXE can come from --pe-file, or we look for it inside the tar.
     let pe_data = if let Some(pe_path) = &cli_args.pe_file {
         std::fs::read(pe_path)
@@ -645,7 +784,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let mut ctx = litebox_common_linux::ExecutionContext::default();
 
     // Debug watchdog: after 2 seconds, suspend the thread and dump RIP.
-    #[cfg(debug_assertions)]
+    #[cfg(any())] // disabled — watchdog interferes with guest timing
     let _watchdog = {
         #[link(name = "kernel32")]
         unsafe extern "system" {
@@ -680,9 +819,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let handle_val = real_handle as usize;
         Some(std::thread::spawn(move || {
             let thread_handle = handle_val as *mut core::ffi::c_void;
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            // Sample RIP 5 times at 200ms intervals
-            for sample in 0..5 {
+            // Wait 1 second for init, then sample at 10ms intervals
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            // Sample RIP 20 times at 10ms intervals
+            for sample in 0..20 {
                 unsafe {
                     SuspendThread(thread_handle);
                     let mut ctx_buf = vec![0u8; 1232];
@@ -740,7 +880,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
                     ResumeThread(thread_handle);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             eprintln!("[watchdog] Done sampling");
         }))

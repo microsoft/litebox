@@ -484,6 +484,49 @@ fn map_image_section(
     // Track this image mapping so NtQueryVirtualMemory returns MEM_IMAGE type.
     process_state.track_image_mapping(load_info.image_base, load_info.image_size);
 
+    // ── Neutralise Win32k syscall stubs (win32u.dll / gdi32full.dll) ──
+    //
+    // Only ntdll.dll has its syscall stubs rewritten to go through the
+    // sandbox trampoline.  Other DLLs such as win32u.dll contain stubs
+    // for Win32k system calls (window manager, GDI) that would execute
+    // real `syscall` instructions and reach the host kernel's win32k
+    // driver.  This is both unnecessary (console programs don't use
+    // Win32k) and actively harmful: the host kernel may convert the
+    // thread to a "GUI thread", dispatch user-mode callbacks, or
+    // corrupt sandbox-internal state.
+    //
+    // We detect these stubs by the standard Windows syscall stub
+    // pattern (`mov r10,rcx; mov eax,<nr>; … syscall; ret`) with
+    // syscall numbers ≥ 0x1000 (the Win32k range) and patch each
+    // stub to immediately return STATUS_NOT_IMPLEMENTED (0xC0000002).
+    // This tells the calling DLL (user32, gdi32full, etc.) that
+    // Win32k services are unavailable, letting it fall back to its
+    // "no Win32 subsystem" code path gracefully.
+    patch_win32k_stubs(
+        load_info.image_base,
+        load_info.image_size,
+        &process_state.pm,
+    );
+
+    // ── Neutralise __fastfail (int 0x29) in all loaded DLLs ──
+    //
+    // __fastfail (CD 29) is a software interrupt that bypasses ALL
+    // user-mode exception handlers (VEH, SEH, UEF) and directly
+    // terminates the process.  The ntdll rewriter already patches
+    // ntdll's __fastfail sites.  We must also patch DLLs loaded by
+    // ntdll (kernelbase, kernel32, ucrtbase, etc.) to prevent them
+    // from killing the host process on stack cookie failures, range
+    // check failures, or other __fastfail scenarios.
+    //
+    // Patch: CD 29 → EB 00 (jmp +0, two-byte NOP).  This makes
+    // __fastfail a no-op; the code after it (typically a `ret`)
+    // executes normally.
+    patch_fastfail(
+        load_info.image_base,
+        load_info.image_size,
+        &process_state.pm,
+    );
+
     // Return STATUS_IMAGE_NOT_AT_BASE when the image was loaded at a
     // different address than its preferred base. The loader uses this to
     // decide whether to apply relocations.
@@ -491,6 +534,164 @@ fn map_image_section(
         NtStatus::STATUS_SUCCESS
     } else {
         NtStatus::STATUS_IMAGE_NOT_AT_BASE
+    }
+}
+
+/// Scan a freshly-mapped PE image for Win32k syscall stubs and replace
+/// each one with `mov eax, STATUS_NOT_IMPLEMENTED; ret`.
+///
+/// A Win32k stub has the same layout as an ntdll stub:
+///
+/// ```text
+/// +00: 4C 8B D1              mov  r10, rcx
+/// +03: B8 xx xx xx xx        mov  eax, <syscall_nr>     (nr ≥ 0x1000)
+/// +08: F6 04 25 08 03 FE 7F  test byte [0x7FFE0308], 1
+/// +0F: 01
+/// +10: 75 03                 jne  +3
+/// +12: 0F 05                 syscall
+/// +14: C3                    ret
+/// ```
+///
+/// We overwrite bytes +00..+06 with either:
+///
+/// - `mov eax, 0; ret` (STATUS_SUCCESS) for critical init syscalls that
+///   user32/gdi32 check during DllMain, or
+/// - `mov eax, 0xC0000002; ret` (STATUS_NOT_IMPLEMENTED) for everything else.
+///
+/// The remaining bytes become dead code.
+fn patch_win32k_stubs(
+    image_base: usize,
+    image_size: usize,
+    pm: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
+) {
+    // Walk the mapped image looking for the syscall stub prefix.
+    // The prefix is: 4C 8B D1 B8 xx xx xx xx (8 bytes).
+    // We require syscall_nr >= 0x1000 to only target Win32k stubs.
+    const STUB_LEN: usize = 0x18; // minimum stub size (24 bytes)
+    const PREFIX: [u8; 3] = [0x4C, 0x8B, 0xD1]; // mov r10, rcx
+    const SYSCALL_BYTES: [u8; 2] = [0x0F, 0x05]; // syscall
+
+    // Replacement: mov eax, STATUS_NOT_IMPLEMENTED (0xC0000002); ret
+    const PATCH_NOT_IMPL: [u8; 6] = [0xB8, 0x02, 0x00, 0x00, 0xC0, 0xC3];
+
+    // Win32k syscalls: ALL stubs return STATUS_NOT_IMPLEMENTED.
+    //
+    // Returning STATUS_SUCCESS from init stubs like NtUserProcessConnect
+    // tells user32 that win32k is connected, but we don't set up any
+    // actual connection data (shared info pointer, callback table, etc.).
+    // This causes user32 to dereference NULL pointers during init.
+    //
+    // By returning STATUS_NOT_IMPLEMENTED for everything, user32 knows
+    // there is no win32k connection and should take its headless/degraded
+    // initialization path.  Console programs don't need win32k.
+
+    let end = image_base + image_size;
+    let mut patched = 0u32;
+    let mut pos = image_base;
+
+    while pos + STUB_LEN <= end {
+        // Safety: the image was just mapped, so these addresses are valid.
+        let bytes = unsafe { core::slice::from_raw_parts(pos as *const u8, STUB_LEN) };
+
+        // Check prefix: mov r10, rcx; mov eax, <nr>
+        if bytes[0..3] == PREFIX && bytes[3] == 0xB8 {
+            let nr = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+
+            // Only patch Win32k stubs (syscall numbers >= 0x1000).
+            if nr >= 0x1000 {
+                // Verify the stub contains `syscall` somewhere in the expected range.
+                let has_syscall = (8..STUB_LEN - 1)
+                    .any(|i| bytes[i] == SYSCALL_BYTES[0] && bytes[i + 1] == SYSCALL_BYTES[1]);
+
+                if has_syscall {
+                    // Make the page writable so we can patch.
+                    let page_addr = pos & !(PAGE_SIZE - 1);
+                    use litebox::platform::{RawConstPointer as _, RawPointerProvider};
+                    let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                        page_addr,
+                    );
+                    let _ = unsafe { pm.make_pages_writable(ptr, PAGE_SIZE) };
+
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            PATCH_NOT_IMPL.as_ptr(),
+                            pos as *mut u8,
+                            PATCH_NOT_IMPL.len(),
+                        );
+                    }
+                    patched += 1;
+                    pos += 0x20; // stubs are typically 32-byte aligned
+                    continue;
+                }
+            }
+        }
+
+        pos += 1;
+    }
+
+    if patched > 0 {
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: patched {patched} Win32k stubs at 0x{image_base:X} → NOT_IMPLEMENTED\n",
+            ));
+        }
+        let _ = patched;
+    }
+}
+
+/// Scan a freshly-mapped PE image for `int 0x29` (__fastfail) instructions
+/// and replace each with `jmp +0` (EB 00), a two-byte NOP.
+///
+/// __fastfail bypasses all user-mode exception handlers.  On a real
+/// Windows system the kernel handles int 0x29 and terminates the process.
+/// In the sandbox we don't intercept int 0x29, so it would reach the
+/// host kernel and kill the host process.  Neutralising it lets the
+/// code fall through to whatever comes after (usually a `ret`).
+fn patch_fastfail(
+    image_base: usize,
+    image_size: usize,
+    pm: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
+) {
+    let end = image_base + image_size;
+    let mut patched = 0u32;
+    let mut pos = image_base;
+
+    while pos + 2 <= end {
+        // Safety: the image was just mapped into guest VA.
+        let b0 = unsafe { core::ptr::read(pos as *const u8) };
+        let b1 = unsafe { core::ptr::read((pos + 1) as *const u8) };
+
+        if b0 == 0xCD && b1 == 0x29 {
+            // Make the page writable so we can patch.
+            let page_addr = pos & !(PAGE_SIZE - 1);
+            use litebox::platform::{RawConstPointer as _, RawPointerProvider};
+            let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(page_addr);
+            let _ = unsafe { pm.make_pages_writable(ptr, PAGE_SIZE) };
+
+            // Replace CD 29 (int 0x29) with EB 00 (jmp +0 = NOP).
+            unsafe {
+                core::ptr::write(pos as *mut u8, 0xEB);
+                core::ptr::write((pos + 1) as *mut u8, 0x00);
+            }
+            patched += 1;
+            pos += 2;
+            continue;
+        }
+
+        pos += 1;
+    }
+
+    if patched > 0 {
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: patched {patched} __fastfail sites at 0x{image_base:X}\n",
+            ));
+        }
+        let _ = patched;
     }
 }
 
