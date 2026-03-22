@@ -10,6 +10,7 @@
 //! worker thread to deliver the matching response.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -23,21 +24,21 @@ use super::pending_table::PendingTable;
 use super::transport::{self, Read, Write};
 
 /// Fid generator with thread-safe access
-struct FidGenerator<Platform: RawSyncPrimitivesProvider> {
-    inner: Mutex<Platform, IdPool>,
+struct FidGenerator {
+    inner: spin::Mutex<IdPool>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> Default for FidGenerator<Platform> {
+impl Default for FidGenerator {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> FidGenerator<Platform> {
+impl FidGenerator {
     /// Create a new fid generator
     fn new() -> Self {
         FidGenerator {
-            inner: Mutex::new(IdPool::new()),
+            inner: spin::Mutex::new(IdPool::new()),
         }
     }
 
@@ -81,12 +82,37 @@ pub(super) struct ClientInner {
     pending_table: PendingTable,
     /// Set once the transport has observed an unrecoverable I/O failure.
     poisoned: AtomicBool,
+    /// Reason for poisoning (0=not poisoned, 1=read_error, 2=short_msg, 3=tag_desync, 4=write_error, 5=decode_error)
+    poison_reason: core::sync::atomic::AtomicU8,
     /// When set, `fcall()` reads responses inline instead of relying on a
     /// worker thread. Used by platforms that cannot spawn threads (e.g. SNP).
     inline_reader: spin::Mutex<Option<InlineReaderState>>,
+    /// Fid generator — shared so the worker can free fids for async clunks.
+    fids: FidGenerator,
+    /// Tags for fire-and-forget clunks whose Rclunk has not yet arrived.
+    /// Maps tag → fid so the worker can free the fid when the response comes.
+    pending_clunks: spin::Mutex<BTreeMap<u16, fcall::Fid>>,
 }
 
 impl ClientInner {
+    /// Returns a string describing the poison reason (for diagnostics).
+    pub(super) fn poison_reason_str(&self) -> &'static str {
+        match self.poison_reason.load(Ordering::Relaxed) {
+            0 => "not_poisoned",
+            1 => "read_error",
+            2 => "short_message",
+            3 => "tag_desync",
+            4 => "write_error",
+            5 => "decode_error",
+            _ => "unknown",
+        }
+    }
+
+    /// Returns true if the client is poisoned.
+    pub(super) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Relaxed)
+    }
+
     /// Called by the 9P worker thread in a loop. Reads one response from
     /// the reader and dispatches it to the pending table by tag.
     ///
@@ -97,24 +123,52 @@ impl ClientInner {
         reader: &mut R,
         reader_buf: &mut Vec<u8>,
     ) -> bool {
-        if transport::read_to_buf(reader, reader_buf).is_err() {
-            self.poisoned.store(true, Ordering::Release);
-            return false;
+        match transport::read_to_buf(reader, reader_buf) {
+            Ok(()) => {}
+            Err(super::Error::InvalidResponse) => {
+                self.poison_reason.store(2, Ordering::Relaxed); // short/invalid msg
+                self.poisoned.store(true, Ordering::Release);
+                return false;
+            }
+            Err(_) => {
+                self.poison_reason.store(1, Ordering::Relaxed); // read_error
+                self.poisoned.store(true, Ordering::Release);
+                return false;
+            }
         }
 
-        if reader_buf.len() < 7 {
-            self.poisoned.store(true, Ordering::Release);
-            return false;
-        }
         let tag = u16::from_le_bytes([reader_buf[5], reader_buf[6]]);
 
-        if tag == 0 {
-            // Fire-and-forget clunk response — discard
+        // Check if this is a response for a fire-and-forget clunk.
+        if let Some(fid) = self.pending_clunks.lock().remove(&tag) {
+            // Validate the response before completing (complete() swaps
+            // the buffer). Rclunk and Rlerror both release the fid per the
+            // 9P spec. Any other type is a protocol violation.
+            let valid = match super::fcall::TaggedFcall::decode(reader_buf) {
+                Ok(resp) => matches!(
+                    resp.fcall,
+                    super::fcall::Fcall::Rclunk(_) | super::fcall::Fcall::Rlerror(_)
+                ),
+                Err(_) => false,
+            };
+
+            // Complete the pending-table entry (swaps buffers so reader_buf
+            // is available for the next read), then free the tag and fid.
+            self.pending_table.complete(tag, reader_buf);
+            self.pending_table.free_tag(super::pending_table::Tag(tag));
+            self.fids.free(fid);
+
+            if !valid {
+                self.poison_reason.store(5, Ordering::Relaxed); // decode_error
+                self.poisoned.store(true, Ordering::Release);
+                return false;
+            }
             return true;
         }
 
         if !self.pending_table.complete(tag, reader_buf) {
             // Response for unknown/freed tag — protocol desync
+            self.poison_reason.store(3, Ordering::Relaxed); // tag_desync
             self.poisoned.store(true, Ordering::Release);
             return false;
         }
@@ -144,6 +198,22 @@ impl ClientInner {
     fn has_inline_reader(&self) -> bool {
         self.inline_reader.lock().is_some()
     }
+
+    /// In inline mode, read responses until at least one pending async clunk
+    /// is drained (freeing a tag). Used to break the livelock where all 64
+    /// tags are held by pending clunks and fcall() can't allocate one.
+    fn drain_inline_pending_clunks(&self) {
+        if self.pending_clunks.lock().is_empty() {
+            return;
+        }
+        let mut guard = self.inline_reader.lock();
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        // Read one response — poll_responses will free the tag+fid if it's
+        // an Rclunk for a pending async clunk.
+        self.poll_responses(&mut *state.reader, &mut state.buf);
+    }
 }
 
 /// Pipelined 9P client.
@@ -159,8 +229,6 @@ pub(super) struct Client<Platform: RawSyncPrimitivesProvider, W: Write> {
     write_state: Mutex<Platform, ClientWriteState<W>>,
     /// Shared state visible to the worker thread
     inner: Arc<ClientInner>,
-    /// Fid generator
-    fids: FidGenerator<Platform>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
@@ -226,7 +294,7 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
         };
 
         // --- Attach (synchronous) ---
-        let fids: FidGenerator<Platform> = FidGenerator::new();
+        let fids: FidGenerator = FidGenerator::new();
         let fid = fids.next()?;
         transport::write_message(
             &mut writer,
@@ -277,9 +345,11 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
             inner: Arc::new(ClientInner {
                 pending_table: PendingTable::new(),
                 poisoned: AtomicBool::new(false),
+                poison_reason: core::sync::atomic::AtomicU8::new(0),
                 inline_reader: spin::Mutex::new(None),
+                fids,
+                pending_clunks: spin::Mutex::new(BTreeMap::new()),
             }),
-            fids,
         };
 
         Ok((client, reader, qid, root_fid))
@@ -324,6 +394,12 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
             if self.inner.poisoned.load(Ordering::Acquire) {
                 return Err(Error::Io);
             }
+            // In inline mode (no worker thread), pending async clunks hold
+            // tags that can only be freed by reading their Rclunk responses.
+            // Pump the inline reader to avoid livelock.
+            if self.inner.has_inline_reader() {
+                self.inner.drain_inline_pending_clunks();
+            }
             core::hint::spin_loop();
         };
 
@@ -344,6 +420,7 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
                 },
             ) {
                 self.inner.pending_table.free_tag(tag);
+                self.inner.poison_reason.store(4, Ordering::Relaxed); // write_error
                 self.inner.poisoned.store(true, Ordering::Release);
                 return Err(match e {
                     transport::WriteError::Interrupted => Error::Interrupted,
@@ -373,9 +450,23 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
         };
 
         // 4. Decode response and process
-        let response =
-            fcall::TaggedFcall::decode(&completion).map_err(|_| Error::InvalidResponse)?;
-        f(response.fcall)
+        let response = fcall::TaggedFcall::decode(&completion).map_err(|_| {
+            // A decode failure means the transport delivered a valid-length
+            // message that doesn't parse as a 9P fcall — the protocol is
+            // broken and no further operations are safe.
+            self.inner.poison_reason.store(5, Ordering::Relaxed); // decode_error
+            self.inner.poisoned.store(true, Ordering::Release);
+            Error::InvalidResponse
+        })?;
+        let result = f(response.fcall);
+        if matches!(result, Err(Error::InvalidResponse)) {
+            // The response decoded but was the wrong message type for this
+            // request (e.g. Rwalk arriving for a Tclunk). This is a protocol
+            // violation — poison the client.
+            self.inner.poison_reason.store(5, Ordering::Relaxed); // decode_error
+            self.inner.poisoned.store(true, Ordering::Release);
+        }
+        result
         // completion dropped here → frees tag automatically
     }
 
@@ -398,7 +489,7 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
         if wnames.len() > fcall::MAXWELEM {
             return Err(Error::InvalidPathname);
         }
-        let new_fid = self.fids.next()?;
+        let new_fid = self.inner.fids.next()?;
         let ret = self.fcall(
             Fcall::Twalk(fcall::Twalk {
                 fid,
@@ -412,7 +503,7 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
             },
         );
         if ret.is_err() {
-            self.fids.free(new_fid);
+            self.inner.fids.free(new_fid);
         }
         ret
     }
@@ -713,7 +804,7 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
         )
     }
 
-    /// Clunk (close) a fid
+    /// Clunk (close) a fid synchronously — waits for Rclunk.
     #[allow(dead_code)]
     pub(super) fn clunk(&self, fid: fcall::Fid) -> Result<(), Error> {
         let result = self.fcall(
@@ -724,39 +815,66 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
                 _ => Err(Error::InvalidResponse),
             },
         );
-        self.fids.free(fid);
+        // Always free: Rclunk confirms the server released the fid; Rlerror
+        // also releases per the 9P spec ("even if the clunk returns an error,
+        // the fid is no longer valid"); all other errors poison the client.
+        self.inner.fids.free(fid);
         result
     }
 
-    /// Send a Tclunk without waiting for the Rclunk response.
+    /// Send a Tclunk without blocking for the Rclunk response.
     ///
-    /// Uses tag 0 so the worker thread discards the response without
-    /// looking it up in the pending table. The fid is intentionally NOT
-    /// recycled to the pool because the server may still reference it
-    /// until it processes the Tclunk; with u32 fids and short-lived
-    /// sandboxes this is safe.
+    /// Uses a real tag so the worker thread can match the Rclunk and
+    /// recycle the fid once the server confirms the clunk. This avoids
+    /// both blocking the caller and the race condition that would occur
+    /// if the fid were recycled before the server processes the Tclunk
+    /// (relevant when the broker dispatches requests to multiple workers).
     pub(super) fn clunk_async(&self, fid: fcall::Fid) {
         if self.inner.poisoned.load(Ordering::Acquire) {
+            self.inner.fids.free(fid);
             return;
         }
+
+        // Allocate a real tag for the clunk so we can track it.
+        let Some(tag) = self.inner.pending_table.alloc_tag() else {
+            // All 64 tags are in use — fall back to sync clunk.
+            let _ = self.clunk(fid);
+            return;
+        };
+        let tag_val = tag.get();
+
+        // Register the fid BEFORE sending, so the worker can't process the
+        // Rclunk before we insert the entry.
+        self.inner.pending_clunks.lock().insert(tag_val, fid);
+
         let mut write_state = self.write_state.lock();
         if self.inner.poisoned.load(Ordering::Acquire) {
+            self.inner.pending_clunks.lock().remove(&tag_val);
+            self.inner.pending_table.free_tag(tag);
+            self.inner.fids.free(fid);
             return;
         }
+
         let ClientWriteState { transport, wbuf } = &mut *write_state;
-        if matches!(
-            transport::write_message(
-                transport,
-                wbuf,
-                TaggedFcall {
-                    tag: 0, // fire-and-forget: worker discards tag-0 responses
-                    fcall: Fcall::Tclunk(fcall::Tclunk { fid }),
-                },
-            ),
-            Err(transport::WriteError::Io)
+        if let Err(e) = transport::write_message(
+            transport,
+            wbuf,
+            TaggedFcall {
+                tag: tag_val,
+                fcall: Fcall::Tclunk(fcall::Tclunk { fid }),
+            },
         ) {
-            self.inner.poisoned.store(true, Ordering::Release);
+            self.inner.pending_clunks.lock().remove(&tag_val);
+            self.inner.pending_table.free_tag(tag);
+            self.inner.fids.free(fid);
+            if matches!(e, transport::WriteError::Io) {
+                self.inner.poison_reason.store(4, Ordering::Relaxed);
+                self.inner.poisoned.store(true, Ordering::Release);
+            }
         }
+        // Tag ownership transferred to pending_table + pending_clunks;
+        // the worker thread will free both when Rclunk arrives.
+        // (Tag has no Drop impl, so letting it go out of scope is fine.)
     }
 
     /// Clone a fid (walk with empty path)
@@ -770,7 +888,7 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
     ///
     /// Use this when the fid has already been invalidated (e.g., after remove)
     pub(super) fn free_fid(&self, fid: fcall::Fid) {
-        self.fids.free(fid);
+        self.inner.fids.free(fid);
     }
 
     /// Read the target of a symlink identified by `fid`.
@@ -1012,17 +1130,10 @@ mod tests {
     }
 
     #[test]
-    fn clunk_async_poisoned_write_failure_blocks_future_requests() {
+    fn clunk_async_write_failure_poisons_client() {
         let write_calls = Arc::new(StdMutex::new(0));
 
-        let mut responses = handshake_responses(8192);
-        // No extra responses needed — clunk_async uses tag 0 (fire-and-forget)
-        // and the subsequent fcall will fail before waiting for a response.
-        // Add a tag-0 Rclunk so the reader doesn't immediately EOF:
-        responses.extend(encode_message(TaggedFcall {
-            tag: 0,
-            fcall: Fcall::Rclunk(fcall::Rclunk {}),
-        }));
+        let responses = handshake_responses(8192);
 
         let reader = MockReader {
             reads: Cursor::new(responses),
@@ -1041,9 +1152,10 @@ mod tests {
         assert_eq!(
             *write_calls.lock().unwrap(),
             2,
-            "async clunk should attempt a partial write and then fail"
+            "clunk_async should attempt a partial write and then fail"
         );
 
+        // Subsequent requests should also fail — the client is poisoned.
         let result = client.fcall(
             Fcall::Tclunk(fcall::Tclunk { fid: 8 }),
             |response| match response {

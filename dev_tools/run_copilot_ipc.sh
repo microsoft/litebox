@@ -62,7 +62,7 @@ else
     fi
 
     # Start the broker in the background.
-    "$BROKER" \
+    RUST_LOG="${RUST_LOG:-litebox_broker=warn}" "$BROKER" \
       --root-dir / \
       --rewrite-syscalls \
       --read-only \

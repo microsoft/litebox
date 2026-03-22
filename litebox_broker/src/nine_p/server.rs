@@ -27,7 +27,7 @@ use std::time::SystemTime;
 
 use super::fs_compat::{self, FileExt, MetadataExt, OpenOptionsExt};
 
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use super::fcall::{self, Fcall, FcallStr, TaggedFcall};
 use super::transport::{self, Read, Write};
@@ -368,14 +368,18 @@ impl Server {
                             server.dispatch(request)
                         })) {
                             Ok(response) => response,
-                            Err(_) => {
-                                warn!(tag, "9P worker panicked while handling request");
+                            Err(e) => {
+                                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = e.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                error!(tag, "9P worker panicked: {}", msg);
                                 error_response(libc::EIO as u32)
                             }
                         };
-                        if let Fcall::Rlerror(ref e) = response {
-                            debug!("9P error: errno={}", e.ecode);
-                        }
                         let reply = TaggedFcall {
                             tag,
                             fcall: response,

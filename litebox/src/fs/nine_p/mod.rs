@@ -2385,6 +2385,16 @@ impl WorkerHandle {
     ) -> bool {
         self.inner.poll_responses(reader, reader_buf)
     }
+
+    /// Returns a string describing why the client was poisoned (for diagnostics).
+    pub fn poison_reason_str(&self) -> &'static str {
+        self.inner.poison_reason_str()
+    }
+
+    /// Returns true if the client is poisoned.
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
+    }
 }
 
 crate::fd::enable_fds_for_subsystem! {

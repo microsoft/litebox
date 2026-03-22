@@ -27,7 +27,7 @@ const COMPLETED: u8 = 2;
 
 /// Ownership token for an allocated tag.
 #[derive(Debug)]
-pub(super) struct Tag(u16);
+pub(super) struct Tag(pub(super) u16);
 
 impl Tag {
     pub(super) fn get(&self) -> u16 {

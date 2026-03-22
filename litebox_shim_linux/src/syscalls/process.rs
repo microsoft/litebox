@@ -277,6 +277,13 @@ impl<FS: ShimFS> Task<FS> {
     /// Updates the process exit status for a group exit and signals all threads
     /// to exit.
     pub(crate) fn exit_group(&self, status: ExitStatus) {
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[EXIT] pid={} status={:?}",
+            self.pid,
+            status,
+        );
         let mut inner = self.thread.process.inner.lock();
         if self.is_exiting() {
             return;
@@ -1361,7 +1368,15 @@ impl<FS: ShimFS> Task<FS> {
             .litebox
             .process_registry()
             .create_process(Some(self.process_id), exit_signal)
-            .map_err(|_| Errno::ENOMEM)?;
+            .map_err(|_| {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[FORK] pid={}: create_process failed (ENOMEM)",
+                    self.pid,
+                );
+                Errno::ENOMEM
+            })?;
 
         // 2. Fork address space: allocate a VA partition for the child.
         let parent_as_id = self.process_state.borrow().address_space_id;
@@ -1370,6 +1385,12 @@ impl<FS: ShimFS> Task<FS> {
             .platform
             .fork_address_space(parent_as_id)
             .map_err(|_| {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[FORK] pid={}: fork_address_space failed — no VA partitions left (ENOMEM)",
+                    self.pid,
+                );
                 self.global
                     .litebox
                     .process_registry()
@@ -1383,6 +1404,16 @@ impl<FS: ShimFS> Task<FS> {
         let is_shared = matches!(
             forked,
             litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(_)
+        );
+
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[FORK] pid={} -> child_pid={} as_id={} shared={}",
+            self.pid,
+            child_process_id.0,
+            child_as_id,
+            is_shared,
         );
 
         // 3. Allocate a TID for the child. For the initial thread of a
@@ -2729,6 +2760,14 @@ impl<FS: ShimFS> Task<FS> {
         };
         let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?;
 
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[EXEC-ENTER] pid={} path={:?}",
+            self.pid,
+            path,
+        );
+
         // Copy argv and envp vectors
         let argv_vec = if argv.as_usize() == 0 {
             alloc::vec::Vec::new()
@@ -2759,12 +2798,24 @@ impl<FS: ShimFS> Task<FS> {
         loop {
             let fd = {
                 use litebox::utils::ReinterpretSignedExt as _;
-                self.sys_open(
+                match self.sys_open(
                     path.as_str(),
                     litebox::fs::OFlags::RDONLY,
                     litebox::fs::Mode::empty(),
-                )?
-                .reinterpret_as_signed()
+                ) {
+                    Ok(v) => v.reinterpret_as_signed(),
+                    Err(e) => {
+                        #[cfg(feature = "trace_syscalls")]
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[EXEC-OPEN-FAIL] pid={} path={:?} err={:?}",
+                            self.pid,
+                            path,
+                            e,
+                        );
+                        return Err(e);
+                    }
+                }
             };
             let mut header = [0u8; SHEBANG_MAX_LINE];
             let n = match self.sys_read(fd, &mut header, Some(0)) {
@@ -2798,6 +2849,14 @@ impl<FS: ShimFS> Task<FS> {
                 None => break,
             }
         }
+
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[EXEC] pid={} path={:?}",
+            self.pid,
+            path,
+        );
 
         let loader = crate::loader::elf::ElfLoader::new(self, &path).map_err(Errno::from)?;
 

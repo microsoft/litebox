@@ -481,6 +481,10 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         let _nine_p_worker = litebox_platform_linux_userland::spawn_host_thread(move || {
             let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
             while worker_handle.poll_responses(&mut reader, &mut buf) {}
+            eprintln!(
+                "[9P-WORKER] reader thread exited, reason={}",
+                worker_handle.poison_reason_str()
+            );
         });
 
         let combined = litebox::fs::layered::FileSystem::new(
@@ -550,6 +554,10 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     let _nine_p_worker = litebox_platform_linux_userland::spawn_host_thread(move || {
         let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
         while worker_handle.poll_responses(&mut reader, &mut buf) {}
+        eprintln!(
+            "[9P-WORKER] reader thread exited, reason={}",
+            worker_handle.poison_reason_str()
+        );
     });
 
     let combined = litebox::fs::layered::FileSystem::new(
@@ -608,7 +616,8 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
     }
-    std::process::exit(program.process.wait())
+    let exit_code = program.process.wait();
+    std::process::exit(exit_code)
 }
 
 /// Connect to a network broker via Unix domain socket.
