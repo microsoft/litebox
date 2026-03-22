@@ -418,6 +418,32 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared-memory ring buffer transport wrappers
+// ---------------------------------------------------------------------------
+
+/// Write-half wrapper that adapts a [`RingWriter`](litebox_common_linux::shmem_ring::RingWriter)
+/// to the `litebox` 9P transport [`Write`](litebox::fs::nine_p::transport::Write) trait.
+struct ShmemTransportWriter(litebox_common_linux::shmem_ring::RingWriter);
+
+impl litebox::fs::nine_p::transport::Write for ShmemTransportWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, litebox::fs::nine_p::transport::WriteError> {
+        std::io::Write::write(&mut self.0, buf)
+            .map_err(|_| litebox::fs::nine_p::transport::WriteError::Io)
+    }
+}
+
+/// Read-half wrapper that adapts a [`RingReader`](litebox_common_linux::shmem_ring::RingReader)
+/// to the `litebox` 9P transport [`Read`](litebox::fs::nine_p::transport::Read) trait.
+struct ShmemTransportReader(litebox_common_linux::shmem_ring::RingReader);
+
+impl litebox::fs::nine_p::transport::Read for ShmemTransportReader {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, litebox::fs::nine_p::transport::ReadError> {
+        std::io::Read::read(&mut self.0, buf)
+            .map_err(|_| litebox::fs::nine_p::transport::ReadError::Io)
+    }
+}
+
 /// Finish running with a 9P broker providing the lower file system layer.
 ///
 /// Builds the shim, starts the network worker, connects to the 9P broker,
@@ -434,16 +460,16 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
 
     // In IPC mode, open a dedicated 9P channel that bypasses smoltcp entirely.
+    // Uses shared-memory ring buffers for zero-syscall 9P transport.
     if let Some(broker_path) = &cli_args.network_broker {
-        let channel_fd = connect_nine_p_channel(broker_path)?;
-        platform.set_raw_message_fd(channel_fd);
+        let (ring_writer, ring_reader) = connect_nine_p_channel(broker_path)?;
 
         let shim = shim_builder.build();
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let net_worker = start_network_worker(&shim, &shutdown);
 
-        let transport = shim.message_channel();
-        let (writer, reader) = transport.split();
+        let writer = ShmemTransportWriter(ring_writer);
+        let reader = ShmemTransportReader(ring_reader);
         let litebox = shim.litebox();
         let msize = 4 * 1024 * 1024u32;
         let (nine_p_fs, mut reader) =
@@ -661,20 +687,31 @@ fn connect_to_broker_ipc(path: &str) -> Result<std::os::fd::OwnedFd> {
     Ok(fd)
 }
 
-/// Open a dedicated 9P channel to the broker via Unix domain socket.
+/// Open a dedicated 9P channel to the broker via Unix domain socket and
+/// establish a shared-memory ring buffer transport.
 ///
-/// This is a **blocking** socket — 9P is strictly request-response, so the
-/// transport blocks waiting for each reply.  The broker identifies this
-/// connection by the `LB9P` handshake magic and routes it directly to the
-/// 9P server (bypassing smoltcp).
-fn connect_nine_p_channel(broker_path: &str) -> Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
+/// Connects to the broker, sends the `LB9P` handshake magic, creates a
+/// [`ShmemRingPair`](litebox_common_linux::shmem_ring::ShmemRingPair), and
+/// sends the ring buffer file descriptors to the broker via `SCM_RIGHTS`.
+/// Returns the `(RingWriter, RingReader)` pair for use as the 9P transport.
+///
+/// The Unix socket is only used for the initial handshake and fd passing;
+/// all subsequent 9P I/O flows through the shared-memory ring buffers.
+fn connect_nine_p_channel(
+    broker_path: &str,
+) -> Result<(
+    litebox_common_linux::shmem_ring::RingWriter,
+    litebox_common_linux::shmem_ring::RingReader,
+)> {
+    use std::os::fd::{AsRawFd, FromRawFd};
 
-    // Blocking socket (no SOCK_NONBLOCK).
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    // Blocking socket with CLOEXEC to prevent fd leak across exec.
+    // SAFETY: standard socket() call with valid arguments.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         anyhow::bail!("Failed to create Unix socket for 9P channel");
     }
+    // SAFETY: socket() succeeded, fd is valid.
     let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
 
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -693,9 +730,11 @@ fn connect_nine_p_channel(broker_path: &str) -> Result<std::os::fd::OwnedFd> {
         }
     }
 
+    // SAFETY: `fd` is a valid socket, `addr` is a properly initialised
+    // sockaddr_un with a NUL-terminated path.
     let ret = unsafe {
         libc::connect(
-            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            fd.as_raw_fd(),
             (&raw const addr).cast::<libc::sockaddr>(),
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -704,15 +743,17 @@ fn connect_nine_p_channel(broker_path: &str) -> Result<std::os::fd::OwnedFd> {
         )
     };
     if ret < 0 {
+        // SAFETY: reading thread-local errno immediately after a failed syscall.
         let errno = unsafe { *libc::__errno_location() };
         anyhow::bail!("Failed to connect 9P channel to broker at {broker_path}: errno {errno}");
     }
 
     // Send 9P channel handshake: "LB9P" magic (4 bytes).
     let magic = b"LB9P";
+    // SAFETY: `fd` is a valid connected socket, `magic` points to 4 bytes.
     let ret = unsafe {
         libc::send(
-            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            fd.as_raw_fd(),
             magic.as_ptr().cast::<libc::c_void>(),
             4,
             libc::MSG_NOSIGNAL,
@@ -722,7 +763,121 @@ fn connect_nine_p_channel(broker_path: &str) -> Result<std::os::fd::OwnedFd> {
         anyhow::bail!("Failed to send 9P channel handshake");
     }
 
-    Ok(fd)
+    // Create shared-memory ring buffer pair.
+    let (pair, tx_fd, rx_fd) = litebox_common_linux::shmem_ring::ShmemRingPair::create()
+        .map_err(|e| anyhow!("Failed to create shared-memory ring pair: {e}"))?;
+
+    // Send the two ring-buffer fds to the broker via SCM_RIGHTS.
+    send_ring_fds(&fd, &tx_fd, &rx_fd)?;
+
+    // Wait for a 1-byte ACK from the broker confirming the ring pair was
+    // opened successfully.  This keeps the Unix socket alive long enough for
+    // the broker (which reads with non-blocking I/O in an event loop) to
+    // receive the magic bytes and SCM_RIGHTS message.
+    let mut ack = [0u8; 1];
+    // SAFETY: `fd` is a valid connected socket, `ack` is 1 byte.
+    let ret = unsafe {
+        libc::recv(
+            fd.as_raw_fd(),
+            ack.as_mut_ptr().cast::<libc::c_void>(),
+            1,
+            0, // blocking
+        )
+    };
+    if ret != 1 || ack[0] != b'K' {
+        anyhow::bail!("9P shared-memory handshake: broker did not ACK ring fds");
+    }
+
+    // The Unix socket can now be dropped — all 9P I/O uses the ring buffers.
+    Ok(pair.into_parts())
+}
+
+/// Send two file descriptors over a Unix socket using `SCM_RIGHTS`.
+///
+/// Sends a single dummy byte of regular data (required by `sendmsg`) along
+/// with an ancillary `SCM_RIGHTS` message carrying `fd1` and `fd2`.
+fn send_ring_fds(
+    sock: &std::os::fd::OwnedFd,
+    fd1: &std::os::fd::OwnedFd,
+    fd2: &std::os::fd::OwnedFd,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: CMSG_SPACE with a valid payload size returns the correct
+    // buffer size for the ancillary data.
+    #[allow(clippy::cast_possible_truncation)] // 2 * 4 = 8 always fits u32
+    const CMSG_SPACE: usize = unsafe { libc::CMSG_SPACE((2 * size_of::<i32>()) as u32) as usize };
+
+    // Guarantees the control-message buffer is aligned for `cmsghdr`.
+    // `CMSG_FIRSTHDR` returns a `*mut cmsghdr` pointing into this buffer,
+    // so it must satisfy `cmsghdr`'s alignment requirement.
+    #[repr(C)]
+    union CmsgBuf {
+        _align: libc::cmsghdr,
+        buf: [u8; CMSG_SPACE],
+    }
+
+    let dummy = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: dummy.as_ptr().cast_mut().cast(),
+        iov_len: 1,
+    };
+
+    let fds = [fd1.as_raw_fd(), fd2.as_raw_fd()];
+
+    let mut cmsg_buf = CmsgBuf {
+        buf: [0u8; CMSG_SPACE],
+    };
+
+    // SAFETY: zeroing msghdr is safe; all-zero is a valid representation.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    // SAFETY: accessing the `buf` field of a zero-initialised union is safe.
+    msg.msg_control = unsafe { cmsg_buf.buf.as_mut_ptr().cast() };
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        msg.msg_controllen = CMSG_SPACE as _;
+    }
+
+    // Fill the cmsghdr with SCM_RIGHTS and the two fds.
+    // SAFETY: `msg` has a properly sized and aligned control buffer.
+    // `CMSG_FIRSTHDR` points into that buffer when ancillary data fits;
+    // guard against the documented null return before dereferencing it.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+        if cmsg.is_null() {
+            anyhow::bail!("Failed to build SCM_RIGHTS control message");
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        #[allow(clippy::cast_possible_truncation)] // 2 * 4 = 8 always fits u32
+        {
+            (*cmsg).cmsg_len = libc::CMSG_LEN((2 * size_of::<i32>()) as u32) as _;
+        }
+        // SAFETY: CMSG_DATA returns a pointer to the data area of the cmsghdr,
+        // which has room for 2 i32 values. We copy as raw bytes to avoid
+        // alignment requirements on the destination pointer.
+        std::ptr::copy_nonoverlapping(
+            fds.as_ptr().cast::<u8>(),
+            libc::CMSG_DATA(cmsg),
+            2 * size_of::<i32>(),
+        );
+    }
+
+    // SAFETY: `sock` is a valid connected Unix socket, `msg` is fully
+    // initialised with valid iov and control-message buffers.
+    let ret = unsafe { libc::sendmsg(sock.as_raw_fd(), &raw const msg, libc::MSG_NOSIGNAL) };
+    if ret < 0 {
+        // SAFETY: reading thread-local errno immediately after a failed syscall.
+        let errno = unsafe { *libc::__errno_location() };
+        anyhow::bail!("Failed to send ring fds via SCM_RIGHTS: errno {errno}");
+    }
+    if ret != 1 {
+        anyhow::bail!("Incomplete SCM_RIGHTS sendmsg: expected 1 byte sent, got {ret}");
+    }
+
+    Ok(())
 }
 
 /// IPC handshake constants.

@@ -106,10 +106,32 @@ impl IpcStream {
     /// Returns bytes peeked, or `Err` on failure.  On would-block the
     /// returned byte count is 0.
     pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let normalize = |result: io::Result<usize>| match result {
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(0),
+            other => other,
+        };
         match self {
-            Self::Tcp(s) => s.peek(buf),
+            Self::Tcp(s) => normalize(s.peek(buf)),
             #[cfg(unix)]
-            Self::Unix(s) => s.peek(buf),
+            Self::Unix(s) => {
+                use std::os::unix::io::AsRawFd;
+                // SAFETY: `s` is a valid open Unix socket, and `buf` points to
+                // `buf.len()` bytes of writable memory. `MSG_PEEK` reads data
+                // without consuming it.
+                let ret = unsafe {
+                    libc::recv(
+                        s.as_raw_fd(),
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                        libc::MSG_PEEK,
+                    )
+                };
+                normalize(if ret < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(ret as usize)
+                })
+            }
         }
     }
 }

@@ -84,20 +84,49 @@ fn build_local_services(cli: &Cli) -> Option<litebox_broker::net_proxy::LocalSer
     let rewrite_syscalls = cli.rewrite_syscalls;
 
     let mut registry = litebox_broker::net_proxy::LocalServiceRegistry::new();
-    registry.register(
-        5640,
-        Box::new(move |stream| {
-            let root = root.clone();
-            let policy = Arc::clone(&policy);
-            std::thread::spawn(move || {
-                let mut stream = stream;
-                let mut server =
-                    litebox_broker::nine_p::server::Server::new(root, policy, rewrite_syscalls);
-                server.serve(&mut stream);
-                info!("9P local service session ended");
-            })
-        }),
-    );
+
+    // Register TCP spawner for smoltcp bridge connections.
+    {
+        let root = root.clone();
+        let policy = Arc::clone(&policy);
+        registry.register(
+            5640,
+            Box::new(move |stream| {
+                let root = root.clone();
+                let policy = Arc::clone(&policy);
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut server =
+                        litebox_broker::nine_p::server::Server::new(root, policy, rewrite_syscalls);
+                    server.serve(&mut stream);
+                    info!("9P local service session ended");
+                })
+            }),
+        );
+    }
+
+    // Register shared-memory ring spawner for direct IPC connections (Unix only).
+    #[cfg(unix)]
+    {
+        let root = root.clone();
+        let policy = Arc::clone(&policy);
+        registry.register_ring(
+            5640,
+            Box::new(move |writer, reader| {
+                let root = root.clone();
+                let policy = Arc::clone(&policy);
+                std::thread::spawn(move || {
+                    let mut transport =
+                        litebox_broker::nine_p::transport::RingTransport { writer, reader };
+                    let mut server =
+                        litebox_broker::nine_p::server::Server::new(root, policy, rewrite_syscalls);
+                    server.serve(&mut transport);
+                    info!("9P local service session ended (shared memory)");
+                })
+            }),
+        );
+    }
+
     info!("registered 9P file service on local port 5640");
     Some(registry)
 }

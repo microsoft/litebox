@@ -119,6 +119,158 @@ struct UdpFlow {
 }
 
 // ---------------------------------------------------------------------------
+// SCM_RIGHTS fd receiving (Unix only)
+// ---------------------------------------------------------------------------
+
+/// Receive two file descriptors from an IPC stream via `SCM_RIGHTS`.
+///
+/// The runner sends the shared-memory ring buffer fds immediately after the
+/// `LB9P` magic bytes. This function performs a blocking `recvmsg` to receive
+/// a single dummy byte plus the ancillary `SCM_RIGHTS` message carrying two
+/// file descriptors (tx_fd, rx_fd from the creator's perspective).
+#[cfg(unix)]
+fn recv_ring_fds(
+    stream: &IpcStream,
+) -> Result<(std::os::unix::io::OwnedFd, std::os::unix::io::OwnedFd), std::io::Error> {
+    use std::os::unix::io::FromRawFd;
+
+    // Control message buffer: large enough for SCM_RIGHTS with 2 fds.
+    // Use a union to guarantee the buffer is aligned for `cmsghdr`.
+    // `CMSG_FIRSTHDR` / `CMSG_NXTHDR` return `*mut cmsghdr` pointing into
+    // this buffer, so it must satisfy `cmsghdr`'s alignment requirement.
+    #[allow(clippy::cast_possible_truncation)] // 2 * 4 = 8 always fits u32
+    const CMSG_SPACE: usize = unsafe { libc::CMSG_SPACE((2 * size_of::<i32>()) as u32) as usize };
+    #[repr(C)]
+    union CmsgBuf {
+        _align: libc::cmsghdr,
+        buf: [u8; CMSG_SPACE],
+    }
+
+    let raw_fd = stream.raw();
+
+    // Make the socket blocking with a receive timeout for the fd-receive step.
+    // A timeout prevents this recvmsg from blocking the event loop indefinitely
+    // if the runner stalls after sending the marker byte.
+    // SAFETY: `raw_fd` is a valid open file descriptor.
+    unsafe {
+        let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(raw_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+        let timeout = libc::timeval {
+            tv_sec: 2,
+            tv_usec: 0,
+        };
+        libc::setsockopt(
+            raw_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw const timeout).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+
+    // Buffer for the dummy data byte.
+    let mut dummy = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: dummy.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+
+    let mut cmsg_buf = CmsgBuf {
+        buf: [0u8; CMSG_SPACE],
+    };
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    // SAFETY: accessing the `buf` field of a zero-initialised union is safe.
+    msg.msg_control = unsafe { cmsg_buf.buf.as_mut_ptr().cast() };
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        msg.msg_controllen = CMSG_SPACE as _;
+    }
+
+    // SAFETY: `raw_fd` is a valid socket, `msg` points to properly initialised
+    // buffers, and the control-message buffer is large enough for 2 fds.
+    let n = unsafe { libc::recvmsg(raw_fd, &raw mut msg, libc::MSG_CMSG_CLOEXEC) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed before ring fds received",
+        ));
+    }
+    if n != 1 || dummy[0] != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected LB9P transport marker",
+        ));
+    }
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SCM_RIGHTS control data was truncated",
+        ));
+    }
+
+    // Walk the control messages looking for SCM_RIGHTS.
+    // SAFETY: `msg` was filled by a successful `recvmsg`; iterating with
+    // `CMSG_FIRSTHDR`/`CMSG_NXTHDR` is the standard way to walk ancillary
+    // data.
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const msg) };
+    while !cmsg.is_null() {
+        // SAFETY: `cmsg` is a valid pointer returned by CMSG_FIRSTHDR/CMSG_NXTHDR.
+        let hdr = unsafe { &*cmsg };
+        if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_RIGHTS {
+            // SAFETY: the kernel placed the fd array right after the cmsghdr.
+            let data_ptr = unsafe { libc::CMSG_DATA(cmsg) };
+            let header_len = unsafe { libc::CMSG_LEN(0) } as usize;
+            if (hdr.cmsg_len as usize) < header_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed SCM_RIGHTS message",
+                ));
+            }
+            let fd_count = ((hdr.cmsg_len as usize) - header_len) / size_of::<i32>();
+            if fd_count != 2 {
+                for i in 0..fd_count {
+                    // SAFETY: `data_ptr` points to `fd_count` consecutive `i32`
+                    // values written by the kernel for this SCM_RIGHTS message.
+                    let leaked_fd =
+                        unsafe { std::ptr::read_unaligned(data_ptr.cast::<i32>().add(i)) };
+                    // SAFETY: these fds were opened in this process by recvmsg;
+                    // close any unexpected extras before returning an error.
+                    unsafe {
+                        libc::close(leaked_fd);
+                    }
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("expected exactly 2 fds in SCM_RIGHTS, got {fd_count}"),
+                ));
+            }
+            // SAFETY: `data_ptr` points to at least 2 consecutive `i32` values
+            // written by the kernel.
+            let tx_raw = unsafe { std::ptr::read_unaligned(data_ptr.cast::<i32>()) };
+            let rx_raw = unsafe { std::ptr::read_unaligned(data_ptr.cast::<i32>().add(1)) };
+            // SAFETY: these are valid open fds received via SCM_RIGHTS.
+            let tx_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(tx_raw) };
+            let rx_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(rx_raw) };
+            return Ok((tx_fd, rx_fd));
+        }
+        cmsg = unsafe { libc::CMSG_NXTHDR(&raw const msg, cmsg) };
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "no SCM_RIGHTS message received with ring fds",
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Local service registry — broker-internal services on BROKER_IP
 // ---------------------------------------------------------------------------
 
@@ -129,13 +281,33 @@ struct UdpFlow {
 pub type ServiceSpawner =
     Box<dyn Fn(std::net::TcpStream) -> std::thread::JoinHandle<()> + Send + Sync>;
 
+/// Factory that spawns a service handler on a shared-memory ring buffer pair.
+///
+/// Used for direct IPC connections (LB9P handshake) where the runner sends
+/// shared-memory file descriptors via `SCM_RIGHTS`. The handler runs in a
+/// separate thread.
+#[cfg(unix)]
+pub type RingServiceSpawner = Box<
+    dyn Fn(
+            litebox_common_linux::shmem_ring::RingWriter,
+            litebox_common_linux::shmem_ring::RingReader,
+        ) -> std::thread::JoinHandle<()>
+        + Send
+        + Sync,
+>;
+
 /// Registry of broker-internal services keyed by TCP port.
 ///
 /// When a guest connects to `BROKER_IP:<port>`, the proxy looks up this
 /// registry. If a service is registered, the connection is handled
 /// in-process via a loopback TCP pair instead of opening a host TCP socket.
+///
+/// On Unix, services may also be registered with a ring spawner for direct
+/// shared-memory IPC via the `LB9P` handshake path.
 pub struct LocalServiceRegistry {
     services: HashMap<u16, ServiceSpawner>,
+    #[cfg(unix)]
+    ring_services: HashMap<u16, RingServiceSpawner>,
 }
 
 impl Default for LocalServiceRegistry {
@@ -148,6 +320,8 @@ impl LocalServiceRegistry {
     pub fn new() -> Self {
         Self {
             services: HashMap::new(),
+            #[cfg(unix)]
+            ring_services: HashMap::new(),
         }
     }
 
@@ -158,8 +332,23 @@ impl LocalServiceRegistry {
         self.services.insert(port, spawner);
     }
 
+    /// Register a shared-memory ring spawner for the given port.
+    ///
+    /// When a direct IPC connection (LB9P) arrives, the proxy receives
+    /// shared-memory fds via `SCM_RIGHTS` and calls this spawner with the
+    /// resulting ring writer/reader pair.
+    #[cfg(unix)]
+    pub fn register_ring(&mut self, port: u16, spawner: RingServiceSpawner) {
+        self.ring_services.insert(port, spawner);
+    }
+
     fn get(&self, port: u16) -> Option<&ServiceSpawner> {
         self.services.get(&port)
+    }
+
+    #[cfg(unix)]
+    fn get_ring(&self, port: u16) -> Option<&RingServiceSpawner> {
+        self.ring_services.get(&port)
     }
 }
 
@@ -522,20 +711,26 @@ pub fn run(
                 );
                 return false;
             }
-            let n = sock_compat::recv_nb(ph.raw_socket, &mut ph.magic[ph.got..], 0);
-            if n > 0 {
-                #[allow(clippy::cast_sign_loss)]
-                {
-                    ph.got += n as usize;
-                }
-            } else if n == 0 {
-                debug!("accepted connection closed during handshake, dropping");
-                return false;
-            } else {
-                let err = sock_compat::last_socket_error();
-                if !sock_compat::is_would_block(err) {
-                    debug!("accepted connection handshake read failed: {err}");
+            // Only read more bytes if we haven't received all 4 magic bytes yet.
+            if ph.got < 4 {
+                let n = sock_compat::recv_nb(ph.raw_socket, &mut ph.magic[ph.got..], 0);
+                if n > 0 {
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        ph.got += n as usize;
+                    }
+                } else if n == 0 {
+                    debug!(
+                        "accepted connection closed during handshake (got {}/4 bytes), dropping",
+                        ph.got
+                    );
                     return false;
+                } else {
+                    let err = sock_compat::last_socket_error();
+                    if !sock_compat::is_would_block(err) {
+                        debug!("accepted connection handshake read failed: {err}");
+                        return false;
+                    }
                 }
             }
 
@@ -545,14 +740,67 @@ pub fn run(
 
             // Got all 4 bytes — check magic.
             if &ph.magic == b"LB9P" {
-                if let Some(spawner) = local_services.get(5640) {
-                    if let Some(stream) = ph.stream.take() {
+                #[cfg(unix)]
+                {
+                    if local_services.get_ring(5640).is_some() {
+                        let mut marker = [0u8; 1];
+                        let Some(stream) = ph.stream.as_ref() else {
+                            return false;
+                        };
+                        match stream.peek(&mut marker) {
+                            Ok(0) => return true,
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("failed to classify LB9P transport: {e}");
+                                return false;
+                            }
+                        }
+
+                        if marker[0] == 0 {
+                            let Some(mut stream) = ph.stream.take() else {
+                                return false;
+                            };
+                            let Some(ring_spawner) = local_services.get_ring(5640) else {
+                                warn!("LB9P ring marker received but no ring service registered");
+                                return false;
+                            };
+                            match recv_ring_fds(&stream) {
+                                Ok((tx_fd, rx_fd)) => {
+                                    match litebox_common_linux::shmem_ring::ShmemRingPair::open(
+                                        tx_fd, rx_fd,
+                                    ) {
+                                        Ok((writer, reader)) => {
+                                            // Send 1-byte ACK to runner so it
+                                            // knows the ring pair is open and
+                                            // can safely drop the Unix socket.
+                                            stream.set_nonblocking(false).ok();
+                                            use std::io::Write as _;
+                                            let _ = stream.write_all(&[b'K']);
+                                            ring_spawner(writer, reader);
+                                            info!("direct 9P channel connected (shared memory)");
+                                        }
+                                        Err(e) => {
+                                            warn!("failed to open ring pair: {e}");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("failed to receive ring fds: {e}");
+                                }
+                            }
+                            return false;
+                        }
+                    }
+                }
+
+                if let Some(stream) = ph.stream.take() {
+                    if let Some(spawner) = local_services.get(5640) {
                         let stream = sock_compat::into_blocking_tcp_stream(stream);
                         spawner(stream);
                         info!("direct 9P channel connected");
+                    } else {
+                        warn!("LB9P connection but no 9P service registered");
                     }
-                } else {
-                    warn!("LB9P connection but no 9P service registered");
                 }
             } else {
                 debug!("accepted connection with unknown handshake magic, dropping");

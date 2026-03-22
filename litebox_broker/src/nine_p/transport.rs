@@ -128,3 +128,35 @@ impl Write for std::os::unix::net::UnixStream {
         std::io::Write::write(self, buf).map_err(|_| WriteError)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared-memory ring transport (Unix only)
+// ---------------------------------------------------------------------------
+
+/// Bidirectional shared-memory ring transport for 9P.
+///
+/// Wraps a [`RingWriter`](litebox_common_linux::shmem_ring::RingWriter) and
+/// [`RingReader`](litebox_common_linux::shmem_ring::RingReader) pair into a
+/// single type that implements both [`Read`] and [`Write`], suitable for
+/// passing to [`Server::serve`](super::server::Server::serve).
+#[cfg(unix)]
+pub struct RingTransport {
+    /// Write half — sends data to the remote process.
+    pub writer: litebox_common_linux::shmem_ring::RingWriter,
+    /// Read half — receives data from the remote process.
+    pub reader: litebox_common_linux::shmem_ring::RingReader,
+}
+
+#[cfg(unix)]
+impl Read for RingTransport {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
+        std::io::Read::read(&mut self.reader, buf).map_err(|_| ReadError)
+    }
+}
+
+#[cfg(unix)]
+impl Write for RingTransport {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError> {
+        std::io::Write::write(&mut self.writer, buf).map_err(|_| WriteError)
+    }
+}
