@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
 use super::fs_compat::{self, FileExt, MetadataExt, OpenOptionsExt};
@@ -65,18 +66,23 @@ pub struct Server {
     root: PathBuf,
     /// Policy engine for access control.
     policy: Arc<dyn Policy>,
-    /// FID → state mapping for this connection.
-    fids: HashMap<u32, FidState>,
-    /// Negotiated maximum message size.
-    msize: u32,
+    /// FID → state mapping for this connection (two-level locking for interior mutability).
+    fids: RwLock<HashMap<u32, Arc<RwLock<FidState>>>>,
+    /// Negotiated maximum message size (set once during version negotiation).
+    msize: AtomicU32,
     /// Whether to rewrite syscall instructions in ELF files.
     rewrite_syscalls: bool,
     /// Cache of patched ELF data, keyed by canonical path.
     /// Stores `(mtime_secs, patched_data)` to invalidate when the file changes.
-    elf_cache: HashMap<PathBuf, (i64, Arc<Vec<u8>>)>,
+    elf_cache: Mutex<HashMap<PathBuf, (i64, Arc<Vec<u8>>)>>,
 }
 
 impl Server {
+    fn get_fid(&self, fid: u32) -> Result<Arc<RwLock<FidState>>, u32> {
+        let fids = read_lock(&self.fids, "fids");
+        fids.get(&fid).cloned().ok_or(libc::EBADF as u32)
+    }
+
     /// Create a new 9P server.
     ///
     /// # Arguments
@@ -87,10 +93,10 @@ impl Server {
         Self {
             root,
             policy,
-            fids: HashMap::new(),
-            msize: 4 * 1024 * 1024,
+            fids: RwLock::new(HashMap::new()),
+            msize: AtomicU32::new(0),
             rewrite_syscalls,
-            elf_cache: HashMap::new(),
+            elf_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -136,9 +142,10 @@ impl Server {
     /// Run the server loop, reading requests and sending responses.
     ///
     /// Returns when the connection is closed or an unrecoverable I/O error occurs.
-    pub fn serve<T: Read + Write>(&mut self, transport: &mut T) {
-        let mut rbuf = Vec::with_capacity(self.msize as usize);
-        let mut wbuf = Vec::with_capacity(self.msize as usize);
+    pub fn serve<T: Read + Write>(&self, transport: &mut T) {
+        let initial_capacity = self.msize.load(Ordering::Acquire) as usize;
+        let mut rbuf = Vec::with_capacity(initial_capacity);
+        let mut wbuf = Vec::with_capacity(initial_capacity);
 
         // Before version negotiation we don't know the client's msize yet.
         // Use a safe upper bound (1 MiB) for the very first message.
@@ -166,7 +173,7 @@ impl Server {
             }
 
             // After version negotiation, enforce the negotiated msize
-            current_max = self.msize;
+            current_max = self.msize.load(Ordering::Acquire);
 
             // Decode and convert to owned request (releases borrow on rbuf)
             let (tag, request) = match TaggedFcall::decode(&rbuf) {
@@ -234,7 +241,7 @@ impl Server {
     }
 
     /// Dispatch a single 9P request to the appropriate handler.
-    fn dispatch<'a>(&mut self, request: OwnedRequest) -> Fcall<'a> {
+    fn dispatch<'a>(&self, request: OwnedRequest) -> Fcall<'a> {
         match request {
             OwnedRequest::Version { msize, version } => self.handle_version(msize, version),
             OwnedRequest::Attach { fid, aname } => self.handle_attach(fid, aname),
@@ -294,27 +301,31 @@ impl Server {
     // Version & attach
     // ========================================================================
 
-    fn handle_version<'a>(&mut self, msize: u32, version: Vec<u8>) -> Fcall<'a> {
+    fn handle_version<'a>(&self, msize: u32, version: Vec<u8>) -> Fcall<'a> {
         if version != b"9P2000.L" {
             return error_response(libc::ENOTSUP as u32);
         }
 
         // Negotiate msize: use the smaller of client's and our max
         let max_msize = 4 * 1024 * 1024;
-        self.msize = msize.min(max_msize);
+        let negotiated = msize.min(max_msize);
+        self.msize.store(negotiated, Ordering::Release);
 
         Fcall::Rversion(fcall::Rversion {
-            msize: self.msize,
+            msize: negotiated,
             version: Cow::Owned(b"9P2000.L".to_vec()),
         })
     }
 
-    fn handle_attach<'a>(&mut self, fid: u32, aname: String) -> Fcall<'a> {
-        if self.fids.contains_key(&fid) {
-            return error_response(libc::EEXIST as u32);
-        }
-        if self.fids.len() >= MAX_FIDS {
-            return error_response(libc::ENOMEM as u32);
+    fn handle_attach<'a>(&self, fid: u32, aname: String) -> Fcall<'a> {
+        {
+            let fids = read_lock(&self.fids, "fids");
+            if fids.contains_key(&fid) {
+                return error_response(libc::EEXIST as u32);
+            }
+            if fids.len() >= MAX_FIDS {
+                return error_response(libc::ENOMEM as u32);
+            }
         }
 
         // Resolve the attach path relative to root, preventing traversal attacks
@@ -334,9 +345,16 @@ impl Server {
             Err(errno) => return error_response(errno),
         };
 
-        self.fids.insert(
+        let mut fids = write_lock(&self.fids, "fids");
+        if fids.contains_key(&fid) {
+            return error_response(libc::EEXIST as u32);
+        }
+        if fids.len() >= MAX_FIDS {
+            return error_response(libc::ENOMEM as u32);
+        }
+        fids.insert(
             fid,
-            FidState {
+            Arc::new(RwLock::new(FidState {
                 path,
                 readlink_path: None,
                 file: None,
@@ -345,7 +363,7 @@ impl Server {
                 qid,
                 is_open: false,
                 is_canonical: true,
-            },
+            })),
         );
 
         Fcall::Rattach(fcall::Rattach { qid })
@@ -355,32 +373,52 @@ impl Server {
     // Walk
     // ========================================================================
 
-    fn handle_walk<'a>(&mut self, fid: u32, new_fid: u32, wnames: Vec<Vec<u8>>) -> Fcall<'a> {
-        let src_fid = match self.fids.get(&fid) {
-            Some(f) => f,
-            None => return error_response(libc::EBADF as u32),
+    fn handle_walk<'a>(&self, fid: u32, new_fid: u32, wnames: Vec<Vec<u8>>) -> Fcall<'a> {
+        // Phase 1: Read source fid data, validate fid constraints
+        let (src_path, src_qid, src_is_canonical, src_readlink_path) = {
+            let fids = read_lock(&self.fids, "fids");
+            let fid_arc = match fids.get(&fid) {
+                Some(arc) => Arc::clone(arc),
+                None => return error_response(libc::EBADF as u32),
+            };
+
+            if fids.contains_key(&new_fid) && fid != new_fid {
+                return error_response(libc::EEXIST as u32);
+            }
+            if fids.len() >= MAX_FIDS && !fids.contains_key(&new_fid) {
+                return error_response(libc::ENOMEM as u32);
+            }
+            drop(fids);
+
+            let state = read_lock(&fid_arc, "fid");
+            (
+                state.path.clone(),
+                state.qid,
+                state.is_canonical,
+                state.readlink_path.clone(),
+            )
         };
 
-        if self.fids.contains_key(&new_fid) && fid != new_fid {
-            return error_response(libc::EEXIST as u32);
-        }
-        if self.fids.len() >= MAX_FIDS && !self.fids.contains_key(&new_fid) {
-            return error_response(libc::ENOMEM as u32);
-        }
-
-        let mut current_path = src_fid.path.clone();
+        let mut current_path = src_path;
         let mut wqids = Vec::new();
         let mut readlink_path = None;
 
         // Empty walk = clone the fid
         if wnames.is_empty() {
-            let qid = src_fid.qid;
-            let is_canonical = src_fid.is_canonical;
-            let readlink_path = src_fid.readlink_path.clone();
+            let qid = src_qid;
+            let is_canonical = src_is_canonical;
+            let readlink_path = src_readlink_path;
             if fid != new_fid {
-                self.fids.insert(
+                let mut fids = write_lock(&self.fids, "fids");
+                if fids.contains_key(&new_fid) {
+                    return error_response(libc::EEXIST as u32);
+                }
+                if fids.len() >= MAX_FIDS {
+                    return error_response(libc::ENOMEM as u32);
+                }
+                fids.insert(
                     new_fid,
-                    FidState {
+                    Arc::new(RwLock::new(FidState {
                         path: current_path,
                         readlink_path,
                         file: None,
@@ -389,12 +427,13 @@ impl Server {
                         qid,
                         is_open: false,
                         is_canonical,
-                    },
+                    })),
                 );
             }
             return Fcall::Rwalk(fcall::Rwalk { wqids });
         }
 
+        // Phase 2: Walk I/O — no locks held
         // Component-by-component walk with containment check.
         // Symlinks are resolved transparently: we canonicalize after each
         // step so the stored path always points at the real location.
@@ -459,24 +498,36 @@ impl Server {
             return error_response(libc::ENOENT as u32);
         }
 
-        // Only update FID if ALL components were walked
+        // Phase 3: Write result — only update FID if ALL components were walked
         if wqids.len() == wnames.len() {
             let qid = *wqids.last().unwrap();
             if fid == new_fid {
                 // In-place update
-                if let Some(state) = self.fids.get_mut(&fid) {
+                let fids = read_lock(&self.fids, "fids");
+                if let Some(fid_arc) = fids.get(&fid) {
+                    let fid_arc = Arc::clone(fid_arc);
+                    drop(fids);
+                    let mut state = write_lock(&fid_arc, "fid");
                     state.path = current_path;
                     state.readlink_path = readlink_path;
                     state.qid = qid;
                     state.file = None;
                     state.patched_data = None;
+                    state.patched_offset = 0;
                     state.is_open = false;
                     state.is_canonical = true;
                 }
             } else {
-                self.fids.insert(
+                let mut fids = write_lock(&self.fids, "fids");
+                if fids.contains_key(&new_fid) {
+                    return error_response(libc::EEXIST as u32);
+                }
+                if fids.len() >= MAX_FIDS {
+                    return error_response(libc::ENOMEM as u32);
+                }
+                fids.insert(
                     new_fid,
-                    FidState {
+                    Arc::new(RwLock::new(FidState {
                         path: current_path,
                         readlink_path,
                         file: None,
@@ -485,7 +536,7 @@ impl Server {
                         qid,
                         is_open: false,
                         is_canonical: true,
-                    },
+                    })),
                 );
             }
         }
@@ -497,11 +548,16 @@ impl Server {
     // Open / Create
     // ========================================================================
 
-    fn handle_lopen<'a>(&mut self, req: fcall::Tlopen) -> Fcall<'a> {
-        // Extract what we need from fid state with an immutable borrow first
-        let (is_open, path, is_canonical) = match self.fids.get(&req.fid) {
-            Some(s) => (s.is_open, s.path.clone(), s.is_canonical),
-            None => return error_response(libc::EBADF as u32),
+    fn handle_lopen<'a>(&self, req: fcall::Tlopen) -> Fcall<'a> {
+        // Phase 1: Get fid Arc and extract state
+        let fid_arc = match self.get_fid(req.fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
+        };
+
+        let (is_open, path, is_canonical) = {
+            let state = read_lock(&fid_arc, "fid");
+            (state.is_open, state.path.clone(), state.is_canonical)
         };
 
         trace!(
@@ -515,6 +571,7 @@ impl Server {
             return error_response(libc::EIO as u32);
         }
 
+        // Phase 2: I/O — no fid locks held
         // If the path was already canonicalized by walk, skip the
         // expensive re-canonicalization and just verify containment.
         // Otherwise, resolve symlinks before opening.
@@ -547,13 +604,13 @@ impl Server {
                 };
                 let qid = metadata_to_qid(&meta);
 
-                // Try ELF patching for read-only opens (no conflicting borrow now)
+                // Try ELF patching for read-only opens
                 let is_read_only =
                     !flags.intersects(fcall::LOpenFlags::O_WRONLY | fcall::LOpenFlags::O_RDWR);
-                let patched = self.try_patch_elf(&mut file, &path, is_read_only);
+                let patched = self.try_patch_elf(&mut file, &resolved, is_read_only);
 
-                // Now get mutable access to update the state
-                let state = self.fids.get_mut(&req.fid).unwrap();
+                // Phase 3: Update fid state via inner write lock
+                let mut state = write_lock(&fid_arc, "fid");
                 state.file = Some(file);
                 state.patched_data = patched;
                 state.patched_offset = 0;
@@ -561,9 +618,10 @@ impl Server {
                 state.is_open = true;
                 state.readlink_path = None;
 
+                let msize = self.msize.load(Ordering::Acquire);
                 Fcall::Rlopen(fcall::Rlopen {
                     qid,
-                    iounit: self.msize - fcall::IOHDRSZ,
+                    iounit: msize - fcall::IOHDRSZ,
                 })
             }
             Err(e) => io_error_response(e),
@@ -571,17 +629,22 @@ impl Server {
     }
 
     fn handle_lcreate<'a>(
-        &mut self,
+        &self,
         fid: u32,
         name: String,
         flags: fcall::LOpenFlags,
         mode: u32,
         _gid: u32,
     ) -> Fcall<'a> {
-        // Extract what we need before taking a mutable borrow later.
-        let (parent_path, is_canonical) = match self.fids.get(&fid) {
-            Some(s) => (s.path.clone(), s.is_canonical),
-            None => return error_response(libc::EBADF as u32),
+        // Phase 1: Get fid Arc and extract state
+        let fid_arc = match self.get_fid(fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
+        };
+
+        let (parent_path, is_canonical) = {
+            let state = read_lock(&fid_arc, "fid");
+            (state.path.clone(), state.is_canonical)
         };
 
         // Validate name
@@ -591,6 +654,7 @@ impl Server {
 
         let target = parent_path.join(&name);
 
+        // Phase 2: I/O — no fid locks held
         // Containment check — resolve the parent directory to catch symlink escapes.
         // Skip re-canonicalization if walk already produced a canonical path.
         let resolved_parent = match self.resolve_fid_path(&parent_path, is_canonical) {
@@ -639,8 +703,9 @@ impl Server {
                 };
                 let qid = metadata_to_qid(&meta);
 
-                // After create, the fid now represents the new file (not the parent dir)
-                let state = self.fids.get_mut(&fid).unwrap();
+                // Phase 3: Update fid state — after create, the fid now represents
+                // the new file (not the parent dir)
+                let mut state = write_lock(&fid_arc, "fid");
                 state.path = target;
                 state.file = Some(file);
                 state.patched_data = None;
@@ -650,9 +715,10 @@ impl Server {
                 state.is_canonical = false;
                 state.readlink_path = None;
 
+                let msize = self.msize.load(Ordering::Acquire);
                 Fcall::Rlcreate(fcall::Rlcreate {
                     qid,
-                    iounit: self.msize - fcall::IOHDRSZ,
+                    iounit: msize - fcall::IOHDRSZ,
                 })
             }
             Err(e) => io_error_response(e),
@@ -663,17 +729,35 @@ impl Server {
     // Read / Write
     // ========================================================================
 
-    fn handle_read<'a>(&mut self, req: fcall::Tread) -> Fcall<'a> {
-        let state = match self.fids.get_mut(&req.fid) {
-            Some(s) => s,
-            None => return error_response(libc::EBADF as u32),
+    fn handle_read<'a>(&self, req: fcall::Tread) -> Fcall<'a> {
+        let fid_arc = match self.get_fid(req.fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
         };
 
-        let max_count = (self.msize - fcall::IOHDRSZ) as usize;
+        let msize = self.msize.load(Ordering::Acquire);
+        let max_count = (msize - fcall::IOHDRSZ) as usize;
         let count = (req.count as usize).min(max_count);
 
+        let (patched_data, file) = {
+            let state = read_lock(&fid_arc, "fid");
+            let patched_data = state.patched_data.clone();
+            let file = if patched_data.is_some() {
+                None
+            } else {
+                match state.file.as_ref() {
+                    Some(file) => match file.try_clone() {
+                        Ok(file) => Some(file),
+                        Err(e) => return io_error_response(e),
+                    },
+                    None => None,
+                }
+            };
+            (patched_data, file)
+        };
+
         // For patched ELFs, serve from cached patched data
-        if let Some(ref data) = state.patched_data {
+        if let Some(data) = patched_data {
             let offset = req.offset;
             let data_len = data.len() as u64;
             if offset >= data_len {
@@ -689,7 +773,7 @@ impl Server {
             });
         }
 
-        let file = match state.file.as_ref() {
+        let file = match file {
             Some(f) => f,
             None => return error_response(libc::EBADF as u32),
         };
@@ -706,18 +790,30 @@ impl Server {
         }
     }
 
-    fn handle_write<'a>(&mut self, fid: u32, offset: u64, data: Vec<u8>) -> Fcall<'a> {
-        let state = match self.fids.get_mut(&fid) {
-            Some(s) => s,
-            None => return error_response(libc::EBADF as u32),
+    fn handle_write<'a>(&self, fid: u32, offset: u64, data: Vec<u8>) -> Fcall<'a> {
+        let fid_arc = match self.get_fid(fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
+        };
+
+        let (path, file) = {
+            let state = read_lock(&fid_arc, "fid");
+            let file = match state.file.as_ref() {
+                Some(file) => match file.try_clone() {
+                    Ok(file) => Some(file),
+                    Err(e) => return io_error_response(e),
+                },
+                None => None,
+            };
+            (state.path.clone(), file)
         };
 
         // Policy check for write using the full path
-        if self.policy.check(Action::Write, Some(&state.path)) == Decision::Deny {
+        if self.policy.check(Action::Write, Some(&path)) == Decision::Deny {
             return error_response(libc::EPERM as u32);
         }
 
-        let file = match state.file.as_ref() {
+        let file = match file {
             Some(f) => f,
             None => return error_response(libc::EBADF as u32),
         };
@@ -742,8 +838,8 @@ impl Server {
         wnames: &[Vec<u8>],
         follow_final: bool,
     ) -> Result<PathBuf, u32> {
-        let src_fid = self.fids.get(&fid).ok_or(libc::EBADF as u32)?;
-        let mut current_path = src_fid.path.clone();
+        let fid_arc = self.get_fid(fid)?;
+        let mut current_path = read_lock(&fid_arc, "fid").path.clone();
 
         for (i, name) in wnames.iter().enumerate() {
             let component = std::str::from_utf8(name).map_err(|_| libc::ENOENT as u32)?;
@@ -778,21 +874,34 @@ impl Server {
         Ok(current_path)
     }
 
-    fn handle_getattr<'a>(&mut self, req: fcall::Tgetattr) -> Fcall<'a> {
-        let state = match self.fids.get(&req.fid) {
-            Some(s) => s,
-            None => return error_response(libc::EBADF as u32),
+    fn handle_getattr<'a>(&self, req: fcall::Tgetattr) -> Fcall<'a> {
+        let fid_arc = match self.get_fid(req.fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
+        };
+
+        let (file, path, patched_size) = {
+            let state = read_lock(&fid_arc, "fid");
+            let file = match state.file.as_ref() {
+                Some(file) => match file.try_clone() {
+                    Ok(file) => Some(file),
+                    Err(e) => return io_error_response(e),
+                },
+                None => None,
+            };
+            let patched_size = state.patched_data.as_ref().map(|data| data.len() as u64);
+            (file, state.path.clone(), patched_size)
         };
 
         // Use fd-based metadata if available (more accurate for open files)
-        let meta = if let Some(ref file) = state.file {
+        let meta = if let Some(file) = file {
             match file.metadata() {
                 Ok(m) => m,
                 Err(e) => return io_error_response(e),
             }
         } else {
             // Use symlink_metadata to not follow symlinks
-            match fs::symlink_metadata(&state.path) {
+            match fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(e) => return io_error_response(e),
             }
@@ -802,8 +911,8 @@ impl Server {
         let mut size = meta.len();
 
         // For patched ELFs, report patched size
-        if let Some(ref data) = state.patched_data {
-            size = data.len() as u64;
+        if let Some(patched_size) = patched_size {
+            size = patched_size;
         }
 
         Fcall::Rgetattr(fcall::Rgetattr {
@@ -828,11 +937,16 @@ impl Server {
         })
     }
 
-    fn handle_setattr<'a>(&mut self, req: fcall::Tsetattr) -> Fcall<'a> {
-        // Extract path/canonical info before mutable borrow for file handle.
-        let (path, is_canonical) = match self.fids.get(&req.fid) {
-            Some(s) => (s.path.clone(), s.is_canonical),
-            None => return error_response(libc::EBADF as u32),
+    fn handle_setattr<'a>(&self, req: fcall::Tsetattr) -> Fcall<'a> {
+        // Get fid Arc and extract path/canonical info
+        let fid_arc = match self.get_fid(req.fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
+        };
+
+        let (path, is_canonical) = {
+            let state = read_lock(&fid_arc, "fid");
+            (state.path.clone(), state.is_canonical)
         };
 
         // chmod
@@ -862,18 +976,28 @@ impl Server {
             if self.policy.check(Action::Truncate, Some(&resolved)) == Decision::Deny {
                 return error_response(libc::EPERM as u32);
             }
-            // Re-borrow mutably only for the file handle access.
-            let state = self.fids.get_mut(&req.fid).unwrap();
-            if let Some(ref file) = state.file {
+            let open_file = {
+                let state = read_lock(&fid_arc, "fid");
+                match state.file.as_ref() {
+                    Some(file) => match file.try_clone() {
+                        Ok(file) => Some(file),
+                        Err(e) => return io_error_response(e),
+                    },
+                    None => None,
+                }
+            };
+            if let Some(file) = open_file {
                 if let Err(e) = file.set_len(req.stat.size) {
                     return io_error_response(e);
                 }
-            } else if let Err(e) = fs::OpenOptions::new()
-                .write(true)
-                .open(&resolved)
-                .and_then(|f| f.set_len(req.stat.size))
-            {
-                return io_error_response(e);
+            } else {
+                if let Err(e) = fs::OpenOptions::new()
+                    .write(true)
+                    .open(&resolved)
+                    .and_then(|f| f.set_len(req.stat.size))
+                {
+                    return io_error_response(e);
+                }
             }
         }
 
@@ -884,13 +1008,14 @@ impl Server {
     // Directory operations
     // ========================================================================
 
-    fn handle_readdir<'a>(&mut self, req: fcall::Treaddir) -> Fcall<'a> {
-        let state = match self.fids.get(&req.fid) {
-            Some(s) => s,
-            None => return error_response(libc::EBADF as u32),
+    fn handle_readdir<'a>(&self, req: fcall::Treaddir) -> Fcall<'a> {
+        let fid_arc = match self.get_fid(req.fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
         };
+        let path = read_lock(&fid_arc, "fid").path.clone();
 
-        let read_dir = match fs::read_dir(&state.path) {
+        let read_dir = match fs::read_dir(&path) {
             Ok(rd) => rd,
             Err(e) => return io_error_response(e),
         };
@@ -957,18 +1082,23 @@ impl Server {
         })
     }
 
-    fn handle_mkdir<'a>(&mut self, dfid: u32, name: String, mode: u32, _gid: u32) -> Fcall<'a> {
-        let state = match self.fids.get(&dfid) {
-            Some(s) => s,
-            None => return error_response(libc::EBADF as u32),
+    fn handle_mkdir<'a>(&self, dfid: u32, name: String, mode: u32, _gid: u32) -> Fcall<'a> {
+        let fid_arc = match self.get_fid(dfid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
         };
 
         if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
             return error_response(libc::EINVAL as u32);
         }
 
+        let (dir_path, is_canonical) = {
+            let state = read_lock(&fid_arc, "fid");
+            (state.path.clone(), state.is_canonical)
+        };
+
         // Resolve parent directory to catch symlink escapes
-        let resolved_parent = match self.resolve_fid_path(&state.path, state.is_canonical) {
+        let resolved_parent = match self.resolve_fid_path(&dir_path, is_canonical) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
@@ -997,18 +1127,23 @@ impl Server {
         }
     }
 
-    fn handle_unlinkat<'a>(&mut self, dfid: u32, name: String, flags: u32) -> Fcall<'a> {
-        let state = match self.fids.get(&dfid) {
-            Some(s) => s,
-            None => return error_response(libc::EBADF as u32),
+    fn handle_unlinkat<'a>(&self, dfid: u32, name: String, flags: u32) -> Fcall<'a> {
+        let fid_arc = match self.get_fid(dfid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
         };
 
         if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
             return error_response(libc::EINVAL as u32);
         }
 
+        let (dir_path, is_canonical) = {
+            let state = read_lock(&fid_arc, "fid");
+            (state.path.clone(), state.is_canonical)
+        };
+
         // Resolve parent directory to catch symlink escapes
-        let resolved_parent = match self.resolve_fid_path(&state.path, state.is_canonical) {
+        let resolved_parent = match self.resolve_fid_path(&dir_path, is_canonical) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
@@ -1044,27 +1179,32 @@ impl Server {
     // Rename
     // ========================================================================
 
-    fn handle_rename<'a>(&mut self, fid: u32, dfid: u32, name: String) -> Fcall<'a> {
+    fn handle_rename<'a>(&self, fid: u32, dfid: u32, name: String) -> Fcall<'a> {
         // Validate destination name
         if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
             return error_response(libc::EINVAL as u32);
         }
 
-        let (src_path, src_canonical, dst_dir_path, dst_canonical) = {
-            let src = match self.fids.get(&fid) {
-                Some(s) => s,
+        let (src_arc, dst_arc) = {
+            let fids = read_lock(&self.fids, "fids");
+            let src_arc = match fids.get(&fid) {
+                Some(arc) => Arc::clone(arc),
                 None => return error_response(libc::EBADF as u32),
             };
-            let dst_dir = match self.fids.get(&dfid) {
-                Some(s) => s,
+            let dst_arc = match fids.get(&dfid) {
+                Some(arc) => Arc::clone(arc),
                 None => return error_response(libc::EBADF as u32),
             };
-            (
-                src.path.clone(),
-                src.is_canonical,
-                dst_dir.path.clone(),
-                dst_dir.is_canonical,
-            )
+            (src_arc, dst_arc)
+        };
+
+        let (src_path, src_canonical) = {
+            let src = read_lock(&src_arc, "fid");
+            (src.path.clone(), src.is_canonical)
+        };
+        let (dst_dir_path, dst_canonical) = {
+            let dst = read_lock(&dst_arc, "fid");
+            (dst.path.clone(), dst.is_canonical)
         };
 
         // Resolve symlinks on both source and destination
@@ -1092,9 +1232,8 @@ impl Server {
         match fs::rename(&resolved_src, &dst) {
             Ok(()) => {
                 // Update the FID's path to the new location
-                if let Some(state) = self.fids.get_mut(&fid) {
-                    state.path = dst;
-                }
+                let mut state = write_lock(&src_arc, "fid");
+                state.path = dst;
                 Fcall::Rrename(fcall::Rrename {})
             }
             Err(e) => io_error_response(e),
@@ -1102,7 +1241,7 @@ impl Server {
     }
 
     fn handle_renameat<'a>(
-        &mut self,
+        &self,
         olddfid: u32,
         oldname: String,
         newdfid: u32,
@@ -1116,21 +1255,26 @@ impl Server {
             return error_response(libc::EINVAL as u32);
         }
 
-        let (old_dir_path, old_canonical, new_dir_path, new_canonical) = {
-            let old_dir = match self.fids.get(&olddfid) {
-                Some(s) => s,
+        let (old_arc, new_arc) = {
+            let fids = read_lock(&self.fids, "fids");
+            let old_arc = match fids.get(&olddfid) {
+                Some(arc) => Arc::clone(arc),
                 None => return error_response(libc::EBADF as u32),
             };
-            let new_dir = match self.fids.get(&newdfid) {
-                Some(s) => s,
+            let new_arc = match fids.get(&newdfid) {
+                Some(arc) => Arc::clone(arc),
                 None => return error_response(libc::EBADF as u32),
             };
-            (
-                old_dir.path.clone(),
-                old_dir.is_canonical,
-                new_dir.path.clone(),
-                new_dir.is_canonical,
-            )
+            (old_arc, new_arc)
+        };
+
+        let (old_dir_path, old_canonical) = {
+            let old = read_lock(&old_arc, "fid");
+            (old.path.clone(), old.is_canonical)
+        };
+        let (new_dir_path, new_canonical) = {
+            let new = read_lock(&new_arc, "fid");
+            (new.path.clone(), new.is_canonical)
         };
 
         // Resolve symlinks on both parent directories
@@ -1168,7 +1312,7 @@ impl Server {
     // Statfs / Fsync / Clunk / Remove
     // ========================================================================
 
-    fn handle_statfs<'a>(&mut self, _fid: u32) -> Fcall<'a> {
+    fn handle_statfs<'a>(&self, _fid: u32) -> Fcall<'a> {
         // Return a generic statfs suitable for most operations
         Fcall::Rstatfs(new_rstatfs(fcall::Statfs {
             typ: 0x01021997, // V9FS_MAGIC
@@ -1183,13 +1327,24 @@ impl Server {
         }))
     }
 
-    fn handle_fsync<'a>(&mut self, req: fcall::Tfsync) -> Fcall<'a> {
-        let state = match self.fids.get(&req.fid) {
-            Some(s) => s,
-            None => return error_response(libc::EBADF as u32),
+    fn handle_fsync<'a>(&self, req: fcall::Tfsync) -> Fcall<'a> {
+        let fid_arc = match self.get_fid(req.fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
         };
 
-        if let Some(ref file) = state.file {
+        let file = {
+            let state = read_lock(&fid_arc, "fid");
+            match state.file.as_ref() {
+                Some(file) => match file.try_clone() {
+                    Ok(file) => Some(file),
+                    Err(e) => return io_error_response(e),
+                },
+                None => None,
+            }
+        };
+
+        if let Some(file) = file {
             if req.datasync != 0 {
                 if let Err(e) = file.sync_data() {
                     return io_error_response(e);
@@ -1202,26 +1357,35 @@ impl Server {
         Fcall::Rfsync(fcall::Rfsync {})
     }
 
-    fn handle_clunk<'a>(&mut self, req: fcall::Tclunk) -> Fcall<'a> {
+    fn handle_clunk<'a>(&self, req: fcall::Tclunk) -> Fcall<'a> {
         // Remove the FID; the file handle (if any) is dropped automatically
-        self.fids.remove(&req.fid);
+        let mut fids = write_lock(&self.fids, "fids");
+        fids.remove(&req.fid);
         Fcall::Rclunk(fcall::Rclunk {})
     }
 
-    fn handle_remove<'a>(&mut self, req: fcall::Tremove) -> Fcall<'a> {
+    fn handle_remove<'a>(&self, req: fcall::Tremove) -> Fcall<'a> {
         // Remove always clunks the fid, even on error
-        let state = match self.fids.remove(&req.fid) {
-            Some(s) => s,
-            None => return error_response(libc::EBADF as u32),
+        let fid_arc = {
+            let mut fids = write_lock(&self.fids, "fids");
+            match fids.remove(&req.fid) {
+                Some(arc) => arc,
+                None => return error_response(libc::EBADF as u32),
+            }
+        };
+
+        let (path, is_canonical, qid) = {
+            let state = read_lock(&fid_arc, "fid");
+            (state.path.clone(), state.is_canonical, state.qid)
         };
 
         // Resolve symlinks to prevent jail escape
-        let resolved = match self.resolve_fid_path(&state.path, state.is_canonical) {
+        let resolved = match self.resolve_fid_path(&path, is_canonical) {
             Ok(p) => p,
             Err(errno) => return error_response(errno),
         };
 
-        let is_dir = state.qid.typ.contains(fcall::QidType::DIR);
+        let is_dir = qid.typ.contains(fcall::QidType::DIR);
         let action = if is_dir {
             Action::Rmdir
         } else {
@@ -1244,13 +1408,19 @@ impl Server {
     }
 
     fn handle_readlink<'a>(&self, fid: u32) -> Fcall<'a> {
-        let state = match self.fids.get(&fid) {
-            Some(s) => s,
-            None => return error_response(libc::EBADF as u32),
+        let fid_arc = match self.get_fid(fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
         };
 
-        let readlink_path = state.readlink_path.as_deref().unwrap_or(&state.path);
-        match fs::read_link(readlink_path) {
+        let readlink_path = {
+            let state = read_lock(&fid_arc, "fid");
+            state
+                .readlink_path
+                .clone()
+                .unwrap_or_else(|| state.path.clone())
+        };
+        match fs::read_link(&readlink_path) {
             Ok(target) => Fcall::Rreadlink(fcall::Rreadlink {
                 target: Cow::Owned(target.as_os_str().as_encoded_bytes().to_vec()),
             }),
@@ -1267,7 +1437,7 @@ impl Server {
     /// Only patches read-only opens when syscall rewriting is enabled.
     /// The cache is keyed by path and invalidated when mtime changes.
     fn try_patch_elf(
-        &mut self,
+        &self,
         file: &mut fs::File,
         path: &Path,
         is_read_only: bool,
@@ -1287,10 +1457,13 @@ impl Server {
             .as_secs() as i64;
 
         // Check cache with mtime validation
-        if let Some((cached_mtime, cached_data)) = self.elf_cache.get(path)
-            && *cached_mtime == current_mtime
         {
-            return Some(Arc::clone(cached_data));
+            let cache = mutex_lock(&self.elf_cache, "elf_cache");
+            if let Some((cached_mtime, cached_data)) = cache.get(path)
+                && *cached_mtime == current_mtime
+            {
+                return Some(Arc::clone(cached_data));
+            }
         }
 
         // Read the full file
@@ -1330,8 +1503,8 @@ impl Server {
         );
 
         let arc = Arc::new(patched);
-        self.elf_cache
-            .insert(path.to_owned(), (current_mtime, Arc::clone(&arc)));
+        let mut cache = mutex_lock(&self.elf_cache, "elf_cache");
+        cache.insert(path.to_owned(), (current_mtime, Arc::clone(&arc)));
         Some(arc)
     }
 }
@@ -1341,7 +1514,7 @@ impl Server {
 // ============================================================================
 
 /// Owned version of 9P request data, used to break the borrow on the read
-/// buffer before calling `&mut self` handler methods.
+/// buffer before calling `&self` handler methods.
 enum OwnedRequest {
     Version {
         msize: u32,
@@ -1551,6 +1724,36 @@ fn metadata_to_qid(meta: &fs::Metadata) -> fcall::Qid {
 /// Create an Rlerror response.
 fn error_response<'a>(errno: u32) -> Fcall<'a> {
     Fcall::Rlerror(fcall::Rlerror { ecode: errno })
+}
+
+fn read_lock<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockReadGuard<'a, T> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(lock = name, "recovering from poisoned read lock");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn write_lock<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockWriteGuard<'a, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(lock = name, "recovering from poisoned write lock");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn mutex_lock<'a, T>(lock: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(lock = name, "recovering from poisoned mutex");
+            poisoned.into_inner()
+        }
+    }
 }
 
 /// Convert an `io::Error` to an Rlerror response.
