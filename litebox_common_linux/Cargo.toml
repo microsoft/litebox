@@ -3,11 +3,15 @@ name = "litebox_common_linux"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+std = ["dep:libc"]
+
 [dependencies]
 bitfield = "0.19.1"
 bitflags = "2.9.0"
 cfg-if = "1.0.0"
 elf = { version = "0.8.0", default-features = false }
+libc = { version = "0.2", optional = true }
 litebox = { path = "../litebox/", version = "0.1.0" }
 thiserror = { version = "2.0.6", default-features = false }
 int-enum = "1.2.0"

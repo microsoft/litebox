@@ -24,6 +24,12 @@ pub mod mm;
 pub mod signal;
 pub mod vmap;
 
+#[cfg(feature = "std")]
+extern crate std;
+
+#[cfg(feature = "std")]
+pub mod shmem_ring;
+
 extern crate alloc;
 
 // TODO(jayb): Should errno::Errno be publicly re-exported?
