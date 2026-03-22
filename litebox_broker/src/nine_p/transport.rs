@@ -160,3 +160,17 @@ impl Write for RingTransport {
         std::io::Write::write(&mut self.writer, buf).map_err(|_| WriteError)
     }
 }
+
+#[cfg(unix)]
+impl Read for litebox_common_linux::shmem_ring::RingReader {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
+        std::io::Read::read(self, buf).map_err(|_| ReadError)
+    }
+}
+
+#[cfg(unix)]
+impl Write for litebox_common_linux::shmem_ring::RingWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError> {
+        std::io::Write::write(self, buf).map_err(|_| WriteError)
+    }
+}

@@ -19,8 +19,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read as _, Seek, SeekFrom};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
@@ -94,7 +95,7 @@ impl Server {
             root,
             policy,
             fids: RwLock::new(HashMap::new()),
-            msize: AtomicU32::new(0),
+            msize: AtomicU32::new(4 * 1024 * 1024),
             rewrite_syscalls,
             elf_cache: Mutex::new(HashMap::new()),
         }
@@ -240,6 +241,228 @@ impl Server {
         }
     }
 
+    /// Run the server loop with concurrent request dispatch.
+    ///
+    /// Bootstrap (version + attach) runs single-threaded on the calling thread.
+    /// After bootstrap, requests are dispatched to `num_workers` threads.
+    /// Returns when the connection is closed or an unrecoverable I/O error occurs.
+    pub fn serve_threaded<R: Read, W: Write + Send + 'static>(
+        server: Arc<Self>,
+        mut reader: R,
+        mut writer: W,
+        num_workers: usize,
+    ) {
+        const INITIAL_MAX_SIZE: u32 = 1_048_576;
+
+        let mut rbuf = Vec::with_capacity(1_048_576);
+        let mut wbuf = Vec::with_capacity(1_048_576);
+        let mut current_max = INITIAL_MAX_SIZE;
+
+        // Process version and attach synchronously before spawning workers.
+        for phase in ["version", "attach"] {
+            if transport::read_to_buf(&mut reader, &mut rbuf, current_max).is_err() {
+                debug!("9P connection closed during {} bootstrap", phase);
+                return;
+            }
+            current_max = {
+                let m = server.msize.load(Ordering::Acquire);
+                if m > 0 { m } else { current_max }
+            };
+            let (tag, request) = match TaggedFcall::decode(&rbuf) {
+                Ok(msg) => (msg.tag, OwnedRequest::from_fcall(msg.fcall)),
+                Err(_) => {
+                    warn!("9P decode error during bootstrap");
+                    return;
+                }
+            };
+            let expected = match phase {
+                "version" => matches!(&request, OwnedRequest::Version { .. }),
+                "attach" => matches!(&request, OwnedRequest::Attach { .. }),
+                _ => false,
+            };
+            if !expected {
+                warn!(
+                    "unexpected 9P {} bootstrap request, closing connection",
+                    phase
+                );
+                let reply = TaggedFcall {
+                    tag,
+                    fcall: error_response(libc::EPROTO as u32),
+                };
+                let _ = transport::write_message(&mut writer, &mut wbuf, reply);
+                return;
+            }
+            let response = server.dispatch(request);
+            let bootstrap_ok = matches!(
+                (phase, &response),
+                ("version", Fcall::Rversion(_)) | ("attach", Fcall::Rattach(_))
+            );
+            let reply = TaggedFcall {
+                tag,
+                fcall: response,
+            };
+            if transport::write_message(&mut writer, &mut wbuf, reply).is_err() {
+                warn!("9P write error during bootstrap");
+                return;
+            }
+            if !bootstrap_ok {
+                warn!("9P {} bootstrap failed, closing connection", phase);
+                return;
+            }
+            current_max = {
+                let m = server.msize.load(Ordering::Acquire);
+                if m > 0 { m } else { current_max }
+            };
+        }
+
+        if num_workers == 0 {
+            warn!("serve_threaded called with zero workers; falling back to inline dispatch");
+            loop {
+                if transport::read_to_buf(&mut reader, &mut rbuf, current_max).is_err() {
+                    break;
+                }
+                current_max = server.msize.load(Ordering::Acquire);
+                let (tag, request) = match TaggedFcall::decode(&rbuf) {
+                    Ok(msg) => (msg.tag, OwnedRequest::from_fcall(msg.fcall)),
+                    Err(_) => break,
+                };
+                let response = server.dispatch(request);
+                let reply = TaggedFcall {
+                    tag,
+                    fcall: response,
+                };
+                if transport::write_message(&mut writer, &mut wbuf, reply).is_err() {
+                    break;
+                }
+            }
+            return;
+        }
+
+        // Concurrent phase: spawn worker threads and dispatch via channel.
+        let writer = Arc::new(std::sync::Mutex::new(writer));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u16, OwnedRequest)>(num_workers * 4);
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+
+        let mut workers = Vec::with_capacity(num_workers);
+        for i in 0..num_workers {
+            let server = Arc::clone(&server);
+            let rx = Arc::clone(&rx);
+            let writer = Arc::clone(&writer);
+            let shutdown = Arc::clone(&shutdown);
+            match std::thread::Builder::new()
+                .name(format!("9p-worker-{i}"))
+                .spawn(move || {
+                    let msize = server.msize.load(Ordering::Acquire) as usize;
+                    let mut wbuf = Vec::with_capacity(msize);
+                    loop {
+                        let (tag, request) = match mutex_lock(&rx, "threaded_rx").recv() {
+                            Ok(item) => item,
+                            Err(_) => break,
+                        };
+                        let response = match panic::catch_unwind(AssertUnwindSafe(|| {
+                            server.dispatch(request)
+                        })) {
+                            Ok(response) => response,
+                            Err(_) => {
+                                warn!(tag, "9P worker panicked while handling request");
+                                error_response(libc::EIO as u32)
+                            }
+                        };
+                        if let Fcall::Rlerror(ref e) = response {
+                            debug!("9P error: errno={}", e.ecode);
+                        }
+                        let reply = TaggedFcall {
+                            tag,
+                            fcall: response,
+                        };
+                        let write_result = panic::catch_unwind(AssertUnwindSafe(|| {
+                            let mut w = mutex_lock(&writer, "threaded_writer");
+                            transport::write_message(&mut *w, &mut wbuf, reply)
+                        }));
+                        match write_result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => {
+                                shutdown.store(true, Ordering::Release);
+                                break;
+                            }
+                            Err(_) => {
+                                shutdown.store(true, Ordering::Release);
+                                warn!(tag, "9P worker panicked while writing response");
+                                break;
+                            }
+                        }
+                    }
+                }) {
+                Ok(worker) => workers.push(worker),
+                Err(e) => warn!(worker = i, error = %e, "failed to spawn 9P worker thread"),
+            }
+        }
+
+        if workers.is_empty() {
+            warn!("failed to spawn any 9P workers; falling back to inline dispatch");
+            drop(tx);
+            loop {
+                if transport::read_to_buf(&mut reader, &mut rbuf, current_max).is_err() {
+                    break;
+                }
+                current_max = server.msize.load(Ordering::Acquire);
+                let (tag, request) = match TaggedFcall::decode(&rbuf) {
+                    Ok(msg) => (msg.tag, OwnedRequest::from_fcall(msg.fcall)),
+                    Err(_) => break,
+                };
+                let response = server.dispatch(request);
+                let reply = TaggedFcall {
+                    tag,
+                    fcall: response,
+                };
+                let mut w = mutex_lock(&writer, "threaded_writer");
+                if transport::write_message(&mut *w, &mut wbuf, reply).is_err() {
+                    break;
+                }
+            }
+            return;
+        }
+
+        // Reader loop: read requests and dispatch to workers.
+        'reader: loop {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            if transport::read_to_buf(&mut reader, &mut rbuf, current_max).is_err() {
+                break;
+            }
+            current_max = server.msize.load(Ordering::Acquire);
+            let (tag, request) = match TaggedFcall::decode(&rbuf) {
+                Ok(msg) => (msg.tag, OwnedRequest::from_fcall(msg.fcall)),
+                Err(_) => break,
+            };
+            let mut pending = (tag, request);
+            loop {
+                match tx.try_send(pending) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TrySendError::Full(item)) => {
+                        if shutdown.load(Ordering::Acquire) {
+                            break 'reader;
+                        }
+                        pending = item;
+                        std::thread::yield_now();
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break 'reader,
+                }
+            }
+        }
+
+        // Shutdown: close channel, wait for workers.
+        drop(tx);
+        for w in workers {
+            let worker_name = w.thread().name().unwrap_or("9p-worker").to_string();
+            if w.join().is_err() {
+                warn!(worker = %worker_name, "9P worker thread panicked during shutdown");
+            }
+        }
+    }
+
     /// Dispatch a single 9P request to the appropriate handler.
     fn dispatch<'a>(&self, request: OwnedRequest) -> Fcall<'a> {
         match request {
@@ -304,6 +527,9 @@ impl Server {
     fn handle_version<'a>(&self, msize: u32, version: Vec<u8>) -> Fcall<'a> {
         if version != b"9P2000.L" {
             return error_response(libc::ENOTSUP as u32);
+        }
+        if msize < fcall::IOHDRSZ {
+            return error_response(libc::EINVAL as u32);
         }
 
         // Negotiate msize: use the smaller of client's and our max
@@ -1680,7 +1906,7 @@ impl OwnedRequest {
                 newdfid: r.newdfid,
                 newname: String::from_utf8_lossy(&r.newname).into_owned(),
             },
-            Fcall::Tstatfs(_) => OwnedRequest::Statfs { fid: 0 },
+            Fcall::Tstatfs(r) => OwnedRequest::Statfs { fid: r.fid },
             Fcall::Tfsync(r) => OwnedRequest::Fsync {
                 fid: r.fid,
                 datasync: r.datasync,

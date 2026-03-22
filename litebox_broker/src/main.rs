@@ -116,11 +116,14 @@ fn build_local_services(cli: &Cli) -> Option<litebox_broker::net_proxy::LocalSer
                 let root = root.clone();
                 let policy = Arc::clone(&policy);
                 std::thread::spawn(move || {
-                    let mut transport =
-                        litebox_broker::nine_p::transport::RingTransport { writer, reader };
-                    let server =
-                        litebox_broker::nine_p::server::Server::new(root, policy, rewrite_syscalls);
-                    server.serve(&mut transport);
+                    let server = Arc::new(litebox_broker::nine_p::server::Server::new(
+                        root,
+                        policy,
+                        rewrite_syscalls,
+                    ));
+                    litebox_broker::nine_p::server::Server::serve_threaded(
+                        server, reader, writer, 8,
+                    );
                     info!("9P local service session ended (shared memory)");
                 })
             }),

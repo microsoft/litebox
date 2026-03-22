@@ -595,7 +595,7 @@ Serializer! {
     /// Statfs request
     #[derive(Clone, Debug)]
     pub(crate) struct Tstatfs {
-        fid: u32,
+        pub(crate) fid: u32,
     }
 }
 
