@@ -9,6 +9,7 @@
 //! sends its message under the write lock, then spin-waits for the dedicated
 //! worker thread to deliver the matching response.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +60,15 @@ struct ClientWriteState<W> {
     wbuf: Vec<u8>,
 }
 
+/// State for inline (synchronous) response reading.
+///
+/// When a worker thread is not available (e.g. kernel-mode platforms like
+/// SNP), the calling thread reads the response directly after sending.
+struct InlineReaderState {
+    reader: Box<dyn Read + Send>,
+    buf: Vec<u8>,
+}
+
 /// State shared between guest threads (via [`Client`]) and the worker thread
 /// (via [`super::WorkerHandle`]).
 ///
@@ -71,6 +81,9 @@ pub(super) struct ClientInner {
     pending_table: PendingTable,
     /// Set once the transport has observed an unrecoverable I/O failure.
     poisoned: AtomicBool,
+    /// When set, `fcall()` reads responses inline instead of relying on a
+    /// worker thread. Used by platforms that cannot spawn threads (e.g. SNP).
+    inline_reader: spin::Mutex<Option<InlineReaderState>>,
 }
 
 impl ClientInner {
@@ -79,7 +92,11 @@ impl ClientInner {
     ///
     /// Returns `false` when the connection is dead (EOF or error),
     /// signalling the worker to exit.
-    pub(super) fn poll_responses<R: Read>(&self, reader: &mut R, reader_buf: &mut Vec<u8>) -> bool {
+    pub(super) fn poll_responses<R: Read + ?Sized>(
+        &self,
+        reader: &mut R,
+        reader_buf: &mut Vec<u8>,
+    ) -> bool {
         if transport::read_to_buf(reader, reader_buf).is_err() {
             self.poisoned.store(true, Ordering::Release);
             return false;
@@ -102,6 +119,30 @@ impl ClientInner {
             return false;
         }
         true
+    }
+
+    /// Read and dispatch responses using the inline reader (synchronous mode).
+    ///
+    /// Called by `fcall()` when no worker thread is available. Reads responses
+    /// until the expected tag is completed or an error occurs.
+    fn poll_inline_until_completed(&self, expected_tag: u16) -> bool {
+        let mut guard = self.inline_reader.lock();
+        let Some(state) = guard.as_mut() else {
+            return false;
+        };
+        loop {
+            if !self.poll_responses(&mut *state.reader, &mut state.buf) {
+                return false;
+            }
+            if self.pending_table.is_completed(expected_tag) {
+                return true;
+            }
+        }
+    }
+
+    /// Returns `true` if the client has an inline reader (synchronous mode).
+    fn has_inline_reader(&self) -> bool {
+        self.inline_reader.lock().is_some()
     }
 }
 
@@ -236,6 +277,7 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
             inner: Arc::new(ClientInner {
                 pending_table: PendingTable::new(),
                 poisoned: AtomicBool::new(false),
+                inline_reader: spin::Mutex::new(None),
             }),
             fids,
         };
@@ -246,6 +288,18 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
     /// Returns the negotiated maximum message size.
     pub(super) fn msize(&self) -> u32 {
         self.msize
+    }
+
+    /// Install an inline reader for synchronous (single-threaded) operation.
+    ///
+    /// When set, `fcall()` reads responses directly after sending instead
+    /// of relying on a background worker thread. Used by platforms that
+    /// cannot spawn threads (e.g. SNP kernel mode).
+    pub(super) fn set_inline_reader(&self, reader: Box<dyn Read + Send>, msize: u32) {
+        *self.inner.inline_reader.lock() = Some(InlineReaderState {
+            reader,
+            buf: Vec::with_capacity(msize as usize),
+        });
     }
 
     /// Send a request and wait for the response via the pending table.
@@ -298,7 +352,14 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
             }
         } // write lock released here
 
-        // 3. Spin-wait for response from the worker thread
+        // 3. Read response — either inline (synchronous) or via worker thread
+        if self.inner.has_inline_reader() {
+            // Synchronous mode: read responses directly until our tag completes
+            if !self.inner.poll_inline_until_completed(tag.get()) {
+                self.inner.pending_table.free_tag(tag);
+                return Err(Error::Io);
+            }
+        }
         let completion = match self
             .inner
             .pending_table

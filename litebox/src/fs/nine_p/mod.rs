@@ -467,6 +467,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
         ))
     }
 
+    /// Construct a synchronous (single-threaded) `FileSystem` instance.
+    ///
+    /// Unlike [`new`](Self::new), this variant stores the reader inside the
+    /// client so that `fcall()` reads responses inline after each send.
+    /// No background worker thread is needed.
+    ///
+    /// Use this for platforms that cannot spawn threads (e.g. SNP kernel).
+    pub fn new_sync<R: transport::Read + Send + 'static>(
+        litebox: &LiteBox<Platform>,
+        writer: W,
+        reader: R,
+        msize: u32,
+        username: &str,
+        path: &str,
+    ) -> Result<Self, Error> {
+        let (fs, reader) = Self::new(litebox, writer, reader, msize, username, path)?;
+        fs.client
+            .set_inline_reader(alloc::boxed::Box::new(reader), fs.client.msize());
+        Ok(fs)
+    }
+
     /// Returns the negotiated maximum message size.
     pub fn msize(&self) -> u32 {
         self.client.msize()

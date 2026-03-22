@@ -87,7 +87,10 @@ pub(super) fn write_message<W: Write>(
 }
 
 /// Read a 9P message size header (4 bytes) and then the full message
-pub(super) fn read_to_buf<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), super::Error> {
+pub(super) fn read_to_buf<R: Read + ?Sized>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+) -> Result<(), super::Error> {
     buf.resize(4, 0);
     r.read_exact(&mut buf[..]).map_err(|e| match e {
         ReadError::Interrupted => super::Error::Interrupted,

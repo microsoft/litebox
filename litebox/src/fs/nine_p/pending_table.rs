@@ -254,6 +254,15 @@ impl PendingTable {
     pub(super) fn allocated_count(&self) -> u32 {
         self.allocated.load(Ordering::Relaxed).count_ones()
     }
+
+    /// Check whether the slot for the given tag has been completed.
+    pub(super) fn is_completed(&self, tag: u16) -> bool {
+        let idx = match (tag as usize).checked_sub(1) {
+            Some(i) if i < MAX_TAGS => i,
+            _ => return false,
+        };
+        self.slots[idx].state.load(Ordering::Acquire) == COMPLETED
+    }
 }
 
 #[cfg(test)]

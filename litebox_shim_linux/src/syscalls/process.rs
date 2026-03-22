@@ -19,9 +19,11 @@ use litebox::mm::linux::VmFlags;
 use litebox::platform::PageManagementProvider;
 use litebox::platform::ThreadProvider;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
+#[allow(unused_imports)]
+// StdioProvider needed for SNP but resolved via inherent method on Linux userland
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
-    ThreadLocalStorageProvider as _,
+    StdioProvider as _, ThreadLocalStorageProvider as _,
 };
 use litebox::platform::{RawMutPointer as _, TimerHandle, TimerProvider};
 use litebox::sync::Mutex;

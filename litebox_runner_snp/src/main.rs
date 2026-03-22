@@ -24,7 +24,10 @@ type DefaultFS = litebox::fs::layered::FileSystem<
     litebox::fs::layered::FileSystem<
         Platform,
         litebox::fs::devices::FileSystem<Platform>,
-        litebox::fs::nine_p::FileSystem<Platform, litebox_shim_linux::transport::ShimTransport>,
+        litebox::fs::nine_p::FileSystem<
+            Platform,
+            litebox_shim_linux::transport::ShimTransportWriter,
+        >,
     >,
 >;
 
@@ -206,8 +209,9 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_GENERAL,
         );
     };
+    let (writer, reader) = transport.split();
     let Ok(nine_p) =
-        litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/tmp")
+        litebox::fs::nine_p::FileSystem::new_sync(litebox, writer, reader, 65536, "root", "/tmp")
     else {
         ghcb_prints("failed to create 9P filesystem");
         litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
