@@ -35,6 +35,11 @@ pub mod teb_offsets {
     pub const PEB_PTR: usize = 0x0060;
     /// LastErrorValue
     pub const LAST_ERROR: usize = 0x0068;
+    /// DeallocationStack — base of the stack allocation (lowest address).
+    /// ntdll's `RtlpGetStackLimits` returns STATUS_BAD_STACK when this is 0.
+    pub const DEALLOCATION_STACK: usize = 0x1478;
+    /// GuaranteedStackBytes — minimum stack guarantee for the thread.
+    pub const GUARANTEED_STACK_BYTES: usize = 0x1748;
 }
 
 /// Offsets within the 64-bit PEB structure.
@@ -300,6 +305,15 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     write_u64(teb, teb_offsets::PEB_PTR, layout.peb_va as u64);
     // LastErrorValue = 0
     write_u32(teb, teb_offsets::LAST_ERROR, 0);
+    // DeallocationStack = stack_limit (base of the stack allocation).
+    // ntdll's RtlpGetStackLimits returns STATUS_BAD_STACK when this is 0.
+    write_u64(
+        teb,
+        teb_offsets::DEALLOCATION_STACK,
+        params.stack_limit as u64,
+    );
+    // GuaranteedStackBytes — minimum stack guarantee (default 4KB).
+    write_u64(teb, teb_offsets::GUARANTEED_STACK_BYTES, 0x1000);
 
     // ---- PEB ----
     let peb_start = TEB_SIZE;
