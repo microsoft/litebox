@@ -39,6 +39,10 @@ const MAX_FIDS: usize = 8192;
 /// Linux `AT_REMOVEDIR` flag for `Tunlinkat`.
 const AT_REMOVEDIR: u32 = 0x200;
 
+/// Cache of patched ELF data, keyed by canonical path.
+/// Stores `(mtime_secs, patched_data)` to invalidate when the file changes.
+type ElfCache = HashMap<PathBuf, (i64, Arc<Vec<u8>>)>;
+
 /// State for a single FID (file identifier) in the 9P server.
 struct FidState {
     /// Host-side path this FID refers to. After a successful walk, this
@@ -75,7 +79,7 @@ pub struct Server {
     rewrite_syscalls: bool,
     /// Cache of patched ELF data, keyed by canonical path.
     /// Stores `(mtime_secs, patched_data)` to invalidate when the file changes.
-    elf_cache: Mutex<HashMap<PathBuf, (i64, Arc<Vec<u8>>)>>,
+    elf_cache: Mutex<ElfCache>,
 }
 
 impl Server {
@@ -1053,52 +1057,6 @@ impl Server {
     // ========================================================================
     // Stat / Setattr
     // ========================================================================
-
-    /// Walk a sequence of path components from a starting fid, returning
-    /// the resolved path. When `follow_final` is false, the last component
-    /// is not canonicalized (used by readlink to avoid following the
-    /// symlink it wants to read).
-    fn walk_path_components(
-        &self,
-        fid: u32,
-        wnames: &[Vec<u8>],
-        follow_final: bool,
-    ) -> Result<PathBuf, u32> {
-        let fid_arc = self.get_fid(fid)?;
-        let mut current_path = read_lock(&fid_arc, "fid").path.clone();
-
-        for (i, name) in wnames.iter().enumerate() {
-            let component = std::str::from_utf8(name).map_err(|_| libc::ENOENT as u32)?;
-            if component.contains('/') || component.contains('\0') {
-                return Err(libc::ENOENT as u32);
-            }
-
-            let next = if component == "." {
-                current_path.clone()
-            } else if component == ".." {
-                if current_path == self.root {
-                    current_path.clone()
-                } else {
-                    current_path.parent().unwrap_or(&self.root).to_path_buf()
-                }
-            } else {
-                current_path.join(component)
-            };
-
-            let is_final = i == wnames.len() - 1;
-            if !is_final || follow_final {
-                let resolved = fs::canonicalize(&next).map_err(io_errno)?;
-                if !resolved.starts_with(&self.root) {
-                    return Err(libc::EACCES as u32);
-                }
-                current_path = resolved;
-            } else {
-                current_path = next;
-            }
-        }
-
-        Ok(current_path)
-    }
 
     fn handle_getattr<'a>(&self, req: fcall::Tgetattr) -> Fcall<'a> {
         let fid_arc = match self.get_fid(req.fid) {

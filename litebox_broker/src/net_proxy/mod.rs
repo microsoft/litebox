@@ -775,7 +775,7 @@ pub fn run(
                                             // can safely drop the Unix socket.
                                             stream.set_nonblocking(false).ok();
                                             use std::io::Write as _;
-                                            let _ = stream.write_all(&[b'K']);
+                                            let _ = stream.write_all(b"K");
                                             ring_spawner(writer, reader);
                                             info!("direct 9P channel connected (shared memory)");
                                         }

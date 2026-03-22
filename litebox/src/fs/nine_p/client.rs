@@ -784,6 +784,8 @@ mod tests {
 
     impl Read for ChannelReader {
         fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
+            #[allow(clippy::cast_possible_truncation)]
+            // Cursor position fits in usize for in-memory buffers
             if self.buf.position() as usize >= self.buf.get_ref().len() {
                 match self.rx.recv() {
                     Ok(data) => self.buf = Cursor::new(data),

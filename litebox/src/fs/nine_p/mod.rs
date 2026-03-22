@@ -649,6 +649,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
     /// that refer to the same underlying file.
     fn invalidate_stat_cache_by_qid(&self, qid_path: u64) {
         self.cache_generation.fetch_add(1, Ordering::SeqCst);
+        #[allow(clippy::cast_possible_truncation)]
+        // ino is opaque identifier, truncation is acceptable
         let ino = qid_path as usize;
         let mut cache = self.stat_cache.lock();
         cache.retain(|_, status| status.node_info.ino != ino);
@@ -2095,6 +2097,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         };
         if !has_pending_writes {
             let cache = self.stat_cache.lock();
+            #[allow(clippy::cast_possible_truncation)] // ino is opaque identifier
             if let Some(cached) = cache.get(&path)
                 && cached.node_info.ino == qid_path as usize
             {
