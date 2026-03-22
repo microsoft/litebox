@@ -748,7 +748,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     AllocationError::Unaligned
                     | AllocationError::BelowMinAddress
                     | AllocationError::AboveMaxAddress,
-                ) => unreachable!(),
+                ) => return Err(VmemResizeError::OutOfRange),
             }
             return Ok(());
         }
@@ -1064,6 +1064,8 @@ pub(super) enum VmemResizeError {
     RangeOccupied(Range<usize>),
     #[error("out of memory")]
     OutOfMemory,
+    #[error("expanded range exceeds address space limits")]
+    OutOfRange,
 }
 
 /// Error for moving mappings

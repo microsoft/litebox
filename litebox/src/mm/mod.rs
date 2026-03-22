@@ -511,6 +511,24 @@ where
             Err(linux::VmemResizeError::NotExist(_)) => Err(RemapError::AlreadyUnallocated),
             Err(linux::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
             Err(linux::VmemResizeError::OutOfMemory) => Err(RemapError::OutOfMemory),
+            Err(linux::VmemResizeError::OutOfRange) => {
+                // Expanded range exceeds address space limits — try moving
+                if !may_move {
+                    return Err(RemapError::OutOfMemory);
+                }
+                match unsafe {
+                    vmem.move_mappings(
+                        old_range,
+                        None,
+                        NonZeroPageSize::new(new_size).ok_or(RemapError::Unaligned)?,
+                    )
+                } {
+                    Ok(new_addr) => Ok(new_addr),
+                    Err(linux::VmemMoveError::OutOfMemory) => Err(RemapError::OutOfMemory),
+                    Err(linux::VmemMoveError::UnAligned) => Err(RemapError::Unaligned),
+                    Err(linux::VmemMoveError::RemapError(err)) => Err(err),
+                }
+            }
         }
     }
 
