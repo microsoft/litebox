@@ -443,15 +443,16 @@ impl<
         let flags = flags - OFlags::NOCTTY - OFlags::NOFOLLOW - OFlags::APPEND;
         let truncate = flags.contains(OFlags::TRUNC);
         let flags = flags - OFlags::TRUNC;
-        if flags.contains(OFlags::CREAT | OFlags::EXCL) {
-            return Err(OpenError::AlreadyExists);
-        }
+        let excl = flags.contains(OFlags::EXCL);
         // Existing device nodes ignore create-only metadata and large-file mode bits.
-        let flags = flags - OFlags::CREAT - OFlags::LARGEFILE;
+        let flags = flags - OFlags::CREAT - OFlags::EXCL - OFlags::LARGEFILE;
         let _ = mode;
         let path = self.absolute_path(path)?;
         let (device, pty_pair) = match path.as_str() {
             "/dev/stdin" => {
+                if excl {
+                    return Err(OpenError::AlreadyExists);
+                }
                 if flags == OFlags::RDONLY || flags == OFlags::RDWR {
                     (Device::Stdin, None)
                 } else {
@@ -459,6 +460,9 @@ impl<
                 }
             }
             "/dev/stdout" => {
+                if excl {
+                    return Err(OpenError::AlreadyExists);
+                }
                 if flags == OFlags::WRONLY || flags == OFlags::RDWR {
                     (Device::Stdout, None)
                 } else {
@@ -466,21 +470,45 @@ impl<
                 }
             }
             "/dev/stderr" => {
+                if excl {
+                    return Err(OpenError::AlreadyExists);
+                }
                 if flags == OFlags::WRONLY || flags == OFlags::RDWR {
                     (Device::Stderr, None)
                 } else {
                     return Err(OpenError::AccessNotAllowed);
                 }
             }
-            "/dev/null" => (Device::Null, None),
-            "/dev/urandom" => (Device::URandom, None),
-            "/dev/tty" => (Device::Tty, None),
+            "/dev/null" => {
+                if excl {
+                    return Err(OpenError::AlreadyExists);
+                }
+                (Device::Null, None)
+            }
+            "/dev/urandom" => {
+                if excl {
+                    return Err(OpenError::AlreadyExists);
+                }
+                (Device::URandom, None)
+            }
+            "/dev/tty" => {
+                if excl {
+                    return Err(OpenError::AlreadyExists);
+                }
+                (Device::Tty, None)
+            }
             "/dev/ptmx" => {
+                if excl {
+                    return Err(OpenError::AlreadyExists);
+                }
                 let idx = self.pty_manager.alloc();
                 let pair = self.pty_manager.get(idx).unwrap();
                 (Device::PtyMaster(idx), Some(pair))
             }
             p if p.starts_with("/dev/pts/") => {
+                if excl {
+                    return Err(OpenError::AlreadyExists);
+                }
                 let num_str = &p["/dev/pts/".len()..];
                 let idx: u32 = num_str
                     .parse()
