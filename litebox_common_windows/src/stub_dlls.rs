@@ -12,7 +12,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::NtSyscallId;
-use crate::pe_builder::{CALLBACK_PTR_RVA, GS_TABLE_PTR_RVA, StubExport, build_stub_dll};
+use crate::pe_builder::{
+    CALLBACK_PTR_RVA, GS_TABLE_PTR_RVA, REVERSE_GS_TABLE_PTR_RVA, StubExport, build_stub_dll,
+};
 
 /// Default preferred base addresses for stub DLLs.
 /// Each DLL gets a distinct base to avoid collisions.
@@ -42,10 +44,20 @@ pub const FALLBACK_IMAGE_BASE: u64 = 0x0000_7FFE_000F_0000;
 /// The returned DLL's export VA can be used as a fallback for unresolved
 /// imports so that calling an unimplemented function returns 0 instead of
 /// crashing.
-pub fn build_fallback_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_fallback_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     let exports = vec![StubExport::return_status("__fallback_stub", 0)];
     let mut bytes = build_stub_dll("__fallback.dll", &exports, image_base);
-    patch_text_header(&mut bytes, syscall_entry, gs_table_ptr);
+    patch_text_header(
+        &mut bytes,
+        syscall_entry,
+        gs_table_ptr,
+        reverse_gs_table_ptr,
+    );
     bytes
 }
 
@@ -56,34 +68,74 @@ pub fn build_fallback_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64
 ///
 /// `syscall_entry` is the address of the platform's `syscall_callback`.
 /// `gs_table_ptr` is the address of the host-owned GS lookup table.
-pub fn build_ntdll_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_ntdll_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     let exports = ntdll_exports();
     let mut bytes = build_stub_dll("ntdll.dll", &exports, image_base);
-    patch_text_header(&mut bytes, syscall_entry, gs_table_ptr);
+    patch_text_header(
+        &mut bytes,
+        syscall_entry,
+        gs_table_ptr,
+        reverse_gs_table_ptr,
+    );
     bytes
 }
 
 /// Generate the kernel32.dll stub bytes with a specific load base and callback.
-pub fn build_kernel32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_kernel32_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     let exports = kernel32_exports();
     let mut bytes = build_stub_dll("kernel32.dll", &exports, image_base);
-    patch_text_header(&mut bytes, syscall_entry, gs_table_ptr);
+    patch_text_header(
+        &mut bytes,
+        syscall_entry,
+        gs_table_ptr,
+        reverse_gs_table_ptr,
+    );
     bytes
 }
 
 /// Generate the advapi32.dll stub bytes with a specific load base and callback.
-pub fn build_advapi32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_advapi32_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     let exports = advapi32_exports();
     let mut bytes = build_stub_dll("advapi32.dll", &exports, image_base);
-    patch_text_header(&mut bytes, syscall_entry, gs_table_ptr);
+    patch_text_header(
+        &mut bytes,
+        syscall_entry,
+        gs_table_ptr,
+        reverse_gs_table_ptr,
+    );
     bytes
 }
 
 /// Generate the ws2_32.dll stub bytes with a specific load base and callback.
-pub fn build_ws2_32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_ws2_32_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     let exports = ws2_32_exports();
     let mut bytes = build_stub_dll("ws2_32.dll", &exports, image_base);
-    patch_text_header(&mut bytes, syscall_entry, gs_table_ptr);
+    patch_text_header(
+        &mut bytes,
+        syscall_entry,
+        gs_table_ptr,
+        reverse_gs_table_ptr,
+    );
     bytes
 }
 
@@ -116,95 +168,154 @@ fn build_generic_stub(
     image_base: u64,
     syscall_entry: u64,
     gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
 ) -> Vec<u8> {
     let mut bytes = build_stub_dll(dll_name, exports, image_base);
-    patch_text_header(&mut bytes, syscall_entry, gs_table_ptr);
+    patch_text_header(
+        &mut bytes,
+        syscall_entry,
+        gs_table_ptr,
+        reverse_gs_table_ptr,
+    );
     bytes
 }
 
-pub fn build_crypt32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_crypt32_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     build_generic_stub(
         "crypt32.dll",
         &crypt32_exports(),
         image_base,
         syscall_entry,
         gs_table_ptr,
+        reverse_gs_table_ptr,
     )
 }
 
-pub fn build_iphlpapi_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_iphlpapi_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     build_generic_stub(
         "iphlpapi.dll",
         &iphlpapi_exports(),
         image_base,
         syscall_entry,
         gs_table_ptr,
+        reverse_gs_table_ptr,
     )
 }
 
-pub fn build_shell32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_shell32_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     build_generic_stub(
         "shell32.dll",
         &shell32_exports(),
         image_base,
         syscall_entry,
         gs_table_ptr,
+        reverse_gs_table_ptr,
     )
 }
 
-pub fn build_user32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_user32_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     build_generic_stub(
         "user32.dll",
         &user32_exports(),
         image_base,
         syscall_entry,
         gs_table_ptr,
+        reverse_gs_table_ptr,
     )
 }
 
-pub fn build_userenv_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_userenv_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     build_generic_stub(
         "userenv.dll",
         &userenv_exports(),
         image_base,
         syscall_entry,
         gs_table_ptr,
+        reverse_gs_table_ptr,
     )
 }
 
-pub fn build_winmm_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_winmm_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     build_generic_stub(
         "winmm.dll",
         &winmm_exports(),
         image_base,
         syscall_entry,
         gs_table_ptr,
+        reverse_gs_table_ptr,
     )
 }
 
-pub fn build_dbghelp_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_dbghelp_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     build_generic_stub(
         "dbghelp.dll",
         &dbghelp_exports(),
         image_base,
         syscall_entry,
         gs_table_ptr,
+        reverse_gs_table_ptr,
     )
 }
 
-pub fn build_ole32_for(image_base: u64, syscall_entry: u64, gs_table_ptr: u64) -> Vec<u8> {
+pub fn build_ole32_for(
+    image_base: u64,
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) -> Vec<u8> {
     build_generic_stub(
         "ole32.dll",
         &ole32_exports(),
         image_base,
         syscall_entry,
         gs_table_ptr,
+        reverse_gs_table_ptr,
     )
 }
 
-/// Write the callback pointer and GS table pointer into the raw DLL bytes
-/// at the file offsets corresponding to their RVAs.
-fn patch_text_header(bytes: &mut [u8], syscall_entry: u64, gs_table_ptr: u64) {
+/// Write the callback pointer, forward GS table pointer, and reverse GS table
+/// pointer into the raw DLL bytes at the file offsets corresponding to their RVAs.
+fn patch_text_header(
+    bytes: &mut [u8],
+    syscall_entry: u64,
+    gs_table_ptr: u64,
+    reverse_gs_table_ptr: u64,
+) {
     use crate::pe_parser::PeParsedFile;
     let parsed = PeParsedFile::parse(bytes).expect("stub DLL should be valid PE");
 
@@ -217,6 +328,11 @@ fn patch_text_header(bytes: &mut [u8], syscall_entry: u64, gs_table_ptr: u64) {
         .rva_to_file_offset(GS_TABLE_PTR_RVA)
         .expect("GS table pointer RVA must be in .text section");
     bytes[gs_off..gs_off + 8].copy_from_slice(&gs_table_ptr.to_le_bytes());
+
+    let rev_gs_off = parsed
+        .rva_to_file_offset(REVERSE_GS_TABLE_PTR_RVA)
+        .expect("reverse GS table pointer RVA must be in .text section");
+    bytes[rev_gs_off..rev_gs_off + 8].copy_from_slice(&reverse_gs_table_ptr.to_le_bytes());
 }
 
 /// Ntdll exports: one syscall stub per NT syscall number.

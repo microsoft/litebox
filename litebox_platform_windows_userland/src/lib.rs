@@ -2157,6 +2157,25 @@ exception_callback:
     jmp .Ldone
 
 interrupt_callback:
+    // Defensively swap GS to host. When reached via ThreadHandle::interrupt(),
+    // GS may still be the guest TEB because SetThreadContext only sets
+    // RIP/RSP/RBP without restoring GS.
+    rdgsbase r11
+    mov  rcx, QWORD PTR [rip + {GS_TABLE_BASE_PTR}]
+    test rcx, rcx
+    jz   .Lint_gs_done
+.Lint_gs_probe:
+    mov  rax, QWORD PTR [rcx]     // entry.guest_gs
+    test rax, rax
+    jz   .Lint_gs_done             // sentinel → GS is already host
+    cmp  rax, r11
+    je   .Lint_gs_found
+    add  rcx, 16
+    jmp  .Lint_gs_probe
+.Lint_gs_found:
+    mov  rax, QWORD PTR [rcx + 8] // entry.host_gs
+    wrgsbase rax
+.Lint_gs_done:
     mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {interrupt_handler}
     jmp .Ldone
@@ -2198,6 +2217,7 @@ DEFAULT_MXCSR:
     syscall_handler = sym syscall_handler,
     exception_handler = sym exception_handler,
     interrupt_handler = sym interrupt_handler,
+    GS_TABLE_BASE_PTR = sym GS_TABLE_BASE_PTR,
     TLS_INDEX = sym TLS_INDEX,
     HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
     HOST_BP = const core::mem::offset_of!(TlsState, host_bp),

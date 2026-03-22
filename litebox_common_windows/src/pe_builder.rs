@@ -33,21 +33,26 @@ use crate::pe::{
 
 /// Size of the data header reserved at the start of .text in stub DLLs.
 ///
-/// Layout (16 bytes):
+/// Layout (24 bytes):
 /// - `[0..8]`: callback pointer (address of `syscall_callback`)
-/// - `[8..16]`: GS lookup table pointer (address of the host-owned table)
+/// - `[8..16]`: forward GS table pointer (guest→host)
+/// - `[16..24]`: reverse GS table pointer (host→guest)
 ///
-/// The GS lookup table maps guest GS base → host GS base. It is allocated
-/// and owned by the platform (not in guest-writable memory). Each trampoline
-/// reads the table pointer from here, then does a linear scan to find the
-/// host GS base for the current thread's guest GS.
-pub const TEXT_HEADER_SIZE: usize = 16;
+/// The forward GS table maps guest GS base → host GS base. The reverse
+/// table maps host GS base → guest GS base. Both are allocated and owned
+/// by the platform (not in guest-writable memory). Each trampoline reads
+/// both table pointers so it can handle the case where GS is already the
+/// host TEB (e.g., after Windows kernel resets GS during APC/exception).
+pub const TEXT_HEADER_SIZE: usize = 24;
 
 /// RVA of the callback pointer within a stub DLL (offset 0 in .text).
 pub const CALLBACK_PTR_RVA: u32 = 0x1000;
 
-/// RVA of the GS lookup table pointer within a stub DLL (offset 8 in .text).
+/// RVA of the forward GS lookup table pointer within a stub DLL (offset 8 in .text).
 pub const GS_TABLE_PTR_RVA: u32 = 0x1008;
+
+/// RVA of the reverse GS lookup table pointer within a stub DLL (offset 16 in .text).
+pub const REVERSE_GS_TABLE_PTR_RVA: u32 = 0x1010;
 
 /// An export to include in the generated stub DLL.
 #[derive(Clone, Debug)]
@@ -63,26 +68,32 @@ pub struct StubExport {
 pub enum StubExportKind {
     /// A syscall stub that jumps to the platform's `syscall_callback`.
     ///
-    /// Generated code layout (60 bytes — see `emit_syscall_trampoline`):
+    /// Generated code layout (82 bytes — see `emit_syscall_trampoline`):
     /// ```text
     /// mov r10, rcx                   ;  3 — save arg0
     /// mov eax, <NR>                  ;  5 — syscall number
-    /// rdgsbase r11                   ;  5 — read guest GS
-    /// mov rcx, [rip + gs_table_ptr]  ;  7 — load GS table pointer
-    /// ; linear scan: find entry where guest_gs == r11
-    /// cmp qword [rcx], 0            ;  4 — sentinel check
-    /// je .miss                       ;  2 — empty slot → ud2
+    /// rdgsbase r11                   ;  5 — read current GS
+    /// mov rcx, [rip + fwd_gs_tbl]    ;  7 — load forward GS table pointer
+    /// ; Phase 1: forward scan (guest → host)
     /// cmp [rcx], r11                 ;  3 — match?
-    /// je .found                      ;  2 — yes → load host_gs
-    /// add rcx, 16                   ;  4 — next entry
-    /// jmp .probe                    ;  2 — loop
-    /// .found:
+    /// je .found_guest                ;  2 — yes → swap GS
+    /// add rcx, 16                    ;  4 — next entry
+    /// cmp qword [rcx], 0             ;  4 — sentinel?
+    /// jne .probe_fwd                 ;  2 — loop
+    /// ; Phase 2: reverse scan (host → guest) — GS may already be host
+    /// mov rcx, [rip + rev_gs_tbl]    ;  7 — load reverse GS table pointer
+    /// cmp [rcx], r11                 ;  3 — match?
+    /// je .already_host               ;  2 — yes → skip swap
+    /// add rcx, 16                    ;  4 — next entry
+    /// cmp qword [rcx], 0             ;  4 — sentinel?
+    /// jne .probe_rev                 ;  2 — loop
+    /// ud2                            ;  2 — no match → crash
+    /// .found_guest:
     /// mov rcx, [rcx + 8]            ;  4 — host_gs
     /// wrgsbase rcx                   ;  5 — restore host GS
+    /// .already_host:
     /// lea rcx, [rip + <ret>]        ;  7 — return address
     /// jmp qword [rip + callback]    ;  6 — jump to callback
-    /// .miss:
-    /// ud2                           ;  2 — hard fault
     /// ret                           ;  1 — (after callback resumes)
     /// ```
     SyscallTrampoline { syscall_nr: u32 },
@@ -197,9 +208,10 @@ pub fn build_stub_dll(dll_name: &str, exports: &[StubExport], image_base: u64) -
     sorted_exports.sort_by(|a, b| a.1.name.as_bytes().cmp(b.1.name.as_bytes()));
 
     // ---- Build .text section content (all function code) ----
-    // Reserve the first 16 bytes for the data header:
-    //   [0..8]  = callback pointer (patched before load)
-    //   [8..16] = host GS base     (patched before load)
+    // Reserve the first 24 bytes for the data header:
+    //   [0..8]   = callback pointer        (patched before load)
+    //   [8..16]  = forward GS table ptr    (patched before load)
+    //   [16..24] = reverse GS table ptr    (patched before load)
     let mut text_data = vec![0u8; TEXT_HEADER_SIZE];
 
     // Map from original export index → offset within .text
@@ -214,42 +226,34 @@ pub fn build_stub_dll(dll_name: &str, exports: &[StubExport], image_base: u64) -
 
         match &export.kind {
             StubExportKind::SyscallTrampoline { syscall_nr } => {
-                // Offsets are relative to stub_offset.
+                // Two-phase GS scan trampoline (82 bytes):
                 //
                 //  0: mov r10, rcx                          — 3
                 //  3: mov eax, <NR>                         — 5
-                //  8: rdgsbase r11    (guest GS = TEB VA)   — 5
-                // 13: mov rcx, [rip+disp] (GS table ptr)   — 7
-                // 20: cmp [rcx], r11  (.probe)              — 3
-                // 23: je .found (+12)                       — 2
+                //  8: rdgsbase r11                          — 5
+                // 13: mov rcx, [rip+disp] (fwd GS table)   — 7
+                //     === Phase 1: forward scan (guest → host) ===
+                // 20: cmp [rcx], r11  (.probe_fwd)          — 3
+                // 23: je .found_guest (+34 → 59)            — 2
                 // 25: add rcx, 16                           — 4
                 // 29: cmp qword [rcx], 0                    — 4
-                // 33: jne .probe (-15)                      — 2
-                // 35: ud2             (miss → crash)        — 2
-                // 37: mov rcx, [rcx+8] (.found: host_gs)   — 4
-                // 41: wrgsbase rcx                          — 5
-                // 46: lea rcx, [rip+6] (return addr)        — 7
-                // 53: jmp [rip+disp]   (callback)           — 6
-                // 59: ret                                   — 1
-                // Total: 60 bytes
-
-                // Trampoline layout (60 bytes):
-                //  0: mov r10, rcx                             — 3
-                //  3: mov eax, imm32                           — 5
-                //  8: rdgsbase r11                             — 5
-                // 13: mov rcx, [rip+disp] (GS table ptr)      — 7
-                // 20: cmp [rcx], r11  (.probe)                 — 3
-                // 23: je .found (+12 → 37)                     — 2
-                // 25: add rcx, 16                              — 4
-                // 29: cmp qword [rcx], 0                       — 4
-                // 33: jne .probe (-15 → 20)                    — 2
-                // 35: int3; int3  (miss → crash)               — 2
-                // 37: mov rcx, [rcx+8] (.found: host_gs)      — 4
-                // 41: wrgsbase rcx                             — 5
-                // 46: lea rcx, [rip+6] (return addr)           — 7
-                // 53: jmp [rip+disp]   (callback)              — 6
-                // 59: ret                                      — 1
-                // Total: 60 bytes
+                // 33: jne .probe_fwd (-15 → 20)             — 2
+                //     === Phase 2: reverse scan (host → guest) ===
+                // 35: mov rcx, [rip+disp] (rev GS table)   — 7
+                // 42: cmp [rcx], r11  (.probe_rev)          — 3
+                // 45: je .already_host (+21 → 68)           — 2
+                // 47: add rcx, 16                           — 4
+                // 51: cmp qword [rcx], 0                    — 4
+                // 55: jne .probe_rev (-15 → 42)             — 2
+                // 57: ud2             (miss → crash)        — 2
+                //     === found guest: swap GS ===
+                // 59: mov rcx, [rcx+8]  (.found_guest)     — 4
+                // 63: wrgsbase rcx                          — 5
+                //     === already_host: skip swap ===
+                // 68: lea rcx, [rip+6]  (.already_host)    — 7
+                // 75: jmp [rip+disp]    (callback)          — 6
+                // 81: ret                                   — 1
+                // Total: 82 bytes
 
                 //  0: mov r10, rcx  (49 89 CA)
                 text_data.extend_from_slice(&[0x49, 0x89, 0xCA]);
@@ -258,40 +262,54 @@ pub fn build_stub_dll(dll_name: &str, exports: &[StubExport], image_base: u64) -
                 text_data.extend_from_slice(&syscall_nr.to_le_bytes());
                 //  8: rdgsbase r11  (F3 49 0F AE CB)
                 text_data.extend_from_slice(&[0xF3, 0x49, 0x0F, 0xAE, 0xCB]);
-                // 13: mov rcx, [rip+disp32]  (48 8B 0D xx xx xx xx)
-                // disp = gs_table_ptr_offset - (stub_offset + 20)
-                //   where gs_table_ptr is at TEXT_HEADER_SIZE/2..TEXT_HEADER_SIZE = offset 8
-                let rip_after_mov_rcx = stub_offset + 20; // RIP after this 7-byte insn
-                let gs_ptr_file_offset = 8u32; // GS table ptr at byte 8 in .text
-                let mov_rcx_disp =
-                    (gs_ptr_file_offset as i32).wrapping_sub(rip_after_mov_rcx as i32);
+                // 13: mov rcx, [rip+disp32] — forward GS table ptr at byte 8
+                let rip_after_fwd_load = stub_offset + 20;
+                let fwd_gs_ptr_file_offset = 8u32;
+                let fwd_disp =
+                    (fwd_gs_ptr_file_offset as i32).wrapping_sub(rip_after_fwd_load as i32);
                 text_data.extend_from_slice(&[0x48, 0x8B, 0x0D]);
-                text_data.extend_from_slice(&mov_rcx_disp.to_le_bytes());
+                text_data.extend_from_slice(&fwd_disp.to_le_bytes());
                 // 20: cmp [rcx], r11  (4C 39 19)
                 text_data.extend_from_slice(&[0x4C, 0x39, 0x19]);
-                // 23: je .found (+12) → target is offset 37  (74 0C)
-                text_data.extend_from_slice(&[0x74, 0x0C]);
+                // 23: je .found_guest (+34 → 59)  (74 22)
+                text_data.extend_from_slice(&[0x74, 0x22]);
                 // 25: add rcx, 16  (48 83 C1 10)
                 text_data.extend_from_slice(&[0x48, 0x83, 0xC1, 0x10]);
                 // 29: cmp qword [rcx], 0  (48 83 39 00)
                 text_data.extend_from_slice(&[0x48, 0x83, 0x39, 0x00]);
-                // 33: jne .probe (-15) → target is offset 20  (75 F1)
-                // offset 35 + (-15) = 20. disp = 20 - 35 = -15 = 0xF1
+                // 33: jne .probe_fwd (-15 → 20)  (75 F1)
                 text_data.extend_from_slice(&[0x75, 0xF1]);
-                // 35: ud2 (miss → crash)
+                // 35: mov rcx, [rip+disp32] — reverse GS table ptr at byte 16
+                let rip_after_rev_load = stub_offset + 42;
+                let rev_gs_ptr_file_offset = 16u32;
+                let rev_disp =
+                    (rev_gs_ptr_file_offset as i32).wrapping_sub(rip_after_rev_load as i32);
+                text_data.extend_from_slice(&[0x48, 0x8B, 0x0D]);
+                text_data.extend_from_slice(&rev_disp.to_le_bytes());
+                // 42: cmp [rcx], r11  (4C 39 19)
+                text_data.extend_from_slice(&[0x4C, 0x39, 0x19]);
+                // 45: je .already_host (+21 → 68)  (74 15)
+                text_data.extend_from_slice(&[0x74, 0x15]);
+                // 47: add rcx, 16  (48 83 C1 10)
+                text_data.extend_from_slice(&[0x48, 0x83, 0xC1, 0x10]);
+                // 51: cmp qword [rcx], 0  (48 83 39 00)
+                text_data.extend_from_slice(&[0x48, 0x83, 0x39, 0x00]);
+                // 55: jne .probe_rev (-15 → 42)  (75 F1)
+                text_data.extend_from_slice(&[0x75, 0xF1]);
+                // 57: ud2 (miss → crash)
                 text_data.extend_from_slice(&[0x0F, 0x0B]);
-                // 37: mov rcx, [rcx+8]  (48 8B 49 08)
+                // 59: mov rcx, [rcx+8]  (48 8B 49 08)
                 text_data.extend_from_slice(&[0x48, 0x8B, 0x49, 0x08]);
-                // 41: wrgsbase rcx  (F3 48 0F AE D9)
+                // 63: wrgsbase rcx  (F3 48 0F AE D9)
                 text_data.extend_from_slice(&[0xF3, 0x48, 0x0F, 0xAE, 0xD9]);
-                // 46: lea rcx, [rip+6]  (48 8D 0D 06 00 00 00)
+                // 68: lea rcx, [rip+6]  (48 8D 0D 06 00 00 00)
                 text_data.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
-                // 53: jmp qword [rip+disp32] → callback ptr at offset 0
-                let rip_after_jmp = stub_offset + 59;
+                // 75: jmp qword [rip+disp32] → callback ptr at offset 0
+                let rip_after_jmp = stub_offset + 81;
                 let jmp_disp = 0i32.wrapping_sub(rip_after_jmp as i32);
                 text_data.extend_from_slice(&[0xFF, 0x25]);
                 text_data.extend_from_slice(&jmp_disp.to_le_bytes());
-                // 59: ret  (C3)
+                // 81: ret  (C3)
                 text_data.push(0xC3);
             }
             StubExportKind::ReturnStatus { status } => {
