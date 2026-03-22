@@ -42,30 +42,42 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
                 return NtStatus::STATUS_INFO_LENGTH_MISMATCH;
             }
             // Zero-fill then set key fields.
+            // Layout (x64, 64 bytes):
+            //   0x00 ULONG  Reserved
+            //   0x04 ULONG  TimerResolution
+            //   0x08 ULONG  PageSize
+            //   0x0C ULONG  NumberOfPhysicalPages
+            //   0x10 ULONG  LowestPhysicalPageNumber
+            //   0x14 ULONG  HighestPhysicalPageNumber
+            //   0x18 ULONG  AllocationGranularity
+            //   0x20 ULONG_PTR MinimumUserModeAddress  (8 bytes, 8-aligned)
+            //   0x28 ULONG_PTR MaximumUserModeAddress
+            //   0x30 KAFFINITY ActiveProcessorsAffinityMask
+            //   0x38 CCHAR  NumberOfProcessors
             unsafe {
                 core::ptr::write_bytes(info_ptr as *mut u8, 0, SBI_SIZE);
                 let base = info_ptr as *mut u8;
-                // TimerResolution at offset 0 (ULONG) — 100ns units, ~15.6ms
-                core::ptr::write(base.cast::<u32>(), 156250);
-                // PageSize at offset 4 (ULONG)
-                core::ptr::write(base.add(4).cast::<u32>(), 4096);
-                // NumberOfPhysicalPages at offset 8 (ULONG)
-                core::ptr::write(base.add(8).cast::<u32>(), 1048576); // ~4GB
-                // LowestPhysicalPageNumber at offset 12 (ULONG)
-                core::ptr::write(base.add(12).cast::<u32>(), 1);
-                // HighestPhysicalPageNumber at offset 16 (ULONG)
-                core::ptr::write(base.add(16).cast::<u32>(), 1048576);
-                // AllocationGranularity at offset 20 (ULONG)
-                core::ptr::write(base.add(20).cast::<u32>(), 65536);
-                // MinimumUserModeAddress at offset 24 (ULONG_PTR)
-                core::ptr::write(base.add(24).cast::<u64>(), 0x10000);
-                // MaximumUserModeAddress at offset 32 (ULONG_PTR)
-                core::ptr::write(base.add(32).cast::<u64>(), 0x7FFFFFFEFFFF);
-                // ActiveProcessorsAffinityMask at offset 40 (KAFFINITY)
-                // Must match ActiveProcessorCount in KUSD shadow (4).
-                core::ptr::write(base.add(40).cast::<u64>(), 0xF); // bits 0-3 for 4 CPUs
-                // NumberOfProcessors at offset 48 (CCHAR)
-                core::ptr::write(base.add(48), 4);
+                // offset 0x00: Reserved = 0 (already zero)
+                // offset 0x04: TimerResolution — 100ns units, ~15.6ms
+                core::ptr::write(base.add(0x04).cast::<u32>(), 156250);
+                // offset 0x08: PageSize
+                core::ptr::write(base.add(0x08).cast::<u32>(), 4096);
+                // offset 0x0C: NumberOfPhysicalPages (~4GB)
+                core::ptr::write(base.add(0x0C).cast::<u32>(), 1048576);
+                // offset 0x10: LowestPhysicalPageNumber
+                core::ptr::write(base.add(0x10).cast::<u32>(), 1);
+                // offset 0x14: HighestPhysicalPageNumber
+                core::ptr::write(base.add(0x14).cast::<u32>(), 1048576);
+                // offset 0x18: AllocationGranularity
+                core::ptr::write(base.add(0x18).cast::<u32>(), 65536);
+                // offset 0x20: MinimumUserModeAddress
+                core::ptr::write(base.add(0x20).cast::<u64>(), 0x10000);
+                // offset 0x28: MaximumUserModeAddress
+                core::ptr::write(base.add(0x28).cast::<u64>(), 0x7FFF_FFFE_FFFF);
+                // offset 0x30: ActiveProcessorsAffinityMask (4 CPUs)
+                core::ptr::write(base.add(0x30).cast::<u64>(), 0xF);
+                // offset 0x38: NumberOfProcessors
+                core::ptr::write(base.add(0x38), 4);
             }
             if return_length_ptr != 0 {
                 unsafe {
@@ -130,10 +142,7 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             }
             NtStatus::STATUS_SUCCESS
         }
-        // SystemBasicInformation extended (0x3E = 62). Same as class 0 but with a
-        // 4-byte reserved field prepended, shifting all other fields by 4 bytes.
-        // The heap manager reads AllocationGranularity and MaximumUserModeAddress
-        // from this structure to compute the initial heap reservation size.
+        // SystemBasicInformation extended (0x3E = 62). Same layout as class 0.
         0x3E => {
             const SBIE_SIZE: usize = 64;
             if (info_length as usize) < SBIE_SIZE || info_ptr == 0 {
@@ -147,28 +156,17 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             unsafe {
                 core::ptr::write_bytes(info_ptr as *mut u8, 0, SBIE_SIZE);
                 let base = info_ptr as *mut u8;
-                // offset 0: Reserved (ULONG) = 0
-                // offset 4: TimerResolution (ULONG)
-                core::ptr::write(base.add(4).cast::<u32>(), 156250);
-                // offset 8: PageSize (ULONG)
-                core::ptr::write(base.add(8).cast::<u32>(), 4096);
-                // offset 12: NumberOfPhysicalPages (ULONG) — ~4GB
-                core::ptr::write(base.add(12).cast::<u32>(), 1048576);
-                // offset 16: LowestPhysicalPageNumber (ULONG)
-                core::ptr::write(base.add(16).cast::<u32>(), 1);
-                // offset 20: HighestPhysicalPageNumber (ULONG)
-                core::ptr::write(base.add(20).cast::<u32>(), 1048576);
-                // offset 24: AllocationGranularity (ULONG)
-                core::ptr::write(base.add(24).cast::<u32>(), 65536);
-                // offset 32: MinimumUserModeAddress (ULONG_PTR)
-                core::ptr::write(base.add(32).cast::<u64>(), 0x10000);
-                // offset 40: MaximumUserModeAddress (ULONG_PTR)
-                core::ptr::write(base.add(40).cast::<u64>(), 0x7FFF_FFFE_FFFF);
-                // offset 48: ActiveProcessorsAffinityMask (KAFFINITY)
-                // Must match ActiveProcessorCount in KUSD shadow (4).
-                core::ptr::write(base.add(48).cast::<u64>(), 0xF); // bits 0-3 for 4 CPUs
-                // offset 56: NumberOfProcessors (CCHAR)
-                core::ptr::write(base.add(56), 4);
+                // Same layout as class 0 (see comments there).
+                core::ptr::write(base.add(0x04).cast::<u32>(), 156250);
+                core::ptr::write(base.add(0x08).cast::<u32>(), 4096);
+                core::ptr::write(base.add(0x0C).cast::<u32>(), 1048576);
+                core::ptr::write(base.add(0x10).cast::<u32>(), 1);
+                core::ptr::write(base.add(0x14).cast::<u32>(), 1048576);
+                core::ptr::write(base.add(0x18).cast::<u32>(), 65536);
+                core::ptr::write(base.add(0x20).cast::<u64>(), 0x10000);
+                core::ptr::write(base.add(0x28).cast::<u64>(), 0x7FFF_FFFE_FFFF);
+                core::ptr::write(base.add(0x30).cast::<u64>(), 0xF);
+                core::ptr::write(base.add(0x38), 4);
             }
             if return_length_ptr != 0 {
                 unsafe {
