@@ -4197,65 +4197,6 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         // ── Segment heap lazy context initialization fixup ──
         //
         // NOTE: This fixup is disabled because we disable the segment heap
-        // via FrontEndHeapDebugOptions=0x8 in NtQueryValueKey. The fixup
-        // was originally needed when the segment heap was active but its
-        // per-context areas weren't fully initialized. With the segment
-        // heap disabled, this code path should never be needed and its
-        // broad `fault_addr < 0x10000` check can cause false positives
-        // (e.g., a NULL deref in user32.dll would be misidentified as a
-        // heap context fault, causing a secondary crash on unrelated reads).
-        if false && info.exception == litebox::shim::Exception::PAGE_FAULT {
-            let raw_fault_addr = info.cr2;
-            if raw_fault_addr < 0x10000 {
-                let r13 = ctx.regs.r13 as usize;
-                if let Some((res_base, _)) = self.shared.process_state.va_reservation_at(r13) {
-                    let heap_ptr =
-                        unsafe { core::ptr::read_unaligned((res_base + 0x18) as *const u64) };
-                    let val_n = unsafe { core::ptr::read_unaligned((r13 + 0x18) as *const u64) };
-
-                    if heap_ptr != 0 && val_n == 0 {
-                        // (a) Initialise the per-context area.
-                        unsafe {
-                            core::ptr::write(r13 as *mut u64, 0);
-                            core::ptr::write((r13 + 0x08) as *mut u64, (r13 + 8) as u64);
-                            core::ptr::write((r13 + 0x10) as *mut u64, (r13 + 8) as u64);
-                            core::ptr::write((r13 + 0x18) as *mut u64, heap_ptr);
-                        }
-
-                        // (b) Copy HeapSegContexts entry from cage → heap.
-                        // context_index is already in EAX (loaded by the
-                        // preceding `movzx eax, word [r12+0xAC]`).
-                        let ctx_idx = ctx.regs.rax & 0xFFFF;
-                        let cage_hs = res_base + (ctx_idx * 8) as usize + 0x4A8;
-                        let heap_hs = heap_ptr as usize + (ctx_idx * 8) as usize + 0x4A8;
-                        let seg_ctx_ptr =
-                            unsafe { core::ptr::read_unaligned(cage_hs as *const u64) };
-                        if seg_ctx_ptr != 0 {
-                            unsafe {
-                                core::ptr::write(heap_hs as *mut u64, seg_ctx_ptr);
-                            }
-                        }
-
-                        // (c) Patch RCX (stale 0 from [R13+0x18]).
-                        ctx.regs.rcx = heap_ptr as usize;
-
-                        #[cfg(debug_assertions)]
-                        {
-                            use litebox::platform::DebugLogProvider as _;
-                            litebox_platform_multiplex::platform().debug_log_print(
-                                &alloc::format!(
-                                    "NT shim: segment-heap lazy init fixup \
-                                     R13=0x{r13:X} ctx_idx={ctx_idx} \
-                                     heap=0x{heap_ptr:X} seg_ctx=0x{seg_ctx_ptr:X}\n",
-                                ),
-                            );
-                        }
-                        return ContinueOperation::Resume;
-                    }
-                }
-            }
-        }
-
         // ── Forward unhandled guest exceptions to ntdll's ──
         // ── KiUserExceptionDispatcher (guest SEH chain)    ──
         //
