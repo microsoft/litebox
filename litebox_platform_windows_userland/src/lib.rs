@@ -2251,12 +2251,17 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
     /// Restores the full guest register state and jumps to the guest RIP
     /// entirely in user-mode — no kernel round-trip.
     ///
-    /// Technique: before popping registers, we stage the guest RIP at
-    /// `(guest_rsp - 8)` on the guest stack. The pop sequence restores
-    /// ALL GP registers (including RCX). After `popfq` and `pop rsp`,
-    /// we `lea rsp, [rsp - 8]` (flags-preserving) to point at the
-    /// staged RIP, then `ret` to jump there. This avoids the old
-    /// NtContinue kernel path which could lose our custom GS base.
+    /// GS is swapped to the guest TEB as late as possible (just 3
+    /// instructions before `ret`) to minimize the window where host code
+    /// runs with guest GS active. The technique:
+    ///
+    /// 1. Pre-stage guest_gs and guest_rip at `(guest_rsp - 16)` and
+    ///    `(guest_rsp - 8)` on the guest stack (while GS is still host).
+    /// 2. Pop ALL GP registers (GS remains host throughout).
+    /// 3. `popfq` + `pop rsp` to restore EFLAGS and RSP.
+    /// 4. `xchg rax, [rsp]` to get a scratch register (does not clobber flags).
+    /// 5. `wrgsbase` the pre-staged guest_gs value.
+    /// 6. `mov rax, [rsp]` to restore guest rax, `lea` to skip the gs slot, `ret`.
     #[unsafe(naked)]
     extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::ExecutionContext) -> ! {
         core::arch::naked_asm!(
@@ -2283,23 +2288,26 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
             ".Lguest_fp_restore_fxrstor:",
             "fxrstor64 [rcx + {FP_REGS_OFFSET}]",
             ".Lguest_fp_restore_done:",
-            // Restore guest GS base (if set) from the TlsState. GS still
-            // points to the host TEB here, so we can read the TLS slot.
-            // This must happen AFTER FP restore (so any fault sees host GS)
-            // and BEFORE we start restoring guest registers.
+            // Read guest_gs_base from TlsState. If zero (no GS swap needed),
+            // substitute the current host GS so wrgsbase at the end is a
+            // harmless identity operation. This avoids a flag-clobbering
+            // branch after popfq.
             "mov     r11, QWORD PTR [r11 + {GUEST_GS_BASE}]",
             "test    r11, r11",
-            "jz      2f",
-            "wrgsbase r11",
+            "jnz     2f",
+            "rdgsbase r11",            // keep host GS if guest_gs is 0
             "2:",
-            // Pre-stage: write guest RIP at (guest_rsp - 8) so we can
-            // restore ALL registers (including RCX) and use `ret` to
-            // jump to the guest. This does NOT modify the ExecutionContext,
-            // so it is idempotent and safe if an interrupt causes re-entry.
-            "mov     r11, QWORD PTR [rcx + {PT_RSP}]",
-            "mov     rax, QWORD PTR [rcx + {PT_RIP}]",
-            "mov     QWORD PTR [r11 - 8], rax",
-            // Load all registers from the guest context structure.
+            // Pre-stage: write guest_gs and guest_rip below guest_rsp.
+            // Layout: [guest_gs @ rsp-16] [guest_rip @ rsp-8]
+            // This does NOT modify the ExecutionContext, so it is idempotent
+            // and safe if an interrupt causes re-entry.
+            "mov     rax, QWORD PTR [rcx + {PT_RSP}]",
+            "mov     QWORD PTR [rax - 16], r11",          // guest_gs (or host_gs)
+            "mov     r11, QWORD PTR [rcx + {PT_RIP}]",
+            "mov     QWORD PTR [rax - 8], r11",           // guest_rip
+            // Load all GP registers from the guest context structure.
+            // GS is still host TEB throughout — immune to kernel preemption
+            // resetting GS to the thread's official TEB.
             "mov rsp, rcx",
             "pop r15",
             "pop r14",
@@ -2318,9 +2326,18 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
             "pop rdi",
             "add rsp, 24",   // skip orig_rax + rip + cs
             "popfq",
-            "pop rsp",                        // rsp = guest_rsp
-            "lea rsp, QWORD PTR [rsp - 8]",  // rsp = guest_rsp - 8 (no flags clobber)
-            "ret",                            // pop staged RIP → guest, rsp = guest_rsp
+            "pop rsp",                         // rsp = guest_rsp
+            // Swap GS to guest as late as possible. The pre-staged guest_gs
+            // is at (guest_rsp - 16). We use xchg to borrow rax as a scratch
+            // without clobbering EFLAGS or writing below guest_rsp - 16.
+            // xchg with memory has an implicit LOCK prefix (atomic + fence)
+            // but does NOT affect any flags.
+            "lea rsp, QWORD PTR [rsp - 16]",  // rsp → [guest_gs] [guest_rip]
+            "xchg rax, QWORD PTR [rsp]",      // rax = guest_gs, [rsp] = guest_rax
+            "wrgsbase rax",                    // GS = guest TEB (no flags clobber)
+            "mov  rax, QWORD PTR [rsp]",      // rax = guest_rax (no flags clobber)
+            "lea rsp, QWORD PTR [rsp + 8]",   // skip guest_gs → rsp points at guest_rip
+            "ret",                             // pop guest_rip, rsp = guest_rsp
             "switch_to_guest_end:",
             FP_REGS_OFFSET = const core::mem::offset_of!(litebox_common_linux::ExecutionContext, fp_regs),
             TLS_INDEX = sym TLS_INDEX,
