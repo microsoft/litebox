@@ -697,6 +697,11 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             }
             Ok(data.to_vec())
         }
+        Err(litebox_syscall_rewriter::Error::UnsupportedBunExecutable) => bail!(
+            "{} is a Bun-packaged executable and cannot be packaged as-is: \
+             tar-loaded programs must already contain LiteBox syscall trampolines",
+            path.display()
+        ),
         Err(litebox_syscall_rewriter::Error::NoTextSectionFound) => {
             if verbose {
                 eprintln!(
@@ -743,4 +748,21 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
 
     builder.finish().context("failed to finalize tar archive")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_elf;
+    use std::path::Path;
+
+    #[test]
+    fn rewrite_elf_rejects_bun_packaged_executables() {
+        let mut bun_binary = b"\x7fELF".to_vec();
+        bun_binary.extend_from_slice(b"\n---- Bun! ----\n");
+
+        let error = rewrite_elf(&bun_binary, Path::new("/tmp/claude"), false)
+            .expect_err("bun-packaged executable should not be packaged as-is");
+
+        assert!(error.to_string().contains("Bun-packaged executable"));
+    }
 }

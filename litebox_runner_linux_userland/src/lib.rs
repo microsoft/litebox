@@ -153,6 +153,59 @@ fn resolve_host_program_path(path: &str) -> PathBuf {
     std::fs::canonicalize(&abs).unwrap_or(abs)
 }
 
+fn initial_exec_path(cli_args: &CliArgs) -> PathBuf {
+    if cli_args.program_from_tar {
+        PathBuf::from(&cli_args.program_and_arguments[0])
+    } else if cli_args.nine_p_broker.is_some() {
+        // When the lower 9P filesystem is active, preserve the original execve
+        // pathname so the guest sees the same launcher path in argv[0] /
+        // AT_EXECFN that the user invoked on the host. The guest open path can
+        // still follow symlinks to the real binary.
+        PathBuf::from(&cli_args.program_and_arguments[0])
+    } else {
+        resolve_host_program_path(&cli_args.program_and_arguments[0])
+    }
+}
+
+fn load_program_path(cli_args: &CliArgs) -> PathBuf {
+    if cli_args.program_from_tar {
+        PathBuf::from(&cli_args.program_and_arguments[0])
+    } else {
+        resolve_host_program_path(&cli_args.program_and_arguments[0])
+    }
+}
+
+fn initial_program_data(
+    file: MmappedFile,
+    rewrite_syscalls: bool,
+    cow_eligible_regions: &mut Vec<MmappedFile>,
+    program_path: &Path,
+) -> Result<alloc::borrow::Cow<'static, [u8]>> {
+    if rewrite_syscalls {
+        match litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None) {
+            Ok(data) => Ok(data.into()),
+            Err(litebox_syscall_rewriter::Error::UnsupportedBunExecutable) => {
+                eprintln!(
+                    "warning: skipping --rewrite-syscalls for Bun-packaged executable {}; \
+                     falling back to loader-time rewriting",
+                    program_path.display()
+                );
+                let data = file.data.into();
+                cow_eligible_regions.push(file);
+                Ok(data)
+            }
+            Err(err) => Err(anyhow!(
+                "failed to rewrite program {}: {err}",
+                program_path.display()
+            )),
+        }
+    } else {
+        let data = file.data.into();
+        cow_eligible_regions.push(file);
+        Ok(data)
+    }
+}
+
 /// Run Linux programs with LiteBox on unmodified Linux
 ///
 /// # Panics
@@ -221,15 +274,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 })
                 .collect();
             let file = mmapped_file(&prog)?;
-            let data = if cli_args.rewrite_syscalls {
-                litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
-                    .unwrap()
-                    .into()
-            } else {
-                let data = file.data.into();
-                cow_eligible_regions.push(file);
-                data
-            };
+            let data = initial_program_data(
+                file,
+                cli_args.rewrite_syscalls,
+                &mut cow_eligible_regions,
+                &prog,
+            )?;
             (modes, Some(data))
         }
     };
@@ -381,14 +431,17 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
 ) -> Result<()> {
     let platform = litebox_platform_multiplex::platform();
 
-    let exec_prog = if cli_args.program_from_tar {
-        PathBuf::from(&cli_args.program_and_arguments[0])
-    } else {
-        resolve_host_program_path(&cli_args.program_and_arguments[0])
-    };
-    let prog_path = exec_prog.to_str().ok_or_else(|| {
+    let load_prog = load_program_path(cli_args);
+    let load_prog_path = load_prog.to_str().ok_or_else(|| {
         anyhow!(
             "Could not convert program path {:?} to a string",
+            cli_args.program_and_arguments[0]
+        )
+    })?;
+    let exec_prog = initial_exec_path(cli_args);
+    let exec_prog_path = exec_prog.to_str().ok_or_else(|| {
+        anyhow!(
+            "Could not convert exec filename {:?} to a string",
             cli_args.program_and_arguments[0]
         )
     })?;
@@ -419,7 +472,16 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
     // If a 9P broker is requested, build shim → start network → connect 9P → layer FS.
     // The FS type differs between branches, so each must build its own shim and run.
     if cli_args.nine_p_broker.is_some() {
-        finish_run_with_nine_p(shim_builder, fs, cli_args, platform, prog_path, argv, envp)
+        finish_run_with_nine_p(
+            shim_builder,
+            fs,
+            cli_args,
+            platform,
+            load_prog_path,
+            exec_prog_path,
+            argv,
+            envp,
+        )
     } else {
         let initial_file_system = std::sync::Arc::new(fs);
         let shim = shim_builder.build();
@@ -427,10 +489,11 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let net_worker = start_network_worker(&shim, &shutdown);
 
-        let program = shim.load_program(
+        let program = shim.load_program_with_exec_filename(
             initial_file_system,
             platform.init_task(),
-            prog_path,
+            load_prog_path,
+            exec_prog_path,
             argv,
             envp,
             cli_args.working_directory.clone(),
@@ -475,7 +538,8 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     base_fs: FS,
     cli_args: &CliArgs,
     platform: &litebox_platform_multiplex::Platform,
-    prog_path: &str,
+    load_prog_path: &str,
+    exec_prog_path: &str,
     argv: Vec<alloc::ffi::CString>,
     envp: Vec<alloc::ffi::CString>,
 ) -> Result<()> {
@@ -514,10 +578,11 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         );
         let combined_fs = std::sync::Arc::new(combined);
 
-        let program = shim.load_program(
+        let program = shim.load_program_with_exec_filename(
             combined_fs,
             platform.init_task(),
-            prog_path,
+            load_prog_path,
+            exec_prog_path,
             argv,
             envp,
             cli_args.working_directory.clone(),
@@ -583,10 +648,11 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     );
     let combined_fs = std::sync::Arc::new(combined);
 
-    let program = shim.load_program(
+    let program = shim.load_program_with_exec_filename(
         combined_fs,
         platform.init_task(),
-        prog_path,
+        load_prog_path,
+        exec_prog_path,
         argv,
         envp,
         cli_args.working_directory.clone(),
@@ -709,6 +775,149 @@ fn connect_to_broker_ipc(path: &str) -> Result<std::os::fd::OwnedFd> {
     perform_ipc_handshake(&fd)?;
 
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cli_args(program: &str) -> CliArgs {
+        CliArgs {
+            program_and_arguments: vec![program.to_string()],
+            environment_variables: vec![],
+            forward_environment_variables: false,
+            unstable: false,
+            insert_files: vec![],
+            initial_files: None,
+            rewrite_syscalls: false,
+            interception_backend: InterceptionBackend::Rewriter,
+            tun_device_name: None,
+            network_broker: None,
+            program_from_tar: false,
+            nine_p_broker: None,
+            working_directory: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_exec_path_canonicalizes_without_nine_p() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "litebox-runner-initial-exec-path-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let real = base.join("real-binary");
+        let launcher = base.join("launcher");
+        std::fs::write(&real, b"test").unwrap();
+        symlink(&real, &launcher).unwrap();
+
+        let cli = test_cli_args(launcher.to_str().unwrap());
+        assert_eq!(
+            initial_exec_path(&cli),
+            std::fs::canonicalize(&real).unwrap()
+        );
+
+        let _ = std::fs::remove_file(&launcher);
+        let _ = std::fs::remove_file(&real);
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_exec_path_preserves_launcher_with_nine_p() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "litebox-runner-initial-exec-path-9p-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let real = base.join("real-binary");
+        let launcher = base.join("launcher");
+        std::fs::write(&real, b"test").unwrap();
+        symlink(&real, &launcher).unwrap();
+
+        let mut cli = test_cli_args(launcher.to_str().unwrap());
+        cli.nine_p_broker = Some("/tmp/litebox-broker.sock".to_string());
+        assert_eq!(initial_exec_path(&cli), launcher);
+
+        let _ = std::fs::remove_file(base.join("launcher"));
+        let _ = std::fs::remove_file(base.join("real-binary"));
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_program_path_canonicalizes_with_nine_p_for_relative_launcher() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "litebox-runner-load-program-path-9p-{}-{unique}",
+            std::process::id()
+        ));
+        let guest_cwd = std::env::temp_dir().join(format!(
+            "litebox-runner-load-program-path-cwd-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&guest_cwd).unwrap();
+        let real = base.join("real-binary");
+        let launcher = base.join("launcher");
+        std::fs::write(&real, b"test").unwrap();
+        symlink(&real, &launcher).unwrap();
+
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&base).unwrap();
+
+        let mut cli = test_cli_args("./launcher");
+        cli.nine_p_broker = Some("/tmp/litebox-broker.sock".to_string());
+        cli.working_directory = Some(guest_cwd.to_string_lossy().into_owned());
+
+        assert_eq!(initial_exec_path(&cli), PathBuf::from("./launcher"));
+        assert_eq!(
+            load_program_path(&cli),
+            std::fs::canonicalize(&real).unwrap()
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        let _ = std::fs::remove_file(&launcher);
+        let _ = std::fs::remove_file(&real);
+        let _ = std::fs::remove_dir(&base);
+        let _ = std::fs::remove_dir(&guest_cwd);
+    }
+
+    #[test]
+    fn initial_program_data_falls_back_for_bun_executable() {
+        static BUN_BYTES: &[u8] = b"not-elf\n---- Bun! ----\n";
+
+        let mut cow_regions = Vec::new();
+        let file = MmappedFile {
+            data: BUN_BYTES,
+            abs_path: PathBuf::from("/tmp/fake-bun"),
+        };
+
+        let data =
+            initial_program_data(file, true, &mut cow_regions, Path::new("/tmp/fake-bun")).unwrap();
+
+        assert_eq!(&*data, BUN_BYTES);
+        assert_eq!(cow_regions.len(), 1);
+        assert_eq!(cow_regions[0].abs_path, PathBuf::from("/tmp/fake-bun"));
+    }
 }
 
 /// Open a dedicated 9P channel to the broker via Unix domain socket and

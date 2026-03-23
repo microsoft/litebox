@@ -3385,55 +3385,6 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             Some(event_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
         };
-        #[cfg(feature = "trace_syscalls")]
-        if let Some(event) = event {
-            let events_bits = event.events;
-            let data = event.data;
-            let event_ptr = event_ptr.as_usize();
-            let raw = crate::ConstPtr::<u8>::from_usize(event_ptr)
-                .to_owned_slice(core::mem::size_of::<litebox_common_linux::EpollEvent>())
-                .map(|bytes| alloc::vec::Vec::from(bytes));
-            let last_syscall = self.last_syscall.get();
-            let entry_rip = last_syscall.map(|sys| sys.entry_rip);
-            let stack_pointer = last_syscall.map(|sys| sys.entry_rsp);
-            let code = entry_rip.and_then(|rip| {
-                crate::ConstPtr::<u8>::from_usize(rip.saturating_sub(0x40))
-                    .to_owned_slice(0x60)
-                    .map(|bytes| alloc::vec::Vec::from(bytes))
-            });
-            let trampoline_target = entry_rip.and_then(|rip| {
-                let jmp_addr = rip.checked_sub(7)?;
-                let raw = crate::ConstPtr::<u8>::from_usize(jmp_addr).to_owned_slice(5)?;
-                if raw.first().copied()? != 0xE9 {
-                    return None;
-                }
-                let disp = i32::from_le_bytes(raw[1..5].try_into().ok()?);
-                Some(jmp_addr.wrapping_add(5).wrapping_add_signed(disp as isize))
-            });
-            let trampoline = trampoline_target.and_then(|addr| {
-                crate::ConstPtr::<u8>::from_usize(addr)
-                    .to_owned_slice(0x30)
-                    .map(|bytes| alloc::vec::Vec::from(bytes))
-            });
-            litebox::log_println!(
-                self.global.platform,
-                "[TRACE-EPOLL-CTL] pid={} tid={} epfd={} op={:?} fd={} event_ptr={:#x} rsp={:#x?} events={:#x} data={:#x} rip={:#x?} target={:#x?} raw={:x?} code={:x?} tramp={:x?}",
-                self.pid,
-                self.tid,
-                epfd,
-                op,
-                fd,
-                event_ptr,
-                stack_pointer,
-                events_bits,
-                data,
-                entry_rip,
-                trampoline_target,
-                raw,
-                code,
-                trampoline,
-            );
-        }
         let handle = self
             .global
             .litebox
@@ -3524,28 +3475,6 @@ impl<FS: ShimFS> Task<FS> {
                 maxevents,
             ) {
                 Ok(epoll_events) => {
-                    #[cfg(feature = "trace_syscalls")]
-                    if !epoll_events.is_empty() {
-                        let sample: alloc::vec::Vec<(u32, u64)> = epoll_events
-                            .iter()
-                            .take(4)
-                            .map(|event| {
-                                let events_bits = event.events;
-                                let data = event.data;
-                                (events_bits, data)
-                            })
-                            .collect();
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[TRACE-EPOLL-WAIT] pid={} tid={} epfd={} ready={} events_ptr={:#x} sample={:?}",
-                            self.pid,
-                            self.tid,
-                            epfd,
-                            epoll_events.len(),
-                            events.as_usize(),
-                            sample,
-                        );
-                    }
                     if !epoll_events.is_empty() {
                         events
                             .copy_from_slice(0, &epoll_events)

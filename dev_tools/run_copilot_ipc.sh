@@ -51,6 +51,16 @@ fi
 
 STARTED_BROKER=false
 
+# Clean up broker on exit (only if we started it).
+cleanup() {
+    if [ "$STARTED_BROKER" = true ] && [ -n "${BROKER_PID:-}" ]; then
+        kill "$BROKER_PID" 2>/dev/null || true
+        wait "$BROKER_PID" 2>/dev/null || true
+        rm -f "$BROKER_SOCK"
+    fi
+}
+trap cleanup EXIT
+
 if [ -S "$BROKER_SOCK" ]; then
     [ "${DEBUG:-}" = "1" ] && echo "Using existing broker at $BROKER_SOCK"
 else
@@ -84,16 +94,6 @@ else
         exit 1
     fi
 fi
-
-# Clean up broker on exit (only if we started it).
-cleanup() {
-    if [ "$STARTED_BROKER" = true ] && [ -n "${BROKER_PID:-}" ]; then
-        kill "$BROKER_PID" 2>/dev/null || true
-        wait "$BROKER_PID" 2>/dev/null || true
-        rm -f "$BROKER_SOCK"
-    fi
-}
-trap cleanup EXIT
 
 # Run the guest with IPC networking.
 "$RUNNER" -Z \

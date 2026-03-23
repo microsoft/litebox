@@ -295,6 +295,19 @@ impl<FS: ShimFS> LinuxShim<FS> {
         envp: Vec<alloc::ffi::CString>,
         initial_cwd: Option<alloc::string::String>,
     ) -> Result<LoadedProgram<FS>, loader::elf::ElfLoaderError> {
+        self.load_program_with_exec_filename(fs, task, path, path, argv, envp, initial_cwd)
+    }
+
+    pub fn load_program_with_exec_filename(
+        &self,
+        fs: alloc::sync::Arc<FS>,
+        task: litebox_common_linux::TaskParams,
+        path: &str,
+        exec_filename: &str,
+        argv: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
+        initial_cwd: Option<alloc::string::String>,
+    ) -> Result<LoadedProgram<FS>, loader::elf::ElfLoaderError> {
         let litebox_common_linux::TaskParams {
             pid,
             ppid,
@@ -343,7 +356,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 deferred_vfork_park: Cell::new(false),
             },
         };
-        let exec_filename = alloc::ffi::CString::new(path).ok();
+        let exec_filename = alloc::ffi::CString::new(exec_filename).ok();
         let (resolved_path, argv) = entrypoints
             .task
             .resolve_shebang_program(path, argv)

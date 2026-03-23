@@ -3262,7 +3262,6 @@ impl<FS: ShimFS> Task<FS> {
             self.pid,
             path,
         );
-
         // Copy argv and envp vectors
         let argv_vec = if argv.as_usize() == 0 {
             alloc::vec::Vec::new()

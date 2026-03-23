@@ -1,12 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::session::allocate_session_id;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod tests;
 
@@ -55,6 +55,26 @@ pub enum InterceptionBackend {
     Rewriter,
 }
 
+fn rewrite_program_bytes(data: &[u8], path: &Path) -> Result<Vec<u8>> {
+    match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
+        Ok(rewritten) => Ok(rewritten),
+        Err(litebox_syscall_rewriter::Error::UnsupportedBunExecutable) => anyhow::bail!(
+            "{} is a Bun-packaged executable, and this runner requires a LiteBox trampoline to load it; Bun-packaged executables are unsupported here",
+            path.display()
+        ),
+        Err(e) => Err(e).with_context(|| format!("failed to rewrite {}", path.display())),
+    }
+}
+
+fn load_program_data(path: &Path, rewrite_syscalls: bool) -> Result<Vec<u8>> {
+    let data = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if rewrite_syscalls {
+        rewrite_program_bytes(&data, path)
+    } else {
+        Ok(data)
+    }
+}
+
 /// Test OP-TEE TAs with LiteBox on unmodified Linux
 ///
 /// # Panics
@@ -63,25 +83,10 @@ pub enum InterceptionBackend {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
-    let ldelf_data: Vec<u8> = {
-        let ldelf = PathBuf::from(&cli_args.ldelf);
-        let data = std::fs::read(ldelf).unwrap();
-        if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
-        } else {
-            data
-        }
-    };
-
-    let prog_data: Vec<u8> = {
-        let prog = PathBuf::from(&cli_args.program);
-        let data = std::fs::read(prog).unwrap();
-        if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
-        } else {
-            data
-        }
-    };
+    let ldelf = PathBuf::from(&cli_args.ldelf);
+    let ldelf_data = load_program_data(&ldelf, cli_args.rewrite_syscalls)?;
+    let prog = PathBuf::from(&cli_args.program);
+    let prog_data = load_program_data(&prog, cli_args.rewrite_syscalls)?;
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     //

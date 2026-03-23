@@ -118,6 +118,28 @@ This produces `/tmp/copilot_ustar.tar` by default. Use `-o path` to change the o
 
 All arguments after the script name are passed directly to `copilot`.
 
+### 8. Run Claude Code (IPC helper)
+
+```bash
+# Show help
+./dev_tools/run_claude_ipc.sh --help
+
+# One-shot prompt
+./dev_tools/run_claude_ipc.sh -p "Print exactly OK and exit." \
+  --dangerously-skip-permissions --output-format text
+```
+
+Unlike Copilot, Claude runs directly from the host over 9P, so no tar step is
+needed. The helper creates a private per-run temp directory, refreshes a
+writable sandbox home there from host `~/.claude` and `~/.claude.json`, then
+points `HOME` and the XDG directories at that private copy. It forwards only a
+small allowlist of non-secret host environment variables by default, while
+leaving extra forwarding opt-in via `CLAUDE_FORWARD_ENV`. This keeps the broker
+read-only for the rest of the host filesystem while still allowing Claude to
+update its auth/session state. For safety, `run_claude_ipc.sh` only allows
+`SANDBOX_HOME` and `BROKER_SOCK` overrides that stay inside its fresh private
+run directory, and it refuses a pre-existing broker socket path.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -126,6 +148,9 @@ All arguments after the script name are passed directly to `copilot`.
 | `TUN_DEVICE` | `tun99` | TUN device name |
 | `BROKER_ADDR` | `10.0.0.1:5640` | 9P broker address |
 | `SANDBOX_CWD` | `$(pwd)` | Working directory inside the sandbox |
+| `SANDBOX_HOME` | tool-specific | Sandbox home directory used by IPC helpers; `run_claude_ipc.sh` requires it to stay under its private run dir |
+| `BROKER_SOCK` | tool-specific | Unix socket path for IPC broker helpers; `run_claude_ipc.sh` requires a fresh path under its private run dir |
+| `CLAUDE_FORWARD_ENV` | empty | Extra host env var names to pass through in `run_claude_ipc.sh` |
 
 ## Script Reference
 
@@ -134,3 +159,5 @@ All arguments after the script name are passed directly to `copilot`.
 | `setup_tun_nat.sh` | Creates/destroys TUN device with NAT and DNS forwarding |
 | `create_tar_for_copilot.sh` | Packages Copilot and dependencies into a sandbox tar |
 | `run_copilot.sh` | Launches Copilot inside the litebox sandbox |
+| `run_copilot_ipc.sh` | Launches Copilot inside the litebox sandbox over IPC |
+| `run_claude_ipc.sh` | Launches Claude Code inside the litebox sandbox over IPC |

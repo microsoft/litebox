@@ -13,6 +13,17 @@ use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+#[test]
+fn rewrite_program_bytes_reports_bun_executables_without_panicking() {
+    let mut bun_binary = b"\x7fELF".to_vec();
+    bun_binary.extend_from_slice(b"\n---- Bun! ----\n");
+
+    let error = super::rewrite_program_bytes(&bun_binary, std::path::Path::new("/tmp/claude"))
+        .expect_err("bun-packaged executables should return a normal error");
+
+    assert!(error.to_string().contains("Bun-packaged executable"));
+}
+
 /// Run the loaded TA with a sequence of test commands
 pub fn run_ta_with_test_commands(
     shim: &litebox_shim_optee::OpteeShim,

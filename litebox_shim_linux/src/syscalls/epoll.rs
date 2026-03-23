@@ -212,7 +212,9 @@ impl<FS: ShimFS> EpollFile<FS> {
         {
             // At least one descriptor requires periodic host polling (e.g.
             // stdin). Re-scan all interests with a short timeout to detect
-            // host-side readiness changes.
+            // host-side readiness changes, but also wait on the ready set so
+            // observer-driven wakeups (e.g. eventfd) are not delayed until the
+            // next poll tick.
             const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(50);
             loop {
                 // Re-poll every interest — this calls check_io_events()
@@ -238,8 +240,16 @@ impl<FS: ShimFS> EpollFile<FS> {
                 // Sleep up to POLL_INTERVAL or until an observer fires or
                 // the caller's deadline arrives, whichever is sooner.
                 let poll_cx = cx.with_timeout(Some(POLL_INTERVAL));
-                match poll_cx.sleep() {
-                    WaitError::TimedOut => {
+                match self.ready.pollee.wait(&poll_cx, false, Events::IN, || {
+                    self.ready.pop_multiple(global, fs, maxevents, &mut events);
+                    if events.is_empty() {
+                        return Err(TryOpError::<Infallible>::TryAgain);
+                    }
+                    Ok(())
+                }) {
+                    Ok(()) => return Ok(events),
+                    Err(TryOpError::TryAgain) => unreachable!(),
+                    Err(TryOpError::WaitError(WaitError::TimedOut)) => {
                         // If the caller's deadline has passed, propagate.
                         if cx
                             .deadline()
@@ -249,7 +259,10 @@ impl<FS: ShimFS> EpollFile<FS> {
                         }
                         // Otherwise it was just our poll interval — continue.
                     }
-                    WaitError::Interrupted => return Err(WaitError::Interrupted),
+                    Err(TryOpError::WaitError(WaitError::Interrupted)) => {
+                        return Err(WaitError::Interrupted);
+                    }
+                    Err(TryOpError::Other(infallible)) => match infallible {},
                 }
             }
         } else {
@@ -752,12 +765,15 @@ impl Observer<Events> for PollEntryObserver {
 
 #[cfg(test)]
 mod test {
+    use core::sync::atomic::{AtomicBool, Ordering};
     use core::time::Duration;
 
     use alloc::sync::Arc;
     use litebox::event::Events;
     use litebox::event::wait::WaitState;
+    use litebox::platform::RawConstPointer as _;
     use litebox::platform::TimeProvider as _;
+    use litebox::utils::TruncateExt as _;
     use litebox_common_linux::{
         ClockId, EfdFlags, EpollEvent, ItimerSpec, TimerfdFlags, TimerfdTimerFlags,
     };
@@ -896,6 +912,288 @@ mod test {
             )
             .unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_epoll_with_eventfd_and_timerfd() {
+        let (task, epoll, fs) = setup_epoll();
+
+        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
+
+        let timerfd = crate::syscalls::eventfd::EventFile::new_timer(
+            platform(),
+            platform().now(),
+            ClockId::Monotonic,
+            TimerfdFlags::empty(),
+        );
+        let timerfd = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(timerfd);
+
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(eventfd_raw) = files.insert_raw_fd(eventfd) else {
+            unreachable!()
+        };
+        let Ok(timerfd_raw) = files.insert_raw_fd(timerfd) else {
+            unreachable!()
+        };
+
+        let eventfd_desc = super::EpollDescriptor::try_from(&files, eventfd_raw).unwrap();
+        epoll
+            .add_interest(
+                &task.global,
+                &*fs,
+                12,
+                &eventfd_desc,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 12,
+                },
+            )
+            .unwrap();
+
+        let timerfd_desc = super::EpollDescriptor::try_from(&files, timerfd_raw).unwrap();
+        epoll
+            .add_interest(
+                &task.global,
+                &*fs,
+                13,
+                &timerfd_desc,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 13,
+                },
+            )
+            .unwrap();
+
+        {
+            let global = task.global.clone();
+            let files = Arc::clone(&files);
+            std::thread::spawn(move || {
+                std::thread::sleep(core::time::Duration::from_millis(10));
+                let typed = files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd_raw)
+                    .unwrap();
+                let _ = global
+                    .litebox
+                    .descriptor_table()
+                    .with_entry(&typed, |entry| {
+                        entry.write(&WaitState::new(platform()).context(), 1)
+                    });
+            });
+        }
+
+        let events = epoll
+            .wait(
+                &task.global,
+                &*fs,
+                &WaitState::new(platform())
+                    .context()
+                    .with_timeout(core::time::Duration::from_secs(1)),
+                1024,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        let data = event.data;
+        let events_bits = event.events;
+        assert_eq!(data, 12);
+        assert_eq!(events_bits, Events::IN.bits());
+    }
+
+    #[test]
+    fn test_epoll_with_host_poll_and_spurious_wakes() {
+        let (task, epoll, fs) = setup_epoll();
+
+        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
+
+        let timerfd = crate::syscalls::eventfd::EventFile::new_timer(
+            platform(),
+            platform().now(),
+            ClockId::Monotonic,
+            TimerfdFlags::empty(),
+        );
+        let timerfd = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(timerfd);
+
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(eventfd_raw) = files.insert_raw_fd(eventfd) else {
+            unreachable!()
+        };
+        let Ok(timerfd_raw) = files.insert_raw_fd(timerfd) else {
+            unreachable!()
+        };
+
+        let eventfd_desc = super::EpollDescriptor::try_from(&files, eventfd_raw).unwrap();
+        epoll
+            .add_interest(
+                &task.global,
+                &*fs,
+                12,
+                &eventfd_desc,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 12,
+                },
+            )
+            .unwrap();
+
+        let timerfd_desc = super::EpollDescriptor::try_from(&files, timerfd_raw).unwrap();
+        epoll
+            .add_interest(
+                &task.global,
+                &*fs,
+                13,
+                &timerfd_desc,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 13,
+                },
+            )
+            .unwrap();
+
+        let wait_state = WaitState::new(platform());
+        let waiter_waker = wait_state.context().waker().clone();
+        let stop_spurious_wakes = Arc::new(AtomicBool::new(false));
+
+        let spurious_waker = {
+            let stop_spurious_wakes = Arc::clone(&stop_spurious_wakes);
+            std::thread::spawn(move || {
+                while !stop_spurious_wakes.load(Ordering::Relaxed) {
+                    waiter_waker.wake();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+
+        let writer = {
+            let global = task.global.clone();
+            let files = Arc::clone(&files);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                let typed = files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd_raw)
+                    .unwrap();
+                let _ = global
+                    .litebox
+                    .descriptor_table()
+                    .with_entry(&typed, |entry| {
+                        entry.write(&WaitState::new(platform()).context(), 1)
+                    });
+            })
+        };
+
+        let events = epoll
+            .wait(
+                &task.global,
+                &*fs,
+                &wait_state
+                    .context()
+                    .with_timeout(Duration::from_millis(200)),
+                1024,
+            )
+            .unwrap();
+
+        stop_spurious_wakes.store(true, Ordering::Relaxed);
+        spurious_waker.join().unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        let data = event.data;
+        let events_bits = event.events;
+        assert_eq!(data, 12);
+        assert_eq!(events_bits, Events::IN.bits());
+    }
+
+    #[test]
+    fn test_sys_epoll_pwait_with_eventfd_and_timerfd() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let epfd = task
+            .sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
+            .expect("failed to create epoll");
+        let epfd = i32::try_from(epfd).unwrap();
+
+        let eventfd = task
+            .sys_eventfd2(0, EfdFlags::empty())
+            .expect("failed to create eventfd");
+        let eventfd = i32::try_from(eventfd).unwrap();
+
+        let timerfd = task
+            .sys_timerfd_create(ClockId::Monotonic, TimerfdFlags::empty())
+            .expect("failed to create timerfd");
+        let timerfd = i32::try_from(timerfd).unwrap();
+
+        let eventfd_event = litebox_common_linux::EpollEvent {
+            events: Events::IN.bits(),
+            data: 0x1111,
+        };
+        task.sys_epoll_ctl(
+            epfd,
+            litebox_common_linux::EpollOp::EpollCtlAdd,
+            eventfd,
+            crate::ConstPtr::from_usize((&raw const eventfd_event) as usize),
+        )
+        .expect("failed to add eventfd to epoll");
+
+        let timerfd_event = litebox_common_linux::EpollEvent {
+            events: Events::IN.bits(),
+            data: 0x2222,
+        };
+        task.sys_epoll_ctl(
+            epfd,
+            litebox_common_linux::EpollOp::EpollCtlAdd,
+            timerfd,
+            crate::ConstPtr::from_usize((&raw const timerfd_event) as usize),
+        )
+        .expect("failed to add timerfd to epoll");
+
+        task.spawn_clone_for_test(move |task| {
+            std::thread::sleep(core::time::Duration::from_millis(10));
+            let written = task
+                .sys_write(eventfd, &1u64.to_le_bytes(), None)
+                .expect("eventfd write failed");
+            assert_eq!(written, 8);
+        });
+
+        let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 4];
+        let ready = task
+            .sys_epoll_pwait(
+                epfd,
+                crate::MutPtr::from_usize(events.as_mut_ptr() as usize),
+                events.len().truncate(),
+                litebox_common_linux::TimeParam::Milliseconds(1000),
+                None,
+                0,
+            )
+            .expect("epoll_pwait failed");
+
+        assert_eq!(ready, 1);
+        let event = &events[0];
+        let data = event.data;
+        let events_bits = event.events;
+        assert_eq!(data, 0x1111);
+        assert_eq!(events_bits, Events::IN.bits());
     }
 
     #[test]

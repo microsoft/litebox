@@ -757,7 +757,9 @@ impl LinuxUserland {
                 )
             }
             .map_err(|err| match err {
-                syscalls::Errno::EPIPE => litebox::platform::StdioWriteError::Closed,
+                syscalls::Errno::EPIPE | syscalls::Errno::EBADF => {
+                    litebox::platform::StdioWriteError::Closed
+                }
                 _ => panic!("unhandled error {err}"),
             })?;
 
@@ -1127,11 +1129,10 @@ impl litebox::platform::AddressSpaceProvider for LinuxUserland {
     /// Slot index into the VA partition table.
     type AddressSpaceId = u32;
 
-    // Shared-vfork children resume on a fresh host thread before they can
-    // reliably service CoW write faults. Lazy CoW makes their first writes to
-    // stack/global pages crash the process, so eagerly snapshot writable pages
-    // and leave them writable for the duration of the vfork window.
-    const EAGER_COW_FOR_VFORK: bool = true;
+    // Linux shared-vfork uses lazy CoW for writable mappings. The shim keeps
+    // a small child-stack prefault window so the first post-clone stack writes
+    // can succeed before the new host thread is fully running.
+    const EAGER_COW_FOR_VFORK: bool = false;
 
     #[cfg(target_arch = "x86_64")]
     fn create_address_space(
@@ -3095,7 +3096,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
                     )
                 };
                 return result.map_err(|err| match err {
-                    syscalls::Errno::EPIPE | syscalls::Errno::EIO => {
+                    syscalls::Errno::EPIPE | syscalls::Errno::EIO | syscalls::Errno::EBADF => {
                         litebox::platform::StdioReadError::Closed
                     }
                     _ => panic!("unhandled error {err}"),

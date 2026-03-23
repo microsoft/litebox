@@ -588,7 +588,8 @@ impl<FS: ShimFS> GlobalState<FS> {
                 SocketOption::ERROR => {
                     // SO_ERROR is self-clearing: atomically read and reset to 0.
                     let proxy = self.get_proxy(fd)?;
-                    match proxy.get_async_error(true) {
+                    let async_error = proxy.get_async_error(true);
+                    match async_error {
                         Some(err) => {
                             let errno: Errno = err.into();
                             i32::from(errno).cast_unsigned()
@@ -1337,7 +1338,8 @@ impl<FS: ShimFS> Task<FS> {
             sockfd,
             |fd| {
                 let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
-                self.global.connect(&self.wait_cx(), fd, addr)
+                let result = self.global.connect(&self.wait_cx(), fd, addr);
+                result
             },
             |file| {
                 let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -1450,8 +1452,10 @@ impl<FS: ShimFS> Task<FS> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                self.global
-                    .sendto(&self.wait_cx(), fd, buf, flags, sockaddr)
+                let result = self
+                    .global
+                    .sendto(&self.wait_cx(), fd, buf, flags, sockaddr);
+                result
             },
             |file| {
                 let addr = sockaddr
@@ -2160,6 +2164,24 @@ mod tests {
         .expect("epoll_wait failed")
     }
 
+    fn epoll_wait_timeout(
+        task: &crate::Task<crate::DefaultFS>,
+        epfd: i32,
+        events: &mut [litebox_common_linux::EpollEvent],
+        timeout_ms: i32,
+    ) -> usize {
+        let events_ptr = crate::MutPtr::from_usize(events.as_mut_ptr() as usize);
+        task.sys_epoll_pwait(
+            epfd,
+            events_ptr,
+            events.len().truncate(),
+            litebox_common_linux::TimeParam::Milliseconds(timeout_ms),
+            None,
+            0,
+        )
+        .expect("epoll_wait with timeout failed")
+    }
+
     fn test_tcp_socket_as_server(
         task: &crate::Task<crate::DefaultFS>,
         ip: [u8; 4],
@@ -2528,6 +2550,108 @@ mod tests {
             .expect("Failed to wait for client");
         let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout, buf);
+    }
+
+    fn test_nonblocking_tcp_connect_epoll_then_send(epoll_add_delay: core::time::Duration) {
+        const NONBLOCK_CONNECT_PORT: u16 = 8082;
+
+        let task = init_platform(Some(TUN_DEVICE_NAME));
+        let buf = "Hello, world!";
+
+        let child_handle = std::thread::spawn(|| {
+            std::process::Command::new("nc")
+                .args([
+                    "-w",
+                    "2",
+                    "-l",
+                    "10.0.0.1",
+                    NONBLOCK_CONNECT_PORT.to_string().as_str(),
+                ])
+                .output()
+        });
+        std::thread::sleep(core::time::Duration::from_millis(1000));
+
+        let client_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .expect("failed to create nonblocking client socket");
+        let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from([10, 0, 0, 1]),
+            NONBLOCK_CONNECT_PORT,
+        )));
+        let err = task
+            .do_connect(client_fd, server_addr)
+            .expect_err("nonblocking connect should report EINPROGRESS");
+        assert_eq!(err, Errno::EINPROGRESS);
+
+        if !epoll_add_delay.is_zero() {
+            std::thread::sleep(epoll_add_delay);
+        }
+
+        let epfd = task
+            .sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
+            .expect("failed to create epoll");
+        let epfd = i32::try_from(epfd).unwrap();
+        epoll_add(
+            &task,
+            epfd,
+            client_fd,
+            litebox::event::Events::OUT | litebox::event::Events::ERR,
+        );
+
+        let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+        let n = epoll_wait_timeout(&task, epfd, &mut events, 5_000);
+        assert_ne!(n, 0, "timed out waiting for nonblocking connect readiness");
+        assert_eq!(n, 1, "expected a single epoll event, got {n}");
+        let event = &events[0];
+        let event_data = event.data;
+        let event_bits = event.events;
+        assert_eq!(
+            event_data,
+            u64::from(client_fd),
+            "epoll returned readiness for the wrong fd"
+        );
+        assert_ne!(
+            event_bits & litebox::event::Events::OUT.bits(),
+            0,
+            "expected EPOLLOUT after connect completion, got events={:#x}",
+            event_bits
+        );
+
+        let so_error = get_so_error(&task, client_fd);
+        assert_eq!(
+            so_error, 0,
+            "SO_ERROR should be 0 after successful nonblocking connect, got {so_error}"
+        );
+
+        let n = task
+            .do_sendto(client_fd, buf.as_bytes(), SendFlags::empty(), None)
+            .expect("first send after nonblocking connect failed");
+        assert_eq!(n, buf.len());
+
+        close_socket(&task, client_fd);
+        task.sys_close(epfd).expect("failed to close epoll fd");
+
+        let output = child_handle
+            .join()
+            .unwrap()
+            .expect("failed to wait for listener");
+        let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout, buf);
+    }
+
+    #[test]
+    fn test_tun_nonblocking_tcp_connect_epoll_writable_then_send() {
+        test_nonblocking_tcp_connect_epoll_then_send(core::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn test_tun_nonblocking_tcp_connect_epoll_add_after_connected() {
+        test_nonblocking_tcp_connect_epoll_then_send(core::time::Duration::from_millis(200));
     }
 
     fn blocking_udp_server_socket(test_trunc: bool, is_nonblocking: bool) {

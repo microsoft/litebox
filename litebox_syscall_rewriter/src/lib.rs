@@ -36,6 +36,8 @@ pub enum Error {
     ParseError(String),
     #[error("unsupported executable")]
     UnsupportedObjectFile,
+    #[error("unsupported Bun-packaged executable")]
+    UnsupportedBunExecutable,
     #[error("executable is already hooked with trampoline")]
     AlreadyHooked,
     #[error("no .text section found")]
@@ -55,6 +57,7 @@ type Result<T> = core::result::Result<T, Error>;
 /// The magic bytes used to identify the trampoline data.
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
+const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
@@ -103,6 +106,10 @@ struct TextSectionInfo {
 ///
 /// This layout allows loaders to read just the last 32/20 bytes to get the metadata.
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    if has_bun_footer_marker(input_binary) {
+        return Err(Error::UnsupportedBunExecutable);
+    }
+
     // Relocatable object files (.o) must not be patched: they are linker
     // input, not executable code. Rewriting instructions or appending
     // trampoline data would corrupt the object file for the linker.
@@ -283,6 +290,32 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         out.extend_from_slice(header.as_bytes());
     }
     Ok(out)
+}
+
+fn has_bun_footer_marker(input_binary: &[u8]) -> bool {
+    let window_len = input_binary.len().min(256);
+    input_binary[input_binary.len().saturating_sub(window_len)..]
+        .windows(BUN_FOOTER_MARKER.len())
+        .any(|window| window == BUN_FOOTER_MARKER)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BUN_FOOTER_MARKER, has_bun_footer_marker};
+
+    #[test]
+    fn detects_bun_footer_marker_near_end() {
+        let mut bytes = vec![0u8; 512];
+        let offset = bytes.len() - BUN_FOOTER_MARKER.len() - 8;
+        bytes[offset..offset + BUN_FOOTER_MARKER.len()].copy_from_slice(BUN_FOOTER_MARKER);
+        assert!(has_bun_footer_marker(&bytes));
+    }
+
+    #[test]
+    fn ignores_missing_bun_footer_marker() {
+        let bytes = vec![0u8; 512];
+        assert!(!has_bun_footer_marker(&bytes));
+    }
 }
 
 /// Patch a single mapped code segment in-place, returning trampoline stubs.
