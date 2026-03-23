@@ -38,6 +38,8 @@ pub(crate) struct ElfPatchState {
     pub trampoline_cursor: usize,
     /// Whether the trampoline region has been allocated.
     pub trampoline_mapped: bool,
+    /// Total number of trampoline bytes currently mapped.
+    pub trampoline_mapped_len: usize,
     /// File path of the ELF (from the fd→path table, if available).
     #[allow(dead_code)]
     pub file_path: Option<alloc::string::String>,
@@ -410,6 +412,7 @@ impl<FS: ShimFS> Task<FS> {
             trampoline_addr: trampoline_vaddr,
             trampoline_cursor: 0,
             trampoline_mapped: false,
+            trampoline_mapped_len: 0,
             file_path,
         });
     }
@@ -490,15 +493,25 @@ impl<FS: ShimFS> Task<FS> {
                             MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
                         )
                     });
-                if alloc_result.is_err() {
+                let actual_addr = match alloc_result {
+                    Ok(ptr) => ptr.as_usize(),
+                    Err(_) => return,
+                };
+                if actual_addr != tramp_addr {
+                    let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), tramp_len);
                     return;
                 }
 
                 // Read trampoline data from the file.
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
                 let file_off = state.trampoline_file_offset as usize;
-                if self.sys_read(fd, &mut tramp_data, Some(file_off)).is_err() {
-                    return;
+                let tramp_ptr = MutPtr::<u8>::from_usize(tramp_addr);
+                match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
+                    Ok(n) if n == tramp_data.len() => {}
+                    _ => {
+                        let _ = self.sys_munmap(tramp_ptr, tramp_len);
+                        return;
+                    }
                 }
 
                 // Write syscall entry point to the first 8 bytes.
@@ -507,17 +520,26 @@ impl<FS: ShimFS> Task<FS> {
                 }
 
                 // Write to the mapped region.
-                let tramp_ptr = MutPtr::<u8>::from_usize(tramp_addr);
-                let _ = tramp_ptr.copy_from_slice(0, &tramp_data);
+                if tramp_ptr.copy_from_slice(0, &tramp_data).is_none() {
+                    let _ = self.sys_munmap(tramp_ptr, tramp_len);
+                    return;
+                }
 
                 // Protect as RX immediately.
-                let _ = self.sys_mprotect(
-                    tramp_ptr,
-                    tramp_len,
-                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                );
+                if self
+                    .sys_mprotect(
+                        tramp_ptr,
+                        tramp_len,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                    )
+                    .is_err()
+                {
+                    let _ = self.sys_munmap(tramp_ptr, tramp_len);
+                    return;
+                }
 
                 state.trampoline_mapped = true;
+                state.trampoline_mapped_len = tramp_len;
             }
             return;
         }
@@ -563,9 +585,16 @@ impl<FS: ShimFS> Task<FS> {
 
             // Write the 8-byte syscall entry point at the start.
             let entry_ptr = MutPtr::<u8>::from_usize(actual_addr);
-            let _ = entry_ptr.copy_from_slice(0, &syscall_entry.to_le_bytes());
+            if entry_ptr
+                .copy_from_slice(0, &syscall_entry.to_le_bytes())
+                .is_none()
+            {
+                let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                return;
+            }
             state.trampoline_cursor = 8; // stubs start after the 8-byte entry
             state.trampoline_mapped = true;
+            state.trampoline_mapped_len = PAGE_SIZE;
         }
 
         // Make the code segment writable for in-place patching.
@@ -591,6 +620,7 @@ impl<FS: ShimFS> Task<FS> {
             return;
         };
         let mut code_buf = code_owned.into_vec();
+        let original_code = code_buf.clone();
 
         let code_vaddr = addr_usize as u64;
         let trampoline_write_vaddr = (state.trampoline_addr + state.trampoline_cursor) as u64;
@@ -603,32 +633,61 @@ impl<FS: ShimFS> Task<FS> {
             syscall_entry_addr,
         ) {
             Ok(stubs) if !stubs.is_empty() => {
-                // Write patched code back to the mapped region.
-                let _ = mapped_addr.copy_from_slice(0, &code_buf);
+                let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
+                    let _ = self.sys_mprotect(
+                        mapped_addr,
+                        len,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                    );
+                    return;
+                };
+                let tramp_pages_needed = align_up(new_cursor, PAGE_SIZE);
+                if tramp_pages_needed > state.trampoline_mapped_len {
+                    let extra_start = state.trampoline_addr + state.trampoline_mapped_len;
+                    let extra_len = tramp_pages_needed - state.trampoline_mapped_len;
+                    if self
+                        .do_mmap_anonymous(
+                            Some(extra_start),
+                            extra_len,
+                            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                        )
+                        .is_err()
+                    {
+                        let _ = self.sys_mprotect(
+                            mapped_addr,
+                            len,
+                            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                        );
+                        return;
+                    }
+                    state.trampoline_mapped_len = tramp_pages_needed;
+                }
 
-                // Write stubs to the trampoline region.
+                // Write stubs before patching the code so rewritten jumps never
+                // target an uninitialized trampoline.
                 let tramp_write_ptr =
                     MutPtr::<u8>::from_usize(state.trampoline_addr + state.trampoline_cursor);
-                let _ = tramp_write_ptr.copy_from_slice(0, &stubs);
-                state.trampoline_cursor += stubs.len();
-
-                // Grow trampoline if needed (allocate more pages).
-                let tramp_pages_needed = state.trampoline_cursor.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-                let tramp_pages_mapped = if state.trampoline_mapped {
-                    PAGE_SIZE
-                } else {
-                    0
-                };
-                if tramp_pages_needed > tramp_pages_mapped {
-                    let extra_start = state.trampoline_addr + tramp_pages_mapped;
-                    let extra_len = tramp_pages_needed - tramp_pages_mapped;
-                    let _ = self.do_mmap_anonymous(
-                        Some(extra_start),
-                        extra_len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                        MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                if tramp_write_ptr.copy_from_slice(0, &stubs).is_none() {
+                    let _ = self.sys_mprotect(
+                        mapped_addr,
+                        len,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                     );
+                    return;
                 }
+
+                // Write patched code back to the mapped region.
+                if mapped_addr.copy_from_slice(0, &code_buf).is_none() {
+                    let _ = mapped_addr.copy_from_slice(0, &original_code);
+                    let _ = self.sys_mprotect(
+                        mapped_addr,
+                        len,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                    );
+                    return;
+                }
+                state.trampoline_cursor = new_cursor;
             }
             _ => {
                 // No syscalls found or error — no patching needed.
@@ -656,7 +715,7 @@ impl<FS: ShimFS> Task<FS> {
             && state.trampoline_mapped
             && !state.pre_patched
         {
-            let tramp_len = align_up(state.trampoline_cursor, PAGE_SIZE);
+            let tramp_len = state.trampoline_mapped_len;
             if tramp_len > 0 {
                 let _ = self.sys_mprotect(
                     MutPtr::<u8>::from_usize(state.trampoline_addr),
