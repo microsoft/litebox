@@ -567,25 +567,25 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    fn nested_vfork_layer_count(&self) -> usize {
+    fn active_vfork_layer_count(&self) -> usize {
         let ps = self.process_state.borrow();
         ps.active_vfork_layers.lock().len()
     }
 
-    fn reject_nested_vfork_vm_mutation(&self, what: &'static str) -> Result<(), Errno> {
-        let depth = self.nested_vfork_layer_count();
-        if depth <= 1 {
+    fn reject_shared_vfork_vm_mutation(&self, what: &'static str) -> Result<(), Errno> {
+        let depth = self.active_vfork_layer_count();
+        if depth == 0 {
             return Ok(());
         }
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
-            "[TRACE-VFORK] rejecting {} during nested shared-vfork depth={}",
+            "[TRACE-VFORK] rejecting {} during shared-vfork depth={}",
             what,
             depth,
         );
         log_unsupported!(
-            "{} during nested shared-vfork (vm rollback not implemented yet)",
+            "{} during shared-vfork (vm rollback not implemented yet)",
             what
         );
         Err(Errno::EINVAL)
