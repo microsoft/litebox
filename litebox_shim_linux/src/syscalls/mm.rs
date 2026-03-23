@@ -990,6 +990,7 @@ impl<FS: ShimFS> Task<FS> {
         fd: i32,
         offset: usize,
     ) -> Result<MutPtr<u8>, Errno> {
+        self.reject_nested_vfork_vm_mutation("mmap")?;
         // check alignment
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
@@ -1506,6 +1507,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `munmap`
     pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
+        self.reject_nested_vfork_vm_mutation("munmap")?;
         if len == 0 || !addr.as_usize().is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
         }
@@ -1532,10 +1534,9 @@ impl<FS: ShimFS> Task<FS> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        if prot.contains(ProtFlags::PROT_WRITE) && self.fork_context.borrow().is_some() {
-            let ps = self.process_state.borrow();
-            let cow_lock = ps.active_cow.lock();
-            if let Some(cow) = cow_lock.as_ref() {
+        self.reject_nested_vfork_vm_mutation("mprotect")?;
+        if prot.contains(ProtFlags::PROT_WRITE) {
+            if let Some(cow) = self.top_cow_layer() {
                 let req_start = addr.as_usize();
                 let req_end = req_start + len;
 
@@ -1548,7 +1549,7 @@ impl<FS: ShimFS> Task<FS> {
                         for page_addr in
                             (overlap_start & !(PAGE_SIZE - 1)..overlap_end).step_by(PAGE_SIZE)
                         {
-                            if dirty.iter().any(|(a, _)| *a == page_addr) {
+                            if dirty.contains_key(&page_addr) {
                                 continue;
                             }
                             let mut buf = alloc::vec![0u8; PAGE_SIZE];
@@ -1560,7 +1561,7 @@ impl<FS: ShimFS> Task<FS> {
                                     PAGE_SIZE,
                                 );
                             }
-                            dirty.push((page_addr, buf));
+                            dirty.insert(page_addr, buf);
                         }
                     }
                 }
@@ -1681,6 +1682,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: MRemapFlags,
         new_addr: usize,
     ) -> Result<crate::MutPtr<u8>, Errno> {
+        self.reject_nested_vfork_vm_mutation("mremap")?;
         // Replicate the common layer's cheap O(1) validation checks so that
         // obviously-invalid requests are rejected before we allocate a
         // potentially large tail snapshot buffer.
@@ -1952,6 +1954,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `brk`
     pub(crate) fn sys_brk(&self, addr: MutPtr<u8>) -> Result<usize, Errno> {
+        self.reject_nested_vfork_vm_mutation("brk")?;
         litebox_common_linux::mm::sys_brk(&self.process_state.borrow().pm, addr)
     }
 

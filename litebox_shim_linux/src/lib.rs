@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -236,7 +237,7 @@ impl LinuxShimBuilder {
             pm: PageManager::new(&self.litebox, as_range),
             address_space_id: init_as_id,
             thread_count: core::sync::atomic::AtomicI32::new(1),
-            active_cow: litebox::sync::Mutex::new(None),
+            active_vfork_layers: litebox::sync::Mutex::new(Vec::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
             main_bss_start: core::sync::atomic::AtomicUsize::new(0),
@@ -510,6 +511,169 @@ type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConst
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
 impl<FS: ShimFS> Task<FS> {
+    fn top_cow_layer(&self) -> Option<Arc<CowState>> {
+        let ps = self.process_state.borrow();
+        ps.active_vfork_layers.lock().last().cloned()
+    }
+
+    fn top_cow_layer_for_page(
+        &self,
+        page_addr: usize,
+    ) -> Option<(
+        Arc<CowState>,
+        litebox::platform::page_mgmt::MemoryRegionPermissions,
+    )> {
+        let cow = self.top_cow_layer()?;
+        let perms = cow
+            .protected_ranges
+            .iter()
+            .find(|&&(base, len, _)| page_addr >= base && page_addr < base + len)
+            .map(|&(_, _, perms)| perms)?;
+        Some((cow, perms))
+    }
+
+    fn snapshot_cow_page_if_needed(&self, cow: &CowState, page_addr: usize, page_present: bool) {
+        let mut dirty = cow.dirty_pages.lock();
+        if dirty.contains_key(&page_addr) {
+            return;
+        }
+        let buf = if page_present {
+            let mut buf = vec![0u8; PAGE_SIZE];
+            unsafe {
+                core::ptr::copy_nonoverlapping(page_addr as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
+            }
+            buf
+        } else {
+            vec![0u8; PAGE_SIZE]
+        };
+        dirty.insert(page_addr, buf);
+    }
+
+    fn prepare_guest_write<T: zerocopy::FromBytes + zerocopy::IntoBytes>(
+        &self,
+        ptr: MutPtr<T>,
+        count: usize,
+    ) -> Result<(), Errno> {
+        let len = core::mem::size_of::<T>()
+            .checked_mul(count)
+            .ok_or(Errno::ENOMEM)?;
+        if len == 0 {
+            return Ok(());
+        }
+        if self.prepare_cow_for_host_write(ptr.as_usize(), len) {
+            Ok(())
+        } else {
+            Err(Errno::ENOMEM)
+        }
+    }
+
+    fn nested_vfork_layer_count(&self) -> usize {
+        let ps = self.process_state.borrow();
+        ps.active_vfork_layers.lock().len()
+    }
+
+    fn reject_nested_vfork_vm_mutation(&self, what: &'static str) -> Result<(), Errno> {
+        let depth = self.nested_vfork_layer_count();
+        if depth <= 1 {
+            return Ok(());
+        }
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[TRACE-VFORK] rejecting {} during nested shared-vfork depth={}",
+            what,
+            depth,
+        );
+        log_unsupported!(
+            "{} during nested shared-vfork (vm rollback not implemented yet)",
+            what
+        );
+        Err(Errno::EINVAL)
+    }
+
+    fn lower_cow_page_permissions(
+        &self,
+        cow: &Arc<CowState>,
+        page_addr: usize,
+    ) -> Option<litebox::platform::page_mgmt::MemoryRegionPermissions> {
+        use litebox::platform::page_mgmt::MemoryRegionPermissions;
+
+        let ps = self.process_state.borrow();
+        let layers = ps.active_vfork_layers.lock();
+        let layer_index = layers.iter().rposition(|layer| Arc::ptr_eq(layer, cow))?;
+        for lower in layers[..layer_index].iter().rev() {
+            let Some(perms) = lower
+                .protected_ranges
+                .iter()
+                .find(|&&(base, len, _)| page_addr >= base && page_addr < base + len)
+                .map(|&(_, _, perms)| perms)
+            else {
+                continue;
+            };
+            let dirty = lower.dirty_pages.lock();
+            return Some(if dirty.contains_key(&page_addr) {
+                perms
+            } else {
+                perms & !MemoryRegionPermissions::WRITE
+            });
+        }
+        None
+    }
+
+    fn restore_cow_layer_permissions(&self, cow: &Arc<CowState>) {
+        for &(base, len, orig_perms) in &cow.protected_ranges {
+            for page_addr in (base..base + len).step_by(PAGE_SIZE) {
+                let perms = self
+                    .lower_cow_page_permissions(cow, page_addr)
+                    .unwrap_or(orig_perms);
+                unsafe {
+                    <crate::Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::update_permissions(
+                        self.global.platform,
+                        page_addr..page_addr + PAGE_SIZE,
+                        perms,
+                    )
+                    .expect("CoW restore: failed to restore page permissions");
+                }
+            }
+        }
+    }
+
+    fn pop_cow_layer(&self, cow: &Arc<CowState>) {
+        let ps = self.process_state.borrow();
+        let mut layers = ps.active_vfork_layers.lock();
+        let popped = layers.pop().expect("CoW stack must contain pushed layer");
+        assert!(
+            Arc::ptr_eq(&popped, cow),
+            "CoW layers must unwind in LIFO order"
+        );
+    }
+
+    fn restore_cow_layer(&self, cow: &Arc<CowState>, restore_bytes: bool) {
+        if restore_bytes {
+            let dirty = cow.dirty_pages.lock();
+            for (page_addr, original_data) in dirty.iter() {
+                if <crate::Platform as litebox::platform::AddressSpaceProvider>::EAGER_COW_FOR_VFORK
+                {
+                    let current =
+                        unsafe { core::slice::from_raw_parts(*page_addr as *const u8, PAGE_SIZE) };
+                    if current == original_data.as_slice() {
+                        continue;
+                    }
+                }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        original_data.as_ptr(),
+                        *page_addr as *mut u8,
+                        PAGE_SIZE,
+                    );
+                }
+            }
+        }
+
+        self.restore_cow_layer_permissions(cow);
+        self.pop_cow_layer(cow);
+    }
+
     /// If the current task's transport told a "deferred park lie" during a 9P
     /// spin loop, this method claims that lie and blocks until the vfork window
     /// closes. Must be called before any guest memory write in `do_syscall`.
@@ -538,74 +702,13 @@ impl<FS: ShimFS> Task<FS> {
             page_present,
             self.fork_context.borrow().is_some(),
         );
-        let ps = self.process_state.borrow();
-        let cow_lock = ps.active_cow.lock();
-        let Some(cow) = cow_lock.as_ref() else {
-            return false;
-        };
-
         let page_addr = fault_addr & !(PAGE_SIZE - 1);
-
-        let orig_perms = cow
-            .protected_ranges
-            .iter()
-            .find(|&&(base, len, _)| page_addr >= base && page_addr < base + len)
-            .map(|&(_, _, perms)| perms);
-        let Some(orig_perms) = orig_perms else {
+        let Some((cow, orig_perms)) = self.top_cow_layer_for_page(page_addr) else {
             return false;
         };
-
-        let is_child = self.fork_context.borrow().is_some();
         let page_range = page_addr..page_addr + PAGE_SIZE;
-
-        if is_child {
-            let mut dirty = cow.dirty_pages.lock();
-            if dirty.iter().any(|(addr, _)| *addr == page_addr) {
-                // SAFETY: restoring the page's original permissions.
-                return unsafe {
-                    cow_update_permissions(self.global.platform, page_range, orig_perms)
-                };
-            }
-            let buf = if page_present {
-                let mut buf = vec![0u8; PAGE_SIZE];
-                // SAFETY: page is present (mapped), safe to read.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        page_addr as *const u8,
-                        buf.as_mut_ptr(),
-                        PAGE_SIZE,
-                    );
-                }
-                buf
-            } else {
-                vec![0u8; PAGE_SIZE]
-            };
-            dirty.push((page_addr, buf));
-            // SAFETY: restoring the page's original (writable) permissions.
-            unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
-        } else {
-            let mut dirty = cow.dirty_pages.lock();
-            if !dirty.iter().any(|(addr, _)| *addr == page_addr) {
-                let buf = if page_present {
-                    let mut buf = vec![0u8; PAGE_SIZE];
-                    // SAFETY: page is present (mapped), safe to read.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            page_addr as *const u8,
-                            buf.as_mut_ptr(),
-                            PAGE_SIZE,
-                        );
-                    }
-                    buf
-                } else {
-                    vec![0u8; PAGE_SIZE]
-                };
-                dirty.push((page_addr, buf));
-            }
-            drop(dirty);
-            // SAFETY: restoring the page's original (writable) permissions.
-            unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
-        }
+        self.snapshot_cow_page_if_needed(cow.as_ref(), page_addr, page_present);
+        unsafe { cow_update_permissions(self.global.platform, page_range, orig_perms) }
     }
 
     /// Uses CAS (not `fetch_sub`) to avoid underflow races with
@@ -2011,6 +2114,7 @@ impl<FS: ShimFS> Task<FS> {
             }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
+                    self.prepare_guest_write(pipefd, 2)?;
                     pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT)?;
                     pipefd.write_at_offset(1, write_fd).ok_or(Errno::EFAULT)?;
                     Ok(0)
@@ -2065,6 +2169,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::GetRobustList { pid, head, len } => self
                 .sys_get_robust_list(pid, head)
                 .and_then(|()| {
+                    self.prepare_guest_write(len, 1)?;
                     len.write_at_offset(0, size_of::<litebox_common_linux::RobustListHead>())
                         .ok_or(Errno::EFAULT)
                 })
@@ -2216,10 +2321,10 @@ struct ProcessState {
     /// Number of active threads in this process (including the main thread).
     /// Starts at 1 and is incremented on each `clone(CLONE_THREAD)`.
     thread_count: core::sync::atomic::AtomicI32,
-    /// Active CoW state during a vfork window. Set by the forking thread
-    /// before spawning the child; cleared after restore. All threads in the
-    /// process check this on page faults and mprotect calls.
-    active_cow: litebox::sync::Mutex<Platform, Option<Arc<CowState>>>,
+    /// Active shared-vfork CoW layers, with the newest layer at the end.
+    /// The forking thread pushes a new layer before spawning the child and
+    /// pops it after restoring state once that child execs or exits.
+    active_vfork_layers: litebox::sync::Mutex<Platform, Vec<Arc<CowState>>>,
     /// Per-fd ELF patching state for the runtime syscall rewriter.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
     /// Tracks `MAP_SHARED|PROT_WRITE` file-backed mappings for writeback on
@@ -2316,9 +2421,9 @@ struct CowState {
         usize,
         litebox::platform::page_mgmt::MemoryRegionPermissions,
     )>,
-    /// Per-page snapshots taken on child's first write (lazy) or upfront (eager):
-    /// (page-aligned addr, original content).
-    dirty_pages: litebox::sync::Mutex<Platform, Vec<(usize, Vec<u8>)>>,
+    /// Per-page snapshots taken on first write for this layer, keyed by
+    /// page-aligned address.
+    dirty_pages: litebox::sync::Mutex<Platform, BTreeMap<usize, Vec<u8>>>,
 }
 
 /// Call `update_permissions` with the correct `PAGE_SIZE` const generic.

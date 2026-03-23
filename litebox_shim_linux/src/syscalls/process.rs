@@ -468,10 +468,12 @@ impl<FS: ShimFS> Task<FS> {
         arg: PrctlArg<litebox_platform_multiplex::Platform>,
     ) -> Result<usize, Errno> {
         match arg {
-            PrctlArg::GetName(name) => name
-                .write_slice_at_offset(0, &self.comm.get())
-                .ok_or(Errno::EFAULT)
-                .map(|()| 0),
+            PrctlArg::GetName(name) => {
+                self.prepare_guest_write(name, 1)?;
+                name.write_slice_at_offset(0, &self.comm.get())
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
             PrctlArg::SetName(name) => {
                 let mut name_buf = [0u8; litebox_common_linux::TASK_COMM_LEN - 1];
                 // strncpy
@@ -553,6 +555,7 @@ impl<FS: ShimFS> Task<FS> {
                     litebox::platform::PunchthroughError::Failure(errno) => errno,
                     _ => unimplemented!("Unsupported punchthrough error {:?}", e),
                 })?;
+                self.prepare_guest_write(addr, 1)?;
                 addr.write_at_offset(0, fsbase).ok_or(Errno::EFAULT)?;
                 Ok(())
             }
@@ -649,7 +652,7 @@ fn wake_robust_list(
 impl<FS: ShimFS> Task<FS> {
     /// Make any active shared-fork CoW pages covering a host-side guest-memory
     /// write writable before using fallible pointer helpers from shim code.
-    fn prepare_cow_for_host_write(&self, addr: usize, len: usize) -> bool {
+    pub(crate) fn prepare_cow_for_host_write(&self, addr: usize, len: usize) -> bool {
         if len == 0 {
             return true;
         }
@@ -657,45 +660,15 @@ impl<FS: ShimFS> Task<FS> {
             return false;
         };
 
-        let ps = self.process_state.borrow();
-        let cow_lock = ps.active_cow.lock();
-        let Some(cow) = cow_lock.as_ref() else {
-            return true;
-        };
-
         let start = addr & !(PAGE_SIZE - 1);
         let end = (last_addr & !(PAGE_SIZE - 1)).saturating_add(PAGE_SIZE);
 
         for page_addr in (start..end).step_by(PAGE_SIZE) {
-            let Some(orig_perms) = cow
-                .protected_ranges
-                .iter()
-                .find(|&&(base, plen, _)| page_addr >= base && page_addr < base + plen)
-                .map(|&(_, _, perms)| perms)
-            else {
+            let Some((cow, orig_perms)) = self.top_cow_layer_for_page(page_addr) else {
                 continue;
             };
 
-            {
-                let mut dirty = cow.dirty_pages.lock();
-                if !dirty
-                    .iter()
-                    .any(|(tracked_addr, _)| *tracked_addr == page_addr)
-                {
-                    let mut buf = alloc::vec![0u8; PAGE_SIZE];
-                    // SAFETY: CoW-protected pages remain mapped while the
-                    // shared fork window is active, so we can snapshot them.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            page_addr as *const u8,
-                            buf.as_mut_ptr(),
-                            PAGE_SIZE,
-                        );
-                    }
-                    dirty.push((page_addr, buf));
-                }
-            }
-
+            self.snapshot_cow_page_if_needed(cow.as_ref(), page_addr, true);
             let page_range = page_addr..page_addr + PAGE_SIZE;
             // SAFETY: restoring the page's original permissions is exactly what
             // the CoW write-fault path does before resuming execution.
@@ -763,10 +736,7 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
-            let _ = self.prepare_cow_for_host_write(
-                clear_child_tid.as_usize(),
-                core::mem::size_of::<i32>(),
-            );
+            let _ = self.prepare_guest_write(clear_child_tid, 1);
             let _ = clear_child_tid.write_at_offset(0, 0);
             let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
             let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
@@ -955,6 +925,7 @@ impl<FS: ShimFS> Task<FS> {
                 if let Some(ptr) = wstatus {
                     // Encode status as Linux wait status: (exit_code & 0xff) << 8
                     let encoded = (wr.status & 0xff) << 8;
+                    self.prepare_guest_write(ptr, 1)?;
                     let _ = ptr.write_at_offset(0, encoded);
                 }
                 Ok(wr.pid.0 as usize)
@@ -1056,6 +1027,7 @@ impl<FS: ShimFS> Task<FS> {
                     const SIGCHLD: i32 = 17;
                     const CLD_EXITED: i32 = 1;
                     let si_ptr: crate::MutPtr<i32> = crate::MutPtr::from_usize(ptr.as_usize());
+                    self.prepare_guest_write(si_ptr, 6)?;
                     let _ = si_ptr.write_at_offset(0, SIGCHLD); // si_signo
                     let _ = si_ptr.write_at_offset(1, 0); // si_errno
                     let _ = si_ptr.write_at_offset(2, CLD_EXITED); // si_code
@@ -1069,6 +1041,7 @@ impl<FS: ShimFS> Task<FS> {
                 // WNOHANG: zero out infop and return 0.
                 if let Some(ptr) = infop {
                     let si_ptr: crate::MutPtr<i32> = crate::MutPtr::from_usize(ptr.as_usize());
+                    self.prepare_guest_write(si_ptr, 1)?;
                     let _ = si_ptr.write_at_offset(0, 0); // si_signo = 0
                 }
                 Ok(0)
@@ -1349,6 +1322,7 @@ impl<FS: ShimFS> Task<FS> {
 
         let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         if let Some(parent_tid_ptr) = set_parent_tid {
+            let _ = self.prepare_guest_write(parent_tid_ptr, 1);
             let _ = parent_tid_ptr.write_at_offset(0, child_tid);
         }
 
@@ -1627,7 +1601,7 @@ impl<FS: ShimFS> Task<FS> {
                 let mappings = ps.pm.mappings();
                 drop(ps);
 
-                let mut eager_dirty = alloc::vec::Vec::<(usize, alloc::vec::Vec<u8>)>::new();
+                let mut eager_dirty = BTreeMap::<usize, alloc::vec::Vec<u8>>::new();
                 let mut protected = alloc::vec::Vec::new();
 
                 for (range, flags) in &mappings {
@@ -1648,7 +1622,7 @@ impl<FS: ShimFS> Task<FS> {
                                     PAGE_SIZE,
                                 );
                             }
-                            eager_dirty.push((page_addr, buf));
+                            eager_dirty.insert(page_addr, buf);
                         }
                     } else {
                         // Lazy CoW: mark writable pages read-only and
@@ -1701,7 +1675,11 @@ impl<FS: ShimFS> Task<FS> {
                 });
                 // Store CoW state in ProcessState so all threads (and the
                 // fault handler) can access it.
-                *self.process_state.borrow().active_cow.lock() = Some(cow.clone());
+                self.process_state
+                    .borrow()
+                    .active_vfork_layers
+                    .lock()
+                    .push(cow.clone());
                 Some(cow)
             };
 
@@ -1730,7 +1708,7 @@ impl<FS: ShimFS> Task<FS> {
                 pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
                 address_space_id: child_as_id,
                 thread_count: core::sync::atomic::AtomicI32::new(1),
-                active_cow: litebox::sync::Mutex::new(None),
+                active_vfork_layers: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                 shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 main_bss_start: core::sync::atomic::AtomicUsize::new(0),
@@ -1825,17 +1803,8 @@ impl<FS: ShimFS> Task<FS> {
                 .process_registry()
                 .remove_process(child_process_id);
             if let Some(cow) = &cow_state {
-                for &(base, len, orig_perms) in &cow.protected_ranges {
-                    unsafe {
-                        <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
-                            self.global.platform,
-                            base..base + len,
-                            orig_perms,
-                        )
-                        .expect("CoW prefault cleanup: failed to restore permissions");
-                    }
-                }
-                *self.process_state.borrow().active_cow.lock() = None;
+                self.restore_cow_layer_permissions(cow);
+                self.pop_cow_layer(cow);
             }
             if did_park_threads {
                 self.unpark_other_threads();
@@ -1909,17 +1878,8 @@ impl<FS: ShimFS> Task<FS> {
                 .remove_process(child_process_id);
             // On failure, restore write permissions if CoW was set up.
             if let Some(cow) = &cow_state {
-                for &(base, len, orig_perms) in &cow.protected_ranges {
-                    unsafe {
-                        <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
-                            self.global.platform,
-                            base..base + len,
-                            orig_perms,
-                        )
-                        .expect("CoW spawn-failure cleanup: failed to restore permissions");
-                    }
-                }
-                *self.process_state.borrow().active_cow.lock() = None;
+                self.restore_cow_layer_permissions(cow);
+                self.pop_cow_layer(cow);
             }
             if did_park_threads {
                 self.unpark_other_threads();
@@ -1937,50 +1897,8 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             // Restore pages modified by the child and clear CoW state.
-            //
-            // With lazy CoW, `dirty_pages` contains only child-first-write
-            // snapshots — restore all unconditionally. All other parent
-            // threads are parked, so no concurrent writes can interfere.
-            //
-            // With eager CoW, `dirty_pages` are upfront copies of all
-            // protected pages. Compare and restore only those that changed.
             if let Some(cow) = &cow_state {
-                let dirty = cow.dirty_pages.lock();
-                for (page_addr, original_data) in dirty.iter() {
-                    if <crate::Platform as AddressSpaceProvider>::EAGER_COW_FOR_VFORK {
-                        let current = unsafe {
-                            core::slice::from_raw_parts(*page_addr as *const u8, PAGE_SIZE)
-                        };
-                        if current == original_data.as_slice() {
-                            continue;
-                        }
-                    }
-                    // SAFETY: page is mapped and was originally writable.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            original_data.as_ptr(),
-                            *page_addr as *mut u8,
-                            PAGE_SIZE,
-                        );
-                    }
-                }
-                drop(dirty);
-
-                // Restore original write permissions on lazily-protected ranges.
-                for &(base, len, orig_perms) in &cow.protected_ranges {
-                    // SAFETY: restoring original permissions.
-                    unsafe {
-                        <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
-                            self.global.platform,
-                            base..base + len,
-                            orig_perms,
-                        )
-                        .expect("CoW restore: failed to re-enable write permissions");
-                    }
-                }
-
-                // Clear the process-wide CoW state.
-                *self.process_state.borrow().active_cow.lock() = None;
+                self.restore_cow_layer(cow, true);
             }
 
             // Unpark other threads now that CoW is fully restored.
@@ -2335,6 +2253,7 @@ impl<FS: ShimFS> Task<FS> {
         let old_limit =
             litebox_common_linux::rlimit_to_rlimit64(self.do_prlimit(resource, new_limit)?);
         if let Some(old_rlim) = old_rlim {
+            self.prepare_guest_write(old_rlim, 1)?;
             old_rlim
                 .write_at_offset(0, old_limit)
                 .ok_or(Errno::EINVAL)?;
@@ -2349,6 +2268,7 @@ impl<FS: ShimFS> Task<FS> {
         rlim: crate::MutPtr<litebox_common_linux::Rlimit>,
     ) -> Result<(), Errno> {
         let old_limit = self.do_prlimit(resource, None)?;
+        self.prepare_guest_write(rlim, 1)?;
         rlim.write_at_offset(0, old_limit).ok_or(Errno::EINVAL)
     }
 
@@ -2383,6 +2303,7 @@ impl<FS: ShimFS> Task<FS> {
             .robust_list
             .get()
             .map_or(0, |ptr| ptr.as_usize());
+        self.prepare_guest_write(head_ptr, 1)?;
         head_ptr.write_at_offset(0, head).ok_or(Errno::EFAULT)
     }
 
@@ -2419,6 +2340,9 @@ impl<FS: ShimFS> Task<FS> {
         let flags_ptr = crate::MutPtr::<u32>::from_usize(rseq.as_usize() + 16);
 
         let write_state = |cpu_id_start: u32, cpu_id: u32| -> Result<(), Errno> {
+            self.prepare_guest_write(cpu_ptr, 8)?;
+            self.prepare_guest_write(rseq_cs_ptr, 1)?;
+            self.prepare_guest_write(flags_ptr, 1)?;
             cpu_ptr
                 .write_at_offset(0, cpu_id_start)
                 .ok_or(Errno::EFAULT)?;
@@ -2628,6 +2552,7 @@ impl<FS: ShimFS> Task<FS> {
             unimplemented!()
         }
         if let Some(tv) = tv {
+            self.prepare_guest_write(tv, 1)?;
             tv.write_at_offset(0, self.real_time_as_duration_since_epoch().into())
                 .ok_or(Errno::EFAULT)?;
         }
@@ -2643,6 +2568,7 @@ impl<FS: ShimFS> Task<FS> {
         let seconds: u64 = time.as_secs();
         let seconds: litebox_common_linux::time_t = seconds.try_into().or(Err(Errno::EOVERFLOW))?;
         if let Some(tloc) = tloc {
+            self.prepare_guest_write(tloc, 1)?;
             tloc.write_at_offset(0, seconds).ok_or(Errno::EFAULT)?;
         }
         Ok(seconds)
@@ -2659,6 +2585,7 @@ impl<FS: ShimFS> Task<FS> {
             _ => return Err(Errno::EINVAL),
         }
 
+        self.prepare_guest_write(usage, 1)?;
         usage
             .write_at_offset(0, litebox_common_linux::Rusage::default())
             .ok_or(Errno::EFAULT)
@@ -2949,6 +2876,7 @@ impl<FS: ShimFS> Task<FS> {
 
         let ret = usize::try_from(ret).map_err(|_| Errno::EINVAL)?;
         debug_assert_eq!(ret, count);
+        self.prepare_guest_write(list, ret)?;
         for (i, gid) in groups.into_iter().enumerate().take(ret) {
             list.write_at_offset(i.try_into().unwrap(), gid)
                 .ok_or(Errno::EFAULT)?;
@@ -3330,7 +3258,7 @@ impl<FS: ShimFS> Task<FS> {
                 pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
                 address_space_id: fc.address_space_id,
                 thread_count: core::sync::atomic::AtomicI32::new(1),
-                active_cow: litebox::sync::Mutex::new(None),
+                active_vfork_layers: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                 shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 main_bss_start: core::sync::atomic::AtomicUsize::new(0),
@@ -3573,10 +3501,7 @@ impl<FS: ShimFS> Task<FS> {
 
                 if let Some(child_tid_ptr) = set_child_tid {
                     // Set the child TID if requested.
-                    let _ = self.prepare_cow_for_host_write(
-                        child_tid_ptr.as_usize(),
-                        core::mem::size_of::<i32>(),
-                    );
+                    let _ = self.prepare_guest_write(child_tid_ptr, 1);
                     let _ = child_tid_ptr.write_at_offset(0, self.tid);
                 }
                 false
