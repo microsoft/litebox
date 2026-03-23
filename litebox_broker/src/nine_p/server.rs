@@ -41,7 +41,7 @@ const AT_REMOVEDIR: u32 = 0x200;
 
 /// Cache of patched ELF data, keyed by canonical path.
 /// Stores `(mtime_secs, patched_data)` to invalidate when the file changes.
-type ElfCache = HashMap<PathBuf, (i64, Arc<Vec<u8>>)>;
+pub type ElfCache = HashMap<PathBuf, (i64, Arc<Vec<u8>>)>;
 
 /// State for a single FID (file identifier) in the 9P server.
 struct FidState {
@@ -79,7 +79,9 @@ pub struct Server {
     rewrite_syscalls: bool,
     /// Cache of patched ELF data, keyed by canonical path.
     /// Stores `(mtime_secs, patched_data)` to invalidate when the file changes.
-    elf_cache: Mutex<ElfCache>,
+    /// Shared across all server instances via `Arc` so ELF patching is amortized
+    /// across connections.
+    elf_cache: Arc<Mutex<ElfCache>>,
 }
 
 impl Server {
@@ -95,14 +97,37 @@ impl Server {
     /// * `policy` - Policy engine for access control
     /// * `rewrite_syscalls` - Whether to patch ELF files with syscall trampolines
     pub fn new(root: PathBuf, policy: Arc<dyn Policy>, rewrite_syscalls: bool) -> Self {
+        Self::with_elf_cache(
+            root,
+            policy,
+            rewrite_syscalls,
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+    }
+
+    /// Create a new 9P server sharing an existing ELF patch cache.
+    ///
+    /// Use this when multiple server instances serve the same root directory
+    /// so that expensive ELF patching work is shared across connections.
+    pub fn with_elf_cache(
+        root: PathBuf,
+        policy: Arc<dyn Policy>,
+        rewrite_syscalls: bool,
+        elf_cache: Arc<Mutex<ElfCache>>,
+    ) -> Self {
         Self {
             root,
             policy,
             fids: RwLock::new(HashMap::new()),
             msize: AtomicU32::new(4 * 1024 * 1024),
             rewrite_syscalls,
-            elf_cache: Mutex::new(HashMap::new()),
+            elf_cache,
         }
+    }
+
+    /// Create a shared ELF cache that can be passed to multiple server instances.
+    pub fn new_elf_cache() -> Arc<Mutex<ElfCache>> {
+        Arc::new(Mutex::new(HashMap::new()))
     }
 
     /// Canonicalize `path` and verify it is contained within the server root.
@@ -1300,7 +1325,11 @@ impl Server {
         }
 
         if let Err(e) = fs::create_dir(&target) {
-            return io_error_response(e);
+            // EEXIST is benign when the directory already exists — callers
+            // like rustup do `mkdir` unconditionally and expect success.
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return io_error_response(e);
+            }
         }
 
         // Apply permissions

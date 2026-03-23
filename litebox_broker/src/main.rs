@@ -9,7 +9,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use tracing::info;
@@ -77,7 +77,10 @@ fn build_policy(cli: &Cli) -> Arc<dyn litebox_broker::policy::Policy> {
 /// Build a `LocalServiceRegistry` when `--root-dir` is provided alongside
 /// network proxy flags. The 9P file server is registered on port 5640 so the
 /// guest can reach it at `BROKER_IP:5640` without a real TCP listener.
-fn build_local_services(cli: &Cli) -> Option<litebox_broker::net_proxy::LocalServiceRegistry> {
+fn build_local_services(
+    cli: &Cli,
+    elf_cache: Arc<Mutex<litebox_broker::nine_p::server::ElfCache>>,
+) -> Option<litebox_broker::net_proxy::LocalServiceRegistry> {
     let root_dir = cli.root_dir.as_ref()?;
     let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
     let policy = build_policy(cli);
@@ -89,15 +92,21 @@ fn build_local_services(cli: &Cli) -> Option<litebox_broker::net_proxy::LocalSer
     {
         let root = root.clone();
         let policy = Arc::clone(&policy);
+        let elf_cache = Arc::clone(&elf_cache);
         registry.register(
             5640,
             Box::new(move |stream| {
                 let root = root.clone();
                 let policy = Arc::clone(&policy);
+                let elf_cache = Arc::clone(&elf_cache);
                 std::thread::spawn(move || {
                     let mut stream = stream;
-                    let server =
-                        litebox_broker::nine_p::server::Server::new(root, policy, rewrite_syscalls);
+                    let server = litebox_broker::nine_p::server::Server::with_elf_cache(
+                        root,
+                        policy,
+                        rewrite_syscalls,
+                        elf_cache,
+                    );
                     server.serve(&mut stream);
                     info!("9P local service session ended");
                 })
@@ -110,16 +119,19 @@ fn build_local_services(cli: &Cli) -> Option<litebox_broker::net_proxy::LocalSer
     {
         let root = root.clone();
         let policy = Arc::clone(&policy);
+        let elf_cache = Arc::clone(&elf_cache);
         registry.register_ring(
             5640,
             Box::new(move |writer, reader| {
                 let root = root.clone();
                 let policy = Arc::clone(&policy);
+                let elf_cache = Arc::clone(&elf_cache);
                 std::thread::spawn(move || {
-                    let server = Arc::new(litebox_broker::nine_p::server::Server::new(
+                    let server = Arc::new(litebox_broker::nine_p::server::Server::with_elf_cache(
                         root,
                         policy,
                         rewrite_syscalls,
+                        elf_cache,
                     ));
                     litebox_broker::nine_p::server::Server::serve_threaded(
                         server, reader, writer, 8,
@@ -151,7 +163,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // We take ownership of it.
         let fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd_num) };
         let ipc = IpcStream::from_owned_fd(fd);
-        let registry = build_local_services(&cli);
+        let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
+        let registry = build_local_services(&cli, elf_cache);
         return litebox_broker::net_proxy::run(ipc, false, registry, None);
     }
     #[cfg(not(unix))]
@@ -170,6 +183,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         info!(addr = %listen_addr, "network proxy listening");
 
+        // Shared ELF patch cache — persists across connections so that
+        // expensive ELF patching is amortized over the broker's lifetime.
+        let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
+
         // Accept connections, validating the LBNP handshake before entering the
         // proxy event loop.  Stray/slow clients are rejected quickly so they
         // cannot block the real runner from connecting.
@@ -182,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             info!("network proxy client connected");
-            let registry = build_local_services(&cli);
+            let registry = build_local_services(&cli, Arc::clone(&elf_cache));
             if let Err(e) = litebox_broker::net_proxy::run(ipc, true, registry, Some(&listener)) {
                 tracing::error!("network proxy error: {e}");
             }
