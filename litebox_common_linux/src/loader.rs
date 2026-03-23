@@ -624,6 +624,26 @@ pub trait ReadAt {
     fn size(&mut self) -> Result<u64, Self::Error>;
 }
 
+/// Blanket [`ReadAt`] implementation for byte slices, useful for parsing
+/// in-memory ELF binaries (e.g. after syscall-rewriter patching).
+impl ReadAt for &[u8] {
+    type Error = Errno;
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+        let offset: usize = offset.truncate();
+        let end = offset.checked_add(buf.len()).ok_or(Errno::ENODATA)?;
+        if end > self.len() {
+            return Err(Errno::ENODATA);
+        }
+        buf.copy_from_slice(&self[offset..end]);
+        Ok(())
+    }
+
+    fn size(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.len() as u64)
+    }
+}
+
 pub trait MapMemory {
     type Error;
 

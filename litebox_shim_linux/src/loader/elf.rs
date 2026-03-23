@@ -7,10 +7,14 @@ use alloc::{ffi::CString, vec::Vec};
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
-    platform::{RawConstPointer as _, SystemInfoProvider as _},
+    platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _},
     utils::{ReinterpretSignedExt, TruncateExt},
 };
-use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
+use litebox_common_linux::{
+    MapFlags,
+    errno::Errno,
+    loader::{ElfParsedFile, ReadAt as _},
+};
 use thiserror::Error;
 
 use crate::{
@@ -152,6 +156,78 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
     }
 }
 
+/// A [`MapMemory`] wrapper that reads file-backed data from an in-memory buffer
+/// instead of from a file descriptor. Used when the loader has patched the ELF
+/// binary on the fly (e.g. syscall rewriting of the dynamic linker).
+///
+/// `reserve`, `map_zero`, and `protect` are delegated to the underlying
+/// [`ElfFile`]; `map_file` is replaced by `map_zero` + a memory copy from the
+/// patched buffer.
+struct PatchedMapper<'a, 'b, FS: ShimFS> {
+    inner: &'b mut ElfFile<'a, FS>,
+    data: &'b [u8],
+}
+
+impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for PatchedMapper<'_, '_, FS> {
+    type Error = Errno;
+
+    fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
+        self.inner.reserve(len, align)
+    }
+
+    fn map_file(
+        &mut self,
+        address: usize,
+        len: usize,
+        offset: u64,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Self::Error> {
+        // Allocate anonymous pages, copy from the in-memory buffer, then apply
+        // the requested protection.
+        self.inner.map_zero(
+            address,
+            len,
+            &litebox_common_linux::loader::Protection {
+                read: true,
+                write: true,
+                execute: false,
+            },
+        )?;
+
+        let offset: usize = offset.truncate();
+        if offset < self.data.len() {
+            let end = core::cmp::min(offset + len, self.data.len());
+            let src = &self.data[offset..end];
+            let dest = MutPtr::<u8>::from_usize(address);
+            dest.copy_from_slice(0, src).ok_or(Errno::EFAULT)?;
+        }
+
+        // Set final permissions if different from the writable mapping above.
+        if !prot.write || prot.execute {
+            self.inner.protect(address, len, prot)?;
+        }
+        Ok(())
+    }
+
+    fn map_zero(
+        &mut self,
+        address: usize,
+        len: usize,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Self::Error> {
+        self.inner.map_zero(address, len, prot)
+    }
+
+    fn protect(
+        &mut self,
+        address: usize,
+        len: usize,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Self::Error> {
+        self.inner.protect(address, len, prot)
+    }
+}
+
 /// Struct to hold the information needed to start the program
 /// (entry point and user stack top).
 pub struct ElfLoadInfo {
@@ -169,6 +245,9 @@ pub(crate) struct ElfLoader<'a, FS: ShimFS> {
 struct FileAndParsed<'a, FS: ShimFS> {
     file: ElfFile<'a, FS>,
     parsed: ElfParsedFile,
+    /// When the rewriter backend is active and the binary was not pre-patched,
+    /// the loader patches it on the fly and loads from this in-memory copy.
+    patched_data: Option<Vec<u8>>,
 }
 
 impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
@@ -176,8 +255,66 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        let _ = parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point());
-        Ok(Self { file, parsed })
+
+        let syscall_entry_point = task.global.platform.get_syscall_entry_point();
+        let trampoline_result = parsed.parse_trampoline(&mut &file, syscall_entry_point);
+
+        // If the rewriter backend is active (syscall_entry_point != 0) and the
+        // binary lacks a trampoline, patch it on the fly so that both the main
+        // program and the dynamic linker are covered.
+        let patched_data = if syscall_entry_point != 0 && trampoline_result.is_err() {
+            let size: usize = (&mut &file)
+                .size()
+                .map_err(ElfLoaderError::OpenError)?
+                .truncate();
+            let mut buf = alloc::vec![0u8; size];
+            (&mut &file)
+                .read_at(0, &mut buf)
+                .map_err(ElfLoaderError::OpenError)?;
+
+            match litebox_syscall_rewriter::hook_syscalls_in_elf(&buf, None) {
+                Ok(patched) => {
+                    // Re-parse the patched binary and extract its trampoline.
+                    parsed =
+                        litebox_common_linux::loader::ElfParsedFile::parse(&mut patched.as_slice())
+                            .map_err(ElfLoaderError::ParseError)?;
+                    parsed
+                        .parse_trampoline(&mut patched.as_slice(), syscall_entry_point)
+                        .map_err(ElfLoaderError::ParseError)?;
+                    Some(patched)
+                }
+                Err(_) => {
+                    // Patching failed (e.g. ET_REL, no .text). Proceed without
+                    // a trampoline — the binary may simply have no syscalls.
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Self {
+            file,
+            parsed,
+            patched_data,
+        })
+    }
+
+    /// Load the ELF into guest memory, choosing the right mapper depending on
+    /// whether the binary was patched in memory.
+    fn load_mapped(
+        &mut self,
+        platform: &(impl litebox::platform::RawPointerProvider + litebox::platform::SystemInfoProvider),
+    ) -> Result<litebox_common_linux::loader::MappingInfo, ElfLoaderError> {
+        if let Some(ref data) = self.patched_data {
+            let mut mapper = PatchedMapper {
+                inner: &mut self.file,
+                data,
+            };
+            Ok(self.parsed.load(&mut mapper, &mut &*platform)?)
+        } else {
+            Ok(self.parsed.load(&mut self.file, &mut &*platform)?)
+        }
     }
 }
 
@@ -219,18 +356,11 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         }
 
         // Load the main ELF file first so that it gets privileged addresses.
-        let info = self
-            .main
-            .parsed
-            .load(&mut self.main.file, &mut &*global.platform)?;
+        let info = self.main.load_mapped(global.platform)?;
 
         // Load the interpreter ELF file, if any.
         let interp = if let Some(interp) = &mut self.interp {
-            Some(
-                interp
-                    .parsed
-                    .load(&mut interp.file, &mut &*global.platform)?,
-            )
+            Some(interp.load_mapped(global.platform)?)
         } else {
             None
         };
