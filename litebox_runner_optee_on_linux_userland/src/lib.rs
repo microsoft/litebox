@@ -140,7 +140,7 @@ fn run_ta_with_default_commands(
             unsafe {
                 litebox_platform_linux_userland::run_thread_ref(
                     entrypoints,
-                    &mut litebox_common_linux::PtRegs::default(),
+                    &mut litebox_common_linux::ExecutionContext::default(),
                 );
             }
 
@@ -155,7 +155,7 @@ fn run_ta_with_default_commands(
             unsafe {
                 litebox_platform_linux_userland::reenter_thread(
                     entrypoints,
-                    &mut litebox_common_linux::PtRegs::default(),
+                    &mut litebox_common_linux::ExecutionContext::default(),
                 );
             }
         } else if func_id == UteeEntryFunc::CloseSession {

@@ -63,7 +63,7 @@ pub fn run_ta_with_test_commands(
                 .unwrap();
             ta_info = Some(loaded);
             let info = ta_info.as_mut().unwrap();
-            let mut ctx = litebox_common_linux::PtRegs::default();
+            let mut ctx = litebox_common_linux::ExecutionContext::default();
             unsafe {
                 litebox_platform_linux_userland::run_thread_ref(
                     info.entrypoints.as_ref().unwrap(),
@@ -89,7 +89,7 @@ pub fn run_ta_with_test_commands(
                 .map_err(|_| {
                     panic!("Failed to load TA context");
                 });
-            let mut ctx = litebox_common_linux::PtRegs::default();
+            let mut ctx = litebox_common_linux::ExecutionContext::default();
             unsafe {
                 litebox_platform_linux_userland::reenter_thread(
                     info.entrypoints.as_ref().unwrap(),
