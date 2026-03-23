@@ -3204,6 +3204,7 @@ impl<FS: ShimFS> Task<FS> {
 
         let (path, argv_vec) = self.resolve_shebang_program(path, argv_vec)?;
 
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[EXEC] pid={} path={:?} argc={} argv={:?}",

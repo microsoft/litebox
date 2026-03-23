@@ -520,7 +520,7 @@ fn patch_elf64_exec_image_with_bias(
     data: &mut [u8],
     layout: &Elf64ExecLayout,
     bias: u64,
-    platform: &impl litebox::platform::DebugLogProvider,
+    _platform: &impl litebox::platform::DebugLogProvider,
 ) -> Result<(), ElfLoaderError> {
     const DT_PLTRELSZ: i64 = 2;
     const DT_PLTGOT: i64 = 3;
@@ -604,6 +604,7 @@ fn patch_elf64_exec_image_with_bias(
                     window[1] = 0x8d;
                     window[2] = 0x3d;
                     window[3..7].copy_from_slice(&disp32.to_le_bytes());
+                    #[cfg(feature = "trace_syscalls")]
                     litebox::log_println!(
                         platform,
                         "[ELF-LOAD] rewrote _start main pointer entry={:#x} instr={:#x} main={:#x} biased_main={:#x}",
@@ -1068,6 +1069,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         } else {
             false
         };
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             global.platform,
             "[ELF-LOAD] path={} fixed_range={:?} bias_main_exec={} pm=[{:#x},{:#x})",
@@ -1080,6 +1082,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
 
         // Load the main ELF file first so that it gets privileged addresses.
         let info = self.main.load_mapped(global.platform, bias_main_exec)?;
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             global.platform,
             "[ELF-LOAD] mapped path={} base={:#x} entry={:#x} brk={:#x}",
