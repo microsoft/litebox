@@ -99,7 +99,7 @@ trap cleanup EXIT
 "$RUNNER" -Z \
   --initial-files "$TAR" --program-from-tar \
   --network-broker "$BROKER_SOCK" \
-  --nine-p-broker "10.0.0.1:5640" \
+  --nine-p-broker "$BROKER_SOCK" \
   --cwd "$CWD" \
   --env HOME=$SANDBOX_HOME \
   --env COPILOT_DATA_DIR=$SANDBOX_HOME/.copilot \

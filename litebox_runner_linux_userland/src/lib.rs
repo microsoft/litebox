@@ -90,12 +90,17 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
-    /// Connect to a 9P file broker at the given address (e.g., 10.0.0.1:5640).
+    /// Connect to a 9P file broker for host filesystem access.
     ///
-    /// Requires a network backend (--tun-device-name or --network-broker).
-    /// The broker must be a 9P2000.L server listening on the network gateway.
-    /// All file I/O flows through the shim's network stack, making it
-    /// suspension-aware for multi-process support.
+    /// Accepts either a Unix socket path for IPC transport (e.g.,
+    /// `/tmp/litebox-broker.sock`) or a TCP address for TUN transport
+    /// (e.g., `10.0.0.1:5640`).
+    ///
+    /// - **IPC mode** (socket path): uses shared-memory ring buffers for
+    ///   zero-syscall 9P transport. Does not require `--network-broker` or
+    ///   `--tun-device-name`.
+    /// - **TCP mode** (address): routes 9P over the guest network stack.
+    ///   Requires a network backend (`--tun-device-name` or `--network-broker`).
     #[arg(
         long = "nine-p-broker",
         requires = "unstable",
@@ -384,14 +389,17 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
     let argv = build_argv(cli_args);
     let envp = build_envp(cli_args);
 
-    // If a 9P broker is requested, validate that a network backend is configured.
-    if cli_args.nine_p_broker.is_some()
-        && cli_args.tun_device_name.is_none()
-        && cli_args.network_broker.is_none()
-    {
-        anyhow::bail!(
-            "--nine-p-broker requires a network backend (--tun-device-name or --network-broker)"
-        );
+    // Validate 9P broker configuration.
+    // TCP addresses (parseable as SocketAddr) require a network backend.
+    // Unix socket paths work standalone via IPC.
+    if let Some(ref broker) = cli_args.nine_p_broker {
+        let is_tcp = broker.parse::<core::net::SocketAddr>().is_ok();
+        if is_tcp && cli_args.tun_device_name.is_none() && cli_args.network_broker.is_none() {
+            anyhow::bail!(
+                "--nine-p-broker with a TCP address requires a network backend \
+                 (--tun-device-name or --network-broker)"
+            );
+        }
     }
 
     // If a 9P broker is requested, build shim → start network → connect 9P → layer FS.
@@ -458,11 +466,12 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     envp: Vec<alloc::ffi::CString>,
 ) -> Result<()> {
     let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
+    let is_tcp = broker_addr.parse::<core::net::SocketAddr>().is_ok();
 
-    // In IPC mode, open a dedicated 9P channel that bypasses smoltcp entirely.
-    // Uses shared-memory ring buffers for zero-syscall 9P transport.
-    if let Some(broker_path) = &cli_args.network_broker {
-        let (ring_writer, ring_reader) = connect_nine_p_channel(broker_path)?;
+    // IPC mode: --nine-p-broker points to a Unix socket path.
+    // Open a dedicated 9P channel using shared-memory ring buffers.
+    if !is_tcp {
+        let (ring_writer, ring_reader) = connect_nine_p_channel(broker_addr)?;
 
         let shim = shim_builder.build();
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
