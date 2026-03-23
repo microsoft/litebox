@@ -148,6 +148,11 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
     Ok(MmappedFile { data, abs_path })
 }
 
+fn resolve_host_program_path(path: &str) -> PathBuf {
+    let abs = std::path::absolute(Path::new(path)).unwrap();
+    std::fs::canonicalize(&abs).unwrap_or(abs)
+}
+
 /// Run Linux programs with LiteBox on unmodified Linux
 ///
 /// # Panics
@@ -176,6 +181,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     // When --program-from-tar is set, the program binary is already in the tar file,
     // so we skip reading it from the host filesystem and skip extracting ancestor modes.
+    //
+    // Likewise, when a 9P broker is active, prefer loading the initial program from the
+    // lower 9P filesystem instead of shadowing it into the in-memory upper layer. That
+    // preserves symlinks and package-relative layouts (e.g. Node CLI launchers such as
+    // `codex` whose `bin/` entry points resolve modules relative to the real package tree).
     #[allow(clippy::type_complexity)]
     let (ancestor_modes_and_users, prog_data): (
         Vec<(litebox::fs::Mode, u32)>,
@@ -183,7 +193,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     ) = if cli_args.program_from_tar {
         (Vec::new(), None)
     } else {
-        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+        let prog = resolve_host_program_path(&cli_args.program_and_arguments[0]);
         if !prog.exists() {
             let mut msg = format!("program not found on host filesystem: {}", prog.display());
             if cli_args.initial_files.is_some() {
@@ -194,30 +204,34 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
             anyhow::bail!(msg);
         }
-        let ancestors: Vec<_> = prog.ancestors().collect();
-        let modes: Vec<_> = ancestors
-            .into_iter()
-            .rev()
-            .skip(1)
-            .map(|path| {
-                let metadata = path.metadata().unwrap();
-                (
-                    litebox::fs::Mode::from_bits(metadata.st_mode()).unwrap(),
-                    metadata.st_uid(),
-                )
-            })
-            .collect();
-        let file = mmapped_file(&prog)?;
-        let data = if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
-                .unwrap()
-                .into()
+        if cli_args.nine_p_broker.is_some() {
+            (Vec::new(), None)
         } else {
-            let data = file.data.into();
-            cow_eligible_regions.push(file);
-            data
-        };
-        (modes, Some(data))
+            let ancestors: Vec<_> = prog.ancestors().collect();
+            let modes: Vec<_> = ancestors
+                .into_iter()
+                .rev()
+                .skip(1)
+                .map(|path| {
+                    let metadata = path.metadata().unwrap();
+                    (
+                        litebox::fs::Mode::from_bits(metadata.st_mode()).unwrap(),
+                        metadata.st_uid(),
+                    )
+                })
+                .collect();
+            let file = mmapped_file(&prog)?;
+            let data = if cli_args.rewrite_syscalls {
+                litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
+                    .unwrap()
+                    .into()
+            } else {
+                let data = file.data.into();
+                cow_eligible_regions.push(file);
+                data
+            };
+            (modes, Some(data))
+        }
     };
     let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
         if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
@@ -282,7 +296,7 @@ fn build_initial_fs(
     // directories or write the program binary into the in-memory FS -- the program
     // is already in the tar layer.
     if let Some(prog_data) = prog_data {
-        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+        let prog = resolve_host_program_path(&cli_args.program_and_arguments[0]);
         let ancestors: Vec<_> = prog.ancestors().collect();
         let mut prev_user = 0;
         for (path, &mode_and_user) in ancestors
@@ -370,7 +384,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
     let prog = if cli_args.program_from_tar {
         PathBuf::from(&cli_args.program_and_arguments[0])
     } else {
-        std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap()
+        resolve_host_program_path(&cli_args.program_and_arguments[0])
     };
     let prog_path = prog.to_str().ok_or_else(|| {
         anyhow!(

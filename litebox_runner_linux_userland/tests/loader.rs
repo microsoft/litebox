@@ -155,6 +155,26 @@ fn test_load_exec_static() {
     launcher.test_load_exec_common(executable_path);
 }
 
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_load_exec_initial_shebang_script() {
+    let mut files_to_install = common::find_dependencies("/bin/true");
+    files_to_install.push("/bin/true".to_string());
+
+    let mut launcher = TestLauncher::init_platform(
+        &[],
+        &["bin", "lib64", "lib", "lib/x86_64-linux-gnu"],
+        &files_to_install
+            .iter()
+            .map(std::string::String::as_str)
+            .collect::<Vec<_>>(),
+        None,
+        false,
+    );
+    launcher.install_file(b"#!/bin/true\n".to_vec(), "/script.sh");
+    launcher.test_load_exec_common("/script.sh");
+}
+
 const HELLO_WORLD_NOLIBC: &str = r#"
 // gcc tests/test.c -o test -static -nostdlib (-m32)
 #if defined(__x86_64__)

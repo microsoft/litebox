@@ -2709,6 +2709,76 @@ fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    /// Resolve `#!` interpreter scripts to their real executable path and argv.
+    ///
+    /// Returns the final executable path plus the argv vector rewritten to match
+    /// Linux `binfmt_script` semantics:
+    /// `[interpreter, optional_arg?, script_path, original_argv[1:]]`.
+    pub(crate) fn resolve_shebang_program(
+        &self,
+        path: &str,
+        argv_vec: alloc::vec::Vec<alloc::ffi::CString>,
+    ) -> Result<(alloc::string::String, alloc::vec::Vec<alloc::ffi::CString>), Errno> {
+        let mut path = alloc::string::String::from(path);
+        let mut argv_vec = argv_vec;
+        let mut shebang_depth = 0u32;
+        loop {
+            let fd = {
+                use litebox::utils::ReinterpretSignedExt as _;
+                match self.sys_open(
+                    path.as_str(),
+                    litebox::fs::OFlags::RDONLY,
+                    litebox::fs::Mode::empty(),
+                ) {
+                    Ok(v) => v.reinterpret_as_signed(),
+                    Err(e) => {
+                        #[cfg(feature = "trace_syscalls")]
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[EXEC-OPEN-FAIL] pid={} path={:?} err={:?}",
+                            self.pid,
+                            path,
+                            e,
+                        );
+                        return Err(e);
+                    }
+                }
+            };
+            let mut header = [0u8; SHEBANG_MAX_LINE];
+            let n = match self.sys_read(fd, &mut header, Some(0)) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = self.sys_close(fd);
+                    return Err(e);
+                }
+            };
+            let _ = self.sys_close(fd);
+
+            match parse_shebang(&header[..n]) {
+                Some((interp, opt_arg)) => {
+                    if shebang_depth >= SHEBANG_MAX_RECURSION {
+                        return Err(Errno::ELOOP);
+                    }
+                    let mut new_argv = alloc::vec::Vec::new();
+                    new_argv.push(alloc::ffi::CString::new(interp).map_err(|_| Errno::EINVAL)?);
+                    if let Some(arg) = opt_arg {
+                        new_argv.push(alloc::ffi::CString::new(arg).map_err(|_| Errno::EINVAL)?);
+                    }
+                    new_argv
+                        .push(alloc::ffi::CString::new(path.as_str()).map_err(|_| Errno::EINVAL)?);
+                    if argv_vec.len() > 1 {
+                        new_argv.extend_from_slice(&argv_vec[1..]);
+                    }
+                    path = alloc::string::String::from(interp);
+                    argv_vec = new_argv;
+                    shebang_depth += 1;
+                }
+                None => break,
+            }
+        }
+        Ok((path, argv_vec))
+    }
+
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
@@ -2780,75 +2850,7 @@ impl<FS: ShimFS> Task<FS> {
             copy_vector(envp, "envp")?
         };
 
-        // --- Shebang (#!) detection and rewriting ---
-        //
-        // If the target file begins with "#!", it is an interpreter script.
-        // We parse the interpreter path (and optional single argument) from the
-        // first line, then rewrite argv to:
-        //
-        //   [interpreter, optional_arg?, script_path, original_argv[1:]]
-        //
-        // and retry with the interpreter as the new executable. This matches
-        // Linux kernel binfmt_script semantics. We loop (up to
-        // SHEBANG_MAX_RECURSION times) to handle chained shebangs (e.g., a
-        // script whose interpreter is itself a script).
-        let mut path = alloc::string::String::from(path);
-        let mut argv_vec = argv_vec;
-        let mut shebang_depth = 0u32;
-        loop {
-            let fd = {
-                use litebox::utils::ReinterpretSignedExt as _;
-                match self.sys_open(
-                    path.as_str(),
-                    litebox::fs::OFlags::RDONLY,
-                    litebox::fs::Mode::empty(),
-                ) {
-                    Ok(v) => v.reinterpret_as_signed(),
-                    Err(e) => {
-                        #[cfg(feature = "trace_syscalls")]
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[EXEC-OPEN-FAIL] pid={} path={:?} err={:?}",
-                            self.pid,
-                            path,
-                            e,
-                        );
-                        return Err(e);
-                    }
-                }
-            };
-            let mut header = [0u8; SHEBANG_MAX_LINE];
-            let n = match self.sys_read(fd, &mut header, Some(0)) {
-                Ok(n) => n,
-                Err(e) => {
-                    let _ = self.sys_close(fd);
-                    return Err(e);
-                }
-            };
-            let _ = self.sys_close(fd);
-
-            match parse_shebang(&header[..n]) {
-                Some((interp, opt_arg)) => {
-                    if shebang_depth >= SHEBANG_MAX_RECURSION {
-                        return Err(Errno::ELOOP);
-                    }
-                    let mut new_argv = alloc::vec::Vec::new();
-                    new_argv.push(alloc::ffi::CString::new(interp).map_err(|_| Errno::EINVAL)?);
-                    if let Some(arg) = opt_arg {
-                        new_argv.push(alloc::ffi::CString::new(arg).map_err(|_| Errno::EINVAL)?);
-                    }
-                    new_argv
-                        .push(alloc::ffi::CString::new(path.as_str()).map_err(|_| Errno::EINVAL)?);
-                    if argv_vec.len() > 1 {
-                        new_argv.extend_from_slice(&argv_vec[1..]);
-                    }
-                    path = alloc::string::String::from(interp);
-                    argv_vec = new_argv;
-                    shebang_depth += 1;
-                }
-                None => break,
-            }
-        }
+        let (path, argv_vec) = self.resolve_shebang_program(path, argv_vec)?;
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(

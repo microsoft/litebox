@@ -343,13 +343,18 @@ impl<FS: ShimFS> LinuxShim<FS> {
             },
         };
         let exec_filename = alloc::ffi::CString::new(path).ok();
+        let (resolved_path, argv) = entrypoints
+            .task
+            .resolve_shebang_program(path, argv)
+            .map_err(loader::elf::ElfLoaderError::OpenError)?;
         entrypoints.task.load_program(
-            loader::elf::ElfLoader::new(&entrypoints.task, path)?,
+            loader::elf::ElfLoader::new(&entrypoints.task, resolved_path.as_str())?,
             argv,
             envp,
             exec_filename.as_ref(),
         )?;
-        *entrypoints.task.fs.borrow().exe_path.write() = entrypoints.task.resolve_exe_path(path);
+        *entrypoints.task.fs.borrow().exe_path.write() =
+            entrypoints.task.resolve_exe_path(resolved_path.as_str());
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
             entrypoints,
