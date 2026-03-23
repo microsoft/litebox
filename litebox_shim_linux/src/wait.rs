@@ -51,6 +51,29 @@ impl<FS: ShimFS> Task<FS> {
             });
             self.check_alarm_deadline();
             self.process_signals(ctx);
+            #[cfg(all(feature = "trace_syscalls", target_arch = "x86_64"))]
+            litebox::log_println!(
+                self.global.platform,
+                "[TRACE] prepare resume: pid={} tid={} rip={:#x} rcx={:#x} r11={:#x} rsp={:#x} rax={:#x}",
+                self.pid,
+                self.tid,
+                ctx.rip,
+                ctx.rcx,
+                ctx.r11,
+                ctx.rsp,
+                ctx.rax,
+            );
+            #[cfg(all(feature = "trace_syscalls", target_arch = "x86"))]
+            litebox::log_println!(
+                self.global.platform,
+                "[TRACE] prepare resume: pid={} tid={} eip={:#x} ecx={:#x} esp={:#x} eax={:#x}",
+                self.pid,
+                self.tid,
+                ctx.eip,
+                ctx.ecx,
+                ctx.esp,
+                ctx.eax,
+            );
             !self.is_exiting()
         })
     }

@@ -5,6 +5,9 @@
 //!
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
+#[cfg(target_os = "linux")]
+use core::mem::MaybeUninit;
+
 use crate::{ShimFS, Task};
 use litebox::{
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
@@ -55,8 +58,8 @@ const fn to_fixed_size_array<const N: usize>(s: &str) -> [u8; N] {
     }
     arr
 }
-const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
-    sysname: to_fixed_size_array::<65>("LiteBox"),
+const FALLBACK_SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
+    sysname: to_fixed_size_array::<65>("Linux"),
     nodename: to_fixed_size_array::<65>("litebox"),
     release: to_fixed_size_array::<65>("5.11.0"), // libc seems to expect this to be not too old
     version: to_fixed_size_array::<65>("5.11.0"),
@@ -67,17 +70,89 @@ const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
     domainname: to_fixed_size_array::<65>(""),
 };
 
+#[cfg(target_os = "linux")]
+fn c_char_array_to_fixed<const N: usize>(src: &[libc::c_char; N]) -> [u8; N] {
+    let mut dst = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        dst[i] = src[i] as u8;
+        if dst[i] == 0 {
+            break;
+        }
+        i += 1;
+    }
+    if i == N {
+        dst[N - 1] = 0;
+    }
+    dst
+}
+
+#[cfg(target_os = "linux")]
+fn current_utsname() -> litebox_common_linux::Utsname {
+    let mut uts = MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: `uts` points to valid writable memory for a host `uname(2)` call.
+    if unsafe { libc::uname(uts.as_mut_ptr()) } != 0 {
+        return FALLBACK_SYS_INFO;
+    }
+    // SAFETY: The previous successful `uname(2)` call initialized the struct.
+    let uts = unsafe { uts.assume_init() };
+    litebox_common_linux::Utsname {
+        sysname: c_char_array_to_fixed(&uts.sysname),
+        nodename: c_char_array_to_fixed(&uts.nodename),
+        release: c_char_array_to_fixed(&uts.release),
+        version: c_char_array_to_fixed(&uts.version),
+        machine: c_char_array_to_fixed(&uts.machine),
+        domainname: c_char_array_to_fixed(&uts.domainname),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_utsname() -> litebox_common_linux::Utsname {
+    FALLBACK_SYS_INFO
+}
+
+#[cfg(target_os = "linux")]
+fn host_sysinfo() -> Option<litebox_common_linux::Sysinfo> {
+    let mut info = MaybeUninit::<libc::sysinfo>::uninit();
+    // SAFETY: `info` points to valid writable memory for a host `sysinfo(2)` call.
+    if unsafe { libc::sysinfo(info.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: The previous successful `sysinfo(2)` call initialized the struct.
+    let info = unsafe { info.assume_init() };
+    Some(litebox_common_linux::Sysinfo {
+        uptime: info.uptime.try_into().unwrap_or_default(),
+        loads: info.loads.map(|load| load as usize),
+        totalram: info.totalram as usize,
+        freeram: info.freeram as usize,
+        sharedram: info.sharedram as usize,
+        bufferram: info.bufferram as usize,
+        totalswap: info.totalswap as usize,
+        freeswap: info.freeswap as usize,
+        procs: info.procs,
+        totalhigh: info.totalhigh as usize,
+        freehigh: info.freehigh as usize,
+        mem_unit: info.mem_unit,
+        ..Default::default()
+    })
+}
+
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `uname`.
     pub(crate) fn sys_uname(
         &self,
         buf: crate::MutPtr<litebox_common_linux::Utsname>,
     ) -> Result<(), Errno> {
-        buf.write_at_offset(0, SYS_INFO).ok_or(Errno::EFAULT)
+        buf.write_at_offset(0, current_utsname())
+            .ok_or(Errno::EFAULT)
     }
 
     /// Handle syscall `sysinfo`.
     pub(crate) fn sys_sysinfo(&self) -> litebox_common_linux::Sysinfo {
+        #[cfg(target_os = "linux")]
+        if let Some(info) = host_sysinfo() {
+            return info;
+        }
         let now = self.global.platform.now();
         litebox_common_linux::Sysinfo {
             uptime: now
@@ -198,11 +273,12 @@ mod tests {
         task.sys_uname(ptr).expect("uname failed");
         let utsname = unsafe { utsname.assume_init() };
 
-        assert_eq!(utsname.sysname, super::SYS_INFO.sysname);
-        assert_eq!(utsname.nodename, super::SYS_INFO.nodename);
-        assert_eq!(utsname.release, super::SYS_INFO.release);
-        assert_eq!(utsname.version, super::SYS_INFO.version);
-        assert_eq!(utsname.machine, super::SYS_INFO.machine);
-        assert_eq!(utsname.domainname, super::SYS_INFO.domainname);
+        let expected = super::current_utsname();
+        assert_eq!(utsname.sysname, expected.sysname);
+        assert_eq!(utsname.nodename, expected.nodename);
+        assert_eq!(utsname.release, expected.release);
+        assert_eq!(utsname.version, expected.version);
+        assert_eq!(utsname.machine, expected.machine);
+        assert_eq!(utsname.domainname, expected.domainname);
     }
 }

@@ -49,6 +49,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///   a page fault.
     /// - `populate_pages_immediately`: If `true`, the pages are populated immediately; otherwise,
     ///   they are populated lazily.
+    /// - `noreserve`: If `true`, request a sparse reservation that avoids reserving swap/commit
+    ///   upfront when the platform supports it.
     /// - `fixed_address_behavior`: Specifies the required semantics of `suggested_range`.
     ///
     /// # Returns
@@ -64,6 +66,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
+        noreserve: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
 
@@ -108,6 +111,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
                 temp_permissions,
                 false,
                 true,
+                false,
                 FixedAddressBehavior::NoReplace,
             )
             .map_err(|e| match e {

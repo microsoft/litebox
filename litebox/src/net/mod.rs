@@ -85,6 +85,14 @@ where
     Platform:
         platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
+    fn ip_listen_endpoint_v4(addr: SocketAddrV4, port: u16) -> smoltcp::wire::IpListenEndpoint {
+        smoltcp::wire::IpListenEndpoint {
+            addr: (!addr.ip().is_unspecified())
+                .then_some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+            port,
+        }
+    }
+
     /// Construct a new `Network` instance
     ///
     /// This function is expected to only be invoked once per platform, as an initialization step,
@@ -271,6 +279,8 @@ impl TcpServerSpecific {
 
 /// Socket-specific data for UDP sockets
 pub(crate) struct UdpSpecific {
+    /// A local port associated with this socket, if any.
+    local_port: Option<LocalPort>,
     /// Remote endpoint
     ///
     /// If `connect`-ed, this is the remote endpoint to which packets are sent by default.
@@ -783,6 +793,7 @@ where
                     connect_initiated_at_us: None,
                 }),
                 Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
+                    local_port: None,
                     remote_endpoint: None,
                 }),
                 Protocol::Icmp => unimplemented!(),
@@ -931,6 +942,9 @@ where
                 let _ = self.socket_set.remove(handle);
             }
             Protocol::Udp => {
+                if let Some(local_port) = specific.udp_mut().local_port.take() {
+                    self.local_port_allocator.deallocate(local_port);
+                }
                 let smoltcp::socket::Socket::Udp(mut socket) = self.socket_set.remove(handle)
                 else {
                     unreachable!()
@@ -1030,13 +1044,26 @@ where
                 if addr.port() == 0 {
                     return Err(ConnectError::Unaddressable);
                 }
-                let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
-                if !socket.is_open() {
-                    let local_port = self.local_port_allocator.ephemeral_port()?;
-                    let local_endpoint: smoltcp::wire::IpListenEndpoint = local_port.port().into();
-                    let Ok(()) = socket.bind(local_endpoint) else {
-                        unreachable!("binding to a free port cannot fail")
-                    };
+                let new_local_port = {
+                    let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                    if socket.is_open() {
+                        None
+                    } else {
+                        let local_port = self.local_port_allocator.ephemeral_port()?;
+                        let local_endpoint: smoltcp::wire::IpListenEndpoint =
+                            local_port.port().into();
+                        let Ok(()) = socket.bind(local_endpoint) else {
+                            unreachable!("binding to a free port cannot fail")
+                        };
+                        Some(local_port)
+                    }
+                };
+                if let Some(local_port) = new_local_port {
+                    let old_port = socket_handle.udp_mut().local_port.replace(local_port);
+                    debug_assert!(old_port.is_none());
+                    if let Some(old_port) = old_port {
+                        self.local_port_allocator.deallocate(old_port);
+                    }
                 }
                 let addr: smoltcp::wire::IpEndpoint = (*addr).into();
                 socket_handle.udp_mut().remote_endpoint = Some(addr);
@@ -1184,31 +1211,33 @@ where
                     unimplemented!()
                 }
                 socket_handle.tcp_mut().server_socket = Some(TcpServerSpecific {
-                    ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
-                        addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
-                        port: new_port,
-                    },
+                    ip_listen_endpoint: Self::ip_listen_endpoint_v4(*addr, new_port),
                     backlog: None,
                     socket_set_handles: vec![],
                 });
             }
             Protocol::Udp => {
-                let lp = self
-                    .local_port_allocator
-                    .allocate_local_port(addr.port())
-                    .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
-                let local_endpoint = smoltcp::wire::IpListenEndpoint {
-                    addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
-                    port: lp.port(),
-                };
-                let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
-                socket.bind(local_endpoint).map_err(|e| {
-                    self.local_port_allocator.deallocate(lp);
-                    match e {
-                        udp::BindError::InvalidState => BindError::AlreadyBound,
-                        udp::BindError::Unaddressable => unreachable!(),
+                let new_local_port = {
+                    let local_port = self
+                        .local_port_allocator
+                        .allocate_local_port(addr.port())
+                        .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
+                    let local_endpoint = Self::ip_listen_endpoint_v4(*addr, local_port.port());
+                    let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                    if let Err(e) = socket.bind(local_endpoint) {
+                        self.local_port_allocator.deallocate(local_port);
+                        return Err(match e {
+                            udp::BindError::InvalidState => BindError::AlreadyBound,
+                            udp::BindError::Unaddressable => unreachable!(),
+                        });
                     }
-                })?;
+                    local_port
+                };
+                let old_port = socket_handle.udp_mut().local_port.replace(new_local_port);
+                debug_assert!(old_port.is_none());
+                if let Some(old_port) = old_port {
+                    self.local_port_allocator.deallocate(old_port);
+                }
             }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
@@ -1270,10 +1299,7 @@ where
                         unimplemented!()
                     }
                     handle.server_socket = Some(TcpServerSpecific {
-                        ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
-                            addr: Some(smoltcp::wire::IpAddress::v4(0, 0, 0, 0)),
-                            port,
-                        },
+                        ip_listen_endpoint: smoltcp::wire::IpListenEndpoint { addr: None, port },
                         backlog: None,
                         socket_set_handles: vec![],
                     });
@@ -1436,20 +1462,34 @@ where
                 let Some(remote_endpoint) = destination else {
                     return Err(SendError::DestinationAddressRequired);
                 };
-                let udp_socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
-                if !udp_socket.is_open() {
-                    let Ok(()) = udp_socket.bind(smoltcp::wire::IpListenEndpoint {
-                        addr: None,
-                        port: self
+                let new_local_port = {
+                    let udp_socket: &mut udp::Socket =
+                        self.socket_set.get_mut(socket_handle.handle);
+                    if udp_socket.is_open() {
+                        None
+                    } else {
+                        let local_port = self
                             .local_port_allocator
                             .ephemeral_port()
-                            .map_err(SendError::PortAllocationFailure)?
-                            .port(),
-                    }) else {
-                        unreachable!("binding to a free port cannot fail")
-                    };
+                            .map_err(SendError::PortAllocationFailure)?;
+                        let Ok(()) = udp_socket.bind(smoltcp::wire::IpListenEndpoint {
+                            addr: None,
+                            port: local_port.port(),
+                        }) else {
+                            unreachable!("binding to a free port cannot fail")
+                        };
+                        Some(local_port)
+                    }
+                };
+                if let Some(local_port) = new_local_port {
+                    let old_port = socket_handle.udp_mut().local_port.replace(local_port);
+                    debug_assert!(old_port.is_none());
+                    if let Some(old_port) = old_port {
+                        self.local_port_allocator.deallocate(old_port);
+                    }
                 }
-                udp_socket
+                self.socket_set
+                    .get_mut::<udp::Socket>(socket_handle.handle)
                     .send_slice(buf, remote_endpoint)
                     .map(|()| buf.len())
                     .map_err(|e| match e {

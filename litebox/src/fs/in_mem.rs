@@ -223,6 +223,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         mode: super::Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
         use super::OFlags;
+        flags.remove(OFlags::PATH);
         let currently_supported_oflags: OFlags = OFlags::CREAT
             | OFlags::RDONLY
             | OFlags::WRONLY
@@ -234,7 +235,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::NONBLOCK
             | OFlags::LARGEFILE
             | OFlags::NOFOLLOW
-            | OFlags::APPEND;
+            | OFlags::APPEND
+            | OFlags::PATH;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }

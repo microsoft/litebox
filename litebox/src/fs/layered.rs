@@ -652,6 +652,7 @@ impl<
         flags: OFlags,
         mode: Mode,
     ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
+        let flags = flags - OFlags::PATH;
         let currently_supported_oflags: OFlags = OFlags::CREAT
             | OFlags::RDONLY
             | OFlags::WRONLY
@@ -663,7 +664,8 @@ impl<
             | OFlags::NONBLOCK
             | OFlags::LARGEFILE
             | OFlags::NOFOLLOW
-            | OFlags::APPEND;
+            | OFlags::APPEND
+            | OFlags::PATH;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }

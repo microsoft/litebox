@@ -200,6 +200,39 @@ where
         unsafe { self.create_pages(suggested_address, length, flags, perms, perms, op) }
     }
 
+    /// Create readable, writable, and executable pages.
+    ///
+    /// Pages are created writable so `op` can initialize them, then upgraded to
+    /// their final RWX permissions before returning.
+    ///
+    /// # Safety
+    ///
+    /// Writable+executable mappings are inherently dangerous. Callers must only
+    /// use this for legitimate cases such as JITs that require RWX memory.
+    pub unsafe fn create_rwx_pages<F>(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
+        let before_perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        let after_perms = before_perms | MemoryRegionPermissions::EXEC;
+        unsafe {
+            self.create_pages(
+                suggested_address,
+                length,
+                flags,
+                before_perms,
+                after_perms,
+                op,
+            )
+        }
+    }
+
     /// Create read-only pages.
     ///
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
@@ -803,6 +836,7 @@ where
                     range,
                     vma,
                     false,
+                    vma.noreserve(),
                     crate::platform::page_mgmt::FixedAddressBehavior::NoReplace,
                 )
             } {

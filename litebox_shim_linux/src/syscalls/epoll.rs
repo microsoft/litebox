@@ -159,8 +159,13 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
 
     /// Returns `true` if this descriptor requires periodic host polling
     /// rather than observer-based notifications.
-    fn needs_host_poll(&self, fs: &FS) -> bool {
+    fn needs_host_poll(&self, global: &GlobalState<FS>, fs: &FS) -> bool {
         match self {
+            EpollDescriptor::Eventfd(fd) => global
+                .litebox
+                .descriptor_table()
+                .entry_handle(fd)
+                .is_some_and(|handle| handle.with_entry(|entry| entry.needs_host_poll())),
             EpollDescriptor::File(file) => fs
                 .get_io_pollable(file)
                 .is_some_and(|p| p.needs_host_poll()),
@@ -330,7 +335,7 @@ impl<FS: ShimFS> EpollFile<FS> {
         if !events.is_empty() {
             self.ready.push(&entry);
         }
-        if file.needs_host_poll(fs) {
+        if file.needs_host_poll(global, fs) {
             self.needs_host_poll
                 .store(true, core::sync::atomic::Ordering::Relaxed);
         }
@@ -707,7 +712,7 @@ impl PollSet {
     /// Returns true if any entry in the poll set requires host polling.
     fn has_host_poll_fds<FS: ShimFS>(
         &self,
-        _global: &GlobalState<FS>,
+        global: &GlobalState<FS>,
         files: &FilesState<FS>,
     ) -> bool {
         for entry in &self.entries {
@@ -716,7 +721,7 @@ impl PollSet {
             }
             let raw_fd = entry.fd.reinterpret_as_unsigned() as usize;
             if let Ok(poll_descriptor) = EpollDescriptor::try_from(files, raw_fd)
-                && poll_descriptor.needs_host_poll(&*files.fs)
+                && poll_descriptor.needs_host_poll(global, &*files.fs)
             {
                 return true;
             }
@@ -747,10 +752,15 @@ impl Observer<Events> for PollEntryObserver {
 
 #[cfg(test)]
 mod test {
+    use core::time::Duration;
+
     use alloc::sync::Arc;
     use litebox::event::Events;
     use litebox::event::wait::WaitState;
-    use litebox_common_linux::{EfdFlags, EpollEvent};
+    use litebox::platform::TimeProvider as _;
+    use litebox_common_linux::{
+        ClockId, EfdFlags, EpollEvent, ItimerSpec, TimerfdFlags, TimerfdTimerFlags,
+    };
     use litebox_platform_multiplex::platform;
 
     use super::EpollFile;
@@ -822,6 +832,70 @@ mod test {
                 1024,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn test_epoll_with_timerfd() {
+        let (task, epoll, fs) = setup_epoll();
+        let timerfd = crate::syscalls::eventfd::EventFile::new_timer(
+            platform(),
+            platform().now(),
+            ClockId::Monotonic,
+            TimerfdFlags::empty(),
+        );
+        let typed = task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(timerfd);
+        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
+        let Ok(raw_fd) = files.insert_raw_fd(typed) else {
+            unreachable!()
+        };
+        let descriptor = super::EpollDescriptor::try_from(&files, raw_fd).unwrap();
+        epoll
+            .add_interest(
+                &task.global,
+                &*fs,
+                11,
+                &descriptor,
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 0,
+                },
+            )
+            .unwrap();
+        task.global
+            .litebox
+            .descriptor_table()
+            .with_entry(
+                &files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                    .unwrap(),
+                |entry| {
+                    entry.set_timer(
+                        TimerfdTimerFlags::empty(),
+                        ItimerSpec {
+                            interval: Duration::ZERO.into(),
+                            value: Duration::from_millis(1).into(),
+                        },
+                    )
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        let events = epoll
+            .wait(
+                &task.global,
+                &*fs,
+                &WaitState::new(platform()).context(),
+                1024,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
     }
 
     #[test]

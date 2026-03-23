@@ -25,11 +25,13 @@ pub use page_mgmt::PageManagementProvider;
 #[macro_export]
 macro_rules! log_println {
     ($platform:expr, $s:expr) => {{
+        #[allow(unused_imports)]
         use $crate::platform::DebugLogProvider as _;
         $platform.debug_log_print($s);
     }};
     ($platform:expr, $($tt:tt)*) => {{
         use core::fmt::Write as _;
+        #[allow(unused_imports)]
         use $crate::platform::DebugLogProvider as _;
         let mut t: arrayvec::ArrayString<8192> = arrayvec::ArrayString::new();
         writeln!(t, $($tt)*).unwrap();

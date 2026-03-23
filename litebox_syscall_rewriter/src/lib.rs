@@ -521,6 +521,12 @@ fn hook_syscalls_in_section(
 
         let return_addr = inst.next_ip();
         if arch == Arch::X86_64 {
+            // Reserve the SysV red zone before entering the shim so async
+            // guest signal delivery / interrupt handling cannot clobber
+            // stack locals parked below the architectural RSP.
+            // LEA RSP, [RSP - 0x80] = 48 8D 64 24 80
+            trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x80]);
+
             // Put the address of the original JMP (call-site) into R11 so
             // that SA_RESTART can rewind ctx.rip to re-enter the trampoline.
             // The real `syscall` instruction clobbers R11 with RFLAGS, so
@@ -938,6 +944,12 @@ fn hook_syscall_and_after(
     let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
 
     if arch == Arch::X86_64 {
+        // Reserve the SysV red zone before entering the shim so async guest
+        // signal delivery / interrupt handling cannot clobber stack locals
+        // parked below the architectural RSP.
+        // LEA RSP, [RSP - 0x80] = 48 8D 64 24 80
+        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x80]);
+
         // Put the address of the original JMP (call-site) into R11 so
         // that SA_RESTART can rewind ctx.rip to re-enter the trampoline.
         // LEA R11, [RIP + disp32] = 4C 8D 1D <disp32>

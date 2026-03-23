@@ -241,6 +241,7 @@ impl LinuxShimBuilder {
             shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
             main_bss_start: core::sync::atomic::AtomicUsize::new(0),
             main_bss_end: core::sync::atomic::AtomicUsize::new(0),
+            proc_map_paths: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
             vfork_parking: Arc::new(VforkParking {
                 park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                 parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
@@ -513,6 +514,17 @@ impl<FS: ShimFS> Task<FS> {
         _ctx: &litebox_common_linux::PtRegs,
         page_present: bool,
     ) -> bool {
+        #[cfg(all(feature = "trace_syscalls", target_arch = "x86_64"))]
+        litebox::log_println!(
+            self.global.platform,
+            "[TRACE-COW] pid={} tid={} rip={:#x} fault_addr={:#x} page_present={} child={}",
+            self.pid,
+            self.tid,
+            _ctx.rip,
+            fault_addr,
+            page_present,
+            self.fork_context.borrow().is_some(),
+        );
         let ps = self.process_state.borrow();
         let cow_lock = ps.active_cow.lock();
         let Some(cow) = cow_lock.as_ref() else {
@@ -1022,10 +1034,22 @@ impl<FS: ShimFS> Task<FS> {
             number: syscall_number,
             entry_rip: ctx.rip,
             entry_rsp: ctx.rsp,
+            #[cfg(target_arch = "x86")]
+            entry_rbp: ctx.ebp as usize,
+            #[cfg(target_arch = "x86_64")]
+            entry_rbp: ctx.rbp,
             arg0: ctx.syscall_arg(0),
             arg1: ctx.syscall_arg(1),
             arg2: ctx.syscall_arg(2),
         }));
+    }
+
+    #[cfg(all(feature = "trace_syscalls", target_arch = "x86_64"))]
+    fn trace_stack_words(&self, rsp: usize) -> (Option<usize>, Option<usize>) {
+        let stack0 = ConstPtr::<usize>::from_usize(rsp).read_at_offset(0);
+        let stack1 =
+            ConstPtr::<usize>::from_usize(rsp + core::mem::size_of::<usize>()).read_at_offset(0);
+        (stack0, stack1)
     }
 
     fn log_fatal_signal_recent_activity(&self) {
@@ -1160,16 +1184,23 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(feature = "trace_syscalls")]
         {
             #[cfg(target_arch = "x86_64")]
-            litebox::log_println!(
-                self.global.platform,
-                "[TRACE] syscall: pid={} nr={} rip={:#x} arg0={:#x} arg1={:#x} arg2={:#x}",
-                self.pid,
-                ctx.orig_rax,
-                ctx.rip,
-                ctx.syscall_arg(0),
-                ctx.syscall_arg(1),
-                ctx.syscall_arg(2),
-            );
+            {
+                let (stack0, stack1) = self.trace_stack_words(ctx.rsp);
+                litebox::log_println!(
+                    self.global.platform,
+                    "[TRACE] syscall: pid={} tid={} nr={} rip={:#x} rsp={:#x} stack0={:?} stack1={:?} arg0={:#x} arg1={:#x} arg2={:#x}",
+                    self.pid,
+                    self.tid,
+                    ctx.orig_rax,
+                    ctx.rip,
+                    ctx.rsp,
+                    stack0,
+                    stack1,
+                    ctx.syscall_arg(0),
+                    ctx.syscall_arg(1),
+                    ctx.syscall_arg(2),
+                );
+            }
         }
 
         let return_value = match self.do_syscall(ctx) {
@@ -1177,8 +1208,9 @@ impl<FS: ShimFS> Task<FS> {
                 #[cfg(feature = "trace_syscalls")]
                 litebox::log_println!(
                     self.global.platform,
-                    "[TRACE] syscall done: pid={} ret=Ok({})",
+                    "[TRACE] syscall done: pid={} tid={} ret=Ok({})",
                     self.pid,
+                    self.tid,
                     v,
                 );
                 v
@@ -1187,8 +1219,9 @@ impl<FS: ShimFS> Task<FS> {
                 #[cfg(feature = "trace_syscalls")]
                 litebox::log_println!(
                     self.global.platform,
-                    "[TRACE] syscall done: pid={} ret=Err({})",
+                    "[TRACE] syscall done: pid={} tid={} ret=Err({})",
                     self.pid,
+                    self.tid,
                     err.as_neg(),
                 );
                 (err.as_neg() as isize).reinterpret_as_unsigned()
@@ -1202,6 +1235,22 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(target_arch = "x86_64")]
         {
             ctx.rax = return_value;
+            #[cfg(feature = "trace_syscalls")]
+            let (stack0, stack1) = self.trace_stack_words(ctx.rsp);
+            #[cfg(feature = "trace_syscalls")]
+            litebox::log_println!(
+                self.global.platform,
+                "[TRACE] syscall resume: pid={} tid={} rip={:#x} rcx={:#x} r11={:#x} rsp={:#x} stack0={:?} stack1={:?} rax={:#x}",
+                self.pid,
+                self.tid,
+                ctx.rip,
+                ctx.rcx,
+                ctx.r11,
+                ctx.rsp,
+                stack0,
+                stack1,
+                ctx.rax,
+            );
         }
     }
 
@@ -1252,6 +1301,7 @@ impl<FS: ShimFS> Task<FS> {
                 infop,
                 options,
             } => self.sys_waitid(idtype, id, infop, options),
+            SyscallRequest::PidfdOpen { pid, flags } => syscall!(sys_pidfd_open(pid, flags)),
             SyscallRequest::Execve {
                 pathname,
                 argv,
@@ -1408,6 +1458,13 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Mprotect { addr, length, prot } => {
                 syscall!(sys_mprotect(addr, length, prot))
             }
+            SyscallRequest::Msync {
+                addr,
+                length,
+                flags,
+            } => {
+                syscall!(sys_msync(addr, length, flags))
+            }
             SyscallRequest::Mremap {
                 old_addr,
                 old_size,
@@ -1508,6 +1565,7 @@ impl<FS: ShimFS> Task<FS> {
                 addr,
                 addrlen,
             } => self.sys_recvfrom(sockfd, buf, len, flags, addr, addrlen),
+            SyscallRequest::Recvmsg { sockfd, msg, flags } => self.sys_recvmsg(sockfd, msg, flags),
             SyscallRequest::Bind {
                 sockfd,
                 sockaddr,
@@ -1626,6 +1684,7 @@ impl<FS: ShimFS> Task<FS> {
                     })
             }),
             SyscallRequest::Gettimeofday { tv, tz } => syscall!(sys_gettimeofday(tv, tz)),
+            SyscallRequest::Getrusage { who, usage } => syscall!(sys_getrusage(who, usage)),
             SyscallRequest::ClockGettime { clockid, tp } => {
                 litebox_common_linux::ClockId::try_from(clockid)
                     .map_err(|_| {
@@ -1907,6 +1966,36 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
+            SyscallRequest::InotifyInit1 { flags } => syscall!(sys_inotify_init1(flags)),
+            SyscallRequest::InotifyAddWatch { fd, pathname, mask } => {
+                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_inotify_add_watch(fd, path, mask))
+                })
+            }
+            SyscallRequest::InotifyRmWatch { fd, wd } => syscall!(sys_inotify_rm_watch(fd, wd)),
+            SyscallRequest::TimerfdCreate { clockid, flags } => {
+                litebox_common_linux::ClockId::try_from(clockid)
+                    .map_err(|_| Errno::EINVAL)
+                    .and_then(|clockid| syscall!(sys_timerfd_create(clockid, flags)))
+            }
+            SyscallRequest::TimerfdSettime {
+                fd,
+                flags,
+                new_value,
+                old_value,
+            } => new_value
+                .read_at_offset(0)
+                .ok_or(Errno::EFAULT)
+                .and_then(|new_value| self.sys_timerfd_settime(fd, flags, new_value, old_value))
+                .map(|()| 0),
+            SyscallRequest::TimerfdGettime { fd, curr_value } => {
+                self.sys_timerfd_gettime(fd).and_then(|curr_value_value| {
+                    curr_value
+                        .write_at_offset(0, curr_value_value)
+                        .ok_or(Errno::EFAULT)
+                        .map(|()| 0)
+                })
+            }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                     pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT)?;
@@ -1967,11 +2056,25 @@ impl<FS: ShimFS> Task<FS> {
                         .ok_or(Errno::EFAULT)
                 })
                 .map(|()| 0),
+            SyscallRequest::Rseq {
+                rseq,
+                rseq_len,
+                flags,
+                sig,
+            } => syscall!(sys_rseq(rseq, rseq_len, flags, sig)),
             SyscallRequest::GetRandom { buf, count, flags } => {
                 self.sys_getrandom(buf, count, flags)
             }
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::ProcessVmReadv {
+                pid,
+                local_iov,
+                liovcnt,
+                remote_iov,
+                riovcnt,
+                flags,
+            } => self.sys_process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags),
             SyscallRequest::Getpgid { pid } => self.sys_getpgid(pid).map(|v| v as usize),
             SyscallRequest::Setpgid { pid, pgid } => self.sys_setpgid(pid, pgid).map(|()| 0),
             SyscallRequest::Getsid { pid } => self.sys_getsid(pid).map(|v| v as usize),
@@ -1980,6 +2083,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
+            SyscallRequest::Getgroups { size, list } => self.sys_getgroups(size, list),
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
                 buf.write_at_offset(0, sysinfo)
@@ -2019,6 +2123,9 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::SchedGetscheduler { pid: _ } => {
                 // Return SCHED_OTHER (0) — the default Linux scheduler policy.
                 Ok(0)
+            }
+            SyscallRequest::SchedSetscheduler { pid, policy, param } => {
+                self.sys_sched_setscheduler(pid, policy, param)
             }
             SyscallRequest::Futex { args } => self.sys_futex(args),
             SyscallRequest::Umask { mask } => {
@@ -2111,6 +2218,11 @@ struct ProcessState {
     /// Page-aligned end of the main binary's `.bss` region. Set once during
     /// ELF loading.
     main_bss_end: core::sync::atomic::AtomicUsize,
+    /// Best-effort pathname annotations for guest `/proc/self/maps`.
+    proc_map_paths: litebox::sync::Mutex<
+        Platform,
+        alloc::vec::Vec<(core::ops::Range<usize>, alloc::string::String)>,
+    >,
     /// Shared vfork parking state, wrapped in `Arc` so that both the
     /// syscall-boundary parking path (`park_for_vfork_if_requested`) and the
     /// transport spin-loop parking path (`ShimTransport::park_for_vfork`) can
@@ -2248,6 +2360,8 @@ struct RecentSyscall {
     number: usize,
     entry_rip: usize,
     entry_rsp: usize,
+    #[allow(dead_code)]
+    entry_rbp: usize,
     arg0: usize,
     arg1: usize,
     arg2: usize,

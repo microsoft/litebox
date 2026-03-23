@@ -641,6 +641,26 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy)]
+    pub struct TimerfdFlags: core::ffi::c_uint {
+        const CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits();
+        const NONBLOCK = litebox::fs::OFlags::NONBLOCK.bits();
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy)]
+    pub struct TimerfdTimerFlags: core::ffi::c_uint {
+        const ABSTIME = 0x1;
+        const CANCEL_ON_SET = 0x2;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 #[repr(C)]
@@ -970,10 +990,43 @@ impl From<Duration> for Timespec32 {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Default)]
+pub struct ItimerSpec {
+    pub interval: Timespec,
+    pub value: Timespec,
+}
+
+#[repr(C)]
 #[derive(Default, Clone, Copy, FromBytes, IntoBytes)]
 pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
+}
+
+#[cfg(target_pointer_width = "64")]
+type RusageWord = i64;
+#[cfg(target_pointer_width = "32")]
+type RusageWord = i32;
+
+#[repr(C)]
+#[derive(Default, Clone, Copy, FromBytes, IntoBytes)]
+pub struct Rusage {
+    pub ru_utime: TimeVal,
+    pub ru_stime: TimeVal,
+    pub ru_maxrss: RusageWord,
+    pub ru_ixrss: RusageWord,
+    pub ru_idrss: RusageWord,
+    pub ru_isrss: RusageWord,
+    pub ru_minflt: RusageWord,
+    pub ru_majflt: RusageWord,
+    pub ru_nswap: RusageWord,
+    pub ru_inblock: RusageWord,
+    pub ru_oublock: RusageWord,
+    pub ru_msgsnd: RusageWord,
+    pub ru_msgrcv: RusageWord,
+    pub ru_nsignals: RusageWord,
+    pub ru_nvcsw: RusageWord,
+    pub ru_nivcsw: RusageWord,
 }
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
@@ -1568,6 +1621,7 @@ pub enum MadviseBehavior {
     DontNeedLocked = 24,
 }
 
+#[repr(C)]
 #[derive(Clone, Debug, Default, FromBytes, IntoBytes)]
 pub struct Sysinfo {
     /// Seconds since boot
@@ -1588,16 +1642,26 @@ pub struct Sysinfo {
     pub freeswap: usize,
     /// Number of current processes
     pub procs: u16,
-    /// Explicit padding for m68k
+    /// Explicit padding for the legacy ABI.
     pub pad: u16,
+    /// Explicitly model the x86_64 ABI padding between `pad` and `totalhigh`
+    /// so the struct remains padding-free for zerocopy.
+    #[allow(clippy::pub_underscore_fields)]
+    #[cfg(target_pointer_width = "64")]
+    pub _pad2: u32,
     /// Total high memory size
     pub totalhigh: usize,
     /// Available high memory size
     pub freehigh: usize,
     /// Memory unit size in bytes
     pub mem_unit: u32,
-    /// Padding: libc5 uses this..
+    /// Explicit trailing padding from the Linux UAPI struct.
     #[allow(clippy::pub_underscore_fields)]
+    #[cfg(target_pointer_width = "64")]
+    pub _f: [u8; 4],
+    /// Explicit trailing padding from the Linux UAPI struct.
+    #[allow(clippy::pub_underscore_fields)]
+    #[cfg(target_pointer_width = "32")]
     pub _f: [u8; 20 - 2 * core::mem::size_of::<usize>() - core::mem::size_of::<u32>()],
 }
 
@@ -1818,6 +1882,8 @@ pub enum PrctlArg<Platform: litebox::platform::RawPointerProvider> {
     SetName(Platform::RawConstPointer<u8>),
     GetName(Platform::RawMutPointer<u8>),
     CapBSetRead(usize),
+    SetTHPDisable(usize),
+    GetTHPDisable(usize),
 }
 
 #[repr(i32)]
@@ -1850,6 +1916,8 @@ bitflags::bitflags! {
         const OOB = 0x1;
         /// `MSG_PEEK`: requests to peek at incoming messages
         const PEEK = 0x2;
+        /// `MSG_NOSIGNAL`: ignored for receive calls on Linux.
+        const NOSIGNAL = 0x4000;
         /// `MSG_TRUNC`: truncate the message
         const TRUNC = 0x20;
         /// `MSG_WAITALL`: wait for the full amount of data
@@ -1913,7 +1981,7 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     /// number of bytes of ancillary data
     pub msg_controllen: usize,
     /// flags on received message
-    pub msg_flags: SendFlags,
+    pub msg_flags: ReceiveFlags,
     /// Explicit trailing padding to match the 4-byte gap after `msg_flags` in
     /// Linux's naturally-aligned `struct user_msghdr` on 64-bit (total size 56).
     #[cfg(target_pointer_width = "64")]
@@ -1922,18 +1990,23 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
 
 impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platform> {
     fn clone(&self) -> Self {
-        Self {
-            msg_name: self.msg_name,
-            msg_namelen: self.msg_namelen,
-            #[cfg(target_pointer_width = "64")]
-            _pad: 0,
-            msg_iov: self.msg_iov,
-            msg_iovlen: self.msg_iovlen,
-            msg_control: self.msg_control,
-            msg_controllen: self.msg_controllen,
-            msg_flags: self.msg_flags,
-            #[cfg(target_pointer_width = "64")]
-            _pad2: 0,
+        // SAFETY: `UserMsgHdr` is a packed ABI struct, so its fields may be
+        // unaligned in memory. Read them with `read_unaligned` before
+        // constructing the aligned Rust value.
+        unsafe {
+            Self {
+                msg_name: core::ptr::read_unaligned(core::ptr::addr_of!(self.msg_name)),
+                msg_namelen: core::ptr::read_unaligned(core::ptr::addr_of!(self.msg_namelen)),
+                #[cfg(target_pointer_width = "64")]
+                _pad: 0,
+                msg_iov: core::ptr::read_unaligned(core::ptr::addr_of!(self.msg_iov)),
+                msg_iovlen: core::ptr::read_unaligned(core::ptr::addr_of!(self.msg_iovlen)),
+                msg_control: core::ptr::read_unaligned(core::ptr::addr_of!(self.msg_control)),
+                msg_controllen: core::ptr::read_unaligned(core::ptr::addr_of!(self.msg_controllen)),
+                msg_flags: core::ptr::read_unaligned(core::ptr::addr_of!(self.msg_flags)),
+                #[cfg(target_pointer_width = "64")]
+                _pad2: 0,
+            }
         }
     }
 }
@@ -2070,6 +2143,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         addr: Platform::RawMutPointer<u8>,
         length: usize,
         prot: ProtFlags,
+    },
+    Msync {
+        addr: Platform::RawMutPointer<u8>,
+        length: usize,
+        flags: i32,
     },
     Munmap {
         addr: Platform::RawMutPointer<u8>,
@@ -2222,6 +2300,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         addr: Option<Platform::RawMutPointer<u8>>,
         addrlen: Platform::RawMutPointer<u32>,
     },
+    Recvmsg {
+        sockfd: i32,
+        msg: Platform::RawMutPointer<UserMsgHdr<Platform>>,
+        flags: ReceiveFlags,
+    },
     Bind {
         sockfd: i32,
         sockaddr: Platform::RawConstPointer<u8>,
@@ -2280,7 +2363,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         epfd: i32,
         events: Platform::RawMutPointer<EpollEvent>,
         maxevents: u32,
-        timeout: i32,
+        timeout: TimeParam<Platform>,
         sigmask: Option<Platform::RawConstPointer<SigSet>>,
         sigsetsize: usize,
     },
@@ -2421,6 +2504,32 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         initval: u32,
         flags: EfdFlags,
     },
+    InotifyInit1 {
+        flags: litebox::fs::OFlags,
+    },
+    InotifyAddWatch {
+        fd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        mask: u32,
+    },
+    InotifyRmWatch {
+        fd: i32,
+        wd: i32,
+    },
+    TimerfdCreate {
+        clockid: i32,
+        flags: TimerfdFlags,
+    },
+    TimerfdSettime {
+        fd: i32,
+        flags: TimerfdTimerFlags,
+        new_value: Platform::RawConstPointer<ItimerSpec>,
+        old_value: Option<Platform::RawMutPointer<ItimerSpec>>,
+    },
+    TimerfdGettime {
+        fd: i32,
+        curr_value: Platform::RawMutPointer<ItimerSpec>,
+    },
     /// No-op: file locking (single-process sandbox).
     Flock {
         fd: i32,
@@ -2506,6 +2615,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Time {
         tloc: Option<Platform::RawMutPointer<time_t>>,
     },
+    Getrusage {
+        who: i32,
+        usage: Platform::RawMutPointer<Rusage>,
+    },
     Getrlimit {
         resource: RlimitResource,
         rlim: Platform::RawMutPointer<Rlimit>,
@@ -2537,6 +2650,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         head: Platform::RawMutPointer<usize>,
         len: Platform::RawMutPointer<usize>,
     },
+    Rseq {
+        rseq: Platform::RawMutPointer<u8>,
+        rseq_len: u32,
+        flags: u32,
+        sig: u32,
+    },
     GetRandom {
         buf: Platform::RawMutPointer<u8>,
         count: usize,
@@ -2559,6 +2678,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Geteuid,
     Getgid,
     Getegid,
+    Getgroups {
+        size: i32,
+        list: Platform::RawMutPointer<u32>,
+    },
     Sysinfo {
         buf: Platform::RawMutPointer<Sysinfo>,
     },
@@ -2583,6 +2706,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     SchedGetscheduler {
         pid: i32,
+    },
+    SchedSetscheduler {
+        pid: i32,
+        policy: i32,
+        param: Platform::RawConstPointer<i32>,
     },
     Futex {
         args: FutexArgs<Platform>,
@@ -2617,6 +2745,18 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         id: u32,
         infop: Option<Platform::RawMutPointer<u8>>,
         options: i32,
+    },
+    ProcessVmReadv {
+        pid: i32,
+        local_iov: Platform::RawConstPointer<IoReadVec<Platform::RawMutPointer<u8>>>,
+        liovcnt: usize,
+        remote_iov: Platform::RawConstPointer<IoWriteVec<Platform::RawConstPointer<u8>>>,
+        riovcnt: usize,
+        flags: usize,
+    },
+    PidfdOpen {
+        pid: i32,
+        flags: u32,
     },
 }
 
@@ -2704,6 +2844,31 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             };
         }
 
+        #[cfg(target_arch = "x86_64")]
+        {
+            const __NR_PIDFD_OPEN: usize = 434;
+            const __NR_EPOLL_PWAIT2: usize = 441;
+
+            if syscall_number == __NR_PIDFD_OPEN {
+                return Ok(SyscallRequest::PidfdOpen {
+                    pid: ctx.sys_req_arg(0),
+                    flags: ctx.sys_req_arg(1),
+                });
+            }
+            if syscall_number == __NR_EPOLL_PWAIT2 {
+                let timeout_ptr: Option<Platform::RawMutPointer<Timespec>> = ctx.sys_req_ptr(3);
+                let sigmask: Option<Platform::RawConstPointer<SigSet>> = ctx.sys_req_ptr(4);
+                return Ok(SyscallRequest::EpollPwait {
+                    epfd: ctx.sys_req_arg(0),
+                    events: ctx.sys_req_ptr(1),
+                    maxevents: ctx.sys_req_arg(2),
+                    timeout: TimeParam::timespec64(timeout_ptr),
+                    sigmask,
+                    sigsetsize: ctx.sys_req_arg(5),
+                });
+            }
+        }
+
         let sysno = Sysno::new(syscall_number).ok_or_else(|| {
             log_unsupported(format_args!("unknown syscall {syscall_number}"));
             errno::Errno::ENOSYS
@@ -2739,6 +2904,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 offset,
             }),
             Sysno::mprotect => sys_req!(Mprotect { addr:*, length, prot }),
+            Sysno::msync => sys_req!(Msync { addr:*, length, flags }),
             Sysno::munmap => sys_req!(Munmap { addr:*, length }),
             Sysno::brk => sys_req!(Brk { addr:* }),
             Sysno::mremap => sys_req!(Mremap { old_addr:*, old_size, new_size, flags, new_addr }),
@@ -2867,6 +3033,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::sendmsg => sys_req!(Sendmsg { sockfd, msg:*, flags }),
             Sysno::sendmmsg => sys_req!(Sendmmsg { sockfd, msgvec:*, vlen, flags }),
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
+            Sysno::recvmsg => sys_req!(Recvmsg { sockfd, msg:*, flags }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
             Sysno::shutdown => sys_req!(Shutdown { sockfd, how }),
@@ -2890,6 +3057,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             Sysno::wait4 => sys_req!(Wait4 { pid, wstatus:*, options, rusage:* }),
             Sysno::waitid => sys_req!(Waitid { idtype, id, infop:*, options }),
+            Sysno::process_vm_readv => sys_req!(ProcessVmReadv {
+                pid,
+                local_iov:*,
+                liovcnt,
+                remote_iov:*,
+                riovcnt,
+                flags,
+            }),
             Sysno::uname => sys_req!(Uname { buf:* }),
             Sysno::fcntl => {
                 let cmd: i32 = ctx.sys_req_arg(1);
@@ -2964,6 +3139,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
+            Sysno::getrusage => sys_req!(Getrusage { who, usage:* }),
             Sysno::getpgid => sys_req!(Getpgid { pid }),
             Sysno::getpgrp => SyscallRequest::Getpgid { pid: 0 },
             Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
@@ -2973,12 +3149,27 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
+            Sysno::getgroups => sys_req!(Getgroups { size, list:* }),
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
             Sysno::epoll_wait => {
-                sys_req!(EpollPwait { epfd, events:*, maxevents, timeout, sigmask: { None }, sigsetsize: { 0 }, })
+                sys_req!(EpollPwait {
+                    epfd,
+                    events:*,
+                    maxevents,
+                    timeout: { TimeParam::Milliseconds(ctx.sys_req_arg(3)) },
+                    sigmask: { None },
+                    sigsetsize: { 0 },
+                })
             }
             Sysno::epoll_pwait => {
-                sys_req!(EpollPwait { epfd, events:*, maxevents, timeout, sigmask:*, sigsetsize })
+                sys_req!(EpollPwait {
+                    epfd,
+                    events:*,
+                    maxevents,
+                    timeout: { TimeParam::Milliseconds(ctx.sys_req_arg(3)) },
+                    sigmask:*,
+                    sigsetsize,
+                })
             }
             Sysno::epoll_create => sys_req!(EpollCreate {
                 size,
@@ -3051,6 +3242,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         },
                         PrctlOption::CapBSetRead => SyscallRequest::Prctl {
                             args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::SetTHPDisable => SyscallRequest::Prctl {
+                            args: PrctlArg::SetTHPDisable(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetTHPDisable => SyscallRequest::Prctl {
+                            args: PrctlArg::GetTHPDisable(ctx.sys_req_arg(1)),
                         },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
@@ -3166,6 +3363,23 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            Sysno::inotify_init => SyscallRequest::InotifyInit1 {
+                flags: litebox::fs::OFlags::empty(),
+            },
+            Sysno::inotify_init1 => sys_req!(InotifyInit1 { flags }),
+            Sysno::inotify_add_watch => sys_req!(InotifyAddWatch { fd, pathname:*, mask }),
+            Sysno::inotify_rm_watch => sys_req!(InotifyRmWatch { fd, wd }),
+            Sysno::timerfd_create => SyscallRequest::TimerfdCreate {
+                clockid: ctx.sys_req_arg(0),
+                flags: TimerfdFlags::from_bits_truncate(ctx.sys_req_arg(1)),
+            },
+            Sysno::timerfd_settime => SyscallRequest::TimerfdSettime {
+                fd: ctx.sys_req_arg(0),
+                flags: TimerfdTimerFlags::from_bits_truncate(ctx.sys_req_arg(1)),
+                new_value: ctx.sys_req_ptr(2),
+                old_value: ctx.sys_req_ptr(3),
+            },
+            Sysno::timerfd_gettime => sys_req!(TimerfdGettime { fd, curr_value:* }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone => {
                 let args = CloneArgs {
@@ -3242,6 +3456,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     len: ctx.sys_req_ptr(2),
                 }
             }
+            Sysno::rseq => SyscallRequest::Rseq {
+                rseq: ctx.sys_req_ptr(0),
+                rseq_len: ctx.sys_req_arg(1),
+                flags: ctx.sys_req_arg(2),
+                sig: ctx.sys_req_arg(3),
+            },
             Sysno::sysinfo => sys_req!(Sysinfo { buf:* }),
             Sysno::capget => sys_req!(CapGet { header:*,data:* }),
             Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
@@ -3260,6 +3480,11 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             Sysno::sched_getscheduler => SyscallRequest::SchedGetscheduler {
                 pid: ctx.sys_req_arg(0),
+            },
+            Sysno::sched_setscheduler => SyscallRequest::SchedSetscheduler {
+                pid: ctx.sys_req_arg(0),
+                policy: ctx.sys_req_arg(1),
+                param: ctx.sys_req_ptr(2),
             },
             Sysno::futex => Self::parse_futex(ctx, TimeParam::timespec_old, unsupported_einval)?,
             #[cfg(target_arch = "x86")]
@@ -3292,7 +3517,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 len,
                 flags
             }),
-            Sysno::io_uring_setup | Sysno::rseq => {
+            Sysno::io_uring_setup => {
                 return Err(errno::Errno::ENOSYS);
             }
             // Single-process sandbox: file locking is a no-op.

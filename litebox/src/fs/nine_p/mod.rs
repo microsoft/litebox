@@ -1168,7 +1168,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         mode: super::Mode,
     ) -> Result<FileFd<Platform, W>, super::errors::OpenError> {
         // TODO: we don't support non-blocking, so ignore that flag instead of returning an error
-        let flags = flags - OFlags::NONBLOCK;
+        let flags = flags - OFlags::NONBLOCK - OFlags::PATH;
         let currently_supported_oflags: OFlags = OFlags::RDONLY
             | OFlags::WRONLY
             | OFlags::RDWR
@@ -1183,7 +1183,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             | OFlags::SYNC
             | OFlags::DSYNC
             | OFlags::DIRECT
-            | OFlags::NOATIME;
+            | OFlags::NOATIME
+            | OFlags::PATH;
         if flags.intersects(currently_supported_oflags.complement()) {
             unimplemented!("{flags:?}")
         }

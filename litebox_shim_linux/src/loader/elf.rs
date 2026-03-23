@@ -3,7 +3,12 @@
 
 //! ELF loader for LiteBox
 
-use alloc::{ffi::CString, vec::Vec};
+use alloc::{
+    ffi::CString,
+    string::{String, ToString as _},
+    vec::Vec,
+};
+use core::mem::size_of;
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
@@ -13,7 +18,7 @@ use litebox::{
 use litebox_common_linux::{
     MapFlags,
     errno::Errno,
-    loader::{ElfParsedFile, ReadAt as _},
+    loader::{ElfParsedFile, MapMemory as _, ReadAt as _},
 };
 use thiserror::Error;
 
@@ -184,7 +189,7 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for PatchedMapper<'_, '
     ) -> Result<(), Self::Error> {
         // Allocate anonymous pages, copy from the in-memory buffer, then apply
         // the requested protection.
-        self.inner.map_zero(
+        let result = self.inner.map_zero(
             address,
             len,
             &litebox_common_linux::loader::Protection {
@@ -192,7 +197,18 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for PatchedMapper<'_, '
                 write: true,
                 execute: false,
             },
-        )?;
+        );
+        #[cfg(feature = "trace_syscalls")]
+        if let Err(err) = &result {
+            litebox::log_println!(
+                self.inner.task.global.platform,
+                "[TRACE-EXEC-BIAS] patched map_zero addr={:#x} len={:#x} err={:?}",
+                address,
+                len,
+                err,
+            );
+        }
+        result?;
 
         let offset: usize = offset.truncate();
         if offset < self.data.len() {
@@ -204,7 +220,21 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for PatchedMapper<'_, '
 
         // Set final permissions if different from the writable mapping above.
         if !prot.write || prot.execute {
-            self.inner.protect(address, len, prot)?;
+            let result = self.inner.protect(address, len, prot);
+            #[cfg(feature = "trace_syscalls")]
+            if let Err(err) = &result {
+                litebox::log_println!(
+                    self.inner.task.global.platform,
+                    "[TRACE-EXEC-BIAS] patched protect addr={:#x} len={:#x} r={} w={} x={} err={:?}",
+                    address,
+                    len,
+                    prot.read,
+                    prot.write,
+                    prot.execute,
+                    err,
+                );
+            }
+            result?;
         }
         Ok(())
     }
@@ -215,7 +245,21 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for PatchedMapper<'_, '
         len: usize,
         prot: &litebox_common_linux::loader::Protection,
     ) -> Result<(), Self::Error> {
-        self.inner.map_zero(address, len, prot)
+        let result = self.inner.map_zero(address, len, prot);
+        #[cfg(feature = "trace_syscalls")]
+        if let Err(err) = &result {
+            litebox::log_println!(
+                self.inner.task.global.platform,
+                "[TRACE-EXEC-BIAS] direct map_zero addr={:#x} len={:#x} r={} w={} x={} err={:?}",
+                address,
+                len,
+                prot.read,
+                prot.write,
+                prot.execute,
+                err,
+            );
+        }
+        result
     }
 
     fn protect(
@@ -224,7 +268,21 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for PatchedMapper<'_, '
         len: usize,
         prot: &litebox_common_linux::loader::Protection,
     ) -> Result<(), Self::Error> {
-        self.inner.protect(address, len, prot)
+        let result = self.inner.protect(address, len, prot);
+        #[cfg(feature = "trace_syscalls")]
+        if let Err(err) = &result {
+            litebox::log_println!(
+                self.inner.task.global.platform,
+                "[TRACE-EXEC-BIAS] direct protect addr={:#x} len={:#x} r={} w={} x={} err={:?}",
+                address,
+                len,
+                prot.read,
+                prot.write,
+                prot.execute,
+                err,
+            );
+        }
+        result
     }
 }
 
@@ -243,15 +301,600 @@ pub(crate) struct ElfLoader<'a, FS: ShimFS> {
 }
 
 struct FileAndParsed<'a, FS: ShimFS> {
+    path: String,
     file: ElfFile<'a, FS>,
     parsed: ElfParsedFile,
     /// When the rewriter backend is active and the binary was not pre-patched,
     /// the loader patches it on the fly and loads from this in-memory copy.
     patched_data: Option<Vec<u8>>,
+    exec_bias_applied: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct Elf64ProgramHeader {
+    offset: usize,
+    p_type: u32,
+    p_offset: usize,
+    p_vaddr: usize,
+    p_paddr: usize,
+    p_filesz: usize,
+    _p_memsz: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+struct Elf64ExecLayout {
+    phdrs: Vec<Elf64ProgramHeader>,
+    dynamic: Option<Elf64ProgramHeader>,
+    entry: usize,
+    min_vaddr: usize,
+    max_vaddr: usize,
+    align: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Elf64ExecLayout {
+    fn span_len(&self) -> usize {
+        self.max_vaddr - self.min_vaddr
+    }
+
+    fn contains(&self, value: usize) -> bool {
+        (self.min_vaddr..self.max_vaddr).contains(&value)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn invalid_program_header() -> ElfLoaderError {
+    ElfLoaderError::LoadError(litebox_common_linux::loader::ElfLoadError::InvalidProgramHeader)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_bytes<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N], ElfLoaderError> {
+    data.get(offset..offset + N)
+        .ok_or_else(invalid_program_header)?
+        .try_into()
+        .map_err(|_| invalid_program_header())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_u16(data: &[u8], offset: usize) -> Result<u16, ElfLoaderError> {
+    Ok(u16::from_le_bytes(read_bytes::<2>(data, offset)?))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_u32(data: &[u8], offset: usize) -> Result<u32, ElfLoaderError> {
+    Ok(u32::from_le_bytes(read_bytes::<4>(data, offset)?))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_u64(data: &[u8], offset: usize) -> Result<u64, ElfLoaderError> {
+    Ok(u64::from_le_bytes(read_bytes::<8>(data, offset)?))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_i64(data: &[u8], offset: usize) -> Result<i64, ElfLoaderError> {
+    Ok(i64::from_le_bytes(read_bytes::<8>(data, offset)?))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn write_u64(data: &mut [u8], offset: usize, value: usize) -> Result<(), ElfLoaderError> {
+    data.get_mut(offset..offset + 8)
+        .ok_or_else(invalid_program_header)?
+        .copy_from_slice(&(value as u64).to_le_bytes());
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn write_i64(data: &mut [u8], offset: usize, value: usize) -> Result<(), ElfLoaderError> {
+    let value = i64::try_from(value).map_err(|_| invalid_program_header())?;
+    data.get_mut(offset..offset + 8)
+        .ok_or_else(invalid_program_header)?
+        .copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parse_elf64_exec_layout(data: &[u8]) -> Result<Elf64ExecLayout, ElfLoaderError> {
+    const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
+    const TRAMPOLINE_HEADER_SIZE: usize = 32;
+    if data.get(0..4) != Some(&b"\x7fELF"[..]) || data.get(4) != Some(&2) || data.get(5) != Some(&1)
+    {
+        return Err(invalid_program_header());
+    }
+    let e_phoff: usize = read_u64(data, 32)?
+        .try_into()
+        .map_err(|_| invalid_program_header())?;
+    let entry: usize = read_u64(data, 24)?
+        .try_into()
+        .map_err(|_| invalid_program_header())?;
+    let e_phentsize = usize::from(read_u16(data, 54)?);
+    let e_phnum = usize::from(read_u16(data, 56)?);
+    if e_phentsize < 56 || e_phnum == 0 {
+        return Err(invalid_program_header());
+    }
+    let phdr_bytes = e_phentsize
+        .checked_mul(e_phnum)
+        .and_then(|size| e_phoff.checked_add(size))
+        .ok_or_else(invalid_program_header)?;
+    if phdr_bytes > data.len() {
+        return Err(invalid_program_header());
+    }
+
+    let mut phdrs = Vec::with_capacity(e_phnum);
+    let mut dynamic = None;
+    let mut min_vaddr = usize::MAX;
+    let mut max_vaddr = 0usize;
+    let mut align = PAGE_SIZE;
+    for i in 0..e_phnum {
+        let offset = e_phoff + i * e_phentsize;
+        let p_type = read_u32(data, offset)?;
+        let p_offset: usize = read_u64(data, offset + 8)?
+            .try_into()
+            .map_err(|_| invalid_program_header())?;
+        let p_vaddr: usize = read_u64(data, offset + 16)?
+            .try_into()
+            .map_err(|_| invalid_program_header())?;
+        let phys_addr: usize = read_u64(data, offset + 24)?
+            .try_into()
+            .map_err(|_| invalid_program_header())?;
+        let p_filesz: usize = read_u64(data, offset + 32)?
+            .try_into()
+            .map_err(|_| invalid_program_header())?;
+        let p_memsz: usize = read_u64(data, offset + 40)?
+            .try_into()
+            .map_err(|_| invalid_program_header())?;
+        let p_align: usize = read_u64(data, offset + 48)?
+            .try_into()
+            .map_err(|_| invalid_program_header())?;
+        let phdr = Elf64ProgramHeader {
+            offset,
+            p_type,
+            p_offset,
+            p_vaddr,
+            p_paddr: phys_addr,
+            p_filesz,
+            _p_memsz: p_memsz,
+        };
+        if p_type == PT_LOAD {
+            min_vaddr = min_vaddr.min(p_vaddr);
+            max_vaddr = max_vaddr.max(
+                p_vaddr
+                    .checked_add(p_memsz)
+                    .ok_or_else(invalid_program_header)?,
+            );
+            if p_align.is_power_of_two() {
+                align = align.max(p_align);
+            }
+        } else if p_type == PT_DYNAMIC {
+            dynamic = Some(phdr);
+        }
+        phdrs.push(phdr);
+    }
+    if min_vaddr >= max_vaddr {
+        return Err(invalid_program_header());
+    }
+    if data.len() >= TRAMPOLINE_HEADER_SIZE
+        && data[data.len() - TRAMPOLINE_HEADER_SIZE..data.len() - TRAMPOLINE_HEADER_SIZE + 8]
+            == b"LITEBOX0"[..]
+    {
+        let trampoline_vaddr: usize = read_u64(data, data.len() - 16)?.truncate();
+        let trampoline_size: usize = read_u64(data, data.len() - 8)?.truncate();
+        max_vaddr = max_vaddr.max(
+            trampoline_vaddr
+                .checked_add(trampoline_size)
+                .ok_or_else(invalid_program_header)?,
+        );
+    }
+    Ok(Elf64ExecLayout {
+        phdrs,
+        dynamic,
+        entry,
+        min_vaddr,
+        max_vaddr,
+        align,
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn vaddr_to_file_offset(layout: &Elf64ExecLayout, vaddr: usize) -> Result<usize, ElfLoaderError> {
+    for phdr in &layout.phdrs {
+        if phdr.p_type != 1 {
+            continue;
+        }
+        let Some(file_end) = phdr.p_vaddr.checked_add(phdr.p_filesz) else {
+            continue;
+        };
+        if (phdr.p_vaddr..file_end).contains(&vaddr) {
+            return phdr
+                .p_offset
+                .checked_add(vaddr - phdr.p_vaddr)
+                .ok_or_else(invalid_program_header);
+        }
+    }
+    Err(invalid_program_header())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn patch_elf64_exec_image_with_bias(
+    data: &mut [u8],
+    layout: &Elf64ExecLayout,
+    bias: u64,
+    platform: &impl litebox::platform::DebugLogProvider,
+) -> Result<(), ElfLoaderError> {
+    const DT_PLTRELSZ: i64 = 2;
+    const DT_PLTGOT: i64 = 3;
+    const DT_HASH: i64 = 4;
+    const DT_STRTAB: i64 = 5;
+    const DT_SYMTAB: i64 = 6;
+    const DT_RELA: i64 = 7;
+    const DT_RELASZ: i64 = 8;
+    const DT_RELAENT: i64 = 9;
+    const DT_SYMENT: i64 = 11;
+    const DT_INIT: i64 = 12;
+    const DT_FINI: i64 = 13;
+    const DT_REL: i64 = 17;
+    const DT_JMPREL: i64 = 23;
+    const DT_INIT_ARRAY: i64 = 25;
+    const DT_FINI_ARRAY: i64 = 26;
+    const DT_INIT_ARRAYSZ: i64 = 27;
+    const DT_FINI_ARRAYSZ: i64 = 28;
+    const DT_PREINIT_ARRAY: i64 = 32;
+    const DT_PREINIT_ARRAYSZ: i64 = 33;
+    const DT_GNU_HASH: i64 = 0x6fff_fef5;
+    const DT_VERSYM: i64 = 0x6fff_fff0;
+    const DT_VERDEF: i64 = 0x6fff_fffc;
+    const DT_VERNEED: i64 = 0x6fff_fffe;
+    const SHF_WRITE: u64 = 0x1;
+    const SHF_ALLOC: u64 = 0x2;
+    const SHF_EXECINSTR: u64 = 0x4;
+    const SHT_NOBITS: u32 = 8;
+    const R_X86_64_RELATIVE: u32 = 8;
+    const R_X86_64_IRELATIVE: u32 = 37;
+    const TRAMPOLINE_HEADER_SIZE: usize = 32;
+    let bias = usize::try_from(bias).map_err(|_| invalid_program_header())?;
+
+    let add_bias = |value: usize| -> Result<usize, ElfLoaderError> {
+        if layout.contains(value) {
+            value.checked_add(bias).ok_or_else(invalid_program_header)
+        } else {
+            Ok(value)
+        }
+    };
+
+    write_u64(data, 24, add_bias(read_u64(data, 24)?.truncate())?)?;
+
+    // Non-PIE glibc crt1 on x86_64 commonly loads `main` with
+    // `mov $imm32, %rdi` in `_start` before calling `__libc_start_main`.
+    // That encoding cannot represent a rebased address above 4 GiB. When we
+    // bias ET_EXEC into a higher VA slot, rewrite the instruction to the
+    // same-length RIP-relative `lea main(%rip), %rdi`.
+    if layout.contains(layout.entry) {
+        let entry_offset = vaddr_to_file_offset(layout, layout.entry)?;
+        let scan_end = entry_offset
+            .checked_add(64)
+            .ok_or_else(invalid_program_header)?
+            .min(data.len());
+        let mut cursor = entry_offset;
+        while cursor + 13 <= scan_end {
+            let window = &mut data[cursor..cursor + 13];
+            if window[0] == 0x48
+                && window[1] == 0xc7
+                && window[2] == 0xc7
+                && window[7] == 0xff
+                && window[8] == 0x15
+            {
+                let imm =
+                    <[u8; 4]>::try_from(&window[3..7]).map_err(|_| invalid_program_header())?;
+                let main = usize::try_from(u32::from_le_bytes(imm))
+                    .map_err(|_| invalid_program_header())?;
+                if layout.contains(main) {
+                    let instr_vaddr = layout
+                        .entry
+                        .checked_add(cursor - entry_offset)
+                        .ok_or_else(invalid_program_header)?;
+                    let biased_instr = add_bias(instr_vaddr)?;
+                    let biased_main = add_bias(main)?;
+                    let next_ip = biased_instr
+                        .checked_add(7)
+                        .ok_or_else(invalid_program_header)?;
+                    let disp = i64::try_from(biased_main).map_err(|_| invalid_program_header())?
+                        - i64::try_from(next_ip).map_err(|_| invalid_program_header())?;
+                    let disp32 = i32::try_from(disp).map_err(|_| invalid_program_header())?;
+                    window[1] = 0x8d;
+                    window[2] = 0x3d;
+                    window[3..7].copy_from_slice(&disp32.to_le_bytes());
+                    litebox::log_println!(
+                        platform,
+                        "[ELF-LOAD] rewrote _start main pointer entry={:#x} instr={:#x} main={:#x} biased_main={:#x}",
+                        layout.entry,
+                        instr_vaddr,
+                        main,
+                        biased_main,
+                    );
+                    break;
+                }
+            }
+            cursor += 1;
+        }
+    }
+
+    for phdr in &layout.phdrs {
+        if phdr.p_vaddr != 0 {
+            write_u64(data, phdr.offset + 16, add_bias(phdr.p_vaddr)?)?;
+        }
+        if phdr.p_paddr != 0 {
+            write_u64(data, phdr.offset + 24, add_bias(phdr.p_paddr)?)?;
+        }
+    }
+
+    let mut dyn_entries = Vec::new();
+    if let Some(dynamic) = layout.dynamic {
+        let dyn_len = dynamic
+            .p_offset
+            .checked_add(dynamic.p_filesz)
+            .ok_or_else(invalid_program_header)?;
+        if dyn_len > data.len() || dynamic.p_filesz % 16 != 0 {
+            return Err(invalid_program_header());
+        }
+        for idx in 0..(dynamic.p_filesz / 16) {
+            let entry_offset = dynamic.p_offset + idx * 16;
+            let tag = read_i64(data, entry_offset)?;
+            let value = read_u64(data, entry_offset + 8)?.truncate();
+            dyn_entries.push((tag, value));
+            if matches!(
+                tag,
+                DT_PLTGOT
+                    | DT_HASH
+                    | DT_STRTAB
+                    | DT_SYMTAB
+                    | DT_RELA
+                    | DT_REL
+                    | DT_JMPREL
+                    | DT_INIT
+                    | DT_FINI
+                    | DT_INIT_ARRAY
+                    | DT_FINI_ARRAY
+                    | DT_PREINIT_ARRAY
+                    | DT_GNU_HASH
+                    | DT_VERSYM
+                    | DT_VERDEF
+                    | DT_VERNEED
+            ) {
+                write_u64(data, entry_offset + 8, add_bias(value)?)?;
+            }
+        }
+    }
+
+    let dyn_value = |tag: i64| {
+        dyn_entries
+            .iter()
+            .find(|(entry_tag, _)| *entry_tag == tag)
+            .map(|(_, value)| *value)
+    };
+
+    for (array_tag, size_tag) in [
+        (DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ),
+        (DT_INIT_ARRAY, DT_INIT_ARRAYSZ),
+        (DT_FINI_ARRAY, DT_FINI_ARRAYSZ),
+    ] {
+        let Some(array_addr) = dyn_value(array_tag) else {
+            continue;
+        };
+        let Some(array_size) = dyn_value(size_tag) else {
+            continue;
+        };
+        let array_offset = vaddr_to_file_offset(layout, array_addr)?;
+        for item in (0..array_size).step_by(size_of::<u64>()) {
+            let value_offset = array_offset
+                .checked_add(item)
+                .ok_or_else(invalid_program_header)?;
+            write_u64(
+                data,
+                value_offset,
+                add_bias(read_u64(data, value_offset)?.truncate())?,
+            )?;
+        }
+    }
+
+    if let (Some(symtab_addr), Some(strtab_addr), Some(sym_ent)) = (
+        dyn_value(DT_SYMTAB),
+        dyn_value(DT_STRTAB),
+        dyn_value(DT_SYMENT),
+    ) {
+        if strtab_addr > symtab_addr && sym_ent >= size_of::<u64>() * 2 {
+            let symtab_offset = vaddr_to_file_offset(layout, symtab_addr)?;
+            let sym_count = (strtab_addr - symtab_addr) / sym_ent;
+            for index in 0..sym_count {
+                let symbol_offset = symtab_offset
+                    .checked_add(index * sym_ent)
+                    .ok_or_else(invalid_program_header)?;
+                let shndx = read_u16(data, symbol_offset + 6)?;
+                let value = read_u64(data, symbol_offset + 8)?.truncate();
+                if shndx != 0 && layout.contains(value) {
+                    write_u64(data, symbol_offset + 8, add_bias(value)?)?;
+                }
+            }
+        }
+    }
+
+    for (rela_tag, rela_size) in [
+        (DT_RELA, dyn_value(DT_RELASZ)),
+        (DT_JMPREL, dyn_value(DT_PLTRELSZ)),
+    ] {
+        let Some(rela_addr) = dyn_value(rela_tag) else {
+            continue;
+        };
+        let Some(rela_bytes) = rela_size else {
+            continue;
+        };
+        let rela_offset = vaddr_to_file_offset(layout, rela_addr)?;
+        let rela_ent = dyn_value(DT_RELAENT).unwrap_or(24);
+        if rela_ent == 0 || rela_bytes % rela_ent != 0 {
+            return Err(invalid_program_header());
+        }
+        for index in 0..(rela_bytes / rela_ent) {
+            let entry_offset = rela_offset
+                .checked_add(index * rela_ent)
+                .ok_or_else(invalid_program_header)?;
+            let r_offset = read_u64(data, entry_offset)?.truncate();
+            if layout.contains(r_offset) {
+                write_u64(data, entry_offset, add_bias(r_offset)?)?;
+            }
+            let r_info = read_u64(data, entry_offset + 8)?;
+            let r_type =
+                u32::try_from(r_info & 0xffff_ffff).map_err(|_| invalid_program_header())?;
+            let r_addend = read_i64(data, entry_offset + 16)?;
+            if r_addend >= 0 {
+                let addend = usize::try_from(r_addend).map_err(|_| invalid_program_header())?;
+                if matches!(r_type, R_X86_64_RELATIVE | R_X86_64_IRELATIVE)
+                    && layout.contains(addend)
+                {
+                    write_i64(data, entry_offset + 16, add_bias(addend)?)?;
+                }
+            }
+        }
+    }
+
+    let e_shoff: usize = read_u64(data, 40)?
+        .try_into()
+        .map_err(|_| invalid_program_header())?;
+    let e_shentsize = usize::from(read_u16(data, 58)?);
+    let e_shnum = usize::from(read_u16(data, 60)?);
+    let e_shstrndx = usize::from(read_u16(data, 62)?);
+    if e_shoff != 0 && e_shentsize >= 64 && e_shnum != 0 && e_shstrndx < e_shnum {
+        let shdr_bytes = e_shoff
+            .checked_add(
+                e_shentsize
+                    .checked_mul(e_shnum)
+                    .ok_or_else(invalid_program_header)?,
+            )
+            .ok_or_else(invalid_program_header)?;
+        if shdr_bytes > data.len() {
+            return Err(invalid_program_header());
+        }
+        let shstr_offset = e_shoff + e_shentsize * e_shstrndx;
+        let shstr_data_offset: usize = read_u64(data, shstr_offset + 24)?
+            .try_into()
+            .map_err(|_| invalid_program_header())?;
+        let shstr_size: usize = read_u64(data, shstr_offset + 32)?
+            .try_into()
+            .map_err(|_| invalid_program_header())?;
+        let shstr_end = shstr_data_offset
+            .checked_add(shstr_size)
+            .ok_or_else(invalid_program_header)?;
+        let shstr = data
+            .get(shstr_data_offset..shstr_end)
+            .ok_or_else(invalid_program_header)?
+            .to_vec();
+        for index in 0..e_shnum {
+            let sh_offset = e_shoff + e_shentsize * index;
+            let name_offset = usize::try_from(read_u32(data, sh_offset)?)
+                .map_err(|_| invalid_program_header())?;
+            let sh_type = read_u32(data, sh_offset + 4)?;
+            let sh_flags = read_u64(data, sh_offset + 8)?;
+            let sh_addr: usize = read_u64(data, sh_offset + 16)?
+                .try_into()
+                .map_err(|_| invalid_program_header())?;
+            let sh_file_offset: usize = read_u64(data, sh_offset + 24)?
+                .try_into()
+                .map_err(|_| invalid_program_header())?;
+            let sh_size: usize = read_u64(data, sh_offset + 32)?
+                .try_into()
+                .map_err(|_| invalid_program_header())?;
+            if sh_type == SHT_NOBITS || sh_size < size_of::<u64>() || sh_flags & SHF_ALLOC == 0 {
+                continue;
+            }
+            let name = shstr
+                .get(name_offset..)
+                .and_then(|tail| tail.split(|&b| b == 0).next())
+                .ok_or_else(invalid_program_header)?;
+            if matches!(
+                name,
+                b".dynamic" | b".init_array" | b".fini_array" | b".preinit_array"
+            ) {
+                continue;
+            }
+            let section_end = sh_file_offset
+                .checked_add(sh_size)
+                .ok_or_else(invalid_program_header)?;
+            if section_end > data.len() {
+                return Err(invalid_program_header());
+            }
+            if sh_flags & SHF_EXECINSTR != 0 {
+                let mut cursor = 0usize;
+                while cursor + 7 <= sh_size {
+                    let instr_offset = sh_file_offset + cursor;
+                    let rex = data[instr_offset];
+                    let opcode = data[instr_offset + 1];
+                    let modrm = data[instr_offset + 2];
+                    if rex & 0xf8 == 0x48
+                        && opcode == 0xc7
+                        && rex & 0x08 != 0
+                        && modrm & 0b11_111_000 == 0b11_000_000
+                    {
+                        let imm = <[u8; 4]>::try_from(&data[instr_offset + 3..instr_offset + 7])
+                            .map_err(|_| invalid_program_header())?;
+                        let target = usize::try_from(u32::from_le_bytes(imm))
+                            .map_err(|_| invalid_program_header())?;
+                        if layout.contains(target) {
+                            let instr_vaddr = sh_addr
+                                .checked_add(cursor)
+                                .ok_or_else(invalid_program_header)?;
+                            let biased_instr = add_bias(instr_vaddr)?;
+                            let biased_target = add_bias(target)?;
+                            let next_ip = biased_instr
+                                .checked_add(7)
+                                .ok_or_else(invalid_program_header)?;
+                            let disp = i64::try_from(biased_target)
+                                .map_err(|_| invalid_program_header())?
+                                - i64::try_from(next_ip).map_err(|_| invalid_program_header())?;
+                            let disp32 =
+                                i32::try_from(disp).map_err(|_| invalid_program_header())?;
+                            let reg_low3 = modrm & 0x7;
+                            let new_rex = 0x40 | (rex & 0x08) | ((rex & 0x1) << 2);
+                            data[instr_offset] = new_rex;
+                            data[instr_offset + 1] = 0x8d;
+                            data[instr_offset + 2] = (reg_low3 << 3) | 0x05;
+                            data[instr_offset + 3..instr_offset + 7]
+                                .copy_from_slice(&disp32.to_le_bytes());
+                        }
+                    }
+                    cursor += 1;
+                }
+                continue;
+            }
+            if sh_flags & SHF_WRITE == 0 {
+                continue;
+            }
+            for word_offset in
+                (sh_file_offset..section_end - size_of::<u64>() + 1).step_by(size_of::<u64>())
+            {
+                let value = read_u64(data, word_offset)?.truncate();
+                if layout.contains(value) {
+                    write_u64(data, word_offset, add_bias(value)?)?;
+                }
+            }
+        }
+    }
+
+    if data.len() >= TRAMPOLINE_HEADER_SIZE
+        && data[data.len() - TRAMPOLINE_HEADER_SIZE..data.len() - TRAMPOLINE_HEADER_SIZE + 8]
+            == b"LITEBOX0"[..]
+    {
+        let vaddr_offset = data.len() - 16;
+        let vaddr = read_u64(data, vaddr_offset)?.truncate();
+        if layout.contains(vaddr) {
+            write_u64(data, vaddr_offset, add_bias(vaddr)?)?;
+        }
+    }
+
+    Ok(())
 }
 
 impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
     fn new(task: &'a Task<FS>, path: impl litebox::path::Arg) -> Result<Self, ElfLoaderError> {
+        let path_string = path.as_rust_str().map_err(|_| Errno::EINVAL)?.to_string();
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
@@ -294,18 +937,91 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         };
 
         Ok(Self {
+            path: path_string,
             file,
             parsed,
             patched_data,
+            exec_bias_applied: false,
         })
+    }
+
+    fn materialize_file_data(&mut self) -> Result<Vec<u8>, ElfLoaderError> {
+        if let Some(data) = self.patched_data.take() {
+            return Ok(data);
+        }
+        let size: usize = (&mut &self.file)
+            .size()
+            .map_err(ElfLoaderError::OpenError)?
+            .truncate();
+        let mut data = alloc::vec![0u8; size];
+        (&mut &self.file)
+            .read_at(0, &mut data)
+            .map_err(ElfLoaderError::OpenError)?;
+        Ok(data)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn ensure_biased_exec_image(
+        &mut self,
+        platform: &(impl litebox::platform::SystemInfoProvider + litebox::platform::DebugLogProvider),
+    ) -> Result<(), ElfLoaderError> {
+        if self.exec_bias_applied {
+            return Ok(());
+        }
+        let mut data = self.materialize_file_data()?;
+        let layout = parse_elf64_exec_layout(&data)?;
+        let reserved_start = self
+            .file
+            .reserve(layout.span_len(), layout.align)
+            .map_err(ElfLoaderError::OpenError)?;
+        let bias = u64::try_from(
+            reserved_start
+                .checked_sub(layout.min_vaddr)
+                .ok_or(ElfLoaderError::OutOfRange)?,
+        )
+        .map_err(|_| ElfLoaderError::OutOfRange)?;
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.file.task.global.platform,
+            "[TRACE-EXEC-BIAS] path={} min={:#x} max={:#x} align={:#x} reserve={:#x} bias={:#x}",
+            self.path,
+            layout.min_vaddr,
+            layout.max_vaddr,
+            layout.align,
+            reserved_start,
+            bias,
+        );
+        patch_elf64_exec_image_with_bias(&mut data, &layout, bias, platform)?;
+        let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut data.as_slice())
+            .map_err(ElfLoaderError::ParseError)?;
+        match parsed.parse_trampoline(&mut data.as_slice(), platform.get_syscall_entry_point()) {
+            Ok(()) => {}
+            Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {}
+            Err(err) => return Err(ElfLoaderError::ParseError(err)),
+        }
+        self.parsed = parsed;
+        self.patched_data = Some(data);
+        self.exec_bias_applied = true;
+        Ok(())
     }
 
     /// Load the ELF into guest memory, choosing the right mapper depending on
     /// whether the binary was patched in memory.
     fn load_mapped(
         &mut self,
-        platform: &(impl litebox::platform::RawPointerProvider + litebox::platform::SystemInfoProvider),
+        platform: &(
+             impl litebox::platform::RawPointerProvider
+             + litebox::platform::SystemInfoProvider
+             + litebox::platform::DebugLogProvider
+         ),
+        bias_exec: bool,
     ) -> Result<litebox_common_linux::loader::MappingInfo, ElfLoaderError> {
+        if bias_exec {
+            #[cfg(target_arch = "x86_64")]
+            self.ensure_biased_exec_image(platform)?;
+            #[cfg(not(target_arch = "x86_64"))]
+            return Err(ElfLoaderError::OutOfRange);
+        }
         if let Some(ref data) = self.patched_data {
             let mut mapper = PatchedMapper {
                 inner: &mut self.file,
@@ -345,25 +1061,66 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         let global = &self.main.file.task.global;
         let process_state = self.main.file.task.process_state.borrow();
 
-        // Reject ET_EXEC binaries whose fixed load addresses fall outside the
-        // process's VA partition (e.g., a child process in a higher slot).
-        if let Some(fixed_range) = self.main.parsed.fixed_load_range() {
+        let bias_main_exec = if let Some(fixed_range) = self.main.parsed.fixed_load_range() {
             let pm_min = process_state.pm.addr_min();
             let pm_max = process_state.pm.addr_max();
-            if fixed_range.start < pm_min || fixed_range.end > pm_max {
-                return Err(ElfLoaderError::OutOfRange);
-            }
-        }
+            fixed_range.start < pm_min || fixed_range.end > pm_max
+        } else {
+            false
+        };
+        litebox::log_println!(
+            global.platform,
+            "[ELF-LOAD] path={} fixed_range={:?} bias_main_exec={} pm=[{:#x},{:#x})",
+            self.main.path,
+            self.main.parsed.fixed_load_range(),
+            bias_main_exec,
+            process_state.pm.addr_min(),
+            process_state.pm.addr_max(),
+        );
 
         // Load the main ELF file first so that it gets privileged addresses.
-        let info = self.main.load_mapped(global.platform)?;
+        let info = self.main.load_mapped(global.platform, bias_main_exec)?;
+        litebox::log_println!(
+            global.platform,
+            "[ELF-LOAD] mapped path={} base={:#x} entry={:#x} brk={:#x}",
+            self.main.path,
+            info.base_addr,
+            info.entry_point,
+            info.brk,
+        );
 
         // Load the interpreter ELF file, if any.
         let interp = if let Some(interp) = &mut self.interp {
-            Some(interp.load_mapped(global.platform)?)
+            let bias_interp_exec = if let Some(fixed_range) = interp.parsed.fixed_load_range() {
+                let pm_min = process_state.pm.addr_min();
+                let pm_max = process_state.pm.addr_max();
+                fixed_range.start < pm_min || fixed_range.end > pm_max
+            } else {
+                false
+            };
+            Some(interp.load_mapped(global.platform, bias_interp_exec)?)
         } else {
             None
         };
+
+        {
+            let mut proc_map_paths = process_state.proc_map_paths.lock();
+            proc_map_paths.clear();
+            if info.base_addr < info.brk {
+                proc_map_paths.push((
+                    info.base_addr..info.brk,
+                    self.main.file.task.resolve_exe_path(&self.main.path),
+                ));
+            }
+            if let (Some(interp_info), Some(interp_file)) = (interp.as_ref(), self.interp.as_ref())
+                && interp_info.base_addr < interp_info.brk
+            {
+                proc_map_paths.push((
+                    interp_info.base_addr..interp_info.brk,
+                    self.main.file.task.resolve_exe_path(&interp_file.path),
+                ));
+            }
+        }
 
         process_state.pm.set_initial_brk(info.brk);
         process_state

@@ -1127,10 +1127,11 @@ impl litebox::platform::AddressSpaceProvider for LinuxUserland {
     /// Slot index into the VA partition table.
     type AddressSpaceId = u32;
 
-    // Lazy CoW: mark pages read-only at fork time and snapshot on first
-    // write fault. More memory-efficient than eager for processes with many
-    // writable pages since only actually-modified pages are copied.
-    const EAGER_COW_FOR_VFORK: bool = false;
+    // Shared-vfork children resume on a fresh host thread before they can
+    // reliably service CoW write faults. Lazy CoW makes their first writes to
+    // stack/global pages crash the process, so eagerly snapshot writable pages
+    // and leave them writable for the duration of the vfork window.
+    const EAGER_COW_FOR_VFORK: bool = true;
 
     #[cfg(target_arch = "x86_64")]
     fn create_address_space(
@@ -1495,6 +1496,43 @@ syscall_callback:
     // Switch to the top of the guest context.
     mov     r11, rsp
     mov     rsp, fs:guest_context_top@tpoff
+    jmp .Lsyscall_save_regs
+
+    .globl syscall_callback_redzone
+syscall_callback_redzone:
+    // Same as syscall_callback, but the trampoline has already reserved
+    // 128 bytes below RSP to protect the SysV red zone.
+    mov      BYTE PTR gs:in_guest@tpoff, 0
+    mov      gs:saved_r11@tpoff, r11
+    rdfsbase r11
+    mov      gs:guest_fsbase@tpoff, r11
+    rdgsbase r11
+
+    mov      r11, gs:guest_context_top@tpoff
+    cmp BYTE PTR gs:guest_xsave_enabled@tpoff, 0
+    je .Lsyscall_redzone_fp_save_fx
+    push rax
+    push rdx
+    mov eax, DWORD PTR gs:guest_xsave_mask_lo@tpoff
+    mov edx, DWORD PTR gs:guest_xsave_mask_hi@tpoff
+    xsave64 [r11 + {FP_REGS_OFFSET} - {PTREGS_SIZE}]
+    pop rdx
+    pop rax
+    jmp .Lsyscall_redzone_fp_saved
+.Lsyscall_redzone_fp_save_fx:
+    fxsave64 [r11 + {FP_REGS_OFFSET} - {PTREGS_SIZE}]
+.Lsyscall_redzone_fp_saved:
+    rdgsbase r11
+    ldmxcsr  [r11 + default_mxcsr@tpoff]
+
+    wrfsbase r11
+
+    // The trampoline lowered RSP by 128 bytes with LEA, so recover the
+    // architectural guest stack pointer before saving pt_regs.
+    lea     r11, [rsp + 128]
+    mov     rsp, fs:guest_context_top@tpoff
+
+.Lsyscall_save_regs:
 
     // Save caller-saved registers
     push    0x2b       // pt_regs->ss = __USER_DS
@@ -2750,6 +2788,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
+        noreserve: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         let flags = MapFlags::MAP_PRIVATE
@@ -2766,6 +2805,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             }
             | if populate_pages_immediately {
                 MapFlags::MAP_POPULATE
+            } else {
+                MapFlags::empty()
+            }
+            | if noreserve {
+                MapFlags::MAP_NORESERVE
             } else {
                 MapFlags::empty()
             };
@@ -3232,6 +3276,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
+    fn syscall_callback_redzone() -> isize;
     fn exception_callback();
     fn interrupt_callback();
     fn switch_to_guest_start();
@@ -3271,11 +3316,12 @@ extern "C-unwind" fn exception_handler(
     error: usize,
     cr2: usize,
 ) {
+    let kernel_mode = EXCEPTION_KERNEL_MODE.replace(false);
     let info = litebox::shim::ExceptionInfo {
         exception: litebox::shim::Exception(trapno.try_into().unwrap()),
         error_code: error.try_into().unwrap(),
         cr2,
-        kernel_mode: false,
+        kernel_mode,
     };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
 }
@@ -3312,7 +3358,7 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        syscall_callback as *const () as usize
+        syscall_callback_redzone as *const () as usize
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -3333,6 +3379,7 @@ thread_local! {
     // Use `ManuallyDrop` for more efficient TLS accesses, since this is always
     // dropped manually before the thread exits.
     static PLATFORM_TLS: Cell<*mut ()> = const { Cell::new(core::ptr::null_mut()) };
+    static EXCEPTION_KERNEL_MODE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// LinuxUserland platform's thread-local storage implementation.
@@ -3523,34 +3570,40 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
 /// the guest context pointer (which does not necessarily have up-to-date guest
 /// register state yet).
 #[cfg(target_arch = "x86_64")]
+struct SignalGuestState {
+    regs: *mut litebox_common_linux::PtRegs,
+    kernel_mode: bool,
+}
+
 fn signal_handler_exit_guest(
     _context: &libc::ucontext_t,
     set_interrupt: bool,
-) -> Option<*mut litebox_common_linux::PtRegs> {
+    allow_kernel_mode: bool,
+) -> Option<SignalGuestState> {
     unsafe {
         let gsbase: u64;
         core::arch::asm! {
             "rdgsbase {}", out(reg) gsbase
         };
-        let is_in_guest = if gsbase == 0 {
-            false
-        } else {
-            let in_guest: u8;
+        if gsbase == 0 {
+            return None;
+        }
+
+        let in_guest: u8;
+        core::arch::asm! {
+            "mov {in_guest}, BYTE PTR gs:in_guest@tpoff",
+            "mov BYTE PTR gs:in_guest@tpoff, 0",
+            in_guest = out(reg_byte) in_guest,
+            options(nostack, preserves_flags)
+        }
+        if set_interrupt {
             core::arch::asm! {
-                "mov {in_guest}, BYTE PTR gs:in_guest@tpoff",
-                "mov BYTE PTR gs:in_guest@tpoff, 0",
-                in_guest = out(reg_byte) in_guest,
+                "mov BYTE PTR gs:interrupt@tpoff, 1",
                 options(nostack, preserves_flags)
-            }
-            if set_interrupt {
-                core::arch::asm! {
-                    "mov BYTE PTR gs:interrupt@tpoff, 1",
-                    options(nostack, preserves_flags)
-                };
-            }
-            in_guest != 0
-        };
-        if !is_in_guest {
+            };
+        }
+        let kernel_mode = in_guest == 0;
+        if kernel_mode && !allow_kernel_mode {
             return None;
         }
 
@@ -3562,7 +3615,10 @@ fn signal_handler_exit_guest(
             guest_context_top = out(reg) guest_context_top,
             options(nostack, preserves_flags)
         };
-        Some(guest_context_top.sub(1))
+        Some(SignalGuestState {
+            regs: guest_context_top.sub(1),
+            kernel_mode,
+        })
     }
 }
 
@@ -3577,27 +3633,28 @@ fn signal_handler_exit_guest(
 fn signal_handler_exit_guest(
     context: &libc::ucontext_t,
     set_interrupt: bool,
-) -> Option<*mut litebox_common_linux::PtRegs> {
+    allow_kernel_mode: bool,
+) -> Option<SignalGuestState> {
     unsafe {
-        let is_in_guest = if context.uc_mcontext.gregs[libc::REG_FS as usize] == 0 {
-            false
-        } else {
-            let in_guest: u8;
+        if context.uc_mcontext.gregs[libc::REG_FS as usize] == 0 {
+            return None;
+        }
+
+        let in_guest: u8;
+        core::arch::asm! {
+            "mov {in_guest}, BYTE PTR fs:in_guest@ntpoff",
+            "mov BYTE PTR fs:in_guest@ntpoff, 0",
+            in_guest = out(reg_byte) in_guest,
+            options(nostack, preserves_flags)
+        }
+        if set_interrupt {
             core::arch::asm! {
-                "mov {in_guest}, BYTE PTR fs:in_guest@ntpoff",
-                "mov BYTE PTR fs:in_guest@ntpoff, 0",
-                in_guest = out(reg_byte) in_guest,
+                "mov BYTE PTR fs:interrupt@ntpoff, 1",
                 options(nostack, preserves_flags)
-            }
-            if set_interrupt {
-                core::arch::asm! {
-                    "mov BYTE PTR fs:interrupt@ntpoff, 1",
-                    options(nostack, preserves_flags)
-                };
-            }
-            in_guest != 0
-        };
-        if !is_in_guest {
+            };
+        }
+        let kernel_mode = in_guest == 0;
+        if kernel_mode && !allow_kernel_mode {
             return None;
         }
 
@@ -3609,7 +3666,10 @@ fn signal_handler_exit_guest(
             guest_context_top = out(reg) guest_context_top,
             options(nostack, preserves_flags)
         };
-        Some(guest_context_top.sub(1))
+        Some(SignalGuestState {
+            regs: guest_context_top.sub(1),
+            kernel_mode,
+        })
     }
 }
 
@@ -3757,10 +3817,24 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    let Some(regs) = signal_handler_exit_guest(context, false) else {
+    #[cfg(target_arch = "x86_64")]
+    let ip = context.uc_mcontext.gregs[libc::REG_RIP as usize]
+        .reinterpret_as_unsigned()
+        .truncate();
+    #[cfg(target_arch = "x86")]
+    let ip = context.uc_mcontext.gregs[libc::REG_EIP as usize].reinterpret_as_unsigned() as usize;
+    let allow_kernel_mode = (syscall_callback as *const () as usize
+        ..exception_callback as *const () as usize)
+        .contains(&ip)
+        || (exception_callback as *const () as usize..interrupt_callback as *const () as usize)
+            .contains(&ip)
+        || (switch_to_guest_start as *const () as usize..switch_to_guest_end as *const () as usize)
+            .contains(&ip);
+    let Some(guest_state) = signal_handler_exit_guest(context, false, allow_kernel_mode) else {
         return unsafe { next_signal_handler(signum, info, context) };
     };
-    copy_signal_context(unsafe { &mut *regs }, context);
+    copy_signal_context(unsafe { &mut *guest_state.regs }, context);
+    EXCEPTION_KERNEL_MODE.set(guest_state.kernel_mode);
 
     // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
     let _ = run_thread_arch as *const () as usize;
@@ -3979,17 +4053,20 @@ unsafe fn interrupt_signal_handler(
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
-    if ip == syscall_callback as *const () as usize {
+    if ip == syscall_callback as *const () as usize
+        || ip == syscall_callback_redzone as *const () as usize
+    {
         // No need to clear `in_guest` or set interrupt; the syscall handler will
         // clear `in_guest` and call into the shim.
         return;
     }
 
     // Clear `in_guest` and set `interrupt`.
-    let Some(regs) = signal_handler_exit_guest(context, true) else {
+    let Some(guest_state) = signal_handler_exit_guest(context, true, false) else {
         // Case 2: not in guest.
         return;
     };
+    let regs = guest_state.regs;
 
     // If the interrupt happened while returning to the guest, don't overwrite
     // the saved context.

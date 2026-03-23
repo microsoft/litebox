@@ -86,6 +86,75 @@ fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<Moc
         .unwrap();
 }
 
+fn wildcard_bound_udp_comms(
+    mut network: Network<MockPlatform>,
+    comms: fn(&mut Network<MockPlatform>),
+) {
+    let server_fd = network
+        .socket(Protocol::Udp)
+        .expect("Failed to create UDP server socket");
+    let server_addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    network
+        .bind(&server_fd, &server_addr)
+        .expect("Failed to bind UDP server socket");
+
+    let client_fd = network
+        .socket(Protocol::Udp)
+        .expect("Failed to create UDP client socket");
+    let wildcard_addr = SocketAddr::V4(SocketAddrV4::from_str("0.0.0.0:0").unwrap());
+    network
+        .bind(&client_fd, &wildcard_addr)
+        .expect("Failed to bind UDP client socket");
+
+    let client_to_server_data = b"Hello from wildcard client!";
+    let bytes_sent = network
+        .send(
+            &client_fd,
+            client_to_server_data,
+            SendFlags::empty(),
+            Some(server_addr),
+        )
+        .expect("Failed to send UDP packet from wildcard-bound client");
+    assert_eq!(bytes_sent, client_to_server_data.len());
+
+    comms(&mut network);
+
+    let mut server_buffer = [0u8; 1024];
+    let mut source_addr = None;
+    let bytes_received = network
+        .receive(
+            &server_fd,
+            &mut server_buffer,
+            ReceiveFlags::empty(),
+            Some(&mut source_addr),
+        )
+        .expect("Failed to receive UDP packet on server");
+    assert_eq!(&server_buffer[..bytes_received], client_to_server_data);
+    let source_addr = source_addr.expect("Expected UDP source address");
+
+    let server_to_client_data = b"Hello back from server!";
+    let bytes_sent = network
+        .send(
+            &server_fd,
+            server_to_client_data,
+            SendFlags::empty(),
+            Some(source_addr),
+        )
+        .expect("Failed to send UDP reply to wildcard-bound client");
+    assert_eq!(bytes_sent, server_to_client_data.len());
+
+    comms(&mut network);
+
+    let mut client_buffer = [0u8; 1024];
+    let bytes_received = network
+        .receive(&client_fd, &mut client_buffer, ReceiveFlags::empty(), None)
+        .expect("Failed to receive UDP reply on wildcard-bound client");
+    assert_eq!(&client_buffer[..bytes_received], server_to_client_data);
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+}
+
 #[test]
 fn test_bidirectional_tcp_communication_default() {
     let litebox = LiteBox::new(MockPlatform::new());
@@ -109,4 +178,41 @@ fn test_bidirectional_tcp_communication_automatic() {
     let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Automatic);
     bidi_tcp_comms(network, |_| {});
+}
+
+#[test]
+fn test_wildcard_bound_udp_communication_manual() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    wildcard_bound_udp_comms(network, |nw| {
+        while nw.perform_platform_interaction().call_again_immediately() {}
+    });
+}
+
+#[test]
+fn test_udp_bound_port_is_released_on_close() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let first_fd = network
+        .socket(Protocol::Udp)
+        .expect("Failed to create UDP socket");
+    network
+        .bind(&first_fd, &addr)
+        .expect("Failed to bind first UDP socket");
+    network
+        .close(&first_fd, CloseBehavior::Immediate)
+        .expect("Failed to close first UDP socket");
+
+    let second_fd = network
+        .socket(Protocol::Udp)
+        .expect("Failed to create UDP socket");
+    network
+        .bind(&second_fd, &addr)
+        .expect("UDP port should be reusable after close");
+    network
+        .close(&second_fd, CloseBehavior::Immediate)
+        .expect("Failed to close second UDP socket");
 }

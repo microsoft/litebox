@@ -381,12 +381,12 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
 ) -> Result<()> {
     let platform = litebox_platform_multiplex::platform();
 
-    let prog = if cli_args.program_from_tar {
+    let exec_prog = if cli_args.program_from_tar {
         PathBuf::from(&cli_args.program_and_arguments[0])
     } else {
         resolve_host_program_path(&cli_args.program_and_arguments[0])
     };
-    let prog_path = prog.to_str().ok_or_else(|| {
+    let prog_path = exec_prog.to_str().ok_or_else(|| {
         anyhow!(
             "Could not convert program path {:?} to a string",
             cli_args.program_and_arguments[0]

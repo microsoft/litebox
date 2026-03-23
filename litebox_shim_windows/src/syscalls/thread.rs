@@ -13,6 +13,14 @@ use litebox_common_windows::ntstatus::NtStatus;
 
 use super::NtSyscallArgs;
 
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn set_guest_gs_base(value: u64) {
+    litebox_platform_windows_userland::WindowsUserland::set_guest_gs_base(value);
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+fn set_guest_gs_base(_value: u64) {}
+
 /// Sentinel return address pushed onto child thread stacks. When the start
 /// routine returns, RIP becomes this value and faults. The exception handler
 /// recognises this specific address as a clean thread exit (using RAX as exit
@@ -234,9 +242,7 @@ impl litebox::shim::InitThread for NtChildThreadInit {
     {
         // Set GS base for this host thread to point to the child TEB.
         // This must happen on the new thread (TLS is per-thread).
-        litebox_platform_windows_userland::WindowsUserland::set_guest_gs_base(
-            self.child_teb_va as u64,
-        );
+        set_guest_gs_base(self.child_teb_va as u64);
 
         // Return the child's shim entrypoints. Its init() will set RIP, RSP,
         // and RCX correctly for child thread entry.

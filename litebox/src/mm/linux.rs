@@ -131,7 +131,7 @@ const DEFAULT_RESERVED_SPACE_SIZE: usize = 0x100_0000; // 16 MiB
 
 bitflags::bitflags! {
     /// Options for page creation.
-    pub struct CreatePagesFlags: u8 {
+    pub struct CreatePagesFlags: u16 {
         /// Force the mapping to be created at the given address, resulting in any
         /// existing overlapping mappings being removed.
         const FIXED_ADDR     = 1 << 0;
@@ -153,6 +153,9 @@ bitflags::bitflags! {
         /// mapping, the VMA gets `VM_MAYWRITE` so `mprotect(PROT_WRITE)` can
         /// succeed later.
         const FD_WRITABLE = 1 << 7;
+        /// Request a sparse reservation without reserving swap/commit upfront
+        /// when the platform supports it.
+        const NORESERVE = 1 << 8;
     }
 }
 
@@ -278,6 +281,8 @@ pub(super) struct VmArea {
     flags: VmFlags,
     /// Whether this area is backed by a file
     is_file_backed: bool,
+    /// Whether this mapping was created with MAP_NORESERVE semantics.
+    noreserve: bool,
 }
 
 impl VmArea {
@@ -293,13 +298,27 @@ impl VmArea {
         self.is_file_backed
     }
 
+    /// Check whether this area uses sparse noreserve semantics.
+    #[inline]
+    pub(super) fn noreserve(self) -> bool {
+        self.noreserve
+    }
+
     /// Create a new [`VmArea`] with the given flags.
     #[inline]
     pub(super) fn new(flags: VmFlags, is_file_backed: bool) -> Self {
         Self {
             flags,
             is_file_backed,
+            noreserve: false,
         }
+    }
+
+    /// Return a copy of this VMA with the requested MAP_NORESERVE semantics.
+    #[inline]
+    pub(super) fn with_noreserve(mut self, noreserve: bool) -> Self {
+        self.noreserve = noreserve;
+        self
     }
 }
 
@@ -384,10 +403,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
             vmem.vmas.insert(
                 clamped_start..clamped_end,
-                VmArea {
-                    flags: VmFlags::empty(),
-                    is_file_backed: false,
-                },
+                VmArea::new(VmFlags::empty(), false),
             );
         }
         vmem
@@ -492,8 +508,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let start = r.start.max(range.start);
             let end = r.end.min(range.end);
             let new_range = PageRange::new(start, end).unwrap();
-            unsafe { self.insert_mapping(new_range, vma, false, FixedAddressBehavior::Replace) }
-                .expect("failed to reset pages");
+            unsafe {
+                self.insert_mapping(
+                    new_range,
+                    vma,
+                    false,
+                    vma.noreserve(),
+                    FixedAddressBehavior::Replace,
+                )
+            }
+            .expect("failed to reset pages");
         }
         if unmapped_error {
             Err(VmemResetError::AlreadyUnallocated)
@@ -521,6 +545,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         suggested_range: PageRange<ALIGN>,
         vma: VmArea,
         populate_pages_immediately: bool,
+        noreserve: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let (start, end) = (suggested_range.start, suggested_range.end);
@@ -580,6 +605,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 MemoryRegionPermissions::from_bits(permissions).unwrap(),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
                 populate_pages_immediately,
+                noreserve,
                 platform_fixed_address_behavior,
             )
             .map_err(|err| match err {
@@ -659,6 +685,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 new_range,
                 vma,
                 flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
+                flags.contains(CreatePagesFlags::NORESERVE),
                 if flags.contains(CreatePagesFlags::FIXED_ADDR) {
                     if flags.contains(CreatePagesFlags::NOREPLACE) {
                         FixedAddressBehavior::NoReplace
@@ -735,7 +762,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // litebox mappings in this range, this may fail if there are
             // platform mappings in the way.
             match unsafe {
-                self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::NoReplace)
+                self.insert_mapping(
+                    range,
+                    *cur_vma,
+                    false,
+                    cur_vma.noreserve(),
+                    FixedAddressBehavior::NoReplace,
+                )
             } {
                 Ok(_) => {}
                 Err(AllocationError::OutOfMemory) => return Err(VmemResizeError::OutOfMemory),
@@ -870,6 +903,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 VmArea {
                     flags: new_flags,
                     is_file_backed: vma.is_file_backed,
+                    noreserve: vma.noreserve,
                 },
             );
             if !before.is_empty() {
@@ -926,7 +960,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                             VmFlags::empty()
                         },
                     flags.contains(CreatePagesFlags::MAP_FILE),
-                ),
+                )
+                .with_noreserve(flags.contains(CreatePagesFlags::NORESERVE)),
                 flags,
             )
         }

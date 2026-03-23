@@ -52,6 +52,7 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _},
+    process::{ProcessId, ProcessState},
     shim::Exception,
     sync::Mutex,
     utils::ReinterpretUnsignedExt as _,
@@ -283,7 +284,7 @@ impl Clone for SignalHandlers {
     }
 }
 
-struct PendingSignals {
+pub(crate) struct PendingSignals {
     /// The set of pending signals.
     pending: SigSet,
     /// The queue of pending siginfo structures.
@@ -291,7 +292,7 @@ struct PendingSignals {
 }
 
 impl PendingSignals {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: SigSet::empty(),
             queue: VecDeque::new(),
@@ -685,6 +686,9 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
+        if pid > 0 && pid != self.pid {
+            return self.do_remote_process_kill(pid, signal);
+        }
         self.do_kill(Some(pid), None, signal)
     }
 
@@ -696,22 +700,149 @@ impl<FS: ShimFS> Task<FS> {
         self.do_kill(Some(pid), Some(tid), signal)
     }
 
-    fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
+    fn do_remote_process_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
+        let target = ProcessId(pid.try_into().map_err(|_| Errno::ESRCH)?);
+        let is_running = self
+            .global
+            .litebox
+            .process_registry()
+            .with_context(target, |ctx| matches!(ctx.state, ProcessState::Running))
+            .ok_or(Errno::ESRCH)?;
+        if !is_running {
+            return Err(Errno::ESRCH);
+        }
+        if signal == 0 {
+            return Ok(0);
+        }
+
         let signal = Signal::try_from(signal)?;
+        self.global
+            .cross_process_signals
+            .lock()
+            .push(crate::CrossProcessSignal {
+                target_process_id: target.0,
+                signal,
+                siginfo: siginfo_kill(signal),
+            });
+
+        if let Some(remote) = self.global.process_thread_handles.read().get(&pid) {
+            remote.interrupt();
+        }
+        Ok(0)
+    }
+
+    #[cfg(feature = "trace_syscalls")]
+    fn log_abort_stack(&self) {
+        let Some(last_syscall) = self.last_syscall.get() else {
+            return;
+        };
+        litebox::log_println!(
+            self.global.platform,
+            "[TRACE-ABORT] pid={} tid={} rsp={:#x} rbp={:#x}",
+            self.pid,
+            self.tid,
+            last_syscall.entry_rsp,
+            last_syscall.entry_rbp,
+        );
+        for slot in 0..8usize {
+            let addr = last_syscall.entry_rsp + slot * core::mem::size_of::<usize>();
+            let word = ConstPtr::<usize>::from_usize(addr).read_at_offset(0);
+            match word {
+                Some(word) => {
+                    let summary = if word >= 0x10000 {
+                        self.address_mapping_summary(word)
+                    } else {
+                        alloc::format!("addr={:#x}", word)
+                    };
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[TRACE-ABORT] stack[{}] @ {:#x} = {:#x} {}",
+                        slot,
+                        addr,
+                        word,
+                        summary,
+                    );
+                }
+                None => {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[TRACE-ABORT] stack[{}] @ {:#x} = <unreadable>",
+                        slot,
+                        addr,
+                    );
+                }
+            }
+        }
+        let mut rbp = last_syscall.entry_rbp;
+        for frame in 0..8usize {
+            if rbp < 0x10000 {
+                break;
+            }
+            let saved_rbp = ConstPtr::<usize>::from_usize(rbp).read_at_offset(0);
+            let ret_addr = ConstPtr::<usize>::from_usize(rbp + core::mem::size_of::<usize>())
+                .read_at_offset(0);
+            let Some(ret_addr) = ret_addr else {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[TRACE-ABORT] frame[{}] rbp={:#x} ret=<unreadable>",
+                    frame,
+                    rbp,
+                );
+                break;
+            };
+            let summary = if ret_addr >= 0x10000 {
+                self.address_mapping_summary(ret_addr)
+            } else {
+                alloc::format!("addr={:#x}", ret_addr)
+            };
+            litebox::log_println!(
+                self.global.platform,
+                "[TRACE-ABORT] frame[{}] rbp={:#x} next_rbp={:?} ret={:#x} {}",
+                frame,
+                rbp,
+                saved_rbp,
+                ret_addr,
+                summary,
+            );
+            let Some(next_rbp) = saved_rbp else {
+                break;
+            };
+            if next_rbp <= rbp {
+                break;
+            }
+            rbp = next_rbp;
+        }
+    }
+
+    fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
+        let signal = if signal == 0 {
+            None
+        } else {
+            Some(Signal::try_from(signal)?)
+        };
         if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid) {
             // Sending signal to self.
-            self.send_signal(signal, siginfo_kill(signal));
+            #[cfg(feature = "trace_syscalls")]
+            if signal == Some(Signal::SIGABRT) {
+                self.log_abort_stack();
+            }
+            if let Some(signal) = signal {
+                self.send_signal(signal, siginfo_kill(signal));
+            }
             Ok(0)
         } else if pid.is_none_or(|pid| pid == self.pid) {
             // Sending signal to a different thread in the same process.
-            // We can't enqueue the signal into the target thread's pending
-            // set (it's thread-local), but we can interrupt its wait so it
-            // gets a chance to reschedule. This is sufficient for Go's
-            // goroutine preemption (SIGURG) and other cooperative schemes.
             if let Some(target_tid) = tid {
                 let inner = self.process().inner.lock();
                 if let Some(remote) = inner.threads.get(&target_tid) {
-                    remote.interrupt();
+                    if let Some(signal) = signal {
+                        remote.pending_signals.lock().push(
+                            &self.process().limits,
+                            signal,
+                            siginfo_kill(signal),
+                        );
+                        remote.interrupt();
+                    }
                     return Ok(0);
                 }
             }
@@ -731,6 +862,10 @@ impl<FS: ShimFS> Task<FS> {
     /// Returns whether there are any pending signals that can be delivered.
     pub(crate) fn has_pending_signals(&self) -> bool {
         let blocked = self.signals.blocked.get();
+        let remote_pending = self.thread.remote().pending_signals.lock().pending & !blocked;
+        if !remote_pending.is_empty() {
+            return true;
+        }
         let thread_pending = self.signals.pending.borrow().pending & !blocked;
         if !thread_pending.is_empty() {
             return true;
@@ -743,9 +878,25 @@ impl<FS: ShimFS> Task<FS> {
     #[cfg(test)]
     pub(crate) fn pending_signal_set(&self) -> SigSet {
         let blocked = self.signals.blocked.get();
+        let remote = self.thread.remote().pending_signals.lock().pending & !blocked;
         let thread = self.signals.pending.borrow().pending & !blocked;
         let shared = self.signals.shared_pending.lock().pending & !blocked;
-        thread | shared
+        remote | thread | shared
+    }
+
+    fn drain_thread_signals(&self) {
+        let mut remote_pending = self.thread.remote().pending_signals.lock();
+        if remote_pending.queue.is_empty() {
+            return;
+        }
+
+        let mut local_pending = self.signals.pending.borrow_mut();
+        while let Some(siginfo) = remote_pending.queue.pop_front() {
+            let signal =
+                Signal::try_from(siginfo.signo).expect("cross-thread pending signal is invalid");
+            local_pending.push(&self.process().limits, signal, siginfo);
+        }
+        remote_pending.pending = SigSet::empty();
     }
 
     /// Move cross-process signals (e.g. SIGCHLD from a child exit) from the
@@ -811,6 +962,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut litebox_common_linux::ExecutionContext) {
+        self.drain_thread_signals();
         // Drain cross-process signals for this process into our local pending queue.
         self.drain_cross_process_signals();
 
@@ -897,6 +1049,49 @@ impl<FS: ShimFS> Task<FS> {
                             Self::restart_syscall(ctx);
                         }
                         self.syscall_restartable.set(false);
+                    }
+                    #[cfg(feature = "trace_syscalls")]
+                    if matches!(
+                        signal,
+                        Signal::SIGSEGV
+                            | Signal::SIGILL
+                            | Signal::SIGBUS
+                            | Signal::SIGFPE
+                            | Signal::SIGTRAP
+                            | Signal::SIGABRT
+                    ) {
+                        let last_exception = self.signals.last_exception.get();
+                        #[cfg(target_arch = "x86_64")]
+                        let rip = ctx.rip;
+                        #[cfg(target_arch = "x86")]
+                        let rip = ctx.eip;
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[TRACE-SIGNAL] pid={} tid={} deliver={:?} handler={:#x} restorer={:#x} flags={:#x} rip={:#x} rip_summary={} fault_addr={:#x} fault_summary={} error_code={:#x} rsp={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}",
+                            self.pid,
+                            self.tid,
+                            signal,
+                            action.sigaction,
+                            action.restorer,
+                            action.flags.bits(),
+                            rip,
+                            self.address_mapping_summary(rip),
+                            last_exception.cr2,
+                            self.address_mapping_summary(last_exception.cr2),
+                            last_exception.error_code,
+                            ctx.rsp,
+                            ctx.rbp,
+                            ctx.r12,
+                            ctx.r13,
+                            ctx.r14,
+                            ctx.r15,
+                            ctx.rax,
+                            ctx.rbx,
+                            ctx.rcx,
+                            ctx.rdx,
+                            ctx.rsi,
+                            ctx.rdi,
+                        );
                     }
                     handler_delivered = true;
                     if let Err(DeliverFault) = self

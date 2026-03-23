@@ -97,6 +97,81 @@ fn test_fcntl() {
 }
 
 #[test]
+fn test_fcntl_dupfd_respects_min_fd() {
+    let task = init_platform(None);
+
+    let fd = task
+        .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+        .expect("Failed to open stdin");
+    let fd = i32::try_from(fd).unwrap();
+
+    let min_fd = u32::try_from(fd + 10).unwrap();
+    let duped = task
+        .sys_fcntl(
+            fd,
+            FcntlArg::DUPFD {
+                cloexec: false,
+                min_fd,
+            },
+        )
+        .expect("F_DUPFD should succeed");
+    assert_eq!(duped, min_fd);
+
+    let cloexec_duped = task
+        .sys_fcntl(
+            fd,
+            FcntlArg::DUPFD {
+                cloexec: true,
+                min_fd: min_fd + 1,
+            },
+        )
+        .expect("F_DUPFD_CLOEXEC should succeed");
+    assert_eq!(cloexec_duped, min_fd + 1);
+    assert_eq!(
+        task.sys_fcntl(i32::try_from(cloexec_duped).unwrap(), FcntlArg::GETFD)
+            .unwrap(),
+        FileDescriptorFlags::FD_CLOEXEC.bits()
+    );
+}
+
+#[test]
+fn test_inotify_stub() {
+    let task = init_platform(None);
+
+    let fd = task
+        .sys_inotify_init1(OFlags::CLOEXEC | OFlags::NONBLOCK)
+        .expect("Failed to create inotify stub");
+    let fd = i32::try_from(fd).unwrap();
+
+    assert_eq!(
+        task.sys_fcntl(fd, FcntlArg::GETFD).unwrap(),
+        FileDescriptorFlags::FD_CLOEXEC.bits()
+    );
+    assert_eq!(
+        task.sys_fcntl(fd, FcntlArg::GETFL).unwrap(),
+        (OFlags::RDWR | OFlags::NONBLOCK).bits()
+    );
+
+    let wd = task
+        .sys_inotify_add_watch(fd, "/", 0)
+        .expect("Failed to add watch");
+    let wd = i32::try_from(wd).unwrap();
+
+    let dup_fd = task.sys_dup(fd, None, None).expect("dup failed");
+    let dup_fd = i32::try_from(dup_fd).unwrap();
+    let dup_watch = task
+        .sys_inotify_add_watch(dup_fd, "/", 0)
+        .expect("Failed to add watch through dup fd");
+    let dup_watch = i32::try_from(dup_watch).unwrap();
+
+    task.sys_inotify_rm_watch(fd, dup_watch)
+        .expect("Failed to remove watch through original fd");
+    task.sys_inotify_rm_watch(dup_fd, wd)
+        .expect("Failed to remove watch through dup fd");
+    assert_eq!(task.sys_inotify_rm_watch(fd, wd), Err(Errno::EINVAL));
+}
+
+#[test]
 fn test_dup() {
     let task = init_platform(None);
 

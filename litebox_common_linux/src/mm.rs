@@ -66,6 +66,10 @@ pub fn do_mmap<
             flags.contains(MapFlags::MAP_SHARED),
         );
         create_flags.set(CreatePagesFlags::FD_WRITABLE, fd_writable);
+        create_flags.set(
+            CreatePagesFlags::NORESERVE,
+            flags.contains(MapFlags::MAP_NORESERVE),
+        );
         create_flags
     };
     let suggested_addr = match suggested_addr {
@@ -76,6 +80,9 @@ pub fn do_mmap<
     match prot {
         ProtFlags::PROT_READ_EXEC => unsafe {
             pm.create_executable_pages(suggested_addr, length, flags, op)
+        },
+        ProtFlags::PROT_READ_WRITE_EXEC => unsafe {
+            pm.create_rwx_pages(suggested_addr, length, flags, op)
         },
         ProtFlags::PROT_READ_WRITE => unsafe {
             pm.create_writable_pages(suggested_addr, length, flags, op)
@@ -246,14 +253,27 @@ pub fn sys_madvise<
 
     match advice {
         crate::MadviseBehavior::Normal
+        | crate::MadviseBehavior::Random
+        | crate::MadviseBehavior::Sequential
+        | crate::MadviseBehavior::WillNeed
         | crate::MadviseBehavior::DontFork
         | crate::MadviseBehavior::DoFork
+        | crate::MadviseBehavior::Mergeable
+        | crate::MadviseBehavior::Unmergeable
+        | crate::MadviseBehavior::HugePage
+        | crate::MadviseBehavior::NoHugePage
+        | crate::MadviseBehavior::DontDump
+        | crate::MadviseBehavior::DoDump
         | crate::MadviseBehavior::WipeOnFork
-        | crate::MadviseBehavior::KeepOnFork => {
-            // Fork-related hints are no-ops for now.
+        | crate::MadviseBehavior::KeepOnFork
+        | crate::MadviseBehavior::Cold
+        | crate::MadviseBehavior::Pageout
+        | crate::MadviseBehavior::PopulateRead
+        | crate::MadviseBehavior::PopulateWrite => {
+            // Advisory-only behaviors are no-ops for now.
             Ok(())
         }
-        crate::MadviseBehavior::DontNeed => {
+        crate::MadviseBehavior::DontNeed | crate::MadviseBehavior::DontNeedLocked => {
             // After a successful MADV_DONTNEED operation, the semantics of memory access in the specified region are changed:
             // subsequent accesses of pages in the range will succeed, but will result in either repopulating the memory contents
             // from the up-to-date contents of the underlying mapped file (for shared file mappings, shared anonymous mappings,
@@ -265,6 +285,8 @@ pub fn sys_madvise<
         crate::MadviseBehavior::Free => {
             unsafe { pm.reset_pages(addr, aligned_len, true) }.map_err(Errno::from)
         }
-        _ => unimplemented!("Unsupported madvise behavior {:?}", advice),
+        crate::MadviseBehavior::Remove
+        | crate::MadviseBehavior::HWPoison
+        | crate::MadviseBehavior::SoftOffline => Err(Errno::EINVAL),
     }
 }

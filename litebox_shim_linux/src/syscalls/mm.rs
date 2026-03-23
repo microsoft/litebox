@@ -403,7 +403,7 @@ impl<FS: ShimFS> Task<FS> {
         let ps = self.process_state.borrow();
         let file_path = self.fd_path_for_raw(fd);
         let mut cache = ps.elf_patch_cache.lock();
-        cache.entry(fd).or_insert(ElfPatchState {
+        let _state = cache.entry(fd).or_insert(ElfPatchState {
             _base_addr: base_addr,
             pre_patched,
             trampoline_file_offset: tramp_file_offset,
@@ -415,6 +415,18 @@ impl<FS: ShimFS> Task<FS> {
             trampoline_mapped_len: 0,
             file_path,
         });
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[TRACE-ELF-PATCH] init fd={} path={:?} base={:#x} tramp={:#x} pre_patched={} tramp_file_off={:#x} tramp_file_size={:#x}",
+            fd,
+            _state.file_path,
+            base_addr,
+            _state.trampoline_addr,
+            _state.pre_patched,
+            _state.trampoline_file_offset,
+            _state.trampoline_file_size,
+        );
     }
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
@@ -468,6 +480,20 @@ impl<FS: ShimFS> Task<FS> {
         let Some(state) = cache.get_mut(&fd) else {
             return; // No patch state — not an ELF we're tracking
         };
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[TRACE-ELF-PATCH] exec fd={} path={:?} map={:#x}-{:#x} offset={:#x} tramp={:#x} tramp_len={:#x} cursor={:#x} pre_patched={}",
+            fd,
+            state.file_path,
+            mapped_addr.as_usize(),
+            mapped_addr.as_usize() + len,
+            offset,
+            state.trampoline_addr,
+            state.trampoline_mapped_len,
+            state.trampoline_cursor,
+            state.pre_patched,
+        );
 
         if state.pre_patched {
             // Pre-patched binary: map the trampoline data from the file.
@@ -597,6 +623,28 @@ impl<FS: ShimFS> Task<FS> {
             state.trampoline_mapped_len = PAGE_SIZE;
         }
 
+        let restore_trampoline_rx = |task: &Self, state: &ElfPatchState| {
+            if state.trampoline_mapped_len > 0 {
+                let _ = task.sys_mprotect(
+                    MutPtr::<u8>::from_usize(state.trampoline_addr),
+                    state.trampoline_mapped_len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                );
+            }
+        };
+
+        if state.trampoline_mapped_len > 0
+            && self
+                .sys_mprotect(
+                    MutPtr::<u8>::from_usize(state.trampoline_addr),
+                    state.trampoline_mapped_len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                )
+                .is_err()
+        {
+            return;
+        }
+
         // Make the code segment writable for in-place patching.
         if self
             .sys_mprotect(
@@ -617,6 +665,7 @@ impl<FS: ShimFS> Task<FS> {
                 len,
                 ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
             );
+            restore_trampoline_rx(self, state);
             return;
         };
         let mut code_buf = code_owned.into_vec();
@@ -639,6 +688,7 @@ impl<FS: ShimFS> Task<FS> {
                         len,
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                     );
+                    restore_trampoline_rx(self, state);
                     return;
                 };
                 let tramp_pages_needed = align_up(new_cursor, PAGE_SIZE);
@@ -659,6 +709,7 @@ impl<FS: ShimFS> Task<FS> {
                             len,
                             ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                         );
+                        restore_trampoline_rx(self, state);
                         return;
                     }
                     state.trampoline_mapped_len = tramp_pages_needed;
@@ -674,6 +725,7 @@ impl<FS: ShimFS> Task<FS> {
                         len,
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                     );
+                    restore_trampoline_rx(self, state);
                     return;
                 }
 
@@ -685,9 +737,20 @@ impl<FS: ShimFS> Task<FS> {
                         len,
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                     );
+                    restore_trampoline_rx(self, state);
                     return;
                 }
                 state.trampoline_cursor = new_cursor;
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[TRACE-ELF-PATCH] updated fd={} path={:?} tramp={:#x} tramp_len={:#x} cursor={:#x}",
+                    fd,
+                    state.file_path,
+                    state.trampoline_addr,
+                    state.trampoline_mapped_len,
+                    state.trampoline_cursor,
+                );
             }
             _ => {
                 // No syscalls found or error — no patching needed.
@@ -700,6 +763,7 @@ impl<FS: ShimFS> Task<FS> {
             len,
             ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
         );
+        restore_trampoline_rx(self, state);
     }
 
     /// Finalize the ELF patching state for `fd`.
@@ -878,14 +942,19 @@ impl<FS: ShimFS> Task<FS> {
             let mut buffer = [0; PAGE_SIZE];
             let mut copied = 0;
             while copied < len {
-                let size =
-                    self.sys_read(fd, &mut buffer, Some(file_offset))
-                        .map_err(|e| match e {
-                            Errno::EBADF => MappingError::BadFD(fd),
-                            Errno::EISDIR => MappingError::NotAFile,
-                            Errno::EACCES => MappingError::NotForReading,
-                            _ => unimplemented!(),
-                        })?;
+                let remaining = len - copied;
+                let size = self
+                    .sys_read(
+                        fd,
+                        &mut buffer[..remaining.min(PAGE_SIZE)],
+                        Some(file_offset),
+                    )
+                    .map_err(|e| match e {
+                        Errno::EBADF => MappingError::BadFD(fd),
+                        Errno::EISDIR => MappingError::NotAFile,
+                        Errno::EACCES => MappingError::NotForReading,
+                        _ => unimplemented!(),
+                    })?;
                 if size == 0 {
                     break;
                 }
@@ -1353,6 +1422,86 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
         }
+    }
+
+    fn sync_shared_mappings_in_range(&self, start: usize, len: usize) {
+        let end = start + len;
+        let ps = self.process_state.borrow();
+        let mappings = ps.shared_file_mappings.lock();
+
+        for m in mappings.iter() {
+            if !m.needs_writeback {
+                continue;
+            }
+            let m_end = m.addr + m.len;
+            let wb_start = start.max(m.addr);
+            let wb_end = end.min(m_end);
+            if wb_start >= wb_end {
+                continue;
+            }
+
+            let mut written = 0usize;
+            let wb_len = wb_end - wb_start;
+            while written < wb_len {
+                let chunk = (wb_len - written).min(PAGE_SIZE);
+                if let Some(buf) = read_for_writeback(&ps.pm, wb_start + written, chunk) {
+                    let file_off = m.file_offset + (wb_start - m.addr) + written;
+                    match self.internal_fs_write(&*m.internal_fd, &buf, Some(file_off)) {
+                        Ok(n) => written += n,
+                        Err(_) => break,
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Handle syscall `msync`
+    pub(crate) fn sys_msync(
+        &self,
+        addr: crate::MutPtr<u8>,
+        len: usize,
+        flags: i32,
+    ) -> Result<(), Errno> {
+        const MS_ASYNC: i32 = 1;
+        const MS_INVALIDATE: i32 = 2;
+        const MS_SYNC: i32 = 4;
+        const SUPPORTED_FLAGS: i32 = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
+
+        if !addr.as_usize().is_multiple_of(PAGE_SIZE) {
+            return Err(Errno::EINVAL);
+        }
+        if flags & !SUPPORTED_FLAGS != 0 || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0) {
+            return Err(Errno::EINVAL);
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let Some(aligned_len) = len.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1)) else {
+            return Err(Errno::EINVAL);
+        };
+        let Some(end) = addr.as_usize().checked_add(aligned_len) else {
+            return Err(Errno::EINVAL);
+        };
+
+        let ps = self.process_state.borrow();
+        let mappings = ps.pm.mappings();
+        let mut cursor = addr.as_usize();
+        while cursor < end {
+            let Some((range, _)) = mappings
+                .iter()
+                .find(|(range, _)| range.start <= cursor && cursor < range.end)
+            else {
+                return Err(Errno::ENOMEM);
+            };
+            cursor = range.end.min(end);
+        }
+        drop(mappings);
+        drop(ps);
+
+        self.sync_shared_mappings_in_range(addr.as_usize(), aligned_len);
+        Ok(())
     }
 
     /// Handle syscall `munmap`
@@ -1848,6 +1997,25 @@ mod tests {
     }
 
     #[test]
+    fn test_anonymous_mmap_rwx() {
+        let task = init_platform(None);
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ_WRITE_EXEC,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+        addr.write_slice_at_offset(0, &[0xaa; 0x10]).unwrap();
+        assert_eq!(addr.read_at_offset(0).unwrap(), 0xaa,);
+        task.sys_munmap(addr, 0x1000).unwrap();
+    }
+
+    #[test]
     fn test_file_backed_mmap() {
         let task = init_platform(None);
 
@@ -2231,6 +2399,43 @@ mod tests {
     }
 
     #[test]
+    fn test_msync_shared_file_mapping() {
+        let task = init_platform(None);
+
+        let fd = task
+            .sys_open("shared-msync.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        let initial = [0u8; 0x1000];
+        assert_eq!(task.sys_write(fd, &initial, None).unwrap(), initial.len());
+        task.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToBeginning)
+            .unwrap();
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .unwrap();
+
+        addr.write_slice_at_offset(0, b"hello").unwrap();
+        task.sys_msync(addr, 0x1000, 4).unwrap();
+
+        task.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToBeginning)
+            .unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(task.sys_read(fd, &mut buf, None).unwrap(), buf.len());
+        assert_eq!(&buf, b"hello");
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_close(fd).unwrap();
+    }
+
+    #[test]
     fn test_madvise() {
         let task = init_platform(None);
 
@@ -2250,6 +2455,21 @@ mod tests {
         // Test MADV_NORMAL
         assert!(
             task.sys_madvise(addr, 0x2000, litebox_common_linux::MadviseBehavior::Normal)
+                .is_ok()
+        );
+
+        // Advisory-only hints should succeed even when the sandbox does not
+        // implement their optional kernel-side bookkeeping.
+        assert!(
+            task.sys_madvise(
+                addr,
+                0x2000,
+                litebox_common_linux::MadviseBehavior::DontDump
+            )
+            .is_ok()
+        );
+        assert!(
+            task.sys_madvise(addr, 0x2000, litebox_common_linux::MadviseBehavior::DoDump)
                 .is_ok()
         );
 

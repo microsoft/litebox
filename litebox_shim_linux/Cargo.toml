@@ -17,6 +17,7 @@ seq-macro = "0.3"
 ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+libc = "0.2.177"
 
 [features]
 default = ["platform_linux_userland"]
@@ -27,7 +28,6 @@ trace_syscalls = ["litebox/trace_fs"]
 
 [dev-dependencies]
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
-libc = "0.2.177"
 tempfile = "3"
 
 [lints]

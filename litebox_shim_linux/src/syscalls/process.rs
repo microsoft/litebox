@@ -14,6 +14,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
+use litebox::fs::OFlags;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::mm::linux::VmFlags;
 use litebox::platform::PageManagementProvider;
@@ -26,10 +27,11 @@ use litebox::platform::{
     StdioProvider as _, ThreadLocalStorageProvider as _,
 };
 use litebox::platform::{RawMutPointer as _, TimerHandle, TimerProvider};
+use litebox::process::ProcessId;
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
-    ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
+    ArchPrctlArg, CloneFlags, FileDescriptorFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -48,6 +50,8 @@ pub(crate) struct ThreadState {
     /// This operation wakes a single thread waiting on the specified memory location via futex.
     /// Any errors from the futex wake operation are ignored.
     clear_child_tid: Cell<Option<MutPtr<i32>>>,
+    /// Registered guest rseq area for this thread, if any.
+    rseq: Cell<Option<MutPtr<u8>>>,
     /// The purpose of the robust futex list is to ensure that if a thread accidentally fails to unlock a futex before
     /// terminating or calling execve(2), another thread that is waiting on that futex is notified that the former owner
     /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
@@ -67,6 +71,7 @@ impl ThreadState {
             remote,
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
+            rseq: Cell::new(None),
             robust_list: Cell::new(None),
         }
     }
@@ -79,14 +84,20 @@ impl ThreadState {
             remote,
             attached_tid: Cell::new(Some(tid)),
             clear_child_tid: Cell::new(None),
+            rseq: Cell::new(None),
             robust_list: Cell::new(None),
         })
     }
 
-    fn detach_from_process(&self) {
+    fn detach_from_process(&self) -> bool {
         if let Some(tid) = self.attached_tid.take() {
-            self.process.detach_thread(tid);
+            return self.process.detach_thread(tid);
         }
+        false
+    }
+
+    pub(crate) fn remote(&self) -> &ThreadRemote {
+        &self.remote
     }
 }
 
@@ -104,6 +115,8 @@ pub(crate) struct ThreadRemote {
     /// Set by the forking thread to request this thread to park. The thread
     /// checks this in `check_for_interrupt` and `prepare_to_run_guest`.
     is_suspended: AtomicBool,
+    /// Thread-directed signals queued by other threads in the same process.
+    pub(crate) pending_signals: Mutex<Platform, crate::syscalls::signal::PendingSignals>,
     /// Handle to interrupt waits on this thread.
     handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
 }
@@ -113,6 +126,7 @@ impl ThreadRemote {
         Self {
             is_exiting: AtomicBool::new(false),
             is_suspended: AtomicBool::new(false),
+            pending_signals: Mutex::new(crate::syscalls::signal::PendingSignals::new()),
             handle: once_cell::race::OnceBox::new(),
         }
     }
@@ -135,6 +149,8 @@ pub(crate) struct Process {
     pub(crate) limits: ResourceLimits,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm>,
+    /// Whether transparent huge pages are disabled for this process.
+    pub(crate) thp_disabled: AtomicBool,
 }
 
 pub(crate) struct Alarm {
@@ -184,6 +200,7 @@ impl Process {
                 handle: None,
                 deadline: None,
             }),
+            thp_disabled: AtomicBool::new(false),
         }
     }
 
@@ -235,9 +252,9 @@ impl Process {
     ///
     /// # Panics
     /// Panics if the thread ID does not exist in this process.
-    fn detach_thread(&self, tid: i32) {
+    fn detach_thread(&self, tid: i32) -> bool {
         let data;
-        let notify = {
+        let (notify, was_last) = {
             let mut inner = self.inner.lock();
             data = inner.threads.remove(&tid);
             assert!(data.is_some());
@@ -246,7 +263,8 @@ impl Process {
             let n = nr_threads.load(Ordering::Relaxed);
             let new_count = n.checked_sub(1).expect("decrementing from zero threads");
             nr_threads.store(new_count, Ordering::Release);
-            if new_count == 0 {
+            let was_last = new_count == 0;
+            if was_last {
                 assert!(inner.threads.is_empty());
                 // The last thread exited. Prevent new threads.
                 inner.group_exit = true;
@@ -255,11 +273,15 @@ impl Process {
             // Notify waiters if this is the last thread of the process
             // (`wait_for_exit`) or if this is the last thread being killed
             // during an exec (`kill_other_threads`).
-            new_count == 0 || (new_count == 1 && inner.is_killing_other_threads)
+            (
+                was_last || (new_count == 1 && inner.is_killing_other_threads),
+                was_last,
+            )
         };
         if notify {
             self.nr_threads.wake_all();
         }
+        was_last
     }
 }
 
@@ -478,6 +500,24 @@ impl<FS: ShimFS> Task<FS> {
                 // Note we don't support capabilities in LiteBox, so we always return 0.
                 Ok(0)
             }
+            PrctlArg::SetTHPDisable(disable) => {
+                self.thread
+                    .process
+                    .thp_disabled
+                    .store(disable != 0, Ordering::Relaxed);
+                Ok(0)
+            }
+            PrctlArg::GetTHPDisable(arg) => {
+                if arg != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                Ok(self
+                    .thread
+                    .process
+                    .thp_disabled
+                    .load(Ordering::Relaxed)
+                    .into())
+            }
             _ => unimplemented!(),
         }
     }
@@ -607,6 +647,68 @@ fn wake_robust_list(
 }
 
 impl<FS: ShimFS> Task<FS> {
+    /// Make any active shared-fork CoW pages covering a host-side guest-memory
+    /// write writable before using fallible pointer helpers from shim code.
+    fn prepare_cow_for_host_write(&self, addr: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(last_addr) = addr.checked_add(len - 1) else {
+            return false;
+        };
+
+        let ps = self.process_state.borrow();
+        let cow_lock = ps.active_cow.lock();
+        let Some(cow) = cow_lock.as_ref() else {
+            return true;
+        };
+
+        let start = addr & !(PAGE_SIZE - 1);
+        let end = (last_addr & !(PAGE_SIZE - 1)).saturating_add(PAGE_SIZE);
+
+        for page_addr in (start..end).step_by(PAGE_SIZE) {
+            let Some(orig_perms) = cow
+                .protected_ranges
+                .iter()
+                .find(|&&(base, plen, _)| page_addr >= base && page_addr < base + plen)
+                .map(|&(_, _, perms)| perms)
+            else {
+                continue;
+            };
+
+            {
+                let mut dirty = cow.dirty_pages.lock();
+                if !dirty
+                    .iter()
+                    .any(|(tracked_addr, _)| *tracked_addr == page_addr)
+                {
+                    let mut buf = alloc::vec![0u8; PAGE_SIZE];
+                    // SAFETY: CoW-protected pages remain mapped while the
+                    // shared fork window is active, so we can snapshot them.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            page_addr as *const u8,
+                            buf.as_mut_ptr(),
+                            PAGE_SIZE,
+                        );
+                    }
+                    dirty.push((page_addr, buf));
+                }
+            }
+
+            let page_range = page_addr..page_addr + PAGE_SIZE;
+            // SAFETY: restoring the page's original permissions is exactly what
+            // the CoW write-fault path does before resuming execution.
+            if !unsafe {
+                crate::cow_update_permissions(self.global.platform, page_range, orig_perms)
+            } {
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
         // If this thread has a deferred park lie that was claimed (at a
@@ -637,12 +739,12 @@ impl<FS: ShimFS> Task<FS> {
                 .wake_all();
         }
 
-        self.thread.detach_from_process();
+        let is_last_thread = self.thread.detach_from_process();
 
         // Maintain process_thread_handles: clean up on last-thread exit, or
         // retarget to a surviving thread if the registered thread is leaving.
         let proc_key = self.process_id.0.cast_signed();
-        if self.thread.process.nr_threads() == 0 {
+        if is_last_thread {
             // Last thread — remove the entry entirely.
             self.global.process_thread_handles.write().remove(&proc_key);
         } else {
@@ -660,9 +762,26 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
+        if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
+            let _ = self.prepare_cow_for_host_write(
+                clear_child_tid.as_usize(),
+                core::mem::size_of::<i32>(),
+            );
+            let _ = clear_child_tid.write_at_offset(0, 0);
+            let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
+            let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
+                addr: clear_child_tid,
+                flags: litebox_common_linux::FutexFlags::PRIVATE,
+                count: 1,
+            });
+        }
+        if let Some(robust_list) = self.thread.robust_list.take() {
+            let _ = wake_robust_list(robust_list);
+        }
+
         // If this was the last thread in the process, close all open FDs and
         // notify the core registry.
-        if self.thread.process.nr_threads() == 0 {
+        if is_last_thread {
             use litebox::platform::AddressSpaceProvider;
 
             // Close all remaining open file descriptors. This is essential for
@@ -754,22 +873,6 @@ impl<FS: ShimFS> Task<FS> {
                 r.is_ok(),
                 "failed to destroy address space {as_id:?}: {r:?}"
             );
-        }
-
-        if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
-            // Clear the child TID if requested
-            // TODO: if we are the last thread, we don't need to clear it
-            let _ = clear_child_tid.write_at_offset(0, 0);
-            // Cast from *i32 to *u32
-            let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
-            let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
-                addr: clear_child_tid,
-                flags: litebox_common_linux::FutexFlags::PRIVATE,
-                count: 1,
-            });
-        }
-        if let Some(robust_list) = self.thread.robust_list.take() {
-            let _ = wake_robust_list(robust_list);
         }
 
         // If this is a vfork child, unblock the parent only after all exit
@@ -1019,6 +1122,40 @@ impl<FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<FS> {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    pub(crate) fn sys_pidfd_open(&self, pid: i32, flags: u32) -> Result<usize, Errno> {
+        const PIDFD_NONBLOCK: u32 = OFlags::NONBLOCK.bits();
+
+        let pid = u32::try_from(pid).map_err(|_| Errno::EINVAL)?;
+        if pid == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flags & !PIDFD_NONBLOCK != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let state = self
+            .global
+            .litebox
+            .process_registry()
+            .exit_state(ProcessId(pid))
+            .ok_or(Errno::ESRCH)?;
+        let pidfd = crate::syscalls::eventfd::EventFile::new_pidfd(
+            state.exited,
+            state.subject,
+            flags & PIDFD_NONBLOCK != 0,
+        );
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let typed = dt.insert::<crate::syscalls::eventfd::EventfdSubsystem>(pidfd);
+        let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+        assert!(old.is_none());
+        drop(dt);
+
+        self.files
+            .borrow()
+            .insert_raw_fd(typed)
+            .map_err(|_| Errno::EMFILE)
+    }
+
     pub(crate) fn sys_clone(
         &self,
         ctx: &litebox_common_linux::ExecutionContext,
@@ -1341,23 +1478,21 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        // clone3-based fork may provide an explicit child stack. This is how
-        // glibc/musl and Rust std implement posix_spawn: they allocate a small
-        // stack for the child to use between clone3 and execve. For non-vfork
-        // independent fork (kernel CoW), the child's address space is already
-        // a copy of the parent's, but the child stack pointer should be set to
-        // the provided stack. For vfork (shared address space), the child runs
-        // on this provided stack instead of the parent's. Without clone3, an
-        // explicit stack is not expected and is rejected.
-        if !clone3 && (args.stack != 0 || args.stack_size != 0) {
+        // Fork-like clone may provide an explicit child stack. `clone3()` uses
+        // `(stack, stack_size)` as a base/size pair, while legacy `clone()`
+        // passes the already-adjusted child stack pointer directly via `stack`
+        // and leaves `stack_size` as zero. glibc/musl/Rust use both forms for
+        // posix_spawn-style helpers that run on a temporary child stack until
+        // execve().
+        if !clone3 && args.stack_size != 0 {
             #[cfg(feature = "trace_syscalls")]
             litebox::log_println!(
                 self.global.platform,
-                "[TRACE-FORK] EINVAL: non-clone3 fork with explicit child stack={:#x} stack_size={:#x}",
+                "[TRACE-FORK] EINVAL: non-clone3 fork with unexpected stack_size stack={:#x} stack_size={:#x}",
                 args.stack,
                 args.stack_size,
             );
-            log_unsupported!("fork with explicit child stack");
+            log_unsupported!("fork with unexpected non-clone3 stack_size");
             return Err(Errno::EINVAL);
         }
 
@@ -1600,6 +1735,7 @@ impl<FS: ShimFS> Task<FS> {
                 shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 main_bss_start: core::sync::atomic::AtomicUsize::new(0),
                 main_bss_end: core::sync::atomic::AtomicUsize::new(0),
+                proc_map_paths: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 vfork_parking: Arc::new(crate::VforkParking {
                     park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
@@ -1640,15 +1776,72 @@ impl<FS: ShimFS> Task<FS> {
         let parent_tls = None;
 
         let child_thread = ThreadState::new_process(child_pid);
-        // If clone3 provided an explicit stack, compute the stack top for the
-        // child. This is how glibc/Rust posix_spawn-style clone3 works: the
-        // caller allocates a small stack and the child uses it until execve.
+        // If the caller provided an explicit child stack, compute the initial
+        // stack pointer the spawned child thread should start with.
+        //
+        // - `clone3()`: `stack` points at the base of the region and
+        //   `stack_size` describes its size, so the child starts at the top.
+        // - legacy `clone()`: `stack` is already the child stack pointer and
+        //   `stack_size` is zero.
         let child_stack = if args.stack != 0 {
             let base: usize = args.stack.truncate();
-            Some(base.wrapping_add(args.stack_size.truncate()))
+            let sp = if clone3 {
+                base.wrapping_add(args.stack_size.truncate())
+            } else {
+                base
+            };
+            Some(sp)
         } else {
             None
         };
+
+        // A shared-vfork child can resume on the parent's stack before the new
+        // host thread has a chance to service its first CoW write fault. Make
+        // the initial stack window writable up front so the first post-clone
+        // `push`/prologue writes don't crash the child before exec.
+        let prefault_child_stack = if is_shared {
+            #[cfg(target_arch = "x86_64")]
+            let sp = child_stack.unwrap_or_else(|| ctx.rsp.truncate());
+            #[cfg(target_arch = "x86")]
+            let sp = child_stack.unwrap_or_else(|| ctx.esp.truncate());
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+            let sp = child_stack.unwrap_or(0);
+            let prefault_len = PAGE_SIZE * 5;
+            if sp != 0 {
+                let start = sp.saturating_sub(PAGE_SIZE * 4);
+                Some((start, prefault_len))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((start, len)) = prefault_child_stack
+            && !self.prepare_cow_for_host_write(start, len)
+        {
+            let _ = self.global.platform.destroy_address_space(child_as_id);
+            self.global
+                .litebox
+                .process_registry()
+                .remove_process(child_process_id);
+            if let Some(cow) = &cow_state {
+                for &(base, len, orig_perms) in &cow.protected_ranges {
+                    unsafe {
+                        <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
+                            self.global.platform,
+                            base..base + len,
+                            orig_perms,
+                        )
+                        .expect("CoW prefault cleanup: failed to restore permissions");
+                    }
+                }
+                *self.process_state.borrow().active_cow.lock() = None;
+            }
+            if did_park_threads {
+                self.unpark_other_threads();
+            }
+            return Err(Errno::ENOMEM);
+        }
         // Handle CHILD_SETTID and CHILD_CLEARTID for the fork child.
         let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) && args.child_tid != 0 {
             Some(crate::MutPtr::<i32>::from_usize(args.child_tid.truncate()))
@@ -2193,6 +2386,73 @@ impl<FS: ShimFS> Task<FS> {
         head_ptr.write_at_offset(0, head).ok_or(Errno::EFAULT)
     }
 
+    /// Handle syscall `rseq`.
+    pub(crate) fn sys_rseq(
+        &self,
+        rseq: crate::MutPtr<u8>,
+        rseq_len: u32,
+        flags: u32,
+        sig: u32,
+    ) -> Result<(), Errno> {
+        const RSEQ_LEN: u32 = 0x20;
+        const RSEQ_FLAG_UNREGISTER: u32 = 1;
+
+        if rseq_len != RSEQ_LEN || flags & !RSEQ_FLAG_UNREGISTER != 0 || rseq.as_usize() == 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let cpu_id = {
+            #[cfg(target_os = "linux")]
+            {
+                // SAFETY: `sched_getcpu(3)` takes no pointers and has no side effects
+                // beyond reporting the current host CPU for this thread.
+                unsafe { libc::sched_getcpu() }.max(0) as u32
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                0
+            }
+        };
+
+        let cpu_ptr = crate::MutPtr::<u32>::from_usize(rseq.as_usize());
+        let rseq_cs_ptr = crate::MutPtr::<u64>::from_usize(rseq.as_usize() + 8);
+        let flags_ptr = crate::MutPtr::<u32>::from_usize(rseq.as_usize() + 16);
+
+        let write_state = |cpu_id_start: u32, cpu_id: u32| -> Result<(), Errno> {
+            cpu_ptr
+                .write_at_offset(0, cpu_id_start)
+                .ok_or(Errno::EFAULT)?;
+            cpu_ptr.write_at_offset(1, cpu_id).ok_or(Errno::EFAULT)?;
+            rseq_cs_ptr.write_at_offset(0, 0).ok_or(Errno::EFAULT)?;
+            flags_ptr.write_at_offset(0, 0).ok_or(Errno::EFAULT)?;
+            cpu_ptr.write_at_offset(5, 0).ok_or(Errno::EFAULT)?;
+            cpu_ptr.write_at_offset(6, 0).ok_or(Errno::EFAULT)?;
+            cpu_ptr.write_at_offset(7, 0).ok_or(Errno::EFAULT)?;
+            Ok(())
+        };
+
+        match flags {
+            0 => {
+                if self.thread.rseq.get().is_some() {
+                    return Err(Errno::EBUSY);
+                }
+                let _ = sig;
+                write_state(cpu_id, cpu_id)?;
+                self.thread.rseq.set(Some(rseq));
+                Ok(())
+            }
+            RSEQ_FLAG_UNREGISTER => {
+                let _ = sig;
+                if self.thread.rseq.get().map(|ptr| ptr.as_usize()) != Some(rseq.as_usize()) {
+                    return Err(Errno::EINVAL);
+                }
+                self.thread.rseq.set(None);
+                write_state(u32::MAX, u32::MAX)
+            }
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
     fn real_time_as_duration_since_epoch(&self) -> core::time::Duration {
         let now = self.global.platform.current_time();
         let unix_epoch =
@@ -2388,6 +2648,97 @@ impl<FS: ShimFS> Task<FS> {
         Ok(seconds)
     }
 
+    /// Handle syscall `getrusage`.
+    pub(crate) fn sys_getrusage(
+        &self,
+        who: i32,
+        usage: crate::MutPtr<litebox_common_linux::Rusage>,
+    ) -> Result<(), Errno> {
+        match who {
+            0 | -1 | 1 => {}
+            _ => return Err(Errno::EINVAL),
+        }
+
+        usage
+            .write_at_offset(0, litebox_common_linux::Rusage::default())
+            .ok_or(Errno::EFAULT)
+    }
+
+    /// Handle syscall `process_vm_readv`.
+    pub(crate) fn sys_process_vm_readv(
+        &self,
+        pid: i32,
+        local_iov: ConstPtr<litebox_common_linux::IoReadVec<MutPtr<u8>>>,
+        liovcnt: usize,
+        remote_iov: ConstPtr<litebox_common_linux::IoWriteVec<ConstPtr<u8>>>,
+        riovcnt: usize,
+        flags: usize,
+    ) -> Result<usize, Errno> {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if pid != self.pid {
+            return Err(Errno::EPERM);
+        }
+
+        let local_iovs = local_iov.to_owned_slice(liovcnt).ok_or(Errno::EFAULT)?;
+        let remote_iovs = remote_iov.to_owned_slice(riovcnt).ok_or(Errno::EFAULT)?;
+        let mut local_index = 0usize;
+        let mut local_offset = 0usize;
+        let mut total = 0usize;
+
+        for remote in &*remote_iovs {
+            let mut remote_offset = 0usize;
+            let remote_len = remote.iov_len;
+            let remote_base = remote.iov_base;
+            while remote_offset < remote_len {
+                while local_index < local_iovs.len()
+                    && local_offset == local_iovs[local_index].iov_len
+                {
+                    local_index += 1;
+                    local_offset = 0;
+                }
+                if local_index == local_iovs.len() {
+                    return Ok(total);
+                }
+
+                let local = &local_iovs[local_index];
+                let local_len = local.iov_len;
+                let local_base = local.iov_base;
+                let chunk = (remote_len - remote_offset).min(local_len - local_offset);
+                let Some(remote_addr) = remote_base.as_usize().checked_add(remote_offset) else {
+                    return if total == 0 {
+                        Err(Errno::EFAULT)
+                    } else {
+                        Ok(total)
+                    };
+                };
+                let Some(buf) = ConstPtr::<u8>::from_usize(remote_addr).to_owned_slice(chunk)
+                else {
+                    return if total == 0 {
+                        Err(Errno::EFAULT)
+                    } else {
+                        Ok(total)
+                    };
+                };
+                self.park_if_deferred();
+                if local_base.copy_from_slice(local_offset, &buf).is_none() {
+                    return if total == 0 {
+                        Err(Errno::EFAULT)
+                    } else {
+                        Ok(total)
+                    };
+                }
+
+                remote_offset += chunk;
+                local_offset += chunk;
+                total = total.checked_add(chunk).ok_or(Errno::EINVAL)?;
+            }
+        }
+
+        Ok(total)
+    }
+
     /// Handle syscall `alarm`.
     ///
     /// Sets a process-wide timer to deliver SIGALRM after `seconds` seconds. If
@@ -2560,6 +2911,50 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_getegid(&self) -> u32 {
         self.credentials.egid
     }
+
+    /// Handle syscall `getgroups`.
+    pub(crate) fn sys_getgroups(&self, size: i32, list: MutPtr<u32>) -> Result<usize, Errno> {
+        fn host_errno() -> Errno {
+            let errno = unsafe { *libc::__errno_location() };
+            Errno::try_from(errno as u32).unwrap_or(Errno::EINVAL)
+        }
+
+        if size < 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let count = unsafe { libc::getgroups(0, core::ptr::null_mut()) };
+        if count < 0 {
+            return Err(host_errno());
+        }
+
+        let count = usize::try_from(count).map_err(|_| Errno::EINVAL)?;
+        let size = usize::try_from(size).map_err(|_| Errno::EINVAL)?;
+        if size == 0 {
+            return Ok(count);
+        }
+        if size < count {
+            return Err(Errno::EINVAL);
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let mut groups = Vec::new();
+        groups.resize(count, 0 as libc::gid_t);
+        let ret = unsafe { libc::getgroups(count as i32, groups.as_mut_ptr()) };
+        if ret < 0 {
+            return Err(host_errno());
+        }
+
+        let ret = usize::try_from(ret).map_err(|_| Errno::EINVAL)?;
+        debug_assert_eq!(ret, count);
+        for (i, gid) in groups.into_iter().enumerate().take(ret) {
+            list.write_at_offset(i.try_into().unwrap(), gid)
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(ret)
+    }
 }
 
 /// Number of CPUs
@@ -2586,6 +2981,36 @@ impl<FS: ShimFS> Task<FS> {
         let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
         cpuset.iter_mut().for_each(|mut b| *b = true);
         CpuSet { bits: cpuset }
+    }
+
+    pub(crate) fn sys_sched_setscheduler(
+        &self,
+        pid: i32,
+        policy: i32,
+        param: crate::ConstPtr<i32>,
+    ) -> Result<usize, Errno> {
+        const SCHED_OTHER: i32 = 0;
+        const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
+
+        let priority = param.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let target_tid = if pid == 0 { self.tid } else { pid };
+        if !self
+            .thread
+            .process
+            .inner
+            .lock()
+            .threads
+            .contains_key(&target_tid)
+        {
+            return Err(Errno::ESRCH);
+        }
+
+        let base_policy = policy & !SCHED_RESET_ON_FORK;
+        if base_policy != SCHED_OTHER || priority != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        Ok(0)
     }
 }
 
@@ -2852,12 +3277,17 @@ impl<FS: ShimFS> Task<FS> {
 
         let (path, argv_vec) = self.resolve_shebang_program(path, argv_vec)?;
 
-        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
-            "[EXEC] pid={} path={:?}",
+            "[EXEC] pid={} path={:?} argc={} argv={:?}",
             self.pid,
             path,
+            argv_vec.len(),
+            argv_vec
+                .iter()
+                .take(6)
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<alloc::vec::Vec<_>>(),
         );
 
         let loader = crate::loader::elf::ElfLoader::new(self, &path).map_err(Errno::from)?;
@@ -2906,6 +3336,7 @@ impl<FS: ShimFS> Task<FS> {
                 shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 main_bss_start: core::sync::atomic::AtomicUsize::new(0),
                 main_bss_end: core::sync::atomic::AtomicUsize::new(0),
+                proc_map_paths: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 vfork_parking: Arc::new(crate::VforkParking {
                     park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
@@ -3143,6 +3574,10 @@ impl<FS: ShimFS> Task<FS> {
 
                 if let Some(child_tid_ptr) = set_child_tid {
                     // Set the child TID if requested.
+                    let _ = self.prepare_cow_for_host_write(
+                        child_tid_ptr.as_usize(),
+                        core::mem::size_of::<i32>(),
+                    );
                     let _ = child_tid_ptr.write_at_offset(0, self.tid);
                 }
                 false
@@ -3205,6 +3640,27 @@ mod tests {
             .map(|b| b.count_ones() as usize)
             .sum();
         assert_eq!(ones, super::NR_CPUS);
+    }
+
+    #[test]
+    fn test_sched_setscheduler_reset_on_fork_other() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let param = 0i32;
+        let rc = task
+            .sys_sched_setscheduler(0, 0x4000_0000, crate::ConstPtr::from_ptr(&raw const param))
+            .expect("sched_setscheduler should accept SCHED_OTHER|RESET_ON_FORK");
+        assert_eq!(rc, 0);
+
+        let bad_priority = 1i32;
+        assert_eq!(
+            task.sys_sched_setscheduler(
+                0,
+                0x4000_0000,
+                crate::ConstPtr::from_ptr(&raw const bad_priority),
+            )
+            .unwrap_err(),
+            litebox_common_linux::errno::Errno::EINVAL
+        );
     }
 
     #[test]
