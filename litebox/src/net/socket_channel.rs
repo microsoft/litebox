@@ -466,6 +466,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
             _ => return Err(SendError::SocketInInvalidState),
         }
 
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
         let mut tx_prod = self.inner.tx_prod.lock();
         let n = tx_prod.push_slice(buf);
 
@@ -1114,6 +1118,16 @@ mod tests {
         assert_eq!(&buf[..popped], data);
 
         // No more pending TX
+        assert!(!channel.has_pending_tx());
+    }
+
+    #[test]
+    fn stream_channel_zero_length_write_succeeds() {
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
+        channel.set_state(SocketState::Connected);
+
+        let written = channel.try_write(&[]).unwrap();
+        assert_eq!(written, 0);
         assert!(!channel.has_pending_tx());
     }
 

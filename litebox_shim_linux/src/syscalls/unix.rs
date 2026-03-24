@@ -533,6 +533,9 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                     };
                 }
             };
+            if n == 0 {
+                continue;
+            }
             total_read += n;
             buf = &mut buf[n..];
         }
@@ -740,6 +743,7 @@ impl<FS: ShimFS> UnixStream<FS> {
         buf: &[u8],
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
+        preserve_empty_record: bool,
     ) -> Result<usize, Errno> {
         let mut msg = Some(Message { data: buf.to_vec() });
         cx.with_timeout(timeout)
@@ -760,6 +764,9 @@ impl<FS: ShimFS> UnixStream<FS> {
                             .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
                         if addr.is_some() {
                             return Err(TryOpError::Other(Errno::EISCONN));
+                        }
+                        if buf.is_empty() && !preserve_empty_record {
+                            return Ok(0);
                         }
                         match conn.try_sendto(msg.take().unwrap()) {
                             Ok(()) => Ok(buf.len()),
@@ -936,6 +943,9 @@ impl ReadEnd<DatagramMessage> {
                 }
             };
             total_read += n;
+            if n == 0 {
+                break;
+            }
             buf = &mut buf[n..];
         }
         if let (Some(src), Some(source_addr)) = (src, source_addr) {
@@ -1228,6 +1238,10 @@ impl<FS: ShimFS> UnixSocket<FS> {
         }
     }
 
+    pub(super) fn sock_type(&self) -> SockType {
+        self.sock_type
+    }
+
     pub(super) fn listen(&self, backlog: u16, global: &Arc<GlobalState<FS>>) -> Result<(), Errno> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.listen(backlog, global),
@@ -1280,9 +1294,14 @@ impl<FS: ShimFS> UnixSocket<FS> {
             flags.contains(SendFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
         let timeout = self.options.lock().send_timeout;
         let ret = match &self.inner {
-            UnixSocketInner::Stream(stream) => {
-                stream.sendto(&task.wait_cx(), timeout, buf, is_nonblocking, addr)
-            }
+            UnixSocketInner::Stream(stream) => stream.sendto(
+                &task.wait_cx(),
+                timeout,
+                buf,
+                is_nonblocking,
+                addr,
+                self.sock_type == SockType::SeqPacket,
+            ),
             UnixSocketInner::Datagram(datagram) => {
                 datagram.sendto(task, timeout, buf, is_nonblocking, addr)
             }

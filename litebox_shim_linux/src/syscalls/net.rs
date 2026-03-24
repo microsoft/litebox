@@ -830,6 +830,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                     Ok(())
                 },
                 || match proxy.try_write(buf, new_flags, sockaddr) {
+                    Ok(0) if buf.is_empty() => Ok(0),
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
@@ -1480,6 +1481,57 @@ impl<FS: ShimFS> Task<FS> {
         let msg = msg.read_at_offset(0).ok_or(Errno::EFAULT)?;
         self.do_sendmsg(fd, &msg, flags)
     }
+
+    fn copy_sendmsg_iovs(
+        iovs: &[litebox_common_linux::IoVec<MutPtr<u8>>],
+    ) -> Result<Vec<u8>, Errno> {
+        let total_len = iovs
+            .iter()
+            .try_fold(0usize, |acc, iov| acc.checked_add(iov.iov_len))
+            .ok_or(Errno::EINVAL)?;
+        let mut buf = Vec::with_capacity(total_len);
+        for iov in iovs {
+            let iov_base = iov.iov_base;
+            let iov_len = iov.iov_len;
+            let start = buf.len();
+            buf.resize(start + iov_len, 0);
+            let ptr = ConstPtr::<u8>::from_usize(iov_base.as_usize());
+            for (offset, byte) in buf[start..].iter_mut().enumerate() {
+                *byte = ptr
+                    .read_at_offset(isize::try_from(offset).unwrap())
+                    .ok_or(Errno::EFAULT)?;
+            }
+        }
+        Ok(buf)
+    }
+
+    fn sendmsg_stream_iovs(
+        iovs: &[litebox_common_linux::IoVec<MutPtr<u8>>],
+        mut send_chunk: impl FnMut(&[u8]) -> Result<usize, Errno>,
+    ) -> Result<usize, Errno> {
+        let mut total_sent = 0usize;
+        for iov in iovs {
+            let iov_base = iov.iov_base;
+            let iov_len = iov.iov_len;
+            let mut offset = 0usize;
+            while offset < iov_len {
+                let ptr = ConstPtr::<u8>::from_usize(iov_base.as_usize().wrapping_add(offset));
+                let chunk = ptr.to_owned_slice(iov_len - offset).ok_or(Errno::EFAULT)?;
+                let sent = match send_chunk(&chunk) {
+                    Ok(sent) => sent,
+                    Err(_err) if total_sent > 0 => return Ok(total_sent),
+                    Err(err) => return Err(err),
+                };
+                total_sent = total_sent.checked_add(sent).ok_or(Errno::EINVAL)?;
+                if sent == 0 || sent < chunk.len() {
+                    return Ok(total_sent);
+                }
+                offset += sent;
+            }
+        }
+        Ok(total_sent)
+    }
+
     fn do_sendmsg(
         &self,
         sockfd: u32,
@@ -1496,15 +1548,19 @@ impl<FS: ShimFS> Task<FS> {
             None
         };
         if msg.msg_controllen != 0 {
-            unimplemented!("ancillary data is not supported");
+            return Err(Errno::EOPNOTSUPP);
         }
-        if msg.msg_iovlen == 0 || msg.msg_iovlen > 1024 {
+        if msg.msg_iovlen > 1024 {
             return Err(Errno::EINVAL);
         }
         let iovs = msg
             .msg_iov
             .to_owned_slice(msg.msg_iovlen)
             .ok_or(Errno::EFAULT)?;
+        let total_len = iovs
+            .iter()
+            .try_fold(0usize, |acc, iov| acc.checked_add(iov.iov_len))
+            .ok_or(Errno::EINVAL)?;
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -1513,22 +1569,39 @@ impl<FS: ShimFS> Task<FS> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                let mut total_sent = 0;
-                for iov in &iovs {
-                    if iov.iov_len == 0 {
-                        continue;
+                if self.global.get_socket_type(fd)? == SockType::Stream {
+                    if total_len == 0 {
+                        return self
+                            .global
+                            .sendto(&self.wait_cx(), fd, &[], flags, sock_addr);
                     }
-                    let buf = iov
-                        .iov_base
-                        .to_owned_slice(iov.iov_len)
-                        .ok_or(Errno::EFAULT)?;
-                    total_sent +=
+                    Self::sendmsg_stream_iovs(&iovs, |chunk| {
                         self.global
-                            .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)?;
+                            .sendto(&self.wait_cx(), fd, chunk, flags, sock_addr)
+                    })
+                } else {
+                    let buf = Self::copy_sendmsg_iovs(&iovs)?;
+                    self.global
+                        .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)
                 }
-                Ok(total_sent)
             },
-            |_file| Err(Errno::ENOTSOCK),
+            |file| {
+                let sock_addr = sock_addr
+                    .clone()
+                    .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
+                    .transpose()?;
+                if file.sock_type() == SockType::Stream {
+                    if total_len == 0 {
+                        return file.sendto(self, &[], flags, sock_addr.clone());
+                    }
+                    Self::sendmsg_stream_iovs(&iovs, |chunk| {
+                        file.sendto(self, chunk, flags, sock_addr.clone())
+                    })
+                } else {
+                    let buf = Self::copy_sendmsg_iovs(&iovs)?;
+                    file.sendto(self, &buf, flags, sock_addr)
+                }
+            },
         )
     }
 
@@ -3480,6 +3553,197 @@ mod unix_tests {
     fn test_unix_socketpair_recvmsg() {
         unix_socketpair_recvmsg(SockType::Stream);
         unix_socketpair_recvmsg(SockType::Datagram);
+    }
+
+    fn unix_socketpair_sendmsg(ty: SockType) {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        let buf1 = b"sendmsg ";
+        let buf2 = b"over unix socketpair";
+        let iovec = [
+            litebox_common_linux::IoVec {
+                iov_base: MutPtr::from_usize(buf1.as_ptr() as usize),
+                iov_len: buf1.len(),
+            },
+            litebox_common_linux::IoVec {
+                iov_base: MutPtr::from_usize(buf2.as_ptr() as usize),
+                iov_len: buf2.len(),
+            },
+        ];
+        let hdr = {
+            use zerocopy::FromZeros as _;
+            let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
+            h.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+            h.msg_iovlen = iovec.len();
+            h
+        };
+        let sent = task
+            .do_sendmsg(sock1, &hdr, SendFlags::empty())
+            .expect("sendmsg failed");
+        assert_eq!(sent, buf1.len() + buf2.len());
+
+        let mut recv = [0u8; 64];
+        let received = task
+            .do_recvfrom(sock2, &mut recv, ReceiveFlags::empty(), None)
+            .expect("recvfrom failed");
+        assert_eq!(received, sent);
+        assert_eq!(
+            &recv[..received],
+            &[buf1.as_slice(), buf2.as_slice()].concat()
+        );
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_unix_socketpair_sendmsg() {
+        unix_socketpair_sendmsg(SockType::Stream);
+        unix_socketpair_sendmsg(SockType::Datagram);
+    }
+
+    #[test]
+    fn test_sendmsg_allows_zero_iovecs_for_unix_datagram() {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Datagram,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .expect("socketpair failed");
+
+        let hdr = {
+            use zerocopy::FromZeros as _;
+            litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed()
+        };
+        let sent = task
+            .do_sendmsg(sock1, &hdr, SendFlags::empty())
+            .expect("zero-iovec sendmsg failed");
+        assert_eq!(sent, 0);
+
+        let mut recv = [0u8; 1];
+        let received = task
+            .do_recvfrom(sock2, &mut recv, ReceiveFlags::DONTWAIT, None)
+            .expect("recvfrom failed");
+        assert_eq!(received, 0);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_sendmsg_zero_iovecs_is_noop_for_unix_stream() {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .expect("socketpair failed");
+
+        let hdr = {
+            use zerocopy::FromZeros as _;
+            litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed()
+        };
+        let sent = task
+            .do_sendmsg(sock1, &hdr, SendFlags::empty())
+            .expect("zero-iovec sendmsg failed");
+        assert_eq!(sent, 0);
+
+        let mut recv = [0u8; 1];
+        let err = task
+            .do_recvfrom(sock2, &mut recv, ReceiveFlags::DONTWAIT, None)
+            .expect_err("zero-length stream send should not enqueue data");
+        assert_eq!(err, Errno::EAGAIN);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_sendmsg_zero_iovecs_unconnected_unix_stream_returns_enotconn() {
+        let task = init_platform(None);
+        let sock = create_unix_socket(&task, SockType::Stream, SockFlags::NONBLOCK);
+
+        let hdr = {
+            use zerocopy::FromZeros as _;
+            litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed()
+        };
+        let err = task
+            .do_sendmsg(sock, &hdr, SendFlags::empty())
+            .expect_err("unconnected stream sendmsg should fail");
+        assert_eq!(err, Errno::ENOTCONN);
+
+        close_socket(&task, sock);
+    }
+
+    #[test]
+    fn test_sendmsg_zero_iovecs_delivers_empty_unix_seqpacket_record() {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::SeqPacket,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .expect("socketpair failed");
+
+        let hdr = {
+            use zerocopy::FromZeros as _;
+            litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed()
+        };
+        let sent = task
+            .do_sendmsg(sock1, &hdr, SendFlags::empty())
+            .expect("zero-iovec sendmsg failed");
+        assert_eq!(sent, 0);
+
+        let mut recv = [0u8; 1];
+        let received = task
+            .do_recvfrom(sock2, &mut recv, ReceiveFlags::DONTWAIT, None)
+            .expect("zero-length seqpacket record should be delivered");
+        assert_eq!(received, 0);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_sendmsg_rejects_ancillary_data_without_panicking() {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+
+        let byte = b"x";
+        let control = [0u8; 1];
+        let iovec = [litebox_common_linux::IoVec {
+            iov_base: MutPtr::from_usize(byte.as_ptr() as usize),
+            iov_len: 1,
+        }];
+        let hdr = {
+            use zerocopy::FromZeros as _;
+            let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
+            h.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+            h.msg_iovlen = iovec.len();
+            h.msg_control = ConstPtr::from_usize(control.as_ptr() as usize);
+            h.msg_controllen = control.len();
+            h
+        };
+        let err = task
+            .do_sendmsg(sock1, &hdr, SendFlags::empty())
+            .expect_err("ancillary data should be rejected");
+        assert_eq!(err, Errno::EOPNOTSUPP);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
     }
 
     fn unix_socket_recv_timeout(ty: SockType) {
