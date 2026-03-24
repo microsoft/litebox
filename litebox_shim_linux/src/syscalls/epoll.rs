@@ -15,7 +15,10 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError, Waker},
     },
-    fd::{EntryHandle, FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd, WeakEntryHandle},
+    fd::{
+        DescriptorObjectId, EntryHandle, FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd,
+        WeakEntryHandle,
+    },
     fs::OFlags,
     utils::ReinterpretUnsignedExt,
 };
@@ -463,17 +466,17 @@ impl<FS: ShimFS> EpollFile<FS> {
         self.parents.lock().push(parent.downgrade());
     }
 
-    fn remove_parent_by_id(&self, parent_id: usize) {
+    fn remove_parent_by_id(&self, parent_id: DescriptorObjectId) {
         let mut parents = self.parents.lock();
         if let Some(idx) = parents
             .iter()
-            .position(|weak| weak.identity_addr() == parent_id)
+            .position(|weak| weak.object_id() == parent_id)
         {
             parents.remove(idx);
         }
     }
 
-    pub(crate) fn detach_nested_children_by_parent_id(&self, parent_id: usize) {
+    pub(crate) fn detach_nested_children_by_parent_id(&self, parent_id: DescriptorObjectId) {
         let entries = {
             let interests = self.interests.lock();
             interests.values().cloned().collect::<Vec<_>>()
@@ -513,7 +516,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                     (parent_handle.as_ref(), removed.desc.upgrade())
                 {
                     child.with_entry(|entry| {
-                        entry.remove_parent_by_id(parent_handle.identity_addr());
+                        entry.remove_parent_by_id(parent_handle.object_id());
                     });
                 }
                 Ok(())
@@ -656,18 +659,18 @@ impl<FS: ShimFS> EpollFile<FS> {
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct EpollEntryKey(u32, usize);
+struct EpollEntryKey(u32, DescriptorObjectId);
 impl EpollEntryKey {
     fn new<FS: ShimFS>(fd: u32, desc: &EpollDescriptor<FS>) -> Self {
-        let ptr = match desc {
-            EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).addr(),
-            EpollDescriptor::Epoll(file) => file.identity_addr(),
-            EpollDescriptor::File(file) => Arc::as_ptr(file).addr(),
-            EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).addr(),
-            EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).addr(),
-            EpollDescriptor::Unix(unix) => Arc::as_ptr(unix).addr(),
+        let object_id = match desc {
+            EpollDescriptor::Eventfd(file) => file.object_id(),
+            EpollDescriptor::Epoll(file) => file.object_id(),
+            EpollDescriptor::File(file) => file.object_id(),
+            EpollDescriptor::Socket(socket_fd) => socket_fd.object_id(),
+            EpollDescriptor::Pipe(pipe_fd) => pipe_fd.object_id(),
+            EpollDescriptor::Unix(unix) => unix.object_id(),
         };
-        Self(fd, ptr)
+        Self(fd, object_id)
     }
 }
 

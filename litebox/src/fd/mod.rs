@@ -24,6 +24,22 @@ mod tests;
 /// Storage of file descriptors and their entries.
 pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
     entries: Vec<Option<IndividualEntry<Platform>>>,
+    next_object_id: u64,
+}
+
+/// Stable identifier for a shared descriptor object.
+///
+/// This corresponds to the underlying open-file-description style object that
+/// may be referenced by multiple duplicated or fork-inherited file-descriptor
+/// tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DescriptorObjectId(u64);
+
+impl DescriptorObjectId {
+    /// Returns the raw numeric value.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
@@ -32,7 +48,19 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// This is expected to be invoked only by [`crate::LiteBox`]'s creation method, and should not
     /// be invoked anywhere else in the codebase.
     pub(crate) fn new_from_litebox_creation() -> Self {
-        Self { entries: vec![] }
+        Self {
+            entries: vec![],
+            next_object_id: 1,
+        }
+    }
+
+    fn allocate_object_id(&mut self) -> DescriptorObjectId {
+        let object_id = DescriptorObjectId(self.next_object_id);
+        self.next_object_id = self
+            .next_object_id
+            .checked_add(1)
+            .expect("descriptor object ids should not overflow");
+        object_id
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
@@ -45,6 +73,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         &mut self,
         entry: impl Into<Subsystem::Entry>,
     ) -> TypedFd<Subsystem> {
+        let object_id = self.allocate_object_id();
         let entry = DescriptorEntry {
             entry: alloc::boxed::Box::new(entry.into()),
             metadata: AnyMap::new(),
@@ -57,11 +86,14 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let old = self.entries[idx].replace(IndividualEntry::new(Arc::new(RwLock::new(entry))));
+        let old = self.entries[idx].replace(IndividualEntry::new(
+            Arc::new(RwLock::new(entry)),
+            object_id,
+        ));
         assert!(old.is_none());
         TypedFd {
             _phantom: PhantomData,
-            x: OwnedFd::new(idx),
+            x: OwnedFd::new(idx, object_id),
         }
     }
 
@@ -86,15 +118,19 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let src = self.entries[raw.as_usize()?].as_ref().unwrap();
-        src.x.read().entry.on_dup();
+        let (shared_entry, metadata, object_id) = {
+            let src = self.entries[raw.as_usize()?].as_ref().unwrap();
+            src.x.read().entry.on_dup();
+            (Arc::clone(&src.x), src.metadata.clone(), src.object_id)
+        };
         let new_ind_entry = IndividualEntry {
-            x: Arc::clone(&src.x),
-            metadata: src.metadata.clone(),
+            x: shared_entry,
+            metadata,
+            object_id,
         };
         let old = self.entries[idx].replace(new_ind_entry);
         assert!(old.is_none());
-        Some(OwnedFd::new(idx))
+        Some(OwnedFd::new(idx, object_id))
     }
 
     /// Create a duplicate of the provided `fd`.
@@ -123,14 +159,17 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let src = self.entries[fd.x.as_usize()?].as_ref().unwrap();
-        src.x.read().entry.on_dup();
-        let new_ind_entry = IndividualEntry::new(Arc::clone(&src.x));
+        let (shared_entry, object_id) = {
+            let src = self.entries[fd.x.as_usize()?].as_ref().unwrap();
+            src.x.read().entry.on_dup();
+            (Arc::clone(&src.x), src.object_id)
+        };
+        let new_ind_entry = IndividualEntry::new(shared_entry, object_id);
         let old = self.entries[idx].replace(new_ind_entry);
         assert!(old.is_none());
         Some(TypedFd {
             _phantom: PhantomData,
-            x: OwnedFd::new(idx),
+            x: OwnedFd::new(idx, object_id),
         })
     }
 
@@ -308,7 +347,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // the first place, none of this should panic---if it does, someone has done a bad cast
         // somewhere.
         let entry = self.entries[fd.x.as_usize()?].as_ref()?;
-        Some(EntryHandle(Arc::clone(&entry.x), PhantomData))
+        Some(EntryHandle {
+            entry: Arc::clone(&entry.x),
+            object_id: entry.object_id,
+            _phantom: PhantomData,
+        })
     }
 
     /// Handles to all currently alive entries in a subsystem.
@@ -322,7 +365,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 return None;
             }
             drop(guard);
-            Some(EntryHandle(entry.x.clone(), PhantomData))
+            Some(EntryHandle {
+                entry: entry.x.clone(),
+                object_id: entry.object_id,
+                _phantom: PhantomData,
+            })
         })
     }
 
@@ -505,57 +552,85 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 
 /// A handle to a descriptor entry (via [`Descriptors::entry_handle`]) that can be used without
 /// maintaining access to the descriptor table itself.
-pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
-    Arc<RwLock<Platform, DescriptorEntry>>,
-    PhantomData<Subsystem>,
-);
+pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> {
+    entry: Arc<RwLock<Platform, DescriptorEntry>>,
+    object_id: DescriptorObjectId,
+    _phantom: PhantomData<Subsystem>,
+}
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> Clone
     for EntryHandle<Platform, Subsystem>
 {
     fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0), PhantomData)
+        Self {
+            entry: Arc::clone(&self.entry),
+            object_id: self.object_id,
+            _phantom: PhantomData,
+        }
     }
 }
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     EntryHandle<Platform, Subsystem>
 {
+    /// Returns the shared descriptor-object identity.
+    pub fn object_id(&self) -> DescriptorObjectId {
+        self.object_id
+    }
+
     pub fn identity_addr(&self) -> usize {
-        Arc::as_ptr(&self.0).addr()
+        Arc::as_ptr(&self.entry).addr()
     }
 
     pub fn with_entry<R>(&self, f: impl FnOnce(&Subsystem::Entry) -> R) -> R {
-        f(self.0.read().as_subsystem::<Subsystem>())
+        f(self.entry.read().as_subsystem::<Subsystem>())
     }
 
     pub fn with_entry_mut<R>(&self, f: impl FnOnce(&mut Subsystem::Entry) -> R) -> R {
-        f(self.0.write().as_subsystem_mut::<Subsystem>())
+        f(self.entry.write().as_subsystem_mut::<Subsystem>())
     }
 
     pub fn downgrade(&self) -> WeakEntryHandle<Platform, Subsystem> {
-        WeakEntryHandle(Arc::downgrade(&self.0), PhantomData)
+        WeakEntryHandle {
+            entry: Arc::downgrade(&self.entry),
+            object_id: self.object_id,
+            _phantom: PhantomData,
+        }
     }
 }
 
-pub struct WeakEntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
-    Weak<RwLock<Platform, DescriptorEntry>>,
-    PhantomData<Subsystem>,
-);
+pub struct WeakEntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> {
+    entry: Weak<RwLock<Platform, DescriptorEntry>>,
+    object_id: DescriptorObjectId,
+    _phantom: PhantomData<Subsystem>,
+}
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> Clone
     for WeakEntryHandle<Platform, Subsystem>
 {
     fn clone(&self) -> Self {
-        Self(self.0.clone(), PhantomData)
+        Self {
+            entry: self.entry.clone(),
+            object_id: self.object_id,
+            _phantom: PhantomData,
+        }
     }
 }
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     WeakEntryHandle<Platform, Subsystem>
 {
+    /// Returns the shared descriptor-object identity.
+    pub fn object_id(&self) -> DescriptorObjectId {
+        self.object_id
+    }
+
     pub fn identity_addr(&self) -> usize {
-        self.0.as_ptr().addr()
+        self.entry.as_ptr().addr()
     }
 
     pub fn upgrade(&self) -> Option<EntryHandle<Platform, Subsystem>> {
-        Some(EntryHandle(self.0.upgrade()?, PhantomData))
+        Some(EntryHandle {
+            entry: self.entry.upgrade()?,
+            object_id: self.object_id,
+            _phantom: PhantomData,
+        })
     }
 }
 
@@ -915,6 +990,7 @@ pub enum MetadataError {
 /// A module-internal fd-specific individual entry
 struct IndividualEntry<Platform: RawSyncPrimitivesProvider> {
     x: Arc<RwLock<Platform, DescriptorEntry>>,
+    object_id: DescriptorObjectId,
     metadata: AnyMap,
 }
 impl<Platform: RawSyncPrimitivesProvider> core::ops::Deref for IndividualEntry<Platform> {
@@ -924,9 +1000,10 @@ impl<Platform: RawSyncPrimitivesProvider> core::ops::Deref for IndividualEntry<P
     }
 }
 impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
-    fn new(x: Arc<RwLock<Platform, DescriptorEntry>>) -> Self {
+    fn new(x: Arc<RwLock<Platform, DescriptorEntry>>, object_id: DescriptorObjectId) -> Self {
         Self {
             x,
+            object_id,
             metadata: AnyMap::new(),
         }
     }
@@ -993,6 +1070,11 @@ impl<Subsystem: FdEnabledSubsystem> TypedFd<Subsystem> {
         assert!(!self.x.is_closed());
         InternalFd { raw: self.x.raw }
     }
+
+    /// Returns the shared descriptor-object identity for this file descriptor.
+    pub fn object_id(&self) -> DescriptorObjectId {
+        self.x.object_id()
+    }
 }
 
 /// A crate-internal representation of file descriptors that supports cloning/copying, and does
@@ -1009,6 +1091,7 @@ pub(crate) struct InternalFd {
 /// entry, since there might be duplicates to the underlying entry.
 pub(crate) struct OwnedFd {
     raw: u32,
+    object_id: DescriptorObjectId,
     closed: AtomicBool,
 }
 
@@ -1016,11 +1099,16 @@ impl OwnedFd {
     /// Produce a new owned token from a raw index
     ///
     /// Panics if outside the u32 range
-    pub(crate) fn new(raw: usize) -> Self {
+    pub(crate) fn new(raw: usize, object_id: DescriptorObjectId) -> Self {
         Self {
             raw: raw.try_into().unwrap(),
+            object_id,
             closed: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn object_id(&self) -> DescriptorObjectId {
+        self.object_id
     }
 
     /// Check if it is closed

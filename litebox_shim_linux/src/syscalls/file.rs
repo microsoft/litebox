@@ -1661,7 +1661,7 @@ impl<FS: ShimFS> Task<FS> {
                 .litebox
                 .descriptor_table()
                 .entry_handle(&fd)
-                .map(|handle| handle.identity_addr());
+                .map(|handle| handle.object_id());
             let entry = {
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 dt.remove(&fd)

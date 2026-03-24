@@ -117,6 +117,29 @@ fn test_with_entry() {
 }
 
 #[test]
+fn test_duplicate_preserves_descriptor_object_id() {
+    let litebox = litebox();
+    let mut descriptors = litebox.descriptor_table_mut();
+
+    let entry = MockEntry {
+        data: "test".to_string(),
+    };
+    let typed_fd: TypedFd<MockSubsystem> = descriptors.insert(entry);
+    let dup_fd = descriptors
+        .duplicate(&typed_fd)
+        .expect("duplicate should succeed");
+
+    assert_eq!(typed_fd.object_id(), dup_fd.object_id());
+
+    let handle = descriptors
+        .entry_handle(&typed_fd)
+        .expect("entry handle should exist");
+    let weak = handle.downgrade();
+    assert_eq!(handle.object_id(), typed_fd.object_id());
+    assert_eq!(weak.object_id(), typed_fd.object_id());
+}
+
+#[test]
 fn test_fd_raw_integer() {
     let litebox = litebox();
     let mut descriptors = litebox.descriptor_table_mut();
@@ -130,11 +153,13 @@ fn test_fd_raw_integer() {
         data: "test".to_string(),
     };
     let typed_fd: TypedFd<MockSubsystem> = descriptors.insert(entry);
+    let object_id = typed_fd.object_id();
     let raw_fd = rds.fd_into_raw_integer(typed_fd);
     let result = rds.fd_from_raw_integer::<MockSubsystem2>(raw_fd);
     assert!(matches!(result, Err(ErrRawIntFd::InvalidSubsystem)));
 
     let fetched_fd = rds.fd_from_raw_integer::<MockSubsystem>(raw_fd).unwrap();
+    assert_eq!(fetched_fd.object_id(), object_id);
     let data = descriptors
         .with_entry(&fetched_fd, |e| e.data.clone())
         .unwrap();
@@ -142,8 +167,35 @@ fn test_fd_raw_integer() {
     drop(fetched_fd);
 
     let consumed_fd = rds.fd_consume_raw_integer::<MockSubsystem>(raw_fd).unwrap();
+    assert_eq!(consumed_fd.object_id(), object_id);
     let data = descriptors
         .with_entry(&consumed_fd, |e| e.data.clone())
         .unwrap();
     assert_eq!(data, "test");
+}
+
+#[test]
+fn test_clone_for_fork_preserves_descriptor_object_id() {
+    let litebox = litebox();
+    let mut descriptors = litebox.descriptor_table_mut();
+    let mut parent_rds = super::RawDescriptorStorage::new();
+
+    let entry = MockEntry {
+        data: "test".to_string(),
+    };
+    let typed_fd: TypedFd<MockSubsystem> = descriptors.insert(entry);
+    let object_id = typed_fd.object_id();
+    let raw_fd = parent_rds.fd_into_raw_integer(typed_fd);
+
+    let child_rds = parent_rds.clone_for_fork(&mut descriptors);
+
+    let parent_fd = parent_rds
+        .fd_from_raw_integer::<MockSubsystem>(raw_fd)
+        .expect("parent fd should still exist");
+    let child_fd = child_rds
+        .fd_from_raw_integer::<MockSubsystem>(raw_fd)
+        .expect("child fd should be cloned");
+
+    assert_eq!(parent_fd.object_id(), object_id);
+    assert_eq!(child_fd.object_id(), object_id);
 }
