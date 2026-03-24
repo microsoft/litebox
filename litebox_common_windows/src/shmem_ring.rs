@@ -9,11 +9,7 @@
 //! to the broker over the `LB9P` control stream, and both sides then exchange
 //! all 9P traffic through the mappings.
 
-use alloc::{
-    format,
-    string::String,
-    vec::Vec,
-};
+use alloc::{format, string::String, vec::Vec};
 use core::{
     mem::size_of,
     sync::atomic::{self, AtomicU32, AtomicU64, Ordering},
@@ -279,9 +275,11 @@ impl Drop for MmapRegion {
         // SAFETY: `ptr` was returned by `MapViewOfFile` for this mapping and
         // has not been unmapped yet.
         unsafe {
-            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: self.ptr.cast(),
-            });
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.ptr.cast(),
+                },
+            );
         }
     }
 }
@@ -799,7 +797,7 @@ fn ring_distance(producer_pos: u32, consumer_pos: u32) -> io::Result<u32> {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::vec;
 
     fn write_all(w: &mut RingWriter, data: &[u8]) {
@@ -906,5 +904,73 @@ mod tests {
 
         let mut eof = [0u8; 1];
         assert_eq!(rx.read(&mut eof).expect("eof read failed"), 0);
+    }
+
+    #[test]
+    fn writer_observes_broken_pipe_after_reader_drop() {
+        let (pair, info) = ShmemRingPair::create().expect("create failed");
+        let (mut tx, _creator_rx) = pair.into_parts();
+        let (_remote_tx, remote_rx) = ShmemRingPair::open(&info).expect("open failed");
+        drop(remote_rx);
+
+        let chunk = vec![0x5Au8; RING_DATA_SIZE / 2];
+        let mut total_written = 0usize;
+        loop {
+            match tx.write(&chunk) {
+                Ok(n) => {
+                    assert!(
+                        n > 0,
+                        "writer should either make progress or report BrokenPipe"
+                    );
+                    total_written += n;
+                }
+                Err(err) => {
+                    assert!(
+                        total_written >= RING_DATA_SIZE,
+                        "writer should fill the ring before observing BrokenPipe"
+                    );
+                    assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_create_open_close_roundtrip() {
+        for round in 0..32u8 {
+            let (pair, info) = ShmemRingPair::create().expect("create failed");
+            let (mut creator_tx, mut creator_rx) = pair.into_parts();
+            let (mut remote_tx, mut remote_rx) = ShmemRingPair::open(&info).expect("open failed");
+
+            let forward = vec![round; 1024];
+            write_all(&mut creator_tx, &forward);
+            let got = read_exact(&mut remote_rx, forward.len());
+            assert_eq!(got, forward);
+
+            let reverse = vec![round.wrapping_add(1); 1536];
+            write_all(&mut remote_tx, &reverse);
+            let got = read_exact(&mut creator_rx, reverse.len());
+            assert_eq!(got, reverse);
+        }
+    }
+
+    #[test]
+    fn named_objects_are_released_after_all_handles_drop() {
+        let info = {
+            let (pair, info) = ShmemRingPair::create().expect("create failed");
+            let remote = ShmemRingPair::open(&info).expect("open failed");
+            drop(remote);
+            drop(pair);
+            info
+        };
+
+        match ShmemRingPair::open(&info) {
+            Ok(_) => panic!("ring objects should be released"),
+            Err(RingError::Io(io_err)) => {
+                assert_eq!(io_err.kind(), io::ErrorKind::NotFound);
+            }
+            Err(other) => panic!("expected not-found I/O error, got {other}"),
+        }
     }
 }

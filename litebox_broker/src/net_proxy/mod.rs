@@ -19,6 +19,7 @@ mod device;
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::sock_compat::{
@@ -90,6 +91,18 @@ struct PendingHandshake {
 
 /// Timeout for the LB9P handshake on an accepted connection.
 const HANDSHAKE_ACCEPT_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Maximum total time to receive direct shared-memory 9P upgrade metadata.
+#[cfg(any(unix, windows))]
+const LB9P_RING_UPGRADE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Hard cap on concurrent background direct 9P ring-upgrade workers.
+#[cfg(any(unix, windows))]
+const MAX_CONCURRENT_LB9P_RING_UPGRADES: usize = 32;
+
+/// Number of currently active background direct 9P ring-upgrade workers.
+#[cfg(any(unix, windows))]
+static ACTIVE_LB9P_RING_UPGRADES: AtomicUsize = AtomicUsize::new(0);
 
 /// Timeout for non-blocking host TCP connect.
 const HOST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -286,10 +299,38 @@ fn recv_ring_connection_info(
     use std::io::Read as _;
 
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-
     let mut payload = [0u8; 1 + litebox_common_windows::shmem_ring::CONNECTION_INFO_SIZE];
-    stream.read_exact(&mut payload)?;
+    let deadline = Instant::now() + LB9P_RING_UPGRADE_TIMEOUT;
+    let mut got = 0usize;
+    while got < payload.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out receiving Windows ring metadata",
+            ));
+        }
+
+        let timeout = if remaining < Duration::from_millis(1) {
+            Duration::from_millis(1)
+        } else {
+            remaining
+        };
+        stream.set_read_timeout(Some(timeout))?;
+
+        match stream.read(&mut payload[got..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before Windows ring metadata was complete",
+                ));
+            }
+            Ok(n) => got += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
     if payload[0] != LB9P_RING_MARKER {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -356,10 +397,44 @@ fn handle_shared_memory_lb9p_connection(stream: &mut IpcStream, ring_spawner: Ri
 }
 
 #[cfg(any(unix, windows))]
+struct RingUpgradePermit;
+
+#[cfg(any(unix, windows))]
+impl RingUpgradePermit {
+    fn acquire() -> Option<Self> {
+        loop {
+            let current = ACTIVE_LB9P_RING_UPGRADES.load(Ordering::Acquire);
+            if current >= MAX_CONCURRENT_LB9P_RING_UPGRADES {
+                return None;
+            }
+            if ACTIVE_LB9P_RING_UPGRADES
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(Self);
+            }
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for RingUpgradePermit {
+    fn drop(&mut self) {
+        ACTIVE_LB9P_RING_UPGRADES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn spawn_shared_memory_lb9p_connection(stream: IpcStream, ring_spawner: RingServiceSpawner) {
+    let Some(permit) = RingUpgradePermit::acquire() else {
+        warn!("dropping LB9P ring upgrade connection: too many concurrent background upgrades");
+        return;
+    };
+
     if let Err(e) = std::thread::Builder::new()
         .name("lb9p-ring-upgrade".into())
         .spawn(move || {
+            let _permit = permit;
             let mut stream = stream;
             handle_shared_memory_lb9p_connection(&mut stream, ring_spawner);
         })
@@ -1092,8 +1167,7 @@ pub fn accept_ipc_client(
                             warn!("LB9P ring marker received but no ring service registered");
                             continue;
                         };
-                        let mut stream = stream;
-                        handle_shared_memory_lb9p_connection(&mut stream, ring_spawner);
+                        spawn_shared_memory_lb9p_connection(stream, ring_spawner);
                         return Ok(None);
                     }
                 }
@@ -1936,7 +2010,7 @@ mod tests {
     use super::*;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
@@ -2029,10 +2103,8 @@ mod tests {
         local_services.register_ring(
             5640,
             Arc::new(move |_writer, _reader| {
-                let invoked_flag = Arc::clone(&invoked_flag);
-                std::thread::spawn(move || {
-                    invoked_flag.store(true, Ordering::SeqCst);
-                })
+                invoked_flag.store(true, Ordering::SeqCst);
+                std::thread::spawn(|| {})
             }),
         );
 
@@ -2066,7 +2138,7 @@ mod tests {
         .expect("accept direct LB9P ring connection");
         assert!(
             accepted.is_none(),
-            "LB9P ring connection should be handled inline"
+            "LB9P ring connection should be consumed by the broker"
         );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -2079,5 +2151,121 @@ mod tests {
         }
 
         client.join().expect("join client thread");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_accept_ipc_client_ignores_truncated_lb9p_ring_then_accepts_valid_one() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let port = probe.local_addr().expect("probe local_addr").port();
+        drop(probe);
+
+        let listener =
+            IpcListener::bind_endpoint(&format!("127.0.0.1:{port}")).expect("bind IPC listener");
+
+        let invocation_count = Arc::new(AtomicUsize::new(0));
+        let invocation_count_flag = Arc::clone(&invocation_count);
+        let mut local_services = LocalServiceRegistry::new();
+        local_services.register_ring(
+            5640,
+            Arc::new(move |_writer, _reader| {
+                invocation_count_flag.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(|| {})
+            }),
+        );
+
+        let endpoint = format!("127.0.0.1:{port}");
+        let bad_endpoint = endpoint.clone();
+        let (bad_ready_tx, bad_ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let (release_bad_tx, release_bad_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let bad_client = std::thread::spawn(move || {
+            use std::io::Write as _;
+
+            let mut stream =
+                std::net::TcpStream::connect(&bad_endpoint).expect("connect truncated test client");
+            stream.write_all(b"LB9P").expect("send LB9P magic");
+            stream
+                .write_all(&[litebox_common_windows::shmem_ring::TRANSPORT_MARKER])
+                .expect("send ring transport marker");
+            stream
+                .write_all(&[0u8; 16])
+                .expect("send truncated ring metadata");
+            bad_ready_tx
+                .send(())
+                .expect("report truncated client readiness");
+            release_bad_rx
+                .recv()
+                .expect("wait for permission to release truncated client");
+        });
+
+        bad_ready_rx
+            .recv()
+            .expect("wait for truncated client readiness");
+        let first_start = std::time::Instant::now();
+        let first = accept_ipc_client(
+            &listener,
+            Some(&local_services),
+            Some(Duration::from_secs(2)),
+        )
+        .expect("handle truncated ring connection");
+        assert!(
+            first.is_none(),
+            "truncated LB9P ring connection should be consumed by the broker"
+        );
+        assert!(
+            first_start.elapsed() < Duration::from_millis(500),
+            "truncated LB9P ring connection should not monopolize the accept loop"
+        );
+        assert_eq!(
+            invocation_count.load(Ordering::SeqCst),
+            0,
+            "truncated LB9P ring connection must not spawn a local service"
+        );
+
+        let good_client = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let mut stream =
+                std::net::TcpStream::connect(&endpoint).expect("connect valid test client");
+            stream.write_all(b"LB9P").expect("send LB9P magic");
+
+            let (_pair, info) = litebox_common_windows::shmem_ring::ShmemRingPair::create()
+                .expect("create Windows ring pair");
+            let metadata = info.encode();
+            stream
+                .write_all(&[litebox_common_windows::shmem_ring::TRANSPORT_MARKER])
+                .expect("send ring transport marker");
+            stream
+                .write_all(&metadata)
+                .expect("send ring metadata payload");
+
+            let mut ack = [0u8; 1];
+            stream.read_exact(&mut ack).expect("read ring ACK");
+            assert_eq!(ack, [LB9P_RING_ACK], "broker should ACK ring metadata");
+        });
+
+        let second = accept_ipc_client(
+            &listener,
+            Some(&local_services),
+            Some(Duration::from_secs(2)),
+        )
+        .expect("accept valid LB9P ring connection after truncated one");
+        assert!(
+            second.is_none(),
+            "valid LB9P ring connection should be consumed by the broker"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while invocation_count.load(Ordering::SeqCst) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "valid LB9P ring connection did not spawn a local service"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        release_bad_tx.send(()).expect("release truncated client");
+        bad_client.join().expect("join truncated client");
+        good_client.join().expect("join valid client");
     }
 }
