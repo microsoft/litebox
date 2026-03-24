@@ -1445,64 +1445,118 @@ impl<FS: ShimFS> Task<FS> {
         };
         let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
-        let mut total_read = 0;
-        let kernel_buffer =
-            core::cell::RefCell::new(vec![
-                0u8;
-                iovs.iter()
-                    .map(|i| i.iov_len)
-                    .max()
-                    .unwrap_or_default()
-                    .min(super::super::MAX_KERNEL_BUF_SIZE)
-            ]);
-        for iov in iovs {
-            if iov.iov_len == 0 {
-                continue;
-            }
-            let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
-                return Err(Errno::EINVAL);
-            };
-            // TODO: The data transfers performed by readv() and writev() are atomic: the data
-            // written by writev() is written as a single block that is not intermingled with
-            // output from writes in other processes
-            let size = files
-                .run_on_raw_fd(
-                    raw_fd,
-                    |fd| {
-                        files
+        // TODO: The data transfers performed by readv() and writev() are atomic: the data
+        // written by writev() is written as a single block that is not intermingled with
+        // output from writes in other processes
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let mut total_read = 0;
+                    let kernel_buffer =
+                        core::cell::RefCell::new(vec![
+                            0u8;
+                            iovs.iter()
+                                .map(|i| i.iov_len)
+                                .max()
+                                .unwrap_or_default()
+                                .min(super::super::MAX_KERNEL_BUF_SIZE)
+                        ]);
+                    for iov in iovs {
+                        if iov.iov_len == 0 {
+                            continue;
+                        }
+                        let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
+                            return Err(Errno::EINVAL);
+                        };
+                        let size = files
                             .fs
                             .read(fd, &mut kernel_buffer.borrow_mut(), None)
-                            .map_err(Errno::from)
-                    },
-                    |_fd| todo!("net"),
-                    |fd| {
-                        let is_vfork_child = self.fork_context.borrow().is_some();
-                        self.global
-                            .pipes
-                            .read_vfork_aware(
+                            .map_err(Errno::from)?;
+                        self.park_if_deferred();
+                        iov.iov_base
+                            .copy_from_slice(0, &kernel_buffer.borrow()[..size])
+                            .ok_or(Errno::EFAULT)?;
+                        total_read += size;
+                        if size < iov.iov_len {
+                            break;
+                        }
+                    }
+                    Ok(total_read)
+                },
+                |fd| {
+                    read_once_to_iovecs(
+                        iovs,
+                        || self.park_if_deferred(),
+                        |buf| {
+                            self.global.receive(
                                 &self.wait_cx(),
                                 fd,
-                                &mut kernel_buffer.borrow_mut(),
-                                is_vfork_child,
+                                buf,
+                                litebox_common_linux::ReceiveFlags::empty(),
+                                None,
                             )
-                            .map_err(Errno::from)
-                    },
-                    |_fd| todo!("eventfd"),
-                    |_fd| Err(Errno::EINVAL),
-                    |_fd| todo!("unix"),
-                )
-                .flatten()?;
-            self.park_if_deferred();
-            iov.iov_base
-                .copy_from_slice(0, &kernel_buffer.borrow()[..size])
-                .ok_or(Errno::EFAULT)?;
-            total_read += size;
-            if size < iov.iov_len {
-                // Okay to transfer fewer bytes than requested
-                break;
-            }
-        }
-        Ok(total_read)
+                        },
+                    )
+                },
+                |fd| {
+                    let is_vfork_child = self.fork_context.borrow().is_some();
+                    read_once_to_iovecs(
+                        iovs,
+                        || self.park_if_deferred(),
+                        |buf| {
+                            self.global
+                                .pipes
+                                .read_vfork_aware(&self.wait_cx(), fd, buf, is_vfork_child)
+                                .map_err(Errno::from)
+                        },
+                    )
+                },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        let total_len = total_readv_len(iovs)?;
+                        if total_len == 0 {
+                            return Ok(0);
+                        }
+                        if total_len < size_of::<u64>() {
+                            return Err(Errno::EINVAL);
+                        }
+                        let bytes = file.read(&self.wait_cx())?.to_le_bytes();
+                        self.park_if_deferred();
+                        scatter_bytes_to_iovecs(iovs, &bytes)
+                    })
+                },
+                |_fd| Err(Errno::EINVAL),
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        read_once_to_iovecs(
+                            iovs,
+                            || self.park_if_deferred(),
+                            |buf| {
+                                file.recvfrom(
+                                    &self.wait_cx(),
+                                    buf,
+                                    litebox_common_linux::ReceiveFlags::empty(),
+                                    None,
+                                )
+                            },
+                        )
+                    })
+                },
+            )
+            .flatten()
     }
 }
 
@@ -1527,6 +1581,104 @@ where
         }
     }
     Ok(total_written)
+}
+
+fn total_readv_len(iovs: &[IoReadVec<MutPtr<u8>>]) -> Result<usize, Errno> {
+    iovs.iter().try_fold(0usize, |total, iov| {
+        let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
+            return Err(Errno::EINVAL);
+        };
+        total.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
+    })
+}
+
+fn total_writev_len(iovs: &[IoWriteVec<ConstPtr<u8>>]) -> Result<usize, Errno> {
+    iovs.iter().try_fold(0usize, |total, iov| {
+        let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
+            return Err(Errno::EINVAL);
+        };
+        total.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
+    })
+}
+
+fn alloc_zeroed_kernel_buf(len: usize) -> Result<alloc::vec::Vec<u8>, Errno> {
+    let mut buf = alloc::vec::Vec::new();
+    buf.try_reserve_exact(len).map_err(|_| Errno::ENOMEM)?;
+    buf.resize(len, 0);
+    Ok(buf)
+}
+
+fn scatter_bytes_to_iovecs(iovs: &[IoReadVec<MutPtr<u8>>], bytes: &[u8]) -> Result<usize, Errno> {
+    let mut copied = 0;
+    for iov in iovs {
+        if copied == bytes.len() {
+            break;
+        }
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let chunk_len = core::cmp::min(iov.iov_len, bytes.len() - copied);
+        iov.iov_base
+            .copy_from_slice(0, &bytes[copied..copied + chunk_len])
+            .ok_or(Errno::EFAULT)?;
+        copied += chunk_len;
+    }
+    Ok(copied)
+}
+
+fn read_once_to_iovecs<F, P>(
+    iovs: &[IoReadVec<MutPtr<u8>>],
+    park_before_guest_write: P,
+    read_fn: F,
+) -> Result<usize, Errno>
+where
+    P: FnOnce(),
+    F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+{
+    let total_len = total_readv_len(iovs)?.min(super::super::MAX_KERNEL_BUF_SIZE);
+    if total_len == 0 {
+        return Ok(0);
+    }
+    let mut kernel_buf = alloc_zeroed_kernel_buf(total_len)?;
+    let size = read_fn(&mut kernel_buf)?;
+    park_before_guest_write();
+    scatter_bytes_to_iovecs(iovs, &kernel_buf[..size])
+}
+
+fn gather_iovecs(iovs: &[IoWriteVec<ConstPtr<u8>>]) -> Result<alloc::vec::Vec<u8>, Errno> {
+    let total_len = total_writev_len(iovs)?.min(super::super::MAX_KERNEL_BUF_SIZE);
+    let mut gathered = alloc::vec::Vec::new();
+    gathered
+        .try_reserve_exact(total_len)
+        .map_err(|_| Errno::ENOMEM)?;
+    let mut remaining = total_len;
+    for iov in iovs {
+        if remaining == 0 {
+            break;
+        }
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let slice = iov
+            .iov_base
+            .to_owned_slice(iov.iov_len)
+            .ok_or(Errno::EFAULT)?;
+        let chunk_len = core::cmp::min(slice.len(), remaining);
+        gathered.extend_from_slice(&slice[..chunk_len]);
+        remaining -= chunk_len;
+    }
+    Ok(gathered)
+}
+
+fn write_once_from_iovecs<F>(iovs: &[IoWriteVec<ConstPtr<u8>>], write_fn: F) -> Result<usize, Errno>
+where
+    F: FnOnce(&[u8]) -> Result<usize, Errno>,
+{
+    let gathered = gather_iovecs(iovs)?;
+    if gathered.is_empty() {
+        return Ok(0);
+    }
+    write_fn(&gathered)
 }
 
 impl<FS: ShimFS> Task<FS> {
@@ -1555,7 +1707,7 @@ impl<FS: ShimFS> Task<FS> {
                     })
                 },
                 |fd| {
-                    write_to_iovec(iovs, |buf| {
+                    write_once_from_iovecs(iovs, |buf| {
                         self.global.sendto(
                             &self.wait_cx(),
                             fd,
@@ -1566,16 +1718,52 @@ impl<FS: ShimFS> Task<FS> {
                     })
                 },
                 |fd| {
-                    write_to_iovec(iovs, |buf| {
+                    write_once_from_iovecs(iovs, |buf| {
                         self.global
                             .pipes
                             .write(&self.wait_cx(), fd, buf)
                             .map_err(Errno::from)
                     })
                 },
-                |_fd| todo!("eventfd"),
+                |fd| {
+                    let total_len = total_writev_len(iovs)?;
+                    if total_len == 0 {
+                        return Ok(0);
+                    }
+                    let Some(first_iov) = iovs.first() else {
+                        return Ok(0);
+                    };
+                    if first_iov.iov_len != size_of::<u64>() {
+                        return Err(Errno::EINVAL);
+                    }
+                    let bytes = first_iov
+                        .iov_base
+                        .to_owned_slice(size_of::<u64>())
+                        .ok_or(Errno::EFAULT)?;
+                    let value: u64 =
+                        u64::from_le_bytes(bytes.as_ref().try_into().map_err(|_| Errno::EINVAL)?);
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| file.write(&self.wait_cx(), value))
+                },
                 |_fd| Err(Errno::EINVAL),
-                |_fd| todo!("unix"),
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        write_once_from_iovecs(iovs, |buf| {
+                            file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
+                        })
+                    })
+                },
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
@@ -4622,6 +4810,280 @@ mod tests {
         );
 
         task.sys_close(dirfd_i32).unwrap();
+    }
+
+    #[test]
+    fn vectored_io_supports_hot_non_file_descriptors() {
+        use litebox_common_linux::{AddressFamily, SockType};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Pipe: writev + readv should preserve the byte stream.
+        let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let read_fd = i32::try_from(read_fd).unwrap();
+        let write_fd = i32::try_from(write_fd).unwrap();
+        let pipe_a = b"he";
+        let pipe_b = b"llo";
+        let pipe_write_iovs = [
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(pipe_a.as_ptr() as usize),
+                iov_len: pipe_a.len(),
+            },
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(pipe_b.as_ptr() as usize),
+                iov_len: pipe_b.len(),
+            },
+        ];
+        assert_eq!(
+            task.sys_writev(
+                write_fd,
+                ConstPtr::from_usize(pipe_write_iovs.as_ptr() as usize),
+                pipe_write_iovs.len(),
+            )
+            .unwrap(),
+            5
+        );
+        let mut pipe_out_a = [0u8; 2];
+        let mut pipe_out_b = [0u8; 3];
+        let pipe_read_iovs = [
+            IoReadVec {
+                iov_base: MutPtr::from_usize(pipe_out_a.as_mut_ptr() as usize),
+                iov_len: pipe_out_a.len(),
+            },
+            IoReadVec {
+                iov_base: MutPtr::from_usize(pipe_out_b.as_mut_ptr() as usize),
+                iov_len: pipe_out_b.len(),
+            },
+        ];
+        assert_eq!(
+            task.sys_readv(
+                read_fd,
+                ConstPtr::from_usize(pipe_read_iovs.as_ptr() as usize),
+                pipe_read_iovs.len(),
+            )
+            .unwrap(),
+            5
+        );
+        let mut pipe_combined = alloc::vec::Vec::new();
+        pipe_combined.extend_from_slice(&pipe_out_a);
+        pipe_combined.extend_from_slice(&pipe_out_b);
+        assert_eq!(pipe_combined.as_slice(), b"hello");
+        task.sys_close(read_fd).unwrap();
+        task.sys_close(write_fd).unwrap();
+
+        // Unix socketpair: stream and datagram paths should both handle
+        // one-message scatter/gather I/O.
+        for sock_type in [SockType::Stream, SockType::Datagram] {
+            let mut sv = [0u32; 2];
+            task.sys_socketpair(
+                AddressFamily::UNIX as u32,
+                sock_type as u32,
+                0,
+                MutPtr::from_usize(sv.as_mut_ptr() as usize),
+            )
+            .unwrap();
+            let sock1 = i32::try_from(sv[0]).unwrap();
+            let sock2 = i32::try_from(sv[1]).unwrap();
+
+            let unix_a = b"unix";
+            let unix_b = b"-iov";
+            let unix_write_iovs = [
+                IoWriteVec {
+                    iov_base: ConstPtr::from_usize(unix_a.as_ptr() as usize),
+                    iov_len: unix_a.len(),
+                },
+                IoWriteVec {
+                    iov_base: ConstPtr::from_usize(unix_b.as_ptr() as usize),
+                    iov_len: unix_b.len(),
+                },
+            ];
+            assert_eq!(
+                task.sys_writev(
+                    sock1,
+                    ConstPtr::from_usize(unix_write_iovs.as_ptr() as usize),
+                    unix_write_iovs.len(),
+                )
+                .unwrap(),
+                8
+            );
+
+            let mut unix_out_a = [0u8; 3];
+            let mut unix_out_b = [0u8; 5];
+            let unix_read_iovs = [
+                IoReadVec {
+                    iov_base: MutPtr::from_usize(unix_out_a.as_mut_ptr() as usize),
+                    iov_len: unix_out_a.len(),
+                },
+                IoReadVec {
+                    iov_base: MutPtr::from_usize(unix_out_b.as_mut_ptr() as usize),
+                    iov_len: unix_out_b.len(),
+                },
+            ];
+            assert_eq!(
+                task.sys_readv(
+                    sock2,
+                    ConstPtr::from_usize(unix_read_iovs.as_ptr() as usize),
+                    unix_read_iovs.len(),
+                )
+                .unwrap(),
+                8
+            );
+            let mut unix_combined = alloc::vec::Vec::new();
+            unix_combined.extend_from_slice(&unix_out_a);
+            unix_combined.extend_from_slice(&unix_out_b);
+            assert_eq!(unix_combined.as_slice(), b"unix-iov");
+
+            task.sys_close(sock1).unwrap();
+            task.sys_close(sock2).unwrap();
+        }
+
+        // eventfd: readv can split the 8-byte counter value across iovecs;
+        // writev requires the first iovec to contain exactly 8 bytes.
+        let eventfd = i32::try_from(task.sys_eventfd2(0, EfdFlags::empty()).unwrap()).unwrap();
+        let event_value = 2u64.to_le_bytes();
+        let ignored = *b"extra";
+        let event_write_iovs = [
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(event_value.as_ptr() as usize),
+                iov_len: event_value.len(),
+            },
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(ignored.as_ptr() as usize),
+                iov_len: ignored.len(),
+            },
+        ];
+        assert_eq!(
+            task.sys_writev(
+                eventfd,
+                ConstPtr::from_usize(event_write_iovs.as_ptr() as usize),
+                event_write_iovs.len(),
+            )
+            .unwrap(),
+            8
+        );
+
+        let mut event_out_a = [0u8; 4];
+        let mut event_out_b = [0u8; 4];
+        let event_read_iovs = [
+            IoReadVec {
+                iov_base: MutPtr::from_usize(event_out_a.as_mut_ptr() as usize),
+                iov_len: event_out_a.len(),
+            },
+            IoReadVec {
+                iov_base: MutPtr::from_usize(event_out_b.as_mut_ptr() as usize),
+                iov_len: event_out_b.len(),
+            },
+        ];
+        assert_eq!(
+            task.sys_readv(
+                eventfd,
+                ConstPtr::from_usize(event_read_iovs.as_ptr() as usize),
+                event_read_iovs.len(),
+            )
+            .unwrap(),
+            8
+        );
+        let mut event_combined = alloc::vec::Vec::new();
+        event_combined.extend_from_slice(&event_out_a);
+        event_combined.extend_from_slice(&event_out_b);
+        assert_eq!(event_combined.as_slice(), event_value.as_slice());
+
+        let mut zero_len = [0u8; 0];
+        let zero_read_iovs = [IoReadVec {
+            iov_base: MutPtr::from_usize(zero_len.as_mut_ptr() as usize),
+            iov_len: 0,
+        }];
+        assert_eq!(
+            task.sys_readv(
+                eventfd,
+                ConstPtr::from_usize(zero_read_iovs.as_ptr() as usize),
+                zero_read_iovs.len(),
+            )
+            .unwrap(),
+            0
+        );
+
+        let split_a = 2u32.to_le_bytes();
+        let split_b = 0u32.to_le_bytes();
+        let bad_event_write_iovs = [
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(split_a.as_ptr() as usize),
+                iov_len: split_a.len(),
+            },
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(split_b.as_ptr() as usize),
+                iov_len: split_b.len(),
+            },
+        ];
+        assert_eq!(
+            task.sys_writev(
+                eventfd,
+                ConstPtr::from_usize(bad_event_write_iovs.as_ptr() as usize),
+                bad_event_write_iovs.len(),
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+        let zero_prefix_event_write_iovs = [
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(zero_len.as_ptr() as usize),
+                iov_len: 0,
+            },
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(event_value.as_ptr() as usize),
+                iov_len: event_value.len(),
+            },
+        ];
+        assert_eq!(
+            task.sys_writev(
+                eventfd,
+                ConstPtr::from_usize(zero_prefix_event_write_iovs.as_ptr() as usize),
+                zero_prefix_event_write_iovs.len(),
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+
+        let short_eventfd =
+            i32::try_from(task.sys_eventfd2(1, EfdFlags::empty()).unwrap()).unwrap();
+        let mut short_event_out = [0u8; 4];
+        let short_event_read_iovs = [IoReadVec {
+            iov_base: MutPtr::from_usize(short_event_out.as_mut_ptr() as usize),
+            iov_len: short_event_out.len(),
+        }];
+        assert_eq!(
+            task.sys_readv(
+                short_eventfd,
+                ConstPtr::from_usize(short_event_read_iovs.as_ptr() as usize),
+                short_event_read_iovs.len(),
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+
+        task.sys_close(eventfd).unwrap();
+        task.sys_close(short_eventfd).unwrap();
+    }
+
+    #[test]
+    fn unix_socket_write_returns_epipe_instead_of_panicking() {
+        use litebox_common_linux::{AddressFamily, SockType};
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let mut sv = [0u32; 2];
+        task.sys_socketpair(
+            AddressFamily::UNIX as u32,
+            SockType::Stream as u32,
+            0,
+            MutPtr::from_usize(sv.as_mut_ptr() as usize),
+        )
+        .unwrap();
+        let sock1 = i32::try_from(sv[0]).unwrap();
+        let sock2 = i32::try_from(sv[1]).unwrap();
+
+        task.sys_close(sock2).unwrap();
+        assert_eq!(task.sys_write(sock1, b"x", None).unwrap_err(), Errno::EPIPE);
+        task.sys_close(sock1).unwrap();
     }
 
     /// rmdir(".", dirfd) must return EINVAL and rename(".", dirfd) must return EBUSY.

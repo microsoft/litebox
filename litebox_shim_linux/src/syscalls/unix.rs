@@ -1291,7 +1291,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
             && !flags.contains(SendFlags::NOSIGNAL)
         {
             // TODO: send SIGPIPE signal
-            unimplemented!("send SIGPIPE on EPIPE");
+            return Err(Errno::EPIPE);
         }
         ret
     }
