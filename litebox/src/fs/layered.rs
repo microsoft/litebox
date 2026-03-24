@@ -127,14 +127,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// Regular files and directories can reuse a shared lower fd because layered descriptors track
     /// their own offsets. Character devices often have per-open state or side effects, so each
     /// layered open must keep its own lower fd.
-    fn lower_fd_is_shareable(&self, fd: &TypedFd<Lower>) -> bool {
-        !matches!(
-            self.lower
-                .fd_file_status(fd)
-                .expect("fresh lower fd must have file status")
-                .file_type,
+    fn lower_fd_is_shareable(&self, fd: &TypedFd<Lower>) -> Result<bool, FileStatusError> {
+        Ok(!matches!(
+            self.lower.fd_file_status(fd)?.file_type,
             FileType::CharacterDevice
-        )
+        ))
     }
 
     /// (private-only) Create all parent/ancestor directories for a `path`, making sure that each of
@@ -719,13 +716,17 @@ impl<
                     // same flags, and since it indicates that there is no such file at the upper
                     // level, we can just return that directly (with the "real" flags being wrapped
                     // up in the layered descriptor).
-                    if self.lower_fd_is_shareable(fd) {
-                        return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
-                            path,
-                            flags,
-                            entry,
-                            position: 0.into(),
-                        }));
+                    match self.lower_fd_is_shareable(fd) {
+                        Ok(true) => {
+                            return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+                                path,
+                                flags,
+                                entry,
+                                position: 0.into(),
+                            }));
+                        }
+                        Ok(false) => {}
+                        Err(_) => return Err(OpenError::Io),
                     }
                 }
             }
@@ -775,19 +776,42 @@ impl<
                     // open path so that subsequent opens of the same
                     // shareable file reuse this entry instead of creating a
                     // conflicting standalone Arc.
-                    let entry = if self.lower_fd_is_shareable(&lower_fd) {
+                    let shareable = match self.lower_fd_is_shareable(&lower_fd) {
+                        Ok(shareable) => shareable,
+                        Err(_) => {
+                            let _ = self.lower.close(&lower_fd);
+                            return Err(OpenError::Io);
+                        }
+                    };
+                    let entry = if shareable {
                         let mut root = self.root.write();
                         if let Some(existing) = root.entries.get(&path) {
-                            if matches!(existing.as_ref(), EntryX::Lower { fd } if self.lower_fd_is_shareable(fd))
-                            {
-                                let shared = Arc::clone(existing);
-                                drop(root);
-                                let _ = self.lower.close(&lower_fd);
-                                shared
-                            } else {
-                                drop(root);
-                                let _ = self.lower.close(&lower_fd);
-                                return Err(PathError::NoSuchFileOrDirectory)?;
+                            match existing.as_ref() {
+                                EntryX::Lower { fd } => {
+                                    let existing_shareable = match self.lower_fd_is_shareable(fd) {
+                                        Ok(shareable) => shareable,
+                                        Err(_) => {
+                                            drop(root);
+                                            let _ = self.lower.close(&lower_fd);
+                                            return Err(OpenError::Io);
+                                        }
+                                    };
+                                    if existing_shareable {
+                                        let shared = Arc::clone(existing);
+                                        drop(root);
+                                        let _ = self.lower.close(&lower_fd);
+                                        shared
+                                    } else {
+                                        drop(root);
+                                        let _ = self.lower.close(&lower_fd);
+                                        return Err(PathError::NoSuchFileOrDirectory.into());
+                                    }
+                                }
+                                EntryX::Upper { .. } | EntryX::Tombstone => {
+                                    drop(root);
+                                    let _ = self.lower.close(&lower_fd);
+                                    return Err(PathError::NoSuchFileOrDirectory.into());
+                                }
                             }
                         } else {
                             let entry = Arc::new(EntryX::Lower { fd: lower_fd });
@@ -940,25 +964,48 @@ impl<
                 return Err(e);
             }
         };
-        let entry = if self.lower_fd_is_shareable(&lower_fd) {
+        let shareable = match self.lower_fd_is_shareable(&lower_fd) {
+            Ok(shareable) => shareable,
+            Err(_) => {
+                let _ = self.lower.close(&lower_fd);
+                return Err(OpenError::Io);
+            }
+        };
+        let entry = if shareable {
             // Insert into root entries, handling the race where another thread may have
             // already inserted an entry for the same path between our earlier read-lock
             // check and this write-lock acquisition.
             let mut root = self.root.write();
             if let Some(existing) = root.entries.get(&path) {
-                if matches!(existing.as_ref(), EntryX::Lower { fd } if self.lower_fd_is_shareable(fd))
-                {
-                    // Another thread won the race — reuse its entry and close ours.
-                    let shared = Arc::clone(existing);
-                    drop(root);
-                    let _ = self.lower.close(&lower_fd);
-                    shared
-                } else {
-                    // Tombstone or Upper inserted concurrently — shouldn't happen in
-                    // normal operation, but close the FD we opened and bail out.
-                    drop(root);
-                    let _ = self.lower.close(&lower_fd);
-                    return Err(PathError::NoSuchFileOrDirectory)?;
+                match existing.as_ref() {
+                    EntryX::Lower { fd } => {
+                        let existing_shareable = match self.lower_fd_is_shareable(fd) {
+                            Ok(shareable) => shareable,
+                            Err(_) => {
+                                drop(root);
+                                let _ = self.lower.close(&lower_fd);
+                                return Err(OpenError::Io);
+                            }
+                        };
+                        if existing_shareable {
+                            // Another thread won the race — reuse its entry and close ours.
+                            let shared = Arc::clone(existing);
+                            drop(root);
+                            let _ = self.lower.close(&lower_fd);
+                            shared
+                        } else {
+                            drop(root);
+                            let _ = self.lower.close(&lower_fd);
+                            return Err(PathError::NoSuchFileOrDirectory.into());
+                        }
+                    }
+                    EntryX::Upper { .. } | EntryX::Tombstone => {
+                        // Tombstone or Upper inserted concurrently — shouldn't happen in
+                        // normal operation, but close the FD we opened and bail out.
+                        drop(root);
+                        let _ = self.lower.close(&lower_fd);
+                        return Err(PathError::NoSuchFileOrDirectory.into());
+                    }
                 }
             } else {
                 let entry = Arc::new(EntryX::Lower { fd: lower_fd });
@@ -1823,7 +1870,7 @@ impl<
             Err(ReadDirError::ClosedFd | ReadDirError::NotADirectory) => unreachable!(),
             Err(ReadDirError::Io) => return Err(RmdirError::Io),
         };
-        self.close(&dir_fd).expect("close dir fd failed");
+        self.close(&dir_fd).map_err(|_| RmdirError::Io)?;
         // "." and ".." are always present; anything more => not empty.
         if entries.len() > 2 {
             return Err(RmdirError::NotEmpty);

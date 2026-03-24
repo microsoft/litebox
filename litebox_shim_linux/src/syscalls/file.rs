@@ -314,6 +314,18 @@ impl FsPath {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    fn validate_removedir_path_str(path: &str) -> Result<(), Errno> {
+        if path.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        match path.rsplit('/').find(|component| !component.is_empty()) {
+            Some(".") => return Err(Errno::EINVAL),
+            Some("..") => return Err(Errno::ENOTEMPTY),
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn get_umask(&self) -> Mode {
         self.fs.borrow().umask()
     }
@@ -724,6 +736,15 @@ impl<FS: ShimFS> Task<FS> {
             .flatten()
     }
 
+    #[cfg(test)]
+    pub(crate) fn sys_rmdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
+        self.sys_unlinkat(
+            litebox_common_linux::AT_FDCWD,
+            pathname,
+            AtFlags::AT_REMOVEDIR,
+        )
+    }
+
     /// Handle syscall `unlinkat`
     pub(crate) fn sys_unlinkat(
         &self,
@@ -733,6 +754,10 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<(), Errno> {
         if flags.intersects(AtFlags::AT_REMOVEDIR.complement()) {
             return Err(Errno::EINVAL);
+        }
+        if flags.contains(AtFlags::AT_REMOVEDIR) {
+            let raw_path = pathname.as_rust_str().map_err(|_| Errno::EINVAL)?;
+            Self::validate_removedir_path_str(raw_path)?;
         }
 
         let get_cwd = || self.fs.borrow().cwd.read().clone();
@@ -765,10 +790,6 @@ impl<FS: ShimFS> Task<FS> {
                             }
                             let dir_path = files.fs.fd_path(dirfd).ok_or(Errno::EBADF)?;
                             let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
-                            // Linux returns EINVAL for rmdir(".") or rmdir("").
-                            if rel.is_empty() || rel == "." {
-                                return Err(Errno::EINVAL);
-                            }
                             let abs = if rel.starts_with('/') {
                                 rel.into()
                             } else if dir_path.ends_with('/') {
@@ -4395,6 +4416,14 @@ mod tests {
             task.sys_stat("/cwd_test/subdir").unwrap_err(),
             Errno::ENOENT
         );
+
+        // ── sys_rmdir: remove another directory via relative path ──
+        task.sys_mkdir("subdir2", 0o777).unwrap();
+        task.sys_rmdir("subdir2").unwrap();
+        assert_eq!(
+            task.sys_stat("/cwd_test/subdir2").unwrap_err(),
+            Errno::ENOENT
+        );
     }
 
     /// Verify `*_at` syscalls work with a real directory fd (FdRelative dispatch).
@@ -4620,6 +4649,49 @@ mod tests {
                 .unwrap_err(),
             Errno::EINVAL
         );
+        assert_eq!(
+            task.sys_unlinkat(dirfd_i32, "", AtFlags::AT_REMOVEDIR)
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(task.sys_rmdir(".").unwrap_err(), Errno::EINVAL);
+        assert_eq!(task.sys_rmdir("./").unwrap_err(), Errno::EINVAL);
+        assert_eq!(task.sys_rmdir("").unwrap_err(), Errno::ENOENT);
+        assert_eq!(
+            task.sys_rmdir("/dot_test/sub/.").unwrap_err(),
+            Errno::EINVAL
+        );
+        assert_eq!(task.sys_rmdir("/..").unwrap_err(), Errno::ENOTEMPTY);
+        assert_eq!(
+            task.sys_unlinkat(
+                litebox_common_linux::AT_FDCWD,
+                "/dot_test/sub/.",
+                AtFlags::AT_REMOVEDIR
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+        let parent_dirfd = task
+            .sys_open(
+                "/dot_test",
+                litebox::fs::OFlags::RDONLY | litebox::fs::OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        let parent_dirfd_i32 = i32::try_from(parent_dirfd).unwrap();
+        assert_eq!(
+            task.sys_unlinkat(parent_dirfd_i32, "sub/.", AtFlags::AT_REMOVEDIR)
+                .unwrap_err(),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            task.sys_unlinkat(parent_dirfd_i32, "sub/..", AtFlags::AT_REMOVEDIR)
+                .unwrap_err(),
+            Errno::ENOTEMPTY
+        );
+        task.sys_chdir("/dot_test/sub").unwrap();
+        assert_eq!(task.sys_rmdir("..").unwrap_err(), Errno::ENOTEMPTY);
+        task.sys_chdir("/").unwrap();
 
         // renameat2(dirfd, ".", AT_FDCWD, "/dot_test/other") → EBUSY
         assert_eq!(
@@ -4638,5 +4710,46 @@ mod tests {
         task.sys_stat("/dot_test/sub").unwrap();
 
         task.sys_close(dirfd_i32).unwrap();
+        task.sys_close(parent_dirfd_i32).unwrap();
+    }
+
+    #[test]
+    fn rmdir_syscall_handles_empty_nonempty_and_not_directory() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        task.sys_mkdir("/rmdir_test", 0o777).unwrap();
+        task.sys_mkdir("/rmdir_test/empty_dir", 0o777).unwrap();
+        task.sys_rmdir("/rmdir_test/empty_dir").unwrap();
+        assert_eq!(
+            task.sys_stat("/rmdir_test/empty_dir").unwrap_err(),
+            Errno::ENOENT
+        );
+
+        task.sys_mkdir("/rmdir_test/nonempty", 0o777).unwrap();
+        let fd = task
+            .sys_open(
+                "/rmdir_test/nonempty/file.txt",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+        assert_eq!(
+            task.sys_rmdir("/rmdir_test/nonempty").unwrap_err(),
+            Errno::ENOTEMPTY
+        );
+
+        let file_fd = task
+            .sys_open(
+                "/rmdir_test/plain_file",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        task.sys_close(i32::try_from(file_fd).unwrap()).unwrap();
+        assert_eq!(
+            task.sys_rmdir("/rmdir_test/plain_file").unwrap_err(),
+            Errno::ENOTDIR
+        );
     }
 }

@@ -3294,6 +3294,15 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     flags: AtFlags::empty(),
                 }
             }
+            Sysno::rmdir => {
+                // rmdir is equivalent to unlinkat with dirfd AT_FDCWD and
+                // AT_REMOVEDIR set.
+                SyscallRequest::Unlinkat {
+                    dirfd: AT_FDCWD,
+                    pathname: ctx.sys_req_ptr(0),
+                    flags: AtFlags::AT_REMOVEDIR,
+                }
+            }
             Sysno::renameat2 => sys_req!(Renameat2 { olddirfd,oldpath:*,newdirfd,newpath:*,flags }),
             Sysno::renameat => SyscallRequest::Renameat2 {
                 olddirfd: ctx.sys_req_arg(0),

@@ -202,8 +202,8 @@ impl From<litebox::fs::errors::ChmodError> for Errno {
 
 impl From<litebox::fs::errors::CloseError> for Errno {
     fn from(value: litebox::fs::errors::CloseError) -> Self {
-        #[expect(clippy::match_single_binding)]
         match value {
+            litebox::fs::errors::CloseError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
     }
