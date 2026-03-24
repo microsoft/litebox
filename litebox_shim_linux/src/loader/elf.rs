@@ -394,6 +394,63 @@ fn write_i64(data: &mut [u8], offset: usize, value: usize) -> Result<(), ElfLoad
 }
 
 #[cfg(target_arch = "x86_64")]
+fn patch_elf64_relocation_entries(
+    data: &mut [u8],
+    layout: &Elf64ExecLayout,
+    add_bias: &impl Fn(usize) -> Result<usize, ElfLoaderError>,
+    table_offset: usize,
+    table_size: usize,
+    entry_size: usize,
+    has_addend: bool,
+) -> Result<(), ElfLoaderError> {
+    const R_X86_64_RELATIVE: u32 = 8;
+    const R_X86_64_IRELATIVE: u32 = 37;
+
+    let table_end = table_offset
+        .checked_add(table_size)
+        .ok_or_else(invalid_program_header)?;
+    if entry_size == 0 || table_size % entry_size != 0 || table_end > data.len() {
+        return Err(invalid_program_header());
+    }
+
+    for index in 0..(table_size / entry_size) {
+        let entry_offset = table_offset
+            .checked_add(index * entry_size)
+            .ok_or_else(invalid_program_header)?;
+        let r_offset = read_u64(data, entry_offset)?.truncate();
+        if layout.contains(r_offset) {
+            write_u64(data, entry_offset, add_bias(r_offset)?)?;
+        }
+        let r_info = read_u64(data, entry_offset + 8)?;
+        let r_type = u32::try_from(r_info & 0xffff_ffff).map_err(|_| invalid_program_header())?;
+        if !matches!(r_type, R_X86_64_RELATIVE | R_X86_64_IRELATIVE) {
+            continue;
+        }
+        if has_addend {
+            let r_addend = read_i64(data, entry_offset + 16)?;
+            if r_addend < 0 {
+                continue;
+            }
+            let addend = usize::try_from(r_addend).map_err(|_| invalid_program_header())?;
+            if layout.contains(addend) {
+                write_i64(data, entry_offset + 16, add_bias(addend)?)?;
+            }
+            continue;
+        }
+        if !layout.contains(r_offset) {
+            continue;
+        }
+        let target_offset = vaddr_to_file_offset(layout, r_offset)?;
+        let value = read_u64(data, target_offset)?.truncate();
+        if layout.contains(value) {
+            write_u64(data, target_offset, add_bias(value)?)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
 fn parse_elf64_exec_layout(data: &[u8]) -> Result<Elf64ExecLayout, ElfLoaderError> {
     const PT_LOAD: u32 = 1;
     const PT_DYNAMIC: u32 = 2;
@@ -520,8 +577,10 @@ fn patch_elf64_exec_image_with_bias(
     data: &mut [u8],
     layout: &Elf64ExecLayout,
     bias: u64,
-    _platform: &impl litebox::platform::DebugLogProvider,
+    platform: &impl litebox::platform::DebugLogProvider,
 ) -> Result<(), ElfLoaderError> {
+    let _ = platform;
+
     const DT_PLTRELSZ: i64 = 2;
     const DT_PLTGOT: i64 = 3;
     const DT_HASH: i64 = 4;
@@ -534,6 +593,8 @@ fn patch_elf64_exec_image_with_bias(
     const DT_INIT: i64 = 12;
     const DT_FINI: i64 = 13;
     const DT_REL: i64 = 17;
+    const DT_RELSZ: i64 = 18;
+    const DT_RELENT: i64 = 19;
     const DT_JMPREL: i64 = 23;
     const DT_INIT_ARRAY: i64 = 25;
     const DT_FINI_ARRAY: i64 = 26;
@@ -548,9 +609,9 @@ fn patch_elf64_exec_image_with_bias(
     const SHF_WRITE: u64 = 0x1;
     const SHF_ALLOC: u64 = 0x2;
     const SHF_EXECINSTR: u64 = 0x4;
+    const SHT_RELA: u32 = 4;
+    const SHT_REL: u32 = 9;
     const SHT_NOBITS: u32 = 8;
-    const R_X86_64_RELATIVE: u32 = 8;
-    const R_X86_64_IRELATIVE: u32 = 37;
     const TRAMPOLINE_HEADER_SIZE: usize = 32;
     let bias = usize::try_from(bias).map_err(|_| invalid_program_header())?;
 
@@ -719,9 +780,25 @@ fn patch_elf64_exec_image_with_bias(
         }
     }
 
-    for (rela_tag, rela_size) in [
-        (DT_RELA, dyn_value(DT_RELASZ)),
-        (DT_JMPREL, dyn_value(DT_PLTRELSZ)),
+    for (rela_tag, rela_size, rela_ent, has_addend) in [
+        (
+            DT_RELA,
+            dyn_value(DT_RELASZ),
+            dyn_value(DT_RELAENT).unwrap_or(24),
+            true,
+        ),
+        (
+            DT_REL,
+            dyn_value(DT_RELSZ),
+            dyn_value(DT_RELENT).unwrap_or(16),
+            false,
+        ),
+        (
+            DT_JMPREL,
+            dyn_value(DT_PLTRELSZ),
+            dyn_value(DT_RELAENT).unwrap_or(24),
+            true,
+        ),
     ] {
         let Some(rela_addr) = dyn_value(rela_tag) else {
             continue;
@@ -730,31 +807,15 @@ fn patch_elf64_exec_image_with_bias(
             continue;
         };
         let rela_offset = vaddr_to_file_offset(layout, rela_addr)?;
-        let rela_ent = dyn_value(DT_RELAENT).unwrap_or(24);
-        if rela_ent == 0 || rela_bytes % rela_ent != 0 {
-            return Err(invalid_program_header());
-        }
-        for index in 0..(rela_bytes / rela_ent) {
-            let entry_offset = rela_offset
-                .checked_add(index * rela_ent)
-                .ok_or_else(invalid_program_header)?;
-            let r_offset = read_u64(data, entry_offset)?.truncate();
-            if layout.contains(r_offset) {
-                write_u64(data, entry_offset, add_bias(r_offset)?)?;
-            }
-            let r_info = read_u64(data, entry_offset + 8)?;
-            let r_type =
-                u32::try_from(r_info & 0xffff_ffff).map_err(|_| invalid_program_header())?;
-            let r_addend = read_i64(data, entry_offset + 16)?;
-            if r_addend >= 0 {
-                let addend = usize::try_from(r_addend).map_err(|_| invalid_program_header())?;
-                if matches!(r_type, R_X86_64_RELATIVE | R_X86_64_IRELATIVE)
-                    && layout.contains(addend)
-                {
-                    write_i64(data, entry_offset + 16, add_bias(addend)?)?;
-                }
-            }
-        }
+        patch_elf64_relocation_entries(
+            data,
+            layout,
+            &add_bias,
+            rela_offset,
+            rela_bytes,
+            rela_ent,
+            has_addend,
+        )?;
     }
 
     let e_shoff: usize = read_u64(data, 40)?
@@ -803,6 +864,27 @@ fn patch_elf64_exec_image_with_bias(
             let sh_size: usize = read_u64(data, sh_offset + 32)?
                 .try_into()
                 .map_err(|_| invalid_program_header())?;
+            let sh_entsize: usize = read_u64(data, sh_offset + 56)?
+                .try_into()
+                .map_err(|_| invalid_program_header())?;
+            if layout.dynamic.is_none() && matches!(sh_type, SHT_RELA | SHT_REL) {
+                patch_elf64_relocation_entries(
+                    data,
+                    layout,
+                    &add_bias,
+                    sh_file_offset,
+                    sh_size,
+                    if sh_entsize != 0 {
+                        sh_entsize
+                    } else if sh_type == SHT_RELA {
+                        24
+                    } else {
+                        16
+                    },
+                    sh_type == SHT_RELA,
+                )?;
+                continue;
+            }
             if sh_type == SHT_NOBITS || sh_size < size_of::<u64>() || sh_flags & SHF_ALLOC == 0 {
                 continue;
             }
@@ -810,10 +892,7 @@ fn patch_elf64_exec_image_with_bias(
                 .get(name_offset..)
                 .and_then(|tail| tail.split(|&b| b == 0).next())
                 .ok_or_else(invalid_program_header)?;
-            if matches!(
-                name,
-                b".dynamic" | b".init_array" | b".fini_array" | b".preinit_array"
-            ) {
+            if name == b".dynamic" {
                 continue;
             }
             let section_end = sh_file_offset
@@ -822,10 +901,28 @@ fn patch_elf64_exec_image_with_bias(
             if section_end > data.len() {
                 return Err(invalid_program_header());
             }
+            if matches!(name, b".init_array" | b".fini_array" | b".preinit_array") {
+                if layout.dynamic.is_none() {
+                    for word_offset in (sh_file_offset..section_end - size_of::<u64>() + 1)
+                        .step_by(size_of::<u64>())
+                    {
+                        let value = read_u64(data, word_offset)?.truncate();
+                        if layout.contains(value) {
+                            write_u64(data, word_offset, add_bias(value)?)?;
+                        }
+                    }
+                }
+                continue;
+            }
             if sh_flags & SHF_EXECINSTR != 0 {
                 let mut cursor = 0usize;
                 while cursor + 7 <= sh_size {
                     let instr_offset = sh_file_offset + cursor;
+                    // Keep executable rewrites self-contained to a single
+                    // instruction. Multi-instruction pattern rewrites can
+                    // accidentally delete control flow in unrelated ET_EXEC
+                    // startup code, which is especially risky for Linux-on-Linux
+                    // rebias paths that still use this loader logic.
                     let rex = data[instr_offset];
                     let opcode = data[instr_offset + 1];
                     let modrm = data[instr_offset + 2];

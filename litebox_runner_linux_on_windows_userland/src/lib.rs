@@ -14,16 +14,16 @@ use std::path::PathBuf;
 
 /// Run Linux programs with LiteBox on unmodified Windows.
 ///
-/// The program binary and all its dependencies (including `litebox_rtld_audit.so`)
-/// must be provided inside a tar archive via `--initial-files`. The program path
-/// refers to a path inside the tar archive.
+/// The program binary and all its dependencies must be provided inside a tar
+/// archive via `--initial-files`. The program path refers to a path inside the
+/// tar archive.
 #[derive(Parser, Debug)]
 pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/bin/ls --color`).
     ///
     /// The program path refers to a path inside the tar archive provided via
     /// `--initial-files`. All binaries must be pre-rewritten with the syscall
-    /// rewriter and the tar must include `litebox_rtld_audit.so`.
+    /// rewriter.
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
@@ -35,7 +35,7 @@ pub struct CliArgs {
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
-    /// Tar archive containing the program, its shared libraries, and litebox_rtld_audit.so.
+    /// Tar archive containing the program and its shared libraries.
     ///
     /// All ELF binaries should be pre-rewritten with the syscall rewriter
     /// (e.g., via `litebox-packager`).
@@ -83,6 +83,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
 
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
+    platform.prefer_slot0_for_first_address_space();
+    platform.prefer_redzone_syscall_entry();
     litebox_platform_multiplex::set_platform(platform);
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
@@ -315,11 +317,7 @@ fn start_network_worker<FS: litebox_shim_linux::ShimFS>(
 }
 
 fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
-    // Always inject LD_AUDIT so the dynamic linker loads the audit library
-    // that sets up trampolines for rewritten binaries.
-    let p = c"LD_AUDIT=/lib/litebox_rtld_audit.so";
-    let has_ld_audit = envp.iter().any(|var| var.as_c_str() == p);
-    if !has_ld_audit {
-        envp.push(p.into());
-    }
+    let _ = envp;
+    // No environment fixups needed — the shim's mmap hook handles
+    // syscall patching at runtime without LD_AUDIT.
 }

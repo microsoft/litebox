@@ -489,6 +489,8 @@ pub struct WindowsUserland {
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
     partitions: Mutex<PartitionState>,
+    prefer_slot0_for_first_address_space: core::sync::atomic::AtomicBool,
+    prefer_redzone_syscall_entry: core::sync::atomic::AtomicBool,
     /// Shared console terminal state for all stdio streams backed by the same
     /// Windows console. Protected by a mutex for thread safety (guest threads
     /// may call TCGETS/TCSETS concurrently).
@@ -1295,19 +1297,24 @@ unsafe extern "system" fn vectored_exception_handler_inner(
         } else {
             ""
         };
-        trace_debugln!(
-            "[VEH-exc] guest exception: code=0x{:08X} rip=0x{:X} addr=0x{:X} access={} guest_context_top={:p} host_sp={:p}",
-            exception_record.ExceptionCode as u32,
-            context.Rip,
-            if exception_record.NumberParameters >= 2 {
-                exception_record.ExceptionInformation[1] as u64
-            } else {
-                0
-            },
-            access_type,
-            ctx_top,
-            tls.host_sp.get(),
-        );
+        static VEH_GUEST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = VEH_GUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 32 || n.is_power_of_two() {
+            trace_debugln!(
+                "[VEH-exc] #{} guest exception: code=0x{:08X} rip=0x{:X} addr=0x{:X} access={} guest_context_top={:p} host_sp={:p}",
+                n,
+                exception_record.ExceptionCode as u32,
+                context.Rip,
+                if exception_record.NumberParameters >= 2 {
+                    exception_record.ExceptionInformation[1] as u64
+                } else {
+                    0
+                },
+                access_type,
+                ctx_top,
+                tls.host_sp.get(),
+            );
+        }
     }
     let exec_ctx =
         unsafe { &mut *(ctx_top.wrapping_sub(1) as *mut litebox_common_linux::ExecutionContext) };
@@ -1596,6 +1603,27 @@ fn get_plain_thread_context(
 }
 
 impl WindowsUserland {
+    /// Opt the next address-space allocation into slot 0 if it is still free.
+    ///
+    /// This is intended for the Linux-on-Windows single-process runner, where
+    /// keeping the init guest in slot 0 lets fixed-address Linux executables
+    /// stay at their linked VA instead of being rebased into a clean slot.
+    pub fn prefer_slot0_for_first_address_space(&self) {
+        self.prefer_slot0_for_first_address_space
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Use the SysV-redzone-aware syscall entrypoint for this platform.
+    ///
+    /// This is intended for the Linux-on-Windows runner, whose syscall
+    /// trampolines reserve 128 bytes below RSP before entering the platform.
+    /// NT-shim trampolines keep the normal Windows x64 stack layout and must
+    /// keep using the plain syscall entrypoint.
+    pub fn prefer_redzone_syscall_entry(&self) {
+        self.prefer_redzone_syscall_entry
+            .store(true, Ordering::Relaxed);
+    }
+
     /// Create a new userland-Windows platform for use in `LiteBox`.
     ///
     /// `tun_device_name` is the name of the WinTUN adapter to open/create for
@@ -1668,6 +1696,8 @@ impl WindowsUserland {
             reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
             partitions: Mutex::new(partitions),
+            prefer_slot0_for_first_address_space: core::sync::atomic::AtomicBool::new(false),
+            prefer_redzone_syscall_entry: core::sync::atomic::AtomicBool::new(false),
             console_terminal: Mutex::new(ConsoleTerminalState::default()),
             stdin_cancelled: core::sync::atomic::AtomicBool::new(false),
             tun_session,
@@ -1962,17 +1992,28 @@ impl litebox::platform::AddressSpaceProvider for WindowsUserland {
     fn create_address_space(
         &self,
     ) -> Result<Self::AddressSpaceId, litebox::platform::address_space::AddressSpaceError> {
+        let mut partitions = self.partitions.lock().unwrap();
+        let prefer_slot0 = self
+            .prefer_slot0_for_first_address_space
+            .swap(false, Ordering::Relaxed);
+        if prefer_slot0 && !partitions.is_allocated(0) {
+            let id = partitions
+                .allocate()
+                .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)?;
+            debug_assert_eq!(id, 0, "slot 0 should be the first allocated slot");
+            return Ok(id);
+        }
         // Try to find a clean VA partition first (no host allocations).
         // This avoids fragmentation conflicts when the guest does its own
         // memory management (e.g., ntdll heap init, DLL loading).
-        let mut partitions = self.partitions.lock().unwrap();
         if let Some(id) = partitions.allocate_probed(is_va_range_clean) {
             return Ok(id);
         }
         // Fallback: use any available slot even if host-contaminated.
-        partitions
+        let id = partitions
             .allocate()
-            .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)
+            .ok_or(litebox::platform::address_space::AddressSpaceError::NoSpace)?;
+        Ok(id)
     }
 
     fn destroy_address_space(
@@ -2335,14 +2376,31 @@ syscall_callback:
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
-    // Set rsp to the top of the guest context.
+    mov     QWORD PTR [r11 + {SCRATCH2}], rax
     mov     QWORD PTR [r11 + {SCRATCH}], rsp
+    jmp     .Lsyscall_callback_common
+
+    .globl  syscall_callback_redzone
+syscall_callback_redzone:
+    // Get the TLS state from the TLS slot and clear the in-guest flag.
+    mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
+    mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
+    mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
+    // The rewriter trampoline lowered RSP by 128 bytes to protect the SysV
+    // red zone. Recover the architectural guest stack pointer before saving
+    // pt_regs so normal `ret` instructions still see the original return
+    // address after the syscall resumes.
+    mov     QWORD PTR [r11 + {SCRATCH2}], rax
+    lea     rax, [rsp + 128]
+    mov     QWORD PTR [r11 + {SCRATCH}], rax
+
+.Lsyscall_callback_common:
+    // Set rsp to the top of the guest context.
     mov     rsp, QWORD PTR [r11 + {GUEST_CONTEXT_TOP}]
 
     // Save guest FP/SIMD state. fp_regs is at GUEST_CONTEXT_TOP + FP_REGS_PAD
     // (padding between end of PtRegs and start of 64-byte-aligned FpRegs).
     // Preserve rax (syscall number) in scratch2 because xsave/fxsave uses eax:edx.
-    mov     QWORD PTR [r11 + {SCRATCH2}], rax
     lea     rax, [rsp + {FP_REGS_PAD}]
     cmp     BYTE PTR [r11 + {XSAVE_ENABLED}], 0
     je      .Lsyscall_fp_save_fxsave
@@ -2610,13 +2668,21 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContex
 
         #[cfg(all(debug_assertions, feature = "trace_debug"))]
         {
-            trace_debugln!(
-                "[switch-guest] rip=0x{:X} rsp=0x{:X} rax=0x{:X} rcx=0x{:X}",
-                ctx.rip,
-                ctx.rsp,
-                ctx.rax,
-                ctx.rcx,
-            );
+            static SWITCH_TRACE_COUNT: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let count = SWITCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 32 || count.is_power_of_two() {
+                trace_debugln!(
+                    "[switch-guest] count={} rip=0x{:X} rsp=0x{:X} rax=0x{:X} rcx=0x{:X} interrupt={} pending_host_signals={:#x}",
+                    count,
+                    ctx.rip,
+                    ctx.rsp,
+                    ctx.rax,
+                    ctx.rcx,
+                    tls.interrupt.get(),
+                    tls.pending_host_signals.load(Ordering::Relaxed),
+                );
+            }
             // Validate guest RSP is writable before switching.
             #[repr(C)]
             struct MemoryBasicInformation {
@@ -4524,7 +4590,9 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
 
 unsafe extern "C" {
     // Defined in asm blocks above
+    #[allow(dead_code)]
     fn syscall_callback() -> isize;
+    fn syscall_callback_redzone() -> isize;
     fn exception_callback() -> isize;
     fn interrupt_callback();
     fn switch_to_guest_start();
@@ -4619,6 +4687,22 @@ unsafe extern "C-unwind" fn exception_handler(
 
 unsafe extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext<'_>) {
     thread_ctx.tls.is_in_guest.set(false);
+    #[cfg(all(debug_assertions, feature = "trace_debug"))]
+    {
+        static INTERRUPT_TRACE_COUNT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let count = INTERRUPT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count < 32 || count.is_power_of_two() {
+            trace_debugln!(
+                "[interrupt] count={} flag={} pending_host_signals={:#x} rip={:#x} rsp={:#x}",
+                count,
+                thread_ctx.tls.interrupt.get(),
+                thread_ctx.tls.pending_host_signals.load(Ordering::Relaxed),
+                thread_ctx.ctx.rip,
+                thread_ctx.ctx.rsp,
+            );
+        }
+    }
     thread_ctx.call_shim(|shim, ctx, interrupt| {
         if interrupt {
             shim.interrupt(ctx)
@@ -4659,7 +4743,11 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        syscall_callback as *const () as usize
+        if self.prefer_redzone_syscall_entry.load(Ordering::Relaxed) {
+            syscall_callback_redzone as *const () as usize
+        } else {
+            syscall_callback as *const () as usize
+        }
     }
 
     fn get_vdso_address(&self) -> Option<usize> {

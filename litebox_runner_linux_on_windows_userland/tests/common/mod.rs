@@ -21,6 +21,8 @@ impl TestLauncher {
         initial_files: &[&str],
     ) -> Self {
         let platform = Platform::new(None);
+        platform.prefer_slot0_for_first_address_space();
+        platform.prefer_redzone_syscall_entry();
         litebox_platform_multiplex::set_platform(platform);
         let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
         let litebox = shim_builder.litebox();
